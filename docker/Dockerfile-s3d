@@ -1,0 +1,19 @@
+FROM alpine:3.19.1
+
+# copy executable file
+COPY ./bin/linux/s3d /s3d
+COPY ./config/server.key /config/server.key
+COPY ./config/server.pem /config/server.pem
+COPY ./config/docker.toml /config/docker.toml
+
+# add glibc compatibility
+RUN apk add gcompat
+
+# allow main to be executed
+RUN chmod +x /s3d
+
+# expose port 443
+EXPOSE 443
+
+# run app executeable file
+CMD ["/s3d"]

@@ -1,0 +1,29 @@
+# Domain configration file in TOML format.
+version = "1.0"
+region = "ap-southeast-2"
+
+[[buckets]]
+name = "downloads"
+region = "ap-southeast-2"
+type = "fs"
+pathname = "/home/ben/Downloads"
+public = true
+encryption = ""
+
+[[buckets]]
+name = "development"
+region = "ap-southeast-2"
+type = "fs"
+pathname = "/home/ben/Development"
+public = false
+encryption = ""
+
+[[buckets.acl]]
+access_key_id = "X"
+secret_access_key = "Y"
+permissions = 0
+
+[[buckets.acl]]
+access_key_id = "X"
+secret_access_key = "Y"
+permissions = 1

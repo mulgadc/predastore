@@ -1,0 +1,14 @@
+version: "3.7"
+
+services:
+  s3d:
+    image: mulgadc/predastore:latest
+    environment:
+      - PORT=443
+      - CONFIG=/config/docker.toml
+    hostname: "predastore-local"
+    volumes:
+      - /Users/benduncan/Downloads/:/downloads/
+      - /Users/benduncan/Movies/:/movies/
+    ports:
+      - "443:443"
