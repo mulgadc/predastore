@@ -5,7 +5,7 @@ go 1.21.0
 require (
 	github.com/aws/aws-sdk-go v1.51.31
 	github.com/davecgh/go-spew v1.1.1
-	github.com/gofiber/fiber/v2 v2.52.4
+	github.com/gofiber/fiber/v2 v2.52.5
 	github.com/pelletier/go-toml/v2 v2.2.1
 	github.com/stretchr/testify v1.9.0
 )
