@@ -14,7 +14,7 @@ func (s3 *Config) PutObject(bucket string, file string, c *fiber.Ctx) error {
 	bucket_config, err := s3.BucketConfig(bucket)
 
 	if err != nil {
-		return errors.New("Could not find bucket")
+		return errors.New("NoSuchBucket")
 	}
 
 	// Confirm directory exists

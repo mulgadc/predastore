@@ -85,6 +85,15 @@ type ListBuckets struct {
 	Buckets []ListBucket `xml:"Buckets>Bucket"`
 }
 
+type S3Error struct {
+	XMLName    xml.Name `xml:"Error"`
+	Code       string   `xml:Code`
+	Message    string   `xml:Message`
+	BucketName string   `xml:BucketName`
+	RequestId  string   `xml:RequestId`
+	HostId     string   `xml:HostId`
+}
+
 func New() *Config {
 	return &Config{}
 }

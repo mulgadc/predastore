@@ -3,6 +3,7 @@ package s3
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -53,10 +54,10 @@ func (s3 *Config) ListObjectsV2Handler(bucket string, c *fiber.Ctx) error {
 
 	if err != nil {
 		slog.Warn(fmt.Sprintf("Could not load bucket from config: %s", err))
-		return nil
-	}
 
-	fmt.Println("REQ => ", req)
+		return errors.New("NoSuchBucket")
+
+	}
 
 	Resp_ListObjectsV2 := ListObjectsV2{}
 	Resp_ListObjectsV2_Contents := []ListObjectsV2_Contents{}
@@ -118,11 +119,12 @@ func (s3 *Config) ListObjectsV2Handler(bucket string, c *fiber.Ctx) error {
 			}
 
 		}
-		fmt.Printf("visited file or dir: %q\n", file.Name())
+
+		//fmt.Printf("visited file or dir: %q\n", file.Name())
 
 		if file.IsDir() {
 
-			fmt.Println("IS DIR", file.Name())
+			//fmt.Println("IS DIR", file.Name())
 			dir := ListObjectsV2_Dir{}
 			dir.Prefix = file.Name() + "/"
 			Resp_ListObjectsV2_Dir = append(Resp_ListObjectsV2_Dir, dir)

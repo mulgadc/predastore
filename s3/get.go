@@ -12,14 +12,13 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/log"
 )
 
 func (s3 *Config) GetObjectHead(bucket string, file string, c *fiber.Ctx) error {
 	bucket_config, err := s3.BucketConfig(bucket)
 
 	if err != nil {
-		return errors.New("Could not find bucket")
+		return errors.New("NoSuchBucket")
 	}
 
 	pathname := fmt.Sprintf("%s/%s", bucket_config.Pathname, file)
@@ -27,7 +26,7 @@ func (s3 *Config) GetObjectHead(bucket string, file string, c *fiber.Ctx) error 
 	info, err := os.Stat(pathname)
 
 	if err != nil {
-		return err
+		return errors.New("NoSuchObject")
 	}
 
 	// Open the file
@@ -73,7 +72,7 @@ func (s3 *Config) GetObject(bucket string, file string, c *fiber.Ctx) error {
 	bucket_config, err := s3.BucketConfig(bucket)
 
 	if err != nil {
-		return errors.New("Could not find bucket")
+		return errors.New("NoSuchBucket")
 	}
 
 	pathname := fmt.Sprintf("%s/%s", bucket_config.Pathname, file)
@@ -81,10 +80,7 @@ func (s3 *Config) GetObject(bucket string, file string, c *fiber.Ctx) error {
 	finfo, err := os.Stat(pathname)
 
 	if err != nil {
-		log.Info("Error reading file", err)
-		c.Status(500)
-		return err
-
+		return errors.New("NoSuchObject")
 	}
 
 	//c.SendFile(pathname)
