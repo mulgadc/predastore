@@ -10,13 +10,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/gofiber/fiber/v2"
 )
 
 func (s3 *Config) ListBuckets(c *fiber.Ctx) error {
-
-	spew.Dump(c.Request().Header)
 
 	Resp_ListBuckets := ListBuckets{}
 
@@ -82,8 +79,6 @@ func (s3 *Config) ListObjectsV2Handler(bucket string, c *fiber.Ctx) error {
 
 	}
 
-	fmt.Println("PATHNAME => ", pathname)
-
 	files, err := os.ReadDir(pathname)
 
 	if err != nil {
@@ -105,15 +100,13 @@ func (s3 *Config) ListObjectsV2Handler(bucket string, c *fiber.Ctx) error {
 
 		cleanPath := strings.Replace(file.Name(), bucket_config.Pathname, "", 1)
 
-		fmt.Println(cleanPath, file.Name(), pathname, req["prefix"])
-
 		if err != nil {
 			fmt.Printf("prevent panic by handling failure accessing a path %q: %v\n", file.Name(), err)
 			return err
 		}
 
 		if req["prefix"] != "" && !strings.HasSuffix(req["prefix"], "/") {
-			fmt.Println("PREFIX => ", cleanPath, req["prefix"])
+
 			if !strings.HasPrefix(cleanPath, req["prefix"]) {
 				continue
 			}

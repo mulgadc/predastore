@@ -39,8 +39,6 @@ func main() {
 		*port, _ = strconv.Atoi(os.Getenv("PORT"))
 	}
 
-	fmt.Println("READING config file", *config)
-
 	err := s3.ReadConfig(*config)
 
 	if err != nil {

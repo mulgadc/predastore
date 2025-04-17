@@ -57,7 +57,7 @@ func TestGetObject(t *testing.T) {
 	assert.NoError(t, err, "Reading body should not error")
 
 	// Compare with actual file content
-	expected, err := os.ReadFile("../tests/data/test.txt")
+	expected, err := os.ReadFile("../tests/data/testbucket/test.txt")
 	assert.NoError(t, err, "Reading test file should not error")
 	assert.Equal(t, expected, body, "File content should match")
 }
@@ -83,7 +83,7 @@ func TestGetObjectWithRange(t *testing.T) {
 	assert.NoError(t, err, "Reading body should not error")
 
 	// Compare with actual file content range
-	expectedFile, err := os.ReadFile("../tests/data/test.txt")
+	expectedFile, err := os.ReadFile("../tests/data/testbucket/test.txt")
 	assert.NoError(t, err, "Reading test file should not error")
 
 	expected := expectedFile[:10]

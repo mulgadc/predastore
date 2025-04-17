@@ -13,10 +13,20 @@ func TestReadConfig(t *testing.T) {
 	assert.NoError(t, err, "Should read config without error")
 	assert.Equal(t, "1.0", s3.Version, "Config version should match")
 	assert.Equal(t, "ap-southeast-2", s3.Region, "Region should match")
-	assert.Equal(t, 1, len(s3.Buckets), "Should have one bucket")
+	assert.Equal(t, 3, len(s3.Buckets), "Should have 3 buckets")
+
 	assert.Equal(t, "testbucket", s3.Buckets[0].Name, "Bucket name should match")
-	assert.Equal(t, "./tests/data", s3.Buckets[0].Pathname, "Path should match")
+	assert.Contains(t, s3.Buckets[0].Pathname, "tests/data/testbucket", "Path should match")
 	assert.True(t, s3.Buckets[0].Public, "Bucket should be public")
+
+	assert.Equal(t, "private", s3.Buckets[1].Name, "Bucket name should match")
+	assert.Contains(t, s3.Buckets[1].Pathname, "tests/data/private", "Path should match")
+	assert.False(t, s3.Buckets[1].Public, "Bucket should be private")
+
+	assert.Equal(t, "secure", s3.Buckets[2].Name, "Bucket name should match")
+	assert.Contains(t, s3.Buckets[2].Pathname, "tests/data/secure", "Path should match")
+	assert.False(t, s3.Buckets[2].Public, "Bucket should be private")
+
 }
 
 func TestBucketConfig(t *testing.T) {

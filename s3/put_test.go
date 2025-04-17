@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -25,13 +26,26 @@ func TestPutObject(t *testing.T) {
 
 	// Make a PUT request
 	req := httptest.NewRequest("PUT", "/testbucket/test_upload.txt", bytes.NewReader(testContent))
+
+	// Add authentication headers using the credentials from server.toml
+	if len(s3.Auth) > 0 {
+		// Use the first auth entry from the config
+		authEntry := s3.Auth[0]
+
+		// Use our utility function to generate a valid authorization header
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		assert.NoError(t, err, "Error generating auth header")
+	}
+
 	resp, err := app.Test(req)
 
 	assert.NoError(t, err, "Request should not error")
 	assert.Equal(t, 200, resp.StatusCode, "Status code should be 200")
 
 	// Verify the file was created with the correct content
-	uploadedPath := filepath.Join("../tests/data", "test_upload.txt")
+	uploadedPath := filepath.Join(s3.Buckets[0].Pathname, "test_upload.txt")
 	defer os.Remove(uploadedPath) // Clean up after test
 
 	// Check if file exists
@@ -60,13 +74,26 @@ func TestPutObjectBinary(t *testing.T) {
 
 	// Make a PUT request
 	req := httptest.NewRequest("PUT", "/testbucket/test_binary_upload.dat", bytes.NewReader(testContent))
+
+	// Add authentication headers using the credentials from server.toml
+	if len(s3.Auth) > 0 {
+		// Use the first auth entry from the config
+		authEntry := s3.Auth[0]
+
+		// Use our utility function to generate a valid authorization header
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		assert.NoError(t, err, "Error generating auth header")
+	}
+
 	resp, err := app.Test(req)
 
 	assert.NoError(t, err, "Request should not error")
 	assert.Equal(t, 200, resp.StatusCode, "Status code should be 200")
 
 	// Verify the file was created with the correct content
-	uploadedPath := filepath.Join("../tests/data", "test_binary_upload.dat")
+	uploadedPath := filepath.Join(s3.Buckets[0].Pathname, "test_binary_upload.dat")
 	defer os.Remove(uploadedPath) // Clean up after test
 
 	// Check if file exists
@@ -92,6 +119,19 @@ func TestPutObjectInvalidBucket(t *testing.T) {
 
 	// Make a PUT request to a non-existent bucket
 	req := httptest.NewRequest("PUT", "/nonexistent/test_upload.txt", bytes.NewReader(testContent))
+
+	// Add authentication headers using the credentials from server.toml
+	if len(s3.Auth) > 0 {
+		// Use the first auth entry from the config
+		authEntry := s3.Auth[0]
+
+		// Use our utility function to generate a valid authorization header
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		assert.NoError(t, err, "Error generating auth header")
+	}
+
 	resp, err := app.Test(req)
 
 	assert.NoError(t, err, "Request should complete")

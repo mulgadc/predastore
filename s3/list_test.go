@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -19,6 +20,19 @@ func TestListBuckets(t *testing.T) {
 
 	// Make a request to list buckets
 	req := httptest.NewRequest("GET", "/", nil)
+
+	// Add authentication headers using the credentials from server.toml
+	if len(s3.Auth) > 0 {
+		// Use the first auth entry from the config
+		authEntry := s3.Auth[0]
+
+		// Use our utility function to generate a valid authorization header
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		assert.NoError(t, err, "Error generating auth header")
+	}
+
 	resp, err := app.Test(req)
 
 	assert.NoError(t, err, "Request should not error")
@@ -30,17 +44,14 @@ func TestListBuckets(t *testing.T) {
 	assert.NoError(t, err, "XML parsing should not error")
 
 	// Verify the response contains our test bucket
-	assert.GreaterOrEqual(t, len(result.Buckets), 1, "Should have at least one bucket")
+	assert.Equal(t, len(result.Buckets), 3, "Should have three buckets")
 
-	found := false
-	for _, bucket := range result.Buckets {
-		if bucket.Name == "testbucket" {
-			found = true
-			break
-		}
+	if len(result.Buckets) == 3 {
+		assert.Equal(t, result.Buckets[0].Name, "testbucket", "Test bucket should be in the list")
+		assert.Equal(t, result.Buckets[1].Name, "private", "Private bucket should be in the list")
+		assert.Equal(t, result.Buckets[2].Name, "secure", "Secure bucket should be in the list")
 	}
 
-	assert.True(t, found, "Test bucket should be in the list")
 }
 
 func TestListObjectsV2Handler(t *testing.T) {
@@ -53,6 +64,20 @@ func TestListObjectsV2Handler(t *testing.T) {
 
 	// Make a request to list objects in the test bucket
 	req := httptest.NewRequest("GET", "/testbucket", nil)
+
+	// Add auth for non-public buckets (testbucket is public, but adding auth won't hurt)
+	if len(s3.Auth) > 0 {
+		// Use the first auth entry from the config
+		authEntry := s3.Auth[0]
+
+		// Use our utility function to generate a valid authorization header
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		assert.NoError(t, err, "Error generating auth header")
+
+	}
+
 	resp, err := app.Test(req)
 
 	assert.NoError(t, err, "Request should not error")
@@ -96,6 +121,20 @@ func TestListObjectsWithPrefix(t *testing.T) {
 
 	// Make a request to list objects with prefix
 	req := httptest.NewRequest("GET", "/testbucket?prefix=test", nil)
+
+	// Add auth for non-public buckets (testbucket is public, but adding auth won't hurt)
+	if len(s3.Auth) > 0 {
+		// Use the first auth entry from the config
+		authEntry := s3.Auth[0]
+
+		// Use our utility function to generate a valid authorization header
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		assert.NoError(t, err, "Error generating auth header")
+
+	}
+
 	resp, err := app.Test(req)
 
 	assert.NoError(t, err, "Request should not error")
@@ -136,8 +175,21 @@ func TestListInvalidBucket(t *testing.T) {
 	// Setup Fiber app using SetupRoutes
 	app := s3.SetupRoutes()
 
-	// Make a request to list objects in the test bucket
+	// Make a request to list objects in an invalid bucket
 	req := httptest.NewRequest("GET", "/invalidbucket", nil)
+
+	// Add authentication headers since routes.go may require it
+	if len(s3.Auth) > 0 {
+		// Use the first auth entry from the config
+		authEntry := s3.Auth[0]
+
+		// Use our utility function to generate a valid authorization header
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		assert.NoError(t, err, "Error generating auth header")
+	}
+
 	resp, err := app.Test(req)
 
 	assert.NoError(t, err, "Request should not error")
@@ -154,5 +206,4 @@ func TestListInvalidBucket(t *testing.T) {
 
 	assert.Equal(t, s3error.Code, "NoSuchBucket", "Error message should indicate invalid bucket")
 	assert.Equal(t, s3error.Message, "The specified bucket does not exist")
-
 }

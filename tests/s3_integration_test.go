@@ -39,7 +39,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 
 	// Create and configure the S3 server
 	s3server := s3.New()
-	err := s3server.ReadConfig("tests/config/server.toml")
+	err := s3server.ReadConfig("./config/server.toml")
 	require.NoError(t, err, "Failed to read config file")
 
 	// Setup routes
@@ -50,7 +50,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 		defer wg.Done()
 
 		// Start the Fiber app directly with ListenTLS
-		err := app.ListenTLS(":8443", "config/server.pem", "config/server.key")
+		err := app.ListenTLS(":8443", "../config/server.pem", "../config/server.key")
 
 		// Only report errors other than server closed
 		if err != nil {
@@ -86,11 +86,16 @@ func createS3Client(t *testing.T) *awss3.S3 {
 	httpClient := &http.Client{Transport: tr}
 
 	// Create a new AWS session
+
+	s3client := s3.New()
+	err := s3client.ReadConfig("./config/server.toml")
+	require.NoError(t, err, "Failed to read config file")
+
 	sess, err := session.NewSession(&aws.Config{
-		Region:           aws.String(S3_REGION),
+		Region:           aws.String(s3client.Region),
 		Endpoint:         aws.String(S3_ENDPOINT),
 		S3ForcePathStyle: aws.Bool(true),
-		Credentials:      credentials.NewStaticCredentials("test_access_key", "test_secret_key", ""),
+		Credentials:      credentials.NewStaticCredentials(s3client.Auth[0].AccessKeyID, s3client.Auth[0].SecretAccessKey, ""),
 		HTTPClient:       httpClient,
 	})
 	require.NoError(t, err, "Failed to create AWS session")
@@ -165,7 +170,7 @@ func TestS3Integration(t *testing.T) {
 		assert.NoError(t, err, "Reading text file should not error")
 		textResult.Body.Close()
 
-		expectedText, err := os.ReadFile(filepath.Join("tests", "data", "test.txt"))
+		expectedText, err := os.ReadFile("./data/testbucket/test.txt")
 		assert.NoError(t, err, "Reading local text file should not error")
 		assert.Equal(t, expectedText, textBytes, "Text file content should match")
 
@@ -180,7 +185,7 @@ func TestS3Integration(t *testing.T) {
 		assert.NoError(t, err, "Reading binary file should not error")
 		binaryResult.Body.Close()
 
-		expectedBinary, err := os.ReadFile(filepath.Join("tests", "data", "binary.dat"))
+		expectedBinary, err := os.ReadFile("./data/testbucket/binary.dat")
 		assert.NoError(t, err, "Reading local binary file should not error")
 		assert.Equal(t, expectedBinary, binaryBytes, "Binary file content should match")
 	})
@@ -279,7 +284,7 @@ func TestByteRangeRequests(t *testing.T) {
 	client := &http.Client{Transport: tr}
 
 	// Get the full text file content for comparison
-	fullText, err := os.ReadFile("tests/data/test.txt")
+	fullText, err := os.ReadFile("./data/testbucket/test.txt")
 	require.NoError(t, err, "Reading text file should not error")
 
 	// Test range request

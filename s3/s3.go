@@ -18,14 +18,36 @@ type S3_Buckets struct {
 	Type       string `toml:"type"`
 	Pathname   string `toml:"pathname"`
 	Public     bool   `toml:"public"`
-	ACL        []ACL  `toml:"acl"`
 	Encryption string `toml:"encryption"`
 }
 
 type Config struct {
-	Version string       `toml:"version"`
-	Region  string       `toml:"region"`
-	Buckets []S3_Buckets `toml:"buckets"`
+	Version               string       `toml:"version"`
+	Region                string       `toml:"region"`
+	Buckets               []S3_Buckets `toml:"buckets"`
+	Auth                  []AuthEntry  `toml:"auth"`
+	AllowAnonymousListing bool         `toml:"allow_anonymous_listing"`
+	AllowAnonymousAccess  bool         `toml:"allow_anonymous_access"`
+}
+
+// Authentication and policy
+type AuthEntry struct {
+	AccessKeyID     string       `toml:"access_key_id"`
+	SecretAccessKey string       `toml:"secret_access_key"`
+	Policy          []PolicyRule `toml:"policy"`
+}
+
+// Action						Meaning
+// s3:ListBucket				List objects in a bucket
+// s3:GetObject					Download (read) an object
+// s3:PutObject					Upload or overwrite an object
+// s3:DeleteObject				Delete an object
+// s3:ListAllMyBuckets			List all buckets visible to a user
+// s3:GetBucketAcl / PutAcl		(TODO) Manage access control for buckets
+
+type PolicyRule struct {
+	Bucket  string   `toml:"bucket"`  // Can be "*" or bucket name
+	Actions []string `toml:"actions"` // Like "s3:GetObject", "s3:PutObject", or "s3:*"
 }
 
 // S3 ListObjects (v2)
@@ -87,13 +109,16 @@ type ListBuckets struct {
 
 type S3Error struct {
 	XMLName    xml.Name `xml:"Error"`
-	Code       string   `xml:Code`
-	Message    string   `xml:Message`
-	BucketName string   `xml:BucketName`
-	RequestId  string   `xml:RequestId`
-	HostId     string   `xml:HostId`
+	Code       string   `xml:"Code"`
+	Message    string   `xml:"Message"`
+	BucketName string   `xml:"BucketName"`
+	RequestId  string   `xml:"RequestId"`
+	HostId     string   `xml:"HostId"`
 }
 
 func New() *Config {
-	return &Config{}
+	return &Config{
+		AllowAnonymousListing: false, // Default to not allow anonymous listing
+		AllowAnonymousAccess:  false, // Default to not allow anonymous access
+	}
 }
