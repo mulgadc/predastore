@@ -193,7 +193,7 @@ func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
 	payloadEncoding := c.Get("X-Amz-Content-SHA256")
 
 	if payloadEncoding == "STREAMING-UNSIGNED-PAYLOAD-TRAILER" || payloadEncoding == "UNSIGNED-PAYLOAD" {
-		payloadHash = hashSHA256("")
+		payloadHash = payloadEncoding //hashSHA256("")
 
 	} else {
 		payloadHash = hashSHA256(string(c.Body()))

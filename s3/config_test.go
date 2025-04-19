@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -8,7 +9,7 @@ import (
 
 func TestReadConfig(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 
 	assert.NoError(t, err, "Should read config without error")
 	assert.Equal(t, "1.0", s3.Version, "Config version should match")
@@ -31,7 +32,7 @@ func TestReadConfig(t *testing.T) {
 
 func TestBucketConfig(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	bucket, err := s3.BucketConfig("testbucket")

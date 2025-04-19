@@ -18,6 +18,7 @@ func main() {
 	config := flag.String("config", "config/server.toml", "S3 server configuration file")
 	tls_key := flag.String("tls-key", "config/server.key", "Path to TLS key")
 	tls_cert := flag.String("tls-cert", "config/server.pem", "Path to TLS cert")
+	base_path := flag.String("base-path", "", "Base path for the S3 directory when undefined in the config file")
 	port := flag.Int("port", 443, "Server port")
 
 	flag.Parse()
@@ -39,7 +40,7 @@ func main() {
 		*port, _ = strconv.Atoi(os.Getenv("PORT"))
 	}
 
-	err := s3.ReadConfig(*config)
+	err := s3.ReadConfig(*config, *base_path)
 
 	if err != nil {
 		slog.Warn("Error reading config file", "error", err)

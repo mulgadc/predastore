@@ -15,7 +15,7 @@ import (
 
 func TestPutObject(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -60,7 +60,7 @@ func TestPutObject(t *testing.T) {
 
 func TestPutObjectBinary(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -108,7 +108,7 @@ func TestPutObjectBinary(t *testing.T) {
 
 func TestPutObjectInvalidBucket(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes

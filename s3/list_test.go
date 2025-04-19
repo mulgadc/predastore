@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"io"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,7 +13,7 @@ import (
 
 func TestListBuckets(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -56,7 +57,7 @@ func TestListBuckets(t *testing.T) {
 
 func TestListObjectsV2Handler(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -113,7 +114,7 @@ func TestListObjectsV2Handler(t *testing.T) {
 
 func TestListObjectsWithPrefix(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -169,7 +170,7 @@ func TestListObjectsWithPrefix(t *testing.T) {
 
 func TestListInvalidBucket(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes

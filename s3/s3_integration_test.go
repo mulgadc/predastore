@@ -1,4 +1,4 @@
-package tests
+package s3
 
 import (
 	"bytes"
@@ -18,7 +18,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
-	"github.com/mulgadc/predastore/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -38,8 +37,8 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	wg.Add(1)
 
 	// Create and configure the S3 server
-	s3server := s3.New()
-	err := s3server.ReadConfig("./config/server.toml")
+	s3server := New()
+	err := s3server.ReadConfig("./tests/config/server.toml", "")
 	require.NoError(t, err, "Failed to read config file")
 
 	// Setup routes
@@ -87,8 +86,8 @@ func createS3Client(t *testing.T) *awss3.S3 {
 
 	// Create a new AWS session
 
-	s3client := s3.New()
-	err := s3client.ReadConfig("./config/server.toml")
+	s3client := New()
+	err := s3client.ReadConfig("./tests/config/server.toml", "")
 	require.NoError(t, err, "Failed to read config file")
 
 	sess, err := session.NewSession(&aws.Config{
@@ -170,7 +169,7 @@ func TestS3Integration(t *testing.T) {
 		assert.NoError(t, err, "Reading text file should not error")
 		textResult.Body.Close()
 
-		expectedText, err := os.ReadFile("./data/testbucket/test.txt")
+		expectedText, err := os.ReadFile("./tests/data/testbucket/test.txt")
 		assert.NoError(t, err, "Reading local text file should not error")
 		assert.Equal(t, expectedText, textBytes, "Text file content should match")
 
@@ -185,7 +184,7 @@ func TestS3Integration(t *testing.T) {
 		assert.NoError(t, err, "Reading binary file should not error")
 		binaryResult.Body.Close()
 
-		expectedBinary, err := os.ReadFile("./data/testbucket/binary.dat")
+		expectedBinary, err := os.ReadFile("./tests/data/testbucket/binary.dat")
 		assert.NoError(t, err, "Reading local binary file should not error")
 		assert.Equal(t, expectedBinary, binaryBytes, "Binary file content should match")
 	})
@@ -225,7 +224,7 @@ func TestS3Integration(t *testing.T) {
 }
 
 // TestGetObjectHead tests the HEAD request for an object
-func TestGetObjectHead(t *testing.T) {
+func TestGetObjectHeadIntegration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
 	}
@@ -284,7 +283,7 @@ func TestByteRangeRequests(t *testing.T) {
 	client := &http.Client{Transport: tr}
 
 	// Get the full text file content for comparison
-	fullText, err := os.ReadFile("./data/testbucket/test.txt")
+	fullText, err := os.ReadFile("./tests/data/testbucket/test.txt")
 	require.NoError(t, err, "Reading text file should not error")
 
 	// Test range request

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,7 +13,7 @@ import (
 
 func TestGetObjectHead(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -39,7 +40,7 @@ func TestGetObjectHead(t *testing.T) {
 
 func TestGetObject(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -57,14 +58,14 @@ func TestGetObject(t *testing.T) {
 	assert.NoError(t, err, "Reading body should not error")
 
 	// Compare with actual file content
-	expected, err := os.ReadFile("../tests/data/testbucket/test.txt")
+	expected, err := os.ReadFile(filepath.Join("tests", "data", "testbucket", "test.txt"))
 	assert.NoError(t, err, "Reading test file should not error")
 	assert.Equal(t, expected, body, "File content should match")
 }
 
 func TestGetObjectWithRange(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -83,7 +84,7 @@ func TestGetObjectWithRange(t *testing.T) {
 	assert.NoError(t, err, "Reading body should not error")
 
 	// Compare with actual file content range
-	expectedFile, err := os.ReadFile("../tests/data/testbucket/test.txt")
+	expectedFile, err := os.ReadFile(filepath.Join("tests", "data", "testbucket", "test.txt"))
 	assert.NoError(t, err, "Reading test file should not error")
 
 	expected := expectedFile[:10]
@@ -96,7 +97,7 @@ func TestGetObjectWithRange(t *testing.T) {
 
 func TestGetObjectNonExistent(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -112,7 +113,7 @@ func TestGetObjectNonExistent(t *testing.T) {
 
 func TestGetInvalidBucket(t *testing.T) {
 	s3 := New()
-	err := s3.ReadConfig("../tests/config/server.toml")
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes

@@ -6,7 +6,7 @@ region = "ap-southeast-2"
 name = "testbucket"
 region = "ap-southeast-2"
 type = "fs"
-pathname = "/home/ben/Development/mulga/predastore/tests/data/testbucket"
+pathname = "tests/data/testbucket"
 public = true
 encryption = ""
 
@@ -14,7 +14,7 @@ encryption = ""
 name = "private"
 region = "ap-southeast-2"
 type = "fs"
-pathname = "/home/ben/Development/mulga/predastore/tests/data/private"
+pathname = "tests/data/private"
 public = false
 encryption = ""
 
@@ -22,7 +22,7 @@ encryption = ""
 name = "secure"
 region = "ap-southeast-2"
 type = "fs"
-pathname = "/home/ben/Development/mulga/predastore/tests/data/secure"
+pathname = "tests/data/secure"
 public = false
 encryption = ""
 
