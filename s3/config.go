@@ -33,6 +33,14 @@ func (s3 *Config) ReadConfig(filename string, base_path string) (err error) {
 
 	// Loop through the buckets, if a directory is relative, add the base path
 	for k, b := range s3.Buckets {
+
+		// Check if the bucket name is valid
+		err = isValidBucketName(b.Name)
+		if err != nil {
+			slog.Warn("Invalid bucket name", "bucket", b.Name, "error", err)
+			return errors.New(fmt.Sprintf("Invalid bucket name: %s", err))
+		}
+
 		// Check if the directory is relative
 		if b.Type == "fs" && !filepath.IsAbs(b.Pathname) {
 			s3.Buckets[k].Pathname = filepath.Join(base_path, b.Pathname)
@@ -50,11 +58,7 @@ func (s3 *Config) ReadConfig(filename string, base_path string) (err error) {
 
 func (s3 *Config) BucketConfig(bucket string) (S3_Buckets, error) {
 
-	//fmt.Println("Searching for bucket", bucket)
-	//fmt.Println(s3)
-
 	for _, b := range s3.Buckets {
-		//fmt.Println("BUCKET: ", b)
 		if b.Name == bucket {
 			return b, nil
 		}

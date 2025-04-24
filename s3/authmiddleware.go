@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -109,21 +110,28 @@ func GenerateAuthHeaderReq(accessKey, secretKey, timestamp, region, service stri
 
 func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
 	authHeader := c.Get("Authorization")
+
+	fmt.Println("Authorization header", authHeader)
+	slog.Debug("Authorization header", "authHeader", authHeader)
+
 	if authHeader == "" {
-		return c.Status(fiber.StatusForbidden).SendString("Missing Authorization header")
+		slog.Debug("Missing Authorization header")
+		return errors.New("AccessDenied")
 	}
 
 	// Example header:
 	// AWS4-HMAC-SHA256 Credential=EXAMPLEACCESSKEY/20250414/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=...
 	parts := strings.Split(authHeader, ", ")
 	if len(parts) != 3 {
-		return c.Status(fiber.StatusUnauthorized).SendString("Invalid Authorization header format")
+		slog.Debug("Invalid Authorization header format")
+		return errors.New("AccessDenied")
 	}
 
 	// Parse credential
 	creds := strings.Split(strings.TrimPrefix(parts[0], "AWS4-HMAC-SHA256 Credential="), "/")
 	if len(creds) != 5 {
-		return c.Status(fiber.StatusUnauthorized).SendString("Invalid credential scope")
+		slog.Debug("Invalid credential scope")
+		return errors.New("AccessDenied")
 	}
 	accessKey, date, region, svc := creds[0], creds[1], creds[2], creds[3]
 
@@ -136,7 +144,8 @@ func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
 	}
 
 	if secretKey == "" {
-		return c.Status(fiber.StatusForbidden).SendString("Invalid access key")
+		slog.Debug("Invalid access key")
+		return errors.New("AccessDenied")
 	}
 
 	signedHeaders := strings.TrimPrefix(parts[1], "SignedHeaders=")
@@ -154,6 +163,8 @@ func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
 	}
 
 	// Next the canonicalQueryString which needs to be sorted
+	canonicalURI = UriEncode(canonicalURI, false)
+	slog.Debug("Canonical URI", "canonicalURI", canonicalURI)
 
 	query := c.Queries()
 	queryUrl := url.Values{}
@@ -169,6 +180,8 @@ func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
 
 	canonicalQueryString := strings.Replace(queryUrl.Encode(), "+", "%20", -1)
 
+	slog.Debug("Canonical query string", "canonicalQueryString", canonicalQueryString)
+
 	// Encode the canonical URI
 	// S3 requires disabling path encoding, however other AWS services may require it
 	// canonicalURI = url.PathEscape(canonicalURI)
@@ -176,15 +189,19 @@ func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
 
 	// Loop through the headers and build the canonical headers
 	headers := strings.Split(signedHeaders, ";")
-	// Required to be sorted
+
+	// Required to be sorted as per spec
 	sort.Strings(headers)
 
-	fmt.Println("Headers", headers)
+	slog.Debug("Headers", "headers", headers)
 
 	canonicalHeaders := ""
 	for _, header := range headers {
-		canonicalHeaders += fmt.Sprintf("%s:%s\n", header, c.Get(header))
-		fmt.Println("Canonical header", header, c.Get(header))
+		//canonicalHeaders += fmt.Sprintf("%s:%s\n", header, c.Get(header))
+
+		// Trim header value
+		canonicalHeaders += fmt.Sprintf("%s:%s\n", header, strings.TrimSpace(c.Get(header)))
+		slog.Debug("Canonical header", "header", header, "value", c.Get(header))
 	}
 
 	// Read payload body
@@ -198,17 +215,6 @@ func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
 	} else {
 		payloadHash = hashSHA256(string(c.Body()))
 	}
-
-	// Write body to /tmp/body.txt
-
-	/*
-		err := os.WriteFile("/tmp/body.txt", c.Body(), 0644)
-		if err != nil {
-			return c.Status(fiber.StatusInternalServerError).SendString("Failed to write body to file")
-		}
-
-		fmt.Println("Payload hash", payloadHash)
-	*/
 
 	canonicalRequest := fmt.Sprintf(
 		"%s\n%s\n%s\n%s\n%s\n%s",
@@ -243,9 +249,8 @@ func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
 
 	// Compare
 	if expectedSig != signature {
-		fmt.Println("Invalid signature", "expected", expectedSig, "actual", signature)
 		slog.Debug("Invalid signature", "expected", expectedSig, "actual", signature)
-		return c.Status(fiber.StatusForbidden).SendString("Invalid signature")
+		return errors.New("AccessDenied")
 	}
 
 	return nil
@@ -272,4 +277,53 @@ func getSigningKey(secret, date, region, service string) []byte {
 	kService := hmacSHA256(kRegion, service)
 	kSigning := hmacSHA256(kService, "aws4_request")
 	return kSigning
+}
+
+// UriEncode follows AWS's specific requirements for canonical URI encoding
+func UriEncode(input string, encodeSlash bool) string {
+	var builder strings.Builder
+	builder.Grow(len(input) * 3) // Pre-allocate space for worst case
+
+	for _, b := range []byte(input) {
+		// AWS's unreserved characters
+		if (b >= 'A' && b <= 'Z') ||
+			(b >= 'a' && b <= 'z') ||
+			(b >= '0' && b <= '9') ||
+			b == '-' || b == '.' || b == '_' || b == '~' {
+			builder.WriteByte(b)
+		} else if b == '/' && !encodeSlash {
+			builder.WriteByte(b)
+		} else {
+			// URI encode everything else
+			builder.WriteString(fmt.Sprintf("%%%02X", b))
+		}
+	}
+
+	return builder.String()
+}
+
+// CanonicalQueryString creates the canonical query string according to AWS specs
+func CanonicalQueryString(queryParams map[string][]string) string {
+	// 1. Sort parameter names in ascending order
+	keys := make([]string, 0, len(queryParams))
+	for k := range queryParams {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// 2. Build canonical query string
+	var pairs []string
+	for _, key := range keys {
+		values := queryParams[key]
+		sort.Strings(values) // Sort values for each key
+
+		// URI encode both key and values
+		encodedKey := UriEncode(key, true)
+		for _, v := range values {
+			encodedValue := UriEncode(v, true)
+			pairs = append(pairs, fmt.Sprintf("%s=%s", encodedKey, encodedValue))
+		}
+	}
+
+	return strings.Join(pairs, "&")
 }

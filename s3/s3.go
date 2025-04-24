@@ -107,6 +107,34 @@ type ListBuckets struct {
 	Buckets []ListBucket `xml:"Buckets>Bucket"`
 }
 
+type InitiateMultipartUploadResult struct {
+	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	UploadId string   `xml:"UploadId"`
+}
+
+type CompleteMultipartUpload struct {
+	XMLName xml.Name              `xml:"CompleteMultipartUpload"`
+	Parts   []MultipartUploadPart `xml:"Part"`
+}
+
+type MultipartUploadPart struct {
+	PartNumber int    `xml:"PartNumber"`
+	ETag       string `xml:"ETag"`
+}
+
+type CompleteMultipartUploadResult struct {
+	XMLName  xml.Name `xml:"CompleteMultipartUpload"`
+	Location string   `xml:"Location"`
+	Bucket   string   `xml:"Bucket"`
+	Key      string   `xml:"Key"`
+	ETag     string   `xml:"ETag"`
+	// Both of these are optional
+	ChecksumCRC64NVME string `xml:"ChecksumCRC64NVME,omitempty"`
+	ChecksumType      string `xml:"ChecksumType,omitempty"`
+}
+
 type S3Error struct {
 	XMLName    xml.Name `xml:"Error"`
 	Code       string   `xml:"Code"`
@@ -117,6 +145,7 @@ type S3Error struct {
 }
 
 func New() *Config {
+
 	return &Config{
 		AllowAnonymousListing: false, // Default to not allow anonymous listing
 		AllowAnonymousAccess:  false, // Default to not allow anonymous access

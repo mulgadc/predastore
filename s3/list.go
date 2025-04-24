@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -116,8 +117,6 @@ func (s3 *Config) ListObjectsV2Handler(bucket string, c *fiber.Ctx) error {
 		//fmt.Printf("visited file or dir: %q\n", file.Name())
 
 		if file.IsDir() {
-
-			//fmt.Println("IS DIR", file.Name())
 			dir := ListObjectsV2_Dir{}
 			dir.Prefix = file.Name() + "/"
 			Resp_ListObjectsV2_Dir = append(Resp_ListObjectsV2_Dir, dir)
@@ -132,6 +131,10 @@ func (s3 *Config) ListObjectsV2Handler(bucket string, c *fiber.Ctx) error {
 			}
 
 			resp.Key = file.Name()
+
+			// URL decode the key
+			resp.Key, _ = url.PathUnescape(resp.Key)
+
 			resp.LastModified = info.ModTime()
 			resp.Size = info.Size()
 			resp.StorageClass = "STANDARD"
@@ -142,8 +145,6 @@ func (s3 *Config) ListObjectsV2Handler(bucket string, c *fiber.Ctx) error {
 			md5Hash.Write([]byte(fileHash))
 
 			resp.ETag = hex.EncodeToString(md5Hash.Sum(nil))
-
-			//fmt.Println(resp)
 
 			Resp_ListObjectsV2_Contents = append(Resp_ListObjectsV2_Contents, resp)
 		}

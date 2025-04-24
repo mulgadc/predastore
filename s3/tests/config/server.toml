@@ -26,6 +26,14 @@ pathname = "tests/data/secure"
 public = false
 encryption = ""
 
+[[buckets]]
+name = "local"
+region = "ap-southeast-2"
+type = "fs"
+pathname = "tests/data/local"
+public = false
+encryption = ""
+
 [[auth]]
 access_key_id = "AKIAIOSFODNN7EXAMPLE"
 secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"

@@ -2,6 +2,7 @@ package s3
 
 import (
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http/httptest"
 	"os"
@@ -137,5 +138,33 @@ func TestGetInvalidBucket(t *testing.T) {
 
 	assert.Equal(t, s3error.Code, "NoSuchBucket", "Error message should indicate invalid bucket")
 	assert.Equal(t, s3error.Message, "The specified bucket does not exist")
+
+}
+
+func TestGetInvalidObjectKey(t *testing.T) {
+	s3 := New()
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	assert.NoError(t, err, "Should read config without error")
+
+	// Setup Fiber app using SetupRoutes
+	app := s3.SetupRoutes()
+
+	// Make a request to list objects in the test bucket with an invalid key
+	req := httptest.NewRequest("GET", fmt.Sprintf("/testbucket/%s", string([]byte{0x80, 0x80})), nil)
+	resp, err := app.Test(req)
+
+	assert.NoError(t, err, "Request should not error")
+	assert.Equal(t, 500, resp.StatusCode, "Status code should be 500")
+
+	// Read response body
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err, "Reading body should not error")
+	var s3error S3Error
+
+	err = xml.Unmarshal(body, &s3error)
+
+	assert.NoError(t, err, "XML parsing failed")
+
+	assert.Equal(t, s3error.Message, "InvalidKey", "Error message should indicate invalid key")
 
 }

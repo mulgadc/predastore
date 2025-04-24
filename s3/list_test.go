@@ -45,13 +45,33 @@ func TestListBuckets(t *testing.T) {
 	assert.NoError(t, err, "XML parsing should not error")
 
 	// Verify the response contains our test bucket
-	assert.Equal(t, len(result.Buckets), 3, "Should have three buckets")
+	assert.Equal(t, len(result.Buckets), 4, "Should have 4 buckets")
 
-	if len(result.Buckets) == 3 {
+	if len(result.Buckets) == 4 {
 		assert.Equal(t, result.Buckets[0].Name, "testbucket", "Test bucket should be in the list")
 		assert.Equal(t, result.Buckets[1].Name, "private", "Private bucket should be in the list")
 		assert.Equal(t, result.Buckets[2].Name, "secure", "Secure bucket should be in the list")
+		assert.Equal(t, result.Buckets[3].Name, "local", "Local bucket should be in the list")
 	}
+
+}
+
+// Test list buckets with no authentication, should fail.
+func TestListBucketsNoAuth(t *testing.T) {
+	s3 := New()
+	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	assert.NoError(t, err, "Should read config without error")
+
+	// Setup Fiber app using SetupRoutes
+	app := s3.SetupRoutes()
+
+	// Make a request to list buckets
+	req := httptest.NewRequest("GET", "/", nil)
+
+	resp, err := app.Test(req)
+
+	assert.NoError(t, err, "Request should not error")
+	assert.Equal(t, 403, resp.StatusCode, "Status code should be 403")
 
 }
 

@@ -163,11 +163,20 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create a new Fiber app
-			app := fiber.New()
+			app := fiber.New(fiber.Config{
+
+				// Set the body limit for S3 specs to 5GiB
+				BodyLimit: 5 * 1024 * 1024 * 1024,
+
+				// Override default error handler
+				ErrorHandler: func(ctx *fiber.Ctx, err error) error {
+					return s3Config.ErrorHandler(ctx, err)
+				}})
 
 			// Add middleware and test endpoint
 			app.Use(s3Config.sigV4AuthMiddleware)
 			app.All("*", func(c *fiber.Ctx) error {
+
 				return c.SendString("Request authenticated")
 			})
 

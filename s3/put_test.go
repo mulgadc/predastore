@@ -150,3 +150,5 @@ func TestPutObjectInvalidBucket(t *testing.T) {
 	assert.Equal(t, s3error.Message, "The specified bucket does not exist")
 
 }
+
+// TODO: Add multipart upload tests
