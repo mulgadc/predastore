@@ -2,6 +2,16 @@
 version = "1.0"
 region = "ap-southeast-2"
 
+# Optionally configure port and host, or specify via daemon CLI options
+# host = 0.0.0.0
+# port = 443
+
+# Enable verbose debugging
+# debug = false
+
+# Optionally configure base-path if full directory path not defined for "fs" buckets
+# base_path = "/home/predastore/data/"
+
 [[buckets]]
 name = "testbucket"
 region = "ap-southeast-2"
@@ -34,10 +44,19 @@ pathname = "tests/data/local"
 public = false
 encryption = ""
 
+[[buckets]]
+name = "predastore"
+region = "ap-southeast-2"
+type = "fs"
+pathname = "tests/data/predastore"
+public = false
+encryption = ""
+
 [[auth]]
 access_key_id = "AKIAIOSFODNN7EXAMPLE"
 secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 policy = [
   { bucket = "private", actions = ["s3:ListBucket",  "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListAllMyBuckets"] },
   { bucket = "secure", actions = ["s3:ListBucket", "s3:ListAllMyBuckets", "s3:GetObject"] },
+  { bucket = "predastore", actions = ["s3:ListBucket",  "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListAllMyBuckets"] },
 ]

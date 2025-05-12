@@ -10,22 +10,24 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-func (s3 *Config) ReadConfig(filename string, base_path string) (err error) {
+func (s3 *Config) ReadConfig() (err error) {
 
-	if !filepath.IsAbs(base_path) {
+	fmt.Println("ReadConfig", s3)
+
+	if !filepath.IsAbs(s3.BasePath) {
 		dir, err := os.Getwd()
 		if err != nil {
 			slog.Warn("Error getting working directory", "error", err)
 			return err
 		}
-		base_path = filepath.Join(dir, base_path)
+		s3.BasePath = filepath.Join(dir, s3.BasePath)
 	}
 
-	config, err := os.ReadFile(filename)
+	config, err := os.ReadFile(s3.ConfigPath)
 
 	if err != nil {
-		errorMsg := fmt.Sprintf("Error reading %s %s", filename, err)
-		slog.Warn(errorMsg)
+		errorMsg := fmt.Sprintf("Error reading %s %s", s3.ConfigPath, err)
+		slog.Warn("Error reading config file", "error", errorMsg)
 		return errors.New(errorMsg)
 	}
 
@@ -38,18 +40,18 @@ func (s3 *Config) ReadConfig(filename string, base_path string) (err error) {
 		err = isValidBucketName(b.Name)
 		if err != nil {
 			slog.Warn("Invalid bucket name", "bucket", b.Name, "error", err)
-			return errors.New(fmt.Sprintf("Invalid bucket name: %s", err))
+			return fmt.Errorf("invalid bucket name: %s", err)
 		}
 
 		// Check if the directory is relative
 		if b.Type == "fs" && !filepath.IsAbs(b.Pathname) {
-			s3.Buckets[k].Pathname = filepath.Join(base_path, b.Pathname)
+			s3.Buckets[k].Pathname = filepath.Join(s3.BasePath, b.Pathname)
 		}
 	}
 
 	if err != nil {
-		errorMsg := fmt.Sprintf("Error parsing %s %s", filename, err)
-		slog.Warn(errorMsg)
+		errorMsg := fmt.Sprintf("Error parsing %s %s", s3.ConfigPath, err)
+		slog.Warn("Error parsing config file", "error", errorMsg)
 		return errors.New(errorMsg)
 	}
 

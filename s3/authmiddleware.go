@@ -25,6 +25,82 @@ const (
 	ShortTimeFormat = "20060102"
 )
 
+// Permission map for methods mapped to actions
+// GET /<bucket>/<key> -> s3:GetObject
+// PUT /<bucket>/<key> -> s3:PutObject
+// DELETE /<bucket>/<key> -> s3:DeleteObject
+// POST /<bucket>/<key> -> s3:PutObject
+// GET /<bucket> -> s3:ListBucket
+// PUT /<bucket> -> s3:PutObject
+// GET / -> s3:ListBucket
+
+type Permissions struct {
+	GetObject    bool
+	PutObject    bool
+	DeleteObject bool
+	ListBucket   bool
+}
+type PermissionMap struct {
+	Method            string
+	Path              string
+	AllowPublicBucket bool
+	RequireAuth       bool
+	Permissions       Permissions
+}
+
+var permissionMap = []PermissionMap{
+	{
+		Method:            "GET",
+		Path:              "/bucket",
+		AllowPublicBucket: true,
+		RequireAuth:       false,
+		Permissions:       Permissions{GetObject: true},
+	},
+	{
+		Method:            "GET",
+		Path:              "/bucket/*",
+		AllowPublicBucket: true,
+		RequireAuth:       false,
+		Permissions:       Permissions{GetObject: true},
+	},
+
+	{
+		Method:            "HEAD",
+		Path:              "/bucket/*",
+		AllowPublicBucket: true,
+		RequireAuth:       false,
+		Permissions:       Permissions{GetObject: true},
+	},
+
+	{
+		Method:            "PUT",
+		Path:              "/bucket/*",
+		AllowPublicBucket: false,
+		RequireAuth:       true,
+		Permissions:       Permissions{PutObject: true},
+	},
+	{
+		Method:            "DELETE",
+		Path:              "/bucket/*",
+		AllowPublicBucket: false,
+		RequireAuth:       true,
+	},
+	{
+		Method:            "POST",
+		Path:              "/bucket/*",
+		AllowPublicBucket: false,
+		RequireAuth:       true,
+		Permissions:       Permissions{PutObject: true},
+	},
+	{
+		Method:            "GET",
+		Path:              "/",
+		AllowPublicBucket: true,
+		RequireAuth:       false,
+		Permissions:       Permissions{ListBucket: true},
+	},
+}
+
 // Utility function to generate AWS Signature V4 authorization header
 func GenerateAuthHeaderReq(accessKey, secretKey, timestamp, region, service string, req *http.Request) error {
 	// Get the date portion of the timestamp
@@ -108,12 +184,92 @@ func GenerateAuthHeaderReq(accessKey, secretKey, timestamp, region, service stri
 	return nil
 }
 
+func (s3 *Config) validatePublicBucketPolicy(bucket string) error {
+
+	// Loop through the buckets and check if the bucket has a public policy for public access
+	for _, v := range s3.Buckets {
+		if v.Name == bucket {
+			if v.Public {
+				return nil
+			}
+		}
+	}
+
+	return errors.New("NotPublicBucket")
+
+}
+
+func (s3 *Config) validatePublicBucketPermission(method, path string) error {
+
+	pathParts := strings.Split(path, "/")
+
+	// Lookup the permission map
+	for _, permission := range permissionMap {
+		slog.Debug("Checking permission", "method", permission.Method, "path", permission.Path)
+
+		if permission.AllowPublicBucket && permission.Method == method {
+
+			permissionMapPath := strings.Split(permission.Path, "/")
+			slog.Debug("Permission map path", "permissionMapPath", permissionMapPath, "len", len(permissionMapPath))
+			slog.Debug("Path parts", "pathParts", pathParts, "len", len(pathParts))
+
+			requestBucket := pathParts[1]
+
+			// Check if a bucket is specified, or root to ListBucket request
+			if len(permissionMapPath) == 2 && len(pathParts) == 2 && permission.AllowPublicBucket {
+
+				err := s3.validatePublicBucketPolicy(requestBucket)
+				if err != nil {
+					slog.Debug("Bucket does not have a public policy", "error", err)
+					return errors.New("AccessDenied")
+				}
+
+				slog.Debug("Allowing public bucket access for listing")
+				return nil
+			}
+
+			// Check if the bucket is public and a GET request for an object
+			if permission.AllowPublicBucket && len(permissionMapPath) == 3 && len(pathParts) >= 3 {
+				slog.Debug("Allowing public bucket access for object")
+				return nil
+			}
+
+			//break
+
+		}
+	}
+
+	return errors.New("AccessDenied")
+}
+
 func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
+
+	// Check route, if authentication is required
+	path := c.Path()
+	segments := strings.Split(path, "/")
+	fmt.Println("Segments", segments)
+
+	// Get the method
+	method := c.Method()
+	fmt.Println("Method", method)
+
+	// Lookup the permission map if route requires authentication
+
 	authHeader := c.Get("Authorization")
 
 	fmt.Println("Authorization header", authHeader)
 	slog.Debug("Authorization header", "authHeader", authHeader)
 
+	// Confirm if the requested resource is public
+	publicBucketAccess := s3.validatePublicBucketPermission(method, path)
+
+	// Allow public bucket access if no auth header is provided (--no-sign-request using the AWS CLI)
+	if publicBucketAccess == nil && authHeader == "" {
+		slog.Debug("Allowing public bucket access with no auth header")
+		return c.Next()
+	}
+
+	// If the resource is not public and no auth header is provided, return access denied
 	if authHeader == "" {
 		slog.Debug("Missing Authorization header")
 		return errors.New("AccessDenied")
@@ -253,7 +409,8 @@ func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
 		return errors.New("AccessDenied")
 	}
 
-	return nil
+	return c.Next()
+	//return nil
 }
 
 func hashSHA256(s string) string {

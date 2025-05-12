@@ -14,8 +14,10 @@ import (
 )
 
 func TestPutObject(t *testing.T) {
-	s3 := New()
-	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -58,9 +60,59 @@ func TestPutObject(t *testing.T) {
 	assert.Equal(t, testContent, content, "Uploaded content should match")
 }
 
+// Test put object to a private bucket, with no auth
+
+func TestPutObjectPublicBucketNoAuth(t *testing.T) {
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
+	assert.NoError(t, err, "Should read config without error")
+
+	// Setup Fiber app using SetupRoutes
+	app := s3.SetupRoutes()
+
+	// Create test content to upload
+	testContent := []byte("This is a test file created during unit testing")
+
+	// Make a PUT request
+	req := httptest.NewRequest("PUT", "/testbucket/test_upload.txt", bytes.NewReader(testContent))
+
+	resp, err := app.Test(req)
+
+	assert.NoError(t, err, "Request should not error")
+	assert.Equal(t, 403, resp.StatusCode, "Status code should be 403")
+
+}
+
+func TestPutObjectPrivateBucketNoAuth(t *testing.T) {
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
+	assert.NoError(t, err, "Should read config without error")
+
+	// Setup Fiber app using SetupRoutes
+	app := s3.SetupRoutes()
+
+	// Create test content to upload
+	testContent := []byte("This is a test file created during unit testing")
+
+	// Make a PUT request
+	req := httptest.NewRequest("PUT", "/private/test_upload.txt", bytes.NewReader(testContent))
+
+	resp, err := app.Test(req)
+
+	assert.NoError(t, err, "Request should not error")
+	assert.Equal(t, 403, resp.StatusCode, "Status code should be 403")
+
+}
+
 func TestPutObjectBinary(t *testing.T) {
-	s3 := New()
-	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -107,8 +159,10 @@ func TestPutObjectBinary(t *testing.T) {
 }
 
 func TestPutObjectInvalidBucket(t *testing.T) {
-	s3 := New()
-	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes

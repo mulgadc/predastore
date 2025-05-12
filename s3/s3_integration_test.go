@@ -37,8 +37,10 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	wg.Add(1)
 
 	// Create and configure the S3 server
-	s3server := New()
-	err := s3server.ReadConfig("./tests/config/server.toml", "")
+	s3server := New(&Config{
+		ConfigPath: "./tests/config/server.toml",
+	})
+	err := s3server.ReadConfig()
 	require.NoError(t, err, "Failed to read config file")
 
 	// Setup routes
@@ -86,8 +88,10 @@ func createS3Client(t *testing.T) *awss3.S3 {
 
 	// Create a new AWS session
 
-	s3client := New()
-	err := s3client.ReadConfig("./tests/config/server.toml", "")
+	s3client := New(&Config{
+		ConfigPath: "./tests/config/server.toml",
+	})
+	err := s3client.ReadConfig()
 	require.NoError(t, err, "Failed to read config file")
 
 	sess, err := session.NewSession(&aws.Config{

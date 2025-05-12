@@ -8,13 +8,16 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
 
 func TestGetObjectHead(t *testing.T) {
-	s3 := New()
-	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -39,9 +42,127 @@ func TestGetObjectHead(t *testing.T) {
 	assert.Empty(t, body, "HEAD response body should be empty")
 }
 
+func TestGetObjectNoBucketPermissions(t *testing.T) {
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
+	assert.NoError(t, err, "Should read config without error")
+
+	// Setup Fiber app using SetupRoutes
+	app := s3.SetupRoutes()
+
+	// Make a HEAD request
+	req := httptest.NewRequest("GET", "/private/note.txt", nil)
+
+	// Use our utility function to generate a valid authorization header
+	timestamp := time.Now().UTC().Format("20060102T150405Z")
+
+	err = GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, s3.Region, "s3", req)
+	assert.NoError(t, err, "Error generating auth header")
+
+	resp, err := app.Test(req)
+
+	assert.NoError(t, err, "Request should not error")
+	assert.Equal(t, 403, resp.StatusCode, "Status code should be 403")
+	// The response body should include the error message
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err, "Reading body should not error")
+
+	var s3error S3Error
+
+	err = xml.Unmarshal(body, &s3error)
+
+	assert.NoError(t, err, "XML parsing failed")
+
+	assert.Equal(t, s3error.Code, "AccessDenied", "Error message should indicate access denied")
+
+}
+
+func TestGetObjectBucketPermissions(t *testing.T) {
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
+	assert.NoError(t, err, "Should read config without error")
+
+	// Setup Fiber app using SetupRoutes
+	app := s3.SetupRoutes()
+
+	// Make a HEAD request
+	req := httptest.NewRequest("GET", "/private/note.txt", nil)
+
+	// Add authentication headers using the credentials from server.toml
+	if len(s3.Auth) > 0 {
+		// Use the first auth entry from the config
+		authEntry := s3.Auth[0]
+
+		// Use our utility function to generate a valid authorization header
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		assert.NoError(t, err, "Error generating auth header")
+	}
+
+	resp, err := app.Test(req)
+
+	assert.NoError(t, err, "Request should not error")
+	assert.Equal(t, 200, resp.StatusCode, "Status code should be 200")
+
+	// Check the content matches the file
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err, "Reading body should not error")
+
+	assert.Equal(t, "Hello World!\n", string(body), "File content should match")
+
+}
+
+// Test Get Object with auth header to public bucket
+func TestGetObjectPublicBucketAuthHeader(t *testing.T) {
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
+	assert.NoError(t, err, "Should read config without error")
+
+	// Setup Fiber app using SetupRoutes
+	app := s3.SetupRoutes()
+
+	// Make a GET request for the text file
+	req := httptest.NewRequest("GET", "/testbucket/test.txt", nil)
+
+	// Add authentication headers using the credentials from server.toml
+	if len(s3.Auth) > 0 {
+		// Use the first auth entry from the config
+		authEntry := s3.Auth[0]
+
+		// Use our utility function to generate a valid authorization header
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		assert.NoError(t, err, "Error generating auth header")
+	}
+
+	resp, err := app.Test(req)
+
+	assert.NoError(t, err, "Request should not error")
+	assert.Equal(t, 200, resp.StatusCode, "Status code should be 200")
+
+	// Check the content matches the file
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err, "Reading body should not error")
+
+	// Compare with actual file content
+	expected, err := os.ReadFile(filepath.Join("tests", "data", "testbucket", "test.txt"))
+	assert.NoError(t, err, "Reading test file should not error")
+	assert.Equal(t, expected, body, "File content should match")
+}
+
 func TestGetObject(t *testing.T) {
-	s3 := New()
-	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -65,8 +186,10 @@ func TestGetObject(t *testing.T) {
 }
 
 func TestGetObjectWithRange(t *testing.T) {
-	s3 := New()
-	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -97,8 +220,10 @@ func TestGetObjectWithRange(t *testing.T) {
 }
 
 func TestGetObjectNonExistent(t *testing.T) {
-	s3 := New()
-	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -113,8 +238,10 @@ func TestGetObjectNonExistent(t *testing.T) {
 }
 
 func TestGetInvalidBucket(t *testing.T) {
-	s3 := New()
-	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -142,8 +269,8 @@ func TestGetInvalidBucket(t *testing.T) {
 }
 
 func TestGetInvalidObjectKey(t *testing.T) {
-	s3 := New()
-	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	s3 := New(&Config{ConfigPath: filepath.Join("tests", "config", "server.toml")})
+	err := s3.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes

@@ -22,12 +22,17 @@ type S3_Buckets struct {
 }
 
 type Config struct {
+	ConfigPath            string       // Path to config file
 	Version               string       `toml:"version"`
 	Region                string       `toml:"region"`
 	Buckets               []S3_Buckets `toml:"buckets"`
 	Auth                  []AuthEntry  `toml:"auth"`
 	AllowAnonymousListing bool         `toml:"allow_anonymous_listing"`
 	AllowAnonymousAccess  bool         `toml:"allow_anonymous_access"`
+	Port                  int          `toml:"port"`
+	Host                  string       `toml:"host"`
+	Debug                 bool         `toml:"debug"`
+	BasePath              string       `toml:"base_path"`
 }
 
 // Authentication and policy
@@ -144,10 +149,6 @@ type S3Error struct {
 	HostId     string   `xml:"HostId"`
 }
 
-func New() *Config {
-
-	return &Config{
-		AllowAnonymousListing: false, // Default to not allow anonymous listing
-		AllowAnonymousAccess:  false, // Default to not allow anonymous access
-	}
+func New(ConfigSettings *Config) *Config {
+	return ConfigSettings
 }

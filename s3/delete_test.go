@@ -12,8 +12,10 @@ import (
 )
 
 func TestDeleteObject(t *testing.T) {
-	s3 := New()
-	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes
@@ -63,9 +65,53 @@ func TestDeleteObject(t *testing.T) {
 	assert.Equal(t, 204, resp.StatusCode, "Status code should be 204")
 }
 
+func TestDeleteObjectNoAuth(t *testing.T) {
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
+	assert.NoError(t, err, "Should read config without error")
+
+	// Setup Fiber app using SetupRoutes
+	app := s3.SetupRoutes()
+	// Send a delete request
+	req := httptest.NewRequest("DELETE", "/local/unknownfile.txt", nil)
+
+	resp, err := app.Test(req)
+
+	assert.NoError(t, err, "Request should not error")
+	assert.Equal(t, 403, resp.StatusCode, "Status code should be 403")
+}
+
+func TestDeleteObjectBadAuth(t *testing.T) {
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
+	assert.NoError(t, err, "Should read config without error")
+
+	// Setup Fiber app using SetupRoutes
+	app := s3.SetupRoutes()
+	// Send a delete request
+	req := httptest.NewRequest("DELETE", "/local/unknownfile.txt", nil)
+
+	// Use our utility function to generate a valid authorization header
+	timestamp := time.Now().UTC().Format("20060102T150405Z")
+
+	err = GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, s3.Region, "s3", req)
+	assert.NoError(t, err, "Error generating auth header")
+
+	resp, err := app.Test(req)
+
+	assert.NoError(t, err, "Request should not error")
+	assert.Equal(t, 403, resp.StatusCode, "Status code should be 403")
+}
+
 func TestDeleteObjectRemovePath(t *testing.T) {
-	s3 := New()
-	err := s3.ReadConfig(filepath.Join("tests", "config", "server.toml"), "")
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+	})
+	err := s3.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
 	// Setup Fiber app using SetupRoutes

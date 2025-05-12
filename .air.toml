@@ -4,7 +4,7 @@ tmp_dir = "tmp"
 
 [build]
   args_bin = []
-  bin = "./bin/s3d_test --port 8443 --config ./s3/tests/config/server.toml --base-path=./s3/"
+  bin = "./bin/s3d_test --port 8443 --config ./s3/tests/config/server.toml --base-path=./s3/ --debug"
   cmd = "go build -o ./bin/s3d_test cmd/s3d/main.go"
   delay = 1000
   exclude_dir = ["assets", "tmp", "vendor", "testdata"]

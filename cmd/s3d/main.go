@@ -13,14 +13,13 @@ import (
 
 func main() {
 
-	s3 := s3.New()
-
 	config := flag.String("config", "config/server.toml", "S3 server configuration file")
 	tls_key := flag.String("tls-key", "config/server.key", "Path to TLS key")
 	tls_cert := flag.String("tls-cert", "config/server.pem", "Path to TLS cert")
 	base_path := flag.String("base-path", "", "Base path for the S3 directory when undefined in the config file")
+	debug := flag.Bool("debug", false, "Enable verbose debug logs")
 	port := flag.Int("port", 443, "Server port")
-
+	host := flag.String("host", "0.0.0.0", "Server host")
 	flag.Parse()
 
 	// Env vars overwrite CLI options
@@ -40,7 +39,15 @@ func main() {
 		*port, _ = strconv.Atoi(os.Getenv("PORT"))
 	}
 
-	err := s3.ReadConfig(*config, *base_path)
+	s3 := s3.New(&s3.Config{
+		ConfigPath: *config,
+		Port:       *port,
+		Host:       *host,
+		Debug:      *debug,
+		BasePath:   *base_path,
+	})
+
+	err := s3.ReadConfig()
 
 	if err != nil {
 		slog.Warn("Error reading config file", "error", err)
@@ -48,8 +55,7 @@ func main() {
 	}
 
 	app := s3.SetupRoutes()
-	//log.Fatal(app.Listen(":3000"))
 
-	log.Fatal(app.ListenTLS(fmt.Sprintf(":%d", *port), *tls_cert, *tls_key))
+	log.Fatal(app.ListenTLS(fmt.Sprintf("%s:%d", *host, *port), *tls_cert, *tls_key))
 
 }

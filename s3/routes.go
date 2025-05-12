@@ -9,13 +9,23 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/google/uuid"
 )
 
 func (s3 *Config) SetupRoutes() *fiber.App {
 
+	var logLevel slog.Level
+
+	if s3.Debug {
+		logLevel = slog.LevelDebug
+	} else {
+		logLevel = slog.LevelInfo
+	}
+
 	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logLevel,
 	})
+
 	// Create a new logger with the custom handler
 	slogger := slog.New(handler)
 
@@ -38,56 +48,24 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 
 	app.Use(logger.New())
 
-	// Add logging middleware
 	/*
 		app.Use(logger.New(logger.Config{
 			Format: "[${ip}]:${port} ${status} - ${method} ${path}\n",
 		}))
 	*/
 
-	// Check if authentication is enabled in config
-	// (if there are auth entries in the config)
-	needsAuth := len(s3.Auth) > 0
-
-	// Map of endpoints that should have auth enabled
-	authEndpoints := map[string]bool{
-		// General bucket operations
-		"/":  true, // List buckets always requires auth
-		"/*": true, // Any direct root operation requires auth
-
-		// Protected endpoints for buckets
-		"/:bucket":   !s3.AllowAnonymousListing,
-		"/:bucket/*": !s3.AllowAnonymousAccess,
-	}
+	// Add authentication middleware for all requests
+	app.Use(s3.sigV4AuthMiddleware)
 
 	// List buckets
 	app.Get("/", func(c *fiber.Ctx) error {
-		// Apply auth middleware if needed
-		if needsAuth && authEndpoints["/"] {
-			if err := s3.sigV4AuthMiddleware(c); err != nil {
-				slog.Error("Authentication error", "error", err)
-				return err
-			}
-		}
+
 		return s3.ListBuckets(c)
 	})
 
 	// ListObjectsV2
 	app.Get("/:bucket<alpha>", func(c *fiber.Ctx) error {
 		bucket := c.Params("bucket")
-
-		// Check if bucket exists before checking auth
-		bucketConfig, err := s3.BucketConfig(bucket)
-		if err != nil {
-			return fmt.Errorf("NoSuchBucket: %w", err)
-		}
-
-		// Apply auth middleware for non-public buckets
-		if needsAuth && !bucketConfig.Public && authEndpoints["/:bucket"] {
-			if err := s3.sigV4AuthMiddleware(c); err != nil {
-				return err
-			}
-		}
 
 		return s3.ListObjectsV2Handler(bucket, c)
 	})
@@ -97,19 +75,6 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
 
-		// Check if bucket exists before checking auth
-		bucketConfig, err := s3.BucketConfig(bucket)
-		if err != nil {
-			return fmt.Errorf("NoSuchBucket: %w", err)
-		}
-
-		// Apply auth middleware for non-public buckets
-		if needsAuth && !bucketConfig.Public && authEndpoints["/:bucket/*"] {
-			if err := s3.sigV4AuthMiddleware(c); err != nil {
-				return err
-			}
-		}
-
 		return s3.GetObjectHead(bucket, file, c)
 	})
 
@@ -117,19 +82,6 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 	app.Get("/:bucket<alpha>/*", func(c *fiber.Ctx) error {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
-
-		// Check if bucket exists before checking auth
-		bucketConfig, err := s3.BucketConfig(bucket)
-		if err != nil {
-			return fmt.Errorf("NoSuchBucket: %w", err)
-		}
-
-		// Apply auth middleware for non-public buckets
-		if needsAuth && !bucketConfig.Public && authEndpoints["/:bucket/*"] {
-			if err := s3.sigV4AuthMiddleware(c); err != nil {
-				return err
-			}
-		}
 
 		return s3.GetObject(bucket, file, c)
 	})
@@ -139,30 +91,12 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
 
-		// Check if bucket exists before checking auth
-		_, err := s3.BucketConfig(bucket)
-		if err != nil {
-			return fmt.Errorf("NoSuchBucket: %w", err)
-		}
-
-		// Always require auth for PUT operations
-		if err := s3.sigV4AuthMiddleware(c); err != nil {
-			slog.Error("Authentication error", "error", err)
-			return err
-		}
-
 		return s3.PutObject(bucket, file, c)
 	})
 
 	app.Post("/:bucket<alpha>/*", func(c *fiber.Ctx) error {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
-
-		// Apply auth middleware for deletion
-		if err := s3.sigV4AuthMiddleware(c); err != nil {
-			slog.Error("Authentication error", "error", err)
-			return err
-		}
 
 		// Confirm if posting a multipart upload, or complete a multipart upload
 		if c.Query("uploadId") == "" {
@@ -178,15 +112,8 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 		file := c.Params("*")
 
 		fmt.Println("Deleting object", bucket, file)
-		// Apply auth middleware for deletion
-		if err := s3.sigV4AuthMiddleware(c); err != nil {
-			slog.Error("Authentication error", "error", err)
-			return err
-		}
 
 		return s3.DeleteObject(bucket, file, c)
-
-		//return nil
 
 	})
 
@@ -242,7 +169,8 @@ func (s3 *Config) ErrorHandler(ctx *fiber.Ctx, err error) error {
 	}
 
 	// Add request ID and host ID
-	s3error.RequestId = ctx.GetRespHeader("x-amz-request-id", "00000000-0000-0000-0000-000000000000")
+
+	s3error.RequestId = ctx.GetRespHeader("x-amz-request-id", uuid.NewString())
 	s3error.HostId = ctx.Hostname()
 
 	// Set standard S3 error response headers
