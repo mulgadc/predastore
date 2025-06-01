@@ -12,8 +12,6 @@ import (
 
 func (s3 *Config) ReadConfig() (err error) {
 
-	fmt.Println("ReadConfig", s3)
-
 	if !filepath.IsAbs(s3.BasePath) {
 		dir, err := os.Getwd()
 		if err != nil {

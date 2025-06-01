@@ -33,6 +33,7 @@ type Config struct {
 	Host                  string       `toml:"host"`
 	Debug                 bool         `toml:"debug"`
 	BasePath              string       `toml:"base_path"`
+	DisableLogging        bool         `toml:"disable_logging"`
 }
 
 // Authentication and policy

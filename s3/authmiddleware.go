@@ -246,18 +246,15 @@ func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
 
 	// Check route, if authentication is required
 	path := c.Path()
-	segments := strings.Split(path, "/")
-	fmt.Println("Segments", segments)
+	//segments := strings.Split(path, "/")
 
 	// Get the method
 	method := c.Method()
-	fmt.Println("Method", method)
 
 	// Lookup the permission map if route requires authentication
 
 	authHeader := c.Get("Authorization")
 
-	fmt.Println("Authorization header", authHeader)
 	slog.Debug("Authorization header", "authHeader", authHeader)
 
 	// Confirm if the requested resource is public

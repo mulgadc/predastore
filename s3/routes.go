@@ -18,6 +18,8 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 
 	if s3.Debug {
 		logLevel = slog.LevelDebug
+	} else if s3.DisableLogging {
+		logLevel = slog.LevelError
 	} else {
 		logLevel = slog.LevelInfo
 	}
@@ -33,9 +35,12 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 	slog.SetDefault(slogger)
 
 	// Configure slog for logging
-	//slog.New(slog.NewTextHandler(os.Stdout, nil))
+	slog.New(slog.NewTextHandler(os.Stdout, nil))
 
 	app := fiber.New(fiber.Config{
+
+		// Disable the startup banner
+		DisableStartupMessage: s3.DisableLogging,
 
 		// Set the body limit for S3 specs to 5GiB
 		BodyLimit: 5 * 1024 * 1024 * 1024,
@@ -46,7 +51,9 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 		}},
 	)
 
-	app.Use(logger.New())
+	if !s3.DisableLogging {
+		app.Use(logger.New())
+	}
 
 	/*
 		app.Use(logger.New(logger.Config{
