@@ -9,6 +9,7 @@ import (
 	"strconv"
 
 	"github.com/mulgadc/predastore/s3"
+	"go.uber.org/automaxprocs/maxprocs"
 )
 
 func main() {
@@ -47,7 +48,15 @@ func main() {
 		BasePath:   *base_path,
 	})
 
-	err := s3.ReadConfig()
+	// Adjust MAXPROCS if running under linux/cgroups quotas.
+	undo, err := maxprocs.Set(maxprocs.Logger(log.Printf))
+	if err != nil {
+		log.Printf("Failed to set GOMAXPROCS: %v", err)
+	} else {
+		defer undo()
+	}
+
+	err = s3.ReadConfig()
 
 	if err != nil {
 		slog.Warn("Error reading config file", "error", err)
