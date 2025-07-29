@@ -55,11 +55,11 @@ Apache 2.0 License. See LICENSE for details.
 List files
 
 ```
-aws --no-verify-ssl --endpoint-url https://localhost/ s3 ls s3://downloads/
+aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 ls s3://downloads/
 ```
 
 Get file
 
 ```
-aws --endpoint-url http://localhost:3000/ s3 cp s3://downloads/ubuntu-22.04.2-desktop-amd64.iso /tmp/ubuntu.iso
+aws --endpoint-url https://localhost:8443/ s3 cp s3://downloads/ubuntu-22.04.2-desktop-amd64.iso /tmp/ubuntu.iso
 ```

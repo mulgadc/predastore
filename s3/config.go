@@ -45,6 +45,11 @@ func (s3 *Config) ReadConfig() (err error) {
 		if b.Type == "fs" && !filepath.IsAbs(b.Pathname) {
 			s3.Buckets[k].Pathname = filepath.Join(s3.BasePath, b.Pathname)
 		}
+
+		// Check if the directory exists, otherwise create it
+		if _, err := os.Stat(s3.Buckets[k].Pathname); os.IsNotExist(err) {
+			os.MkdirAll(s3.Buckets[k].Pathname, 0750)
+		}
 	}
 
 	if err != nil {
