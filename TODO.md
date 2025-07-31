@@ -12,4 +12,5 @@
 - [x] Improve validation for bucket and object keys
 - Add unit tests for testing put/get/list/delete without the correct permission set.
 - Add support for auth header to correctly detect session > 15mins and invalidate.
-- Support checksum CRC32/crc64nvme and other common checksums used
+- Support checksum CRC32/crc64nvme and other common checksums used for functions such as `cp` and multi-part uploads.
+- Add support for S3 bucket delete
