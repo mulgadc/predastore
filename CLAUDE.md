@@ -31,6 +31,37 @@ make docker         # Build Docker images
 make clean          # Clean build artifacts (removes ./bin/s3d)
 ```
 
+### **MANDATORY: Unit Testing Requirements**
+
+**⚠️ CRITICAL: Always run unit tests before any commit or push operation.**
+
+```bash
+# REQUIRED before any git commit or push
+make test           # Must pass with zero failures (uses LOG_IGNORE=1)
+
+# Example workflow:
+make test                    # Verify all tests pass (authentication, S3 API, validation)
+git add .                    # Stage changes
+git commit -m "..."          # Only after tests pass
+git push origin main         # Only after tests pass
+```
+
+**Testing Policy:**
+- **All unit tests MUST pass** before committing changes
+- **No exceptions** - failing tests block commits
+- Tests include S3 API compatibility, AWS Signature V4 authentication, and bucket operations
+- Tests must complete without errors, panics, or authentication failures
+- Use `make test` which runs with `LOG_IGNORE=1` to suppress test logs
+- If tests fail, fix issues before proceeding with git operations
+
+**Test Coverage:**
+- S3 API handlers (GET, PUT, DELETE, HEAD operations)
+- AWS Signature V4 authentication and authorization
+- Bucket and object validation (naming, permissions)
+- Integration tests with real S3 client interactions
+- Multipart upload functionality
+- Error handling and edge cases
+
 ### Docker Commands
 ```bash
 make docker_s3d                 # Build predastore Docker image
