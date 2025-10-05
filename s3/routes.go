@@ -62,7 +62,7 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 	*/
 
 	// Add authentication middleware for all requests
-	app.Use(s3.sigV4AuthMiddleware)
+	app.Use(s3.SigV4AuthMiddleware)
 
 	// List buckets
 	app.Get("/", func(c *fiber.Ctx) error {

@@ -242,7 +242,7 @@ func (s3 *Config) validatePublicBucketPermission(method, path string) error {
 	return errors.New("AccessDenied")
 }
 
-func (s3 *Config) sigV4AuthMiddleware(c *fiber.Ctx) error {
+func (s3 *Config) SigV4AuthMiddleware(c *fiber.Ctx) error {
 
 	// Check route, if authentication is required
 	path := c.Path()

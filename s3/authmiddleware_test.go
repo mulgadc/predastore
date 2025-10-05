@@ -174,7 +174,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				}})
 
 			// Add middleware and test endpoint
-			app.Use(s3Config.sigV4AuthMiddleware)
+			app.Use(s3Config.SigV4AuthMiddleware)
 			app.All("*", func(c *fiber.Ctx) error {
 
 				return c.SendString("Request authenticated")
