@@ -26,7 +26,7 @@ func (s3 *Config) ListBuckets(c *fiber.Ctx) error {
 		dir, err := os.Stat(b.Pathname)
 
 		if err != nil {
-			slog.Warn(fmt.Sprintf("Could not determine bucket path from config", "dir", dir, "err", err))
+			slog.Warn("Could not determine bucket path from config", "dir", dir, "err", err)
 
 			break
 		}
