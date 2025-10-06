@@ -49,8 +49,10 @@ func TestListBuckets(t *testing.T) {
 	// Verify the response contains our test bucket
 	assert.Equal(t, len(result.Buckets), 5, "Should have 4 buckets")
 
+	t.Log("Buckets", result.Buckets)
+
 	if len(result.Buckets) == 5 {
-		assert.Equal(t, result.Buckets[0].Name, "testbucket", "Test bucket should be in the list")
+		assert.Equal(t, result.Buckets[0].Name, "test-bucket01", "Test bucket should be in the list")
 		assert.Equal(t, result.Buckets[1].Name, "private", "Private bucket should be in the list")
 		assert.Equal(t, result.Buckets[2].Name, "secure", "Secure bucket should be in the list")
 		assert.Equal(t, result.Buckets[3].Name, "local", "Local bucket should be in the list")
@@ -91,7 +93,7 @@ func TestListObjectsV2Handler(t *testing.T) {
 	app := s3.SetupRoutes()
 
 	// Make a request to list objects in the test bucket
-	req := httptest.NewRequest("GET", "/testbucket", nil)
+	req := httptest.NewRequest("GET", "/test-bucket01", nil)
 
 	// Add auth for non-public buckets (testbucket is public, but adding auth won't hurt)
 	if len(s3.Auth) > 0 {
@@ -117,7 +119,7 @@ func TestListObjectsV2Handler(t *testing.T) {
 	assert.NoError(t, err, "XML parsing should not error")
 
 	// Verify response
-	assert.Equal(t, "testbucket", result.Name, "Bucket name should match")
+	assert.Equal(t, "test-bucket01", result.Name, "Bucket name should match")
 	assert.NotNil(t, result.Contents, "Contents should not be nil")
 
 	// Check that our test files are in the results
@@ -210,7 +212,7 @@ func TestListObjectsV2HandlerPublicBucketNoAuth(t *testing.T) {
 	app := s3.SetupRoutes()
 
 	// Make a request to list objects in the test bucket
-	req := httptest.NewRequest("GET", "/testbucket", nil)
+	req := httptest.NewRequest("GET", "/test-bucket01", nil)
 
 	resp, err := app.Test(req)
 
@@ -247,7 +249,7 @@ func TestListObjectsWithPrefix(t *testing.T) {
 	app := s3.SetupRoutes()
 
 	// Make a request to list objects with prefix
-	req := httptest.NewRequest("GET", "/testbucket?prefix=test", nil)
+	req := httptest.NewRequest("GET", "/test-bucket01?prefix=test", nil)
 
 	// Add auth for non-public buckets (testbucket is public, but adding auth won't hurt)
 	if len(s3.Auth) > 0 {
@@ -273,7 +275,7 @@ func TestListObjectsWithPrefix(t *testing.T) {
 	assert.NoError(t, err, "XML parsing should not error")
 
 	// Verify only test.txt is in the response
-	assert.Equal(t, "testbucket", result.Name, "Bucket name should match")
+	assert.Equal(t, "test-bucket01", result.Name, "Bucket name should match")
 	assert.Equal(t, "test", result.Prefix, "Prefix should match")
 
 	if result.Contents != nil {

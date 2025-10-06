@@ -31,15 +31,21 @@ func (s3 *Config) ReadConfig() (err error) {
 
 	err = toml.Unmarshal(config, &s3)
 
+	var validBuckets = []S3_Buckets{}
+
 	// Loop through the buckets, if a directory is relative, add the base path
 	for k, b := range s3.Buckets {
 
 		// Check if the bucket name is valid
-		err = isValidBucketName(b.Name)
+		err := isValidBucketName(b.Name)
 		if err != nil {
 			slog.Warn("Invalid bucket name", "bucket", b.Name, "error", err)
-			return fmt.Errorf("invalid bucket name: %s", err)
+			continue
+			//return fmt.Errorf("invalid bucket name: %s", err)
 		}
+
+		// Add to our valid buckets
+		validBuckets = append(validBuckets, s3.Buckets[k])
 
 		// Check if the directory is relative
 		if b.Type == "fs" && !filepath.IsAbs(b.Pathname) {
@@ -57,6 +63,9 @@ func (s3 *Config) ReadConfig() (err error) {
 		slog.Warn("Error parsing config file", "error", errorMsg)
 		return errors.New(errorMsg)
 	}
+
+	// Replace config with our valid buckets
+	s3.Buckets = validBuckets
 
 	return nil
 }

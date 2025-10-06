@@ -34,7 +34,7 @@ func isValidBucketName(bucket string) error {
 	// Bucket names can consist only of lowercase letters, numbers, periods (.), and hyphens (-).
 	validBucket := regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`)
 	if !validBucket.MatchString(bucket) {
-		return errors.New("bucket name must consist of lowercase letters, numbers, periods (.), and hyphens (-)")
+		return errors.New("bucket name must consist of lowercase letters, numbers, periods (.), and hyphens (-) and must begin and end with a letter or number")
 	}
 
 	// Bucket names must not contain two adjacent periods.

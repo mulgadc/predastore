@@ -25,7 +25,7 @@ import (
 const (
 	S3_ENDPOINT     = "https://localhost:8443"
 	S3_REGION       = "ap-southeast-2"
-	S3_BUCKET       = "testbucket"
+	S3_BUCKET       = "test-bucket01"
 	TEXT_FILE_SHA   = "8a71e72cef7867d59c08ee233df6d2b7c35369734d0b6dae702857176a1d69f8"
 	BINARY_FILE_SHA = "ce9d16a33fc9a53f592206c0cd23497632e78d3f6219dcd077ec9a11f50e6e4e"
 )
@@ -173,7 +173,7 @@ func TestS3Integration(t *testing.T) {
 		assert.NoError(t, err, "Reading text file should not error")
 		textResult.Body.Close()
 
-		expectedText, err := os.ReadFile("./tests/data/testbucket/test.txt")
+		expectedText, err := os.ReadFile("./tests/data/test-bucket01/test.txt")
 		assert.NoError(t, err, "Reading local text file should not error")
 		assert.Equal(t, expectedText, textBytes, "Text file content should match")
 
@@ -188,7 +188,7 @@ func TestS3Integration(t *testing.T) {
 		assert.NoError(t, err, "Reading binary file should not error")
 		binaryResult.Body.Close()
 
-		expectedBinary, err := os.ReadFile("./tests/data/testbucket/binary.dat")
+		expectedBinary, err := os.ReadFile("./tests/data/test-bucket01/binary.dat")
 		assert.NoError(t, err, "Reading local binary file should not error")
 		assert.Equal(t, expectedBinary, binaryBytes, "Binary file content should match")
 	})
@@ -287,7 +287,7 @@ func TestByteRangeRequests(t *testing.T) {
 	client := &http.Client{Transport: tr}
 
 	// Get the full text file content for comparison
-	fullText, err := os.ReadFile("./tests/data/testbucket/test.txt")
+	fullText, err := os.ReadFile("./tests/data/test-bucket01/test.txt")
 	require.NoError(t, err, "Reading text file should not error")
 
 	// Test range request

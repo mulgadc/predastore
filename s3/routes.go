@@ -71,14 +71,14 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 	})
 
 	// ListObjectsV2
-	app.Get("/:bucket<alpha>", func(c *fiber.Ctx) error {
+	app.Get(`/:bucket<regex([a-z0-9-.]+)>`, func(c *fiber.Ctx) error {
 		bucket := c.Params("bucket")
 
 		return s3.ListObjectsV2Handler(bucket, c)
 	})
 
 	// GetObject (HEAD)
-	app.Head("/:bucket<alpha>/*", func(c *fiber.Ctx) error {
+	app.Head(`/:bucket<regex([a-z0-9-.]+)>/*`, func(c *fiber.Ctx) error {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
 
@@ -86,7 +86,7 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 	})
 
 	// GetObject (GET, BODY)
-	app.Get("/:bucket<alpha>/*", func(c *fiber.Ctx) error {
+	app.Get(`/:bucket<regex([a-z0-9-.]+)>/*`, func(c *fiber.Ctx) error {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
 
@@ -94,14 +94,14 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 	})
 
 	// PutObject (PUT)
-	app.Put("/:bucket<alpha>/*", func(c *fiber.Ctx) error {
+	app.Put(`/:bucket<regex([a-z0-9-.]+)>/*`, func(c *fiber.Ctx) error {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
 
 		return s3.PutObject(bucket, file, c)
 	})
 
-	app.Post("/:bucket<alpha>/*", func(c *fiber.Ctx) error {
+	app.Post(`/:bucket<regex([a-z0-9-.]+)>/*`, func(c *fiber.Ctx) error {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
 
@@ -114,7 +114,7 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 	})
 
 	// DeleteObject
-	app.Delete("/:bucket<alpha>/*", func(c *fiber.Ctx) error {
+	app.Delete(`/:bucket<regex([a-z0-9-.]+)>/*`, func(c *fiber.Ctx) error {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
 

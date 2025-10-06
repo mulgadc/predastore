@@ -81,13 +81,13 @@ func TestIsValidBucketName(t *testing.T) {
 		{
 			name:   "Invalud bucket name emoji",
 			bucket: "my-bucket-👩‍💻-♗",
-			want:   errors.New("bucket name must consist of lowercase letters, numbers, periods (.), and hyphens (-)"),
+			want:   errors.New("bucket name must consist of lowercase letters, numbers, periods (.), and hyphens (-) and must begin and end with a letter or number"),
 		},
 
 		{
 			name:   "Valid bucket name",
 			bucket: "my-bucket-WITH-UPPERCASE-LETTERS",
-			want:   errors.New("bucket name must consist of lowercase letters, numbers, periods (.), and hyphens (-)"),
+			want:   errors.New("bucket name must consist of lowercase letters, numbers, periods (.), and hyphens (-) and must begin and end with a letter or number"),
 		},
 
 		// Test < 3 characters fails
@@ -108,7 +108,7 @@ func TestIsValidBucketName(t *testing.T) {
 		{
 			name:   "Invalid characters",
 			bucket: "my-bucket*",
-			want:   errors.New("bucket name must consist of lowercase letters, numbers, periods (.), and hyphens (-)"),
+			want:   errors.New("bucket name must consist of lowercase letters, numbers, periods (.), and hyphens (-) and must begin and end with a letter or number"),
 		},
 
 		// Test .. fails

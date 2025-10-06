@@ -24,7 +24,7 @@ func TestGetObjectHead(t *testing.T) {
 	app := s3.SetupRoutes()
 
 	// Make a HEAD request
-	req := httptest.NewRequest("HEAD", "/testbucket/test.txt", nil)
+	req := httptest.NewRequest("HEAD", "/test-bucket01/test.txt", nil)
 	resp, err := app.Test(req)
 
 	assert.NoError(t, err, "Request should not error")
@@ -129,7 +129,7 @@ func TestGetObjectPublicBucketAuthHeader(t *testing.T) {
 	app := s3.SetupRoutes()
 
 	// Make a GET request for the text file
-	req := httptest.NewRequest("GET", "/testbucket/test.txt", nil)
+	req := httptest.NewRequest("GET", "/test-bucket01/test.txt", nil)
 
 	// Add authentication headers using the credentials from server.toml
 	if len(s3.Auth) > 0 {
@@ -153,7 +153,7 @@ func TestGetObjectPublicBucketAuthHeader(t *testing.T) {
 	assert.NoError(t, err, "Reading body should not error")
 
 	// Compare with actual file content
-	expected, err := os.ReadFile(filepath.Join("tests", "data", "testbucket", "test.txt"))
+	expected, err := os.ReadFile(filepath.Join("tests", "data", "test-bucket01", "test.txt"))
 	assert.NoError(t, err, "Reading test file should not error")
 	assert.Equal(t, expected, body, "File content should match")
 }
@@ -169,7 +169,7 @@ func TestGetObject(t *testing.T) {
 	app := s3.SetupRoutes()
 
 	// Make a GET request for the text file
-	req := httptest.NewRequest("GET", "/testbucket/test.txt", nil)
+	req := httptest.NewRequest("GET", "/test-bucket01/test.txt", nil)
 	resp, err := app.Test(req)
 
 	assert.NoError(t, err, "Request should not error")
@@ -180,7 +180,7 @@ func TestGetObject(t *testing.T) {
 	assert.NoError(t, err, "Reading body should not error")
 
 	// Compare with actual file content
-	expected, err := os.ReadFile(filepath.Join("tests", "data", "testbucket", "test.txt"))
+	expected, err := os.ReadFile(filepath.Join("tests", "data", "test-bucket01", "test.txt"))
 	assert.NoError(t, err, "Reading test file should not error")
 	assert.Equal(t, expected, body, "File content should match")
 }
@@ -196,7 +196,7 @@ func TestGetObjectWithRange(t *testing.T) {
 	app := s3.SetupRoutes()
 
 	// Make a GET request with a Range header
-	req := httptest.NewRequest("GET", "/testbucket/test.txt", nil)
+	req := httptest.NewRequest("GET", "/test-bucket01/test.txt", nil)
 	req.Header.Set("Range", "bytes=0-9") // Get the first 10 bytes
 	resp, err := app.Test(req)
 
@@ -208,7 +208,7 @@ func TestGetObjectWithRange(t *testing.T) {
 	assert.NoError(t, err, "Reading body should not error")
 
 	// Compare with actual file content range
-	expectedFile, err := os.ReadFile(filepath.Join("tests", "data", "testbucket", "test.txt"))
+	expectedFile, err := os.ReadFile(filepath.Join("tests", "data", "test-bucket01", "test.txt"))
 	assert.NoError(t, err, "Reading test file should not error")
 
 	expected := expectedFile[:10]
@@ -230,7 +230,7 @@ func TestGetObjectNonExistent(t *testing.T) {
 	app := s3.SetupRoutes()
 
 	// Make a GET request for a non-existent file
-	req := httptest.NewRequest("GET", "/testbucket/nonexistent.txt", nil)
+	req := httptest.NewRequest("GET", "/test-bucket01/nonexistent.txt", nil)
 	resp, err := app.Test(req)
 
 	assert.NoError(t, err, "Request should complete without error")
@@ -277,7 +277,7 @@ func TestGetInvalidObjectKey(t *testing.T) {
 	app := s3.SetupRoutes()
 
 	// Make a request to list objects in the test bucket with an invalid key
-	req := httptest.NewRequest("GET", fmt.Sprintf("/testbucket/%s", string([]byte{0x80, 0x80})), nil)
+	req := httptest.NewRequest("GET", fmt.Sprintf("/test-bucket01/%s", string([]byte{0x80, 0x80})), nil)
 	resp, err := app.Test(req)
 
 	assert.NoError(t, err, "Request should not error")

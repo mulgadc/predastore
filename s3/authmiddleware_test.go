@@ -24,7 +24,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				SecretAccessKey: "TESTSECRETKEY",
 				Policy: []PolicyRule{
 					{
-						Bucket:  "testbucket",
+						Bucket:  "test-bucket01",
 						Actions: []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:ListObjects"},
 					},
 				},
@@ -45,7 +45,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 		{
 			name:   "No Auth Header",
 			method: "GET",
-			path:   "/testbucket",
+			path:   "/test-bucket01",
 			setupHeaders: func(req *http.Request) {
 				// No auth header
 			},
@@ -57,7 +57,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 		{
 			name:   "Valid Signature",
 			method: "GET",
-			path:   "/testbucket",
+			path:   "/test-bucket01",
 			setupHeaders: func(req *http.Request) {
 				// Use our utility function to generate a valid authorization header
 				timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -84,7 +84,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 		{
 			name:   "Valid Signature Wrong Region",
 			method: "GET",
-			path:   "/testbucket",
+			path:   "/test-bucket01",
 			setupHeaders: func(req *http.Request) {
 				// Use our utility function to generate a valid authorization header
 				timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -111,7 +111,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 		{
 			name:   "Invalid Access Key",
 			method: "GET",
-			path:   "/testbucket",
+			path:   "/test-bucket01",
 			setupHeaders: func(req *http.Request) {
 				timestamp := time.Now().UTC().Format("20060102T150405Z")
 
@@ -136,7 +136,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 		{
 			name:   "Invalid Signature",
 			method: "GET",
-			path:   "/testbucket",
+			path:   "/test-bucket01",
 			setupHeaders: func(req *http.Request) {
 				timestamp := time.Now().UTC().Format("20060102T150405Z")
 

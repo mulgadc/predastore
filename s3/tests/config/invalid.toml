@@ -12,40 +12,54 @@ region = "ap-southeast-2"
 # Optionally configure base-path if full directory path not defined for "fs" buckets
 # base_path = "/home/predastore/data/"
 
+# Invalid bucket name ([a-z0-9-.])
 [[buckets]]
-name = "test-bucket01"
+name = "INVALIDNAME"
 region = "ap-southeast-2"
 type = "fs"
-pathname = "tests/data/test-bucket01"
-public = true
-encryption = ""
-
-[[buckets]]
-name = "private"
-region = "ap-southeast-2"
-type = "fs"
-pathname = "tests/data/private"
+pathname = "tests/data/predastore"
 public = false
 encryption = ""
 
+# Invalid bucket name < 3 chars
 [[buckets]]
-name = "secure"
+name = "hi"
 region = "ap-southeast-2"
 type = "fs"
-pathname = "tests/data/secure"
+pathname = "tests/data/predastore"
 public = false
 encryption = ""
 
+# Invalid bucket name > 63 chars
 [[buckets]]
-name = "local"
+name = "1111111111111111111111111111111111111111111111111111111111111111"
 region = "ap-southeast-2"
 type = "fs"
-pathname = "tests/data/local"
+pathname = "tests/data/predastore"
 public = false
 encryption = ""
 
+# Invalid bucket name contains _ chars
 [[buckets]]
-name = "predastore"
+name = "invalid_characters"
+region = "ap-southeast-2"
+type = "fs"
+pathname = "tests/data/predastore"
+public = false
+encryption = ""
+
+# Invalid bucket name contains _ chars
+[[buckets]]
+name = "bad^bucket;'"
+region = "ap-southeast-2"
+type = "fs"
+pathname = "tests/data/predastore"
+public = false
+encryption = ""
+
+# Invalid bucket must end in a-z0-9
+[[buckets]]
+name = "badbucket-"
 region = "ap-southeast-2"
 type = "fs"
 pathname = "tests/data/predastore"

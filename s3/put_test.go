@@ -27,7 +27,7 @@ func TestPutObject(t *testing.T) {
 	testContent := []byte("This is a test file created during unit testing")
 
 	// Make a PUT request
-	req := httptest.NewRequest("PUT", "/testbucket/test_upload.txt", bytes.NewReader(testContent))
+	req := httptest.NewRequest("PUT", "/test-bucket01/test_upload.txt", bytes.NewReader(testContent))
 
 	// Add authentication headers using the credentials from server.toml
 	if len(s3.Auth) > 0 {
@@ -76,7 +76,7 @@ func TestPutObjectPublicBucketNoAuth(t *testing.T) {
 	testContent := []byte("This is a test file created during unit testing")
 
 	// Make a PUT request
-	req := httptest.NewRequest("PUT", "/testbucket/test_upload.txt", bytes.NewReader(testContent))
+	req := httptest.NewRequest("PUT", "/test-bucket01/test_upload.txt", bytes.NewReader(testContent))
 
 	resp, err := app.Test(req)
 
@@ -125,7 +125,7 @@ func TestPutObjectBinary(t *testing.T) {
 	}
 
 	// Make a PUT request
-	req := httptest.NewRequest("PUT", "/testbucket/test_binary_upload.dat", bytes.NewReader(testContent))
+	req := httptest.NewRequest("PUT", "/test-bucket01/test_binary_upload.dat", bytes.NewReader(testContent))
 
 	// Add authentication headers using the credentials from server.toml
 	if len(s3.Auth) > 0 {
