@@ -53,6 +53,28 @@ func TestBucketConfig(t *testing.T) {
 	assert.Error(t, err, "Should return error for nonexistent bucket")
 }
 
+func TestBasePathConfig(t *testing.T) {
+
+	tmpDir := t.TempDir()
+
+	s3 := New(&Config{
+		ConfigPath: filepath.Join("tests", "config", "server.toml"),
+		BasePath:   tmpDir,
+	})
+	err := s3.ReadConfig()
+	assert.NoError(t, err, "Should read config without error")
+
+	bucket, err := s3.BucketConfig("test-bucket01")
+	assert.NoError(t, err, "Should find bucket")
+	assert.Equal(t, "test-bucket01", bucket.Name, "Bucket name should match")
+
+	_, err = s3.BucketConfig("nonexistent")
+	assert.Error(t, err, "Should return error for nonexistent bucket")
+
+	assert.Contains(t, bucket.Pathname, tmpDir, "Path should contain base path")
+
+}
+
 func TestReadInvalidConfig(t *testing.T) {
 	s3 := New(&Config{ConfigPath: filepath.Join("tests", "config", "invalid.toml")})
 	err := s3.ReadConfig()

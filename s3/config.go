@@ -44,9 +44,6 @@ func (s3 *Config) ReadConfig() (err error) {
 			//return fmt.Errorf("invalid bucket name: %s", err)
 		}
 
-		// Add to our valid buckets
-		validBuckets = append(validBuckets, s3.Buckets[k])
-
 		// Check if the directory is relative
 		if b.Type == "fs" && !filepath.IsAbs(b.Pathname) {
 			s3.Buckets[k].Pathname = filepath.Join(s3.BasePath, b.Pathname)
@@ -56,6 +53,10 @@ func (s3 *Config) ReadConfig() (err error) {
 		if _, err := os.Stat(s3.Buckets[k].Pathname); os.IsNotExist(err) {
 			os.MkdirAll(s3.Buckets[k].Pathname, 0750)
 		}
+
+		// Add to our valid buckets
+		validBuckets = append(validBuckets, s3.Buckets[k])
+
 	}
 
 	if err != nil {
