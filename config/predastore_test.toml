@@ -1,0 +1,50 @@
+# Test configuration file for predastore unit and integration tests
+version = "1.0"
+region = "us-east-1"
+
+# Test server configuration
+host = "127.0.0.1"
+port = 18443  # Different port from production to avoid conflicts
+
+# Enable verbose debugging for tests
+debug = true
+
+# Disable logging to keep test output clean
+disable_logging = true
+
+# Base path will be set programmatically to a temp directory in tests
+# base_path = "/tmp/predastore-test"
+
+# Test bucket configuration
+[[buckets]]
+name = "test-bucket"
+region = "us-east-1"
+type = "fs"
+pathname = "test-data"  # Will be prefixed with temp directory in tests
+public = false
+encryption = ""
+
+[[buckets]]
+name = "public-bucket"
+region = "us-east-1"
+type = "fs"
+pathname = "test-public"
+public = true
+encryption = ""
+
+# Valid test authentication credentials
+[[auth]]
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+policy = [
+  { bucket = "test-bucket", actions = ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListAllMyBuckets"] },
+  { bucket = "public-bucket", actions = ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"] },
+]
+
+# Secondary valid credentials with limited permissions
+[[auth]]
+access_key_id = "AKIATESTUSERREADONLY"
+secret_access_key = "testSecretKeyReadOnly123456789EXAMPLE"
+policy = [
+  { bucket = "test-bucket", actions = ["s3:ListBucket", "s3:GetObject"] },
+]

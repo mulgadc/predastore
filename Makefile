@@ -1,5 +1,29 @@
 GO_PROJECT_NAME := s3d
 
+# Where to install Go tools
+GOBIN ?= $(shell go env GOBIN)
+ifeq ($(GOBIN),)
+  GOBIN := $(shell go env GOPATH)/bin
+endif
+
+GOVULNCHECK := $(GOBIN)/govulncheck
+
+# Install govulncheck only if the binary is missing / out of date
+$(GOVULNCHECK):
+	go install golang.org/x/vuln/cmd/govulncheck@latest
+
+GOSECCHECK := $(GOBIN)/gosec
+
+# Install gosec only if the binary is missing / out of date
+$(GOSECCHECK):
+	go install github.com/securego/gosec/v2/cmd/gosec@latest
+
+GOSTATICCHECK := $(GOBIN)/staticcheck
+
+# Install govulncheck only if the binary is missing / out of date
+$(GOSTATICCHECK):
+	go install honnef.co/go/tools/cmd/staticcheck@latest
+
 build:
 	$(MAKE) go_build
 
@@ -19,9 +43,10 @@ go_run:
 	@echo "\n....Running $(GO_PROJECT_NAME)...."
 	$(GOPATH)/bin/$(GO_PROJECT_NAME)
 
-test:
+test: $(GOVULNCHECK)
 	@echo "\n....Running tests for $(GO_PROJECT_NAME)...."
 	LOG_IGNORE=1 go test -v ./...
+	$(GOVULNCHECK) ./...
 
 bench:
 	@echo "\n....Running benchmarks for $(GO_PROJECT_NAME)...."
@@ -61,4 +86,19 @@ run:
 clean:
 	rm ./bin/s3d
 
-.PHONY: go_build go_run build run test docker
+security: $(GOVULNCHECK) $(GOSECCHECK) $(GOSTATICCHECK)
+	@echo "\n....Running security checks for $(GO_PROJECT_NAME)...."
+
+	$(GOVULNCHECK) ./... > tests/govulncheck-report.txt || true
+	@echo "Govulncheck report saved to tests/govulncheck-report.txt"
+
+	$(GOSECCHECK) ./... > tests/gosec-report.txt || true
+	@echo "Gosec report saved to tests/gosec-report.txt"
+
+	$(GOSTATICCHECK) ./...  > tests/staticcheck-report.txt || true
+	@echo "Staticcheck report saved to tests/staticcheck-report.txt"
+	
+	go vet ./... 2>&1 | tee tests/govet-report.txt || true
+	@echo "Go vet report saved to tests/govet-report.txt"
+
+.PHONY: go_build go_run build run test docker security

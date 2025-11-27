@@ -1,0 +1,7 @@
+s3/authmiddleware_test.go:15:7: const host is unused (U1000)
+s3/config.go:82:23: error strings should not be capitalized (ST1005)
+s3/s3_integration_test.go:17:2: "github.com/aws/aws-sdk-go/aws" is deprecated: aws-sdk-go is deprecated. Use aws-sdk-go-v2. See https://aws.amazon.com/blogs/developer/announcing-end-of-support-for-aws-sdk-for-go-v1-on-july-31-2025/.  (SA1019)
+s3/s3_integration_test.go:18:2: "github.com/aws/aws-sdk-go/aws/credentials" is deprecated: aws-sdk-go is deprecated. Use aws-sdk-go-v2. See https://aws.amazon.com/blogs/developer/announcing-end-of-support-for-aws-sdk-for-go-v1-on-july-31-2025/.  (SA1019)
+s3/s3_integration_test.go:19:2: "github.com/aws/aws-sdk-go/aws/session" is deprecated: aws-sdk-go is deprecated. Use aws-sdk-go-v2. See https://aws.amazon.com/blogs/developer/announcing-end-of-support-for-aws-sdk-for-go-v1-on-july-31-2025/.  (SA1019)
+s3/s3_integration_test.go:20:8: "github.com/aws/aws-sdk-go/service/s3" is deprecated: aws-sdk-go is deprecated. Use aws-sdk-go-v2. See https://aws.amazon.com/blogs/developer/announcing-end-of-support-for-aws-sdk-for-go-v1-on-july-31-2025/.  (SA1019)
+s3/s3_integration_test.go:318:6: func checkFileSHA256 is unused (U1000)

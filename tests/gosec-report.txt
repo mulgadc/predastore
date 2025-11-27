@@ -1,0 +1,185 @@
+Results:
+
+
+[[97;41m/Users/benduncan/Development/mulga/predastore/cmd/s3client/main.go:72[0m] - G402 (CWE-295): TLS InsecureSkipVerify set true. (Confidence: HIGH, Severity: HIGH)
+    71: 		tr := &http.Transport{
+  > 72: 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+    73: 		}
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/multipartupload.go:322[0m] - G401 (CWE-328): Use of weak cryptographic primitive (Confidence: HIGH, Severity: MEDIUM)
+    321: 	// Use a io.MultiWriter to send the body and calculate the MD5 checksum
+  > 322: 	md5Writer := md5.New()
+    323: 	multiWriter := io.MultiWriter(fileio, md5Writer)
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/multipartupload.go:215[0m] - G401 (CWE-328): Use of weak cryptographic primitive (Confidence: HIGH, Severity: MEDIUM)
+    214: 	// Calculate final MD5
+  > 215: 	finalMD5 := md5.Sum(concat)
+    216: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/multipartupload.go:102[0m] - G401 (CWE-328): Use of weak cryptographic primitive (Confidence: HIGH, Severity: MEDIUM)
+    101: 
+  > 102: 		md5Writer := md5.New()
+    103: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/list.go:144[0m] - G401 (CWE-328): Use of weak cryptographic primitive (Confidence: HIGH, Severity: MEDIUM)
+    143: 			fileHash := fmt.Sprintf("%s/%s:(%s)", bucket, file.Name(), resp.LastModified.String())
+  > 144: 			md5Hash := md5.New()
+    145: 			md5Hash.Write([]byte(fileHash))
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/get.go:67[0m] - G401 (CWE-328): Use of weak cryptographic primitive (Confidence: HIGH, Severity: MEDIUM)
+    66: 	fileHash := fmt.Sprintf("%s/%s:(%s)", bucket, info.Name(), info.ModTime().String())
+  > 67: 	md5Hash := md5.New()
+    68: 	md5Hash.Write([]byte(fileHash))
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/put.go:67[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    66: 	// Open the file
+  > 67: 	fileio, err := os.Create(pathname)
+    68: 	if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/multipartupload.go:310[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    309: 	// Open the file
+  > 310: 	fileio, err := os.Create(tempFile)
+    311: 	if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/multipartupload.go:147[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    146: 		partFile := fmt.Sprintf("%s/%s.%d", uploadDir, file, part.PartNumber)
+  > 147: 		partIo, err := os.Open(partFile)
+    148: 		if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/multipartupload.go:135[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    134: 	// Open the file
+  > 135: 	fileio, err := os.Create(pathname)
+    136: 	if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/multipartupload.go:94[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    93: 		// Calculate ETAG (MD5) of the part file
+  > 94: 		partIo, err := os.Open(partFile)
+    95: 		if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/get.go:191[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    190: 
+  > 191: 		fileio, err := os.Open(pathname)
+    192: 
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/get.go:110[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    109: 		// Read the file
+  > 110: 		fileio, err := os.Open(pathname)
+    111: 		if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/get.go:41[0m] - G304 (CWE-22): Potential file inclusion via variable (Confidence: HIGH, Severity: MEDIUM)
+    40: 	// Open the file
+  > 41: 	fileio, err := os.Open(pathname)
+    42: 	if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/put.go:60[0m] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    59: 	// Create the directories if they don't exist
+  > 60: 	err = os.MkdirAll(filepath.Dir(pathname), 0755)
+    61: 	if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/multipartupload.go:255[0m] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    254: 	if _, err := os.Stat(uploadDir); os.IsNotExist(err) {
+  > 255: 		err = os.MkdirAll(uploadDir, 0755)
+    256: 		if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/multipartupload.go:50[0m] - G301 (CWE-276): Expect directory permissions to be 0750 or less (Confidence: HIGH, Severity: MEDIUM)
+    49: 	if _, err := os.Stat(uploadDir); os.IsNotExist(err) {
+  > 50: 		err = os.MkdirAll(uploadDir, 0755)
+    51: 		if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/cmd/s3client/main.go:135[0m] - G306 (CWE-276): Expect WriteFile permissions to be 0600 or less (Confidence: HIGH, Severity: MEDIUM)
+    134: 	if opts.OutputFile != "" {
+  > 135: 		err = os.WriteFile(opts.OutputFile, responseBody, 0644)
+    136: 		if err != nil {
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/multipartupload.go:4[0m] - G501 (CWE-327): Blocklisted import crypto/md5: weak cryptographic primitive (Confidence: HIGH, Severity: MEDIUM)
+    3: import (
+  > 4: 	"crypto/md5"
+    5: 	"encoding/base64"
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/list.go:4[0m] - G501 (CWE-327): Blocklisted import crypto/md5: weak cryptographic primitive (Confidence: HIGH, Severity: MEDIUM)
+    3: import (
+  > 4: 	"crypto/md5"
+    5: 	"encoding/hex"
+
+Autofix: 
+
+[[30;43m/Users/benduncan/Development/mulga/predastore/s3/get.go:4[0m] - G501 (CWE-327): Blocklisted import crypto/md5: weak cryptographic primitive (Confidence: HIGH, Severity: MEDIUM)
+    3: import (
+  > 4: 	"crypto/md5"
+    5: 	"encoding/hex"
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/predastore/s3/multipartupload.go:158[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    157: 			if n > 0 {
+  > 158: 				fileio.Write(buffer[:n])
+    159: 			}
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/predastore/s3/get.go:143[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    142: 			}
+  > 143: 			c.Write(buffer[:n])
+    144: 		}
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/predastore/s3/get.go:130[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    129: 		// Rewind the file
+  > 130: 		fileio.Seek(0, 0)
+    131: 
+
+Autofix: 
+
+[[37;40m/Users/benduncan/Development/mulga/predastore/s3/config.go:54[0m] - G104 (CWE-703): Errors unhandled (Confidence: HIGH, Severity: LOW)
+    53: 		if _, err := os.Stat(s3.Buckets[k].Pathname); os.IsNotExist(err) {
+  > 54: 			os.MkdirAll(s3.Buckets[k].Pathname, 0750)
+    55: 		}
+
+Autofix: 
+
+[1;36mSummary:[0m
+  Gosec  : dev
+  Files  : 12
+  Lines  : 2268
+  Nosec  : 0
+  Issues : [1;31m25[0m
+
