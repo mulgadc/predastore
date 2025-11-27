@@ -1,6 +1,6 @@
 module github.com/mulgadc/predastore
 
-go 1.21.0
+go 1.25
 
 require (
 	github.com/aws/aws-sdk-go v1.55.8
