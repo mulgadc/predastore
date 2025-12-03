@@ -1,0 +1,28 @@
+go test -benchmem -timeout=30s  -run=^$ -coverprofile=/var/folders/hs/y5nfkkh56d732dwdd04vmf100000gn/T/vscode-go7uy2fI/go-code-cover -bench . github.com/mulgadc/predastore/s3 | grep -v "WARN Response has no supported checksum"
+goos: darwin
+goarch: arm64
+pkg: github.com/mulgadc/predastore/s3
+cpu: Apple M1 Pro
+BenchmarkS3PutV2/128KB-8            2540            583626 ns/op          140406 B/op        776 allocs/op
+BenchmarkS3PutV2/256KB-8            1705            622845 ns/op          140226 B/op        780 allocs/op
+BenchmarkS3PutV2/1MB-8               604           1821633 ns/op          137873 B/op        803 allocs/op
+BenchmarkS3PutV2/5MB-8               150           7509239 ns/op          138971 B/op        942 allocs/op
+BenchmarkS3PutV2/8MB-8                26          43548332 ns/op          463013 B/op       3474 allocs/op
+BenchmarkS3PutV2/16MB-8               12          86167983 ns/op          756315 B/op       5500 allocs/op
+BenchmarkS3PutV2/32MB-8                6         185187847 ns/op         1238873 B/op       8714 allocs/op
+BenchmarkS3PutV2/64MB-8                3         339806472 ns/op         2150066 B/op      15101 allocs/op
+    4849            237573 ns/op           89017 B/op        667 allocs/op
+    3620            324230 ns/op           88347 B/op        671 allocs/op
+    1390            877039 ns/op           90163 B/op        694 allocs/op
+     246           4785164 ns/op          203560 B/op        823 allocs/op
+     174           6762511 ns/op          345135 B/op        928 allocs/op
+     109          10916172 ns/op          898967 B/op       1208 allocs/op
+      55          20496048 ns/op         3227016 B/op       1802 allocs/op
+      24          49152012 ns/op        14120636 B/op       3265 allocs/op
+BenchmarkS3MultipartV2/8MB-8                  24          45531653 ns/op          470643 B/op       3480 allocs/op
+BenchmarkS3MultipartV2/16MB-8                 12          92576962 ns/op          753007 B/op       5500 allocs/op
+BenchmarkS3MultipartV2/32MB-8                  6         175800930 ns/op         1219008 B/op       8703 allocs/op
+BenchmarkS3MultipartV2/64MB-8                  3         359494069 ns/op         2124754 B/op      15094 allocs/op
+PASS
+coverage: 47.3% of statements
+ok      github.com/mulgadc/predastore/s3        169.528s

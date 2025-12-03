@@ -37,6 +37,15 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 	// Configure slog for logging
 	slog.New(slog.NewTextHandler(os.Stdout, nil))
 
+	// Allow to overwrite stream request body via env var (e.g benchmarking script)
+	streamRequestBodyEnv := os.Getenv("StreamRequestBody")
+
+	streamRequestBody := true
+
+	if streamRequestBodyEnv == "false" {
+		streamRequestBody = false
+	}
+
 	app := fiber.New(fiber.Config{
 
 		// Disable the startup banner
@@ -44,6 +53,9 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 
 		// Set the body limit for S3 specs to 5GiB
 		BodyLimit: 5 * 1024 * 1024 * 1024,
+
+		// Use streaming for more efficiency
+		StreamRequestBody: streamRequestBody,
 
 		// Override default error handler
 		ErrorHandler: func(ctx *fiber.Ctx, err error) error {

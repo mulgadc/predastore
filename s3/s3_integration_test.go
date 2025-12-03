@@ -14,17 +14,29 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
+	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
+	v2config "github.com/aws/aws-sdk-go-v2/config"
+	v2credentials "github.com/aws/aws-sdk-go-v2/credentials"
+	awss3v2 "github.com/aws/aws-sdk-go-v2/service/s3"
+	awss3v2types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	awsv1 "github.com/aws/aws-sdk-go/aws"
+	v1credentials "github.com/aws/aws-sdk-go/aws/credentials"
+	v1session "github.com/aws/aws-sdk-go/aws/session"
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+type s3Adapter struct {
+	listBuckets     func(t *testing.T) []string
+	listObjects     func(t *testing.T, bucket string) []string
+	getObject       func(t *testing.T, bucket, key string) []byte
+	putObject       func(t *testing.T, bucket, key string, body []byte)
+	multiPartUpload func(t *testing.T, bucket, key string, parts [][]byte)
+}
+
 const (
 	S3_ENDPOINT     = "https://localhost:8443"
-	S3_REGION       = "ap-southeast-2"
 	S3_BUCKET       = "test-bucket01"
 	TEXT_FILE_SHA   = "8a71e72cef7867d59c08ee233df6d2b7c35369734d0b6dae702857176a1d69f8"
 	BINARY_FILE_SHA = "ce9d16a33fc9a53f592206c0cd23497632e78d3f6219dcd077ec9a11f50e6e4e"
@@ -78,33 +90,319 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	return cancel, wg
 }
 
-// createS3Client creates an AWS S3 client configured to use our local server
-func createS3Client(t *testing.T) *awss3.S3 {
+// loadTestConfig reads the shared test config once per test
+func loadTestConfig(t *testing.T) *Config {
+	s3config := New(&Config{
+		ConfigPath: "./tests/config/server.toml",
+	})
+	err := s3config.ReadConfig()
+	require.NoError(t, err, "Failed to read config file")
+	return s3config
+}
+
+// createS3ClientV1 creates an AWS SDK v1 S3 client configured to use our local server
+func createS3ClientV1(t *testing.T) *awss3.S3 {
 	// Configure to skip SSL verification for our self-signed cert
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
 	httpClient := &http.Client{Transport: tr}
 
-	// Create a new AWS session
+	cfg := loadTestConfig(t)
 
-	s3client := New(&Config{
-		ConfigPath: "./tests/config/server.toml",
-	})
-	err := s3client.ReadConfig()
-	require.NoError(t, err, "Failed to read config file")
-
-	sess, err := session.NewSession(&aws.Config{
-		Region:           aws.String(s3client.Region),
-		Endpoint:         aws.String(S3_ENDPOINT),
-		S3ForcePathStyle: aws.Bool(true),
-		Credentials:      credentials.NewStaticCredentials(s3client.Auth[0].AccessKeyID, s3client.Auth[0].SecretAccessKey, ""),
+	sess, err := v1session.NewSession(&awsv1.Config{
+		Region:           awsv1.String(cfg.Region),
+		Endpoint:         awsv1.String(S3_ENDPOINT),
+		S3ForcePathStyle: awsv1.Bool(true),
+		Credentials:      v1credentials.NewStaticCredentials(cfg.Auth[0].AccessKeyID, cfg.Auth[0].SecretAccessKey, ""),
 		HTTPClient:       httpClient,
 	})
 	require.NoError(t, err, "Failed to create AWS session")
 
 	// Create S3 service client
 	return awss3.New(sess)
+}
+
+// createS3ClientV2 creates an AWS SDK v2 S3 client configured to use our local server
+func createS3ClientV2(t *testing.T) *awss3v2.Client {
+	// Configure to skip SSL verification for our self-signed cert
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+	httpClient := &http.Client{Transport: tr}
+
+	cfg := loadTestConfig(t)
+
+	awsCfg, err := v2config.LoadDefaultConfig(
+		context.Background(),
+		v2config.WithRegion(cfg.Region),
+		v2config.WithHTTPClient(httpClient),
+		v2config.WithEndpointResolverWithOptions(
+			awsv2.EndpointResolverWithOptionsFunc(func(service, region string, _ ...interface{}) (awsv2.Endpoint, error) {
+				if service == awss3v2.ServiceID {
+					return awsv2.Endpoint{
+						URL:               S3_ENDPOINT,
+						HostnameImmutable: true,
+					}, nil
+				}
+				return awsv2.Endpoint{}, &awsv2.EndpointNotFoundError{}
+			}),
+		),
+		v2config.WithCredentialsProvider(v2credentials.NewStaticCredentialsProvider(
+			cfg.Auth[0].AccessKeyID,
+			cfg.Auth[0].SecretAccessKey,
+			"",
+		)),
+	)
+	require.NoError(t, err, "Failed to create AWS v2 config")
+
+	client := awss3v2.NewFromConfig(awsCfg, func(o *awss3v2.Options) {
+		o.UsePathStyle = true
+	})
+	return client
+}
+
+func newS3AdapterV1(t *testing.T) s3Adapter {
+	client := createS3ClientV1(t)
+
+	return s3Adapter{
+		listBuckets: func(t *testing.T) []string {
+			result, err := client.ListBuckets(&awss3.ListBucketsInput{})
+			require.NoError(t, err, "ListBuckets should not error")
+
+			var buckets []string
+			for _, bucket := range result.Buckets {
+				buckets = append(buckets, awsv1.StringValue(bucket.Name))
+			}
+			return buckets
+		},
+		listObjects: func(t *testing.T, bucket string) []string {
+			result, err := client.ListObjectsV2(&awss3.ListObjectsV2Input{
+				Bucket: awsv1.String(bucket),
+			})
+			require.NoError(t, err, "ListObjectsV2 should not error")
+
+			var keys []string
+			for _, item := range result.Contents {
+				keys = append(keys, awsv1.StringValue(item.Key))
+			}
+			return keys
+		},
+		getObject: func(t *testing.T, bucket, key string) []byte {
+			result, err := client.GetObject(&awss3.GetObjectInput{
+				Bucket: awsv1.String(bucket),
+				Key:    awsv1.String(key),
+			})
+			require.NoError(t, err, "GetObject should not error")
+			return readBody(t, result.Body)
+		},
+		putObject: func(t *testing.T, bucket, key string, body []byte) {
+			_, err := client.PutObject(&awss3.PutObjectInput{
+				Bucket: awsv1.String(bucket),
+				Key:    awsv1.String(key),
+				Body:   bytes.NewReader(body),
+			})
+			require.NoError(t, err, "PutObject should not error")
+		},
+		multiPartUpload: func(t *testing.T, bucket, key string, parts [][]byte) {
+			initOut, err := client.CreateMultipartUpload(&awss3.CreateMultipartUploadInput{
+				Bucket: awsv1.String(bucket),
+				Key:    awsv1.String(key),
+			})
+			require.NoError(t, err, "CreateMultipartUpload should not error")
+
+			var completedParts []*awss3.CompletedPart
+
+			for idx, part := range parts {
+				partNumber := int64(idx + 1)
+				uploadResp, err := client.UploadPart(&awss3.UploadPartInput{
+					Bucket:     awsv1.String(bucket),
+					Key:        awsv1.String(key),
+					UploadId:   initOut.UploadId,
+					PartNumber: awsv1.Int64(partNumber),
+					Body:       bytes.NewReader(part),
+				})
+				require.NoErrorf(t, err, "UploadPart %d should not error", partNumber)
+				require.NotNil(t, uploadResp.ETag, "UploadPart %d ETag should not be nil", partNumber)
+
+				completedParts = append(completedParts, &awss3.CompletedPart{
+					ETag:       uploadResp.ETag,
+					PartNumber: awsv1.Int64(partNumber),
+				})
+			}
+
+			_, err = client.CompleteMultipartUpload(&awss3.CompleteMultipartUploadInput{
+				Bucket:   awsv1.String(bucket),
+				Key:      awsv1.String(key),
+				UploadId: initOut.UploadId,
+				MultipartUpload: &awss3.CompletedMultipartUpload{
+					Parts: completedParts,
+				},
+			})
+			require.NoError(t, err, "CompleteMultipartUpload should not error")
+		},
+	}
+}
+
+func newS3AdapterV2(t *testing.T) s3Adapter {
+	client := createS3ClientV2(t)
+
+	return s3Adapter{
+		listBuckets: func(t *testing.T) []string {
+			result, err := client.ListBuckets(context.Background(), &awss3v2.ListBucketsInput{})
+			require.NoError(t, err, "ListBuckets should not error")
+
+			var buckets []string
+			for _, bucket := range result.Buckets {
+				buckets = append(buckets, awsv2.ToString(bucket.Name))
+			}
+			return buckets
+		},
+		listObjects: func(t *testing.T, bucket string) []string {
+			result, err := client.ListObjectsV2(context.Background(), &awss3v2.ListObjectsV2Input{
+				Bucket: awsv2.String(bucket),
+			})
+			require.NoError(t, err, "ListObjectsV2 should not error")
+
+			var keys []string
+			for _, item := range result.Contents {
+				keys = append(keys, awsv2.ToString(item.Key))
+			}
+			return keys
+		},
+		getObject: func(t *testing.T, bucket, key string) []byte {
+			result, err := client.GetObject(context.Background(), &awss3v2.GetObjectInput{
+				Bucket: awsv2.String(bucket),
+				Key:    awsv2.String(key),
+			})
+			require.NoError(t, err, "GetObject should not error")
+			return readBody(t, result.Body)
+		},
+		putObject: func(t *testing.T, bucket, key string, body []byte) {
+			_, err := client.PutObject(context.Background(), &awss3v2.PutObjectInput{
+				Bucket: awsv2.String(bucket),
+				Key:    awsv2.String(key),
+				Body:   bytes.NewReader(body),
+			})
+			require.NoError(t, err, "PutObject should not error")
+		},
+		multiPartUpload: func(t *testing.T, bucket, key string, parts [][]byte) {
+			initOut, err := client.CreateMultipartUpload(context.Background(), &awss3v2.CreateMultipartUploadInput{
+				Bucket: awsv2.String(bucket),
+				Key:    awsv2.String(key),
+			})
+			require.NoError(t, err, "CreateMultipartUpload should not error")
+
+			var completedParts []awss3v2types.CompletedPart
+
+			for idx, part := range parts {
+				partNumber := int32(idx + 1)
+				uploadResp, err := client.UploadPart(context.Background(), &awss3v2.UploadPartInput{
+					Bucket:     awsv2.String(bucket),
+					Key:        awsv2.String(key),
+					UploadId:   initOut.UploadId,
+					PartNumber: awsv2.Int32(partNumber),
+					Body:       bytes.NewReader(part),
+				})
+				require.NoErrorf(t, err, "UploadPart %d should not error", partNumber)
+
+				completedParts = append(completedParts, awss3v2types.CompletedPart{
+					ETag:       uploadResp.ETag,
+					PartNumber: awsv2.Int32(partNumber),
+				})
+			}
+
+			_, err = client.CompleteMultipartUpload(context.Background(), &awss3v2.CompleteMultipartUploadInput{
+				Bucket:   awsv2.String(bucket),
+				Key:      awsv2.String(key),
+				UploadId: initOut.UploadId,
+				MultipartUpload: &awss3v2types.CompletedMultipartUpload{
+					Parts: completedParts,
+				},
+			})
+			require.NoError(t, err, "CompleteMultipartUpload should not error")
+		},
+	}
+}
+
+func runIntegrationSuite(t *testing.T, client s3Adapter) {
+	t.Helper()
+
+	t.Run("ListBuckets", func(t *testing.T) {
+		buckets := client.listBuckets(t)
+		assert.Contains(t, buckets, S3_BUCKET, "TestBucket should be in the list of buckets")
+	})
+
+	t.Run("ListObjects", func(t *testing.T) {
+		keys := client.listObjects(t, S3_BUCKET)
+		assert.Contains(t, keys, "test.txt", "test.txt should be in the bucket")
+		assert.Contains(t, keys, "binary.dat", "binary.dat should be in the bucket")
+	})
+
+	t.Run("GetObject", func(t *testing.T) {
+		textBytes := client.getObject(t, S3_BUCKET, "test.txt")
+		expectedText := mustReadFile(t, "./tests/data/test-bucket01/test.txt")
+		assert.Equal(t, expectedText, textBytes, "Text file content should match")
+
+		binaryBytes := client.getObject(t, S3_BUCKET, "binary.dat")
+		expectedBinary := mustReadFile(t, "./tests/data/test-bucket01/binary.dat")
+		assert.Equal(t, expectedBinary, binaryBytes, "Binary file content should match")
+	})
+
+	t.Run("PutObject", func(t *testing.T) {
+		testContent := []byte("This is a new test file created during integration testing")
+
+		client.putObject(t, S3_BUCKET, "new_test_file.txt", testContent)
+
+		downloadedBytes := client.getObject(t, S3_BUCKET, "new_test_file.txt")
+		assert.Equal(t, testContent, downloadedBytes, "Downloaded content should match uploaded content")
+
+		localPath := filepath.Join("tests", "data", "new_test_file.txt")
+		if _, err := os.Stat(localPath); err == nil {
+			err = os.Remove(localPath)
+			assert.NoError(t, err, "Removing test file should not error")
+		}
+	})
+
+	t.Run("MultiPartUpload", func(t *testing.T) {
+		const totalSize = 20 * 1024 * 1024 // 20MB
+		const partCount = 4
+		const partSize = totalSize / partCount
+
+		data := make([]byte, totalSize)
+		for i := range data {
+			data[i] = byte(i % 251) // deterministic pattern
+		}
+
+		var parts [][]byte
+		for i := 0; i < partCount; i++ {
+			start := i * partSize
+			end := start + partSize
+			parts = append(parts, data[start:end])
+		}
+
+		const key = "multipart_test.bin"
+		client.multiPartUpload(t, S3_BUCKET, key, parts)
+
+		downloaded := client.getObject(t, S3_BUCKET, key)
+		assert.Equal(t, data, downloaded, "Multipart uploaded content should match original data")
+	})
+}
+
+func readBody(t *testing.T, body io.ReadCloser) []byte {
+	t.Helper()
+	defer body.Close()
+
+	data, err := io.ReadAll(body)
+	require.NoError(t, err, "Reading response body should not error")
+	return data
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err, "Reading local file should not error")
+	return data
 }
 
 func TestS3Integration(t *testing.T) {
@@ -119,112 +417,24 @@ func TestS3Integration(t *testing.T) {
 		wg.Wait()
 	}()
 
-	// Create S3 client
-	client := createS3Client(t)
-
-	// Test ListBuckets
-	t.Run("ListBuckets", func(t *testing.T) {
-		result, err := client.ListBuckets(&awss3.ListBucketsInput{})
-		assert.NoError(t, err, "ListBuckets should not error")
-
-		found := false
-		for _, bucket := range result.Buckets {
-			if *bucket.Name == S3_BUCKET {
-				found = true
-				break
-			}
-		}
-		assert.True(t, found, "TestBucket should be in the list of buckets")
-	})
-
-	// Test ListObjectsV2
-	t.Run("ListObjects", func(t *testing.T) {
-		result, err := client.ListObjectsV2(&awss3.ListObjectsV2Input{
-			Bucket: aws.String(S3_BUCKET),
+	for _, tc := range []struct {
+		name   string
+		client func(t *testing.T) s3Adapter
+	}{
+		{
+			name:   "aws-sdk-go-v1",
+			client: newS3AdapterV1,
+		},
+		{
+			name:   "aws-sdk-go-v2",
+			client: newS3AdapterV2,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			runIntegrationSuite(t, tc.client(t))
 		})
-		assert.NoError(t, err, "ListObjectsV2 should not error")
-
-		foundText := false
-		foundBinary := false
-
-		for _, item := range result.Contents {
-			if *item.Key == "test.txt" {
-				foundText = true
-			}
-			if *item.Key == "binary.dat" {
-				foundBinary = true
-			}
-		}
-
-		assert.True(t, foundText, "test.txt should be in the bucket")
-		assert.True(t, foundBinary, "binary.dat should be in the bucket")
-	})
-
-	// Test GetObject
-	t.Run("GetObject", func(t *testing.T) {
-		// Test text file
-		textResult, err := client.GetObject(&awss3.GetObjectInput{
-			Bucket: aws.String(S3_BUCKET),
-			Key:    aws.String("test.txt"),
-		})
-		assert.NoError(t, err, "GetObject for text file should not error")
-
-		textBytes, err := io.ReadAll(textResult.Body)
-		assert.NoError(t, err, "Reading text file should not error")
-		textResult.Body.Close()
-
-		expectedText, err := os.ReadFile("./tests/data/test-bucket01/test.txt")
-		assert.NoError(t, err, "Reading local text file should not error")
-		assert.Equal(t, expectedText, textBytes, "Text file content should match")
-
-		// Test binary file
-		binaryResult, err := client.GetObject(&awss3.GetObjectInput{
-			Bucket: aws.String(S3_BUCKET),
-			Key:    aws.String("binary.dat"),
-		})
-		assert.NoError(t, err, "GetObject for binary file should not error")
-
-		binaryBytes, err := io.ReadAll(binaryResult.Body)
-		assert.NoError(t, err, "Reading binary file should not error")
-		binaryResult.Body.Close()
-
-		expectedBinary, err := os.ReadFile("./tests/data/test-bucket01/binary.dat")
-		assert.NoError(t, err, "Reading local binary file should not error")
-		assert.Equal(t, expectedBinary, binaryBytes, "Binary file content should match")
-	})
-
-	// Test PutObject
-	t.Run("PutObject", func(t *testing.T) {
-		testContent := []byte("This is a new test file created during integration testing")
-
-		// Upload new file
-		_, err := client.PutObject(&awss3.PutObjectInput{
-			Bucket: aws.String(S3_BUCKET),
-			Key:    aws.String("new_test_file.txt"),
-			Body:   bytes.NewReader(testContent),
-		})
-		assert.NoError(t, err, "PutObject should not error")
-
-		// Verify file was uploaded
-		result, err := client.GetObject(&awss3.GetObjectInput{
-			Bucket: aws.String(S3_BUCKET),
-			Key:    aws.String("new_test_file.txt"),
-		})
-		assert.NoError(t, err, "GetObject should not error after upload")
-
-		downloadedBytes, err := io.ReadAll(result.Body)
-		assert.NoError(t, err, "Reading uploaded file should not error")
-		result.Body.Close()
-
-		assert.Equal(t, testContent, downloadedBytes, "Downloaded content should match uploaded content")
-
-		// Cleanup: delete the file
-		localPath := filepath.Join("tests", "data", "new_test_file.txt")
-		if _, err := os.Stat(localPath); err == nil {
-			err = os.Remove(localPath)
-			assert.NoError(t, err, "Removing test file should not error")
-		}
-	})
+	}
 }
 
 // TestGetObjectHead tests the HEAD request for an object

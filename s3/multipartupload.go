@@ -10,10 +10,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/mulgadc/predastore/s3/chunked"
 )
 
 func (s3 *Config) CompleteMultipartUpload(bucket string, file string, uploadId string, c *fiber.Ctx) error {
@@ -322,11 +324,42 @@ func (s3 *Config) PutObjectPart(bucket string, file string, partNumber int, uplo
 	md5Writer := md5.New()
 	multiWriter := io.MultiWriter(fileio, md5Writer)
 
-	// TODO: Implement checksum verification and multi-part syntax
-	_, err = multiWriter.Write(c.Body())
+	// Setup a reader (using RequestBodySteam, fallback to Body otherwise)
+	baseReader := chunked.RequestBodyReader(c)
 
-	if err != nil {
-		slog.Warn("Error writing file", "error", err)
+	// TODO: Implement checksum verification and multi-part syntax
+
+	reader := baseReader
+	//var copyBuf []byte
+	// reuse a buffer to avoid extra allocations during copy
+	copyBuf := make([]byte, 32*1024)
+
+	if c.Get("content-encoding") == "aws-chunked" {
+
+		slog.Debug("Detected chunked upload with encoding", "checksum", c.Get("x-amz-sdk-checksum-algorithm"))
+
+		decodedLenStr := c.Get("x-amz-decoded-content-length")
+		var decodedLen int64 = 0
+		if decodedLenStr != "" {
+			decodedLen, err = strconv.ParseInt(decodedLenStr, 10, 64)
+			if err != nil {
+				slog.Warn("Error parsing x-amz-decoded-content-length", "error", err)
+				return err
+			}
+		}
+
+		slog.Debug("Using chunked decoder", "decodedLen", decodedLen)
+
+		chunkedDecoder := chunked.NewDecoder(reader, decodedLen)
+
+		// Stream decoded payload to disk while hashing
+		reader = chunkedDecoder
+
+	}
+
+	// Write the file, use io.Copy for improved performance vs c.Body()
+	if _, err := io.CopyBuffer(multiWriter, reader, copyBuf); err != nil {
+		slog.Warn("Error writing chunked file", "error", err)
 		return err
 	}
 
