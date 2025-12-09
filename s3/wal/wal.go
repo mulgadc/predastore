@@ -306,10 +306,13 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 			return nil, fmt.Errorf("could not read chunk header: %v", err)
 		}
 
-		// Parse header fields
+		// Parse all header fields
+		fragment.SeqNum = binary.BigEndian.Uint64(headerBuf[0:8])
 		fragment.ShardNum = binary.BigEndian.Uint64(headerBuf[8:16])
 		fragment.ShardFragment = binary.BigEndian.Uint32(headerBuf[16:20])
 		fragment.Length = binary.BigEndian.Uint32(headerBuf[20:24])
+		fragment.Flags = Flags(binary.BigEndian.Uint32(headerBuf[24:28]))
+		fragment.Checksum = binary.BigEndian.Uint32(headerBuf[28:32])
 
 		// Sanity checks
 		if fragment.ShardNum != shardNum {
@@ -331,6 +334,23 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 		// Confirm, check EOF
 		if err != nil {
 			return nil, fmt.Errorf("could not read chunk: %v", err)
+		}
+
+		// Validate checksum: calculate checksum the same way as Write()
+		// Checksum is calculated over: full 32-byte header (with checksum field set to 0) + data
+		headerForChecksum := make([]byte, 32)
+		copy(headerForChecksum, headerBuf)
+		// Set checksum field to 0 for calculation (bytes 28-32)
+		headerForChecksum[28] = 0
+		headerForChecksum[29] = 0
+		headerForChecksum[30] = 0
+		headerForChecksum[31] = 0
+
+		calculatedChecksum := crc32.ChecksumIEEE(headerForChecksum)
+		calculatedChecksum = crc32.Update(calculatedChecksum, crc32.IEEETable, chunkBuffer)
+
+		if calculatedChecksum != fragment.Checksum {
+			return nil, fmt.Errorf("checksum mismatch for fragment %d: expected %d, got %d", fragment.ShardFragment, fragment.Checksum, calculatedChecksum)
 		}
 
 		// Clamp payloadSize to what's logically remaining in the object
