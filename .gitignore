@@ -1,3 +1,5 @@
+s3/tests/data/distributed/
+.DS_Store
 s3/tests/data/test-*
 s3/tests/data/predastore/*
 s3/tests/data/local/*
