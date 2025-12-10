@@ -3,11 +3,13 @@ package wal
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
@@ -166,6 +168,133 @@ func TestNew(t *testing.T) {
 	wal.Close()
 
 	//
+}
+
+func TestNewWithStateFile(t *testing.T) {
+
+	osTmpDir := os.TempDir()
+
+	tmpDir, err := os.MkdirTemp(osTmpDir, fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
+	assert.NoError(t, err, "MkdirTemp dir should not fail")
+
+	t.Log("tmpDir", tmpDir)
+	//defer os.RemoveAll(tmpDir) // clean up when done
+
+	wal, err := New(filepath.Join(tmpDir, "state.json"), tmpDir)
+	assert.NoError(t, err, "Should not error since state does not exist")
+	assert.NotNil(t, wal)
+	//assert.Greater(t, len(wal.Shard.DB), 0, "WAL should have at least one file open")
+
+	// Write some test data
+
+	for range 10 {
+		testData := []byte(fmt.Sprintf("Hello %d, World! This is test data for checksum validation.", time.Now().UnixNano()))
+
+		testDataReader := bytes.NewReader(testData)
+
+		writeResult, err := wal.Write(testDataReader, len(testData))
+		assert.NoError(t, err, "Write should not error")
+		assert.NotNil(t, writeResult)
+
+	}
+
+	wal.Close()
+
+	// Next, open the WAL
+	wal2, err := New(filepath.Join(tmpDir, "state.json"), tmpDir)
+	assert.NoError(t, err, "Should not error since state does not exist")
+
+	// Check expected WAL state
+	assert.Equal(t, wal.WalNum.Load(), wal2.WalNum.Load(), "WalNum should match")
+	assert.Equal(t, wal.SeqNum.Load(), wal2.SeqNum.Load(), "SeqNum should match")
+	assert.Equal(t, wal.ShardNum.Load(), wal2.ShardNum.Load(), "ShardNum should match")
+	assert.Equal(t, wal.Epoch, wal2.Epoch, "Epoch should match")
+	assert.Equal(t, wal.WalDir, wal2.WalDir, "WalDir should match")
+	assert.Equal(t, wal.StateFile, wal2.StateFile, "StateFile should match")
+
+	// Next, write more data, confirm state increments
+	for range 10 {
+		testData := []byte(fmt.Sprintf("Hello %d, World! This is test data for checksum validation.", time.Now().UnixNano()))
+
+		testDataReader := bytes.NewReader(testData)
+
+		writeResult, err := wal2.Write(testDataReader, len(testData))
+		assert.NoError(t, err, "Write should not error")
+		assert.NotNil(t, writeResult)
+
+	}
+
+	// WAL, should be the same
+	assert.Equal(t, wal.WalNum.Load(), wal2.WalNum.Load(), "WalNum should match")
+
+	// Both SeqNum and ShardNum should increment by 10
+	t.Log("wal.SeqNum.Load()", wal.SeqNum.Load())
+	t.Log("wal2.SeqNum.Load()", wal2.SeqNum.Load())
+	assert.Equal(t, wal.SeqNum.Load()+10, wal2.SeqNum.Load(), "SeqNum should match")
+	assert.Equal(t, wal.ShardNum.Load()+10, wal2.ShardNum.Load(), "ShardNum should match")
+
+	wal2.Close()
+
+	// Validate changes
+	wal3, err := New(filepath.Join(tmpDir, "state.json"), tmpDir)
+	assert.NoError(t, err, "Should not error since state does not exist")
+
+	// WAL, should be the same
+	assert.Equal(t, wal2.WalNum.Load(), wal3.WalNum.Load(), "WalNum should match")
+
+	// Check expected WAL state (again, sanity check)
+	assert.Equal(t, wal2.SeqNum.Load(), wal3.SeqNum.Load(), "SeqNum should match")
+	assert.Equal(t, wal2.ShardNum.Load(), wal3.ShardNum.Load(), "ShardNum should match")
+	assert.Equal(t, wal2.Epoch, wal3.Epoch, "Epoch should match")
+	assert.Equal(t, wal2.WalDir, wal3.WalDir, "WalDir should match")
+	assert.Equal(t, wal2.StateFile, wal3.StateFile, "StateFile should match")
+
+	wal3.Close()
+
+	// Next, write a 4MB chunk, WAL should bump, confirm state changes.
+	// Validate changes
+	wal4, err := New(filepath.Join(tmpDir, "state.json"), tmpDir)
+	assert.NoError(t, err, "Should not error since state does not exist")
+
+	// Generate deterministic test data (using index for reproducibility)
+	sampleSize := (1024 * 1024 * 4) + 1
+	testData := make([]byte, sampleSize)
+	for i := range testData {
+		testData[i] = byte((i + sampleSize) % 256)
+	}
+
+	testDataReader := bytes.NewReader(testData)
+
+	writeResult, err := wal4.Write(testDataReader, len(testData))
+
+	assert.NoError(t, err, "Write should not error")
+	assert.NotNil(t, writeResult)
+
+	testDataReader = bytes.NewReader(testData)
+
+	writeResult, err = wal4.Write(testDataReader, len(testData))
+	assert.NoError(t, err, "Write should not error")
+	assert.NotNil(t, writeResult)
+
+	// WAL, should be the same
+	assert.Equal(t, wal3.WalNum.Load()+2, wal4.WalNum.Load(), "WalNum should match")
+
+	wal4.Close()
+
+}
+
+func TestHeaderSizes(t *testing.T) {
+
+	fragment := Fragment{}
+
+	size := fragment.FragmentHeaderSize()
+	assert.Equal(t, 32, size, "Fragment header size should be 32")
+
+	wal := WAL{}
+
+	size = wal.WALHeaderSize()
+	assert.Equal(t, 14, size, "WAL header size should be 14")
+
 }
 
 func TestReadChecksumValidation(t *testing.T) {
@@ -344,8 +473,8 @@ func TestWriteVariousSizes(t *testing.T) {
 			testDataReader := bytes.NewReader(testData)
 
 			// Calculate exact expectations
-			expectedWALFiles := calculateExpectedWALFiles(tc.size, ShardSize, ChunkSize, wal.WALHeaderSize())
-			expectedSizes := calculateWALFileSizes(tc.size, ShardSize, ChunkSize, wal.WALHeaderSize())
+			expectedWALFiles := calculateExpectedWALFiles(tc.size, wal.Shard.ShardSize, ChunkSize, wal.WALHeaderSize())
+			expectedSizes := calculateWALFileSizes(tc.size, wal.Shard.ShardSize, ChunkSize, wal.WALHeaderSize())
 
 			// Write the data
 			writeResult, err := wal.Write(testDataReader, tc.size)
@@ -368,8 +497,8 @@ func TestWriteVariousSizes(t *testing.T) {
 			for i, walFile := range writeResult.WALFiles {
 				totalWrittenSize += walFile.Size
 				// Verify size doesn't exceed ShardSize (excluding WAL header)
-				assert.LessOrEqual(t, walFile.Size, int64(ShardSize),
-					"WAL file %d size (%d) should not exceed ShardSize (%d)", i, walFile.Size, ShardSize)
+				assert.LessOrEqual(t, walFile.Size, int64(wal.Shard.ShardSize),
+					"WAL file %d size (%d) should not exceed ShardSize (%d)", i, walFile.Size, wal.Shard.ShardSize)
 				// Verify offset is valid
 				assert.GreaterOrEqual(t, walFile.Offset, int64(0),
 					"WAL file %d offset should be non-negative", i)
@@ -494,7 +623,7 @@ func TestWriteReadOffsetsAndChunkBoundaries(t *testing.T) {
 				for i, walFile := range result.WALFiles {
 					assert.Greater(t, walFile.Size, int64(0),
 						"WAL file %d should have data", i)
-					assert.LessOrEqual(t, walFile.Size, int64(ShardSize),
+					assert.LessOrEqual(t, walFile.Size, int64(wal.Shard.ShardSize),
 						"WAL file %d size should not exceed ShardSize", i)
 				}
 			},

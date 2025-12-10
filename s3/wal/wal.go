@@ -19,7 +19,7 @@ import (
 
 // 32MB Shard size per WAL file (prod)
 // 4MB for dev (testing)
-const ShardSize uint32 = 1024 * 1024 * 4
+var ShardSize uint32 = 1024 * 1024 * 4
 
 // 8kb chunk sizes
 const ChunkSize uint32 = 1024 * 8
@@ -39,14 +39,26 @@ const (
 )
 
 type WAL struct {
+	WalNum   atomic.Uint64
 	SeqNum   atomic.Uint64
 	ShardNum atomic.Uint64
 	Epoch    time.Time
 
-	WalDir string
+	WalDir    string
+	StateFile string
 
 	Shard Shard
 	mu    sync.RWMutex `json:"-"`
+}
+
+type WALState struct {
+	WalNum   uint64
+	SeqNum   uint64
+	ShardNum uint64
+	Epoch    time.Time
+
+	WalDir    string
+	StateFile string
 }
 
 type Shard struct {
@@ -84,11 +96,18 @@ type WriteResult struct {
 
 func New(stateFile, walDir string) (wal *WAL, err error) {
 
-	_, err = os.Stat(stateFile)
+	// Add header, and each Chunk header
+	// FragmentHeaderSize() is 32 bytes
+	// WALHeaderSize() 14 bytes
+	var shardHeaders = ((ShardSize / ChunkSize) * 32) + 14
+
+	// Append shardHeaders
+	ShardSize -= shardHeaders
 
 	// State
 	wal = &WAL{
-		WalDir: walDir,
+		WalDir:    walDir,
+		StateFile: stateFile,
 
 		Shard: Shard{
 			// S3 Shard File (S3SF)
@@ -99,37 +118,33 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 		},
 	}
 
+	_, err = os.Stat(stateFile)
+
+	fmt.Println("stateFile", stateFile, "err", err)
+
 	// If no file exists, start from 0
 	if err != nil {
+		fmt.Println("Incrementing WalNum and SeqNum")
 		wal.SeqNum.Add(1)
+		wal.WalNum.Add(1)
 	} else {
 
-		// Read the state file
-		stateData, err := os.ReadFile(stateFile)
-
-		if err != nil {
-			slog.Error("Cannot read stateFile", "stateFile", stateFile)
-			return wal, err
-		}
-
-		err = json.Unmarshal(stateData, &wal)
-
-		if err != nil {
-			slog.Error("Cannot unmarshal stateFile", "stateFile", stateFile)
-
-			return wal, err
-		}
+		wal.LoadState(stateFile)
 
 	}
 
 	// Next, check if a WAL already exists
-	seqNum := wal.SeqNum.Load()
-	filename := filepath.Join(walDir, FormatWalFile(seqNum))
+	walNum := wal.WalNum.Load()
+
+	filename := filepath.Join(walDir, FormatWalFile(walNum))
+	fmt.Println("walNum", walNum, "filename", filename)
+
 	_, err = os.Stat(filename)
 
 	if err != nil {
 
-		err = wal.CreateWAL(filename)
+		err = wal.createWALUnlocked(filename)
+		//wal.CreateWAL(filename)
 		if err != nil {
 			return wal, err
 		}
@@ -139,6 +154,53 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 	return wal, err
 }
 
+// SaveState saves the WAL state to disk
+func (wal *WAL) SaveState() error {
+	state := WALState{
+		WalNum:    wal.WalNum.Load(),
+		SeqNum:    wal.SeqNum.Load(),
+		ShardNum:  wal.ShardNum.Load(),
+		Epoch:     wal.Epoch,
+		WalDir:    wal.WalDir,
+		StateFile: wal.StateFile,
+	}
+
+	stateData, err := json.Marshal(state)
+	if err != nil {
+		return fmt.Errorf("failed to marshal state data: %v", err)
+	}
+
+	filename := filepath.Join(wal.WalDir, "state.json")
+	if wal.StateFile != "" {
+		filename = wal.StateFile
+	}
+
+	return os.WriteFile(filename, stateData, 0640)
+}
+
+// LoadState loads the WAL state from disk
+func (wal *WAL) LoadState(stateFile string) error {
+	stateData, err := os.ReadFile(stateFile)
+	if err != nil {
+		return err
+	}
+
+	var state WALState
+	if err := json.Unmarshal(stateData, &state); err != nil {
+		return err
+	}
+
+	wal.WalNum.Store(state.WalNum)
+	wal.SeqNum.Store(state.SeqNum)
+	wal.ShardNum.Store(state.ShardNum)
+	wal.Epoch = state.Epoch
+	wal.WalDir = state.WalDir
+	wal.StateFile = state.StateFile
+
+	return nil
+}
+
+/*
 func (wal *WAL) CreateWAL(filename string) (err error) {
 
 	// Lock operations on the WAL
@@ -179,6 +241,7 @@ func (wal *WAL) CreateWAL(filename string) (err error) {
 
 	return nil
 }
+*/
 
 // getCurrentWALFileSize returns the current size of the active WAL file (excluding header)
 func (wal *WAL) getCurrentWALFileSize() (int64, error) {
@@ -232,14 +295,17 @@ func (wal *WAL) ensureWALFile() (int, error) {
 	// Keep incrementing until we find an empty file or one with space
 	maxAttempts := 100
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		wal.SeqNum.Add(1)
-		seqNum := wal.SeqNum.Load()
-		filename := filepath.Join(wal.WalDir, FormatWalFile(seqNum))
+		filename := filepath.Join(wal.WalDir, FormatWalFile(wal.WalNum.Load()))
 
 		err := wal.createWALUnlocked(filename)
 		if err != nil {
 			// If file is full, try next number
 			if attempt < maxAttempts-1 {
+				fmt.Println("Incrementing WalNum")
+				fmt.Println("wal.WalNum.Load()", wal.WalNum.Load())
+				wal.WalNum.Add(1)
+				fmt.Println("wal.WalNum.Load()", wal.WalNum.Load())
+
 				continue
 			}
 			return 0, err
@@ -253,8 +319,9 @@ func (wal *WAL) ensureWALFile() (int, error) {
 
 // createWALUnlocked creates a new WAL file (must be called with lock held)
 func (wal *WAL) createWALUnlocked(filename string) error {
+
 	// Create the directory if it doesn't exist
-	os.MkdirAll(filepath.Dir(filename), 0750)
+	//os.MkdirAll(filepath.Dir(filename), 0750)
 
 	// Check if file already exists and has space for at least one full fragment
 	// We need room for: 32 bytes header + up to ChunkSize (8192) bytes data = 8224 bytes
@@ -305,6 +372,13 @@ func (wal *WAL) createWALUnlocked(filename string) error {
 
 	// Append the latest "hot" WAL file to the DB
 	wal.Shard.DB = append(wal.Shard.DB, file)
+
+	// Write the state file to disk, current WAL, Shard Num, etc
+	err = wal.SaveState()
+
+	if err != nil {
+		return fmt.Errorf("failed to save state: %v", err)
+	}
 
 	return nil
 }
@@ -559,7 +633,7 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 	return nil
 }
 
-func (wal *WAL) Close() {
+func (wal *WAL) Close() (err error) {
 
 	// Loop through each file
 
@@ -568,6 +642,16 @@ func (wal *WAL) Close() {
 		v.Close()
 
 	}
+
+	// Write the state file to disk, current WAL, Shard Num, etc
+	err = wal.SaveState()
+
+	if err != nil {
+		return fmt.Errorf("failed to save state: %v", err)
+	}
+
+	return
+
 }
 
 // ReadFromWriteResult reads an object using the WriteResult from a previous Write() call
@@ -901,7 +985,7 @@ func (wal *WAL) WALHeader() []byte {
 
 // WALHeaderSize returns the size of the WAL header in bytes
 func (wal *WAL) WALHeaderSize() int {
-	// Magic bytes (4) + Version (2) + BlockSize (4) + Timestamp (8)
+	// Magic bytes (4) + Version (2) + ShardSize (4) + ChunkSize (4)
 	return len(wal.Shard.Magic) + binary.Size(wal.Shard.Version) + binary.Size(wal.Shard.ShardSize) + binary.Size(wal.Shard.ChunkSize)
 }
 
