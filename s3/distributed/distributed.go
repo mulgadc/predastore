@@ -1,16 +1,19 @@
 package distributed
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/s3"
+	"github.com/mulgadc/predastore/s3/wal"
 )
 
 type Backend struct {
@@ -18,6 +21,10 @@ type Backend struct {
 	RsDataShard   int
 	RsParityShard int
 	HashRing      *consistent.Consistent
+	// DataDir is the root directory for distributed node storage.
+	// Each node will have its own sub-directory inside DataDir.
+	// Example: <DataDir>/node-0
+	DataDir string
 }
 
 type Node struct {
@@ -52,6 +59,7 @@ func New(config interface{}) (svc *Backend, err error) {
 
 		RsDataShard:   3,
 		RsParityShard: 2,
+		DataDir:       filepath.Join("s3", "tests", "data", "distributed", "nodes"),
 	}
 
 	// Create a new consistent instance
@@ -66,7 +74,7 @@ func New(config interface{}) (svc *Backend, err error) {
 
 	// Create necessary directories for distributed storage (for testing purposes)
 	for i := range cfg.PartitionCount {
-		os.MkdirAll(fmt.Sprintf("s3/tests/data/distributed/nodes/node-%d", i), 0750)
+		os.MkdirAll(filepath.Join(svc.DataDir, fmt.Sprintf("node-%d", i)), 0750)
 	}
 
 	for i := range cfg.PartitionCount {
@@ -74,6 +82,13 @@ func New(config interface{}) (svc *Backend, err error) {
 	}
 
 	return svc, nil
+}
+
+func (backend Backend) nodeDir(node string) string {
+	if backend.DataDir == "" {
+		return filepath.Join("s3", "tests", "data", "distributed", "nodes", node)
+	}
+	return filepath.Join(backend.DataDir, node)
 }
 
 func (backend Backend) Delete(bucket string, object string, c *fiber.Ctx) (err error) {
@@ -114,7 +129,7 @@ func (backend Backend) Get(bucket string, object string, c *fiber.Ctx) (err erro
 
 			fmt.Println(i, hashRingShards[i].String())
 
-			infn := fmt.Sprintf(fmt.Sprintf("s3/tests/data/distributed/nodes/%s/%s.%d", hashRingShards[i].String(), object, i))
+			infn := filepath.Join(backend.nodeDir(hashRingShards[i].String()), fmt.Sprintf("%s.%d", object, i))
 			fmt.Println("Opening", infn)
 			shards[i], err = os.ReadFile(infn)
 			if err != nil {
@@ -197,7 +212,7 @@ func (backend Backend) Get(bucket string, object string, c *fiber.Ctx) (err erro
 				outfn := fmt.Sprintf("%s.%d", object, i)
 
 				fmt.Println("Writing to", outfn)
-				out[i], err = os.Create(filepath.Join(fmt.Sprintf("s3/tests/data/distributed/nodes/%s", hashRingShards[i]), outfn))
+				out[i], err = os.Create(filepath.Join(backend.nodeDir(hashRingShards[i].String()), outfn))
 				checkErr(err)
 			}
 		}
@@ -263,125 +278,201 @@ func (backend Backend) PutObjectPart(bucket string, object string, partNumber in
 
 }
 
-func (backend Backend) PutObject(bucket string, object string, c *fiber.Ctx) (err error) {
+type shardWriteOutcome struct {
+	shardIndex int
+	result     *wal.WriteResult
+	err        error
+}
 
-	// Simple encoder
-	/*
-		// Create encoding matrix.
-		enc, err := reedsolomon.New(backend.RsDataShard, backend.RsParityShard)
-		checkErr(err)
-
-		fmt.Println("Opening", object)
-		b, err := os.ReadFile(object)
-		checkErr(err)
-
-		// Split the file into equally sized shards.
-		shards, err := enc.Split(b)
-		checkErr(err)
-		fmt.Printf("File split into %d data+parity shards with %d bytes/shard.\n", len(shards), len(shards[0]))
-
-		// Encode parity
-		err = enc.Encode(shards)
-		checkErr(err)
-
-		// Write out the resulting files.
-		_, file := filepath.Split(object)
-
-		key := []byte(fmt.Sprintf("%s/%s", bucket, file))
-
-		// calculates partition id for the given key
-		// partID := hash(key) % partitionCount
-		// the partitions are already distributed among members by Add function.
-		owner := backend.HashRing.LocateKey(key)
-		fmt.Println(owner.String())
-
-		// Next, get the data and parity shards from the owner node
-		hashRingShards, err := backend.HashRing.GetClosestN(key, backend.RsDataShard+backend.RsParityShard)
-
-		fmt.Println("Writing shards to nodes:")
-		fmt.Println("hashRingShards:", hashRingShards)
-
-		for i, shard := range shards {
-			outfn := fmt.Sprintf("%s.%d", file, i)
-
-			fmt.Println("Writing to", outfn)
-			err = os.WriteFile(filepath.Join(fmt.Sprintf("s3/tests/data/distributed/nodes/%s", hashRingShards[i]), outfn), shard, 0644)
-			checkErr(err)
-		}
-	*/
-
+// putObjectToWAL splits an on-disk file into RS shards and writes each shard to the WAL
+// for the node selected by the hash ring. It returns the WAL WriteResults for data and parity shards.
+func (backend Backend) putObjectToWAL(bucket string, objectPath string) (dataResults []*wal.WriteResult, parityResults []*wal.WriteResult, err error) {
 	// Stream encoder
-	// Create encoding matrix.
 	enc, err := reedsolomon.NewStream(backend.RsDataShard, backend.RsParityShard)
-	checkErr(err)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	fmt.Println("Opening", object)
-	f, err := os.Open(object)
-	checkErr(err)
+	f, err := os.Open(objectPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
 
 	instat, err := f.Stat()
-	checkErr(err)
+	if err != nil {
+		return nil, nil, err
+	}
 
-	shards := backend.RsDataShard + backend.RsParityShard
-	out := make([]*os.File, shards)
-
-	// Create the resulting files.
-
-	_, file := filepath.Split(object)
-	// Stream
-
+	_, file := filepath.Split(objectPath)
 	key := []byte(fmt.Sprintf("%s/%s", bucket, file))
 
-	// calculates partition id for the given key
-	// partID := hash(key) % partitionCount
-	// the partitions are already distributed among members by Add function.
-	owner := backend.HashRing.LocateKey(key)
-	fmt.Println(owner.String())
-
-	// Next, get the data and parity shards from the owner node
 	hashRingShards, err := backend.HashRing.GetClosestN(key, backend.RsDataShard+backend.RsParityShard)
-
-	for i := range out {
-		outfn := fmt.Sprintf("%s.%d", file, i)
-
-		fmt.Println("Writing to", outfn)
-		out[i], err = os.Create(filepath.Join(fmt.Sprintf("s3/tests/data/distributed/nodes/%s", hashRingShards[i]), outfn))
-		checkErr(err)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	// Split into files.
-	data := make([]io.Writer, backend.RsDataShard)
-	for i := range data {
-		data[i] = out[i]
+	totalShards := backend.RsDataShard + backend.RsParityShard
+	walFiles := make([]*wal.WAL, totalShards)
+	for i := range walFiles {
+		walDir := backend.nodeDir(hashRingShards[i].String())
+		if mkErr := os.MkdirAll(walDir, 0750); mkErr != nil {
+			return nil, nil, mkErr
+		}
+		walFiles[i], err = wal.New(filepath.Join(walDir, "state.json"), walDir)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
-	// Do the split
-	err = enc.Split(f, data, instat.Size())
-	checkErr(err)
+	defer func() {
+		for i := range walFiles {
+			if walFiles[i] != nil {
+				_ = walFiles[i].Close()
+			}
+		}
+	}()
 
-	// Close and re-open the files.
-	input := make([]io.Reader, backend.RsDataShard)
+	// Each data shard is ceil(fileSize / dataShards) bytes (RS pads as needed).
+	fileSize := instat.Size()
+	ds := int64(backend.RsDataShard)
+	shardSize := int((fileSize + ds - 1) / ds)
 
-	for i := range data {
-		out[i].Close()
-		f, err := os.Open(out[i].Name())
-		checkErr(err)
-		input[i] = f
-		defer f.Close()
+	// 1) Split input -> data shard writers (pipes) -> per-node WAL writers (wal.Write reads from pipes).
+	dataWriters := make([]io.Writer, backend.RsDataShard)
+	dataPipeWriters := make([]*io.PipeWriter, backend.RsDataShard)
+
+	dataResults = make([]*wal.WriteResult, backend.RsDataShard)
+	dataCh := make(chan shardWriteOutcome, backend.RsDataShard)
+	var dataWG sync.WaitGroup
+
+	for i := 0; i < backend.RsDataShard; i++ {
+		pr, pw := io.Pipe()
+		dataPipeWriters[i] = pw
+		dataWriters[i] = pw
+
+		dataWG.Add(1)
+		go func(idx int, r *io.PipeReader) {
+			defer dataWG.Done()
+			res, werr := walFiles[idx].Write(r, shardSize)
+			dataCh <- shardWriteOutcome{shardIndex: idx, result: res, err: werr}
+		}(i, pr)
 	}
 
-	// Create parity output writers
-	parity := make([]io.Writer, backend.RsParityShard)
-	for i := range parity {
-		parity[i] = out[backend.RsDataShard+i]
-		defer out[backend.RsDataShard+i].Close()
+	splitErr := enc.Split(f, dataWriters, fileSize)
+
+	// Close all writers to unblock WAL readers.
+	for i := 0; i < backend.RsDataShard; i++ {
+		if splitErr != nil {
+			_ = dataPipeWriters[i].CloseWithError(splitErr)
+		} else {
+			_ = dataPipeWriters[i].Close()
+		}
 	}
 
-	// Encode parity
-	err = enc.Encode(input, parity)
-	checkErr(err)
-	fmt.Printf("File split into %d data + %d parity shards.\n", backend.RsDataShard, backend.RsParityShard)
+	// Wait for all WAL goroutines to send results, then close channel.
+	go func() {
+		dataWG.Wait()
+		close(dataCh)
+	}()
 
-	return
+	var firstErr error
+	for outcome := range dataCh {
+		if outcome.err != nil && firstErr == nil {
+			firstErr = outcome.err
+		}
+		dataResults[outcome.shardIndex] = outcome.result
+	}
+	if splitErr != nil && firstErr == nil {
+		firstErr = splitErr
+	}
+	if firstErr != nil {
+		return nil, nil, firstErr
+	}
+
+	// 2) Encode parity using the data shards we just wrote (read back) -> parity pipes -> parity WAL writes.
+	dataReaders := make([]io.Reader, backend.RsDataShard)
+	for i := 0; i < backend.RsDataShard; i++ {
+		b, rerr := walFiles[i].ReadFromWriteResult(dataResults[i])
+		if rerr != nil {
+			return nil, nil, rerr
+		}
+		dataReaders[i] = bytes.NewReader(b)
+	}
+
+	parityWriters := make([]io.Writer, backend.RsParityShard)
+	parityPipeWriters := make([]*io.PipeWriter, backend.RsParityShard)
+	parityResults = make([]*wal.WriteResult, backend.RsParityShard)
+
+	parityCh := make(chan shardWriteOutcome, backend.RsParityShard)
+	var parityWG sync.WaitGroup
+	for i := 0; i < backend.RsParityShard; i++ {
+		pr, pw := io.Pipe()
+		parityPipeWriters[i] = pw
+		parityWriters[i] = pw
+
+		walIdx := backend.RsDataShard + i
+		parityWG.Add(1)
+		go func(localParityIdx int, walIndex int, r *io.PipeReader) {
+			defer parityWG.Done()
+			res, werr := walFiles[walIndex].Write(r, shardSize)
+			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: res, err: werr}
+		}(i, walIdx, pr)
+	}
+
+	encodeErr := enc.Encode(dataReaders, parityWriters)
+
+	for i := 0; i < backend.RsParityShard; i++ {
+		if encodeErr != nil {
+			_ = parityPipeWriters[i].CloseWithError(encodeErr)
+		} else {
+			_ = parityPipeWriters[i].Close()
+		}
+	}
+
+	go func() {
+		parityWG.Wait()
+		close(parityCh)
+	}()
+
+	firstErr = nil
+	for outcome := range parityCh {
+		if outcome.err != nil && firstErr == nil {
+			firstErr = outcome.err
+		}
+		parityResults[outcome.shardIndex] = outcome.result
+	}
+	if encodeErr != nil && firstErr == nil {
+		firstErr = encodeErr
+	}
+	if firstErr != nil {
+		return nil, nil, firstErr
+	}
+
+	return dataResults, parityResults, nil
+}
+
+func (backend Backend) PutObject(bucket string, object string, c *fiber.Ctx) (err error) {
+
+	dataRes, parityRes, err := backend.putObjectToWAL(bucket, object)
+	if err != nil {
+		return err
+	}
+
+	_, file := filepath.Split(object)
+	key := []byte(fmt.Sprintf("%s/%s", bucket, file))
+	hashRingShards, _ := backend.HashRing.GetClosestN(key, backend.RsDataShard+backend.RsParityShard)
+
+	// Print the WAL location results for now (Badger KV later).
+	for i := 0; i < backend.RsDataShard; i++ {
+		fmt.Printf("put_object wal_write data_shard=%d node=%s write_result=%#v\n",
+			i, hashRingShards[i].String(), dataRes[i])
+	}
+	for i := 0; i < backend.RsParityShard; i++ {
+		fmt.Printf("put_object wal_write parity_shard=%d node=%s write_result=%#v\n",
+			i, hashRingShards[backend.RsDataShard+i].String(), parityRes[i])
+	}
+
+	return nil
 
 }
 
@@ -410,7 +501,7 @@ func (backend Backend) openInput(bucket string, object string) (r []io.Reader, s
 			outfn := fmt.Sprintf("%s.%d", file, i)
 
 			fmt.Println("Writing to", outfn)
-			out[i], err = os.Create(filepath.Join(fmt.Sprintf("s3/tests/data/distributed/nodes/%s", hashRingShards[i]), outfn))
+			out[i], err = os.Create(filepath.Join(backend.nodeDir(hashRingShards[i].String()), outfn))
 			checkErr(err)
 		}
 
@@ -421,7 +512,7 @@ func (backend Backend) openInput(bucket string, object string) (r []io.Reader, s
 	for i := range shards {
 		//infn := fmt.Sprintf("%s.%d", fname, i)
 
-		infn := fmt.Sprintf("s3/tests/data/distributed/nodes/%s/%s.%d", hashRingShards[i], object, i)
+		infn := filepath.Join(backend.nodeDir(hashRingShards[i].String()), fmt.Sprintf("%s.%d", object, i))
 
 		fmt.Println("Opening", infn)
 		f, err := os.Open(infn)

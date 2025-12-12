@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -44,6 +45,16 @@ const (
 
 // setupServer starts the S3 server for testing
 func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
+	t.Helper()
+
+	// These are integration tests that spin up a TLS server on a fixed port.
+	// In restricted environments (e.g. sandboxed CI) binding to ports may be disallowed.
+	ln, lerr := net.Listen("tcp4", "127.0.0.1:8443")
+	if lerr != nil {
+		t.Skipf("skipping integration tests: cannot listen on 127.0.0.1:8443: %v", lerr)
+	}
+	_ = ln.Close()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	wg = &sync.WaitGroup{}
 	wg.Add(1)

@@ -1,3 +1,4 @@
+.gocache
 s3/tests/data/distributed/
 .DS_Store
 s3/tests/data/test-*
