@@ -414,7 +414,7 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 
 			// Get new WAL file number and determine offset
 			wal.mu.RLock()
-			newWALNum := wal.SeqNum.Load()
+			newWALNum := wal.WalNum.Load()
 			var newOffset int64 = 0
 			if walIndex < len(wal.Shard.DB) {
 				activeWal := wal.Shard.DB[walIndex]
