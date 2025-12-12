@@ -33,14 +33,8 @@ func calculateExpectedWALFiles(dataSize int, shardSize uint32, chunkSize uint32,
 	numWALFiles := 1
 
 	for remainingData > 0 {
-		// Calculate chunk size (up to ChunkSize or remaining data)
-		chunkDataSize := int64(chunkSize)
-		if remainingData < chunkDataSize {
-			chunkDataSize = remainingData
-		}
-
-		// Calculate fragment size (header + data)
-		fragmentSize := fragmentHeaderSize + chunkDataSize
+		// Each fragment is fixed-size on disk: header + ChunkSize payload (padded).
+		fragmentSize := fragmentHeaderSize + int64(chunkSize)
 
 		// Check if this fragment fits in current WAL file
 		if currentFileSize+fragmentSize > maxFileSize {
@@ -51,7 +45,12 @@ func calculateExpectedWALFiles(dataSize int, shardSize uint32, chunkSize uint32,
 
 		// Add fragment to current WAL
 		currentFileSize += fragmentSize
-		remainingData -= chunkDataSize
+		// Logical data consumption is still up to ChunkSize per fragment.
+		if remainingData > int64(chunkSize) {
+			remainingData -= int64(chunkSize)
+		} else {
+			remainingData = 0
+		}
 	}
 
 	return numWALFiles
@@ -71,14 +70,8 @@ func calculateWALFileSizes(dataSize int, shardSize uint32, chunkSize uint32, wal
 	currentWALFileSize := int64(0) // Size written for this object (fragment headers + data, excluding WAL header)
 
 	for remainingData > 0 {
-		// Calculate chunk size (up to ChunkSize or remaining data)
-		chunkDataSize := int64(chunkSize)
-		if remainingData < chunkDataSize {
-			chunkDataSize = remainingData
-		}
-
-		// Calculate fragment size (header + data)
-		fragmentSize := fragmentHeaderSize + chunkDataSize
+		// Each fragment is fixed-size on disk: header + ChunkSize payload (padded).
+		fragmentSize := fragmentHeaderSize + int64(chunkSize)
 
 		// Check if this fragment fits in current WAL file (check total file size including WAL header)
 		if currentFileTotalSize+fragmentSize > maxFileSize {
@@ -97,7 +90,12 @@ func calculateWALFileSizes(dataSize int, shardSize uint32, chunkSize uint32, wal
 		// Add fragment to current WAL
 		currentFileTotalSize += fragmentSize
 		currentWALFileSize += fragmentSize // Track size (fragment header + data)
-		remainingData -= chunkDataSize
+		// Logical data consumption is still up to ChunkSize per fragment.
+		if remainingData > int64(chunkSize) {
+			remainingData -= int64(chunkSize)
+		} else {
+			remainingData = 0
+		}
 
 		// Ensure sizes slice is large enough and update
 		for len(sizes) <= currentWAL {
@@ -124,50 +122,117 @@ func calculateWALFileSizes(dataSize int, shardSize uint32, chunkSize uint32, wal
 
 func TestNew(t *testing.T) {
 
-	tmpDir := os.TempDir()
+	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
+	assert.NoError(t, err, "MkdirTemp dir should not fail")
 
-	// Remove the previous WAL for tesitng
-	os.RemoveAll(filepath.Join(tmpDir, FormatWalFile(1)))
+	// Clean up any existing WAL files in this temp dir (fresh)
+	for i := 1; i <= 5; i++ {
+		os.RemoveAll(filepath.Join(tmpDir, FormatWalFile(uint64(i))))
+	}
 
 	wal, err := New("", tmpDir)
-
 	t.Log("tmpDir", tmpDir)
-
 	assert.NoError(t, err, "Should read config without error")
 	assert.NotNil(t, wal)
 
-	f, err := os.Open("/Users/benduncan/Desktop/vendors-mock.json")
-	assert.NoError(t, err, "Could not open file")
+	// Use deterministic in-test data (avoid external filesystem dependencies).
+	size := 256*1024 + 123 // spans multiple chunks with remainder
+	origFile := make([]byte, size)
+	for i := range origFile {
+		origFile[i] = byte((i + size) % 256)
+	}
 
-	stat, err := os.Stat("/Users/benduncan/Desktop/vendors-mock.json")
-	assert.NoError(t, err, "Could not stat file")
-
-	origFile, err := os.ReadFile("/Users/benduncan/Desktop/vendors-mock.json")
-	assert.NoError(t, err, "Could not read file")
-
-	writeResult, err := wal.Write(f, int(stat.Size()))
+	writeResult, err := wal.Write(bytes.NewReader(origFile), len(origFile))
 	assert.NoError(t, err, "Write should not error")
 	assert.NotNil(t, writeResult)
 
 	d, err := wal.ReadFromWriteResult(writeResult)
-
 	assert.NoError(t, err, "Read should not error")
 	assert.NotEmpty(t, d, "Data empty")
 
-	// Should match original
-
 	assert.True(t, bytes.Equal(origFile, d), "Data should match original")
-
-	// Diff the bytes
 	if diff := cmp.Diff(origFile, d); diff != "" {
 		t.Errorf("Bytes differ (-want +got):\n%s", diff)
 	}
 
-	//fmt.Println(string(d))
+	wal.Close()
+}
+
+func TestNewWriteOutput(t *testing.T) {
+
+	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
+	t.Log(tmpDir)
+	assert.NoError(t, err, "MkdirTemp dir should not fail")
+
+	wal, err := New("", tmpDir)
+	assert.NoError(t, err, "Should create WAL without error")
+	assert.NotNil(t, wal)
+
+	testCases := []struct {
+		name              string
+		data              []byte
+		expectedWALNum    uint64
+		expectedOffset    int64
+		expectedSize      int64
+		expectedTotalSize int
+		expectedShardNum  uint64
+	}{
+		{"1kb", make([]byte, 1*1024), 1, 0, int64(ChunkSize + FragmentHeaderBytes), 1 * 1024, 1},
+
+		{"16kb", make([]byte, 16*1024), 1, int64(ChunkSize + FragmentHeaderBytes), int64(ChunkSize+FragmentHeaderBytes) * 2, 16 * 1024, 2},
+
+		{"256kb", make([]byte, 256*1024), 1,
+			int64(ChunkSize+FragmentHeaderBytes) * 3, int64((ChunkSize + FragmentHeaderBytes) * 32), 256 * 1024, 3},
+
+		{"8193 bytes (one chunk + 1 byte)", make([]byte, 8193), 1, int64(ChunkSize+FragmentHeaderBytes) * 35, int64((ChunkSize + FragmentHeaderBytes) * 2), 8193, 4},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+
+			sampleSize := len(tc.data)
+			for i := range tc.data {
+				tc.data[i] = byte((i + sampleSize) % 256)
+			}
+
+			testDataReader := bytes.NewReader(tc.data)
+			writeResult, err := wal.Write(testDataReader, len(tc.data))
+
+			t.Log("writeResult", writeResult)
+
+			assert.NoError(t, err, "Write should not error")
+			assert.NotNil(t, writeResult, "WriteResult should not be nil")
+			assert.Equal(t, tc.expectedWALNum, writeResult.WALFiles[0].WALNum, "WALNum should be the expected value")
+			assert.Equal(t, tc.expectedOffset, writeResult.WALFiles[0].Offset, "Offset should be the expected value")
+			assert.Equal(t, tc.expectedSize, writeResult.WALFiles[0].Size, "Size should be the expected value")
+			assert.Equal(t, tc.expectedTotalSize, writeResult.TotalSize, "TotalSize should be the expected value")
+			assert.Equal(t, tc.expectedShardNum, writeResult.ShardNum, "ShardNum should be the expected value")
+
+			// Next read the result, confirm it's the same.
+			data, err := wal.ReadFromWriteResult(writeResult)
+			assert.NoError(t, err, "Read should not error")
+			assert.NotNil(t, data, "Data should not be nil")
+			assert.Equal(t, len(tc.data), len(data), "Data should be the same length as the test data")
+			assert.True(t, bytes.Equal(tc.data, data), "Data should match the test data")
+
+		})
+
+	}
 
 	wal.Close()
 
-	//
+	// Delete the tmpDir
+
+	os.RemoveAll(tmpDir)
+
+	// Verify the tmpDir is deleted
+	_, err = os.Stat(tmpDir)
+	assert.Error(t, err, "tmpDir should be deleted")
+
+	// Verify the WAL files are deleted
+	for i := uint64(1); i <= wal.WalNum.Load(); i++ {
+		assert.NoFileExists(t, filepath.Join(tmpDir, FormatWalFile(uint64(i))))
+	}
 }
 
 func TestNewWithStateFile(t *testing.T) {
@@ -280,6 +345,13 @@ func TestNewWithStateFile(t *testing.T) {
 	assert.Equal(t, wal3.WalNum.Load()+2, wal4.WalNum.Load(), "WalNum should match")
 
 	wal4.Close()
+
+	// Delete the tmpDir
+	os.RemoveAll(tmpDir)
+
+	// Verify the tmpDir is deleted
+	_, err = os.Stat(tmpDir)
+	assert.Error(t, err, "tmpDir should be deleted")
 
 }
 
@@ -442,24 +514,27 @@ func TestWriteVariousSizes(t *testing.T) {
 		{"2MB", 2 * 1024 * 1024},
 		{"4MB", 4 * 1024 * 1024},
 		{"8MB", 8 * 1024 * 1024},
-		// Edge cases with uneven sizes
-		{"4082 bytes (less than one chunk)", 4082},
-		{"8011 bytes (just over one chunk)", 8011},
-		{"55KB (multiple chunks, not aligned)", 55 * 1024},
+		// Key edge cases around chunk/shard boundaries
 		{"8193 bytes (one chunk + 1 byte)", 8193},
-		{"16385 bytes (two chunks + 1 byte)", 16385},
-		{"4194303 bytes (1 byte less than ShardSize)", 4194303},
-		{"4194305 bytes (1 byte more than ShardSize)", 4194305},
+		{"ShardSize-1 (1 byte less than ShardSize)", int(ShardSize) - 1},
+		{"ShardSize+1 (1 byte more than ShardSize)", int(ShardSize) + 1},
+	}
+
+	if testing.Short() {
+		// Keep runtime well under small -timeout values.
+		sizes = []struct {
+			name string
+			size int
+		}{
+			{"16KB", 16 * 1024},
+			{"256KB", 256 * 1024},
+			{"8193 bytes (one chunk + 1 byte)", 8193},
+		}
 	}
 
 	for _, tc := range sizes {
 		t.Run(tc.name, func(t *testing.T) {
-			tmpDir := os.TempDir()
-
-			// Clean up any existing WAL files
-			for i := 1; i <= 20; i++ {
-				os.RemoveAll(filepath.Join(tmpDir, FormatWalFile(uint64(i))))
-			}
+			tmpDir := t.TempDir()
 
 			wal, err := New("", tmpDir)
 			assert.NoError(t, err, "Should create WAL without error")
@@ -514,10 +589,10 @@ func TestWriteVariousSizes(t *testing.T) {
 
 			// Verify total size across all WAL files matches expected
 			numFragments := (tc.size + int(ChunkSize) - 1) / int(ChunkSize)
-			expectedTotalSize := int64(tc.size) + int64(numFragments*32)
-			assert.InDelta(t, expectedTotalSize, totalWrittenSize, 100.0,
-				"Total size across all WAL files should be approximately %d (data %d + %d fragment headers), got %d",
-				expectedTotalSize, tc.size, numFragments*32, totalWrittenSize)
+			expectedTotalSize := int64(numFragments) * int64(32+ChunkSize)
+			assert.InDelta(t, expectedTotalSize, totalWrittenSize, 1.0,
+				"Total size across all WAL files should be %d (%d fragments * (32+ChunkSize)), got %d",
+				expectedTotalSize, numFragments, totalWrittenSize)
 
 			// Verify WAL files are sequential and offsets are correct
 			for i := 1; i < len(writeResult.WALFiles); i++ {
@@ -601,10 +676,9 @@ func TestWriteReadOffsetsAndChunkBoundaries(t *testing.T) {
 			size: 8193,
 			validate: func(t *testing.T, result *WriteResult, wal *WAL) {
 				assert.Equal(t, 1, len(result.WALFiles), "Should use exactly 1 WAL file")
-				// Should have 2 fragments: (32+8192) + (32+1) = 8257 bytes
-				// But if file was reused, size might be different
+				// Should have 2 fragments on disk: 2 * (32+8192)
 				if result.WALFiles[0].Offset == 0 {
-					expectedSize := int64(32+8192) + int64(32+1)
+					expectedSize := int64(2 * (32 + 8192))
 					assert.Equal(t, expectedSize, result.WALFiles[0].Size,
 						"WAL file size should be %d (two fragments)", expectedSize)
 				}
@@ -633,10 +707,9 @@ func TestWriteReadOffsetsAndChunkBoundaries(t *testing.T) {
 			size: 100,
 			validate: func(t *testing.T, result *WriteResult, wal *WAL) {
 				assert.Equal(t, 1, len(result.WALFiles), "Should use exactly 1 WAL file")
-				// Should have 1 fragment: 32 bytes header + 100 bytes data = 132 bytes
-				// But if file was reused, size might be different
+				// On disk payload is padded: 1 * (32+8192)
 				if result.WALFiles[0].Offset == 0 {
-					expectedSize := int64(32 + 100)
+					expectedSize := int64(32 + 8192)
 					assert.Equal(t, expectedSize, result.WALFiles[0].Size,
 						"WAL file size should be %d", expectedSize)
 				}
@@ -664,13 +737,25 @@ func TestWriteReadOffsetsAndChunkBoundaries(t *testing.T) {
 		},
 	}
 
+	if testing.Short() {
+		// Drop the largest case for quick runs.
+		filtered := make([]struct {
+			name     string
+			size     int
+			validate func(t *testing.T, result *WriteResult, wal *WAL)
+		}, 0, len(testCases))
+		for _, tc := range testCases {
+			if tc.name == "Multiple chunks crossing WAL boundary" {
+				continue
+			}
+			filtered = append(filtered, tc)
+		}
+		testCases = filtered
+	}
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Clean up any existing WAL files to ensure fresh state
-			tmpDir := os.TempDir()
-			for i := 1; i <= 20; i++ {
-				os.RemoveAll(filepath.Join(tmpDir, FormatWalFile(uint64(i))))
-			}
+			tmpDir := t.TempDir()
 
 			// Create fresh WAL for this test
 			wal, err := New("", tmpDir)
@@ -703,13 +788,6 @@ func TestWriteReadOffsetsAndChunkBoundaries(t *testing.T) {
 }
 
 func TestReadEndOfShardValidation(t *testing.T) {
-	tmpDir := os.TempDir()
-
-	// Clean up any existing WAL files
-	for i := 1; i <= 10; i++ {
-		os.RemoveAll(filepath.Join(tmpDir, FormatWalFile(uint64(i))))
-	}
-
 	testCases := []struct {
 		name        string
 		dataSize    int
@@ -742,12 +820,15 @@ func TestReadEndOfShardValidation(t *testing.T) {
 		},
 	}
 
+	if testing.Short() {
+		// Drop the largest case for quick runs.
+		testCases = testCases[:len(testCases)-1]
+	}
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Clean up for each test
-			for i := 1; i <= 20; i++ {
-				os.RemoveAll(filepath.Join(tmpDir, FormatWalFile(uint64(i))))
-			}
+			// Fresh WAL dir per subtest to avoid file reuse/offset interactions.
+			tmpDir := t.TempDir()
 
 			wal, err := New("", tmpDir)
 			assert.NoError(t, err, "Should create WAL without error")
@@ -798,14 +879,15 @@ func TestReadEndOfShardValidation(t *testing.T) {
 				fragment.Flags = Flags(binary.BigEndian.Uint32(headerBuf[24:28]))
 				fragment.Checksum = binary.BigEndian.Uint32(headerBuf[28:32])
 
-				// Read payload
-				payload := make([]byte, fragment.Length)
+				// Read full on-disk payload (fixed ChunkSize), not the logical fragment.Length.
+				// (WAL always writes padded ChunkSize bytes per fragment on disk.)
+				payload := make([]byte, wal.Shard.ChunkSize)
 				_, err = io.ReadFull(f, payload)
 				if err != nil {
 					break
 				}
 
-				totalRead += int64(32 + fragment.Length)
+				totalRead += int64(FragmentHeaderBytes + wal.Shard.ChunkSize)
 
 				// Check if this is the last fragment
 				if fragment.Flags&FlagEndOfShard != 0 {

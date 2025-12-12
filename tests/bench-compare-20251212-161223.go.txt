@@ -1,0 +1,23 @@
+ROOT_DIR: /Users/benduncan/Development/mulga/predastore
+WAL_DIR:  /Users/benduncan/Development/mulga/predastore/s3/wal
+OUT_PREFIX: /Users/benduncan/Development/mulga/predastore/s3/wal/bench-compare-20251212-161223
+BENCHTIME: 300ms
+SHORT: 1
+
+== WAL (Go benchmark, O_SYNC) ==
+benchtime=300ms
+
+goos: darwin
+goarch: arm64
+pkg: github.com/mulgadc/predastore/s3/wal
+cpu: Apple M1 Pro
+BenchmarkWAL_Write/write/4KiB-8         	    3976	    107044 ns/op	  38.26 MB/s	   18646 B/op	       9 allocs/op
+BenchmarkWAL_Write/write/64KiB-8        	     426	   1084839 ns/op	  60.41 MB/s	  147203 B/op	      53 allocs/op
+BenchmarkWAL_Write/write/1MiB-8         	      26	  14830314 ns/op	  70.70 MB/s	 2352254 B/op	     812 allocs/op
+BenchmarkWAL_Write/write/8MiB-8         	       3	 117102833 ns/op	  71.63 MB/s	18794938 B/op	    6409 allocs/op
+BenchmarkWAL_Read/read/4KiB-8           	   18291	     19512 ns/op	 209.92 MB/s	   12724 B/op	      10 allocs/op
+BenchmarkWAL_Read/read/64KiB-8          	    6471	     63110 ns/op	1038.44 MB/s	  132024 B/op	      31 allocs/op
+BenchmarkWAL_Read/read/1MiB-8           	     440	    846176 ns/op	1239.19 MB/s	 2107056 B/op	     399 allocs/op
+BenchmarkWAL_Read/read/8MiB-8           	      74	   4998730 ns/op	1678.15 MB/s	16847479 B/op	    3132 allocs/op
+PASS
+ok  	github.com/mulgadc/predastore/s3/wal	6.214s

@@ -24,6 +24,12 @@ var ShardSize uint32 = 1024 * 1024 * 4
 // 8kb chunk sizes
 const ChunkSize uint32 = 1024 * 8
 
+const (
+	// FragmentHeaderBytes is the on-disk header size per fragment.
+	// See Fragment.FragmentHeaderSize() which is expected to be 32.
+	FragmentHeaderBytes = 32
+)
+
 type Flags uint32
 
 const (
@@ -95,15 +101,6 @@ type WriteResult struct {
 }
 
 func New(stateFile, walDir string) (wal *WAL, err error) {
-
-	// Add header, and each Chunk header
-	// FragmentHeaderSize() is 32 bytes
-	// WALHeaderSize() 14 bytes
-	var shardHeaders = ((ShardSize / ChunkSize) * 32) + 14
-
-	// Append shardHeaders
-	ShardSize -= shardHeaders
-
 	// State
 	wal = &WAL{
 		WalDir:    walDir,
@@ -111,8 +108,9 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 
 		Shard: Shard{
 			// S3 Shard File (S3SF)
-			Magic:     [4]byte{'S', '3', 'S', 'F'},
-			Version:   1,
+			Magic:   [4]byte{'S', '3', 'S', 'F'},
+			Version: 1,
+			// ShardSize is the max on-disk WAL file size (including WAL header + fragments).
 			ShardSize: ShardSize,
 			ChunkSize: ChunkSize,
 		},
@@ -120,11 +118,8 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 
 	_, err = os.Stat(stateFile)
 
-	fmt.Println("stateFile", stateFile, "err", err)
-
 	// If no file exists, start from 0
 	if err != nil {
-		fmt.Println("Incrementing WalNum and SeqNum")
 		wal.SeqNum.Add(1)
 		wal.WalNum.Add(1)
 	} else {
@@ -137,7 +132,6 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 	walNum := wal.WalNum.Load()
 
 	filename := filepath.Join(walDir, FormatWalFile(walNum))
-	fmt.Println("walNum", walNum, "filename", filename)
 
 	_, err = os.Stat(filename)
 
@@ -285,7 +279,7 @@ func (wal *WAL) ensureWALFile() (int, error) {
 		// ShardSize is the max total file size on disk (including WAL header and fragment headers)
 		// We need to leave room for at least one fragment (32 bytes header + up to ChunkSize data)
 		// Use strict < to ensure we always have room
-		maxFragmentSize := int64(32 + ChunkSize)
+		maxFragmentSize := int64(FragmentHeaderBytes + ChunkSize)
 		if stat.Size() < int64(wal.Shard.ShardSize)-maxFragmentSize {
 			return len(wal.Shard.DB) - 1, nil
 		}
@@ -301,10 +295,10 @@ func (wal *WAL) ensureWALFile() (int, error) {
 		if err != nil {
 			// If file is full, try next number
 			if attempt < maxAttempts-1 {
-				fmt.Println("Incrementing WalNum")
-				fmt.Println("wal.WalNum.Load()", wal.WalNum.Load())
+				//fmt.Println("Incrementing WalNum")
+				//fmt.Println("wal.WalNum.Load()", wal.WalNum.Load())
 				wal.WalNum.Add(1)
-				fmt.Println("wal.WalNum.Load()", wal.WalNum.Load())
+				//fmt.Println("wal.WalNum.Load()", wal.WalNum.Load())
 
 				continue
 			}
@@ -325,7 +319,7 @@ func (wal *WAL) createWALUnlocked(filename string) error {
 
 	// Check if file already exists and has space for at least one full fragment
 	// We need room for: 32 bytes header + up to ChunkSize (8192) bytes data = 8224 bytes
-	maxFragmentSize := int64(32 + ChunkSize)
+	maxFragmentSize := int64(FragmentHeaderBytes + ChunkSize)
 	if stat, err := os.Stat(filename); err == nil {
 		// File exists, check if it has space for at least one fragment
 		if stat.Size()+maxFragmentSize > int64(wal.Shard.ShardSize) {
@@ -361,7 +355,7 @@ func (wal *WAL) createWALUnlocked(filename string) error {
 		}
 	} else {
 		// File exists, verify it has space for at least one fragment
-		maxFragmentSize := int64(32 + ChunkSize)
+		maxFragmentSize := int64(FragmentHeaderBytes + ChunkSize)
 		if stat.Size()+maxFragmentSize > int64(wal.Shard.ShardSize) {
 			// File doesn't have enough space, close it and return error
 			file.Close()
@@ -481,7 +475,9 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 
 		// Check if this chunk fits in current WAL file
 		// ShardSize is the max total file size on disk (including WAL header and all fragment headers)
-		chunkSizeWithHeader := int64(32 + actualChunkSize)
+		// NOTE: On-disk payload is ALWAYS ChunkSize bytes (padded with zeros when actualChunkSize < ChunkSize),
+		// so every fragment consumes a fixed size on disk.
+		chunkSizeWithHeader := int64(FragmentHeaderBytes + ChunkSize)
 		currentTotalSize := stat.Size()
 		// Use strict check: if adding this chunk would exceed ShardSize, create a new file
 		if currentTotalSize+chunkSizeWithHeader > int64(wal.Shard.ShardSize) {
@@ -499,7 +495,7 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 
 			// Update tracking for new file
 			wal.mu.RLock()
-			newWALNum := wal.SeqNum.Load()
+			newWALNum := wal.WalNum.Load()
 			var newOffset int64 = 0
 			if walIndex < len(wal.Shard.DB) {
 				activeWal := wal.Shard.DB[walIndex]
@@ -552,7 +548,8 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 		}
 
 		// Track size written for this object in current WAL file (from the offset)
-		fragmentSize := int64(32 + actualChunkSize) // header + data
+		// header + fixed on-disk payload
+		fragmentSize := int64(FragmentHeaderBytes + ChunkSize)
 		currentWALFileSize += fragmentSize
 		remaining -= actualChunkSize
 		shardFragment++
@@ -604,7 +601,9 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 	}
 
 	// Calculate a CRC32 checksum of the block data and headers
-	payload := make([]byte, fragment.FragmentHeaderSize()+len(chunk))
+	// On disk, every fragment payload is exactly ChunkSize bytes (padded with zeros).
+	// The header Length field stores the logical size.
+	payload := make([]byte, fragment.FragmentHeaderSize()+int(ChunkSize))
 
 	headers := fragment.FragmentHeader()
 	copy(payload[0:len(headers)], headers)
@@ -615,14 +614,19 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 	binary.BigEndian.PutUint32(payload[20:24], uint32(fragment.Length))
 	binary.BigEndian.PutUint32(payload[24:28], uint32(fragment.Flags))
 
+	// Add the data to the chunk
+	copy(payload[FragmentHeaderBytes:FragmentHeaderBytes+len(chunk)], chunk)
+
+	// Checksum is calculated over: full 32-byte header (with checksum field set to 0) + full (padded) ChunkSize payload.
 	checksum_validated := crc32.ChecksumIEEE(payload[0:len(headers)])
-	checksum_validated = crc32.Update(checksum_validated, crc32.IEEETable, chunk)
+	checksum_validated = crc32.Update(
+		checksum_validated,
+		crc32.IEEETable,
+		payload[fragment.FragmentHeaderSize():fragment.FragmentHeaderSize()+int(ChunkSize)],
+	)
 
 	fragment.Checksum = checksum_validated
 	payload = fragment.AppendChecksum(payload)
-
-	// Add the data to the chunk
-	copy(payload[32:32+len(chunk)], chunk)
 
 	// Write to the WAL file
 	_, err := activeWal.Write(payload)
@@ -707,9 +711,9 @@ func (wal *WAL) ReadFromWriteResult(result *WriteResult) (data []byte, err error
 
 			payloadSize := int(fragment.Length)
 
-			// Read the payload
-			chunkBuffer := make([]byte, payloadSize)
-			n, err := io.ReadFull(f, chunkBuffer)
+			// Read the full on-disk chunk payload (fixed ChunkSize), then use fragment.Length as logical size.
+			fullChunkBuffer := make([]byte, wal.Shard.ChunkSize)
+			n, err := io.ReadFull(f, fullChunkBuffer)
 			if err != nil {
 				return nil, fmt.Errorf("could not read chunk from WAL %d: %v", walFile.WALNum, err)
 			}
@@ -723,7 +727,7 @@ func (wal *WAL) ReadFromWriteResult(result *WriteResult) (data []byte, err error
 			headerForChecksum[31] = 0
 
 			calculatedChecksum := crc32.ChecksumIEEE(headerForChecksum)
-			calculatedChecksum = crc32.Update(calculatedChecksum, crc32.IEEETable, chunkBuffer)
+			calculatedChecksum = crc32.Update(calculatedChecksum, crc32.IEEETable, fullChunkBuffer)
 
 			if calculatedChecksum != fragment.Checksum {
 				return nil, fmt.Errorf("checksum mismatch for fragment %d in WAL %d: expected %d, got %d", fragment.ShardFragment, walFile.WALNum, fragment.Checksum, calculatedChecksum)
@@ -735,9 +739,9 @@ func (wal *WAL) ReadFromWriteResult(result *WriteResult) (data []byte, err error
 			if copySize > remaining {
 				copySize = remaining
 			}
-			copy(data[bytesRead:bytesRead+copySize], chunkBuffer[:copySize])
+			copy(data[bytesRead:bytesRead+copySize], fullChunkBuffer[:copySize])
 			bytesRead += copySize
-			fileBytesRead += int64(32 + n) // header + data
+			fileBytesRead += int64(FragmentHeaderBytes + n) // header + fixed payload
 
 			// Validate end-of-shard flag
 			if fragment.Flags&FlagEndOfShard != 0 {
@@ -826,12 +830,10 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 
 		payloadSize := int(fragment.Length)
 
-		// Read exactly the payload for this fragment (no over-read into the next chunk).
-		chunkBuffer := make([]byte, payloadSize)
+		// Read the full on-disk chunk payload (fixed ChunkSize), then use fragment.Length as logical size.
+		fullChunkBuffer := make([]byte, wal.Shard.ChunkSize)
 
-		//slog.Debug("chunkBuffer", "len", len(chunkBuffer), "fragment.Length", fragment.Length, "remaining", remaining, "bytesRead", bytesRead)
-
-		n, err = io.ReadFull(f, chunkBuffer) // use io.ReadFull so we get exactly len(chunkBuffer) or an error
+		n, err = io.ReadFull(f, fullChunkBuffer) // exactly ChunkSize bytes per fragment on disk
 
 		// Confirm, check EOF
 		if err != nil {
@@ -849,7 +851,7 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 		headerForChecksum[31] = 0
 
 		calculatedChecksum := crc32.ChecksumIEEE(headerForChecksum)
-		calculatedChecksum = crc32.Update(calculatedChecksum, crc32.IEEETable, chunkBuffer)
+		calculatedChecksum = crc32.Update(calculatedChecksum, crc32.IEEETable, fullChunkBuffer)
 
 		if calculatedChecksum != fragment.Checksum {
 			return nil, fmt.Errorf("checksum mismatch for fragment %d: expected %d, got %d", fragment.ShardFragment, fragment.Checksum, calculatedChecksum)
@@ -872,7 +874,7 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 		// Bounds-safe copy
 		copy(
 			data[bytesRead:bytesRead+uint32(payloadSize)],
-			chunkBuffer[:payloadSize],
+			fullChunkBuffer[:payloadSize],
 		)
 
 		remaining -= uint32(payloadSize)

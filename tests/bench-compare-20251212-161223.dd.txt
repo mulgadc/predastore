@@ -1,0 +1,20 @@
+== dd (filesystem) ==
+dd sync flag: oflag=sync
+workdir: /var/folders/hs/y5nfkkh56d732dwdd04vmf100000gn/T/wal-bench-compare.XXXXXX.EVDc5Iz1xk/dd
+
+-- size=4KiB records=256 total=1048576 bytes --
+1048576 bytes transferred in 0.014364 secs (73000278 bytes/sec)
+1048576 bytes transferred in 0.000305 secs (3437954098 bytes/sec)
+
+-- size=64KiB records=256 total=16777216 bytes --
+16777216 bytes transferred in 0.019241 secs (871951354 bytes/sec)
+16777216 bytes transferred in 0.001443 secs (11626622315 bytes/sec)
+
+-- size=1MiB records=16 total=16777216 bytes --
+16777216 bytes transferred in 0.009328 secs (1798586621 bytes/sec)
+16777216 bytes transferred in 0.001311 secs (12797266209 bytes/sec)
+
+-- size=8MiB records=2 total=16777216 bytes --
+16777216 bytes transferred in 0.111872 secs (149967963 bytes/sec)
+16777216 bytes transferred in 0.001989 secs (8435000503 bytes/sec)
+

@@ -50,7 +50,6 @@ test: $(GOVULNCHECK)
 
 bench:
 	@echo "\n....Running benchmarks for $(GO_PROJECT_NAME)...."
-	$(MAKE) easyjson
 	LOG_IGNORE=1 go test -benchmem -run=. -bench=. ./...
 
 dev:

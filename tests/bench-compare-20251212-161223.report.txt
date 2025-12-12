@@ -1,0 +1,15 @@
+WAL vs dd comparison
+Go log: /Users/benduncan/Development/mulga/predastore/s3/wal/bench-compare-20251212-161223.go.txt
+dd log: /Users/benduncan/Development/mulga/predastore/s3/wal/bench-compare-20251212-161223.dd.txt
+benchtime: 300ms
+
+op     size         go(MB/s)     dd(MB/s)      delta summary
+--     ----         --------     --------      ----- -------
+write  4KiB            38.26        73.00       +91% dd is 91% faster (73.00 vs 38.26)
+write  64KiB           60.41       871.95     +1343% dd is 1343% faster (871.95 vs 60.41)
+write  1MiB            70.70      1798.59     +2444% dd is 2444% faster (1798.59 vs 70.70)
+write  8MiB            71.63       149.97      +109% dd is 109% faster (149.97 vs 71.63)
+read   4KiB           209.92      3437.95     +1538% dd is 1538% faster (3437.95 vs 209.92)
+read   64KiB         1038.44     11626.62     +1020% dd is 1020% faster (11626.62 vs 1038.44)
+read   1MiB          1239.19     12797.27      +933% dd is 933% faster (12797.27 vs 1239.19)
+read   8MiB          1678.15      8435.00      +403% dd is 403% faster (8435.00 vs 1678.15)
