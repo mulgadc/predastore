@@ -2,18 +2,26 @@ package distributed
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/gob"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/dgraph-io/badger/v4"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/s3"
 	"github.com/mulgadc/predastore/s3/wal"
+	s3db "github.com/mulgadc/predastore/s3db"
 )
 
 type Backend struct {
@@ -25,10 +33,28 @@ type Backend struct {
 	// Each node will have its own sub-directory inside DataDir.
 	// Example: <DataDir>/node-0
 	DataDir string
+
+	// KV dir
+	BadgerDir string
+
+	// Badger DB for local metadata
+	DB *s3db.S3DB
 }
 
 type Node struct {
 	Id string
+}
+
+type ObjectToShardNodes struct {
+	Object           [32]byte
+	DataShardNodes   []uint32
+	ParityShardNodes []uint32
+}
+
+type ObjectShardReader struct {
+	File *os.File
+
+	WALFileInfo wal.WALFileInfo
 }
 
 // consistent package doesn't provide a default hashing function.
@@ -60,6 +86,19 @@ func New(config interface{}) (svc *Backend, err error) {
 		RsDataShard:   3,
 		RsParityShard: 2,
 		DataDir:       filepath.Join("s3", "tests", "data", "distributed", "nodes"),
+
+		BadgerDir: config.(Backend).BadgerDir,
+	}
+
+	if svc.BadgerDir == "" {
+		return nil, errors.New("badger directory is required to save shard/WAL state")
+	}
+
+	// Create badger DB
+	svc.DB, err = s3db.New(svc.BadgerDir)
+
+	if err != nil {
+		return nil, err
 	}
 
 	// Create a new consistent instance
@@ -182,59 +221,70 @@ func (backend Backend) Get(bucket string, object string, c *fiber.Ctx) (err erro
 
 	// Open the inputs
 	shards, size, err := backend.openInput(bucket, object)
+	fmt.Println(size)
 	checkErr(err)
 
+	// TODO: Optimise
+	shardReaders := make([]io.Reader, len(shards))
+	for i := range shards {
+		shardReaders[i] = shards[i].File
+	}
 	// Verify the shards
-	ok, err := enc.Verify(shards)
+	ok, err := enc.Verify(shardReaders)
+
 	if ok {
 		fmt.Println("No reconstruction needed")
 	} else {
 		fmt.Println("Verification failed. Reconstructing data")
-		shards, size, err = backend.openInput(bucket, object)
-		checkErr(err)
 
-		key := []byte(fmt.Sprintf("%s/%s", bucket, object))
+		// TODO: Refactor
+		/*
+			shards, size, err = backend.openInput(bucket, object)
+			checkErr(err)
 
-		// calculates partition id for the given key
-		// partID := hash(key) % partitionCount
-		// the partitions are already distributed among members by Add function.
-		owner := backend.HashRing.LocateKey(key)
-		fmt.Println(owner.String())
+			key := []byte(fmt.Sprintf("%s/%s", bucket, object))
 
-		// Next, get the data and parity shards from the owner node
-		hashRingShards, err := backend.HashRing.GetClosestN(key, backend.RsDataShard+backend.RsParityShard)
+			// calculates partition id for the given key
+			// partID := hash(key) % partitionCount
+			// the partitions are already distributed among members by Add function.
+			owner := backend.HashRing.LocateKey(key)
+			fmt.Println(owner.String())
 
-		// Create out destination writers
-		out := make([]io.Writer, len(shards))
-		for i := range out {
-			if shards[i] == nil {
+			// Next, get the data and parity shards from the owner node
+			hashRingShards, err := backend.HashRing.GetClosestN(key, backend.RsDataShard+backend.RsParityShard)
 
-				outfn := fmt.Sprintf("%s.%d", object, i)
+			// Create out destination writers
+			out := make([]io.Writer, len(shards))
+			for i := range out {
+				if shards[i] == nil {
 
-				fmt.Println("Writing to", outfn)
-				out[i], err = os.Create(filepath.Join(backend.nodeDir(hashRingShards[i].String()), outfn))
-				checkErr(err)
+					outfn := fmt.Sprintf("%s.%d", object, i)
+
+					fmt.Println("Writing to", outfn)
+					out[i], err = os.Create(filepath.Join(backend.nodeDir(hashRingShards[i].String()), outfn))
+					checkErr(err)
+				}
 			}
-		}
-		err = enc.Reconstruct(shards, out)
-		if err != nil {
-			fmt.Println("Reconstruct failed -", err)
-			os.Exit(1)
-		}
-		// Close output.
-		for i := range out {
-			if out[i] != nil {
-				err := out[i].(*os.File).Close()
-				checkErr(err)
+			err = enc.Reconstruct(shards, out)
+			if err != nil {
+				fmt.Println("Reconstruct failed -", err)
+				os.Exit(1)
 			}
-		}
-		shards, size, err = backend.openInput(bucket, object)
-		ok, err = enc.Verify(shards)
-		if !ok {
-			fmt.Println("Verification failed after reconstruction, data likely corrupted:", err)
-			os.Exit(1)
-		}
-		checkErr(err)
+			// Close output.
+			for i := range out {
+				if out[i] != nil {
+					err := out[i].(*os.File).Close()
+					checkErr(err)
+				}
+			}
+			shards, size, err = backend.openInput(bucket, object)
+			ok, err = enc.Verify(shards)
+			if !ok {
+				fmt.Println("Verification failed after reconstruction, data likely corrupted:", err)
+				os.Exit(1)
+			}
+			checkErr(err)
+		*/
 	}
 
 	// Join the shards and write them
@@ -248,10 +298,10 @@ func (backend Backend) Get(bucket string, object string, c *fiber.Ctx) (err erro
 	checkErr(err)
 
 	// We don't know the exact filesize.
-	std := StdoutWriter{}
+	//std := StdoutWriter{}
 
-	err = enc.Join(std, shards, int64(backend.RsDataShard)*size)
-	checkErr(err)
+	//err = enc.Join(std, shards, int64(backend.RsDataShard)*size)
+	//checkErr(err)
 
 	return
 }
@@ -284,9 +334,112 @@ type shardWriteOutcome struct {
 	err        error
 }
 
+func (backend Backend) PutObject(bucket string, object string, c *fiber.Ctx) (err error) {
+
+	objectHash := genObjectHash(bucket, object)
+
+	objectToShardNodes := ObjectToShardNodes{}
+
+	// Check if existing
+	data, err := backend.DB.Get(objectHash[:])
+
+	if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+		return err
+	} else if errors.Is(err, badger.ErrKeyNotFound) {
+
+		// Set the defaults
+		objectToShardNodes = ObjectToShardNodes{
+			Object:           objectHash,
+			DataShardNodes:   make([]uint32, backend.RsDataShard),
+			ParityShardNodes: make([]uint32, backend.RsParityShard),
+		}
+	} else {
+
+		r := bytes.NewReader(data)
+		dec := gob.NewDecoder(r)
+
+		if err := dec.Decode(&objectToShardNodes); err != nil {
+			return err
+		}
+
+		spew.Dump(data)
+		spew.Dump(objectToShardNodes)
+
+	}
+
+	//objectSha256 := hex.EncodeToString(hashSha256[:])
+
+	dataRes, parityRes, err := backend.putObjectToWAL(bucket, object, objectHash)
+	if err != nil {
+		return err
+	}
+
+	_, file := filepath.Split(object)
+	key := []byte(fmt.Sprintf("%s/%s", bucket, file))
+	hashRingShards, _ := backend.HashRing.GetClosestN(key, backend.RsDataShard+backend.RsParityShard)
+
+	// Print the WAL location results for now (Badger KV later).
+	for i := 0; i < backend.RsDataShard; i++ {
+		fmt.Printf("put_object wal_write data_shard=%d node=%s write_result=%#v\n",
+			i, hashRingShards[i].String(), dataRes[i])
+
+		objectToShardNodes.DataShardNodes[i], err = NodeToUint32(hashRingShards[i].String())
+
+		if err != nil {
+			return err
+		}
+
+	}
+	for i := 0; i < backend.RsParityShard; i++ {
+		fmt.Printf("put_object wal_write parity_shard=%d node=%s write_result=%#v\n",
+			i, hashRingShards[backend.RsDataShard+i].String(), parityRes[i])
+
+		objectToShardNodes.ParityShardNodes[i], err = NodeToUint32(hashRingShards[backend.RsDataShard+i].String())
+
+		if err != nil {
+			return err
+		}
+
+	}
+
+	err = backend.DB.Badger.Update(func(txn *badger.Txn) error {
+
+		// Marshal objectToShardNodes to []byte
+		/*
+			objectToShardNodesBytes, err := json.Marshal(objectToShardNodes)
+			if err != nil {
+				return err
+			}
+		*/
+
+		var buf bytes.Buffer
+		enc := gob.NewEncoder(&buf)
+		if err := enc.Encode(objectToShardNodes); err != nil {
+			return err
+		}
+
+		//err = txn.Set(objectHash[:], objectToShardNodesBytes)
+		e := badger.NewEntry(objectHash[:], buf.Bytes())
+		err = txn.SetEntry(e)
+
+		return err
+	})
+
+	return err
+
+}
+
+// Close, cleanup
+func (backend Backend) Close() (err error) {
+
+	return
+}
+
+// Private methods
+
 // putObjectToWAL splits an on-disk file into RS shards and writes each shard to the WAL
 // for the node selected by the hash ring. It returns the WAL WriteResults for data and parity shards.
-func (backend Backend) putObjectToWAL(bucket string, objectPath string) (dataResults []*wal.WriteResult, parityResults []*wal.WriteResult, err error) {
+func (backend Backend) putObjectToWAL(bucket string, objectPath string, objectHash [32]byte) (dataResults []*wal.WriteResult, parityResults []*wal.WriteResult, err error) {
 	// Stream encoder
 	enc, err := reedsolomon.NewStream(backend.RsDataShard, backend.RsParityShard)
 	if err != nil {
@@ -328,6 +481,8 @@ func (backend Backend) putObjectToWAL(bucket string, objectPath string) (dataRes
 		for i := range walFiles {
 			if walFiles[i] != nil {
 				_ = walFiles[i].Close()
+				// Close the Badger DB
+				_ = walFiles[i].DB.Close()
 			}
 		}
 	}()
@@ -354,6 +509,15 @@ func (backend Backend) putObjectToWAL(bucket string, objectPath string) (dataRes
 		go func(idx int, r *io.PipeReader) {
 			defer dataWG.Done()
 			res, werr := walFiles[idx].Write(r, shardSize)
+
+			// Write the object hash, to where it is stored on disk, to the WAL log of the node
+			if werr == nil {
+				walFiles[idx].UpdateObjectToWAL(objectHash, res)
+				if err != nil {
+					werr = err
+				}
+			}
+
 			dataCh <- shardWriteOutcome{shardIndex: idx, result: res, err: werr}
 		}(i, pr)
 	}
@@ -451,31 +615,6 @@ func (backend Backend) putObjectToWAL(bucket string, objectPath string) (dataRes
 	return dataResults, parityResults, nil
 }
 
-func (backend Backend) PutObject(bucket string, object string, c *fiber.Ctx) (err error) {
-
-	dataRes, parityRes, err := backend.putObjectToWAL(bucket, object)
-	if err != nil {
-		return err
-	}
-
-	_, file := filepath.Split(object)
-	key := []byte(fmt.Sprintf("%s/%s", bucket, file))
-	hashRingShards, _ := backend.HashRing.GetClosestN(key, backend.RsDataShard+backend.RsParityShard)
-
-	// Print the WAL location results for now (Badger KV later).
-	for i := 0; i < backend.RsDataShard; i++ {
-		fmt.Printf("put_object wal_write data_shard=%d node=%s write_result=%#v\n",
-			i, hashRingShards[i].String(), dataRes[i])
-	}
-	for i := 0; i < backend.RsParityShard; i++ {
-		fmt.Printf("put_object wal_write parity_shard=%d node=%s write_result=%#v\n",
-			i, hashRingShards[backend.RsDataShard+i].String(), parityRes[i])
-	}
-
-	return nil
-
-}
-
 func checkErr(err error) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %s", err.Error())
@@ -483,7 +622,7 @@ func checkErr(err error) {
 	}
 }
 
-func (backend Backend) openInput(bucket string, object string) (r []io.Reader, size int64, err error) {
+func (backend Backend) openInput(bucket string, object string) (objectShardReader []ObjectShardReader, size int64, err error) {
 
 	key := []byte(fmt.Sprintf("%s/%s", bucket, object))
 
@@ -496,40 +635,76 @@ func (backend Backend) openInput(bucket string, object string) (r []io.Reader, s
 	// Next, get the data and parity shards from the owner node
 	hashRingShards, err := backend.HashRing.GetClosestN(key, backend.RsDataShard+backend.RsParityShard)
 
-	/*
-		for i := range out {
-			outfn := fmt.Sprintf("%s.%d", file, i)
+	// Query Badger for which files, and offsets,
+	// and create ObjectShardReader for each shard
 
-			fmt.Println("Writing to", outfn)
-			out[i], err = os.Create(filepath.Join(backend.nodeDir(hashRingShards[i].String()), outfn))
-			checkErr(err)
-		}
+	objectHash := genObjectHash(bucket, object)
 
-	*/
+	data, err := backend.DB.Get(objectHash[:])
+
+	// Check if exists
+	if err != nil {
+		return nil, 0, err
+	}
+
+	objectToShardNodes := []wal.WriteResult{}
+
+	// Decode from Badger DB
+	r := bytes.NewReader(data)
+	dec := gob.NewDecoder(r)
+
+	if err := dec.Decode(&objectToShardNodes); err != nil {
+		return nil, 0, err
+	}
+
+	// TODO: Confirm edge case when badger result does not match expected number of shards
+	objectShardReader = make([]ObjectShardReader, backend.RsDataShard+backend.RsParityShard)
 
 	// Create shards and load the data.
-	shards := make([]io.Reader, backend.RsDataShard+backend.RsParityShard)
-	for i := range shards {
+	//shards := make([]io.Reader, backend.RsDataShard+backend.RsParityShard)
+
+	for i := range objectToShardNodes {
 		//infn := fmt.Sprintf("%s.%d", fname, i)
 
-		infn := filepath.Join(backend.nodeDir(hashRingShards[i].String()), fmt.Sprintf("%s.%d", object, i))
+		// Loop through each WAL if object spans multiple files
 
-		fmt.Println("Opening", infn)
-		f, err := os.Open(infn)
-		if err != nil {
-			fmt.Println("Error reading file", err)
-			shards[i] = nil
-			continue
-		} else {
-			shards[i] = f
+		for i2 := range objectToShardNodes[i].WALFiles {
+			walFile := wal.FormatWalFile(objectToShardNodes[i].WALFiles[i2].WALNum)
+			infn := filepath.Join(backend.nodeDir(hashRingShards[i].String()), walFile)
+			fmt.Println("Opening", infn, "shard", i, "wal file", i2)
+			f, err := os.Open(infn)
+			if err != nil {
+				// Potential, data or shard missing, can rebuilt in later step
+				fmt.Println("Error reading file", err)
+				objectShardReader[i] = ObjectShardReader{}
+				continue
+			}
+
+			objectShardReader[i] = ObjectShardReader{
+				File:        f,
+				WALFileInfo: objectToShardNodes[i].WALFiles[i2],
+			}
+
 		}
-		stat, err := f.Stat()
-		checkErr(err)
-		if stat.Size() > 0 {
-			size = stat.Size()
-		} else {
-			shards[i] = nil
-		}
+
 	}
-	return shards, size, nil
+	return objectShardReader, size, nil
+}
+
+// Convert node name to uint32 for internal shard (data / parity tracking )
+func NodeToUint32(value string) (v uint32, err error) {
+
+	s := strings.Replace(value, "node-", "", 1)
+	vint, err := strconv.Atoi(s)
+
+	if err != nil {
+		return 0, err
+	}
+
+	return uint32(vint), nil
+}
+
+func genObjectHash(bucket string, object string) [32]byte {
+	objectKey := fmt.Sprintf("%s/%s", bucket, object)
+	return sha256.Sum256([]byte(objectKey))
 }

@@ -2,11 +2,13 @@ package distributed
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/s3/wal"
@@ -14,7 +16,11 @@ import (
 )
 
 func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
-	backend, err := New(nil)
+
+	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
+	require.NoError(t, err)
+
+	backend, err := New(Backend{BadgerDir: tmpDir})
 	require.NoError(t, err)
 	require.NotNil(t, backend)
 
@@ -37,7 +43,10 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 	objPath := filepath.Join(tmp, "obj.bin")
 	require.NoError(t, os.WriteFile(objPath, orig, 0644))
 
-	dataRes, parityRes, err := backend.putObjectToWAL("bucket", objPath)
+	objectKey := fmt.Sprintf("bucket/%s", objPath)
+	objectHash := sha256.Sum256([]byte(objectKey))
+
+	dataRes, parityRes, err := backend.putObjectToWAL("bucket", objPath, objectHash)
 	require.NoError(t, err)
 	require.Len(t, dataRes, backend.RsDataShard)
 	require.Len(t, parityRes, backend.RsParityShard)

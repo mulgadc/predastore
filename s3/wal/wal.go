@@ -3,6 +3,7 @@ package wal
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/mulgadc/predastore/s3db"
 )
 
 // 32MB Shard size per WAL file (prod)
@@ -55,6 +58,9 @@ type WAL struct {
 
 	Shard Shard
 	mu    sync.RWMutex `json:"-"`
+
+	// Badger DB for local object to WAL/shard/offset
+	DB *s3db.S3DB
 }
 
 type WALState struct {
@@ -100,6 +106,12 @@ type WriteResult struct {
 	TotalSize int           // Total size of the object written
 }
 
+// Object to Shard / WALFileInfo tracker (stored in Badger DB)
+type ObjectToWAL struct {
+	Object      [32]byte      // Sha256 of bucket/object
+	WALFileInfo []WALFileInfo // List of WAL files used (in order)
+}
+
 func New(stateFile, walDir string) (wal *WAL, err error) {
 	// State
 	wal = &WAL{
@@ -126,6 +138,12 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 
 		wal.LoadState(stateFile)
 
+	}
+
+	// Create Badger DB for local object to WAL/shard/offset
+	wal.DB, err = s3db.New(filepath.Join(wal.WalDir, "db"))
+	if err != nil {
+		return nil, err
 	}
 
 	// Next, check if a WAL already exists
@@ -574,7 +592,31 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 		result.WALFiles[len(result.WALFiles)-1].Size = currentWALFileSize
 	}
 
+	// Write to Badger DB
+
 	return result, nil
+}
+
+// Update the ObjectToWAL record in the Badger DB
+func (wal *WAL) UpdateObjectToWAL(objectHash [32]byte, result *WriteResult) error {
+
+	objectToWAL := ObjectToWAL{
+		Object:      objectHash,
+		WALFileInfo: result.WALFiles,
+	}
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(objectToWAL); err != nil {
+		return err
+	}
+
+	err := wal.DB.Set(objectHash[:], buf.Bytes())
+	if err != nil {
+		return fmt.Errorf("failed to update object to WAL: %v", err)
+	}
+
+	return nil
 }
 
 // writeFragment writes a single fragment to the specified WAL file
@@ -639,12 +681,12 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 
 func (wal *WAL) Close() (err error) {
 
+	// Close the Badger DB
+	defer wal.DB.Close()
+
 	// Loop through each file
-
 	for _, v := range wal.Shard.DB {
-
 		v.Close()
-
 	}
 
 	// Write the state file to disk, current WAL, Shard Num, etc
