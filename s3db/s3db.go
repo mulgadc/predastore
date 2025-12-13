@@ -14,7 +14,7 @@ type S3DB struct {
 // DB functions
 func New(dir string) (s3db *S3DB, err error) {
 	s3db = &S3DB{}
-	s3db.Badger, err = badger.Open(badger.DefaultOptions(dir))
+	s3db.Badger, err = badger.Open(badger.DefaultOptions(dir).WithLoggingLevel(badger.WARNING))
 	if err != nil {
 		return nil, err
 	}

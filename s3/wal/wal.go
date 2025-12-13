@@ -107,12 +107,17 @@ type WriteResult struct {
 }
 
 // Object to Shard / WALFileInfo tracker (stored in Badger DB)
-type ObjectToWAL struct {
-	Object      [32]byte      // Sha256 of bucket/object
-	WALFileInfo []WALFileInfo // List of WAL files used (in order)
+type ObjectWriteResult struct {
+	Object      [32]byte    // Sha256 of bucket/object
+	WriteResult WriteResult // List of WAL files used (in order)
 }
 
 func New(stateFile, walDir string) (wal *WAL, err error) {
+
+	if stateFile == "" {
+		stateFile = filepath.Join(walDir, "state.json")
+	}
+
 	// State
 	wal = &WAL{
 		WalDir:    walDir,
@@ -600,14 +605,14 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 // Update the ObjectToWAL record in the Badger DB
 func (wal *WAL) UpdateObjectToWAL(objectHash [32]byte, result *WriteResult) error {
 
-	objectToWAL := ObjectToWAL{
+	objectWriteResult := ObjectWriteResult{
 		Object:      objectHash,
-		WALFileInfo: result.WALFiles,
+		WriteResult: *result,
 	}
 
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(objectToWAL); err != nil {
+	if err := enc.Encode(objectWriteResult); err != nil {
 		return err
 	}
 
@@ -939,6 +944,167 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 
 	return data, nil
 
+}
+
+// The returned reader will yield result.TotalSize bytes (unless it errors early).
+func (wal *WAL) ReadFromWriteResultStream(result *WriteResult) (io.Reader, error) {
+	if result == nil {
+		return nil, errors.New("nil WriteResult")
+	}
+	if len(result.WALFiles) == 0 {
+		return nil, errors.New("no WAL files in WriteResult")
+	}
+	if result.TotalSize < 0 {
+		return nil, fmt.Errorf("invalid TotalSize %d", result.TotalSize)
+	}
+
+	pr, pw := io.Pipe()
+
+	go func() {
+		// IMPORTANT: don't `defer pw.Close()` unconditionally.
+		// If we hit an error and call CloseWithError, a later Close() may mask the error
+		// and make the reader look like a clean EOF (0 bytes, nil error) depending on
+		// implementation details. We explicitly close exactly once.
+		var pipeErr error
+		defer func() {
+			if pipeErr != nil {
+				_ = pw.CloseWithError(pipeErr)
+				return
+			}
+			_ = pw.Close()
+		}()
+
+		var bytesWritten int
+
+		// Reuse buffers to avoid per-fragment allocations.
+		headerBuf := make([]byte, FragmentHeaderBytes)
+		fullChunkBuffer := make([]byte, int(wal.Shard.ChunkSize))
+		headerForChecksum := make([]byte, FragmentHeaderBytes)
+
+		for _, walFile := range result.WALFiles {
+			if walFile.Size < 0 {
+				pipeErr = fmt.Errorf("invalid WALFileInfo.Size %d for WAL %d", walFile.Size, walFile.WALNum)
+				return
+			}
+
+			f, err := os.Open(filepath.Join(wal.WalDir, FormatWalFile(walFile.WALNum)))
+			if err != nil {
+				pipeErr = fmt.Errorf("failed to open WAL file %d: %w", walFile.WALNum, err)
+				return
+			}
+
+			// Ensure file is closed before moving to the next WAL segment.
+			func() {
+				defer f.Close()
+
+				// Skip WAL header and seek to this object's start offset (Offset excludes WAL header).
+				walHeaderSize := int64(wal.WALHeaderSize())
+				if _, err := f.Seek(walHeaderSize+walFile.Offset, io.SeekStart); err != nil {
+					pipeErr = fmt.Errorf("failed to seek in WAL %d: %w", walFile.WALNum, err)
+					return
+				}
+
+				var fileBytesRead int64
+				for fileBytesRead < walFile.Size {
+					// Read fixed-size fragment header (32 bytes).
+					if _, err := io.ReadFull(f, headerBuf); err != nil {
+						pipeErr = fmt.Errorf("could not read fragment header from WAL %d: %w", walFile.WALNum, err)
+						return
+					}
+
+					seqNum := binary.BigEndian.Uint64(headerBuf[0:8])
+					shardNum := binary.BigEndian.Uint64(headerBuf[8:16])
+					shardFragment := binary.BigEndian.Uint32(headerBuf[16:20])
+					length := binary.BigEndian.Uint32(headerBuf[20:24])
+					flags := Flags(binary.BigEndian.Uint32(headerBuf[24:28]))
+					checksum := binary.BigEndian.Uint32(headerBuf[28:32])
+
+					_ = seqNum // currently unused, but kept for symmetry/debuggability
+
+					// Sanity checks (same intent as ReadFromWriteResult).
+					if shardNum != result.ShardNum {
+						pipeErr = fmt.Errorf(
+							"shard num mismatch in WAL %d: expected %d, got %d",
+							walFile.WALNum, result.ShardNum, shardNum,
+						)
+						return
+					}
+					if length > wal.Shard.ChunkSize {
+						pipeErr = fmt.Errorf(
+							"chunk length %d exceeds max %d in WAL %d",
+							length, wal.Shard.ChunkSize, walFile.WALNum,
+						)
+						return
+					}
+
+					// Read full on-disk payload (fixed ChunkSize).
+					if _, err := io.ReadFull(f, fullChunkBuffer); err != nil {
+						pipeErr = fmt.Errorf("could not read chunk from WAL %d: %w", walFile.WALNum, err)
+						return
+					}
+
+					// Validate checksum (same method as ReadFromWriteResult):
+					// CRC(header-with-checksum-zeroed + full padded payload).
+					copy(headerForChecksum, headerBuf)
+					headerForChecksum[28], headerForChecksum[29], headerForChecksum[30], headerForChecksum[31] = 0, 0, 0, 0
+
+					calculated := crc32.ChecksumIEEE(headerForChecksum)
+					calculated = crc32.Update(calculated, crc32.IEEETable, fullChunkBuffer)
+					if calculated != checksum {
+						pipeErr = fmt.Errorf(
+							"checksum mismatch for fragment %d in WAL %d: expected %d, got %d",
+							shardFragment, walFile.WALNum, checksum, calculated,
+						)
+						return
+					}
+
+					// Stream logical bytes into the pipe.
+					remaining := result.TotalSize - bytesWritten
+					if remaining < 0 {
+						pipeErr = fmt.Errorf("wrote past TotalSize (TotalSize=%d)", result.TotalSize)
+						return
+					}
+
+					toWrite := int(length)
+					if toWrite > remaining {
+						toWrite = remaining
+					}
+
+					if toWrite > 0 {
+						if _, err := pw.Write(fullChunkBuffer[:toWrite]); err != nil {
+							// Reader side likely closed early.
+							pipeErr = err
+							return
+						}
+						bytesWritten += toWrite
+					}
+
+					// Track on-disk consumption for this segment.
+					fileBytesRead += int64(FragmentHeaderBytes) + int64(wal.Shard.ChunkSize)
+
+					// End-of-shard validation (same intent as ReadFromWriteResult).
+					if flags&FlagEndOfShard != 0 {
+						if bytesWritten != result.TotalSize {
+							pipeErr = fmt.Errorf(
+								"end-of-shard set in WAL %d but wrote %d/%d bytes",
+								walFile.WALNum, bytesWritten, result.TotalSize,
+							)
+							return
+						}
+						return
+					}
+				}
+			}()
+		}
+
+		// If we exhausted WAL segments, we must have produced TotalSize.
+		if bytesWritten != result.TotalSize {
+			pipeErr = fmt.Errorf("wrote %d bytes but expected %d", bytesWritten, result.TotalSize)
+			return
+		}
+	}()
+
+	return pr, nil
 }
 
 func numFragments(size int) int {
