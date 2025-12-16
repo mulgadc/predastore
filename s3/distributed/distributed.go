@@ -323,7 +323,7 @@ func (backend Backend) PutObject(bucket string, object string, c *fiber.Ctx) (er
 
 	//objectSha256 := hex.EncodeToString(hashSha256[:])
 
-	dataRes, parityRes, size, err := backend.putObjectToWAL(bucket, object, objectHash)
+	_, _, size, err := backend.putObjectToWAL(bucket, object, objectHash)
 	if err != nil {
 		return err
 	}
@@ -336,8 +336,9 @@ func (backend Backend) PutObject(bucket string, object string, c *fiber.Ctx) (er
 
 	// Print the WAL location results for now (Badger KV later).
 	for i := 0; i < backend.RsDataShard; i++ {
-		fmt.Printf("put_object wal_write data_shard=%d node=%s write_result=%#v\n",
-			i, hashRingShards[i].String(), dataRes[i])
+
+		//fmt.Printf("put_object wal_write data_shard=%d node=%s write_result=%#v\n",
+		//	i, hashRingShards[i].String(), dataRes[i])
 
 		objectToShardNodes.DataShardNodes[i], err = NodeToUint32(hashRingShards[i].String())
 
@@ -347,8 +348,9 @@ func (backend Backend) PutObject(bucket string, object string, c *fiber.Ctx) (er
 
 	}
 	for i := 0; i < backend.RsParityShard; i++ {
-		fmt.Printf("put_object wal_write parity_shard=%d node=%s write_result=%#v\n",
-			i, hashRingShards[backend.RsDataShard+i].String(), parityRes[i])
+
+		//fmt.Printf("put_object wal_write parity_shard=%d node=%s write_result=%#v\n",
+		//	i, hashRingShards[backend.RsDataShard+i].String(), parityRes[i])
 
 		objectToShardNodes.ParityShardNodes[i], err = NodeToUint32(hashRingShards[backend.RsDataShard+i].String())
 
