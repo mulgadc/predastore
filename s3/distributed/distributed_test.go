@@ -59,6 +59,22 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, hashRingShards, backend.RsDataShard+backend.RsParityShard)
 
+	// Regression guard: metadata must be written to EACH node's local WAL Badger DB
+	// for both data and parity shards. Missing parity metadata breaks reconstruction later.
+	for i := 0; i < backend.RsDataShard+backend.RsParityShard; i++ {
+		node := hashRingShards[i].String()
+		nodeDir := backend.nodeDir(node)
+		w, err := wal.New(filepath.Join(nodeDir, "state.json"), nodeDir)
+		require.NoError(t, err)
+		require.NotNil(t, w)
+
+		val, err := w.DB.Get(objectHash[:])
+		require.NoErrorf(t, err, "expected object hash metadata in WAL badger: node=%s shard_index=%d", node, i)
+		require.NotEmpty(t, val, "expected non-empty metadata value: node=%s shard_index=%d", node, i)
+
+		require.NoError(t, w.Close())
+	}
+
 	// Read shards back from WAL using the returned WriteResults.
 	totalShards := backend.RsDataShard + backend.RsParityShard
 	shardBytes := make([][]byte, totalShards)

@@ -45,7 +45,7 @@ func main() {
 
 		var outW io.Writer = os.Stdout
 
-		if *out != "" { // optionally also treat "-" as stdout
+		if *out != "" { // optionally also treat no output as stdout
 			outFile, err := os.Create(*out) // creates/truncates, write-only
 			if err != nil {
 				panic(err)
