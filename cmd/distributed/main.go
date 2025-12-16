@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/mulgadc/predastore/s3/distributed"
@@ -25,10 +26,6 @@ func main() {
 
 	flag.Parse()
 
-	if *out == "" && *mode == "download" {
-		panic("Please provide a file to save the downloaded object using -out")
-	}
-
 	if *filename == "" {
 		panic("Please provide a file to upload/download using -file")
 	}
@@ -46,16 +43,18 @@ func main() {
 
 	if *mode == "download" {
 
-		f, err := os.OpenFile(*out, os.O_CREATE|os.O_RDWR, 0640)
+		var outW io.Writer = os.Stdout
 
-		if err != nil {
-			panic(err)
+		if *out != "" { // optionally also treat "-" as stdout
+			outFile, err := os.Create(*out) // creates/truncates, write-only
+			if err != nil {
+				panic(err)
+			}
+			defer outFile.Close()
+			outW = outFile
 		}
-		defer f.Close()
 
-		err = d.Get("test-bucket", *filename, f, nil)
-
-		if err != nil {
+		if err := d.Get("test-bucket", *filename, outW, nil); err != nil {
 			panic(err)
 		}
 
