@@ -1,6 +1,7 @@
 package s3db
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 
@@ -76,4 +77,9 @@ func (s3db *S3DB) Delete(key []byte) error {
 		func(txn *badger.Txn) error {
 			return txn.Delete(key)
 		})
+}
+
+func GenObjectHash(bucket string, object string) [32]byte {
+	objectKey := fmt.Sprintf("%s/%s", bucket, object)
+	return sha256.Sum256([]byte(objectKey))
 }

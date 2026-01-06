@@ -30,6 +30,17 @@ func main() {
 		panic("Please provide a file to upload/download using -file")
 	}
 
+	var outW io.Writer = os.Stdout
+
+	if *out != "" { // optionally also treat no output as stdout
+		outFile, err := os.Create(*out) // creates/truncates, write-only
+		if err != nil {
+			panic(err)
+		}
+		defer outFile.Close()
+		outW = outFile
+	}
+
 	if *mode == "upload" {
 
 		err = d.PutObject("test-bucket", *filename, nil)
@@ -43,21 +54,26 @@ func main() {
 
 	if *mode == "download" {
 
-		var outW io.Writer = os.Stdout
-
-		if *out != "" { // optionally also treat no output as stdout
-			outFile, err := os.Create(*out) // creates/truncates, write-only
-			if err != nil {
-				panic(err)
-			}
-			defer outFile.Close()
-			outW = outFile
-		}
-
 		if err := d.Get("test-bucket", *filename, outW, nil); err != nil {
-			panic(err)
+			fmt.Println("HERE", err)
+			//panic(err)
 		}
 
 	}
+
+	/*
+		if *mode == "client" {
+			c, err := quicclient.Dial(context.Background(), "127.0.0.1:9991")
+			if err != nil {
+				fmt.Println(err)
+			}
+			defer c.Close()
+
+			if err := c.Get(context.Background(), *filename, outW); err != nil {
+				//fmt.Println(err)
+			}
+
+		}
+	*/
 
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3"
 	"go.uber.org/automaxprocs/maxprocs"
 )
@@ -65,6 +66,17 @@ func main() {
 
 	app := s3.SetupRoutes()
 
+	for k, v := range s3.Nodes {
+		fmt.Println(k, v)
+
+		quicAddr := fmt.Sprintf("%s:%d", v.Host, v.Port)
+
+		fmt.Println("Launching new quic server", v.Path, quicAddr)
+		go quicserver.New(v.Path, quicAddr)
+
+	}
+
+	fmt.Println("Launching new s3 server", *host, *port)
 	log.Fatal(app.ListenTLS(fmt.Sprintf("%s:%d", *host, *port), *tls_cert, *tls_key))
 
 }

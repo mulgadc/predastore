@@ -2,12 +2,13 @@ package distributed
 
 import (
 	"bytes"
-	"crypto/sha256"
+	"context"
 	"encoding/gob"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,6 +21,8 @@ import (
 	"github.com/dgraph-io/badger/v4"
 	"github.com/gofiber/fiber/v2"
 	"github.com/klauspost/reedsolomon"
+	"github.com/mulgadc/predastore/quic/quicclient"
+	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3"
 	"github.com/mulgadc/predastore/s3/wal"
 	s3db "github.com/mulgadc/predastore/s3db"
@@ -81,6 +84,12 @@ func (w StdoutWriter) Write(p []byte) (int, error) {
 	return os.Stdout.Write(p)
 }
 
+type shardWriteOutcome struct {
+	shardIndex int
+	result     *wal.WriteResult
+	err        error
+}
+
 func New(config interface{}) (svc *Backend, err error) {
 	svc = &Backend{
 		Config: s3.Config{},
@@ -105,8 +114,8 @@ func New(config interface{}) (svc *Backend, err error) {
 
 	// Create a new consistent instance
 	cfg := consistent.Config{
-		PartitionCount:    11,
-		ReplicationFactor: 20,
+		PartitionCount:    5,
+		ReplicationFactor: 100,
 		Load:              1.25,
 		Hasher:            hasher{},
 	}
@@ -159,21 +168,25 @@ func (backend Backend) Get(bucket string, object string, out io.Writer, ctx *fib
 	}
 
 	// Set parity to false, only query data nodes, fallback to parity if this fails and reconstruct
+	// TODO: Add check for parity corruption, right now we are just interested in the data parts
 	shardReaders, err := backend.shardReaders(bucket, object, shards, false)
+
+	//spew.Dump(shardReaders)
 	if err != nil {
+		fmt.Println("IN HERE", err)
 		return err
 	}
 
 	// Attempt to parse shards into a single object, can we reconstruct the parts?
 	err = enc.Join(out, shardReaders, shards.Size)
 
-	//fmt.Println("shard num", len(shardReaders))
-	//fmt.Println(shards.Size)
-	//fmt.Println(err)
+	fmt.Println("shard num", len(shardReaders))
+	fmt.Println(shards.Size)
+	fmt.Println(err)
 
 	if err != nil {
 
-		//fmt.Println("Error decoding, reconstruction required", err)
+		fmt.Println("Error decoding, reconstruction required", err)
 
 		// Rewind readers
 		// First, query which nodes have our object shards
@@ -194,7 +207,7 @@ func (backend Backend) Get(bucket string, object string, out io.Writer, ctx *fib
 		for i := range reconstruction {
 			if shardReaders[i] == nil {
 				// Generate the object hash
-				objHash := genObjectHash(bucket, object)
+				objHash := s3db.GenObjectHash(bucket, object)
 				filename := fmt.Sprintf("%s.%d", hex.EncodeToString(objHash[:]), i)
 				outfn := filepath.Join(os.TempDir(), filename)
 
@@ -282,15 +295,11 @@ func (backend Backend) PutObjectPart(bucket string, object string, partNumber in
 
 }
 
-type shardWriteOutcome struct {
-	shardIndex int
-	result     *wal.WriteResult
-	err        error
-}
-
 func (backend Backend) PutObject(bucket string, object string, c *fiber.Ctx) (err error) {
 
-	objectHash := genObjectHash(bucket, object)
+	fmt.Println(bucket, object)
+
+	objectHash := s3db.GenObjectHash(bucket, object)
 
 	objectToShardNodes := ObjectToShardNodes{}
 
@@ -316,14 +325,19 @@ func (backend Backend) PutObject(bucket string, object string, c *fiber.Ctx) (er
 			return err
 		}
 
-		spew.Dump(data)
-		spew.Dump(objectToShardNodes)
+		//spew.Dump(data)
+		//spew.Dump(objectToShardNodes)
 
 	}
 
 	//objectSha256 := hex.EncodeToString(hashSha256[:])
 
-	_, _, size, err := backend.putObjectToWAL(bucket, object, objectHash)
+	d, p, size, err := backend.putObjectToWAL(bucket, object, objectHash)
+
+	spew.Dump(d)
+
+	spew.Dump(p)
+
 	if err != nil {
 		return err
 	}
@@ -372,6 +386,7 @@ func (backend Backend) PutObject(bucket string, object string, c *fiber.Ctx) (er
 
 		var buf bytes.Buffer
 		enc := gob.NewEncoder(&buf)
+
 		if err := enc.Encode(objectToShardNodes); err != nil {
 			return err
 		}
@@ -606,7 +621,7 @@ func (backend Backend) openInput(bucket string, object string) (objectToShardNod
 	// Query Badger for which files, and offsets,
 	// and create ObjectShardReader for each shard
 
-	objectHash := genObjectHash(bucket, object)
+	objectHash := s3db.GenObjectHash(bucket, object)
 
 	data, err := backend.DB.Get(objectHash[:])
 
@@ -677,47 +692,68 @@ func (backend Backend) shardReaders(bucket string, object string, shards ObjectT
 		totalNodes = append(totalNodes, shards.ParityShardNodes...)
 	}
 
+	portRange := 9991
+
 	// TODO: Optimise, validate data shards are correct, before parity and validation to improve performance
 	for i := range totalNodes {
-		nodeDir := backend.nodeDir(fmt.Sprintf("node-%d", totalNodes[i]))
+		//nodeDir := backend.nodeDir(fmt.Sprintf("node-%d", totalNodes[i]))
 
-		walInstance, err := wal.New("", nodeDir)
+		/*
+			walInstance, err := wal.New("", nodeDir)
+
+			if err != nil {
+				return shardReaders, err
+			}
+
+			defer walInstance.Close()
+
+			objectHash := GenObjectHash(bucket, object)
+			// Query local node, where does the shard belong?
+			result, err := walInstance.DB.Get(objectHash[:])
+			if err != nil {
+				//fmt.Println("Shard not found", "node", nodeDir)
+				continue
+			}
+
+			var objectWriteResult wal.ObjectWriteResult
+
+			r := bytes.NewReader(result)
+			dec := gob.NewDecoder(r)
+			if err := dec.Decode(&objectWriteResult); err != nil {
+				return shardReaders, err
+			}
+
+		*/
+
+		//		shardReaders[i], err = walInstance.ReadFromWriteResultStream(&objectWriteResult.WriteResult)
+
+		// Retrieve directly from QUIC server for our node shard
+		c, err := quicclient.Dial(context.Background(), fmt.Sprintf("127.0.0.1:%d", portRange+i))
 
 		if err != nil {
-			return shardReaders, err
+			fmt.Println(err)
 		}
 
-		defer walInstance.Close()
+		defer c.Close()
+
+		objectRequest := quicserver.ObjectRequest{
+			Bucket: bucket,
+			Object: object,
+		}
+
+		// TODO: Add context, timeout window, e.g 5 secs
+		shardReaders[i], err = c.Get(context.Background(), objectRequest)
+
+		//spew.Dump(shardReaders[i])
 
 		if err != nil {
-			return shardReaders, err
-		}
-
-		objectHash := genObjectHash(bucket, object)
-		// Query local node, where does the shard belong?
-		result, err := walInstance.DB.Get(objectHash[:])
-		if err != nil {
-			//fmt.Println("Shard not found", "node", nodeDir)
-			continue
-		}
-
-		var objectWriteResult wal.ObjectWriteResult
-
-		r := bytes.NewReader(result)
-		dec := gob.NewDecoder(r)
-		if err := dec.Decode(&objectWriteResult); err != nil {
-			return shardReaders, err
-		}
-
-		shardReaders[i], err = walInstance.ReadFromWriteResultStream(&objectWriteResult.WriteResult)
-
-		if err != nil {
-			//fmt.Println("Error reading from write result stream", err)
+			slog.Error("Error reading from write result stream", "err", err)
 			return shardReaders, err
 		}
 
 	}
 
+	// Happy path
 	return
 
 }
@@ -733,9 +769,4 @@ func NodeToUint32(value string) (v uint32, err error) {
 	}
 
 	return uint32(vint), nil
-}
-
-func genObjectHash(bucket string, object string) [32]byte {
-	objectKey := fmt.Sprintf("%s/%s", bucket, object)
-	return sha256.Sum256([]byte(objectKey))
 }

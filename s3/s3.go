@@ -21,19 +21,40 @@ type S3_Buckets struct {
 	Encryption string `toml:"encryption"`
 }
 
+type RS struct {
+	Data   int `toml:"data"`
+	Parity int `toml:"parity"`
+}
+
+type Nodes struct {
+	ID   int    `toml:"id"`
+	Host string `toml:"host"`
+	Port int    `toml:"port"`
+	Path string `toml:"path"`
+}
+
 type Config struct {
-	ConfigPath            string       // Path to config file
-	Version               string       `toml:"version"`
-	Region                string       `toml:"region"`
-	Buckets               []S3_Buckets `toml:"buckets"`
-	Auth                  []AuthEntry  `toml:"auth"`
-	AllowAnonymousListing bool         `toml:"allow_anonymous_listing"`
-	AllowAnonymousAccess  bool         `toml:"allow_anonymous_access"`
-	Port                  int          `toml:"port"`
-	Host                  string       `toml:"host"`
-	Debug                 bool         `toml:"debug"`
-	BasePath              string       `toml:"base_path"`
-	DisableLogging        bool         `toml:"disable_logging"`
+	ConfigPath string // Path to config file
+	Version    string `toml:"version"`
+	Region     string `toml:"region"`
+
+	RS    RS      `toml:"rs"`
+	Nodes []Nodes `toml:"nodes"`
+
+	Buckets []S3_Buckets `toml:"buckets"`
+
+	// TODO: Move to IAM
+	Auth                  []AuthEntry `toml:"auth"`
+	AllowAnonymousListing bool        `toml:"allow_anonymous_listing"`
+	AllowAnonymousAccess  bool        `toml:"allow_anonymous_access"`
+
+	// Only needed on local (filesystem)
+	Port int    `toml:"port"`
+	Host string `toml:"host"`
+
+	Debug          bool   `toml:"debug"`
+	BasePath       string `toml:"base_path"`
+	DisableLogging bool   `toml:"disable_logging"`
 }
 
 // Authentication and policy
