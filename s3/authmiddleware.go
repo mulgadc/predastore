@@ -124,10 +124,10 @@ func GenerateAuthHeaderReq(accessKey, secretKey, timestamp, region, service stri
 		req.Body = io.NopCloser(bytes.NewReader(bodyContent))
 
 		// Calculate hash
-		payloadHash = hashSHA256(string(bodyContent))
+		payloadHash = HashSHA256(string(bodyContent))
 	} else {
 		// Empty body
-		payloadHash = hashSHA256("")
+		payloadHash = HashSHA256("")
 	}
 
 	queryUrl := req.URL.Query()
@@ -149,7 +149,7 @@ func GenerateAuthHeaderReq(accessKey, secretKey, timestamp, region, service stri
 	)
 
 	// Hash the canonical request
-	hashedCanonicalRequest := hashSHA256(canonicalRequest)
+	hashedCanonicalRequest := HashSHA256(canonicalRequest)
 
 	// Create string to sign
 	scope := fmt.Sprintf("%s/%s/%s/aws4_request", date, region, service)
@@ -161,7 +161,7 @@ func GenerateAuthHeaderReq(accessKey, secretKey, timestamp, region, service stri
 	)
 
 	// Derive signing key
-	signingKey := getSigningKey(secretKey, date, region, service)
+	signingKey := GetSigningKey(secretKey, date, region, service)
 
 	// Calculate signature
 	signature := hmacSHA256Hex(signingKey, stringToSign)
@@ -363,10 +363,10 @@ func (s3 *Config) SigV4AuthMiddleware(c *fiber.Ctx) error {
 	payloadEncoding := c.Get("X-Amz-Content-SHA256")
 
 	if payloadEncoding == "STREAMING-UNSIGNED-PAYLOAD-TRAILER" || payloadEncoding == "UNSIGNED-PAYLOAD" {
-		payloadHash = payloadEncoding //hashSHA256("")
+		payloadHash = payloadEncoding //HashSHA256("")
 
 	} else {
-		payloadHash = hashSHA256(string(c.Body()))
+		payloadHash = HashSHA256(string(c.Body()))
 	}
 
 	canonicalRequest := fmt.Sprintf(
@@ -381,7 +381,7 @@ func (s3 *Config) SigV4AuthMiddleware(c *fiber.Ctx) error {
 	)
 
 	// Hash it
-	hashedCanonicalRequest := hashSHA256(canonicalRequest)
+	hashedCanonicalRequest := HashSHA256(canonicalRequest)
 
 	// Create string to sign
 	timestamp := c.Get("x-amz-date")
@@ -395,7 +395,7 @@ func (s3 *Config) SigV4AuthMiddleware(c *fiber.Ctx) error {
 	)
 
 	// Derive signing key
-	signingKey := getSigningKey(secretKey, date, region, svc)
+	signingKey := GetSigningKey(secretKey, date, region, svc)
 
 	// Calculate signature
 	expectedSig := hmacSHA256Hex(signingKey, stringToSign)
@@ -410,26 +410,29 @@ func (s3 *Config) SigV4AuthMiddleware(c *fiber.Ctx) error {
 	//return nil
 }
 
-func hashSHA256(s string) string {
+// HashSHA256 computes SHA256 hash (exported for testing)
+func HashSHA256(s string) string {
 	hash := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(hash[:])
 }
 
-func hmacSHA256(key []byte, data string) []byte {
+// HmacSHA256 computes HMAC-SHA256 (exported for testing)
+func HmacSHA256(key []byte, data string) []byte {
 	h := hmac.New(sha256.New, key)
 	h.Write([]byte(data))
 	return h.Sum(nil)
 }
 
 func hmacSHA256Hex(key []byte, data string) string {
-	return hex.EncodeToString(hmacSHA256(key, data))
+	return hex.EncodeToString(HmacSHA256(key, data))
 }
 
-func getSigningKey(secret, date, region, service string) []byte {
-	kDate := hmacSHA256([]byte("AWS4"+secret), date)
-	kRegion := hmacSHA256(kDate, region)
-	kService := hmacSHA256(kRegion, service)
-	kSigning := hmacSHA256(kService, "aws4_request")
+// GetSigningKey generates AWS signing key (exported for testing)
+func GetSigningKey(secret, date, region, service string) []byte {
+	kDate := HmacSHA256([]byte("AWS4"+secret), date)
+	kRegion := HmacSHA256(kDate, region)
+	kService := HmacSHA256(kRegion, service)
+	kSigning := HmacSHA256(kService, "aws4_request")
 	return kSigning
 }
 

@@ -7,7 +7,8 @@ import (
 	"unicode/utf8"
 )
 
-func isValidKeyName(key string) error {
+// IsValidKeyName validates S3 key names according to AWS guidelines
+func IsValidKeyName(key string) error {
 
 	// Test for a valid UTF-8 character
 	// https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-guidelines
@@ -15,6 +16,11 @@ func isValidKeyName(key string) error {
 		return errors.New("key must be a valid UTF-8 string")
 	}
 	return nil
+}
+
+// isValidKeyName is kept for backward compatibility in the s3 package
+func isValidKeyName(key string) error {
+	return IsValidKeyName(key)
 }
 
 // Bucket name validation

@@ -220,7 +220,7 @@ func TestGetSigningKey(t *testing.T) {
 	expectedKey := "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
 
 	// Generate the signing key
-	signingKey := getSigningKey(secret, date, region, service)
+	signingKey := GetSigningKey(secret, date, region, service)
 	actualKey := hex.EncodeToString(signingKey)
 
 	// Verify the key matches the expected value
@@ -236,7 +236,7 @@ func TestHmacSHA256(t *testing.T) {
 	expectedHmac := "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
 
 	// Calculate HMAC-SHA256
-	hmac := hmacSHA256(key, data)
+	hmac := HmacSHA256(key, data)
 	actualHmac := hex.EncodeToString(hmac)
 
 	// Verify the HMAC matches the expected value
@@ -251,7 +251,7 @@ func TestHashSHA256(t *testing.T) {
 	expectedHash := "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
 
 	// Calculate SHA256
-	actualHash := hashSHA256(data)
+	actualHash := HashSHA256(data)
 
 	// Verify the hash matches the expected value
 	assert.Equal(t, expectedHash, actualHash)

@@ -8,6 +8,8 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/backend/filesystem"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3"
 	"go.uber.org/automaxprocs/maxprocs"
@@ -64,7 +66,33 @@ func main() {
 		os.Exit(-1)
 	}
 
-	app := s3.SetupRoutes()
+	// Initialize the backend based on config
+	backendType := s3.BackendType
+	if backendType == "" {
+		// Default to filesystem if not specified
+		backendType = "filesystem"
+	}
+
+	var be backend.Backend
+
+	switch backendType {
+	case "filesystem":
+		be, err = filesystem.New(s3)
+	case "distributed":
+		// TODO: Initialize distributed backend when ready
+		slog.Error("Distributed backend not yet implemented")
+		os.Exit(-1)
+	default:
+		slog.Error("Unknown backend type", "type", backendType)
+		os.Exit(-1)
+	}
+
+	if err != nil {
+		slog.Error("Failed to initialize backend", "type", backendType, "error", err)
+		os.Exit(-1)
+	}
+
+	app := s3.SetupRoutesWithBackend(be)
 
 	for k, v := range s3.Nodes {
 		fmt.Println(k, v)

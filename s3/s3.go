@@ -3,6 +3,8 @@ package s3
 import (
 	"encoding/xml"
 	"time"
+
+	"github.com/gofiber/fiber/v2"
 )
 
 type ACL struct {
@@ -55,6 +57,9 @@ type Config struct {
 	Debug          bool   `toml:"debug"`
 	BasePath       string `toml:"base_path"`
 	DisableLogging bool   `toml:"disable_logging"`
+
+	// Backend type: "filesystem" or "distributed"
+	BackendType string `toml:"backend_type"`
 }
 
 // Authentication and policy
@@ -173,4 +178,13 @@ type S3Error struct {
 
 func New(ConfigSettings *Config) *Config {
 	return ConfigSettings
+}
+
+// SetupRoutesWithFilesystemBackend is a convenience method for tests
+// It initializes the filesystem backend and calls SetupRoutes
+func (s3 *Config) SetupRoutesWithFilesystemBackend() *fiber.App {
+	// We can't import backend/filesystem directly due to import cycles
+	// So we use reflection/interface to create it
+	// For now, this will be handled by the test files using a separate helper
+	panic("Use SetupRoutes(backend) directly in tests")
 }

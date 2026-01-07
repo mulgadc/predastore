@@ -10,9 +10,11 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/google/uuid"
+	"github.com/mulgadc/predastore/backend"
 )
 
-func (s3 *Config) SetupRoutes() *fiber.App {
+// SetupRoutesWithBackend sets up the Fiber app with a provided backend
+func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 
 	var logLevel slog.Level
 
@@ -79,14 +81,14 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 	// List buckets
 	app.Get("/", func(c *fiber.Ctx) error {
 
-		return s3.ListBuckets(c)
+		return be.ListBuckets(c)
 	})
 
 	// ListObjectsV2
 	app.Get(`/:bucket<regex([a-z0-9-.]+)>`, func(c *fiber.Ctx) error {
 		bucket := c.Params("bucket")
 
-		return s3.ListObjectsV2Handler(bucket, c)
+		return be.ListObjectsV2Handler(bucket, c)
 	})
 
 	// GetObject (HEAD)
@@ -94,7 +96,7 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
 
-		return s3.GetObjectHead(bucket, file, c)
+		return be.GetObjectHead(bucket, file, c)
 	})
 
 	// GetObject (GET, BODY)
@@ -102,7 +104,7 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
 
-		return s3.GetObject(bucket, file, c)
+		return be.GetObject(bucket, file, c)
 	})
 
 	// PutObject (PUT)
@@ -110,7 +112,7 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 		bucket := c.Params("bucket")
 		file := c.Params("*")
 
-		return s3.PutObject(bucket, file, c)
+		return be.PutObject(bucket, file, c)
 	})
 
 	app.Post(`/:bucket<regex([a-z0-9-.]+)>/*`, func(c *fiber.Ctx) error {
@@ -119,9 +121,9 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 
 		// Confirm if posting a multipart upload, or complete a multipart upload
 		if c.Query("uploadId") == "" {
-			return s3.CreateMultipartUpload(bucket, file, c)
+			return be.CreateMultipartUpload(bucket, file, c)
 		} else {
-			return s3.CompleteMultipartUpload(bucket, file, c.Query("uploadId"), c)
+			return be.CompleteMultipartUpload(bucket, file, c.Query("uploadId"), c)
 		}
 	})
 
@@ -132,11 +134,59 @@ func (s3 *Config) SetupRoutes() *fiber.App {
 
 		fmt.Println("Deleting object", bucket, file)
 
-		return s3.DeleteObject(bucket, file, c)
+		return be.DeleteObject(bucket, file, c)
 
 	})
 
 	return app
+}
+
+// SetupRoutes is a convenience wrapper for tests
+// It uses the old implementation methods wrapped in an adapter
+func (s3 *Config) SetupRoutes() *fiber.App {
+	be := &configBackendAdapter{config: s3}
+	return s3.SetupRoutesWithBackend(be)
+}
+
+// configBackendAdapter wraps old Config methods to implement Backend interface
+type configBackendAdapter struct {
+	config *Config
+}
+
+func (a *configBackendAdapter) DeleteObject(bucket string, file string, c *fiber.Ctx) error {
+	return a.config.DeleteObject(bucket, file, c)
+}
+
+func (a *configBackendAdapter) GetObject(bucket string, file string, c *fiber.Ctx) error {
+	return a.config.GetObject(bucket, file, c)
+}
+
+func (a *configBackendAdapter) GetObjectHead(bucket string, file string, c *fiber.Ctx) error {
+	return a.config.GetObjectHead(bucket, file, c)
+}
+
+func (a *configBackendAdapter) PutObject(bucket string, file string, c *fiber.Ctx) error {
+	return a.config.PutObject(bucket, file, c)
+}
+
+func (a *configBackendAdapter) ListBuckets(c *fiber.Ctx) error {
+	return a.config.ListBuckets(c)
+}
+
+func (a *configBackendAdapter) ListObjectsV2Handler(bucket string, c *fiber.Ctx) error {
+	return a.config.ListObjectsV2Handler(bucket, c)
+}
+
+func (a *configBackendAdapter) CreateMultipartUpload(bucket string, file string, c *fiber.Ctx) error {
+	return a.config.CreateMultipartUpload(bucket, file, c)
+}
+
+func (a *configBackendAdapter) CompleteMultipartUpload(bucket string, file string, uploadId string, c *fiber.Ctx) error {
+	return a.config.CompleteMultipartUpload(bucket, file, uploadId, c)
+}
+
+func (a *configBackendAdapter) PutObjectPart(bucket string, file string, partNumber int, uploadId string, c *fiber.Ctx) error {
+	return a.config.PutObjectPart(bucket, file, partNumber, uploadId, c)
 }
 
 func (s3 *Config) ErrorHandler(ctx *fiber.Ctx, err error) error {
