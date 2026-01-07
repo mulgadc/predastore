@@ -6,3 +6,4 @@ s3/tests/data/predastore/*
 s3/tests/data/local/*
 tmp/
 bin/
+tests/*-report.txt
