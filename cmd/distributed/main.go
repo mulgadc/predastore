@@ -6,7 +6,7 @@ import (
 	"io"
 	"os"
 
-	"github.com/mulgadc/predastore/s3/distributed"
+	"github.com/mulgadc/predastore/backend/distributed"
 )
 
 func main() {
