@@ -37,7 +37,7 @@ type s3Adapter struct {
 }
 
 const (
-	S3_ENDPOINT     = "https://localhost:8443"
+	S3_ENDPOINT     = "https://localhost:6443"
 	S3_BUCKET       = "test-bucket01"
 	TEXT_FILE_SHA   = "8a71e72cef7867d59c08ee233df6d2b7c35369734d0b6dae702857176a1d69f8"
 	BINARY_FILE_SHA = "ce9d16a33fc9a53f592206c0cd23497632e78d3f6219dcd077ec9a11f50e6e4e"
@@ -49,9 +49,9 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 
 	// These are integration tests that spin up a TLS server on a fixed port.
 	// In restricted environments (e.g. sandboxed CI) binding to ports may be disallowed.
-	ln, lerr := net.Listen("tcp4", "127.0.0.1:8443")
+	ln, lerr := net.Listen("tcp4", "127.0.0.1:6443")
 	if lerr != nil {
-		t.Skipf("skipping integration tests: cannot listen on 127.0.0.1:8443: %v", lerr)
+		t.Skipf("skipping integration tests: cannot listen on 127.0.0.1:6443: %v", lerr)
 	}
 	_ = ln.Close()
 
@@ -74,7 +74,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 		defer wg.Done()
 
 		// Start the Fiber app directly with ListenTLS
-		err := app.ListenTLS(":8443", "../config/server.pem", "../config/server.key")
+		err := app.ListenTLS(":6443", "../config/server.pem", "../config/server.key")
 
 		// Only report errors other than server closed
 		if err != nil {
@@ -523,9 +523,9 @@ func TestByteRangeRequests(t *testing.T) {
 	require.NoError(t, err, "Range request should not error")
 	defer resp.Body.Close()
 
-	// Check response
-	assert.Equal(t, http.StatusOK, resp.StatusCode, "Range request should return 200")
-	assert.Equal(t, "bytes", resp.Header.Get("Accept-Ranges"), "Accept-Ranges should be set to 'bytes'")
+	// Check response - 206 Partial Content is correct per RFC 7233 for range requests
+	assert.Equal(t, http.StatusPartialContent, resp.StatusCode, "Range request should return 206 Partial Content")
+	assert.NotEmpty(t, resp.Header.Get("Content-Range"), "Content-Range should be set for partial content")
 
 	// Read the partial content
 	partialContent, err := io.ReadAll(resp.Body)

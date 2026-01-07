@@ -2,6 +2,7 @@ package s3
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -14,134 +15,40 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/google/uuid"
 	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/backend/filesystem"
 	"github.com/mulgadc/predastore/s3/chunked"
 )
 
 func (s3 *Config) SetupRoutes() *fiber.App {
+	// Create filesystem backend from s3 config
+	be := s3.createFilesystemBackend()
+	return s3.SetupRoutesWithBackend(be)
+}
 
-	var logLevel slog.Level
-
-	if s3.Debug {
-		logLevel = slog.LevelDebug
-	} else if s3.DisableLogging {
-		logLevel = slog.LevelError
-	} else {
-		logLevel = slog.LevelInfo
+// createFilesystemBackend creates a filesystem backend from the s3 config
+func (s3 *Config) createFilesystemBackend() backend.Backend {
+	// Convert s3 bucket configs to filesystem bucket configs
+	buckets := make([]filesystem.BucketConfig, 0, len(s3.Buckets))
+	for _, b := range s3.Buckets {
+		buckets = append(buckets, filesystem.BucketConfig{
+			Name:     b.Name,
+			Pathname: b.Pathname,
+			Region:   b.Region,
+			Type:     b.Type,
+			Public:   b.Public,
+		})
 	}
 
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: logLevel,
-	})
-
-	// Create a new logger with the custom handler
-	slogger := slog.New(handler)
-
-	// Set it as the default logger
-	slog.SetDefault(slogger)
-
-	// Configure slog for logging
-	slog.New(slog.NewTextHandler(os.Stdout, nil))
-
-	// Allow to overwrite stream request body via env var (e.g benchmarking script)
-	streamRequestBodyEnv := os.Getenv("StreamRequestBody")
-
-	streamRequestBody := true
-
-	if streamRequestBodyEnv == "false" {
-		streamRequestBody = false
+	config := &filesystem.Config{
+		Buckets: buckets,
 	}
 
-	app := fiber.New(fiber.Config{
-
-		// Disable the startup banner
-		DisableStartupMessage: s3.DisableLogging,
-
-		// Set the body limit for S3 specs to 5GiB
-		BodyLimit: 5 * 1024 * 1024 * 1024,
-
-		// Use streaming for more efficiency
-		StreamRequestBody: streamRequestBody,
-
-		// Override default error handler
-		ErrorHandler: func(ctx *fiber.Ctx, err error) error {
-			return s3.ErrorHandler(ctx, err)
-		}},
-	)
-
-	if !s3.DisableLogging {
-		app.Use(logger.New())
+	be, err := filesystem.New(config)
+	if err != nil {
+		slog.Error("Failed to create filesystem backend", "error", err)
+		panic(fmt.Sprintf("Failed to create filesystem backend: %v", err))
 	}
-
-	/*
-		app.Use(logger.New(logger.Config{
-			Format: "[${ip}]:${port} ${status} - ${method} ${path}\n",
-		}))
-	*/
-
-	// Add authentication middleware for all requests
-	app.Use(s3.SigV4AuthMiddleware)
-
-	// List buckets
-	app.Get("/", func(c *fiber.Ctx) error {
-
-		return s3.ListBuckets(c)
-	})
-
-	// ListObjectsV2
-	app.Get(`/:bucket<regex([a-z0-9-.]+)>`, func(c *fiber.Ctx) error {
-		bucket := c.Params("bucket")
-
-		return s3.ListObjectsV2Handler(bucket, c)
-	})
-
-	// GetObject (HEAD)
-	app.Head(`/:bucket<regex([a-z0-9-.]+)>/*`, func(c *fiber.Ctx) error {
-		bucket := c.Params("bucket")
-		file := c.Params("*")
-
-		return s3.GetObjectHead(bucket, file, c)
-	})
-
-	// GetObject (GET, BODY)
-	app.Get(`/:bucket<regex([a-z0-9-.]+)>/*`, func(c *fiber.Ctx) error {
-		bucket := c.Params("bucket")
-		file := c.Params("*")
-
-		return s3.GetObject(bucket, file, c)
-	})
-
-	// PutObject (PUT)
-	app.Put(`/:bucket<regex([a-z0-9-.]+)>/*`, func(c *fiber.Ctx) error {
-		bucket := c.Params("bucket")
-		file := c.Params("*")
-
-		return s3.PutObject(bucket, file, c)
-	})
-
-	app.Post(`/:bucket<regex([a-z0-9-.]+)>/*`, func(c *fiber.Ctx) error {
-		bucket := c.Params("bucket")
-		file := c.Params("*")
-
-		// Confirm if posting a multipart upload, or complete a multipart upload
-		if c.Query("uploadId") == "" {
-			return s3.CreateMultipartUpload(bucket, file, c)
-		} else {
-			return s3.CompleteMultipartUpload(bucket, file, c.Query("uploadId"), c)
-		}
-	})
-
-	// DeleteObject
-	app.Delete(`/:bucket<regex([a-z0-9-.]+)>/*`, func(c *fiber.Ctx) error {
-		bucket := c.Params("bucket")
-		file := c.Params("*")
-
-		fmt.Println("Deleting object", bucket, file)
-
-		return s3.DeleteObject(bucket, file, c)
-
-	})
-
-	return app
+	return be
 }
 
 func (s3 *Config) ErrorHandler(ctx *fiber.Ctx, err error) error {
@@ -450,8 +357,10 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 		}
 
 		// Complete multipart upload
+		// Use xml.Unmarshal directly instead of c.BodyParser() for AWS SDK v1 compatibility
+		// Fiber's BodyParser relies on Content-Type header which differs between SDK versions
 		var completeReq CompleteMultipartUpload
-		if err := c.BodyParser(&completeReq); err != nil {
+		if err := xml.Unmarshal(c.Body(), &completeReq); err != nil {
 			return err
 		}
 

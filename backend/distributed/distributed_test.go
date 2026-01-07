@@ -2,6 +2,7 @@ package distributed
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/gob"
@@ -20,21 +21,25 @@ import (
 )
 
 func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
-
 	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
 	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
 
-	backend, err := New(Backend{BadgerDir: tmpDir})
+	cfg := &Config{BadgerDir: tmpDir}
+	b, err := New(cfg)
 	require.NoError(t, err)
-	require.NotNil(t, backend)
+	require.NotNil(t, b)
+	defer b.Close()
+
+	backend := b.(*Backend)
 
 	// Ensure tests don't write into the repo's s3/tests/... directories.
 	tmp := t.TempDir()
-	backend.DataDir = filepath.Join(tmp, "nodes")
+	backend.SetDataDir(filepath.Join(tmp, "nodes"))
 
-	// `New()` uses PartitionCount=11 and names nodes as node-0..node-10.
-	for i := 0; i < 11; i++ {
-		require.NoError(t, os.MkdirAll(filepath.Join(backend.DataDir, fmt.Sprintf("node-%d", i)), 0750))
+	// `New()` uses PartitionCount=5 by default and names nodes as node-0..node-4.
+	for i := 0; i < 5; i++ {
+		require.NoError(t, os.MkdirAll(filepath.Join(backend.DataDir(), fmt.Sprintf("node-%d", i)), 0750))
 	}
 
 	// Deterministic data (avoid external fixtures).
@@ -53,19 +58,19 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 	dataRes, parityRes, fsize, err := backend.putObjectToWAL("bucket", objPath, objectHash)
 	require.NoError(t, err)
 	require.Equal(t, fsize, int64(len(orig)))
-	require.Len(t, dataRes, backend.RsDataShard)
-	require.Len(t, parityRes, backend.RsParityShard)
+	require.Len(t, dataRes, backend.RsDataShard())
+	require.Len(t, parityRes, backend.RsParityShard())
 
 	// Recompute shard->node mapping (must match putObjectToWAL).
 	_, file := filepath.Split(objPath)
 	key := []byte(fmt.Sprintf("%s/%s", "bucket", file))
-	hashRingShards, err := backend.HashRing.GetClosestN(key, backend.RsDataShard+backend.RsParityShard)
+	hashRingShards, err := backend.HashRing().GetClosestN(key, backend.RsDataShard()+backend.RsParityShard())
 	require.NoError(t, err)
-	require.Len(t, hashRingShards, backend.RsDataShard+backend.RsParityShard)
+	require.Len(t, hashRingShards, backend.RsDataShard()+backend.RsParityShard())
 
 	// Regression guard: metadata must be written to EACH node's local WAL Badger DB
 	// for both data and parity shards. Missing parity metadata breaks reconstruction later.
-	for i := 0; i < backend.RsDataShard+backend.RsParityShard; i++ {
+	for i := 0; i < backend.RsDataShard()+backend.RsParityShard(); i++ {
 		node := hashRingShards[i].String()
 		nodeDir := backend.nodeDir(node)
 		w, err := wal.New(filepath.Join(nodeDir, "state.json"), nodeDir)
@@ -80,7 +85,7 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 	}
 
 	// Read shards back from WAL using the returned WriteResults.
-	totalShards := backend.RsDataShard + backend.RsParityShard
+	totalShards := backend.RsDataShard() + backend.RsParityShard()
 	shardBytes := make([][]byte, totalShards)
 
 	for i := 0; i < totalShards; i++ {
@@ -90,10 +95,10 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 		require.NotNil(t, w)
 
 		var res *wal.WriteResult
-		if i < backend.RsDataShard {
+		if i < backend.RsDataShard() {
 			res = dataRes[i]
 		} else {
-			res = parityRes[i-backend.RsDataShard]
+			res = parityRes[i-backend.RsDataShard()]
 		}
 		require.NotNil(t, res)
 
@@ -105,7 +110,7 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 		require.NoError(t, w.Close())
 	}
 
-	enc, err := reedsolomon.NewStream(backend.RsDataShard, backend.RsParityShard)
+	enc, err := reedsolomon.NewStream(backend.RsDataShard(), backend.RsParityShard())
 	require.NoError(t, err)
 
 	// Verify consumes the readers, so build readers from the stored bytes.
@@ -132,18 +137,23 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 func TestReadFromWriteResultStream_RoundTripJoin(t *testing.T) {
 	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
 	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
 
-	backend, err := New(Backend{BadgerDir: tmpDir})
+	cfg := &Config{BadgerDir: tmpDir}
+	b, err := New(cfg)
 	require.NoError(t, err)
-	require.NotNil(t, backend)
+	require.NotNil(t, b)
+	defer b.Close()
+
+	backend := b.(*Backend)
 
 	// Ensure tests don't write into the repo's s3/tests/... directories.
 	tmp := t.TempDir()
-	backend.DataDir = filepath.Join(tmp, "nodes")
+	backend.SetDataDir(filepath.Join(tmp, "nodes"))
 
-	// `New()` uses PartitionCount=11 and names nodes as node-0..node-10.
-	for i := 0; i < 11; i++ {
-		require.NoError(t, os.MkdirAll(filepath.Join(backend.DataDir, fmt.Sprintf("node-%d", i)), 0750))
+	// `New()` uses PartitionCount=5 by default and names nodes as node-0..node-4.
+	for i := 0; i < 5; i++ {
+		require.NoError(t, os.MkdirAll(filepath.Join(backend.DataDir(), fmt.Sprintf("node-%d", i)), 0750))
 	}
 
 	// Deterministic data (avoid external fixtures).
@@ -162,18 +172,18 @@ func TestReadFromWriteResultStream_RoundTripJoin(t *testing.T) {
 	dataRes, parityRes, fsize, err := backend.putObjectToWAL("bucket", objPath, objectHash)
 	require.NoError(t, err)
 	require.Equal(t, fsize, int64(len(orig)))
-	require.Len(t, dataRes, backend.RsDataShard)
-	require.Len(t, parityRes, backend.RsParityShard)
+	require.Len(t, dataRes, backend.RsDataShard())
+	require.Len(t, parityRes, backend.RsParityShard())
 
 	// Recompute shard->node mapping (must match putObjectToWAL).
 	_, file := filepath.Split(objPath)
 	key := []byte(fmt.Sprintf("%s/%s", "bucket", file))
-	hashRingShards, err := backend.HashRing.GetClosestN(key, backend.RsDataShard+backend.RsParityShard)
+	hashRingShards, err := backend.HashRing().GetClosestN(key, backend.RsDataShard()+backend.RsParityShard())
 	require.NoError(t, err)
-	require.Len(t, hashRingShards, backend.RsDataShard+backend.RsParityShard)
+	require.Len(t, hashRingShards, backend.RsDataShard()+backend.RsParityShard())
 
 	// Build streaming shard readers directly from the WAL using ReadFromWriteResultStream.
-	totalShards := backend.RsDataShard + backend.RsParityShard
+	totalShards := backend.RsDataShard() + backend.RsParityShard()
 	shardReaders := make([]io.Reader, totalShards)
 
 	// Keep WAL instances alive until join completes (stream goroutines capture *WAL).
@@ -194,10 +204,10 @@ func TestReadFromWriteResultStream_RoundTripJoin(t *testing.T) {
 		wals[i] = w
 
 		var res *wal.WriteResult
-		if i < backend.RsDataShard {
+		if i < backend.RsDataShard() {
 			res = dataRes[i]
 		} else {
-			res = parityRes[i-backend.RsDataShard]
+			res = parityRes[i-backend.RsDataShard()]
 		}
 		require.NotNil(t, res)
 
@@ -207,7 +217,7 @@ func TestReadFromWriteResultStream_RoundTripJoin(t *testing.T) {
 		shardReaders[i] = r
 	}
 
-	enc, err := reedsolomon.NewStream(backend.RsDataShard, backend.RsParityShard)
+	enc, err := reedsolomon.NewStream(backend.RsDataShard(), backend.RsParityShard())
 	require.NoError(t, err)
 
 	var out bytes.Buffer
@@ -222,30 +232,35 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 		name string
 		size int
 	}{
-		//{name: "32kb", size: 32 * 1024},
 		{name: "128kb", size: 128 * 1024},
-		//		{name: "1mb", size: 1 * 1024 * 1024},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
 			require.NoError(t, err)
+			defer os.RemoveAll(tmpDir)
 
-			backend, err := New(Backend{BadgerDir: tmpDir})
+			cfg := &Config{
+				BadgerDir:      tmpDir,
+				PartitionCount: 11,
+			}
+			b, err := New(cfg)
 			require.NoError(t, err)
-			require.NotNil(t, backend)
+			require.NotNil(t, b)
+			defer b.Close()
+
+			backend := b.(*Backend)
 
 			// Ensure tests don't write into the repo's s3/tests/... directories.
 			tmp := t.TempDir()
-			backend.DataDir = filepath.Join(tmp, "nodes")
+			backend.SetDataDir(filepath.Join(tmp, "nodes"))
 
-			t.Log("DataDir", backend.DataDir)
+			t.Log("DataDir", backend.DataDir())
 
 			// `New()` uses PartitionCount=11 and names nodes as node-0..node-10.
 			for i := 0; i < 11; i++ {
-
-				nodeDir := filepath.Join(backend.DataDir, fmt.Sprintf("node-%d", i))
+				nodeDir := filepath.Join(backend.DataDir(), fmt.Sprintf("node-%d", i))
 				t.Log("Creating node directory", nodeDir)
 				require.NoError(t, os.MkdirAll(nodeDir, 0750))
 
@@ -264,15 +279,13 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 			objPath := filepath.Join(tmp, "obj.bin")
 			require.NoError(t, os.WriteFile(objPath, orig, 0644))
 
-			// PUT
-			require.NoError(t, backend.PutObject(bucket, objPath, nil))
+			// PUT using the new interface
+			ctx := context.Background()
+			require.NoError(t, backend.PutObjectFromPath(ctx, bucket, objPath))
 
-			// GET should match.
+			// GET should match using the new interface
 			var out bytes.Buffer
-			require.NoError(t, backend.Get(bucket, objPath, &out, nil))
-
-			//t.Log("orig", string(orig))
-			//t.Log("out", string(out.Bytes()))
+			require.NoError(t, backend.GetFromPath(ctx, bucket, objPath, &out))
 
 			require.Equal(t, 0, bytes.Compare(orig, out.Bytes()))
 
@@ -332,7 +345,7 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 				require.NoError(t, err)
 
 				var out2 bytes.Buffer
-				require.Error(t, backend.Get(bucket, objPath, &out2, nil))
+				require.Error(t, backend.GetFromPath(ctx, bucket, objPath, &out2))
 
 				// Restore header.
 				_, err = f.Seek(seekBase, io.SeekStart)
@@ -363,7 +376,7 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 				require.NoError(t, err)
 
 				var out2 bytes.Buffer
-				require.Error(t, backend.Get(bucket, objPath, &out2, nil))
+				require.Error(t, backend.GetFromPath(ctx, bucket, objPath, &out2))
 
 				// Restore byte.
 				b[0] = origByte
@@ -373,8 +386,7 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 				require.NoError(t, err)
 
 				// Re-test, should not fail
-				require.NoError(t, backend.Get(bucket, objPath, &out2, nil))
-
+				require.NoError(t, backend.GetFromPath(ctx, bucket, objPath, &out2))
 			}
 
 			// Corruption 2: WAL file missing, GET should fail; after restore, GET should succeed.
@@ -383,12 +395,12 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 				require.NoError(t, os.Rename(walPath, moved))
 
 				var out2 bytes.Buffer
-				require.Error(t, backend.Get(bucket, objPath, &out2, nil))
+				require.Error(t, backend.GetFromPath(ctx, bucket, objPath, &out2))
 
 				require.NoError(t, os.Rename(moved, walPath))
 
 				var out3 bytes.Buffer
-				require.NoError(t, backend.Get(bucket, objPath, &out3, nil))
+				require.NoError(t, backend.GetFromPath(ctx, bucket, objPath, &out3))
 				require.Equal(t, 0, bytes.Compare(orig, out3.Bytes()))
 			}
 		})
