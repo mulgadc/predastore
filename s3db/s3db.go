@@ -79,6 +79,27 @@ func (s3db *S3DB) Delete(key []byte) error {
 		})
 }
 
+func (s3db *S3DB) ListKeys(prefix []byte) ([][]byte, error) {
+	var keys [][]byte
+	err := s3db.Badger.View(
+		func(tx *badger.Txn) error {
+			opts := badger.DefaultIteratorOptions
+			opts.Prefix = prefix
+			it := tx.NewIterator(opts)
+			defer it.Close()
+
+			for it.Rewind(); it.Valid(); it.Next() {
+				item := it.Item()
+				key := item.Key()
+				keyCopy := make([]byte, len(key))
+				copy(keyCopy, key)
+				keys = append(keys, keyCopy)
+			}
+			return nil
+		})
+	return keys, err
+}
+
 func GenObjectHash(bucket string, object string) [32]byte {
 	objectKey := fmt.Sprintf("%s/%s", bucket, object)
 	return sha256.Sum256([]byte(objectKey))
