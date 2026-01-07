@@ -1,6 +1,8 @@
 package filesystem
 
 import (
+	"io"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/mulgadc/predastore/s3"
 )
@@ -29,7 +31,7 @@ func (backend Backend) GetObjectHead(bucket string, file string, c *fiber.Ctx) (
 
 }
 
-func (backend Backend) Get(bucket string, file string, c *fiber.Ctx) (err error) {
+func (backend Backend) Get(bucket string, file string, out io.Writer, c *fiber.Ctx) (err error) {
 
 	return
 }

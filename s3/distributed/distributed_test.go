@@ -3,6 +3,8 @@ package distributed
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
+	"encoding/gob"
 	"fmt"
 	"io"
 	"os"
@@ -11,7 +13,9 @@ import (
 	"time"
 
 	"github.com/klauspost/reedsolomon"
+	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3/wal"
+	s3db "github.com/mulgadc/predastore/s3db"
 	"github.com/stretchr/testify/require"
 )
 
@@ -211,7 +215,6 @@ func TestReadFromWriteResultStream_RoundTripJoin(t *testing.T) {
 	require.Equal(t, orig, out.Bytes())
 }
 
-/*
 func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 	bucket := "test-bucket"
 
@@ -219,9 +222,9 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 		name string
 		size int
 	}{
-		{name: "32kb", size: 32 * 1024},
+		//{name: "32kb", size: 32 * 1024},
 		{name: "128kb", size: 128 * 1024},
-		{name: "1mb", size: 1 * 1024 * 1024},
+		//		{name: "1mb", size: 1 * 1024 * 1024},
 	}
 
 	for _, tc := range cases {
@@ -237,10 +240,21 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 			tmp := t.TempDir()
 			backend.DataDir = filepath.Join(tmp, "nodes")
 
+			t.Log("DataDir", backend.DataDir)
+
 			// `New()` uses PartitionCount=11 and names nodes as node-0..node-10.
 			for i := 0; i < 11; i++ {
-				require.NoError(t, os.MkdirAll(filepath.Join(backend.DataDir, fmt.Sprintf("node-%d", i)), 0750))
+
+				nodeDir := filepath.Join(backend.DataDir, fmt.Sprintf("node-%d", i))
+				t.Log("Creating node directory", nodeDir)
+				require.NoError(t, os.MkdirAll(nodeDir, 0750))
+
+				// Spin up a QUIC server for this node
+				go quicserver.New(nodeDir, fmt.Sprintf("127.0.0.1:%d", 9991+i))
 			}
+
+			// Allow QUIC servers time to start listening
+			time.Sleep(100 * time.Millisecond)
 
 			// Create deterministic content.
 			orig := make([]byte, tc.size)
@@ -256,6 +270,10 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 			// GET should match.
 			var out bytes.Buffer
 			require.NoError(t, backend.Get(bucket, objPath, &out, nil))
+
+			//t.Log("orig", string(orig))
+			//t.Log("out", string(out.Bytes()))
+
 			require.Equal(t, 0, bytes.Compare(orig, out.Bytes()))
 
 			// Locate the shard placement and per-node WAL write result metadata.
@@ -376,4 +394,3 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 		})
 	}
 }
-*/

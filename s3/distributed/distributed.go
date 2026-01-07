@@ -171,35 +171,23 @@ func (backend Backend) Get(bucket string, object string, out io.Writer, ctx *fib
 	// TODO: Add check for parity corruption, right now we are just interested in the data parts
 	shardReaders, err := backend.shardReaders(bucket, object, shards, false)
 
-	//spew.Dump(shardReaders)
 	if err != nil {
-		fmt.Println("IN HERE", err)
 		return err
 	}
 
 	// Attempt to parse shards into a single object, can we reconstruct the parts?
 	err = enc.Join(out, shardReaders, shards.Size)
 
-	fmt.Println("shard num", len(shardReaders))
-	fmt.Println(shards.Size)
-	fmt.Println(err)
-
 	if err != nil {
 
-		fmt.Println("Error decoding, reconstruction required", err)
+		slog.Error("Error decoding, reconstruction required", "err", err)
 
-		// Rewind readers
-		// First, query which nodes have our object shards
-		//shards, size, err = backend.openInput(bucket, object)
-
-		//fmt.Println("openInput err", err)
-
+		// Open shards from both data and parity nodes
 		shardReaders, err = backend.shardReaders(bucket, object, shards, true)
+
 		if err != nil {
 			return err
 		}
-
-		//fmt.Println("Verification failed. Reconstructing data")
 
 		// Create out destination writers
 		reconstruction := make([]io.Writer, len(shardReaders))
@@ -214,16 +202,20 @@ func (backend Backend) Get(bucket string, object string, out io.Writer, ctx *fib
 				// Store the missing part on the local FS
 				files[i], err = os.Create(outfn)
 
+				slog.Info("Creating temporary file for reconstruction", "filename", outfn)
+
 				if err != nil {
 					return
 				}
+
+				// Remove for cleanup
+				defer os.Remove(outfn)
 
 				reconstruction[i] = files[i]
 
 			}
 		}
 
-		//fmt.Println("Reconstruct", len(shardReaders), len(reconstruction), backend.RsDataShard, backend.RsParityShard)
 		err = enc.Reconstruct(shardReaders, reconstruction)
 
 		if err != nil {
@@ -236,7 +228,6 @@ func (backend Backend) Get(bucket string, object string, out io.Writer, ctx *fib
 				// Close and remove the file once complete
 				defer func(int) {
 					files[i].Close()
-					os.Remove(files[i].Name())
 				}(i)
 			}
 		}
@@ -335,7 +326,6 @@ func (backend Backend) PutObject(bucket string, object string, c *fiber.Ctx) (er
 	d, p, size, err := backend.putObjectToWAL(bucket, object, objectHash)
 
 	spew.Dump(d)
-
 	spew.Dump(p)
 
 	if err != nil {
@@ -696,9 +686,11 @@ func (backend Backend) shardReaders(bucket string, object string, shards ObjectT
 
 	// TODO: Optimise, validate data shards are correct, before parity and validation to improve performance
 	for i := range totalNodes {
-		//nodeDir := backend.nodeDir(fmt.Sprintf("node-%d", totalNodes[i]))
 
+		// Original WAL (direct)
 		/*
+			nodeDir := backend.nodeDir(fmt.Sprintf("node-%d", totalNodes[i]))
+
 			walInstance, err := wal.New("", nodeDir)
 
 			if err != nil {
@@ -707,7 +699,7 @@ func (backend Backend) shardReaders(bucket string, object string, shards ObjectT
 
 			defer walInstance.Close()
 
-			objectHash := GenObjectHash(bucket, object)
+			objectHash := s3db.GenObjectHash(bucket, object)
 			// Query local node, where does the shard belong?
 			result, err := walInstance.DB.Get(objectHash[:])
 			if err != nil {
@@ -723,12 +715,17 @@ func (backend Backend) shardReaders(bucket string, object string, shards ObjectT
 				return shardReaders, err
 			}
 
+			shardReaders[i], err = walInstance.ReadFromWriteResultStream(&objectWriteResult.WriteResult)
+
+			continue
 		*/
 
-		//		shardReaders[i], err = walInstance.ReadFromWriteResultStream(&objectWriteResult.WriteResult)
+		// QUIC implementation (client <> server model)
 
 		// Retrieve directly from QUIC server for our node shard
-		c, err := quicclient.Dial(context.Background(), fmt.Sprintf("127.0.0.1:%d", portRange+i))
+		// Use the actual node number from totalNodes[i], not the loop index i
+		nodeNum := int(totalNodes[i])
+		c, err := quicclient.Dial(context.Background(), fmt.Sprintf("127.0.0.1:%d", portRange+nodeNum))
 
 		if err != nil {
 			fmt.Println(err)

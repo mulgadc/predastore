@@ -118,7 +118,7 @@ func (qs *QuicServer) handleStream(s *quic.Stream) {
 		return
 	}
 
-	fmt.Println("requestBytes", requestBytes)
+	fmt.Println("requestBytes", string(requestBytes))
 	/*
 		metaBytes, err := quicproto.ReadExactBytes(br, reqHdr.MetaLen, maxMetaLen)
 		if err != nil {
