@@ -1,7 +1,10 @@
-package s3
+package s3_test
 
 import (
 	"bytes"
+	"github.com/gofiber/fiber/v2"
+	"github.com/mulgadc/predastore/backend/filesystem"
+	"github.com/mulgadc/predastore/s3"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -60,14 +63,14 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	wg.Add(1)
 
 	// Create and configure the S3 server
-	s3server := New(&Config{
+	s3server := s3.New(&s3.Config{
 		ConfigPath: "./tests/config/server.toml",
 	})
 	err := s3server.ReadConfig()
 	require.NoError(t, err, "Failed to read config file")
 
 	// Setup routes
-	app := s3server.SetupRoutes()
+	app := setupTestApp(s3server)
 
 	// Start the server in a goroutine
 	go func() {
@@ -102,8 +105,8 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 }
 
 // loadTestConfig reads the shared test config once per test
-func loadTestConfig(t *testing.T) *Config {
-	s3config := New(&Config{
+func loadTestConfig(t *testing.T) *s3.Config {
+	s3config := s3.New(&s3.Config{
 		ConfigPath: "./tests/config/server.toml",
 	})
 	err := s3config.ReadConfig()
@@ -551,4 +554,14 @@ func checkFileSHA256(t *testing.T, filename string, expectedSHA string) {
 	}
 
 	assert.Equal(t, expectedSHA, actualSHA, "File SHA256 should match expected value")
+}
+
+
+// setupTestApp creates a Fiber app with filesystem backend for testing
+func setupTestApp(config *s3.Config) *fiber.App {
+	be, err := filesystem.New(config)
+	if err != nil {
+		panic(err)
+	}
+	return config.SetupRoutesWithBackend(be)
 }

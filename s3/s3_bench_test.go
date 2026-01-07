@@ -1,7 +1,8 @@
-package s3
+package s3_test
 
 import (
 	"bytes"
+	"github.com/mulgadc/predastore/s3"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -25,13 +26,13 @@ func startBenchServer(tb testing.TB) (context.CancelFunc, *sync.WaitGroup) {
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 
-	s3server := New(&Config{
+	s3server := s3.New(&s3.Config{
 		ConfigPath: "./tests/config/server.toml",
 	})
 	require.NoError(tb, s3server.ReadConfig(), "Failed to read config file")
 
 	s3server.DisableLogging = true
-	app := s3server.SetupRoutes()
+	app := setupTestApp(s3server)
 
 	go func() {
 		defer wg.Done()
@@ -59,7 +60,7 @@ func createBenchClientV2(tb testing.TB) *awss3v2.Client {
 	}
 	httpClient := &http.Client{Transport: tr}
 
-	cfg := New(&Config{
+	cfg := s3.New(&s3.Config{
 		ConfigPath: "./tests/config/server.toml",
 	})
 	require.NoError(tb, cfg.ReadConfig(), "Failed to read config file")

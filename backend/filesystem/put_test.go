@@ -22,9 +22,9 @@ func TestPutObject_BucketValidation(t *testing.T) {
 
 	// PutObject with invalid bucket should fail early
 	testFile := "test.txt"
-	
+
 	err := backend.PutObject("invalid-bucket", testFile, nil)
-	
+
 	// Should fail with NoSuchBucket before needing context
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "NoSuchBucket")
@@ -36,7 +36,7 @@ func TestPutObject_ValidatesKeyName(t *testing.T) {
 
 	// Try to put with an invalid key (non-UTF8)
 	invalidKey := string([]byte{0xff, 0xfe, 0xfd})
-	
+
 	err := backend.PutObject("test-bucket", invalidKey, nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "InvalidKey")
