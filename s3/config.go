@@ -37,7 +37,7 @@ func (s3 *Config) ReadConfig() (err error) {
 	for k, b := range s3.Buckets {
 
 		// Check if the bucket name is valid
-		err := isValidBucketName(b.Name)
+		err := IsValidBucketName(b.Name)
 		if err != nil {
 			slog.Warn("Invalid bucket name", "bucket", b.Name, "error", err)
 			continue
@@ -80,4 +80,11 @@ func (s3 *Config) BucketConfig(bucket string) (S3_Buckets, error) {
 	}
 
 	return S3_Buckets{}, errors.New("Bucket not found")
+}
+
+// ToFilesystemConfig converts s3.Config to filesystem backend config
+func (s3 *Config) ToFilesystemConfig() interface{} {
+	// Import dynamically to avoid circular imports
+	// The actual conversion happens in the routes setup
+	return s3
 }

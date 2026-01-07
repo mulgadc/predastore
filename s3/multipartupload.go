@@ -28,7 +28,7 @@ func (s3 *Config) CompleteMultipartUpload(bucket string, file string, uploadId s
 	}
 
 	// Validate the key name
-	err = isValidKeyName(file)
+	err = IsValidKeyName(file)
 	if err != nil {
 		return errors.New("InvalidKey")
 	}
@@ -229,7 +229,7 @@ func (s3 *Config) CreateMultipartUpload(bucket string, file string, c *fiber.Ctx
 	}
 
 	// Validate the key name
-	err = isValidKeyName(file)
+	err = IsValidKeyName(file)
 	if err != nil {
 		return errors.New("InvalidKey")
 	}
@@ -281,7 +281,7 @@ func (s3 *Config) PutObjectPart(bucket string, file string, partNumber int, uplo
 		return errors.New("NoSuchBucket")
 	}
 	// Validate the key name
-	err = isValidKeyName(file)
+	err = IsValidKeyName(file)
 	if err != nil {
 		return errors.New("InvalidKey")
 	}

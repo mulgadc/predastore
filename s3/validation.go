@@ -7,7 +7,8 @@ import (
 	"unicode/utf8"
 )
 
-func isValidKeyName(key string) error {
+// IsValidKeyName validates an object key name
+func IsValidKeyName(key string) error {
 
 	// Test for a valid UTF-8 character
 	// https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-guidelines
@@ -17,9 +18,9 @@ func isValidKeyName(key string) error {
 	return nil
 }
 
-// Bucket name validation
+// IsValidBucketName validates a bucket name according to S3 naming rules
 // https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
-func isValidBucketName(bucket string) error {
+func IsValidBucketName(bucket string) error {
 
 	if len(bucket) < 3 {
 		return errors.New("bucket must be > 3 characters")

@@ -21,7 +21,7 @@ func (s3 *Config) DeleteObject(bucket string, file string, c *fiber.Ctx) error {
 	}
 
 	// Validate the key name
-	err = isValidKeyName(file)
+	err = IsValidKeyName(file)
 	if err != nil {
 		return errors.New("InvalidKey")
 	}

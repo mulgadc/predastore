@@ -24,7 +24,7 @@ func (s3 *Config) GetObjectHead(bucket string, file string, c *fiber.Ctx) error 
 	}
 
 	// Validate the key name
-	err = isValidKeyName(file)
+	err = IsValidKeyName(file)
 	if err != nil {
 		return errors.New("InvalidKey")
 	}
@@ -82,7 +82,7 @@ func (s3 *Config) GetObject(bucket string, file string, c *fiber.Ctx) error {
 	}
 
 	// Validate the key name
-	err = isValidKeyName(file)
+	err = IsValidKeyName(file)
 	if err != nil {
 		return errors.New("InvalidKey")
 	}

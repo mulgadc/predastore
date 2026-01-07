@@ -48,7 +48,7 @@ func TestIsValidKeyName(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := isValidKeyName(string(test.key))
+			err := IsValidKeyName(string(test.key))
 			assert.Equal(t, test.want, err)
 		})
 	}
@@ -184,7 +184,7 @@ func TestIsValidBucketName(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := isValidBucketName(test.bucket)
+			err := IsValidBucketName(test.bucket)
 
 			// Use assert to check if the error is as expected
 			assert.Equal(t, test.want, err)
