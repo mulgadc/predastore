@@ -2,7 +2,6 @@ package s3_test
 
 import (
 	"bytes"
-	"github.com/mulgadc/predastore/s3"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -12,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/mulgadc/predastore/s3"
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
 	v2config "github.com/aws/aws-sdk-go-v2/config"
