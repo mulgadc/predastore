@@ -47,6 +47,20 @@ type ObjectRequest struct {
 	Owner  string
 }
 
+// PutRequest contains metadata for storing a shard via QUIC PUT
+type PutRequest struct {
+	Bucket     string   `json:"bucket"`
+	Object     string   `json:"object"`
+	ObjectHash [32]byte `json:"object_hash"` // SHA256 of bucket/object for metadata
+	ShardSize  int      `json:"shard_size"`  // Expected size of the shard data
+}
+
+// PutResponse contains the result of a QUIC PUT operation
+type PutResponse struct {
+	WriteResult wal.WriteResult `json:"write_result"`
+	Error       string          `json:"error,omitempty"`
+}
+
 func New(walDir string, addr string) {
 
 	qs := &QuicServer{
@@ -101,8 +115,6 @@ func (qs *QuicServer) serveConn(conn *quic.Conn) {
 func (qs *QuicServer) handleStream(s *quic.Stream) {
 	defer s.Close()
 
-	fmt.Println("handleStream")
-
 	br := bufio.NewReaderSize(s, 128*1024)
 	bw := bufio.NewWriterSize(s, 128*1024)
 	defer bw.Flush()
@@ -118,35 +130,23 @@ func (qs *QuicServer) handleStream(s *quic.Stream) {
 		return
 	}
 
-	fmt.Println("requestBytes", string(requestBytes))
-	/*
-		metaBytes, err := quicproto.ReadExactBytes(br, reqHdr.MetaLen, maxMetaLen)
-		if err != nil {
-			writeErr(bw, reqHdr, quicproto.StatusBadRequest, "bad meta")
-			return
-		}
-	*/
-
-	objectRequest := ObjectRequest{}
-	err = json.Unmarshal(requestBytes, &objectRequest)
-
-	slog.Info("requestResult", "objectRequest", objectRequest)
-	if err != nil {
-		writeErr(bw, reqHdr, quicproto.StatusBadRequest, "bad write result")
-		return
-	}
-
-	//key := string(keyBytes)
-
 	switch reqHdr.Method {
 	case quicproto.MethodSTATUS:
 		qs.handleSTATUS(bw, reqHdr)
 	case quicproto.MethodGET:
+		var objectRequest ObjectRequest
+		if err := json.Unmarshal(requestBytes, &objectRequest); err != nil {
+			writeErr(bw, reqHdr, quicproto.StatusBadRequest, "bad object request")
+			return
+		}
 		qs.handleGET(br, bw, reqHdr, objectRequest)
 	case quicproto.MethodPUT:
-		qs.handlePUT(br, bw, reqHdr, objectRequest)
-	//case quicproto.MethodREBUILD:
-	//	qs.handleREBUILD(bw, reqHdr, key, metaBytes)
+		var putRequest PutRequest
+		if err := json.Unmarshal(requestBytes, &putRequest); err != nil {
+			writeErr(bw, reqHdr, quicproto.StatusBadRequest, "bad put request")
+			return
+		}
+		qs.handlePUTShard(br, bw, reqHdr, putRequest)
 	default:
 		writeErr(bw, reqHdr, quicproto.StatusBadRequest, "unknown method")
 	}
@@ -374,64 +374,85 @@ func (qs *QuicServer) handleGET(br *bufio.Reader, bw *bufio.Writer, req quicprot
 	//_, _ = io.Copy(bw, f)
 }
 
-func (qs *QuicServer) handlePUT(br *bufio.Reader, bw *bufio.Writer, req quicproto.Header, objectRequest ObjectRequest) {
-	key := objectRequest.Bucket + "/" + objectRequest.Object
-	path := safePath(storageRoot, key)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		writeErr(bw, req, quicproto.StatusServerError, "mkdir failed")
-		return
-	}
-
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+// handlePUTShard receives shard data via QUIC and writes it to the local WAL
+func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req quicproto.Header, putReq PutRequest) {
+	// Open WAL for this node
+	walInstance, err := wal.New("", qs.WalDir)
 	if err != nil {
-		writeErr(bw, req, quicproto.StatusServerError, "create failed")
+		slog.Error("handlePUTShard: failed to open WAL", "error", err)
+		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("wal open: %v", err))
 		return
 	}
-	defer f.Close()
+	defer walInstance.Close()
 
-	// Read body either by declared length or until EOF.
-	var n int64
+	// Determine how many bytes to read
+	var bodyLen int
 	if req.BodyLen > 0 {
-		n, err = io.CopyN(f, br, int64(req.BodyLen))
-		if err != nil {
-			writeErr(bw, req, quicproto.StatusBadRequest, "short body")
-			_ = os.Remove(tmp)
-			return
-		}
+		bodyLen = int(req.BodyLen)
+	} else if putReq.ShardSize > 0 {
+		bodyLen = putReq.ShardSize
 	} else {
-		n, err = io.Copy(f, br)
-		if err != nil {
-			writeErr(bw, req, quicproto.StatusServerError, "copy failed")
-			_ = os.Remove(tmp)
-			return
-		}
-	}
-
-	if err := f.Sync(); err != nil {
-		writeErr(bw, req, quicproto.StatusServerError, "sync failed")
-		_ = os.Remove(tmp)
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		writeErr(bw, req, quicproto.StatusServerError, "rename failed")
-		_ = os.Remove(tmp)
+		writeErr(bw, req, quicproto.StatusBadRequest, "no body length specified")
 		return
 	}
 
-	meta := fmt.Sprintf(`{"stored_bytes":%d}`, n)
+	// Create a limited reader for the shard data
+	shardReader := io.LimitReader(br, int64(bodyLen))
+
+	// Write to WAL
+	writeResult, err := walInstance.Write(shardReader, bodyLen)
+	if err != nil {
+		slog.Error("handlePUTShard: WAL write failed", "error", err)
+		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("wal write: %v", err))
+		return
+	}
+
+	// Store metadata in local Badger DB (object hash -> WriteResult)
+	err = walInstance.UpdateObjectToWAL(putReq.ObjectHash, writeResult)
+	if err != nil {
+		slog.Error("handlePUTShard: failed to update metadata", "error", err)
+		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("metadata update: %v", err))
+		return
+	}
+
+	slog.Info("handlePUTShard: stored shard",
+		"bucket", putReq.Bucket,
+		"object", putReq.Object,
+		"shardNum", writeResult.ShardNum,
+		"totalSize", writeResult.TotalSize,
+	)
+
+	// Build and send response
+	response := PutResponse{
+		WriteResult: *writeResult,
+	}
+	respBytes, err := json.Marshal(response)
+	if err != nil {
+		writeErr(bw, req, quicproto.StatusServerError, "marshal response failed")
+		return
+	}
+
 	rh := quicproto.Header{
 		Version: quicproto.Version1,
 		Method:  req.Method,
 		Status:  quicproto.StatusOK,
 		ReqID:   req.ReqID,
 		KeyLen:  0,
-		MetaLen: uint32(len(meta)),
+		MetaLen: uint32(len(respBytes)),
 		BodyLen: 0,
 	}
-	_ = quicproto.WriteHeader(bw, rh)
-	_, _ = bw.WriteString(meta)
-	_ = bw.Flush()
+	if err := quicproto.WriteHeader(bw, rh); err != nil {
+		slog.Error("handlePUTShard: write header failed", "error", err)
+		return
+	}
+	if _, err := bw.Write(respBytes); err != nil {
+		slog.Error("handlePUTShard: write response failed", "error", err)
+		return
+	}
+	if err := bw.Flush(); err != nil {
+		slog.Error("handlePUTShard: flush failed", "error", err)
+		return
+	}
 }
 
 type rebuildReq struct {

@@ -70,8 +70,13 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	}
 	tmpFile.Close()
 
-	// Split and write to WAL across nodes
-	_, _, size, err := b.putObjectToWAL(req.Bucket, tmpFile.Name(), objectHash)
+	// Split and write shards (either locally or via QUIC)
+	var size int64
+	if b.useQUIC {
+		_, _, size, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
+	} else {
+		_, _, size, err = b.putObjectToWAL(req.Bucket, tmpFile.Name(), objectHash)
+	}
 	if err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
@@ -161,8 +166,13 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 		}
 	}
 
-	// Split and write to WAL across nodes
-	_, _, size, err := b.putObjectToWAL(bucket, objectPath, objectHash)
+	// Split and write shards (either locally or via QUIC)
+	var size int64
+	if b.useQUIC {
+		_, _, size, err = b.putObjectViaQUIC(ctx, bucket, objectPath, objectHash)
+	} else {
+		_, _, size, err = b.putObjectToWAL(bucket, objectPath, objectHash)
+	}
 	if err != nil {
 		return err
 	}

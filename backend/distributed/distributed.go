@@ -65,6 +65,9 @@ type Config struct {
 	// QUIC server base port (each node uses BasePort + nodeNum)
 	QuicBasePort int
 
+	// UseQUIC enables QUIC-based shard distribution (requires QUIC servers to be running)
+	UseQUIC bool
+
 	// Nodes configuration (from cluster.toml)
 	Nodes []NodeConfig
 
@@ -82,8 +85,9 @@ type Backend struct {
 	badgerDir     string
 	db            *s3db.S3DB
 	quicBasePort  int
-	nodeAddrs     map[int]string    // node ID -> "host:port"
-	buckets       []BucketConfig    // bucket configurations
+	nodeAddrs     map[int]string // node ID -> "host:port"
+	buckets       []BucketConfig // bucket configurations
+	useQUIC       bool           // when true, use QUIC for shard distribution
 }
 
 // ObjectToShardNodes maps an object to its shard locations
@@ -119,6 +123,16 @@ type shardWriteOutcome struct {
 	shardIndex int
 	result     *wal.WriteResult
 	err        error
+}
+
+// bytesBufferWriter wraps a byte slice pointer for use as io.Writer
+type bytesBufferWriter struct {
+	buf *[]byte
+}
+
+func (w *bytesBufferWriter) Write(p []byte) (n int, err error) {
+	*w.buf = append(*w.buf, p...)
+	return len(p), nil
 }
 
 // New creates a new distributed backend
@@ -201,6 +215,7 @@ func New(config interface{}) (backend.Backend, error) {
 		quicBasePort:  quicBasePort,
 		nodeAddrs:     nodeAddrs,
 		buckets:       cfg.Buckets,
+		useQUIC:       cfg.UseQUIC,
 	}, nil
 }
 
@@ -223,6 +238,16 @@ func (b *Backend) nodeDir(node string) string {
 		return filepath.Join("s3", "tests", "data", "distributed", "nodes", node)
 	}
 	return filepath.Join(b.dataDir, node)
+}
+
+// getNodeAddr returns the QUIC address for a node
+// It uses the nodeAddrs map from config if available, otherwise falls back to computed address
+func (b *Backend) getNodeAddr(nodeNum int) string {
+	if addr, ok := b.nodeAddrs[nodeNum]; ok {
+		return addr
+	}
+	// Fallback to computed address for backward compatibility
+	return fmt.Sprintf("127.0.0.1:%d", b.quicBasePort+nodeNum)
 }
 
 // DataDir returns the data directory (for testing)
@@ -433,6 +458,203 @@ func (b *Backend) putObjectToWAL(bucket string, objectPath string, objectHash [3
 	return dataResults, parityResults, size, nil
 }
 
+// putObjectViaQUIC splits a file into RS shards and sends each to the appropriate node via QUIC
+func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPath string, objectHash [32]byte) (dataResults []*wal.WriteResult, parityResults []*wal.WriteResult, size int64, err error) {
+	enc, err := reedsolomon.NewStream(b.rsDataShard, b.rsParityShard)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	f, err := os.Open(objectPath)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	defer f.Close()
+
+	instat, err := f.Stat()
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	size = instat.Size()
+	_, file := filepath.Split(objectPath)
+	key := s3db.GenObjectHash(bucket, file)
+
+	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	// Calculate shard size
+	fileSize := instat.Size()
+	ds := int64(b.rsDataShard)
+	shardSize := int((fileSize + ds - 1) / ds)
+
+	// Step 1: Split file into data shard buffers (in memory)
+	// This allows us to both send to QUIC and use for parity encoding
+	dataShardBuffers := make([][]byte, b.rsDataShard)
+	dataWriters := make([]io.Writer, b.rsDataShard)
+	for i := 0; i < b.rsDataShard; i++ {
+		dataShardBuffers[i] = make([]byte, 0, shardSize)
+		dataWriters[i] = &bytesBufferWriter{buf: &dataShardBuffers[i]}
+	}
+
+	splitErr := enc.Split(f, dataWriters, fileSize)
+	if splitErr != nil {
+		return nil, nil, 0, splitErr
+	}
+
+	// Step 2: Send data shards to nodes via QUIC
+	dataResults = make([]*wal.WriteResult, b.rsDataShard)
+	dataCh := make(chan shardWriteOutcome, b.rsDataShard)
+	var dataWG sync.WaitGroup
+
+	for i := 0; i < b.rsDataShard; i++ {
+		dataWG.Add(1)
+		go func(idx int, shardData []byte) {
+			defer dataWG.Done()
+
+			nodeNum, nodeErr := NodeToUint32(hashRingShards[idx].String())
+			if nodeErr != nil {
+				dataCh <- shardWriteOutcome{shardIndex: idx, result: nil, err: nodeErr}
+				return
+			}
+
+			addr := b.getNodeAddr(int(nodeNum))
+			client, dialErr := quicclient.Dial(ctx, addr)
+			if dialErr != nil {
+				slog.Error("putObjectViaQUIC: dial failed", "node", nodeNum, "addr", addr, "error", dialErr)
+				dataCh <- shardWriteOutcome{shardIndex: idx, result: nil, err: dialErr}
+				return
+			}
+			defer client.Close()
+
+			putReq := quicserver.PutRequest{
+				Bucket:     bucket,
+				Object:     objectPath,
+				ObjectHash: objectHash,
+				ShardSize:  len(shardData),
+			}
+
+			resp, putErr := client.Put(ctx, putReq, bytes.NewReader(shardData))
+			if putErr != nil {
+				slog.Error("putObjectViaQUIC: put failed", "node", nodeNum, "error", putErr)
+				dataCh <- shardWriteOutcome{shardIndex: idx, result: nil, err: putErr}
+				return
+			}
+
+			dataCh <- shardWriteOutcome{shardIndex: idx, result: &resp.WriteResult, err: nil}
+		}(i, dataShardBuffers[i])
+	}
+
+	go func() {
+		dataWG.Wait()
+		close(dataCh)
+	}()
+
+	var firstErr error
+	for outcome := range dataCh {
+		if outcome.err != nil && firstErr == nil {
+			firstErr = outcome.err
+		}
+		dataResults[outcome.shardIndex] = outcome.result
+	}
+	if firstErr != nil {
+		return nil, nil, 0, firstErr
+	}
+
+	// Step 3: Encode parity shards using the buffered data shards
+	// (no need to read back from QUIC - we already have them in memory)
+	dataReaders := make([]io.Reader, b.rsDataShard)
+	for i := 0; i < b.rsDataShard; i++ {
+		slog.Debug("parity encoding: data shard", "shard", i, "len", len(dataShardBuffers[i]), "md5", fmt.Sprintf("%x", md5.Sum(dataShardBuffers[i])))
+		dataReaders[i] = bytes.NewReader(dataShardBuffers[i])
+	}
+
+	// Encode parity shards via pipes
+	parityWriters := make([]io.Writer, b.rsParityShard)
+	parityPipeWriters := make([]*io.PipeWriter, b.rsParityShard)
+	parityResults = make([]*wal.WriteResult, b.rsParityShard)
+	parityCh := make(chan shardWriteOutcome, b.rsParityShard)
+	var parityWG sync.WaitGroup
+
+	for i := 0; i < b.rsParityShard; i++ {
+		pr, pw := io.Pipe()
+		parityPipeWriters[i] = pw
+		parityWriters[i] = pw
+
+		parityIdx := b.rsDataShard + i
+		parityWG.Add(1)
+		go func(localParityIdx int, hashRingIdx int, r *io.PipeReader) {
+			defer parityWG.Done()
+
+			nodeNum, nodeErr := NodeToUint32(hashRingShards[hashRingIdx].String())
+			if nodeErr != nil {
+				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: nil, err: nodeErr}
+				_, _ = io.Copy(io.Discard, r)
+				return
+			}
+
+			addr := b.getNodeAddr(int(nodeNum))
+			client, dialErr := quicclient.Dial(ctx, addr)
+			if dialErr != nil {
+				slog.Error("putObjectViaQUIC: dial failed for parity", "node", nodeNum, "addr", addr, "error", dialErr)
+				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: nil, err: dialErr}
+				_, _ = io.Copy(io.Discard, r)
+				return
+			}
+			defer client.Close()
+
+			putReq := quicserver.PutRequest{
+				Bucket:     bucket,
+				Object:     objectPath,
+				ObjectHash: objectHash,
+				ShardSize:  shardSize,
+			}
+
+			resp, putErr := client.Put(ctx, putReq, r)
+			if putErr != nil {
+				slog.Error("putObjectViaQUIC: put parity failed", "node", nodeNum, "error", putErr)
+				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: nil, err: putErr}
+				return
+			}
+
+			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: &resp.WriteResult, err: nil}
+		}(i, parityIdx, pr)
+	}
+
+	encodeErr := enc.Encode(dataReaders, parityWriters)
+
+	for i := 0; i < b.rsParityShard; i++ {
+		if encodeErr != nil {
+			_ = parityPipeWriters[i].CloseWithError(encodeErr)
+		} else {
+			_ = parityPipeWriters[i].Close()
+		}
+	}
+
+	go func() {
+		parityWG.Wait()
+		close(parityCh)
+	}()
+
+	firstErr = nil
+	for outcome := range parityCh {
+		if outcome.err != nil && firstErr == nil {
+			firstErr = outcome.err
+		}
+		parityResults[outcome.shardIndex] = outcome.result
+	}
+	if encodeErr != nil && firstErr == nil {
+		firstErr = encodeErr
+	}
+	if firstErr != nil {
+		return nil, nil, 0, firstErr
+	}
+
+	return dataResults, parityResults, size, nil
+}
+
 // openInput retrieves shard location metadata for an object
 func (b *Backend) openInput(bucket string, object string) (ObjectToShardNodes, int64, error) {
 	key := s3db.GenObjectHash(bucket, object)
@@ -478,7 +700,7 @@ func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShar
 
 	for i := range totalNodes {
 		nodeNum := int(totalNodes[i])
-		c, err := quicclient.Dial(context.Background(), fmt.Sprintf("127.0.0.1:%d", b.quicBasePort+nodeNum))
+		c, err := quicclient.Dial(context.Background(), b.getNodeAddr(nodeNum))
 		if err != nil {
 			slog.Error("Failed to dial QUIC server", "node", nodeNum, "err", err)
 			continue

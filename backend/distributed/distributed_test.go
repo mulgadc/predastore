@@ -248,6 +248,7 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 			cfg := &Config{
 				BadgerDir:      tmpDir,
 				PartitionCount: 11,
+				UseQUIC:        true,
 			}
 			b, err := New(cfg)
 			require.NoError(t, err)

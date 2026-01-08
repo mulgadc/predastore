@@ -52,31 +52,106 @@ func (c *Client) nextID() uint64 {
 	return atomic.AddUint64(&c.reqID, 1)
 }
 
-/*
-func (c *Client) Status(ctx context.Context) (map[string]any, error) {
-	rh, meta, _, err := c.do(ctx, quicproto.MethodSTATUS, "", nil, nil, 0)
+// Put sends a shard to the QUIC server and returns the WriteResult
+func (c *Client) Put(ctx context.Context, putReq quicserver.PutRequest, shardData io.Reader) (*quicserver.PutResponse, error) {
+	putReqBytes, err := json.Marshal(putReq)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("marshal put request: %w", err)
 	}
+
+	rh, respMeta, err := c.doPut(ctx, putReqBytes, shardData, int64(putReq.ShardSize))
+	if err != nil {
+		return nil, fmt.Errorf("put request failed: %w", err)
+	}
+
 	if rh.Status != quicproto.StatusOK {
-		return nil, fmt.Errorf("status: %d %s", rh.Status, string(meta))
+		return nil, fmt.Errorf("put: status %d", rh.Status)
 	}
-	var out map[string]any
-	_ = json.Unmarshal(meta, &out)
-	return out, nil
+
+	var response quicserver.PutResponse
+	if err := json.Unmarshal(respMeta, &response); err != nil {
+		return nil, fmt.Errorf("unmarshal put response: %w", err)
+	}
+
+	if response.Error != "" {
+		return nil, fmt.Errorf("put error: %s", response.Error)
+	}
+
+	return &response, nil
 }
 
-func (c *Client) Put(ctx context.Context, key string, r io.Reader, size int64) error {
-	rh, meta, _, err := c.do(ctx, quicproto.MethodPUT, key, nil, []byte("temp"), size)
+// doPut performs a PUT RPC with body streaming
+func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader, bodyLen int64) (quicproto.Header, []byte, error) {
+	s, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
-		return err
+		return quicproto.Header{}, nil, err
 	}
-	if rh.Status != quicproto.StatusOK {
-		return fmt.Errorf("put: %d %s", rh.Status, string(meta))
+
+	br := bufio.NewReaderSize(s, 128*1024)
+	bw := bufio.NewWriterSize(s, 128*1024)
+
+	reqID := c.nextID()
+	h := quicproto.Header{
+		Version: quicproto.Version1,
+		Method:  quicproto.MethodPUT,
+		Status:  0,
+		ReqID:   reqID,
+		KeyLen:  uint32(len(requestBytes)),
+		MetaLen: 0,
+		BodyLen: uint64(bodyLen),
 	}
-	return nil
+
+	// Write request header
+	if err := quicproto.WriteHeader(bw, h); err != nil {
+		_ = s.Close()
+		return quicproto.Header{}, nil, fmt.Errorf("write header: %w", err)
+	}
+
+	// Write request metadata (PutRequest JSON)
+	if _, err := bw.Write(requestBytes); err != nil {
+		_ = s.Close()
+		return quicproto.Header{}, nil, fmt.Errorf("write request: %w", err)
+	}
+
+	// Flush header and request before streaming body
+	if err := bw.Flush(); err != nil {
+		_ = s.Close()
+		return quicproto.Header{}, nil, fmt.Errorf("flush header: %w", err)
+	}
+
+	// Stream the body data
+	written, err := io.CopyN(bw, body, bodyLen)
+	if err != nil {
+		_ = s.Close()
+		return quicproto.Header{}, nil, fmt.Errorf("write body: %w (wrote %d of %d)", err, written, bodyLen)
+	}
+
+	// Flush the body
+	if err := bw.Flush(); err != nil {
+		_ = s.Close()
+		return quicproto.Header{}, nil, fmt.Errorf("flush body: %w", err)
+	}
+
+	// Read response header
+	respHdr, err := quicproto.ReadHeader(br)
+	if err != nil {
+		_ = s.Close()
+		return quicproto.Header{}, nil, fmt.Errorf("read response header: %w", err)
+	}
+
+	// Read response metadata
+	var respMeta []byte
+	if respHdr.MetaLen > 0 {
+		respMeta = make([]byte, respHdr.MetaLen)
+		if _, err := io.ReadFull(br, respMeta); err != nil {
+			_ = s.Close()
+			return quicproto.Header{}, nil, fmt.Errorf("read response meta: %w", err)
+		}
+	}
+
+	_ = s.Close()
+	return respHdr, respMeta, nil
 }
-*/
 
 func (c *Client) Get(ctx context.Context, objectRequest quicserver.ObjectRequest) (r io.Reader, err error) {
 
