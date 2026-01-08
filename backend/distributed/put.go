@@ -11,6 +11,7 @@ import (
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/s3/chunked"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
 
@@ -61,9 +62,13 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
 
-	// Copy body to temp file
+	// Copy body to temp file, handling chunked encoding if needed
 	if req.Body != nil {
-		_, err = io.Copy(tmpFile, req.Body)
+		reader := req.Body
+		if req.IsChunked && req.ContentEncoding == "aws-chunked" {
+			reader = chunked.NewDecoder(req.Body, req.DecodedLength)
+		}
+		_, err = io.Copy(tmpFile, reader)
 		if err != nil {
 			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 		}
