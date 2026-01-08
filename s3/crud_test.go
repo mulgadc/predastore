@@ -184,9 +184,7 @@ func TestPutOverwriteWithFilesystem(t *testing.T) {
 }
 
 // TestPutOverwriteWithDistributed tests that PUT overwrites existing objects correctly
-// Note: This test requires QUIC servers to be running for full functionality
 func TestPutOverwriteWithDistributed(t *testing.T) {
-	t.Skip("Distributed backend requires QUIC servers - skipping until infrastructure is ready")
 	RunWithBackends(t, DistributedOnly(), func(t *testing.T, tb *TestBackend) {
 		testPutOverwrite(t, tb)
 	})
