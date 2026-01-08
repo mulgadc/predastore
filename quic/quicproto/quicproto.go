@@ -14,6 +14,7 @@ const (
 	MethodPUT     uint8 = 2
 	MethodSTATUS  uint8 = 3
 	MethodREBUILD uint8 = 4
+	MethodDELETE  uint8 = 5
 
 	StatusOK           uint16 = 200
 	StatusBadRequest   uint16 = 400

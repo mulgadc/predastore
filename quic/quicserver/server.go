@@ -61,6 +61,19 @@ type PutResponse struct {
 	Error       string          `json:"error,omitempty"`
 }
 
+// DeleteRequest contains metadata for deleting a shard via QUIC DELETE
+type DeleteRequest struct {
+	Bucket     string   `json:"bucket"`
+	Object     string   `json:"object"`
+	ObjectHash [32]byte `json:"object_hash"` // SHA256 of bucket/object for metadata lookup
+}
+
+// DeleteResponse contains the result of a QUIC DELETE operation
+type DeleteResponse struct {
+	Deleted bool   `json:"deleted"`
+	Error   string `json:"error,omitempty"`
+}
+
 func New(walDir string, addr string) {
 
 	qs := &QuicServer{
@@ -147,6 +160,13 @@ func (qs *QuicServer) handleStream(s *quic.Stream) {
 			return
 		}
 		qs.handlePUTShard(br, bw, reqHdr, putRequest)
+	case quicproto.MethodDELETE:
+		var deleteRequest DeleteRequest
+		if err := json.Unmarshal(requestBytes, &deleteRequest); err != nil {
+			writeErr(bw, reqHdr, quicproto.StatusBadRequest, "bad delete request")
+			return
+		}
+		qs.handleDELETEShard(bw, reqHdr, deleteRequest)
 	default:
 		writeErr(bw, reqHdr, quicproto.StatusBadRequest, "unknown method")
 	}
@@ -453,6 +473,109 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		slog.Error("handlePUTShard: flush failed", "error", err)
 		return
 	}
+}
+
+// deletedShardPrefix is the key prefix for tracking deleted shards in local badger
+// Format: deleted:<object_hash> -> DeletedShardInfo (gob encoded)
+const deletedShardPrefix = "deleted:"
+
+// DeletedShardInfo tracks a deleted shard for future WAL compaction
+type DeletedShardInfo struct {
+	ObjectHash  [32]byte        `json:"object_hash"`
+	Bucket      string          `json:"bucket"`
+	Object      string          `json:"object"`
+	DeletedAt   int64           `json:"deleted_at"`   // Unix timestamp
+	WriteResult wal.WriteResult `json:"write_result"` // Original location in WAL (for compaction)
+}
+
+// handleDELETEShard removes shard metadata from local badger and logs deletion for WAL compaction
+func (qs *QuicServer) handleDELETEShard(bw *bufio.Writer, req quicproto.Header, delReq DeleteRequest) {
+	// Open WAL for this node (to access local badger)
+	walInstance, err := wal.New("", qs.WalDir)
+	if err != nil {
+		slog.Error("handleDELETEShard: failed to open WAL", "error", err)
+		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("wal open: %v", err))
+		return
+	}
+	defer walInstance.Close()
+
+	// Check if shard exists locally
+	existingMeta, err := walInstance.DB.Get(delReq.ObjectHash[:])
+	if err != nil {
+		slog.Warn("handleDELETEShard: object not found locally", "bucket", delReq.Bucket, "object", delReq.Object)
+		// Return success anyway - idempotent delete
+		qs.sendDeleteResponse(bw, req, true, "")
+		return
+	}
+
+	// Decode the existing write result so we can log it for compaction
+	var objectWriteResult wal.ObjectWriteResult
+	if err := gob.NewDecoder(bytes.NewReader(existingMeta)).Decode(&objectWriteResult); err != nil {
+		slog.Error("handleDELETEShard: failed to decode existing metadata", "error", err)
+		writeErr(bw, req, quicproto.StatusServerError, "corrupt metadata")
+		return
+	}
+
+	// Log this deletion for future WAL compaction
+	// TODO: Future compactor will read these entries and reclaim WAL space
+	deletedInfo := DeletedShardInfo{
+		ObjectHash:  delReq.ObjectHash,
+		Bucket:      delReq.Bucket,
+		Object:      delReq.Object,
+		DeletedAt:   time.Now().Unix(),
+		WriteResult: objectWriteResult.WriteResult,
+	}
+
+	var deletedBuf bytes.Buffer
+	if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err != nil {
+		slog.Error("handleDELETEShard: failed to encode deletion info", "error", err)
+		writeErr(bw, req, quicproto.StatusServerError, "encode error")
+		return
+	}
+
+	// Store deletion record for compaction
+	deletedKey := []byte(deletedShardPrefix + string(delReq.ObjectHash[:]))
+	if err := walInstance.DB.Set(deletedKey, deletedBuf.Bytes()); err != nil {
+		slog.Error("handleDELETEShard: failed to store deletion record", "error", err)
+		writeErr(bw, req, quicproto.StatusServerError, "store deletion failed")
+		return
+	}
+
+	// Delete the object metadata from local badger
+	if err := walInstance.DB.Delete(delReq.ObjectHash[:]); err != nil {
+		slog.Error("handleDELETEShard: failed to delete metadata", "error", err)
+		writeErr(bw, req, quicproto.StatusServerError, "delete failed")
+		return
+	}
+
+	slog.Info("handleDELETEShard: deleted shard",
+		"bucket", delReq.Bucket,
+		"object", delReq.Object,
+		"walFiles", len(objectWriteResult.WriteResult.WALFiles),
+	)
+
+	qs.sendDeleteResponse(bw, req, true, "")
+}
+
+func (qs *QuicServer) sendDeleteResponse(bw *bufio.Writer, req quicproto.Header, deleted bool, errMsg string) {
+	response := DeleteResponse{
+		Deleted: deleted,
+		Error:   errMsg,
+	}
+	respBytes, _ := json.Marshal(response)
+
+	rh := quicproto.Header{
+		Version: quicproto.Version1,
+		Method:  req.Method,
+		Status:  quicproto.StatusOK,
+		ReqID:   req.ReqID,
+		KeyLen:  0,
+		MetaLen: uint32(len(respBytes)),
+		BodyLen: 0,
+	}
+	_ = quicproto.WriteHeader(bw, rh)
+	_, _ = bw.Write(respBytes)
+	_ = bw.Flush()
 }
 
 type rebuildReq struct {

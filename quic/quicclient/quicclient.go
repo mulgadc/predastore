@@ -153,6 +153,94 @@ func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader,
 	return respHdr, respMeta, nil
 }
 
+// Delete sends a delete request to the QUIC server for a shard
+func (c *Client) Delete(ctx context.Context, delReq quicserver.DeleteRequest) (*quicserver.DeleteResponse, error) {
+	delReqBytes, err := json.Marshal(delReq)
+	if err != nil {
+		return nil, fmt.Errorf("marshal delete request: %w", err)
+	}
+
+	rh, respMeta, err := c.doDelete(ctx, delReqBytes)
+	if err != nil {
+		return nil, fmt.Errorf("delete request failed: %w", err)
+	}
+
+	if rh.Status != quicproto.StatusOK {
+		return nil, fmt.Errorf("delete: status %d", rh.Status)
+	}
+
+	var response quicserver.DeleteResponse
+	if err := json.Unmarshal(respMeta, &response); err != nil {
+		return nil, fmt.Errorf("unmarshal delete response: %w", err)
+	}
+
+	if response.Error != "" {
+		return nil, fmt.Errorf("delete error: %s", response.Error)
+	}
+
+	return &response, nil
+}
+
+// doDelete performs a DELETE RPC (no body)
+func (c *Client) doDelete(ctx context.Context, requestBytes []byte) (quicproto.Header, []byte, error) {
+	s, err := c.conn.OpenStreamSync(ctx)
+	if err != nil {
+		return quicproto.Header{}, nil, err
+	}
+
+	br := bufio.NewReaderSize(s, 128*1024)
+	bw := bufio.NewWriterSize(s, 128*1024)
+
+	reqID := c.nextID()
+	h := quicproto.Header{
+		Version: quicproto.Version1,
+		Method:  quicproto.MethodDELETE,
+		Status:  0,
+		ReqID:   reqID,
+		KeyLen:  uint32(len(requestBytes)),
+		MetaLen: 0,
+		BodyLen: 0,
+	}
+
+	// Write request header
+	if err := quicproto.WriteHeader(bw, h); err != nil {
+		_ = s.Close()
+		return quicproto.Header{}, nil, fmt.Errorf("write header: %w", err)
+	}
+
+	// Write request metadata (DeleteRequest JSON)
+	if _, err := bw.Write(requestBytes); err != nil {
+		_ = s.Close()
+		return quicproto.Header{}, nil, fmt.Errorf("write request: %w", err)
+	}
+
+	// Flush
+	if err := bw.Flush(); err != nil {
+		_ = s.Close()
+		return quicproto.Header{}, nil, fmt.Errorf("flush: %w", err)
+	}
+
+	// Read response header
+	respHdr, err := quicproto.ReadHeader(br)
+	if err != nil {
+		_ = s.Close()
+		return quicproto.Header{}, nil, fmt.Errorf("read response header: %w", err)
+	}
+
+	// Read response metadata
+	var respMeta []byte
+	if respHdr.MetaLen > 0 {
+		respMeta = make([]byte, respHdr.MetaLen)
+		if _, err := io.ReadFull(br, respMeta); err != nil {
+			_ = s.Close()
+			return quicproto.Header{}, nil, fmt.Errorf("read response meta: %w", err)
+		}
+	}
+
+	_ = s.Close()
+	return respHdr, respMeta, nil
+}
+
 func (c *Client) Get(ctx context.Context, objectRequest quicserver.ObjectRequest) (r io.Reader, err error) {
 
 	objectRequestMarshalled, err := json.Marshal(objectRequest)
