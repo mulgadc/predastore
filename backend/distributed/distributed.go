@@ -3,6 +3,7 @@ package distributed
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -24,6 +25,27 @@ import (
 	s3db "github.com/mulgadc/predastore/s3db"
 )
 
+// NodeConfig holds configuration for a single node
+type NodeConfig struct {
+	ID     int
+	Host   string
+	Port   int
+	Path   string
+	DB     bool
+	DBPort int
+	DBPath string
+	Leader bool
+	Epoch  int
+}
+
+// BucketConfig holds configuration for a bucket
+type BucketConfig struct {
+	Name   string
+	Region string
+	Type   string
+	Public bool
+}
+
 // Config holds distributed backend configuration
 type Config struct {
 	// DataDir is the root directory for distributed node storage
@@ -42,6 +64,12 @@ type Config struct {
 
 	// QUIC server base port (each node uses BasePort + nodeNum)
 	QuicBasePort int
+
+	// Nodes configuration (from cluster.toml)
+	Nodes []NodeConfig
+
+	// Buckets configuration (from cluster.toml)
+	Buckets []BucketConfig
 }
 
 // Backend implements the distributed storage backend with Reed-Solomon erasure coding
@@ -54,6 +82,8 @@ type Backend struct {
 	badgerDir     string
 	db            *s3db.S3DB
 	quicBasePort  int
+	nodeAddrs     map[int]string    // node ID -> "host:port"
+	buckets       []BucketConfig    // bucket configurations
 }
 
 // ObjectToShardNodes maps an object to its shard locations
@@ -154,6 +184,12 @@ func New(config interface{}) (backend.Backend, error) {
 		hashRing.Add(myMember(fmt.Sprintf("node-%d", i)))
 	}
 
+	// Build node address map from config
+	nodeAddrs := make(map[int]string)
+	for _, node := range cfg.Nodes {
+		nodeAddrs[node.ID] = fmt.Sprintf("%s:%d", node.Host, node.Port)
+	}
+
 	return &Backend{
 		config:        cfg,
 		rsDataShard:   dataShards,
@@ -163,6 +199,8 @@ func New(config interface{}) (backend.Backend, error) {
 		badgerDir:     cfg.BadgerDir,
 		db:            db,
 		quicBasePort:  quicBasePort,
+		nodeAddrs:     nodeAddrs,
+		buckets:       cfg.Buckets,
 	}, nil
 }
 
@@ -238,12 +276,15 @@ func (b *Backend) putObjectToWAL(bucket string, objectPath string, objectHash [3
 	size = instat.Size()
 
 	_, file := filepath.Split(objectPath)
-	key := []byte(fmt.Sprintf("%s/%s", bucket, file))
 
-	hashRingShards, err := b.hashRing.GetClosestN(key, b.rsDataShard+b.rsParityShard)
+	key := s3db.GenObjectHash(bucket, file)
+
+	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return nil, nil, 0, err
 	}
+
+	// TODO: Implement PUT using QUIC client <> server communication.
 
 	totalShards := b.rsDataShard + b.rsParityShard
 	walFiles := make([]*wal.WAL, totalShards)
@@ -332,6 +373,7 @@ func (b *Backend) putObjectToWAL(bucket string, objectPath string, objectHash [3
 		if rerr != nil {
 			return nil, nil, 0, rerr
 		}
+		slog.Debug("parity encoding: data shard read", "shard", i, "len", len(bdata), "md5", fmt.Sprintf("%x", md5.Sum(bdata)))
 		dataReaders[i] = bytes.NewReader(bdata)
 	}
 
@@ -393,9 +435,10 @@ func (b *Backend) putObjectToWAL(bucket string, objectPath string, objectHash [3
 
 // openInput retrieves shard location metadata for an object
 func (b *Backend) openInput(bucket string, object string) (ObjectToShardNodes, int64, error) {
-	key := []byte(fmt.Sprintf("%s/%s", bucket, object))
+	key := s3db.GenObjectHash(bucket, object)
+	//key := []byte(fmt.Sprintf("%s/%s", bucket, object))
 
-	hashRingShards, err := b.hashRing.GetClosestN(key, b.rsDataShard+b.rsParityShard)
+	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}

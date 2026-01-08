@@ -15,6 +15,7 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/google/uuid"
 	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/backend/filesystem"
 	"github.com/mulgadc/predastore/s3/chunked"
 )
@@ -47,6 +48,51 @@ func (s3 *Config) createFilesystemBackend() backend.Backend {
 	if err != nil {
 		slog.Error("Failed to create filesystem backend", "error", err)
 		panic(fmt.Sprintf("Failed to create filesystem backend: %v", err))
+	}
+	return be
+}
+
+// createDistributedBackend creates a distributed backend from the s3 config
+func (s3 *Config) createDistributedBackend() backend.Backend {
+	// Convert s3 node configs to distributed node configs
+	nodes := make([]distributed.NodeConfig, 0, len(s3.Nodes))
+	for _, n := range s3.Nodes {
+		nodes = append(nodes, distributed.NodeConfig{
+			ID:     n.ID,
+			Host:   n.Host,
+			Port:   n.Port,
+			Path:   n.Path,
+			DB:     n.DB,
+			DBPort: n.DBPort,
+			DBPath: n.DBPath,
+			Leader: n.Leader,
+			Epoch:  n.Epoch,
+		})
+	}
+
+	// Convert s3 bucket configs to distributed bucket configs
+	buckets := make([]distributed.BucketConfig, 0, len(s3.Buckets))
+	for _, b := range s3.Buckets {
+		buckets = append(buckets, distributed.BucketConfig{
+			Name:   b.Name,
+			Region: b.Region,
+			Type:   b.Type,
+			Public: b.Public,
+		})
+	}
+
+	config := &distributed.Config{
+		BadgerDir:    s3.BadgerDir,
+		DataShards:   s3.RS.Data,
+		ParityShards: s3.RS.Parity,
+		Nodes:        nodes,
+		Buckets:      buckets,
+	}
+
+	be, err := distributed.New(config)
+	if err != nil {
+		slog.Error("Failed to create distributed backend", "error", err)
+		panic(fmt.Sprintf("Failed to create distributed backend: %v", err))
 	}
 	return be
 }

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +13,10 @@ import (
 	"github.com/mulgadc/predastore/backend"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
+
+// arnObjectPrefix is the ARN prefix for object keys in Badger
+// Format: arn:aws:s3:::<bucket>/<key>
+const arnObjectPrefixPut = "arn:aws:s3:::"
 
 // PutObject stores an object using Reed-Solomon encoding across multiple nodes
 func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) (*backend.PutObjectResponse, error) {
@@ -75,10 +78,10 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 
 	objectToShardNodes.Size = size
 
-	// Get hash ring placement
+	// Get hash ring placement (must match putObjectToWAL's key format)
 	_, file := filepath.Split(tmpFile.Name())
-	key := []byte(fmt.Sprintf("%s/%s", req.Bucket, file))
-	hashRingShards, err := b.hashRing.GetClosestN(key, b.rsDataShard+b.rsParityShard)
+	key := s3db.GenObjectHash(req.Bucket, file)
+	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
@@ -108,8 +111,17 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 			return err
 		}
 
+		// Store object hash -> shard metadata (for retrieval)
 		e := badger.NewEntry(objectHash[:], buf.Bytes())
-		return txn.SetEntry(e)
+		if err := txn.SetEntry(e); err != nil {
+			return err
+		}
+
+		// Store ARN key -> object hash (for listing)
+		// Format: arn:aws:s3:::<bucket>/<key>
+		arnKey := []byte(arnObjectPrefixPut + req.Bucket + "/" + req.Key)
+		arnEntry := badger.NewEntry(arnKey, objectHash[:])
+		return txn.SetEntry(arnEntry)
 	})
 
 	if err != nil {
@@ -157,10 +169,10 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 
 	objectToShardNodes.Size = size
 
-	// Get hash ring placement
+	// Get hash ring placement (must match putObjectToWAL's key format)
 	_, file := filepath.Split(objectPath)
-	key := []byte(fmt.Sprintf("%s/%s", bucket, file))
-	hashRingShards, err := b.hashRing.GetClosestN(key, b.rsDataShard+b.rsParityShard)
+	key := s3db.GenObjectHash(bucket, file)
+	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return err
 	}

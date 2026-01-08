@@ -143,8 +143,8 @@ func (qs *QuicServer) handleStream(s *quic.Stream) {
 		qs.handleSTATUS(bw, reqHdr)
 	case quicproto.MethodGET:
 		qs.handleGET(br, bw, reqHdr, objectRequest)
-	//case quicproto.MethodPUT:
-	//	qs.handlePUT(br, bw, reqHdr, key)
+	case quicproto.MethodPUT:
+		qs.handlePUT(br, bw, reqHdr, objectRequest)
 	//case quicproto.MethodREBUILD:
 	//	qs.handleREBUILD(bw, reqHdr, key, metaBytes)
 	default:
@@ -374,7 +374,8 @@ func (qs *QuicServer) handleGET(br *bufio.Reader, bw *bufio.Writer, req quicprot
 	//_, _ = io.Copy(bw, f)
 }
 
-func (qs *QuicServer) handlePUT(br *bufio.Reader, bw *bufio.Writer, req quicproto.Header, key string) {
+func (qs *QuicServer) handlePUT(br *bufio.Reader, bw *bufio.Writer, req quicproto.Header, objectRequest ObjectRequest) {
+	key := objectRequest.Bucket + "/" + objectRequest.Object
 	path := safePath(storageRoot, key)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		writeErr(bw, req, quicproto.StatusServerError, "mkdir failed")

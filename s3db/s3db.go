@@ -100,6 +100,31 @@ func (s3db *S3DB) ListKeys(prefix []byte) ([][]byte, error) {
 	return keys, err
 }
 
+// Scan iterates over keys with the given prefix and calls the callback for each key-value pair
+func (s3db *S3DB) Scan(prefix []byte, fn func(key, value []byte) error) error {
+	return s3db.Badger.View(func(tx *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = prefix
+		it := tx.NewIterator(opts)
+		defer it.Close()
+
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			key := item.KeyCopy(nil)
+
+			value, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+
+			if err := fn(key, value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func GenObjectHash(bucket string, object string) [32]byte {
 	objectKey := fmt.Sprintf("%s/%s", bucket, object)
 	return sha256.Sum256([]byte(objectKey))

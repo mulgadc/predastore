@@ -3,6 +3,7 @@ package distributed
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/gob"
@@ -63,8 +64,8 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 
 	// Recompute shard->node mapping (must match putObjectToWAL).
 	_, file := filepath.Split(objPath)
-	key := []byte(fmt.Sprintf("%s/%s", "bucket", file))
-	hashRingShards, err := backend.HashRing().GetClosestN(key, backend.RsDataShard()+backend.RsParityShard())
+	key := s3db.GenObjectHash("bucket", file)
+	hashRingShards, err := backend.HashRing().GetClosestN(key[:], backend.RsDataShard()+backend.RsParityShard())
 	require.NoError(t, err)
 	require.Len(t, hashRingShards, backend.RsDataShard()+backend.RsParityShard())
 
@@ -101,10 +102,12 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 			res = parityRes[i-backend.RsDataShard()]
 		}
 		require.NotNil(t, res)
+		t.Logf("Shard %d: TotalSize=%d", i, res.TotalSize)
 
 		b, err := w.ReadFromWriteResult(res)
 		require.NoError(t, err)
 		require.NotEmpty(t, b)
+		t.Logf("Shard %d: actual len=%d, md5=%x", i, len(b), md5.Sum(b))
 		shardBytes[i] = b
 
 		require.NoError(t, w.Close())
@@ -120,6 +123,7 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 	}
 
 	ok, err := enc.Verify(verifyReaders)
+	t.Logf("Verify result: ok=%v, err=%v", ok, err)
 	require.NoError(t, err)
 	require.True(t, ok, "expected shards to verify")
 
@@ -177,8 +181,8 @@ func TestReadFromWriteResultStream_RoundTripJoin(t *testing.T) {
 
 	// Recompute shard->node mapping (must match putObjectToWAL).
 	_, file := filepath.Split(objPath)
-	key := []byte(fmt.Sprintf("%s/%s", "bucket", file))
-	hashRingShards, err := backend.HashRing().GetClosestN(key, backend.RsDataShard()+backend.RsParityShard())
+	key := s3db.GenObjectHash("bucket", file)
+	hashRingShards, err := backend.HashRing().GetClosestN(key[:], backend.RsDataShard()+backend.RsParityShard())
 	require.NoError(t, err)
 	require.Len(t, hashRingShards, backend.RsDataShard()+backend.RsParityShard())
 

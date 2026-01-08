@@ -27,10 +27,15 @@ type RS struct {
 }
 
 type Nodes struct {
-	ID   int    `toml:"id"`
-	Host string `toml:"host"`
-	Port int    `toml:"port"`
-	Path string `toml:"path"`
+	ID     int    `toml:"id"`
+	Host   string `toml:"host"`
+	Port   int    `toml:"port"`
+	Path   string `toml:"path"`
+	DB     bool   `toml:"db"`
+	DBPort int    `toml:"dbport"`
+	DBPath string `toml:"dbpath"`
+	Leader bool   `toml:"leader"`
+	Epoch  int    `toml:"epoch"`
 }
 
 type Config struct {
@@ -55,12 +60,16 @@ type Config struct {
 	Debug          bool   `toml:"debug"`
 	BasePath       string `toml:"base_path"`
 	DisableLogging bool   `toml:"disable_logging"`
+
+	// Distributed backend config
+	BadgerDir string `toml:"badger_dir"`
 }
 
 // Authentication and policy
 type AuthEntry struct {
 	AccessKeyID     string       `toml:"access_key_id"`
 	SecretAccessKey string       `toml:"secret_access_key"`
+	AccountID       string       `toml:"account_id"`
 	Policy          []PolicyRule `toml:"policy"`
 }
 

@@ -411,6 +411,7 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 	result.ShardNum = wal.ShardNum.Load()
 
 	remaining := totalSize
+	var actualBytesWritten int
 	var shardFragment uint32
 	var currentWALIndex int = -1
 	var currentWALFileSize int64 = 0
@@ -574,6 +575,7 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 		// header + fixed on-disk payload
 		fragmentSize := int64(FragmentHeaderBytes + ChunkSize)
 		currentWALFileSize += fragmentSize
+		actualBytesWritten += actualChunkSize
 		remaining -= actualChunkSize
 		shardFragment++
 
@@ -597,7 +599,8 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 		result.WALFiles[len(result.WALFiles)-1].Size = currentWALFileSize
 	}
 
-	// Write to Badger DB
+	// Update TotalSize to reflect actual bytes written (may differ from expected if reader closed early)
+	result.TotalSize = actualBytesWritten
 
 	return result, nil
 }
@@ -1116,14 +1119,16 @@ func numFragments(size int) int {
 
 func ReadChunk(r io.Reader) (chunk []byte, err error) {
 	buf := make([]byte, ChunkSize)
+	totalRead := 0
 
-	for {
-		n, err := r.Read(buf)
+	// Keep reading until we have a full chunk or hit EOF
+	for totalRead < int(ChunkSize) {
+		n, err := r.Read(buf[totalRead:])
+		totalRead += n
 
 		if err == io.EOF {
-			if n > 0 {
-				// Return the actual bytes read, not the full buffer
-				return buf[:n], nil
+			if totalRead > 0 {
+				return buf[:totalRead], nil
 			}
 			return nil, nil // finished cleanly
 		}
@@ -1131,13 +1136,9 @@ func ReadChunk(r io.Reader) (chunk []byte, err error) {
 		if err != nil {
 			return nil, err // read error
 		}
-
-		if n > 0 {
-			// Return only the bytes actually read, not the full 8KB buffer
-			return buf[:n], nil
-		}
 	}
 
+	return buf[:totalRead], nil
 }
 
 func (fragment *Fragment) FragmentHeader() []byte {
