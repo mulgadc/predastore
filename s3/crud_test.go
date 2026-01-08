@@ -11,18 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestCRUDWithFilesystem tests basic CRUD operations with filesystem backend
-func TestCRUDWithFilesystem(t *testing.T) {
-	RunWithBackends(t, FilesystemOnly(), func(t *testing.T, tb *TestBackend) {
-		testCRUD(t, tb)
-	})
-}
-
-// TestCRUDWithDistributed tests basic CRUD operations with distributed backend
-// Note: This test requires QUIC servers to be running for full functionality
-func TestCRUDWithDistributed(t *testing.T) {
-	t.Skip("Distributed backend requires QUIC servers - skipping until infrastructure is ready")
-	RunWithBackends(t, DistributedOnly(), func(t *testing.T, tb *TestBackend) {
+// TestCRUD tests basic CRUD operations with all backends
+func TestCRUD(t *testing.T) {
+	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
 		testCRUD(t, tb)
 	})
 }
@@ -116,9 +107,9 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	assert.Equal(t, 404, resp.StatusCode, "GET after DELETE should return 404")
 }
 
-// TestListBucketsWithBackend tests ListBuckets with the specified backend
-func TestListBucketsWithBackend(t *testing.T) {
-	RunWithBackends(t, FilesystemOnly(), func(t *testing.T, tb *TestBackend) {
+// TestListBucketsAllBackends tests ListBuckets with all backends
+func TestListBucketsAllBackends(t *testing.T) {
+	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
 		req := httptest.NewRequest("GET", "/", nil)
 
 		if len(tb.Config.Auth) > 0 {
@@ -139,9 +130,9 @@ func TestListBucketsWithBackend(t *testing.T) {
 	})
 }
 
-// TestListObjectsWithBackend tests ListObjects with the specified backend
-func TestListObjectsWithBackend(t *testing.T) {
-	RunWithBackends(t, FilesystemOnly(), func(t *testing.T, tb *TestBackend) {
+// TestListObjectsAllBackends tests ListObjects with all backends
+func TestListObjectsAllBackends(t *testing.T) {
+	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
 		bucketName := getBucketForBackend(tb.Type)
 
 		req := httptest.NewRequest("GET", "/"+bucketName, nil)
@@ -176,16 +167,9 @@ func getBucketForBackend(backendType BackendType) string {
 	}
 }
 
-// TestPutOverwriteWithFilesystem tests that PUT overwrites existing objects correctly
-func TestPutOverwriteWithFilesystem(t *testing.T) {
-	RunWithBackends(t, FilesystemOnly(), func(t *testing.T, tb *TestBackend) {
-		testPutOverwrite(t, tb)
-	})
-}
-
-// TestPutOverwriteWithDistributed tests that PUT overwrites existing objects correctly
-func TestPutOverwriteWithDistributed(t *testing.T) {
-	RunWithBackends(t, DistributedOnly(), func(t *testing.T, tb *TestBackend) {
+// TestPutOverwrite tests that PUT overwrites existing objects correctly with all backends
+func TestPutOverwrite(t *testing.T) {
+	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
 		testPutOverwrite(t, tb)
 	})
 }
