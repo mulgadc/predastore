@@ -466,8 +466,3 @@ func NodeToUint32(value string) (uint32, error) {
 	}
 	return uint32(vint), nil
 }
-
-func init() {
-	// Register the distributed backend with the default registry
-	backend.Register("distributed", New)
-}

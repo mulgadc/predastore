@@ -211,8 +211,3 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucketName, key, upl
 	slog.Info("Aborted multipart upload", "bucket", bucket.Name, "key", key, "uploadID", uploadID)
 	return nil
 }
-
-func init() {
-	// Register the filesystem backend with the default registry
-	backend.Register("filesystem", New)
-}
