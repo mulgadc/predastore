@@ -1,7 +1,9 @@
 package distributed
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"strings"
 	"time"
 
@@ -101,11 +103,26 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 			}
 		}
 
+		// Look up object metadata using the objectHash (value) to get size
+		var objectSize int64
+		if len(value) == 32 {
+			// value is the objectHash, look up the full metadata
+			metaData, err := b.db.Get(value)
+			if err == nil && len(metaData) > 0 {
+				var objMeta ObjectToShardNodes
+				r := bytes.NewReader(metaData)
+				dec := gob.NewDecoder(r)
+				if err := dec.Decode(&objMeta); err == nil {
+					objectSize = objMeta.Size
+				}
+			}
+		}
+
 		// Add as content
 		contents = append(contents, backend.ObjectInfo{
 			Key:          objectKey,
 			LastModified: time.Now(), // TODO: Store actual modification time
-			Size:         0,          // TODO: Store actual size in metadata
+			Size:         objectSize,
 			StorageClass: "STANDARD",
 		})
 

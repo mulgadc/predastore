@@ -93,13 +93,13 @@ port = 9995
 path = "s3/tests/data/distributed/nodes/node-5/"
 
 [[nodes]]
-id = 5
+id = 6
 host = "0.0.0.0"
 port = 9996
 path = "s3/tests/data/distributed/nodes/node-6/"
 
 [[nodes]]
-id = 5
+id = 7
 host = "0.0.0.0"
 port = 9997
 path = "s3/tests/data/distributed/nodes/node-7/"

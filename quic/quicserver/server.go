@@ -20,6 +20,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/mulgadc/predastore/quic/quicproto"
@@ -30,15 +31,31 @@ import (
 
 const (
 	alpn               = "mulga-repl-v1"
-	addr               = "0.0.0.0:7443"
 	maxKeyLen   uint32 = 4 * 1024
 	maxMetaLen  uint32 = 64 * 1024
-	storageRoot        = "./data" // demo backing store
 )
 
+// QuicServer handles QUIC RPC requests for shard storage operations
 type QuicServer struct {
 	Addr   string
 	WalDir string
+
+	// Single WAL instance shared across all handlers
+	// The WAL has internal mutex protection for concurrent access
+	wal   *wal.WAL
+	walMu sync.RWMutex // Additional mutex for WAL lifecycle operations
+
+	// Listener for graceful shutdown
+	listener *quic.Listener
+
+	// Context for cancellation
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	// Shutdown signaling
+	shutdownCh chan struct{}
+	shutdownMu sync.Mutex
+	closed     bool
 }
 
 type ObjectRequest struct {
@@ -74,51 +91,147 @@ type DeleteResponse struct {
 	Error   string `json:"error,omitempty"`
 }
 
-func New(walDir string, addr string) {
-
-	qs := &QuicServer{
-		WalDir: walDir,
-		Addr:   addr,
+// NewWithRetry creates and starts a new QUIC server with retry logic for port binding
+// Returns the server instance and any error encountered
+func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, error) {
+	// Ensure WAL directory exists
+	if err := os.MkdirAll(walDir, 0750); err != nil {
+		return nil, fmt.Errorf("failed to create WAL directory %s: %w", walDir, err)
 	}
 
-	_ = os.MkdirAll(storageRoot, 0o755)
+	// Open WAL once at startup - this holds the Badger DB lock
+	walInstance, err := wal.New("", walDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open WAL in %s: %w", walDir, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	qs := &QuicServer{
+		WalDir:     walDir,
+		Addr:       addr,
+		wal:        walInstance,
+		ctx:        ctx,
+		cancel:     cancel,
+		shutdownCh: make(chan struct{}),
+	}
 
 	tlsConf, err := makeServerTLSConfig()
 	if err != nil {
-		log.Fatalf("tls: %v", err)
+		_ = walInstance.Close()
+		return nil, fmt.Errorf("tls config: %w", err)
 	}
 	tlsConf.NextProtos = []string{alpn}
 
-	l, err := quic.ListenAddr(addr, tlsConf, &quic.Config{
-		KeepAlivePeriod: 15 * time.Second,
-		MaxIdleTimeout:  60 * time.Second,
-	})
-	if err != nil {
-		log.Fatalf("listen: %v", err)
+	// Retry port binding with exponential backoff
+	var l *quic.Listener
+	for i := 0; i < maxRetries; i++ {
+		l, err = quic.ListenAddr(addr, tlsConf, &quic.Config{
+			KeepAlivePeriod: 15 * time.Second,
+			MaxIdleTimeout:  60 * time.Second,
+		})
+		if err == nil {
+			break
+		}
+		if i < maxRetries-1 {
+			time.Sleep(time.Duration(100*(i+1)) * time.Millisecond)
+		}
 	}
-	log.Printf("QUIC RPC server listening on %s (ALPN %q)", addr, alpn)
+	if err != nil {
+		_ = walInstance.Close()
+		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	}
 
+	qs.listener = l
+	log.Printf("QUIC RPC server listening on %s (ALPN %q, WAL: %s)", addr, alpn, walDir)
+
+	// Start accept loop in goroutine
+	go qs.acceptLoop()
+
+	return qs, nil
+}
+
+// New creates and starts a new QUIC server for shard operations
+// The WAL is opened once and shared across all request handlers
+// Returns the server instance for graceful shutdown control
+// Panics on error - use NewWithRetry for error handling
+func New(walDir string, addr string) *QuicServer {
+	qs, err := NewWithRetry(walDir, addr, 10)
+	if err != nil {
+		log.Fatalf("failed to start QUIC server: %v", err)
+	}
+	return qs
+}
+
+// acceptLoop handles incoming connections until shutdown
+func (qs *QuicServer) acceptLoop() {
 	for {
-		conn, err := l.Accept(context.Background())
+		// Use cancellable context for Accept
+		conn, err := qs.listener.Accept(qs.ctx)
 		if err != nil {
-			log.Printf("accept conn: %v", err)
-			continue
+			// Check if we're shutting down
+			select {
+			case <-qs.shutdownCh:
+				return
+			default:
+				// Only log if not a context cancellation
+				if qs.ctx.Err() != nil {
+					return
+				}
+				slog.Debug("accept conn error", "error", err)
+				continue
+			}
 		}
 		go qs.serveConn(conn)
 	}
+}
 
+// Close gracefully shuts down the QUIC server and releases the WAL lock
+func (qs *QuicServer) Close() error {
+	qs.shutdownMu.Lock()
+	if qs.closed {
+		qs.shutdownMu.Unlock()
+		return nil
+	}
+	qs.closed = true
+
+	// Cancel context first to interrupt Accept call
+	if qs.cancel != nil {
+		qs.cancel()
+	}
+
+	close(qs.shutdownCh)
+	qs.shutdownMu.Unlock()
+
+	// Close listener to stop accepting new connections
+	if qs.listener != nil {
+		_ = qs.listener.Close()
+	}
+
+	// Give a brief moment for the accept loop to exit
+	time.Sleep(10 * time.Millisecond)
+
+	// Close WAL to release Badger lock
+	qs.walMu.Lock()
+	defer qs.walMu.Unlock()
+	if qs.wal != nil {
+		if err := qs.wal.Close(); err != nil {
+			return fmt.Errorf("failed to close WAL: %w", err)
+		}
+		qs.wal = nil
+	}
+
+	slog.Info("QUIC server shut down", "addr", qs.Addr)
+	return nil
 }
 
 func (qs *QuicServer) serveConn(conn *quic.Conn) {
 	defer conn.CloseWithError(0, "bye")
-	log.Printf("conn from %s", conn.RemoteAddr())
+	slog.Debug("QUIC connection from", "remote", conn.RemoteAddr())
 
 	for {
-
-		fmt.Println("accept stream")
 		s, err := conn.AcceptStream(context.Background())
 		if err != nil {
-			log.Printf("accept stream: %v", err)
+			slog.Debug("accept stream error", "error", err)
 			return
 		}
 		go qs.handleStream(s)
@@ -152,7 +265,7 @@ func (qs *QuicServer) handleStream(s *quic.Stream) {
 			writeErr(bw, reqHdr, quicproto.StatusBadRequest, "bad object request")
 			return
 		}
-		qs.handleGET(br, bw, reqHdr, objectRequest)
+		qs.handleGET(bw, reqHdr, objectRequest)
 	case quicproto.MethodPUT:
 		var putRequest PutRequest
 		if err := json.Unmarshal(requestBytes, &putRequest); err != nil {
@@ -177,7 +290,8 @@ func (qs *QuicServer) handleSTATUS(bw *bufio.Writer, req quicproto.Header) {
 		"ok":         true,
 		"ts_unix_ms": time.Now().UnixMilli(),
 		"node":       hostname(),
-		"version":    "v1-demo",
+		"version":    "v1",
+		"wal_dir":    qs.WalDir,
 	}
 	b, _ := json.Marshal(resp)
 
@@ -195,58 +309,35 @@ func (qs *QuicServer) handleSTATUS(bw *bufio.Writer, req quicproto.Header) {
 	_ = bw.Flush()
 }
 
-func (qs *QuicServer) handleGET(br *bufio.Reader, bw *bufio.Writer, req quicproto.Header, objectRequest ObjectRequest) {
-	// Key is treated like "bucket/object". Map to a safe path.
+func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRequest ObjectRequest) {
+	// Use shared WAL instance with read lock
+	qs.walMu.RLock()
+	walInstance := qs.wal
+	qs.walMu.RUnlock()
 
-	// Catch errors with defer, write QUIC wire message and return
-	var pipeErr error
-	defer func() {
-		if pipeErr != nil {
-			slog.Error("handleGET", "error", pipeErr.Error())
-			writeErr(bw, req, quicproto.StatusServerError, pipeErr.Error())
-			return
-		}
-	}()
-
-	// First, determine the shard number and WAL file number
-	//nodeDir := backend.nodeDir(fmt.Sprintf("node-%d", totalNodes[i]))
-
-	walInstance, pipeErr := wal.New("", qs.WalDir)
-	fmt.Println("wal", qs.WalDir)
-
-	if pipeErr != nil {
+	if walInstance == nil {
+		writeErr(bw, req, quicproto.StatusServerError, "WAL not initialized")
 		return
 	}
 
-	defer walInstance.Close()
-
-	//	fmt.Println(objectRequest.Bucket, objectRequest.Object)
-
 	objectHash := s3db.GenObjectHash(objectRequest.Bucket, objectRequest.Object)
 
-	// Query local node, where does the shard belong?
-	result, pipeErr := walInstance.DB.Get(objectHash[:])
-
-	//	fmt.Println("result")
-	//	spew.Dump(result)
-
-	if pipeErr != nil {
+	// Query local node for shard location
+	result, err := walInstance.DB.Get(objectHash[:])
+	if err != nil {
+		slog.Debug("handleGET: object not found", "bucket", objectRequest.Bucket, "object", objectRequest.Object)
+		writeErr(bw, req, quicproto.StatusNotFound, "object not found")
 		return
 	}
 
 	var objectWriteResult wal.ObjectWriteResult
-
-	r := bytes.NewReader(result)
-	dec := gob.NewDecoder(r)
-	if pipeErr := dec.Decode(&objectWriteResult); pipeErr != nil {
+	if err := gob.NewDecoder(bytes.NewReader(result)).Decode(&objectWriteResult); err != nil {
+		slog.Error("handleGET: failed to decode metadata", "error", err)
+		writeErr(bw, req, quicproto.StatusServerError, "corrupt metadata")
 		return
 	}
 
-	fmt.Println("objectWriteResult")
-
-	//spew.Dump(objectWriteResult)
-
-	// TODO: Need to improve error handling, success header sent, however writeErr will attempt to set headers
+	// Send response header with body length
 	rh := quicproto.Header{
 		Version: quicproto.Version1,
 		Method:  req.Method,
@@ -256,108 +347,76 @@ func (qs *QuicServer) handleGET(br *bufio.Reader, bw *bufio.Writer, req quicprot
 		MetaLen: 0,
 		BodyLen: uint64(objectWriteResult.WriteResult.TotalSize),
 	}
-	if pipeErr := quicproto.WriteHeader(bw, rh); pipeErr != nil {
+	if err := quicproto.WriteHeader(bw, rh); err != nil {
+		slog.Error("handleGET: write header failed", "error", err)
 		return
 	}
-	// Flush the response header immediately so the client can start reading.
-	if pipeErr := bw.Flush(); pipeErr != nil {
+	if err := bw.Flush(); err != nil {
+		slog.Error("handleGET: flush header failed", "error", err)
 		return
 	}
 
+	// Stream shard data from WAL files
 	var bytesWritten int
-
-	// Reuse buffers to avoid per-fragment allocations.
 	headerBuf := make([]byte, wal.FragmentHeaderBytes)
 	fullChunkBuffer := make([]byte, int(walInstance.Shard.ChunkSize))
 	headerForChecksum := make([]byte, wal.FragmentHeaderBytes)
 
 	for _, walFile := range objectWriteResult.WriteResult.WALFiles {
-
-		slog.Info("handleGET", "walFile", walFile.WALNum, "size", walFile.Size, "offset", walFile.Offset)
-
 		if walFile.Size < 0 {
-			pipeErr = fmt.Errorf("invalid WALFileInfo.Size %d for WAL %d", walFile.Size, walFile.WALNum)
+			slog.Error("handleGET: invalid WAL file size", "size", walFile.Size, "walNum", walFile.WALNum)
 			return
 		}
 
 		f, err := os.Open(filepath.Join(qs.WalDir, wal.FormatWalFile(walFile.WALNum)))
 		if err != nil {
-			pipeErr = fmt.Errorf("failed to open WAL file %d: %w", walFile.WALNum, err)
+			slog.Error("handleGET: failed to open WAL file", "walNum", walFile.WALNum, "error", err)
 			return
 		}
 
-		// Ensure file is closed before moving to the next WAL segment.
-		func() {
+		err = func() error {
 			defer f.Close()
 
-			// Skip WAL header and seek to this object's start offset (Offset excludes WAL header).
 			walHeaderSize := int64(walInstance.WALHeaderSize())
 			if _, err := f.Seek(walHeaderSize+walFile.Offset, io.SeekStart); err != nil {
-				pipeErr = fmt.Errorf("failed to seek in WAL %d: %w", walFile.WALNum, err)
-				return
+				return fmt.Errorf("seek failed: %w", err)
 			}
 
 			var fileBytesRead int64
 			for fileBytesRead < walFile.Size {
-				// Read fixed-size fragment header (32 bytes).
 				if _, err := io.ReadFull(f, headerBuf); err != nil {
-					pipeErr = fmt.Errorf("could not read fragment header from WAL %d: %w", walFile.WALNum, err)
-					return
+					return fmt.Errorf("read header failed: %w", err)
 				}
 
-				seqNum := binary.BigEndian.Uint64(headerBuf[0:8])
 				shardNum := binary.BigEndian.Uint64(headerBuf[8:16])
 				shardFragment := binary.BigEndian.Uint32(headerBuf[16:20])
 				length := binary.BigEndian.Uint32(headerBuf[20:24])
 				flags := wal.Flags(binary.BigEndian.Uint32(headerBuf[24:28]))
 				checksum := binary.BigEndian.Uint32(headerBuf[28:32])
 
-				_ = seqNum // currently unused, but kept for symmetry/debuggability
-
-				// Sanity checks (same intent as ReadFromWriteResult).
 				if shardNum != objectWriteResult.WriteResult.ShardNum {
-					pipeErr = fmt.Errorf(
-						"shard num mismatch in WAL %d: expected %d, got %d",
-						walFile.WALNum, objectWriteResult.WriteResult.ShardNum, shardNum,
-					)
-					return
+					return fmt.Errorf("shard num mismatch: expected %d, got %d",
+						objectWriteResult.WriteResult.ShardNum, shardNum)
 				}
 				if length > walInstance.Shard.ChunkSize {
-					pipeErr = fmt.Errorf(
-						"chunk length %d exceeds max %d in WAL %d",
-						length, walInstance.Shard.ChunkSize, walFile.WALNum,
-					)
-					return
+					return fmt.Errorf("chunk length %d exceeds max %d", length, walInstance.Shard.ChunkSize)
 				}
 
-				// Read full on-disk payload (fixed ChunkSize).
 				if _, err := io.ReadFull(f, fullChunkBuffer); err != nil {
-					pipeErr = fmt.Errorf("could not read chunk from WAL %d: %w", walFile.WALNum, err)
-					return
+					return fmt.Errorf("read chunk failed: %w", err)
 				}
 
-				// Validate checksum (same method as ReadFromWriteResult):
-				// CRC(header-with-checksum-zeroed + full padded payload).
+				// Validate checksum
 				copy(headerForChecksum, headerBuf)
 				headerForChecksum[28], headerForChecksum[29], headerForChecksum[30], headerForChecksum[31] = 0, 0, 0, 0
-
 				calculated := crc32.ChecksumIEEE(headerForChecksum)
 				calculated = crc32.Update(calculated, crc32.IEEETable, fullChunkBuffer)
 				if calculated != checksum {
-					pipeErr = fmt.Errorf(
-						"checksum mismatch for fragment %d in WAL %d: expected %d, got %d",
-						shardFragment, walFile.WALNum, checksum, calculated,
-					)
-					return
+					return fmt.Errorf("checksum mismatch for fragment %d: expected %d, got %d",
+						shardFragment, checksum, calculated)
 				}
 
-				// Stream logical bytes into the pipe.
 				remaining := objectWriteResult.WriteResult.TotalSize - bytesWritten
-				if remaining < 0 {
-					pipeErr = fmt.Errorf("wrote past TotalSize (TotalSize=%d)", objectWriteResult.WriteResult.TotalSize)
-					return
-				}
-
 				toWrite := int(length)
 				if toWrite > remaining {
 					toWrite = remaining
@@ -365,45 +424,40 @@ func (qs *QuicServer) handleGET(br *bufio.Reader, bw *bufio.Writer, req quicprot
 
 				if toWrite > 0 {
 					if _, err := bw.Write(fullChunkBuffer[:toWrite]); err != nil {
-						// Reader side likely closed early.
-						pipeErr = err
-						return
+						return fmt.Errorf("write to client failed: %w", err)
 					}
 					bytesWritten += toWrite
 				}
 
-				// Track on-disk consumption for this segment.
 				fileBytesRead += int64(wal.FragmentHeaderBytes) + int64(walInstance.Shard.ChunkSize)
 
-				// End-of-shard validation (same intent as ReadFromWriteResult).
 				if flags&wal.FlagEndOfShard != 0 {
-					if bytesWritten != objectWriteResult.WriteResult.TotalSize {
-						pipeErr = fmt.Errorf(
-							"end-of-shard set in WAL %d but wrote %d/%d bytes",
-							walFile.WALNum, bytesWritten, objectWriteResult.WriteResult.TotalSize,
-						)
-						return
-					}
-					return
+					return nil
 				}
 			}
+			return nil
 		}()
+
+		if err != nil {
+			slog.Error("handleGET: streaming failed", "error", err)
+			return
+		}
 	}
 
-	// Stream body.
-	//_, _ = io.Copy(bw, f)
+	slog.Debug("handleGET: completed", "bucket", objectRequest.Bucket, "object", objectRequest.Object, "bytes", bytesWritten)
 }
 
 // handlePUTShard receives shard data via QUIC and writes it to the local WAL
 func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req quicproto.Header, putReq PutRequest) {
-	// Open WAL for this node
-	walInstance, err := wal.New("", qs.WalDir)
-	if err != nil {
-		slog.Error("handlePUTShard: failed to open WAL", "error", err)
-		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("wal open: %v", err))
+	// Use shared WAL instance
+	qs.walMu.RLock()
+	walInstance := qs.wal
+	qs.walMu.RUnlock()
+
+	if walInstance == nil {
+		writeErr(bw, req, quicproto.StatusServerError, "WAL not initialized")
 		return
 	}
-	defer walInstance.Close()
 
 	// Determine how many bytes to read
 	var bodyLen int
@@ -419,7 +473,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 	// Create a limited reader for the shard data
 	shardReader := io.LimitReader(br, int64(bodyLen))
 
-	// Write to WAL
+	// Write to WAL (WAL has internal mutex for write serialization)
 	writeResult, err := walInstance.Write(shardReader, bodyLen)
 	if err != nil {
 		slog.Error("handlePUTShard: WAL write failed", "error", err)
@@ -427,7 +481,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		return
 	}
 
-	// Store metadata in local Badger DB (object hash -> WriteResult)
+	// Store metadata in local Badger DB
 	err = walInstance.UpdateObjectToWAL(putReq.ObjectHash, writeResult)
 	if err != nil {
 		slog.Error("handlePUTShard: failed to update metadata", "error", err)
@@ -476,7 +530,6 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 }
 
 // deletedShardPrefix is the key prefix for tracking deleted shards in local badger
-// Format: deleted:<object_hash> -> DeletedShardInfo (gob encoded)
 const deletedShardPrefix = "deleted:"
 
 // DeletedShardInfo tracks a deleted shard for future WAL compaction
@@ -484,40 +537,40 @@ type DeletedShardInfo struct {
 	ObjectHash  [32]byte        `json:"object_hash"`
 	Bucket      string          `json:"bucket"`
 	Object      string          `json:"object"`
-	DeletedAt   int64           `json:"deleted_at"`   // Unix timestamp
-	WriteResult wal.WriteResult `json:"write_result"` // Original location in WAL (for compaction)
+	DeletedAt   int64           `json:"deleted_at"`
+	WriteResult wal.WriteResult `json:"write_result"`
 }
 
 // handleDELETEShard removes shard metadata from local badger and logs deletion for WAL compaction
 func (qs *QuicServer) handleDELETEShard(bw *bufio.Writer, req quicproto.Header, delReq DeleteRequest) {
-	// Open WAL for this node (to access local badger)
-	walInstance, err := wal.New("", qs.WalDir)
-	if err != nil {
-		slog.Error("handleDELETEShard: failed to open WAL", "error", err)
-		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("wal open: %v", err))
+	// Use shared WAL instance
+	qs.walMu.RLock()
+	walInstance := qs.wal
+	qs.walMu.RUnlock()
+
+	if walInstance == nil {
+		writeErr(bw, req, quicproto.StatusServerError, "WAL not initialized")
 		return
 	}
-	defer walInstance.Close()
 
 	// Check if shard exists locally
 	existingMeta, err := walInstance.DB.Get(delReq.ObjectHash[:])
 	if err != nil {
-		slog.Warn("handleDELETEShard: object not found locally", "bucket", delReq.Bucket, "object", delReq.Object)
-		// Return success anyway - idempotent delete
+		slog.Debug("handleDELETEShard: object not found locally", "bucket", delReq.Bucket, "object", delReq.Object)
+		// Return success - idempotent delete
 		qs.sendDeleteResponse(bw, req, true, "")
 		return
 	}
 
-	// Decode the existing write result so we can log it for compaction
+	// Decode existing write result for compaction tracking
 	var objectWriteResult wal.ObjectWriteResult
 	if err := gob.NewDecoder(bytes.NewReader(existingMeta)).Decode(&objectWriteResult); err != nil {
-		slog.Error("handleDELETEShard: failed to decode existing metadata", "error", err)
+		slog.Error("handleDELETEShard: failed to decode metadata", "error", err)
 		writeErr(bw, req, quicproto.StatusServerError, "corrupt metadata")
 		return
 	}
 
-	// Log this deletion for future WAL compaction
-	// TODO: Future compactor will read these entries and reclaim WAL space
+	// Log deletion for future WAL compaction
 	deletedInfo := DeletedShardInfo{
 		ObjectHash:  delReq.ObjectHash,
 		Bucket:      delReq.Bucket,
@@ -533,7 +586,7 @@ func (qs *QuicServer) handleDELETEShard(bw *bufio.Writer, req quicproto.Header, 
 		return
 	}
 
-	// Store deletion record for compaction
+	// Store deletion record
 	deletedKey := []byte(deletedShardPrefix + string(delReq.ObjectHash[:]))
 	if err := walInstance.DB.Set(deletedKey, deletedBuf.Bytes()); err != nil {
 		slog.Error("handleDELETEShard: failed to store deletion record", "error", err)
@@ -541,7 +594,7 @@ func (qs *QuicServer) handleDELETEShard(bw *bufio.Writer, req quicproto.Header, 
 		return
 	}
 
-	// Delete the object metadata from local badger
+	// Delete object metadata
 	if err := walInstance.DB.Delete(delReq.ObjectHash[:]); err != nil {
 		slog.Error("handleDELETEShard: failed to delete metadata", "error", err)
 		writeErr(bw, req, quicproto.StatusServerError, "delete failed")
@@ -578,44 +631,6 @@ func (qs *QuicServer) sendDeleteResponse(bw *bufio.Writer, req quicproto.Header,
 	_ = bw.Flush()
 }
 
-type rebuildReq struct {
-	ShardID  int    `json:"shard_id"`
-	Reason   string `json:"reason"`
-	JobID    string `json:"job_id"`
-	Priority int    `json:"priority"`
-}
-
-func (qs *QuicServer) handleREBUILD(bw *bufio.Writer, req quicproto.Header, key string, meta []byte) {
-	var r rebuildReq
-	if len(meta) > 0 {
-		if err := json.Unmarshal(meta, &r); err != nil {
-			writeErr(bw, req, quicproto.StatusBadRequest, "bad rebuild meta json")
-			return
-		}
-	}
-
-	// Demo behavior: acknowledge. In real code, enqueue a job and return job status.
-	resp := map[string]any{
-		"accepted": true,
-		"key":      key,
-		"job_id":   r.JobID,
-		"shard_id": r.ShardID,
-		"ts":       time.Now().UnixMilli(),
-	}
-	b, _ := json.Marshal(resp)
-
-	rh := quicproto.Header{
-		Version: quicproto.Version1,
-		Method:  req.Method,
-		Status:  quicproto.StatusOK,
-		ReqID:   req.ReqID,
-		MetaLen: uint32(len(b)),
-	}
-	_ = quicproto.WriteHeader(bw, rh)
-	_, _ = bw.Write(b)
-	_ = bw.Flush()
-}
-
 func writeErr(bw *bufio.Writer, req quicproto.Header, code uint16, msg string) {
 	meta := fmt.Sprintf(`{"error":%q}`, msg)
 	rh := quicproto.Header{
@@ -629,15 +644,6 @@ func writeErr(bw *bufio.Writer, req quicproto.Header, code uint16, msg string) {
 	_ = quicproto.WriteHeader(bw, rh)
 	_, _ = bw.WriteString(meta)
 	_ = bw.Flush()
-}
-
-func safePath(root, key string) string {
-	// Very basic safety for demo: clean + disallow absolute.
-	clean := filepath.Clean(key)
-	for len(clean) > 0 && clean[0] == '/' {
-		clean = clean[1:]
-	}
-	return filepath.Join(root, clean)
 }
 
 func hostname() string {
