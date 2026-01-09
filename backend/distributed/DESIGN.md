@@ -28,7 +28,102 @@ parity = 2
 
 Defines RS(3,2): 3 data shards, 2 parity shards. Can tolerate loss of any 2 nodes.
 
-### Node Configuration
+## Distributed Database nodes
+
+Predastore provides a lightweight DynamoDB service to store key information, including bucket owners, objects and prefixes stored in S3. This information is required to be distributed between multiple hosts for redundancy, using raft consensus and leader elections for maintaining state across the fleet.
+
+When new buckets are created, or objects appended to a bucket, predastore will push these changes to the distributed database. 
+
+Process flow:
+
+AWS SDK / S3 client
+
+|
+
+S3 PUT - /my-bucket/prefix/img-01.png
+
+|
+
+S3d (predastore)
+
+|
+
+Confirm authentication, user has permissions over /my-bucket/
+
+|
+
+Insert key
+
+`arn:aws:s3:::my-bucket/prefix/img-01.png`
+
+Distributed Database (Badger)
+
+Write to leader node, confirm majority committed transaction.
+
+|
+
+On success, append to S3 Shard nodes following existing pattern.
+
+|
+
+RS encoding > shard > insert each node.
+
+|
+
+Return success to client.
+
+### Database flow
+
+For development a single node can be used, however for production use it is recommended at least 3 to 5 nodes are used to improve reliability and redundancy. Preferably instances on different switches, racks and unique hardware to isolate failures.
+
+The distributed database runs on a unique port to predastore, using a simple REST HTTP fiber service with AWS authentication mirroring basic functionality of Amazon DynamoDB.
+
+HTTP (AWS auth)
+
+Check provided access-key authenticated
+
+|
+
+INSERT:
+
+POST - /put/{table}/{key}
+Body: {value}
+
+GET:
+
+GET - /put/{table}/{key}
+Body: {value}
+
+DELETE:
+
+DELETE - /delete/{table}/{key}
+
+
+### RAFT Consensus
+
+Leveraging the Hashicorp library https://github.com/hashicorp/raft
+
+On insert / delete / update, `predastore` will contact the primary distributed badgerDB node to commit changes. The primary node is responsible to ensure a majority of other nodes in the cluster confirm the commit, prior to returning success. 
+
+The distributed badgerDB will be responsible for leader election and state changes across the cluster for nodes out of sync.
+
+### Database configuration
+
+```
+# Specify DB nodes for prefix/objects
+# TODO
+#[[db]]
+#id = 1
+#host = "0.0.0.0"
+#port = 6661
+#path = "s3/tests/data/distributed/db/node-1/"
+#leader = true
+#access_key_id = "AKIAIOSFODNN7EXAMPLE"
+#secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+#epoch = 0
+```
+
+### Shard Node Configuration
 
 ```toml
 [[nodes]]
