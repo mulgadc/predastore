@@ -242,7 +242,7 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 			}
 		}
 
-		resp, err := be.CreateBucket(ctx, &backend.CreateBucketRequest{
+		_, err := be.CreateBucket(ctx, &backend.CreateBucketRequest{
 			Bucket:           bucket,
 			Region:           region,
 			OwnerID:          ownerID,
@@ -252,8 +252,10 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 			return err
 		}
 
-		c.Set("Location", resp.Location)
-		return c.SendStatus(200)
+		// Set Location header (full URL format expected by AWS CLI)
+		c.Set("Location", fmt.Sprintf("http://%s.s3.%s.amazonaws.com/", bucket, region))
+		// Return 200 with empty body (not SendStatus which sends "OK" as body)
+		return c.Status(200).Send(nil)
 	})
 
 	// HeadBucket - HEAD /:bucket (without key)
@@ -267,7 +269,7 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 		}
 
 		c.Set("x-amz-bucket-region", resp.Region)
-		return c.SendStatus(200)
+		return c.Status(200).Send(nil)
 	})
 
 	// DeleteBucket - DELETE /:bucket (without key)
@@ -289,7 +291,7 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 			return err
 		}
 
-		return c.SendStatus(204)
+		return c.Status(204).Send(nil)
 	})
 
 	// ListObjectsV2
