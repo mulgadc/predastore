@@ -4,18 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
-	"errors"
 	"io"
 	"os"
 	"path/filepath"
 
-	"github.com/dgraph-io/badger/v4"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/s3/chunked"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
 
-// arnObjectPrefix is the ARN prefix for object keys in Badger
+// arnObjectPrefix is the ARN prefix for object keys
 // Format: arn:aws:s3:::<bucket>/<key>
 const arnObjectPrefixPut = "arn:aws:s3:::"
 
@@ -33,12 +31,10 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	objectToShardNodes := ObjectToShardNodes{}
 
 	// Check if existing
-	data, err := b.db.Get(objectHash[:])
+	data, err := b.globalState.Get(TableObjects, objectHash[:])
 
-	if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
-	} else if errors.Is(err, badger.ErrKeyNotFound) {
-		// Set the defaults for new object
+	if err != nil {
+		// Key not found or other error - treat as new object
 		objectToShardNodes = ObjectToShardNodes{
 			Object:           objectHash,
 			DataShardNodes:   make([]uint32, b.rsDataShard),
@@ -112,29 +108,22 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 		}
 	}
 
-	// Store object metadata in Badger
-	err = b.db.Badger.Update(func(txn *badger.Txn) error {
-		var buf bytes.Buffer
-		enc := gob.NewEncoder(&buf)
+	// Encode object metadata
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(objectToShardNodes); err != nil {
+		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+	}
 
-		if err := enc.Encode(objectToShardNodes); err != nil {
-			return err
-		}
+	// Store object hash -> shard metadata (for retrieval)
+	if err := b.globalState.Set(TableObjects, objectHash[:], buf.Bytes()); err != nil {
+		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+	}
 
-		// Store object hash -> shard metadata (for retrieval)
-		e := badger.NewEntry(objectHash[:], buf.Bytes())
-		if err := txn.SetEntry(e); err != nil {
-			return err
-		}
-
-		// Store ARN key -> object hash (for listing)
-		// Format: arn:aws:s3:::<bucket>/<key>
-		arnKey := []byte(arnObjectPrefixPut + req.Bucket + "/" + req.Key)
-		arnEntry := badger.NewEntry(arnKey, objectHash[:])
-		return txn.SetEntry(arnEntry)
-	})
-
-	if err != nil {
+	// Store ARN key -> object hash (for listing)
+	// Format: arn:aws:s3:::<bucket>/<key>
+	arnKey := []byte(arnObjectPrefixPut + req.Bucket + "/" + req.Key)
+	if err := b.globalState.Set(TableObjects, arnKey, objectHash[:]); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 
@@ -150,12 +139,10 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 	objectToShardNodes := ObjectToShardNodes{}
 
 	// Check if existing
-	data, err := b.db.Get(objectHash[:])
+	data, err := b.globalState.Get(TableObjects, objectHash[:])
 
-	if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
-		return err
-	} else if errors.Is(err, badger.ErrKeyNotFound) {
-		// Set the defaults for new object
+	if err != nil {
+		// Key not found or other error - treat as new object
 		objectToShardNodes = ObjectToShardNodes{
 			Object:           objectHash,
 			DataShardNodes:   make([]uint32, b.rsDataShard),
@@ -208,18 +195,15 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 		}
 	}
 
-	// Store object metadata in Badger
-	return b.db.Badger.Update(func(txn *badger.Txn) error {
-		var buf bytes.Buffer
-		enc := gob.NewEncoder(&buf)
+	// Encode object metadata
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(objectToShardNodes); err != nil {
+		return err
+	}
 
-		if err := enc.Encode(objectToShardNodes); err != nil {
-			return err
-		}
-
-		e := badger.NewEntry(objectHash[:], buf.Bytes())
-		return txn.SetEntry(e)
-	})
+	// Store object metadata using GlobalState
+	return b.globalState.Set(TableObjects, objectHash[:], buf.Bytes())
 }
 
 // GetFromPath retrieves an object and writes to the provided writer (used for testing)

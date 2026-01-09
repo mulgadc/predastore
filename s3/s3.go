@@ -38,6 +38,19 @@ type Nodes struct {
 	Epoch  int    `toml:"epoch"`
 }
 
+// DBNode represents a distributed database node configuration
+type DBNode struct {
+	ID              int    `toml:"id"`
+	Host            string `toml:"host"`
+	Port            int    `toml:"port"`
+	RaftPort        int    `toml:"raft_port"` // Port for Raft consensus (default: Port + 1000)
+	Path            string `toml:"path"`
+	AccessKeyID     string `toml:"access_key_id"`
+	SecretAccessKey string `toml:"secret_access_key"`
+	Leader          bool   `toml:"leader"`
+	Epoch           int    `toml:"epoch"`
+}
+
 type Config struct {
 	ConfigPath string // Path to config file
 	Version    string `toml:"version"`
@@ -45,6 +58,9 @@ type Config struct {
 
 	RS    RS      `toml:"rs"`
 	Nodes []Nodes `toml:"nodes"`
+
+	// Distributed database nodes for global state
+	DB []DBNode `toml:"db"`
 
 	Buckets []S3_Buckets `toml:"buckets"`
 
@@ -61,7 +77,7 @@ type Config struct {
 	BasePath       string `toml:"base_path"`
 	DisableLogging bool   `toml:"disable_logging"`
 
-	// Distributed backend config
+	// Distributed backend config (deprecated - use DB nodes instead)
 	BadgerDir string `toml:"badger_dir"`
 }
 

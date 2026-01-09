@@ -14,15 +14,15 @@ import (
 	s3db "github.com/mulgadc/predastore/s3db"
 )
 
-// arnObjectPrefixDel is the ARN prefix for object keys in Badger
+// arnObjectPrefixDel is the ARN prefix for object keys
 const arnObjectPrefixDel = "arn:aws:s3:::"
 
-// deletedObjectPrefix is the key prefix for tracking deleted objects in global badger
+// deletedObjectPrefix is the key prefix for tracking deleted objects
 // Format: deleted:<bucket>/<key> -> DeletedObjectInfo (gob encoded)
 // This allows querying all deleted objects for a future compaction coordinator
 const deletedObjectPrefix = "deleted:"
 
-// DeletedObjectInfo tracks a deleted object in the global badger for compaction coordination
+// DeletedObjectInfo tracks a deleted object for compaction coordination
 type DeletedObjectInfo struct {
 	Bucket         string   `json:"bucket"`
 	Key            string   `json:"key"`
@@ -44,7 +44,7 @@ func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectReq
 	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
 
 	// Check if object exists and get shard node info
-	data, err := b.db.Get(objectHash[:])
+	data, err := b.globalState.Get(TableObjects, objectHash[:])
 	if err != nil {
 		return backend.ErrNoSuchKeyError.WithResource(req.Key)
 	}
@@ -63,7 +63,7 @@ func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectReq
 		}
 	}
 
-	// Track deleted object in global badger for future compaction coordination
+	// Track deleted object for future compaction coordination
 	// TODO: A future compaction coordinator can scan these entries to know which
 	// shard servers have deleted data that needs WAL compaction
 	deletedInfo := DeletedObjectInfo{
@@ -78,18 +78,18 @@ func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectReq
 	var deletedBuf bytes.Buffer
 	if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err == nil {
 		deletedKey := []byte(deletedObjectPrefix + req.Bucket + "/" + req.Key)
-		_ = b.db.Set(deletedKey, deletedBuf.Bytes()) // Best effort, don't fail delete
+		_ = b.globalState.Set(TableObjects, deletedKey, deletedBuf.Bytes()) // Best effort
 	}
 
-	// Delete the object hash metadata from global Badger
-	err = b.db.Delete(objectHash[:])
+	// Delete the object hash metadata from global state
+	err = b.globalState.Delete(TableObjects, objectHash[:])
 	if err != nil {
 		return backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 
-	// Delete the ARN key from Badger (for listing)
+	// Delete the ARN key from global state (for listing)
 	arnKey := []byte(arnObjectPrefixDel + req.Bucket + "/" + req.Key)
-	_ = b.db.Delete(arnKey) // Best effort
+	_ = b.globalState.Delete(TableObjects, arnKey) // Best effort
 
 	return nil
 }

@@ -51,7 +51,7 @@ type Config struct {
 	// DataDir is the root directory for distributed node storage
 	DataDir string
 
-	// BadgerDir is the directory for the Badger KV database
+	// BadgerDir is the directory for the Badger KV database (used when DBClient is nil)
 	BadgerDir string
 
 	// Reed-Solomon configuration
@@ -73,6 +73,10 @@ type Config struct {
 
 	// Buckets configuration (from cluster.toml)
 	Buckets []BucketConfig
+
+	// DBClient holds configuration for the distributed database client
+	// When set, uses distributed s3db for global state instead of local BadgerDB
+	DBClient *DBClientConfig
 }
 
 // Backend implements the distributed storage backend with Reed-Solomon erasure coding
@@ -83,7 +87,7 @@ type Backend struct {
 	hashRing      *consistent.Consistent
 	dataDir       string
 	badgerDir     string
-	db            *s3db.S3DB
+	globalState   GlobalState    // abstraction for global state storage (local or distributed)
 	quicBasePort  int
 	nodeAddrs     map[int]string // node ID -> "host:port"
 	buckets       []BucketConfig // bucket configurations
@@ -142,8 +146,9 @@ func New(config interface{}) (backend.Backend, error) {
 		return nil, errors.New("invalid configuration type for distributed backend")
 	}
 
-	if cfg.BadgerDir == "" {
-		return nil, errors.New("badger directory is required for distributed backend")
+	// Either DBClient or BadgerDir must be configured
+	if cfg.DBClient == nil && cfg.BadgerDir == "" {
+		return nil, errors.New("either DBClient or BadgerDir is required for distributed backend")
 	}
 
 	// Set defaults
@@ -173,10 +178,27 @@ func New(config interface{}) (backend.Backend, error) {
 		dataDir = filepath.Join("s3", "tests", "data", "distributed", "nodes")
 	}
 
-	// Create Badger DB
-	db, err := s3db.New(cfg.BadgerDir)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create badger db: %w", err)
+	// Create global state store (distributed or local)
+	var globalState GlobalState
+	var err error
+
+	if cfg.DBClient != nil && len(cfg.DBClient.Nodes) > 0 {
+		// Use distributed s3db cluster for global state
+		slog.Info("Using distributed database for global state",
+			"nodes", cfg.DBClient.Nodes,
+			"region", cfg.DBClient.Region,
+		)
+		globalState, err = NewDistributedState(cfg.DBClient)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create distributed state: %w", err)
+		}
+	} else {
+		// Fallback to local BadgerDB
+		slog.Info("Using local BadgerDB for global state", "path", cfg.BadgerDir)
+		globalState, err = NewLocalState(cfg.BadgerDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create local state: %w", err)
+		}
 	}
 
 	// Create hash ring
@@ -192,7 +214,7 @@ func New(config interface{}) (backend.Backend, error) {
 	for i := 0; i < partitionCount; i++ {
 		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
 		if err := os.MkdirAll(nodeDir, 0750); err != nil {
-			db.Close()
+			globalState.Close()
 			return nil, fmt.Errorf("failed to create node directory: %w", err)
 		}
 		hashRing.Add(myMember(fmt.Sprintf("node-%d", i)))
@@ -211,7 +233,7 @@ func New(config interface{}) (backend.Backend, error) {
 		hashRing:      hashRing,
 		dataDir:       dataDir,
 		badgerDir:     cfg.BadgerDir,
-		db:            db,
+		globalState:   globalState,
 		quicBasePort:  quicBasePort,
 		nodeAddrs:     nodeAddrs,
 		buckets:       cfg.Buckets,
@@ -226,8 +248,8 @@ func (b *Backend) Type() string {
 
 // Close cleans up resources
 func (b *Backend) Close() error {
-	if b.db != nil {
-		return b.db.Close()
+	if b.globalState != nil {
+		return b.globalState.Close()
 	}
 	return nil
 }
@@ -275,9 +297,18 @@ func (b *Backend) HashRing() *consistent.Consistent {
 	return b.hashRing
 }
 
-// DB returns the badger database (for testing)
+// DB returns the local badger database (for testing/backward compatibility)
+// Returns nil if using distributed state
 func (b *Backend) DB() *s3db.S3DB {
-	return b.db
+	if localState, ok := b.globalState.(*LocalState); ok {
+		return localState.DB()
+	}
+	return nil
+}
+
+// GlobalState returns the global state interface
+func (b *Backend) GlobalState() GlobalState {
+	return b.globalState
 }
 
 // putObjectToWAL splits a file into RS shards and writes each to the appropriate node's WAL
@@ -658,7 +689,6 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 // openInput retrieves shard location metadata for an object
 func (b *Backend) openInput(bucket string, object string) (ObjectToShardNodes, int64, error) {
 	key := s3db.GenObjectHash(bucket, object)
-	//key := []byte(fmt.Sprintf("%s/%s", bucket, object))
 
 	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
@@ -667,7 +697,8 @@ func (b *Backend) openInput(bucket string, object string) (ObjectToShardNodes, i
 
 	objectHash := s3db.GenObjectHash(bucket, object)
 
-	data, err := b.db.Get(objectHash[:])
+	// Use GlobalState interface to get object metadata
+	data, err := b.globalState.Get(TableObjects, objectHash[:])
 	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}

@@ -28,7 +28,7 @@ func (b *Backend) ListBuckets(ctx context.Context) (*backend.ListBucketsResponse
 		if bucket.Type == "distributed" {
 			buckets = append(buckets, backend.BucketInfo{
 				Name:         bucket.Name,
-				CreationDate: time.Now(), // TODO: Store actual creation date in Badger
+				CreationDate: time.Now(), // TODO: Store actual creation date
 			})
 		}
 	}
@@ -42,7 +42,7 @@ func (b *Backend) ListBuckets(ctx context.Context) (*backend.ListBucketsResponse
 	}, nil
 }
 
-// ListObjects returns a list of objects in a bucket by scanning Badger
+// ListObjects returns a list of objects in a bucket by scanning global state
 // Objects are stored with ARN key format: arn:aws:s3:::<bucket>/<key>
 func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsRequest) (*backend.ListObjectsResponse, error) {
 	if req.Bucket == "" {
@@ -68,12 +68,12 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 		scanPrefix += req.Prefix
 	}
 
-	// Scan Badger for matching keys
+	// Scan global state for matching keys
 	contents := make([]backend.ObjectInfo, 0)
 	commonPrefixes := make([]string, 0)
 	prefixSet := make(map[string]bool) // To dedupe common prefixes
 
-	err := b.db.Scan([]byte(scanPrefix), func(key, value []byte) error {
+	err := b.globalState.Scan(TableObjects, []byte(scanPrefix), func(key, value []byte) error {
 		keyStr := string(key)
 
 		// Extract the object key from ARN
@@ -107,7 +107,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 		var objectSize int64
 		if len(value) == 32 {
 			// value is the objectHash, look up the full metadata
-			metaData, err := b.db.Get(value)
+			metaData, err := b.globalState.Get(TableObjects, value)
 			if err == nil && len(metaData) > 0 {
 				var objMeta ObjectToShardNodes
 				r := bytes.NewReader(metaData)
