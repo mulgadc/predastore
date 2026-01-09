@@ -2,6 +2,7 @@ package s3db
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,27 +14,37 @@ import (
 
 // Client provides access to the distributed database cluster
 type Client struct {
-	mu          sync.RWMutex
-	nodes       []string // List of node addresses
-	leaderAddr  string   // Cached leader address
-	httpClient  *http.Client
-	apiKey      string
-	maxRetries  int
+	mu              sync.RWMutex
+	nodes           []string // List of node addresses
+	leaderAddr      string   // Cached leader address
+	httpClient      *http.Client
+	accessKeyID     string
+	secretAccessKey string
+	region          string
+	service         string
+	maxRetries      int
 }
 
 // ClientConfig holds client configuration
 type ClientConfig struct {
-	Nodes      []string      // Initial list of node addresses
-	APIKey     string        // API key for authentication
-	Timeout    time.Duration // HTTP request timeout
-	MaxRetries int           // Max retries on failure
+	Nodes              []string      // Initial list of node addresses
+	AccessKeyID        string        // AWS-style access key ID
+	SecretAccessKey    string        // AWS-style secret access key
+	Region             string        // Region for signing (default: us-east-1)
+	Service            string        // Service name for signing (default: s3db)
+	Timeout            time.Duration // HTTP request timeout
+	MaxRetries         int           // Max retries on failure
+	InsecureSkipVerify bool          // Skip TLS certificate verification (for self-signed certs)
 }
 
 // DefaultClientConfig returns sensible defaults
 func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{
-		Timeout:    10 * time.Second,
-		MaxRetries: 3,
+		Region:             DefaultRegion,
+		Service:            DefaultService,
+		Timeout:            10 * time.Second,
+		MaxRetries:         3,
+		InsecureSkipVerify: true, // Default to true for self-signed certs
 	}
 }
 
@@ -43,12 +54,33 @@ func NewClient(config *ClientConfig) *Client {
 		config = DefaultClientConfig()
 	}
 
+	region := config.Region
+	if region == "" {
+		region = DefaultRegion
+	}
+
+	service := config.Service
+	if service == "" {
+		service = DefaultService
+	}
+
+	// Configure TLS transport with optional certificate verification skip
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: config.InsecureSkipVerify,
+		},
+	}
+
 	return &Client{
-		nodes:      config.Nodes,
-		apiKey:     config.APIKey,
-		maxRetries: config.MaxRetries,
+		nodes:           config.Nodes,
+		accessKeyID:     config.AccessKeyID,
+		secretAccessKey: config.SecretAccessKey,
+		region:          region,
+		service:         service,
+		maxRetries:      config.MaxRetries,
 		httpClient: &http.Client{
-			Timeout: config.Timeout,
+			Timeout:   config.Timeout,
+			Transport: transport,
 		},
 	}
 }
@@ -146,8 +178,22 @@ func (c *Client) doRead(path string) ([]byte, error) {
 	var lastErr error
 	for i := 0; i < c.maxRetries; i++ {
 		for _, node := range nodes {
-			url := "http://" + node + path
-			resp, err := c.httpClient.Get(url)
+			reqURL := "https://" + node + path
+			req, err := http.NewRequest("GET", reqURL, nil)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+
+			// Sign the request if credentials are configured
+			if c.accessKeyID != "" && c.secretAccessKey != "" {
+				if err := SignRequest(req, c.accessKeyID, c.secretAccessKey, c.region, c.service); err != nil {
+					lastErr = fmt.Errorf("failed to sign request: %w", err)
+					continue
+				}
+			}
+
+			resp, err := c.httpClient.Do(req)
 			if err != nil {
 				lastErr = err
 				continue
@@ -234,24 +280,27 @@ func (c *Client) doWrite(method, path string, body []byte) ([]byte, error) {
 // tryWrite attempts a write to a specific node
 // Returns (response, leaderAddr, error)
 func (c *Client) tryWrite(method, node, path string, body []byte) ([]byte, string, error) {
-	url := "http://" + node + path
+	reqURL := "https://" + node + path
 
 	var req *http.Request
 	var err error
 	if body != nil {
-		req, err = http.NewRequest(method, url, bytes.NewReader(body))
+		req, err = http.NewRequest(method, reqURL, bytes.NewReader(body))
 	} else {
-		req, err = http.NewRequest(method, url, nil)
+		req, err = http.NewRequest(method, reqURL, nil)
 	}
 	if err != nil {
 		return nil, "", err
 	}
 
-	if c.apiKey != "" {
-		req.Header.Set("X-API-Key", c.apiKey)
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
 	req.Header.Set("Content-Type", "application/octet-stream")
+
+	// Sign the request if credentials are configured
+	if c.accessKeyID != "" && c.secretAccessKey != "" {
+		if err := SignRequest(req, c.accessKeyID, c.secretAccessKey, c.region, c.service); err != nil {
+			return nil, "", fmt.Errorf("failed to sign request: %w", err)
+		}
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

@@ -22,14 +22,19 @@ type Server struct {
 // ServerConfig holds server configuration
 type ServerConfig struct {
 	// HTTP settings
-	Addr            string
-	ReadTimeout     time.Duration
-	WriteTimeout    time.Duration
-	IdleTimeout     time.Duration
+	Addr         string
+	ReadTimeout  time.Duration
+	WriteTimeout time.Duration
+	IdleTimeout  time.Duration
 
-	// Authentication
-	AccessKeyID     string
-	SecretAccessKey string
+	// TLS settings
+	TLSCert string // Path to TLS certificate file
+	TLSKey  string // Path to TLS private key file
+
+	// Authentication - map of AccessKeyID -> SecretAccessKey
+	Credentials map[string]string
+	Region      string // Region for signature validation (default: us-east-1)
+	Service     string // Service name for signature validation (default: s3db)
 
 	// Cluster configuration
 	ClusterConfig *ClusterConfig
@@ -42,6 +47,8 @@ func DefaultServerConfig() *ServerConfig {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
+		TLSCert:      "config/server.pem",
+		TLSKey:       "config/server.key",
 	}
 }
 
@@ -106,31 +113,35 @@ func (s *Server) setupRoutes() {
 	api.Get("/leader", s.handleLeader)
 }
 
-// authMiddleware validates AWS-style authentication
+// authMiddleware validates AWS Signature V4 authentication
 func (s *Server) authMiddleware(c *fiber.Ctx) error {
 	// Skip auth if no credentials configured
-	if s.config.AccessKeyID == "" {
+	if len(s.config.Credentials) == 0 {
 		return c.Next()
 	}
 
-	// Get Authorization header
-	authHeader := c.Get("Authorization")
-	if authHeader == "" {
+	// Get region and service, with defaults
+	region := s.config.Region
+	if region == "" {
+		region = DefaultRegion
+	}
+	service := s.config.Service
+	if service == "" {
+		service = DefaultService
+	}
+
+	// Validate the signature
+	accessKey, err := ValidateSignature(c, s.config.Credentials, region, service)
+	if err != nil {
+		slog.Debug("Auth failed", "error", err)
 		return c.Status(http.StatusForbidden).JSON(ErrorResponse{
 			Error:   "AccessDenied",
-			Message: "Missing Authorization header",
+			Message: err.Error(),
 		})
 	}
 
-	// TODO: Implement full AWS SigV4 validation
-	// For now, simple API key check
-	apiKey := c.Get("X-API-Key")
-	if apiKey != s.config.AccessKeyID {
-		return c.Status(http.StatusForbidden).JSON(ErrorResponse{
-			Error:   "AccessDenied",
-			Message: "Invalid credentials",
-		})
-	}
+	// Store authenticated access key in context for potential audit logging
+	c.Locals("accessKey", accessKey)
 
 	return c.Next()
 }
@@ -375,10 +386,10 @@ func (s *Server) errorHandler(c *fiber.Ctx, err error) error {
 	})
 }
 
-// Start begins listening for HTTP requests
+// Start begins listening for HTTPS requests with TLS
 func (s *Server) Start() error {
-	slog.Info("Starting database server", "addr", s.config.Addr, "node_id", s.config.ClusterConfig.NodeID)
-	return s.app.Listen(s.config.Addr)
+	slog.Info("Starting database server with TLS", "addr", s.config.Addr, "node_id", s.config.ClusterConfig.NodeID)
+	return s.app.ListenTLS(s.config.Addr, s.config.TLSCert, s.config.TLSKey)
 }
 
 // Shutdown gracefully stops the server

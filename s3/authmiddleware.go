@@ -1,13 +1,8 @@
 package s3
 
 import (
-	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -15,14 +10,15 @@ import (
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/mulgadc/predastore/auth"
 )
 
 const (
 	// TimeFormat is the full-width form to be used in the X-Amz-Date header.
-	TimeFormat = "20060102T150405Z"
+	TimeFormat = auth.TimeFormat
 
 	// ShortTimeFormat is the shortened form used in credential scope.
-	ShortTimeFormat = "20060102"
+	ShortTimeFormat = auth.ShortTimeFormat
 )
 
 // Permission map for methods mapped to actions
@@ -101,87 +97,10 @@ var permissionMap = []PermissionMap{
 	},
 }
 
-// Utility function to generate AWS Signature V4 authorization header
+// GenerateAuthHeaderReq signs an HTTP request using AWS Signature V4
+// This is a wrapper around auth.GenerateAuthHeaderReq for backwards compatibility
 func GenerateAuthHeaderReq(accessKey, secretKey, timestamp, region, service string, req *http.Request) error {
-	// Get the date portion of the timestamp
-	date := timestamp[:8]
-
-	// Create canonical request
-	canonicalHeaders := fmt.Sprintf("host:%s\nx-amz-date:%s\n", req.Host, timestamp)
-	signedHeaders := "host;x-amz-date"
-
-	var payloadHash string
-
-	if req.Body != nil {
-		var bodyContent []byte
-		// Read the body
-		bodyContent, err := io.ReadAll(req.Body)
-		if err != nil {
-			return err
-		}
-
-		// Restore the body for subsequent readers
-		req.Body = io.NopCloser(bytes.NewReader(bodyContent))
-
-		// Calculate hash
-		payloadHash = hashSHA256(string(bodyContent))
-	} else {
-		// Empty body
-		payloadHash = hashSHA256("")
-	}
-
-	queryUrl := req.URL.Query()
-
-	for key := range queryUrl {
-		sort.Strings(queryUrl[key])
-	}
-
-	canonicalQueryString := strings.Replace(queryUrl.Encode(), "+", "%20", -1)
-
-	canonicalRequest := fmt.Sprintf(
-		"%s\n%s\n%s\n%s\n%s\n%s",
-		req.Method,
-		req.URL.Path,
-		canonicalQueryString,
-		canonicalHeaders,
-		signedHeaders,
-		payloadHash,
-	)
-
-	// Hash the canonical request
-	hashedCanonicalRequest := hashSHA256(canonicalRequest)
-
-	// Create string to sign
-	scope := fmt.Sprintf("%s/%s/%s/aws4_request", date, region, service)
-	stringToSign := fmt.Sprintf(
-		"AWS4-HMAC-SHA256\n%s\n%s\n%s",
-		timestamp,
-		scope,
-		hashedCanonicalRequest,
-	)
-
-	// Derive signing key
-	signingKey := getSigningKey(secretKey, date, region, service)
-
-	// Calculate signature
-	signature := hmacSHA256Hex(signingKey, stringToSign)
-
-	// Create authorization header
-	authHeader := fmt.Sprintf(
-		"AWS4-HMAC-SHA256 Credential=%s/%s/%s/%s/aws4_request, SignedHeaders=%s, Signature=%s",
-		accessKey,
-		date,
-		region,
-		service,
-		signedHeaders,
-		signature,
-	)
-
-	req.Header.Set("Authorization", authHeader)
-	req.Header.Set("X-Amz-Date", timestamp)
-	//req.Header.Set("Host", req.Host)
-
-	return nil
+	return auth.GenerateAuthHeaderReq(accessKey, secretKey, timestamp, region, service, req)
 }
 
 func (s3 *Config) validatePublicBucketPolicy(bucket string) error {
@@ -410,28 +329,29 @@ func (s3 *Config) SigV4AuthMiddleware(c *fiber.Ctx) error {
 	//return nil
 }
 
-func hashSHA256(s string) string {
-	hash := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(hash[:])
+// HashSHA256 returns the hex-encoded SHA256 hash of the input
+// Wrapper around auth.HashSHA256 for backwards compatibility
+func HashSHA256(s string) string { return auth.HashSHA256(s) }
+
+// HmacSHA256 returns the HMAC-SHA256 of data using the given key
+// Wrapper around auth.HmacSHA256 for backwards compatibility
+func HmacSHA256(key []byte, data string) []byte { return auth.HmacSHA256(key, data) }
+
+// HmacSHA256Hex returns the hex-encoded HMAC-SHA256 of data using the given key
+// Wrapper around auth.HmacSHA256Hex for backwards compatibility
+func HmacSHA256Hex(key []byte, data string) string { return auth.HmacSHA256Hex(key, data) }
+
+// GetSigningKey derives the signing key for AWS Signature V4
+// Wrapper around auth.GetSigningKey for backwards compatibility
+func GetSigningKey(secret, date, region, service string) []byte {
+	return auth.GetSigningKey(secret, date, region, service)
 }
 
-func hmacSHA256(key []byte, data string) []byte {
-	h := hmac.New(sha256.New, key)
-	h.Write([]byte(data))
-	return h.Sum(nil)
-}
-
-func hmacSHA256Hex(key []byte, data string) string {
-	return hex.EncodeToString(hmacSHA256(key, data))
-}
-
-func getSigningKey(secret, date, region, service string) []byte {
-	kDate := hmacSHA256([]byte("AWS4"+secret), date)
-	kRegion := hmacSHA256(kDate, region)
-	kService := hmacSHA256(kRegion, service)
-	kSigning := hmacSHA256(kService, "aws4_request")
-	return kSigning
-}
+// Lowercase aliases for internal use
+func hashSHA256(s string) string                                { return auth.HashSHA256(s) }
+func hmacSHA256(key []byte, data string) []byte                 { return auth.HmacSHA256(key, data) }
+func hmacSHA256Hex(key []byte, data string) string              { return auth.HmacSHA256Hex(key, data) }
+func getSigningKey(secret, date, region, service string) []byte { return auth.GetSigningKey(secret, date, region, service) }
 
 // UriEncode follows AWS's specific requirements for canonical URI encoding
 func UriEncode(input string, encodeSlash bool) string {
