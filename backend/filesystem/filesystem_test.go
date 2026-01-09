@@ -400,7 +400,7 @@ func TestBackend_ListBuckets(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	resp, err := be.ListBuckets(ctx)
+	resp, err := be.ListBuckets(ctx, "test-owner")
 	require.NoError(t, err)
 	assert.Len(t, resp.Buckets, 1)
 	assert.Equal(t, "test-bucket", resp.Buckets[0].Name)

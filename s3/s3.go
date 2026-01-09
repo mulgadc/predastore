@@ -196,6 +196,28 @@ type S3Error struct {
 	HostId     string   `xml:"HostId"`
 }
 
+// CreateBucketConfiguration is the request body for CreateBucket
+type CreateBucketConfiguration struct {
+	XMLName            xml.Name `xml:"CreateBucketConfiguration"`
+	LocationConstraint string   `xml:"LocationConstraint"`
+}
+
+// CreateBucketResult is the response for CreateBucket
+type CreateBucketResult struct {
+	XMLName  xml.Name `xml:"CreateBucketResult"`
+	Location string   `xml:"Location"`
+}
+
+// Context key for storing authenticated user info
+type contextKey string
+
+const (
+	// ContextKeyAccessKeyID is the context key for the authenticated user's access key ID
+	ContextKeyAccessKeyID contextKey = "accessKeyID"
+	// ContextKeyAccountID is the context key for the authenticated user's account ID
+	ContextKeyAccountID contextKey = "accountID"
+)
+
 func New(ConfigSettings *Config) *Config {
 	return ConfigSettings
 }

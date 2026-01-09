@@ -6,20 +6,22 @@ import "fmt"
 type S3ErrorCode string
 
 const (
-	ErrNoSuchBucket      S3ErrorCode = "NoSuchBucket"
-	ErrNoSuchKey         S3ErrorCode = "NoSuchKey"
-	ErrNoSuchUpload      S3ErrorCode = "NoSuchUpload"
-	ErrInvalidKey        S3ErrorCode = "InvalidKey"
-	ErrInvalidPart       S3ErrorCode = "InvalidPart"
-	ErrInvalidPartOrder  S3ErrorCode = "InvalidPartOrder"
-	ErrAccessDenied      S3ErrorCode = "AccessDenied"
-	ErrInternalError     S3ErrorCode = "InternalError"
-	ErrEntityTooSmall    S3ErrorCode = "EntityTooSmall"
-	ErrInvalidRange      S3ErrorCode = "InvalidRange"
-	ErrBucketNotEmpty    S3ErrorCode = "BucketNotEmpty"
-	ErrBucketExists      S3ErrorCode = "BucketAlreadyOwnedByYou"
-	ErrMissingParameter  S3ErrorCode = "MissingParameter"
-	ErrChecksumMismatch  S3ErrorCode = "XAmzContentChecksumMismatch"
+	ErrNoSuchBucket           S3ErrorCode = "NoSuchBucket"
+	ErrNoSuchKey              S3ErrorCode = "NoSuchKey"
+	ErrNoSuchUpload           S3ErrorCode = "NoSuchUpload"
+	ErrInvalidKey             S3ErrorCode = "InvalidKey"
+	ErrInvalidPart            S3ErrorCode = "InvalidPart"
+	ErrInvalidPartOrder       S3ErrorCode = "InvalidPartOrder"
+	ErrAccessDenied           S3ErrorCode = "AccessDenied"
+	ErrInternalError          S3ErrorCode = "InternalError"
+	ErrEntityTooSmall         S3ErrorCode = "EntityTooSmall"
+	ErrInvalidRange           S3ErrorCode = "InvalidRange"
+	ErrBucketNotEmpty         S3ErrorCode = "BucketNotEmpty"
+	ErrBucketAlreadyExists    S3ErrorCode = "BucketAlreadyExists"
+	ErrBucketAlreadyOwnedByYou S3ErrorCode = "BucketAlreadyOwnedByYou"
+	ErrInvalidBucketName      S3ErrorCode = "InvalidBucketName"
+	ErrMissingParameter       S3ErrorCode = "MissingParameter"
+	ErrChecksumMismatch       S3ErrorCode = "XAmzContentChecksumMismatch"
 )
 
 // S3Error represents a typed S3 error with code and message
@@ -95,6 +97,30 @@ var (
 		Code:       ErrInvalidRange,
 		Message:    "The requested range is not satisfiable",
 		StatusCode: 416,
+	}
+
+	ErrBucketAlreadyExistsError = &S3Error{
+		Code:       ErrBucketAlreadyExists,
+		Message:    "The requested bucket name is not available. The bucket namespace is shared by all users of the system. Please select a different name and try again.",
+		StatusCode: 409,
+	}
+
+	ErrBucketAlreadyOwnedByYouError = &S3Error{
+		Code:       ErrBucketAlreadyOwnedByYou,
+		Message:    "Your previous request to create the named bucket succeeded and you already own it.",
+		StatusCode: 409,
+	}
+
+	ErrInvalidBucketNameError = &S3Error{
+		Code:       ErrInvalidBucketName,
+		Message:    "The specified bucket is not valid.",
+		StatusCode: 400,
+	}
+
+	ErrBucketNotEmptyError = &S3Error{
+		Code:       ErrBucketNotEmpty,
+		Message:    "The bucket you tried to delete is not empty.",
+		StatusCode: 409,
 	}
 )
 

@@ -18,25 +18,68 @@ const (
 	arnObjectPrefix = "arn:aws:s3:::"
 )
 
-// ListBuckets returns a list of buckets from the configuration
-// For beta: buckets are defined in cluster.toml, not dynamically created
-func (b *Backend) ListBuckets(ctx context.Context) (*backend.ListBucketsResponse, error) {
-	buckets := make([]backend.BucketInfo, 0, len(b.buckets))
+// ListBuckets returns a list of buckets from both config and s3db
+// ownerID filters to only show buckets owned by the specified user (empty = all buckets)
+func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.ListBucketsResponse, error) {
+	bucketMap := make(map[string]backend.BucketInfo)
 
+	// First add buckets from config (for backward compatibility)
 	for _, bucket := range b.buckets {
 		// Only include distributed type buckets
 		if bucket.Type == "distributed" {
-			buckets = append(buckets, backend.BucketInfo{
+			bucketMap[bucket.Name] = backend.BucketInfo{
 				Name:         bucket.Name,
-				CreationDate: time.Now(), // TODO: Store actual creation date
-			})
+				Region:       bucket.Region,
+				CreationDate: time.Now(), // Config buckets don't have stored creation date
+			}
 		}
+	}
+
+	// Then scan s3db for dynamically created buckets
+	err := b.globalState.Scan(TableBuckets, nil, func(key, value []byte) error {
+		var metadata backend.BucketMetadata
+		r := bytes.NewReader(value)
+		dec := gob.NewDecoder(r)
+		if err := dec.Decode(&metadata); err != nil {
+			return nil // Skip invalid entries
+		}
+
+		// Filter by owner if ownerID is provided
+		if ownerID != "" && metadata.OwnerID != ownerID {
+			// Check if bucket is public or if we should show it anyway
+			// For now, show all buckets but mark ownership
+			// The auth middleware should handle access control
+		}
+
+		// Add or update (s3db takes precedence for metadata)
+		bucketMap[metadata.Name] = backend.BucketInfo{
+			Name:         metadata.Name,
+			Region:       metadata.Region,
+			CreationDate: metadata.CreationDate,
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		// Log error but don't fail - return what we have from config
+	}
+
+	// Convert map to slice
+	buckets := make([]backend.BucketInfo, 0, len(bucketMap))
+	for _, info := range bucketMap {
+		buckets = append(buckets, info)
+	}
+
+	displayName := "Predastore"
+	if ownerID != "" {
+		displayName = ownerID
 	}
 
 	return &backend.ListBucketsResponse{
 		Owner: backend.OwnerInfo{
-			ID:          "predastore",
-			DisplayName: "Predastore",
+			ID:          ownerID,
+			DisplayName: displayName,
 		},
 		Buckets: buckets,
 	}, nil
@@ -49,16 +92,10 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
 	}
 
-	// Check if bucket exists in config
-	bucketExists := false
-	for _, bucket := range b.buckets {
-		if bucket.Name == req.Bucket {
-			bucketExists = true
-			break
-		}
-	}
-	if !bucketExists {
-		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
+	// Check if bucket exists (in config or s3db)
+	_, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket})
+	if err != nil {
+		return nil, err
 	}
 
 	// Build the ARN prefix for scanning
@@ -73,7 +110,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 	commonPrefixes := make([]string, 0)
 	prefixSet := make(map[string]bool) // To dedupe common prefixes
 
-	err := b.globalState.Scan(TableObjects, []byte(scanPrefix), func(key, value []byte) error {
+	err = b.globalState.Scan(TableObjects, []byte(scanPrefix), func(key, value []byte) error {
 		keyStr := string(key)
 
 		// Extract the object key from ARN

@@ -15,7 +15,8 @@ import (
 )
 
 // ListBuckets returns a list of all configured buckets
-func (b *Backend) ListBuckets(ctx context.Context) (*backend.ListBucketsResponse, error) {
+// ownerID is accepted for interface compatibility but ignored for filesystem backend
+func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.ListBucketsResponse, error) {
 	buckets := make([]backend.BucketInfo, 0, len(b.config.Buckets))
 
 	for _, bucket := range b.config.Buckets {

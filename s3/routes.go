@@ -195,7 +195,14 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 	// List buckets
 	app.Get("/", func(c *fiber.Ctx) error {
 		ctx := context.Background()
-		resp, err := be.ListBuckets(ctx)
+
+		// Get authenticated user's access key ID from context
+		ownerID := ""
+		if accessKey := c.Locals(string(ContextKeyAccessKeyID)); accessKey != nil {
+			ownerID, _ = accessKey.(string)
+		}
+
+		resp, err := be.ListBuckets(ctx, ownerID)
 		if err != nil {
 			return err
 		}
@@ -213,6 +220,76 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 			})
 		}
 		return c.XML(result)
+	})
+
+	// CreateBucket - PUT /:bucket (without key)
+	app.Put(`/:bucket<regex([a-z0-9][a-z0-9.-]*[a-z0-9])>`, func(c *fiber.Ctx) error {
+		ctx := context.Background()
+		bucket := c.Params("bucket")
+
+		// Get authenticated user's access key ID
+		ownerID := ""
+		if accessKey := c.Locals(string(ContextKeyAccessKeyID)); accessKey != nil {
+			ownerID, _ = accessKey.(string)
+		}
+
+		// Parse optional LocationConstraint from request body
+		region := s3.Region // Default to server's configured region
+		if len(c.Body()) > 0 {
+			var config CreateBucketConfiguration
+			if err := xml.Unmarshal(c.Body(), &config); err == nil && config.LocationConstraint != "" {
+				region = config.LocationConstraint
+			}
+		}
+
+		resp, err := be.CreateBucket(ctx, &backend.CreateBucketRequest{
+			Bucket:           bucket,
+			Region:           region,
+			OwnerID:          ownerID,
+			OwnerDisplayName: ownerID, // Use access key as display name for now
+		})
+		if err != nil {
+			return err
+		}
+
+		c.Set("Location", resp.Location)
+		return c.SendStatus(200)
+	})
+
+	// HeadBucket - HEAD /:bucket (without key)
+	app.Head(`/:bucket<regex([a-z0-9][a-z0-9.-]*[a-z0-9])>`, func(c *fiber.Ctx) error {
+		ctx := context.Background()
+		bucket := c.Params("bucket")
+
+		resp, err := be.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: bucket})
+		if err != nil {
+			return err
+		}
+
+		c.Set("x-amz-bucket-region", resp.Region)
+		return c.SendStatus(200)
+	})
+
+	// DeleteBucket - DELETE /:bucket (without key)
+	app.Delete(`/:bucket<regex([a-z0-9][a-z0-9.-]*[a-z0-9])>`, func(c *fiber.Ctx) error {
+		ctx := context.Background()
+		bucket := c.Params("bucket")
+
+		// Get authenticated user's access key ID for ownership verification
+		ownerID := ""
+		if accessKey := c.Locals(string(ContextKeyAccessKeyID)); accessKey != nil {
+			ownerID, _ = accessKey.(string)
+		}
+
+		err := be.DeleteBucket(ctx, &backend.DeleteBucketRequest{
+			Bucket:  bucket,
+			OwnerID: ownerID,
+		})
+		if err != nil {
+			return err
+		}
+
+		return c.SendStatus(204)
 	})
 
 	// ListObjectsV2

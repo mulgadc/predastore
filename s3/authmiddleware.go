@@ -325,8 +325,17 @@ func (s3 *Config) SigV4AuthMiddleware(c *fiber.Ctx) error {
 		return errors.New("AccessDenied")
 	}
 
+	// Store authenticated user info in context for use by handlers
+	c.Locals(string(ContextKeyAccessKeyID), accessKey)
+	// Also store account ID if available
+	for _, auth := range s3.Auth {
+		if auth.AccessKeyID == accessKey {
+			c.Locals(string(ContextKeyAccountID), auth.AccountID)
+			break
+		}
+	}
+
 	return c.Next()
-	//return nil
 }
 
 // HashSHA256 returns the hex-encoded SHA256 hash of the input
