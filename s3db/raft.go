@@ -3,6 +3,7 @@ package s3db
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -71,14 +72,19 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 	raftConfig.LeaderLeaseTimeout = config.LeaderLeaseTimeout
 
 	// Setup Raft transport
-	addr := thisNode.RaftAddr()
-	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	// bindAddr is the address to listen on (can be 0.0.0.0)
+	// advertiseAddr is the address advertised to other nodes (must be reachable)
+	bindAddr := thisNode.RaftAddr()
+	advertiseAddr := thisNode.RaftAdvertiseAddr()
+
+	tcpAddr, err := net.ResolveTCPAddr("tcp", advertiseAddr)
 	if err != nil {
 		node.badgerDB.Close()
 		return nil, fmt.Errorf("failed to resolve TCP address: %w", err)
 	}
 
-	node.transport, err = raft.NewTCPTransport(addr, tcpAddr, 3, 10*time.Second, os.Stderr)
+	slog.Info("Setting up Raft transport", "bindAddr", bindAddr, "advertiseAddr", advertiseAddr)
+	node.transport, err = raft.NewTCPTransport(bindAddr, tcpAddr, 3, 10*time.Second, os.Stderr)
 	if err != nil {
 		node.badgerDB.Close()
 		return nil, fmt.Errorf("failed to create transport: %w", err)
@@ -126,7 +132,7 @@ func (n *RaftNode) bootstrap() error {
 	for _, node := range n.config.Nodes {
 		servers = append(servers, raft.Server{
 			ID:      raft.ServerID(fmt.Sprintf("%d", node.ID)),
-			Address: raft.ServerAddress(node.RaftAddr()),
+			Address: raft.ServerAddress(node.RaftAdvertiseAddr()),
 		})
 	}
 
@@ -150,7 +156,7 @@ func (n *RaftNode) Put(table, key string, value []byte) error {
 	cmd := Command{
 		Type:  CommandPut,
 		Table: table,
-		Key:   key,
+		Key:   []byte(key),
 		Value: value,
 	}
 
@@ -183,7 +189,7 @@ func (n *RaftNode) Delete(table, key string) error {
 	cmd := Command{
 		Type:  CommandDelete,
 		Table: table,
-		Key:   key,
+		Key:   []byte(key),
 	}
 
 	data, err := json.Marshal(cmd)

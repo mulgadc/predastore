@@ -1,6 +1,7 @@
 package s3db
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -173,14 +174,24 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 // handleGet retrieves a value by key
 func (s *Server) handleGet(c *fiber.Ctx) error {
 	table := c.Params("table")
-	key := c.Params("key")
+	hexKey := c.Params("key")
 
-	if table == "" || key == "" {
+	if table == "" || hexKey == "" {
 		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Table and key are required",
 		})
 	}
+
+	// Hex-decode the key (client sends hex-encoded keys)
+	keyBytes, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+			Error:   "InvalidRequest",
+			Message: "Invalid hex-encoded key",
+		})
+	}
+	key := string(keyBytes)
 
 	value, err := s.node.Get(table, key)
 	if err != nil {
@@ -207,14 +218,24 @@ func (s *Server) handleGet(c *fiber.Ctx) error {
 // handlePut stores a key-value pair
 func (s *Server) handlePut(c *fiber.Ctx) error {
 	table := c.Params("table")
-	key := c.Params("key")
+	hexKey := c.Params("key")
 
-	if table == "" || key == "" {
+	if table == "" || hexKey == "" {
 		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Table and key are required",
 		})
 	}
+
+	// Hex-decode the key (client sends hex-encoded keys)
+	keyBytes, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+			Error:   "InvalidRequest",
+			Message: "Invalid hex-encoded key",
+		})
+	}
+	key := string(keyBytes)
 
 	value := c.Body()
 	if len(value) == 0 {
@@ -252,14 +273,24 @@ func (s *Server) handlePut(c *fiber.Ctx) error {
 // handleDelete removes a key
 func (s *Server) handleDelete(c *fiber.Ctx) error {
 	table := c.Params("table")
-	key := c.Params("key")
+	hexKey := c.Params("key")
 
-	if table == "" || key == "" {
+	if table == "" || hexKey == "" {
 		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Table and key are required",
 		})
 	}
+
+	// Hex-decode the key (client sends hex-encoded keys)
+	keyBytes, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+			Error:   "InvalidRequest",
+			Message: "Invalid hex-encoded key",
+		})
+	}
+	key := string(keyBytes)
 
 	// Writes must go through leader
 	if !s.node.IsLeader() {

@@ -97,8 +97,15 @@ func CanonicalQueryString(queryParams map[string][]string) string {
 func GenerateAuthHeaderReq(accessKey, secretKey, timestamp, region, service string, req *http.Request) error {
 	date := timestamp[:8]
 
+	// Determine host value - req.Host is empty for newly created requests,
+	// so we need to use req.URL.Host instead
+	host := req.Host
+	if host == "" {
+		host = req.URL.Host
+	}
+
 	// Create canonical request
-	canonicalHeaders := fmt.Sprintf("host:%s\nx-amz-date:%s\n", req.Host, timestamp)
+	canonicalHeaders := fmt.Sprintf("host:%s\nx-amz-date:%s\n", host, timestamp)
 	signedHeaders := "host;x-amz-date"
 
 	var payloadHash string
@@ -119,10 +126,17 @@ func GenerateAuthHeaderReq(accessKey, secretKey, timestamp, region, service stri
 	}
 	canonicalQueryString := strings.Replace(queryUrl.Encode(), "+", "%20", -1)
 
+	// URI-encode the path for canonical request (required by AWS Signature V4)
+	// This encodes all special characters except forward slashes
+	canonicalURI := UriEncode(req.URL.Path, false)
+	if canonicalURI == "" {
+		canonicalURI = "/"
+	}
+
 	canonicalRequest := fmt.Sprintf(
 		"%s\n%s\n%s\n%s\n%s\n%s",
 		req.Method,
-		req.URL.Path,
+		canonicalURI,
 		canonicalQueryString,
 		canonicalHeaders,
 		signedHeaders,

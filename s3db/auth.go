@@ -67,11 +67,13 @@ func ValidateSignature(c *fiber.Ctx, credentials map[string]string, region, serv
 	}
 
 	// Build canonical URI
-	canonicalURI := string(c.Request().URI().Path())
-	if canonicalURI == "" {
-		canonicalURI = "/"
+	// Fiber/fasthttp's URI.Path() returns the path with percent-sequences decoded.
+	// We need to re-encode it using our UriEncode function to match the client.
+	decodedPath := string(c.Request().URI().Path())
+	if decodedPath == "" {
+		decodedPath = "/"
 	}
-	canonicalURI = auth.UriEncode(canonicalURI, false)
+	canonicalURI := auth.UriEncode(decodedPath, false)
 
 	// Build canonical query string
 	query := c.Queries()

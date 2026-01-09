@@ -10,7 +10,8 @@ type DBNodeConfig struct {
 	ID              uint64 `toml:"id"`
 	Host            string `toml:"host"`
 	Port            int    `toml:"port"`
-	RaftPort        int    `toml:"raft_port"` // Separate port for Raft transport
+	RaftPort        int    `toml:"raft_port"`       // Separate port for Raft transport
+	AdvertiseHost   string `toml:"advertise_host"`  // Address to advertise to other nodes (defaults to Host if empty, or 127.0.0.1 if Host is 0.0.0.0)
 	Path            string `toml:"path"`
 	AccessKeyID     string `toml:"access_key_id"`
 	SecretAccessKey string `toml:"secret_access_key"`
@@ -69,11 +70,30 @@ func (n *DBNodeConfig) HTTPAddr() string {
 	return fmt.Sprintf("%s:%d", n.Host, n.Port)
 }
 
-// RaftAddr returns the Raft transport address for a node
+// RaftAddr returns the Raft transport bind address for a node
 func (n *DBNodeConfig) RaftAddr() string {
 	port := n.RaftPort
 	if port == 0 {
 		port = n.Port + 1000 // Default: HTTP port + 1000
 	}
 	return fmt.Sprintf("%s:%d", n.Host, port)
+}
+
+// RaftAdvertiseAddr returns the address to advertise to other Raft nodes
+// If AdvertiseHost is set, use it. If Host is 0.0.0.0, default to 127.0.0.1
+func (n *DBNodeConfig) RaftAdvertiseAddr() string {
+	port := n.RaftPort
+	if port == 0 {
+		port = n.Port + 1000
+	}
+
+	host := n.AdvertiseHost
+	if host == "" {
+		host = n.Host
+		// 0.0.0.0 is not a valid advertise address - default to localhost
+		if host == "0.0.0.0" {
+			host = "127.0.0.1"
+		}
+	}
+	return fmt.Sprintf("%s:%d", host, port)
 }

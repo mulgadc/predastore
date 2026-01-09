@@ -28,32 +28,36 @@ parity = 2
 #   ./s3d -db -db-node 1          # Run only DB node 1
 #   ./s3d -backend distributed    # Run S3 + embedded DB (if no [[db]] defined)
 #
-#[[db]]
-#id = 1
-#host = "0.0.0.0"
-#port = 6660
-#raft_port = 7660   # Optional: Raft consensus port (default: port + 1000)
-#path = "s3/tests/data/distributed/db/node-1/"
-#access_key_id = "AKIAIOSFODNN7EXAMPLE"
-#secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-#leader = true      # Bootstrap leader hint
+# Note: Use host = "0.0.0.0" to bind to all interfaces. For Raft, if host is
+# 0.0.0.0, the advertise address defaults to 127.0.0.1. For multi-machine
+# clusters, set advertise_host to the reachable IP address.
+#
+[[db]]
+id = 1
+host = "127.0.0.1"
+port = 6660
+#raft_port = 7660       # Optional: Raft consensus port (default: port + 1000)
+#advertise_host = ""    # Optional: Address to advertise to other Raft nodes
+path = "s3/tests/data/distributed/db/node-1/"
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+leader = true      # Bootstrap leader hint
 
-#[[db]]
-#id = 2
-#host = "0.0.0.0"
-#port = 6661
-#path = "s3/tests/data/distributed/db/node-2/"
-#access_key_id = "AKIAIOSFODNN7EXAMPLE"
-#secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+[[db]]
+id = 2
+host = "127.0.0.1"
+port = 6661
+path = "s3/tests/data/distributed/db/node-2/"
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
-#[[db]]
-#id = 3
-#host = "0.0.0.0"
-#port = 6662
-#path = "s3/tests/data/distributed/db/node-3/"
-#access_key_id = "AKIAIOSFODNN7EXAMPLE"
-#secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-
+[[db]]
+id = 3
+host = "127.0.0.1"
+port = 6662
+path = "s3/tests/data/distributed/db/node-3/"
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 
 [[nodes]]
 id = 1

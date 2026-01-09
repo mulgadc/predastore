@@ -3,11 +3,13 @@ package s3db
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -85,16 +87,35 @@ func NewClient(config *ClientConfig) *Client {
 	}
 }
 
+// escapePathSegment escapes a path segment, ensuring all special characters
+// (including +) are percent-encoded. This is needed for consistent signature
+// verification since our UriEncode function encodes + to %2B.
+func escapePathSegment(s string) string {
+	// url.PathEscape doesn't encode +, but we need it encoded for signatures
+	escaped := url.PathEscape(s)
+	// Replace any remaining + with %2B
+	return strings.Replace(escaped, "+", "%2B", -1)
+}
+
+// hexEncodeKey hex-encodes a key for safe transport in URL paths.
+// This avoids issues with binary keys containing characters like '/' that
+// can cause path normalization differences between Go's URL parser and fasthttp.
+func hexEncodeKey(key string) string {
+	return hex.EncodeToString([]byte(key))
+}
+
 // Put stores a key-value pair in the specified table
 func (c *Client) Put(table, key string, value []byte) error {
-	path := fmt.Sprintf("/v1/put/%s/%s", url.PathEscape(table), url.PathEscape(key))
+	// Hex-encode the key to avoid URL path issues with binary data
+	path := fmt.Sprintf("/v1/put/%s/%s", escapePathSegment(table), hexEncodeKey(key))
 	_, err := c.doWrite("POST", path, value)
 	return err
 }
 
 // Get retrieves a value by key from the specified table
 func (c *Client) Get(table, key string) ([]byte, error) {
-	path := fmt.Sprintf("/v1/get/%s/%s", url.PathEscape(table), url.PathEscape(key))
+	// Hex-encode the key to avoid URL path issues with binary data
+	path := fmt.Sprintf("/v1/get/%s/%s", escapePathSegment(table), hexEncodeKey(key))
 
 	resp, err := c.doRead(path)
 	if err != nil {
@@ -111,7 +132,8 @@ func (c *Client) Get(table, key string) ([]byte, error) {
 
 // Delete removes a key from the specified table
 func (c *Client) Delete(table, key string) error {
-	path := fmt.Sprintf("/v1/delete/%s/%s", url.PathEscape(table), url.PathEscape(key))
+	// Hex-encode the key to avoid URL path issues with binary data
+	path := fmt.Sprintf("/v1/delete/%s/%s", escapePathSegment(table), hexEncodeKey(key))
 	_, err := c.doWrite("DELETE", path, nil)
 	return err
 }

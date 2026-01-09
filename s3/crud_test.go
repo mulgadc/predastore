@@ -174,6 +174,84 @@ func TestPutOverwrite(t *testing.T) {
 	})
 }
 
+// TestListObjectsReturnsCorrectSize verifies that ListObjects returns the correct file size
+func TestListObjectsReturnsCorrectSize(t *testing.T) {
+	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
+		testListObjectsReturnsCorrectSize(t, tb)
+	})
+}
+
+// testListObjectsReturnsCorrectSize tests that object size is correctly returned in ListObjects
+func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
+	t.Helper()
+
+	bucketName := getBucketForBackend(tb.Type)
+	objectKey := "size-test-" + time.Now().Format("20060102150405") + ".txt"
+
+	// Create test content with known size
+	testContent := []byte("This is test content with exactly 47 bytes!")
+	expectedSize := int64(len(testContent))
+
+	t.Logf("Uploading object with size %d bytes", expectedSize)
+
+	// PUT the object
+	req := httptest.NewRequest("PUT", "/"+bucketName+"/"+objectKey, bytes.NewReader(testContent))
+	if len(tb.Config.Auth) > 0 {
+		authEntry := tb.Config.Auth[0]
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		require.NoError(t, err, "Error generating auth header")
+	}
+
+	resp, err := tb.App.Test(req)
+	require.NoError(t, err, "PUT request should not error")
+	require.Equal(t, 200, resp.StatusCode, "PUT should return 200")
+
+	// LIST objects and verify size
+	req = httptest.NewRequest("GET", "/"+bucketName+"?list-type=2&prefix=size-test-", nil)
+	if len(tb.Config.Auth) > 0 {
+		authEntry := tb.Config.Auth[0]
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		require.NoError(t, err, "Error generating auth header")
+	}
+
+	resp, err = tb.App.Test(req)
+	require.NoError(t, err, "ListObjects request should not error")
+	require.Equal(t, 200, resp.StatusCode, "ListObjects should return 200")
+
+	var result ListObjectsV2
+	err = xml.NewDecoder(resp.Body).Decode(&result)
+	require.NoError(t, err, "XML parsing should not error")
+
+	// Find our object in the list
+	require.NotNil(t, result.Contents, "Contents should not be nil")
+	var foundObject *ListObjectsV2_Contents
+	for i := range *result.Contents {
+		if (*result.Contents)[i].Key == objectKey {
+			foundObject = &(*result.Contents)[i]
+			break
+		}
+	}
+
+	require.NotNil(t, foundObject, "Object %s should be in the list", objectKey)
+	t.Logf("Found object %s with size %d (expected %d)", foundObject.Key, foundObject.Size, expectedSize)
+	assert.Equal(t, expectedSize, foundObject.Size, "Object size should match expected size")
+
+	// Cleanup: delete the test object
+	req = httptest.NewRequest("DELETE", "/"+bucketName+"/"+objectKey, nil)
+	if len(tb.Config.Auth) > 0 {
+		authEntry := tb.Config.Auth[0]
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		require.NoError(t, err, "Error generating auth header")
+	}
+
+	resp, err = tb.App.Test(req)
+	require.NoError(t, err, "DELETE request should not error")
+	assert.Equal(t, 204, resp.StatusCode, "DELETE should return 204")
+}
+
 // testPutOverwrite verifies that uploading a file, modifying bytes, and re-uploading
 // correctly overwrites the original content
 func testPutOverwrite(t *testing.T, tb *TestBackend) {

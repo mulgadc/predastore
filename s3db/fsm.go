@@ -22,7 +22,7 @@ const (
 type Command struct {
 	Type  CommandType `json:"type"`
 	Table string      `json:"table"`
-	Key   string      `json:"key"`
+	Key   []byte      `json:"key"`   // []byte for safe JSON base64 encoding of binary keys
 	Value []byte      `json:"value,omitempty"`
 }
 
@@ -50,9 +50,9 @@ func (f *FSM) Apply(log *raft.Log) interface{} {
 
 	switch cmd.Type {
 	case CommandPut:
-		return f.applyPut(cmd.Table, cmd.Key, cmd.Value)
+		return f.applyPut(cmd.Table, string(cmd.Key), cmd.Value)
 	case CommandDelete:
-		return f.applyDelete(cmd.Table, cmd.Key)
+		return f.applyDelete(cmd.Table, string(cmd.Key))
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}

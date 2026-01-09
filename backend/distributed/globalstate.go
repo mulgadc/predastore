@@ -147,6 +147,7 @@ func NewDistributedState(cfg *DBClientConfig) (*DistributedState, error) {
 		Region:             region,
 		Service:            "s3db",
 		InsecureSkipVerify: true, // For self-signed certs
+		MaxRetries:         3,    // Required - 0 would skip the retry loop entirely
 	})
 
 	return &DistributedState{client: client}, nil

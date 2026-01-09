@@ -105,6 +105,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 
 		// Look up object metadata using the objectHash (value) to get size
 		var objectSize int64
+
 		if len(value) == 32 {
 			// value is the objectHash, look up the full metadata
 			metaData, err := b.globalState.Get(TableObjects, value)
