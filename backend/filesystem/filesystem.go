@@ -1,8 +1,15 @@
 package filesystem
 
 import (
+	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/s3"
 )
+
+func init() {
+	backend.Register("filesystem", func(config interface{}) (backend.Backend, error) {
+		return New(config)
+	})
+}
 
 // Backend implements the filesystem storage backend
 type Backend struct {

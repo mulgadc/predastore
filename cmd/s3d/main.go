@@ -2,25 +2,21 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"log"
-	"log/slog"
 	"os"
 	"strconv"
 
-	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/backend/filesystem"
-	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3"
-	"go.uber.org/automaxprocs/maxprocs"
+
+	// Import backends to trigger their init() registration
+	_ "github.com/mulgadc/predastore/backend/filesystem"
 )
 
 func main() {
-
 	config := flag.String("config", "config/server.toml", "S3 server configuration file")
-	tls_key := flag.String("tls-key", "config/server.key", "Path to TLS key")
-	tls_cert := flag.String("tls-cert", "config/server.pem", "Path to TLS cert")
-	base_path := flag.String("base-path", "", "Base path for the S3 directory when undefined in the config file")
+	tlsKey := flag.String("tls-key", "config/server.key", "Path to TLS key")
+	tlsCert := flag.String("tls-cert", "config/server.pem", "Path to TLS cert")
+	basePath := flag.String("base-path", "", "Base path for the S3 directory when undefined in the config file")
 	debug := flag.Bool("debug", false, "Enable verbose debug logs")
 	port := flag.Int("port", 443, "Server port")
 	host := flag.String("host", "0.0.0.0", "Server host")
@@ -30,81 +26,26 @@ func main() {
 	if os.Getenv("CONFIG") != "" {
 		*config = os.Getenv("CONFIG")
 	}
-
 	if os.Getenv("TLS_KEY") != "" {
-		*tls_key = os.Getenv("TLS_KEY")
+		*tlsKey = os.Getenv("TLS_KEY")
 	}
-
 	if os.Getenv("TLS_CERT") != "" {
-		*tls_cert = os.Getenv("TLS_CERT")
+		*tlsCert = os.Getenv("TLS_CERT")
 	}
-
 	if os.Getenv("PORT") != "" {
 		*port, _ = strconv.Atoi(os.Getenv("PORT"))
 	}
 
-	s3 := s3.New(&s3.Config{
-		ConfigPath: *config,
-		Port:       *port,
-		Host:       *host,
-		Debug:      *debug,
-		BasePath:   *base_path,
-	})
-
-	// Adjust MAXPROCS if running under linux/cgroups quotas.
-	undo, err := maxprocs.Set(maxprocs.Logger(log.Printf))
+	server, err := s3.NewServer(
+		s3.WithConfigPath(*config),
+		s3.WithAddress(*host, *port),
+		s3.WithTLS(*tlsCert, *tlsKey),
+		s3.WithBasePath(*basePath),
+		s3.WithDebug(*debug),
+	)
 	if err != nil {
-		log.Printf("Failed to set GOMAXPROCS: %v", err)
-	} else {
-		defer undo()
+		log.Fatalf("Failed to create server: %v", err)
 	}
 
-	err = s3.ReadConfig()
-
-	if err != nil {
-		slog.Warn("Error reading config file", "error", err)
-		os.Exit(-1)
-	}
-
-	// Initialize the backend based on config
-	backendType := s3.BackendType
-	if backendType == "" {
-		// Default to filesystem if not specified
-		backendType = "filesystem"
-	}
-
-	var be backend.Backend
-
-	switch backendType {
-	case "filesystem":
-		be, err = filesystem.New(s3)
-	case "distributed":
-		// TODO: Initialize distributed backend when ready
-		slog.Error("Distributed backend not yet implemented")
-		os.Exit(-1)
-	default:
-		slog.Error("Unknown backend type", "type", backendType)
-		os.Exit(-1)
-	}
-
-	if err != nil {
-		slog.Error("Failed to initialize backend", "type", backendType, "error", err)
-		os.Exit(-1)
-	}
-
-	app := s3.SetupRoutesWithBackend(be)
-
-	for k, v := range s3.Nodes {
-		fmt.Println(k, v)
-
-		quicAddr := fmt.Sprintf("%s:%d", v.Host, v.Port)
-
-		fmt.Println("Launching new quic server", v.Path, quicAddr)
-		go quicserver.New(v.Path, quicAddr)
-
-	}
-
-	fmt.Println("Launching new s3 server", *host, *port)
-	log.Fatal(app.ListenTLS(fmt.Sprintf("%s:%d", *host, *port), *tls_cert, *tls_key))
-
+	log.Fatal(server.ListenAndServe())
 }
