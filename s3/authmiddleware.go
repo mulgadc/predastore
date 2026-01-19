@@ -244,6 +244,12 @@ func (s3 *Config) validatePublicBucketPermission(method, path string) error {
 
 func (s3 *Config) SigV4AuthMiddleware(c *fiber.Ctx) error {
 
+	// Skip authentication for OPTIONS requests (CORS preflight)
+	if c.Method() == fiber.MethodOptions {
+		slog.Debug("Skipping auth for OPTIONS request")
+		return c.Next()
+	}
+
 	// Check route, if authentication is required
 	path := c.Path()
 	//segments := strings.Split(path, "/")

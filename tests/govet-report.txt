@@ -1,5 +1,0 @@
-# github.com/mulgadc/predastore/s3
-# [github.com/mulgadc/predastore/s3]
-s3/s3.go:10:2: struct field tag `toml:"secret_access_key` not compatible with reflect.StructTag.Get: bad syntax for struct tag value
-s3/s3.go:11:2: struct field tag `toml:"owner` not compatible with reflect.StructTag.Get: bad syntax for struct tag value
-s3/s3.go:12:2: struct field tag `toml:"permissions` not compatible with reflect.StructTag.Get: bad syntax for struct tag value

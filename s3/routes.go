@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/google/uuid"
 	"github.com/mulgadc/predastore/backend"
@@ -68,6 +69,14 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 	if !s3.DisableLogging {
 		app.Use(logger.New())
 	}
+
+	// Add CORS middleware for browser requests
+	app.Use(cors.New(cors.Config{
+		AllowOrigins:     "https://localhost:3000",
+		AllowMethods:     "GET,POST,PUT,DELETE,HEAD,OPTIONS",
+		AllowHeaders:     "*",
+		AllowCredentials: true,
+	}))
 
 	/*
 		app.Use(logger.New(logger.Config{
