@@ -8,3 +8,4 @@ pids/
 logs/
 tmp/
 bin/
+tests/*-report.txt
