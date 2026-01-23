@@ -14,13 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// BackendType represents the type of backend to use for testing
-type BackendType string
-
-const (
-	BackendFilesystem  BackendType = "filesystem"
-	BackendDistributed BackendType = "distributed"
-)
+// Note: BackendType, BackendFilesystem, and BackendDistributed are defined in server.go
 
 // TestBackend holds the configuration and app for a specific backend
 type TestBackend struct {

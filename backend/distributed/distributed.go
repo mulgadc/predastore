@@ -210,14 +210,27 @@ func New(config interface{}) (backend.Backend, error) {
 	}
 	hashRing := consistent.New(nil, ringCfg)
 
-	// Create node directories and add nodes to ring
-	for i := 0; i < partitionCount; i++ {
-		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
-		if err := os.MkdirAll(nodeDir, 0750); err != nil {
-			globalState.Close()
-			return nil, fmt.Errorf("failed to create node directory: %w", err)
+	// Create node directories and add nodes to ring using config node IDs
+	// This ensures hash ring node names match config node IDs (e.g., node-1, node-2, node-3)
+	if len(cfg.Nodes) > 0 {
+		for _, node := range cfg.Nodes {
+			nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", node.ID))
+			if err := os.MkdirAll(nodeDir, 0750); err != nil {
+				globalState.Close()
+				return nil, fmt.Errorf("failed to create node directory: %w", err)
+			}
+			hashRing.Add(myMember(fmt.Sprintf("node-%d", node.ID)))
 		}
-		hashRing.Add(myMember(fmt.Sprintf("node-%d", i)))
+	} else {
+		// Fallback for tests without config: use 0-indexed nodes
+		for i := 0; i < partitionCount; i++ {
+			nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
+			if err := os.MkdirAll(nodeDir, 0750); err != nil {
+				globalState.Close()
+				return nil, fmt.Errorf("failed to create node directory: %w", err)
+			}
+			hashRing.Add(myMember(fmt.Sprintf("node-%d", i)))
+		}
 	}
 
 	// Build node address map from config
