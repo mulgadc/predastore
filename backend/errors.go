@@ -15,6 +15,7 @@ const (
 	ErrAccessDenied           S3ErrorCode = "AccessDenied"
 	ErrInternalError          S3ErrorCode = "InternalError"
 	ErrEntityTooSmall         S3ErrorCode = "EntityTooSmall"
+	ErrEntityTooLarge         S3ErrorCode = "EntityTooLarge"
 	ErrInvalidRange           S3ErrorCode = "InvalidRange"
 	ErrBucketNotEmpty         S3ErrorCode = "BucketNotEmpty"
 	ErrBucketAlreadyExists    S3ErrorCode = "BucketAlreadyExists"

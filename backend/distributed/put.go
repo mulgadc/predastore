@@ -6,7 +6,6 @@ import (
 	"encoding/gob"
 	"io"
 	"os"
-	"path/filepath"
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/s3/chunked"
@@ -84,10 +83,8 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 
 	objectToShardNodes.Size = size
 
-	// Get hash ring placement (must match putObjectToWAL's key format)
-	_, file := filepath.Split(tmpFile.Name())
-	key := s3db.GenObjectHash(req.Bucket, file)
-	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
+	// Get hash ring placement using objectHash for consistency with storage and retrieval
+	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
@@ -171,10 +168,8 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 
 	objectToShardNodes.Size = size
 
-	// Get hash ring placement (must match putObjectToWAL's key format)
-	_, file := filepath.Split(objectPath)
-	key := s3db.GenObjectHash(bucket, file)
-	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
+	// Get hash ring placement using objectHash for consistency with putObjectViaQUIC
+	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return err
 	}
@@ -209,8 +204,10 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 // GetFromPath retrieves an object and writes to the provided writer (used for testing)
 func (b *Backend) GetFromPath(ctx context.Context, bucket, objectPath string, out *bytes.Buffer) error {
 	req := &backend.GetObjectRequest{
-		Bucket: bucket,
-		Key:    objectPath,
+		Bucket:     bucket,
+		Key:        objectPath,
+		RangeStart: -1, // -1 means "not specified" (full object)
+		RangeEnd:   -1,
 	}
 
 	resp, err := b.GetObject(ctx, req)

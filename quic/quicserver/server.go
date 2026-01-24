@@ -35,6 +35,17 @@ const (
 	maxMetaLen  uint32 = 64 * 1024
 )
 
+// makeShardKey creates a unique key for storing a specific shard's metadata.
+// This ensures that multiple shards of the same object can be stored on the same node
+// without overwriting each other's metadata.
+func makeShardKey(objectHash [32]byte, shardIndex int) []byte {
+	// Append shard index as 4 bytes to the 32-byte hash
+	key := make([]byte, 36)
+	copy(key[:32], objectHash[:])
+	binary.BigEndian.PutUint32(key[32:], uint32(shardIndex))
+	return key
+}
+
 // QuicServer handles QUIC RPC requests for shard storage operations
 type QuicServer struct {
 	Addr   string
@@ -59,9 +70,12 @@ type QuicServer struct {
 }
 
 type ObjectRequest struct {
-	Bucket string
-	Object string
-	Owner  string
+	Bucket     string `json:"bucket"`
+	Object     string `json:"object"`
+	Owner      string `json:"owner,omitempty"`
+	RangeStart int64  `json:"range_start"` // -1 means from start (unset), >= 0 is actual offset
+	RangeEnd   int64  `json:"range_end"`   // -1 means to end (unset), >= 0 is actual offset
+	ShardIndex int    `json:"shard_index"` // Index of shard being requested (for multi-shard objects)
 }
 
 // PutRequest contains metadata for storing a shard via QUIC PUT
@@ -70,6 +84,7 @@ type PutRequest struct {
 	Object     string   `json:"object"`
 	ObjectHash [32]byte `json:"object_hash"` // SHA256 of bucket/object for metadata
 	ShardSize  int      `json:"shard_size"`  // Expected size of the shard data
+	ShardIndex int      `json:"shard_index"` // Index of this shard (0-based, for multi-shard objects)
 }
 
 // PutResponse contains the result of a QUIC PUT operation
@@ -322,11 +337,12 @@ func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRe
 
 	objectHash := s3db.GenObjectHash(objectRequest.Bucket, objectRequest.Object)
 
-	// Query local node for shard location
-	result, err := walInstance.DB.Get(objectHash[:])
+	// Query local node for shard location using shard-specific key
+	shardKey := makeShardKey(objectHash, objectRequest.ShardIndex)
+	result, err := walInstance.DB.Get(shardKey)
 	if err != nil {
-		slog.Debug("handleGET: object not found", "bucket", objectRequest.Bucket, "object", objectRequest.Object)
-		writeErr(bw, req, quicproto.StatusNotFound, "object not found")
+		slog.Debug("handleGET: shard not found", "bucket", objectRequest.Bucket, "object", objectRequest.Object, "shardIndex", objectRequest.ShardIndex)
+		writeErr(bw, req, quicproto.StatusNotFound, "shard not found")
 		return
 	}
 
@@ -337,6 +353,30 @@ func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRe
 		return
 	}
 
+	totalSize := objectWriteResult.WriteResult.TotalSize
+
+	// Handle range request
+	// Values >= 0 indicate explicit range bounds (including 0 for "start from beginning")
+	// Value -1 (or < 0) means "not set" - use defaults (0 for start, totalSize-1 for end)
+	rangeStart := objectRequest.RangeStart
+	rangeEnd := objectRequest.RangeEnd
+	isRangeRequest := rangeStart >= 0 || rangeEnd >= 0
+
+	if rangeStart < 0 {
+		rangeStart = 0
+	}
+	if rangeEnd < 0 || rangeEnd >= int64(totalSize) {
+		rangeEnd = int64(totalSize) - 1
+	}
+
+	// Validate range
+	if rangeStart > rangeEnd || rangeStart >= int64(totalSize) {
+		writeErr(bw, req, quicproto.StatusBadRequest, "invalid range")
+		return
+	}
+
+	responseSize := rangeEnd - rangeStart + 1
+
 	// Send response header with body length
 	rh := quicproto.Header{
 		Version: quicproto.Version1,
@@ -345,7 +385,7 @@ func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRe
 		ReqID:   req.ReqID,
 		KeyLen:  0,
 		MetaLen: 0,
-		BodyLen: uint64(objectWriteResult.WriteResult.TotalSize),
+		BodyLen: uint64(responseSize),
 	}
 	if err := quicproto.WriteHeader(bw, rh); err != nil {
 		slog.Error("handleGET: write header failed", "error", err)
@@ -357,7 +397,8 @@ func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRe
 	}
 
 	// Stream shard data from WAL files
-	var bytesWritten int
+	var globalBytePos int64 // Current position in the shard data (0-indexed)
+	var bytesWritten int64
 	headerBuf := make([]byte, wal.FragmentHeaderBytes)
 	fullChunkBuffer := make([]byte, int(walInstance.Shard.ChunkSize))
 	headerForChecksum := make([]byte, wal.FragmentHeaderBytes)
@@ -416,20 +457,49 @@ func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRe
 						shardFragment, checksum, calculated)
 				}
 
-				remaining := objectWriteResult.WriteResult.TotalSize - bytesWritten
-				toWrite := int(length)
-				if toWrite > remaining {
-					toWrite = remaining
+				// Determine actual data length in this chunk
+				chunkDataLen := int64(length)
+				remaining := int64(totalSize) - globalBytePos
+				if chunkDataLen > remaining {
+					chunkDataLen = remaining
 				}
 
-				if toWrite > 0 {
-					if _, err := bw.Write(fullChunkBuffer[:toWrite]); err != nil {
-						return fmt.Errorf("write to client failed: %w", err)
+				// Calculate overlap with requested range
+				chunkStart := globalBytePos
+				chunkEnd := globalBytePos + chunkDataLen - 1
+
+				// Check if this chunk overlaps with the requested range
+				if chunkEnd >= rangeStart && chunkStart <= rangeEnd {
+					// Calculate the portion of this chunk to write
+					writeStart := int64(0)
+					if rangeStart > chunkStart {
+						writeStart = rangeStart - chunkStart
 					}
-					bytesWritten += toWrite
+					writeEnd := chunkDataLen
+					if rangeEnd < chunkEnd {
+						writeEnd = rangeEnd - chunkStart + 1
+					}
+
+					toWrite := writeEnd - writeStart
+					if toWrite > 0 && bytesWritten < responseSize {
+						// Don't write more than requested
+						if bytesWritten+toWrite > responseSize {
+							toWrite = responseSize - bytesWritten
+						}
+						if _, err := bw.Write(fullChunkBuffer[writeStart : writeStart+toWrite]); err != nil {
+							return fmt.Errorf("write to client failed: %w", err)
+						}
+						bytesWritten += toWrite
+					}
 				}
 
+				globalBytePos += chunkDataLen
 				fileBytesRead += int64(wal.FragmentHeaderBytes) + int64(walInstance.Shard.ChunkSize)
+
+				// Stop if we've written all requested bytes
+				if bytesWritten >= responseSize {
+					return nil
+				}
 
 				if flags&wal.FlagEndOfShard != 0 {
 					return nil
@@ -442,9 +512,26 @@ func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRe
 			slog.Error("handleGET: streaming failed", "error", err)
 			return
 		}
+
+		// Stop if we've written all requested bytes
+		if bytesWritten >= responseSize {
+			break
+		}
 	}
 
-	slog.Debug("handleGET: completed", "bucket", objectRequest.Bucket, "object", objectRequest.Object, "bytes", bytesWritten)
+	if isRangeRequest {
+		slog.Debug("handleGET: range request completed",
+			"bucket", objectRequest.Bucket,
+			"object", objectRequest.Object,
+			"rangeStart", rangeStart,
+			"rangeEnd", rangeEnd,
+			"bytesWritten", bytesWritten)
+	} else {
+		slog.Debug("handleGET: completed",
+			"bucket", objectRequest.Bucket,
+			"object", objectRequest.Object,
+			"bytes", bytesWritten)
+	}
 }
 
 // handlePUTShard receives shard data via QUIC and writes it to the local WAL
@@ -481,8 +568,10 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		return
 	}
 
-	// Store metadata in local Badger DB
-	err = walInstance.UpdateObjectToWAL(putReq.ObjectHash, writeResult)
+	// Store metadata in local Badger DB using shard-specific key
+	// This ensures multiple shards of the same object can be stored on the same node
+	shardKey := makeShardKey(putReq.ObjectHash, putReq.ShardIndex)
+	err = walInstance.UpdateShardToWAL(shardKey, putReq.ObjectHash, writeResult)
 	if err != nil {
 		slog.Error("handlePUTShard: failed to update metadata", "error", err)
 		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("metadata update: %v", err))
@@ -492,6 +581,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 	slog.Info("handlePUTShard: stored shard",
 		"bucket", putReq.Bucket,
 		"object", putReq.Object,
+		"shardIndex", putReq.ShardIndex,
 		"shardNum", writeResult.ShardNum,
 		"totalSize", writeResult.TotalSize,
 	)

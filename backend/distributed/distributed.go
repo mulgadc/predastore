@@ -521,10 +521,9 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	}
 
 	size = instat.Size()
-	_, file := filepath.Split(objectPath)
-	key := s3db.GenObjectHash(bucket, file)
 
-	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
+	// Use objectHash for hash ring placement for consistency with storage and retrieval
+	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -578,6 +577,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				Object:     objectPath,
 				ObjectHash: objectHash,
 				ShardSize:  len(shardData),
+				ShardIndex: idx,
 			}
 
 			resp, putErr := client.Put(ctx, putReq, bytes.NewReader(shardData))
@@ -654,6 +654,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				Object:     objectPath,
 				ObjectHash: objectHash,
 				ShardSize:  shardSize,
+				ShardIndex: hashRingIdx, // Use hash ring index as the shard index
 			}
 
 			resp, putErr := client.Put(ctx, putReq, r)
@@ -731,7 +732,9 @@ func (b *Backend) openInput(bucket string, object string) (ObjectToShardNodes, i
 	return objectToShardNodes, objectToShardNodes.Size, nil
 }
 
-// shardReaders creates readers for each shard via QUIC
+// shardReaders creates readers for each shard via QUIC.
+// Data is buffered into memory before connections are closed to avoid
+// "connection closed" errors when the caller reads from the returned readers.
 func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShardNodes, parity bool) ([]io.Reader, error) {
 	shardReaders := make([]io.Reader, len(shards.DataShardNodes)+len(shards.ParityShardNodes))
 
@@ -749,18 +752,33 @@ func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShar
 			slog.Error("Failed to dial QUIC server", "node", nodeNum, "err", err)
 			continue
 		}
-		defer c.Close()
 
 		objectRequest := quicserver.ObjectRequest{
-			Bucket: bucket,
-			Object: object,
+			Bucket:     bucket,
+			Object:     object,
+			RangeStart: -1, // -1 means full shard (no range)
+			RangeEnd:   -1,
+			ShardIndex: i, // Include shard index for unique lookup
 		}
 
-		shardReaders[i], err = c.Get(context.Background(), objectRequest)
+		reader, err := c.Get(context.Background(), objectRequest)
 		if err != nil {
 			slog.Error("Error reading from QUIC server", "node", nodeNum, "err", err)
+			c.Close()
 			return shardReaders, err
 		}
+
+		// Buffer the shard data into memory before closing the connection.
+		// This prevents "connection closed" errors when the caller reads.
+		data, err := io.ReadAll(reader)
+		c.Close() // Close connection after reading all data
+
+		if err != nil {
+			slog.Error("Error buffering shard data", "node", nodeNum, "err", err)
+			return shardReaders, err
+		}
+
+		shardReaders[i] = bytes.NewReader(data)
 	}
 
 	return shardReaders, nil

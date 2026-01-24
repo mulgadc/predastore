@@ -191,15 +191,28 @@ func (c *Client) Leader() (string, string, error) {
 	return result.LeaderID, result.LeaderAddr, nil
 }
 
-// doRead performs a GET request, can go to any node
+// doRead performs a GET request, tries leader first then all other nodes
 func (c *Client) doRead(path string) ([]byte, error) {
 	c.mu.RLock()
+	leaderAddr := c.leaderAddr
 	nodes := c.nodes
 	c.mu.RUnlock()
 
+	// Build node list with leader first for read-your-writes consistency
+	orderedNodes := make([]string, 0, len(nodes)+1)
+	if leaderAddr != "" {
+		orderedNodes = append(orderedNodes, leaderAddr)
+	}
+	for _, node := range nodes {
+		if node != leaderAddr {
+			orderedNodes = append(orderedNodes, node)
+		}
+	}
+
 	var lastErr error
+	keyNotFoundCount := 0
 	for i := 0; i < c.maxRetries; i++ {
-		for _, node := range nodes {
+		for _, node := range orderedNodes {
 			reqURL := "https://" + node + path
 			req, err := http.NewRequest("GET", reqURL, nil)
 			if err != nil {
@@ -236,16 +249,28 @@ func (c *Client) doRead(path string) ([]byte, error) {
 			var errResp ErrorResponse
 			if json.Unmarshal(body, &errResp) == nil {
 				if errResp.Error == "KeyNotFound" {
-					return nil, ErrKeyNotFound
+					// Continue to try other nodes - data might not be replicated yet
+					keyNotFoundCount++
+					lastErr = ErrKeyNotFound
+					continue
 				}
 				lastErr = fmt.Errorf("%s: %s", errResp.Error, errResp.Message)
 			} else {
 				lastErr = fmt.Errorf("request failed with status %d", resp.StatusCode)
 			}
 		}
+		// If all nodes returned KeyNotFound, the key truly doesn't exist
+		if keyNotFoundCount == len(orderedNodes) {
+			return nil, ErrKeyNotFound
+		}
+		keyNotFoundCount = 0
 		time.Sleep(100 * time.Millisecond)
 	}
 
+	// If we exhausted retries and the last error was KeyNotFound, return that
+	if lastErr == ErrKeyNotFound {
+		return nil, ErrKeyNotFound
+	}
 	return nil, fmt.Errorf("all nodes failed: %w", lastErr)
 }
 

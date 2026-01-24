@@ -42,10 +42,10 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 }
 
 func (c *Client) Close() error {
+	if c.conn != nil {
+		return c.conn.CloseWithError(0, "done")
+	}
 	return nil
-	//return c.conn.
-
-	//WithError(0, "done")
 }
 
 func (c *Client) nextID() uint64 {
@@ -241,34 +241,49 @@ func (c *Client) doDelete(ctx context.Context, requestBytes []byte) (quicproto.H
 	return respHdr, respMeta, nil
 }
 
+// Get retrieves a full shard from the QUIC server
 func (c *Client) Get(ctx context.Context, objectRequest quicserver.ObjectRequest) (r io.Reader, err error) {
-
 	objectRequestMarshalled, err := json.Marshal(objectRequest)
 	if err != nil {
-		fmt.Println(err)
+		return nil, fmt.Errorf("marshal object request: %w", err)
 	}
 
 	rh, r, err := c.do(ctx, quicproto.MethodGET, objectRequestMarshalled, nil, 0)
-
 	if err != nil {
 		return nil, err
 	}
 
 	if rh.Status != quicproto.StatusOK {
-		return nil, fmt.Errorf("get: %d %d", rh.Status, quicproto.StatusOK)
+		return nil, fmt.Errorf("get: status %d (expected %d)", rh.Status, quicproto.StatusOK)
 	}
 
-	//_, err = io.Copy(w, body)
+	return r, nil
+}
 
-	fmt.Println("body")
+// GetRange retrieves a byte range from a shard on the QUIC server.
+// This is an optimized path for partial reads (e.g., viperblock pread operations).
+func (c *Client) GetRange(ctx context.Context, objectRequest quicserver.ObjectRequest) (io.Reader, error) {
+	// ObjectRequest now includes RangeStart and RangeEnd fields
+	objectRequestMarshalled, err := json.Marshal(objectRequest)
+	if err != nil {
+		return nil, fmt.Errorf("marshal object request: %w", err)
+	}
 
-	//body := make([]byte, 1024)
-	//_, _ = r.Read(body)
-	//spew.Dump(body)
+	rh, r, err := c.do(ctx, quicproto.MethodGET, objectRequestMarshalled, nil, 0)
+	if err != nil {
+		return nil, err
+	}
 
-	//_ = body.Close()
+	if rh.Status != quicproto.StatusOK {
+		return nil, fmt.Errorf("get range: status %d (expected %d)", rh.Status, quicproto.StatusOK)
+	}
 
-	return r, err
+	// Return a limited reader for the expected response size
+	if rh.BodyLen > 0 {
+		return io.LimitReader(r, int64(rh.BodyLen)), nil
+	}
+
+	return r, nil
 }
 
 // do performs one RPC on one stream.

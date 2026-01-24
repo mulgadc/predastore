@@ -15,6 +15,15 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// calculateMaxFileSize calculates the max file size (ShardSize + header overhead)
+// This matches WAL.MaxFileSize()
+func calculateMaxFileSize(shardSize uint32, chunkSize uint32, walHeaderSize int) int64 {
+	dataSize := int64(shardSize)
+	numFragments := (dataSize + int64(chunkSize) - 1) / int64(chunkSize)
+	headerOverhead := int64(walHeaderSize) + numFragments*int64(FragmentHeaderBytes)
+	return dataSize + headerOverhead
+}
+
 // calculateExpectedWALFiles calculates the exact number of WAL files needed for a given data size
 // This simulates the actual Write() behavior
 func calculateExpectedWALFiles(dataSize int, shardSize uint32, chunkSize uint32, walHeaderSize int) int {
@@ -24,9 +33,8 @@ func calculateExpectedWALFiles(dataSize int, shardSize uint32, chunkSize uint32,
 
 	walHeaderBytes := int64(walHeaderSize)
 	fragmentHeaderSize := int64(32)
-	// Usable space per WAL = ShardSize - WAL header
-	// But we check against total file size (including WAL header) in Write()
-	maxFileSize := int64(shardSize)
+	// MaxFileSize = ShardSize (data) + header overhead
+	maxFileSize := calculateMaxFileSize(shardSize, chunkSize, walHeaderSize)
 
 	remainingData := int64(dataSize)
 	currentFileSize := walHeaderBytes // Start with WAL header
@@ -61,7 +69,8 @@ func calculateExpectedWALFiles(dataSize int, shardSize uint32, chunkSize uint32,
 func calculateWALFileSizes(dataSize int, shardSize uint32, chunkSize uint32, walHeaderSize int) []int64 {
 	walHeaderBytes := int64(walHeaderSize)
 	fragmentHeaderSize := int64(32)
-	maxFileSize := int64(shardSize) // Max total file size including WAL header
+	// MaxFileSize = ShardSize (data) + header overhead
+	maxFileSize := calculateMaxFileSize(shardSize, chunkSize, walHeaderSize)
 
 	remainingData := int64(dataSize)
 	currentFileTotalSize := walHeaderBytes // Total file size including WAL header
@@ -571,9 +580,9 @@ func TestWriteVariousSizes(t *testing.T) {
 			var totalWrittenSize int64 = 0
 			for i, walFile := range writeResult.WALFiles {
 				totalWrittenSize += walFile.Size
-				// Verify size doesn't exceed ShardSize (excluding WAL header)
-				assert.LessOrEqual(t, walFile.Size, int64(wal.Shard.ShardSize),
-					"WAL file %d size (%d) should not exceed ShardSize (%d)", i, walFile.Size, wal.Shard.ShardSize)
+				// Verify size doesn't exceed MaxFileSize (ShardSize + header overhead)
+				assert.LessOrEqual(t, walFile.Size, wal.MaxFileSize(),
+					"WAL file %d size (%d) should not exceed MaxFileSize (%d)", i, walFile.Size, wal.MaxFileSize())
 				// Verify offset is valid
 				assert.GreaterOrEqual(t, walFile.Offset, int64(0),
 					"WAL file %d offset should be non-negative", i)
@@ -697,8 +706,8 @@ func TestWriteReadOffsetsAndChunkBoundaries(t *testing.T) {
 				for i, walFile := range result.WALFiles {
 					assert.Greater(t, walFile.Size, int64(0),
 						"WAL file %d should have data", i)
-					assert.LessOrEqual(t, walFile.Size, int64(wal.Shard.ShardSize),
-						"WAL file %d size should not exceed ShardSize", i)
+					assert.LessOrEqual(t, walFile.Size, wal.MaxFileSize(),
+						"WAL file %d size should not exceed MaxFileSize", i)
 				}
 			},
 		},
