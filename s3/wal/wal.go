@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/gob"
@@ -37,6 +38,20 @@ const (
 	// See Fragment.FragmentHeaderSize() which is expected to be 32.
 	FragmentHeaderBytes = 32
 )
+
+// fragmentBufferPool reuses fragment write buffers to reduce GC pressure.
+// Buffer size: FragmentHeaderBytes (32) + ChunkSize (8192) = 8224 bytes
+// This pool is critical for performance - writeFragment is called thousands of times
+// per shard write, and allocating 8KB+ per call causes significant GC overhead.
+var fragmentBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, FragmentHeaderBytes+ChunkSize)
+	},
+}
+
+// zeroPadBuffer is a pre-allocated zero buffer for efficient padding.
+// Using copy() from this is faster than a byte-by-byte loop.
+var zeroPadBuffer = make([]byte, ChunkSize)
 
 type Flags uint32
 
@@ -97,7 +112,56 @@ type Shard struct {
 	ShardSize uint32
 	ChunkSize uint32
 
-	DB []*os.File `json:"-"`
+	DB []*bufferedWALFile `json:"-"`
+}
+
+// bufferedWALFile wraps an os.File with a bufio.Writer for efficient batched writes.
+// This reduces syscalls by ~10x for typical shard writes (512 fragments per 4MB shard).
+type bufferedWALFile struct {
+	file   *os.File
+	writer *bufio.Writer
+}
+
+// Write writes to the buffered writer
+func (b *bufferedWALFile) Write(p []byte) (int, error) {
+	return b.writer.Write(p)
+}
+
+// Flush flushes buffered data to the underlying file
+func (b *bufferedWALFile) Flush() error {
+	return b.writer.Flush()
+}
+
+// Sync flushes the buffer and syncs the underlying file to disk
+func (b *bufferedWALFile) Sync() error {
+	if err := b.writer.Flush(); err != nil {
+		return err
+	}
+	return b.file.Sync()
+}
+
+// Stat returns file info (flushes buffer first to get accurate size)
+func (b *bufferedWALFile) Stat() (os.FileInfo, error) {
+	if err := b.writer.Flush(); err != nil {
+		return nil, err
+	}
+	return b.file.Stat()
+}
+
+// Close flushes and closes the file
+func (b *bufferedWALFile) Close() error {
+	if err := b.writer.Flush(); err != nil {
+		return err
+	}
+	return b.file.Close()
+}
+
+// newBufferedWALFile creates a new buffered WAL file with 64KB buffer
+func newBufferedWALFile(f *os.File) *bufferedWALFile {
+	return &bufferedWALFile{
+		file:   f,
+		writer: bufio.NewWriterSize(f, 64*1024), // 64KB buffer batches ~8 fragments
+	}
 }
 
 type Fragment struct {
@@ -315,14 +379,14 @@ func (wal *WAL) syncWALIfDirty() {
 
 	// Get file handle under lock, but release BEFORE calling Sync()
 	// This prevents blocking Write() operations during slow disk I/O
-	var fileToSync *os.File
+	var fileToSync *bufferedWALFile
 	wal.mu.RLock()
 	if len(wal.Shard.DB) > 0 {
 		fileToSync = wal.Shard.DB[len(wal.Shard.DB)-1]
 	}
 	wal.mu.RUnlock()
 
-	// Sync OUTSIDE of lock to prevent blocking writes
+	// Sync OUTSIDE of lock to prevent blocking writes (Sync() flushes buffer first)
 	if fileToSync != nil {
 		if err := fileToSync.Sync(); err != nil {
 			slog.Error("WAL sync failed", "error", err)
@@ -504,8 +568,8 @@ func (wal *WAL) createWALUnlocked(filename string) error {
 		}
 	}
 
-	// Append the latest "hot" WAL file to the DB
-	wal.Shard.DB = append(wal.Shard.DB, file)
+	// Append the latest "hot" WAL file to the DB, wrapped with buffered writer
+	wal.Shard.DB = append(wal.Shard.DB, newBufferedWALFile(file))
 
 	// Write the state file to disk, current WAL, Shard Num, etc
 	err = wal.SaveState()
@@ -709,6 +773,15 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 	// Update TotalSize to reflect actual bytes written (may differ from expected if reader closed early)
 	result.TotalSize = actualBytesWritten
 
+	// Flush buffered writes to OS buffer so they're visible to readers.
+	// This still benefits from batching (many fragments per flush) while ensuring
+	// data visibility. Actual disk sync happens periodically via syncWALIfDirty.
+	for _, db := range wal.Shard.DB {
+		if err := db.Flush(); err != nil {
+			return nil, fmt.Errorf("failed to flush WAL buffer: %w", err)
+		}
+	}
+
 	return result, nil
 }
 
@@ -777,36 +850,42 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 		fragment.Flags |= FlagEndOfShard
 	}
 
-	// Calculate a CRC32 checksum of the block data and headers
+	// Get a buffer from the pool to avoid allocation per fragment.
 	// On disk, every fragment payload is exactly ChunkSize bytes (padded with zeros).
 	// The header Length field stores the logical size.
-	payload := make([]byte, fragment.FragmentHeaderSize()+int(ChunkSize))
+	payload := fragmentBufferPool.Get().([]byte)
 
-	headers := fragment.FragmentHeader()
-	copy(payload[0:len(headers)], headers)
-
+	// Write header fields directly to payload
 	binary.BigEndian.PutUint64(payload[0:8], fragment.SeqNum)
 	binary.BigEndian.PutUint64(payload[8:16], fragment.ShardNum)
 	binary.BigEndian.PutUint32(payload[16:20], fragment.ShardFragment)
 	binary.BigEndian.PutUint32(payload[20:24], uint32(fragment.Length))
 	binary.BigEndian.PutUint32(payload[24:28], uint32(fragment.Flags))
+	// Checksum field (28:32) MUST be zero for CRC calculation
+	binary.BigEndian.PutUint32(payload[28:32], 0)
 
 	// Add the data to the chunk
 	copy(payload[FragmentHeaderBytes:FragmentHeaderBytes+len(chunk)], chunk)
 
-	// Checksum is calculated over: full 32-byte header (with checksum field set to 0) + full (padded) ChunkSize payload.
-	checksum_validated := crc32.ChecksumIEEE(payload[0:len(headers)])
-	checksum_validated = crc32.Update(
-		checksum_validated,
-		crc32.IEEETable,
-		payload[fragment.FragmentHeaderSize():fragment.FragmentHeaderSize()+int(ChunkSize)],
-	)
+	// Clear padding area after chunk data (important: previous data may remain).
+	// Zero-padding is part of the CRC calculation.
+	// Using copy() from zeroPadBuffer is faster than a byte-by-byte loop.
+	paddingStart := FragmentHeaderBytes + len(chunk)
+	copy(payload[paddingStart:], zeroPadBuffer[:len(payload)-paddingStart])
 
-	fragment.Checksum = checksum_validated
-	payload = fragment.AppendChecksum(payload)
+	// Checksum is calculated over: full 32-byte header (with checksum field set to 0) + full (padded) ChunkSize payload.
+	checksum := crc32.ChecksumIEEE(payload[0:FragmentHeaderBytes])
+	checksum = crc32.Update(checksum, crc32.IEEETable, payload[FragmentHeaderBytes:FragmentHeaderBytes+int(ChunkSize)])
+
+	// Write checksum to header
+	binary.BigEndian.PutUint32(payload[28:32], checksum)
 
 	// Write to the WAL file
 	_, err := activeWal.Write(payload)
+
+	// Return buffer to pool immediately after write
+	fragmentBufferPool.Put(payload)
+
 	if err != nil {
 		return fmt.Errorf("failed to write to WAL file: %v", err)
 	}

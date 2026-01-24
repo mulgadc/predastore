@@ -477,30 +477,181 @@ Predastore uses a consistent hash ring with virtual nodes.
 
 # 9. QUIC Protocol
 
-Node-to-node communication uses QUIC for shard fetching.
+Node-to-node communication uses QUIC for shard storage and retrieval. QUIC was chosen specifically to avoid TLS handshakes on every request while maintaining encryption.
 
-### Request
+## Architecture Overview
 
 ```
-MSG_FETCH_SHARD {
-  ObjectID    [32]
-  ChunkIndex  u32
-  ShardRole   u8
-  SegmentIndex u32
-  SegmentCount u16
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           CLIENT SIDE                                    │
+│                                                                          │
+│  Distributed Backend                                                     │
+│       │                                                                  │
+│       ▼                                                                  │
+│  DialPooled("node1:9991")                                               │
+│       │                                                                  │
+│       ▼                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Connection Pool (DefaultPool)                                   │    │
+│  │  ┌─────────────────────────────────────────────────────────┐    │    │
+│  │  │  map[addr]*pooledConn                                   │    │    │
+│  │  │                                                          │    │    │
+│  │  │  "node1:9991" → *Client{conn: quic.Conn} ─┐             │    │    │
+│  │  │  "node2:9991" → *Client{conn: quic.Conn}  │ REUSED!     │    │    │
+│  │  │  "node3:9991" → *Client{conn: quic.Conn}  │ (no TLS)    │    │    │
+│  │  └──────────────────────────────────────────┼──────────────┘    │    │
+│  └─────────────────────────────────────────────┼───────────────────┘    │
+│                                                │                         │
+│       ▼                                        │                         │
+│  client.Put(ctx, putReq, shardData)            │                         │
+│       │                                        │                         │
+│       ▼                                        │                         │
+│  conn.OpenStreamSync() ←───────────────────────┘                        │
+│       │         ▲                                                        │
+│       │         │ Multiplexed streams on SINGLE connection              │
+│       │         │ (stream IDs: 0, 4, 8, 12, ...)                        │
+│       ▼         │                                                        │
+│  ┌──────────────┴──────────────────────────────────────────────┐        │
+│  │  Stream (per request - lightweight!)                         │        │
+│  │  - Write: header + request JSON + shard data                │        │
+│  │  - Read: response header + response JSON                    │        │
+│  │  - Close: CancelRead(0) + Close() → releases stream ID      │        │
+│  └──────────────────────────────────────────────────────────────┘        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+                              │ QUIC/UDP │
+                              │ (single  │
+                              │  socket) │
+                              ▼          ▼
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           SERVER SIDE                                    │
+│                                                                          │
+│  listener.Accept() → quic.Conn (TLS handshake HERE, ONCE per client)   │
+│       │                                                                  │
+│       ▼                                                                  │
+│  serveConn(conn) - runs forever for this connection                     │
+│       │                                                                  │
+│       ▼ (loop)                                                          │
+│  conn.AcceptStream() → gets next stream from client                     │
+│       │                                                                  │
+│       ▼                                                                  │
+│  go handleStream(stream)                                                │
+│       │                                                                  │
+│       ├─→ Read request header + body                                    │
+│       ├─→ Process (WAL write, read, etc.)                               │
+│       ├─→ Write response                                                │
+│       └─→ Close stream (CancelRead + Close)                             │
+│                                                                          │
+│  [Loop back to AcceptStream for next request on same connection]        │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## Connection vs Stream Lifecycle
+
+| Layer | Lifecycle | Cost | When Created |
+|-------|-----------|------|--------------|
+| **Connection** | Long-lived, pooled | TLS handshake (~50-100ms) | First request to node |
+| **Stream** | Per-request | ~0 (stream ID allocation) | Every PUT/GET/DELETE |
+
+### What Happens Per Shard Write
+
+| Step | Operation | Cost |
+|------|-----------|------|
+| 1 | `DialPooled("node:9991")` | **O(1) map lookup** - no TLS! |
+| 2 | Check connection alive | `conn.Context().Err() == nil` |
+| 3 | `conn.OpenStreamSync()` | **Very fast** - just assigns stream ID |
+| 4 | Write request + data | Network I/O |
+| 5 | Read response | Network I/O |
+| 6 | Close stream | Releases stream ID |
+
+**Connection stays in pool, NOT closed!**
+
+### TLS Handshake Occurs Only When
+
+1. **First connection to a node** - unavoidable
+2. **Connection died** (idle timeout, network error) - re-establishes
+3. **Pool cleanup** evicted idle connection (>2 min idle)
+
+## Connection Pool Configuration
+
+```go
+// pool.go
+&quic.Config{
+    HandshakeIdleTimeout: 5 * time.Second,
+    KeepAlivePeriod:      15 * time.Second,
+    MaxIdleTimeout:       120 * time.Second,  // Connection stays alive
 }
+
+// Cleanup: every 30s, evict connections idle > 2 minutes
 ```
 
-### Response
+## Stream Closing (Critical for Connection Reuse)
+
+QUIC streams have two independent half-connections. Both must be closed:
+
+```go
+// After reading all response data:
+s.CancelRead(0)  // Close read side (tells peer we're done reading)
+s.Close()        // Close write side (sends FIN)
+```
+
+**Warning**: Failing to close streams causes stream exhaustion. With ~100 concurrent stream limit, unclosed streams will block `OpenStreamSync()`.
+
+## Protocol Format
+
+### Request Header (32 bytes)
 
 ```
-MSG_FETCH_SHARD_RESP {
-  Status u8
-  Crc32 u32
-  TotalLength u32
-}
-[ compressed bytes ]
+┌────────────────────────────────────────────────────────────────┐
+│ Version (1) │ Method (1) │ Status (1) │ Reserved (1)          │
+├────────────────────────────────────────────────────────────────┤
+│                         ReqID (8)                              │
+├────────────────────────────────────────────────────────────────┤
+│         KeyLen (4)        │        MetaLen (4)                 │
+├────────────────────────────────────────────────────────────────┤
+│                        BodyLen (8)                             │
+└────────────────────────────────────────────────────────────────┘
 ```
+
+### Methods
+
+| Method | Value | Description |
+|--------|-------|-------------|
+| GET | 1 | Retrieve shard data |
+| PUT | 2 | Store shard data |
+| DELETE | 3 | Delete shard metadata |
+
+### Request/Response Flow
+
+**PUT Request:**
+```
+[Header 32B] [PutRequest JSON] [Shard Data...]
+```
+
+**PUT Response:**
+```
+[Header 32B] [PutResponse JSON]
+```
+
+**GET Request:**
+```
+[Header 32B] [ObjectRequest JSON]
+```
+
+**GET Response:**
+```
+[Header 32B] [Shard Data...]
+```
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `quic/quicclient/pool.go` | Connection pooling, reuse logic |
+| `quic/quicclient/quicclient.go` | Client operations (Put, Get, Delete) |
+| `quic/quicserver/server.go` | Server accept loop, stream handling |
+| `quic/quicproto/proto.go` | Header format, read/write helpers |
 
 ---
 
