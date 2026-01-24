@@ -427,6 +427,8 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 		bucket := c.Params("bucket")
 		key := c.Params("*")
 
+		slog.Debug("PutObject: starting", "bucket", bucket, "key", key)
+
 		// Check for multipart part upload
 		if partNum := c.Query("partNumber"); partNum != "" {
 			uploadID := c.Query("uploadId")
@@ -445,6 +447,7 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 				DecodedLength:   decodedLen,
 			})
 			if err != nil {
+				slog.Error("PutObject: UploadPart failed", "error", err)
 				return err
 			}
 
@@ -456,6 +459,7 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 		// Regular put object
 		decodedLen, _ := strconv.ParseInt(c.Get("x-amz-decoded-content-length"), 10, 64)
 
+		slog.Debug("PutObject: calling backend", "bucket", bucket, "key", key, "decodedLen", decodedLen)
 		resp, err := be.PutObject(ctx, &backend.PutObjectRequest{
 			Bucket:          bucket,
 			Key:             key,
@@ -465,9 +469,11 @@ func (s3 *Config) SetupRoutesWithBackend(be backend.Backend) *fiber.App {
 			DecodedLength:   decodedLen,
 		})
 		if err != nil {
+			slog.Error("PutObject: backend failed", "bucket", bucket, "key", key, "error", err)
 			return err
 		}
 
+		slog.Debug("PutObject: completed", "bucket", bucket, "key", key, "etag", resp.ETag)
 		c.Set("ETag", resp.ETag)
 		return nil
 	})

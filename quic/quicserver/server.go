@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mulgadc/predastore/quic/quicproto"
@@ -67,6 +68,9 @@ type QuicServer struct {
 	shutdownCh chan struct{}
 	shutdownMu sync.Mutex
 	closed     bool
+
+	// Active stream counter for debugging
+	activeStreams int64
 }
 
 type ObjectRequest struct {
@@ -141,8 +145,10 @@ func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, erro
 	var l *quic.Listener
 	for i := 0; i < maxRetries; i++ {
 		l, err = quic.ListenAddr(addr, tlsConf, &quic.Config{
-			KeepAlivePeriod: 15 * time.Second,
-			MaxIdleTimeout:  60 * time.Second,
+			KeepAlivePeriod:      15 * time.Second,
+			MaxIdleTimeout:       60 * time.Second,
+			MaxIncomingStreams:   1000, // Allow more concurrent streams
+			MaxIncomingUniStreams: 1000,
 		})
 		if err == nil {
 			break
@@ -254,7 +260,27 @@ func (qs *QuicServer) serveConn(conn *quic.Conn) {
 }
 
 func (qs *QuicServer) handleStream(s *quic.Stream) {
-	defer s.Close()
+	activeCount := atomic.AddInt64(&qs.activeStreams, 1)
+	streamID := s.StreamID()
+	slog.Debug("handleStream: started", "streamID", streamID, "activeStreams", activeCount)
+
+	defer func() {
+		// Close both sides of the stream to fully release it.
+		// By the time this runs, bw.Flush() has already executed (defer LIFO order),
+		// so the response has been sent. It's now safe to close both sides:
+		// - CancelRead(0): close read side (we've already read all request data)
+		// - Close(): close write side (sends FIN to client)
+		s.CancelRead(0)
+		if err := s.Close(); err != nil {
+			slog.Debug("handleStream: close error", "streamID", streamID, "error", err)
+		}
+		finalCount := atomic.AddInt64(&qs.activeStreams, -1)
+		slog.Debug("handleStream: closed", "streamID", streamID, "activeStreams", finalCount)
+	}()
+
+	if activeCount%100 == 0 || activeCount > 50 {
+		slog.Info("handleStream: active streams high", "count", activeCount, "streamID", streamID)
+	}
 
 	br := bufio.NewReaderSize(s, 128*1024)
 	bw := bufio.NewWriterSize(s, 128*1024)
@@ -262,6 +288,7 @@ func (qs *QuicServer) handleStream(s *quic.Stream) {
 
 	reqHdr, err := quicproto.ReadHeader(br)
 	if err != nil {
+		slog.Debug("handleStream: read header failed", "error", err)
 		return
 	}
 
@@ -536,6 +563,13 @@ func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRe
 
 // handlePUTShard receives shard data via QUIC and writes it to the local WAL
 func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req quicproto.Header, putReq PutRequest) {
+	slog.Debug("handlePUTShard: starting",
+		"bucket", putReq.Bucket,
+		"shardIndex", putReq.ShardIndex,
+		"shardSize", putReq.ShardSize,
+		"bodyLen", req.BodyLen,
+	)
+
 	// Use shared WAL instance
 	qs.walMu.RLock()
 	walInstance := qs.wal
@@ -560,6 +594,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 	// Create a limited reader for the shard data
 	shardReader := io.LimitReader(br, int64(bodyLen))
 
+	slog.Debug("handlePUTShard: writing to WAL", "bodyLen", bodyLen)
 	// Write to WAL (WAL has internal mutex for write serialization)
 	writeResult, err := walInstance.Write(shardReader, bodyLen)
 	if err != nil {
@@ -567,6 +602,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("wal write: %v", err))
 		return
 	}
+	slog.Debug("handlePUTShard: WAL write completed", "shardNum", writeResult.ShardNum)
 
 	// Store metadata in local Badger DB using shard-specific key
 	// This ensures multiple shards of the same object can be stored on the same node
@@ -617,6 +653,11 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		slog.Error("handlePUTShard: flush failed", "error", err)
 		return
 	}
+
+	slog.Debug("handlePUTShard: response sent",
+		"bucket", putReq.Bucket,
+		"shardIndex", putReq.ShardIndex,
+	)
 }
 
 // deletedShardPrefix is the key prefix for tracking deleted shards in local badger

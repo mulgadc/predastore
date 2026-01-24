@@ -504,6 +504,8 @@ func (b *Backend) putObjectToWAL(bucket string, objectPath string, objectHash [3
 
 // putObjectViaQUIC splits a file into RS shards and sends each to the appropriate node via QUIC
 func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPath string, objectHash [32]byte) (dataResults []*wal.WriteResult, parityResults []*wal.WriteResult, size int64, err error) {
+	slog.Debug("putObjectViaQUIC: starting", "bucket", bucket, "objectPath", objectPath)
+
 	enc, err := reedsolomon.NewStream(b.rsDataShard, b.rsParityShard)
 	if err != nil {
 		return nil, nil, 0, err
@@ -521,6 +523,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	}
 
 	size = instat.Size()
+	slog.Debug("putObjectViaQUIC: file size", "size", size)
 
 	// Use objectHash for hash ring placement for consistency with storage and retrieval
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
@@ -564,13 +567,14 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 			}
 
 			addr := b.getNodeAddr(int(nodeNum))
-			client, dialErr := quicclient.Dial(ctx, addr)
+			// Use pooled connection to avoid TLS handshake overhead
+			client, dialErr := quicclient.DialPooled(ctx, addr)
 			if dialErr != nil {
 				slog.Error("putObjectViaQUIC: dial failed", "node", nodeNum, "addr", addr, "error", dialErr)
 				dataCh <- shardWriteOutcome{shardIndex: idx, result: nil, err: dialErr}
 				return
 			}
-			defer client.Close()
+			// Don't close - connection stays in pool
 
 			putReq := quicserver.PutRequest{
 				Bucket:     bucket,
@@ -597,13 +601,17 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	}()
 
 	var firstErr error
+	completedDataShards := 0
 	for outcome := range dataCh {
+		completedDataShards++
 		if outcome.err != nil && firstErr == nil {
 			firstErr = outcome.err
 		}
 		dataResults[outcome.shardIndex] = outcome.result
 	}
+	slog.Debug("putObjectViaQUIC: all data shards completed", "count", completedDataShards)
 	if firstErr != nil {
+		slog.Error("putObjectViaQUIC: data shard failed", "error", firstErr)
 		return nil, nil, 0, firstErr
 	}
 
@@ -640,14 +648,15 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 			}
 
 			addr := b.getNodeAddr(int(nodeNum))
-			client, dialErr := quicclient.Dial(ctx, addr)
+			// Use pooled connection to avoid TLS handshake overhead
+			client, dialErr := quicclient.DialPooled(ctx, addr)
 			if dialErr != nil {
 				slog.Error("putObjectViaQUIC: dial failed for parity", "node", nodeNum, "addr", addr, "error", dialErr)
 				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: nil, err: dialErr}
 				_, _ = io.Copy(io.Discard, r)
 				return
 			}
-			defer client.Close()
+			// Don't close - connection stays in pool
 
 			putReq := quicserver.PutRequest{
 				Bucket:     bucket,
@@ -684,19 +693,24 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	}()
 
 	firstErr = nil
+	completedParityShards := 0
 	for outcome := range parityCh {
+		completedParityShards++
 		if outcome.err != nil && firstErr == nil {
 			firstErr = outcome.err
 		}
 		parityResults[outcome.shardIndex] = outcome.result
 	}
+	slog.Debug("putObjectViaQUIC: all parity shards completed", "count", completedParityShards)
 	if encodeErr != nil && firstErr == nil {
 		firstErr = encodeErr
 	}
 	if firstErr != nil {
+		slog.Error("putObjectViaQUIC: parity shard failed", "error", firstErr)
 		return nil, nil, 0, firstErr
 	}
 
+	slog.Debug("putObjectViaQUIC: completed successfully", "size", size)
 	return dataResults, parityResults, size, nil
 }
 
@@ -747,7 +761,8 @@ func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShar
 
 	for i := range totalNodes {
 		nodeNum := int(totalNodes[i])
-		c, err := quicclient.Dial(context.Background(), b.getNodeAddr(nodeNum))
+		// Use pooled connection to avoid TLS handshake overhead
+		c, err := quicclient.DialPooled(context.Background(), b.getNodeAddr(nodeNum))
 		if err != nil {
 			slog.Error("Failed to dial QUIC server", "node", nodeNum, "err", err)
 			continue
@@ -764,14 +779,14 @@ func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShar
 		reader, err := c.Get(context.Background(), objectRequest)
 		if err != nil {
 			slog.Error("Error reading from QUIC server", "node", nodeNum, "err", err)
-			c.Close()
+			// Don't close - connection stays in pool
 			return shardReaders, err
 		}
 
-		// Buffer the shard data into memory before closing the connection.
-		// This prevents "connection closed" errors when the caller reads.
+		// Buffer the shard data into memory before closing the stream.
+		// This prevents "stream closed" errors when the caller reads.
 		data, err := io.ReadAll(reader)
-		c.Close() // Close connection after reading all data
+		reader.Close() // CRITICAL: Close the STREAM (not the connection) to release it back to pool
 
 		if err != nil {
 			slog.Error("Error buffering shard data", "node", nodeNum, "err", err)

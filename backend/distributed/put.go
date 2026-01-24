@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"io"
+	"log/slog"
 	"os"
 
 	"github.com/mulgadc/predastore/backend"
@@ -18,6 +19,8 @@ const arnObjectPrefixPut = "arn:aws:s3:::"
 
 // PutObject stores an object using Reed-Solomon encoding across multiple nodes
 func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) (*backend.PutObjectResponse, error) {
+	slog.Debug("distributed.PutObject: starting", "bucket", req.Bucket, "key", req.Key)
+
 	if req.Bucket == "" {
 		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
 	}
@@ -63,23 +66,30 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 		if req.IsChunked && req.ContentEncoding == "aws-chunked" {
 			reader = chunked.NewDecoder(req.Body, req.DecodedLength)
 		}
+		slog.Debug("distributed.PutObject: copying body to temp file")
 		_, err = io.Copy(tmpFile, reader)
 		if err != nil {
+			slog.Error("distributed.PutObject: copy to temp file failed", "error", err)
 			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 		}
 	}
 	tmpFile.Close()
+	slog.Debug("distributed.PutObject: temp file created", "path", tmpFile.Name())
 
 	// Split and write shards (either locally or via QUIC)
 	var size int64
 	if b.useQUIC {
+		slog.Debug("distributed.PutObject: using QUIC for shards")
 		_, _, size, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
 	} else {
+		slog.Debug("distributed.PutObject: using local WAL for shards")
 		_, _, size, err = b.putObjectToWAL(req.Bucket, tmpFile.Name(), objectHash)
 	}
 	if err != nil {
+		slog.Error("distributed.PutObject: shard distribution failed", "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
+	slog.Debug("distributed.PutObject: shards distributed", "size", size)
 
 	objectToShardNodes.Size = size
 

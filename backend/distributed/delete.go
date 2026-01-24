@@ -111,13 +111,14 @@ func (b *Backend) deleteObjectViaQUIC(ctx context.Context, bucket, key string, o
 			defer wg.Done()
 
 			addr := b.getNodeAddr(int(node))
-			client, err := quicclient.Dial(ctx, addr)
+			// Use pooled connection to avoid TLS handshake overhead
+			client, err := quicclient.DialPooled(ctx, addr)
 			if err != nil {
 				slog.Error("deleteObjectViaQUIC: dial failed", "node", node, "addr", addr, "error", err)
 				errCh <- err
 				return
 			}
-			defer client.Close()
+			// Don't close - connection stays in pool
 
 			delReq := quicserver.DeleteRequest{
 				Bucket:     bucket,

@@ -148,11 +148,12 @@ func (b *Backend) readRangeFromSingleShard(ctx context.Context, bucket, key stri
 	nodeNum := int(shards.DataShardNodes[shardIdx])
 	addr := b.getNodeAddr(nodeNum)
 
-	client, err := quicclient.Dial(ctx, addr)
+	// Use pooled connection to avoid TLS handshake overhead
+	client, err := quicclient.DialPooled(ctx, addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial node %d: %w", nodeNum, err)
 	}
-	defer client.Close()
+	// Don't close - connection stays in pool
 
 	// Request the shard with range
 	objectRequest := quicserver.ObjectRequest{
@@ -167,6 +168,7 @@ func (b *Backend) readRangeFromSingleShard(ctx context.Context, bucket, key stri
 	if err != nil {
 		return nil, fmt.Errorf("get range from node %d: %w", nodeNum, err)
 	}
+	defer reader.Close() // CRITICAL: Close to release QUIC stream back to pool
 
 	// Read the response
 	data, err := io.ReadAll(reader)

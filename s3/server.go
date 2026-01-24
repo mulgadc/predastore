@@ -219,6 +219,30 @@ func (s *Server) init() error {
 		}
 	}
 
+	// CLI/env flags override config file settings
+	// This ensures HIVE_PREDASTORE_DEBUG=true works even if config file has debug=false
+	if s.debug {
+		s.config.Debug = true
+	}
+
+	// Set log level early so debug logs during backend initialization are visible
+	var logLevel slog.Level
+	if s.config.Debug {
+		logLevel = slog.LevelDebug
+	} else if s.config.DisableLogging {
+		logLevel = slog.LevelError
+	} else {
+		logLevel = slog.LevelInfo
+	}
+	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+	})
+	slog.SetDefault(slog.New(handler))
+
+	if s.config.Debug {
+		slog.Info("Debug logging enabled")
+	}
+
 	// Initialize the appropriate backend
 	switch s.backendType {
 	case BackendFilesystem:

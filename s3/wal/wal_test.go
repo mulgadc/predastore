@@ -1021,3 +1021,122 @@ func TestReadEndOfShardValidationErrors(t *testing.T) {
 func contains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
+
+// TestConcurrentWritesWithSync verifies that concurrent writes don't deadlock
+// when the background sync goroutine is running.
+// This test catches the issue where holding RLock during Sync() blocked Write() calls.
+func TestConcurrentWritesWithSync(t *testing.T) {
+	tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("wal-concurrent-test-%d", time.Now().UnixNano()))
+	os.MkdirAll(tmpDir, 0750)
+	defer os.RemoveAll(tmpDir)
+
+	// Use a short sync interval to increase chance of hitting the race condition
+	wal, err := New("", tmpDir)
+	assert.NoError(t, err)
+	wal.WALSyncInterval = 10 * time.Millisecond // Very aggressive sync
+	wal.StopWALSyncer()                         // Stop the default syncer
+	wal.StartWALSyncer()                        // Restart with new interval
+	defer wal.Close()
+
+	// Number of concurrent writers
+	numWriters := 10
+	writesPerWriter := 20
+	dataSize := 8192 // 1 chunk per write
+
+	// Channel to track completion
+	done := make(chan bool, numWriters)
+	errors := make(chan error, numWriters*writesPerWriter)
+
+	// Timeout to detect deadlock - if this test hangs, it's a deadlock
+	timeout := time.After(30 * time.Second)
+
+	// Start concurrent writers
+	for i := 0; i < numWriters; i++ {
+		go func(writerID int) {
+			for j := 0; j < writesPerWriter; j++ {
+				data := make([]byte, dataSize)
+				// Fill with identifiable data
+				for k := 0; k < len(data); k++ {
+					data[k] = byte((writerID*256 + j + k) % 256)
+				}
+
+				_, err := wal.Write(bytes.NewReader(data), len(data))
+				if err != nil {
+					errors <- fmt.Errorf("writer %d, write %d failed: %w", writerID, j, err)
+				}
+			}
+			done <- true
+		}(i)
+	}
+
+	// Wait for all writers to complete or timeout
+	completed := 0
+	for completed < numWriters {
+		select {
+		case <-done:
+			completed++
+		case err := <-errors:
+			t.Errorf("Write error: %v", err)
+		case <-timeout:
+			t.Fatalf("DEADLOCK DETECTED: Test timed out after 30 seconds. "+
+				"Only %d/%d writers completed. "+
+				"This indicates the sync goroutine is blocking writes.", completed, numWriters)
+		}
+	}
+
+	// Check for any remaining errors
+	close(errors)
+	for err := range errors {
+		t.Errorf("Write error: %v", err)
+	}
+
+	t.Logf("All %d writers completed %d writes each successfully", numWriters, writesPerWriter)
+}
+
+// TestSyncDoesNotBlockWrites verifies that the sync operation doesn't hold locks
+// during the actual disk I/O, which would block concurrent writes.
+func TestSyncDoesNotBlockWrites(t *testing.T) {
+	tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("wal-sync-block-test-%d", time.Now().UnixNano()))
+	os.MkdirAll(tmpDir, 0750)
+	defer os.RemoveAll(tmpDir)
+
+	wal, err := New("", tmpDir)
+	assert.NoError(t, err)
+	defer wal.Close()
+
+	// Do an initial write to ensure WAL file exists
+	data := make([]byte, 8192)
+	_, err = wal.Write(bytes.NewReader(data), len(data))
+	assert.NoError(t, err)
+
+	// Mark as dirty
+	wal.dirty.Store(true)
+
+	// Start a goroutine that will try to write while sync is running
+	writeStarted := make(chan bool)
+	writeDone := make(chan bool)
+	timeout := time.After(5 * time.Second)
+
+	go func() {
+		writeStarted <- true
+		_, err := wal.Write(bytes.NewReader(data), len(data))
+		if err != nil {
+			t.Errorf("Write during sync failed: %v", err)
+		}
+		writeDone <- true
+	}()
+
+	// Wait for write goroutine to start
+	<-writeStarted
+
+	// Trigger sync - this should NOT block the write goroutine
+	wal.syncWALIfDirty()
+
+	// The write should complete quickly if sync doesn't block
+	select {
+	case <-writeDone:
+		// Success - write completed
+	case <-timeout:
+		t.Fatal("DEADLOCK: Write blocked by sync operation for more than 5 seconds")
+	}
+}

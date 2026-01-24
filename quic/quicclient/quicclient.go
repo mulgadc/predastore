@@ -54,6 +54,12 @@ func (c *Client) nextID() uint64 {
 
 // Put sends a shard to the QUIC server and returns the WriteResult
 func (c *Client) Put(ctx context.Context, putReq quicserver.PutRequest, shardData io.Reader) (*quicserver.PutResponse, error) {
+	slog.Debug("QUIC Put starting",
+		"bucket", putReq.Bucket,
+		"shardIndex", putReq.ShardIndex,
+		"shardSize", putReq.ShardSize,
+	)
+
 	putReqBytes, err := json.Marshal(putReq)
 	if err != nil {
 		return nil, fmt.Errorf("marshal put request: %w", err)
@@ -61,8 +67,19 @@ func (c *Client) Put(ctx context.Context, putReq quicserver.PutRequest, shardDat
 
 	rh, respMeta, err := c.doPut(ctx, putReqBytes, shardData, int64(putReq.ShardSize))
 	if err != nil {
+		slog.Error("QUIC Put doPut failed",
+			"bucket", putReq.Bucket,
+			"shardIndex", putReq.ShardIndex,
+			"error", err,
+		)
 		return nil, fmt.Errorf("put request failed: %w", err)
 	}
+
+	slog.Debug("QUIC Put doPut completed",
+		"bucket", putReq.Bucket,
+		"shardIndex", putReq.ShardIndex,
+		"status", rh.Status,
+	)
 
 	if rh.Status != quicproto.StatusOK {
 		return nil, fmt.Errorf("put: status %d", rh.Status)
@@ -77,15 +94,24 @@ func (c *Client) Put(ctx context.Context, putReq quicserver.PutRequest, shardDat
 		return nil, fmt.Errorf("put error: %s", response.Error)
 	}
 
+	slog.Debug("QUIC Put completed successfully",
+		"bucket", putReq.Bucket,
+		"shardIndex", putReq.ShardIndex,
+		"shardNum", response.WriteResult.ShardNum,
+	)
+
 	return &response, nil
 }
 
 // doPut performs a PUT RPC with body streaming
 func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader, bodyLen int64) (quicproto.Header, []byte, error) {
+	slog.Debug("doPut: opening stream")
 	s, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
+		slog.Error("doPut: failed to open stream", "error", err)
 		return quicproto.Header{}, nil, err
 	}
+	slog.Debug("doPut: stream opened", "streamID", s.StreamID())
 
 	br := bufio.NewReaderSize(s, 128*1024)
 	bw := bufio.NewWriterSize(s, 128*1024)
@@ -120,24 +146,31 @@ func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader,
 	}
 
 	// Stream the body data
+	slog.Debug("doPut: streaming body", "bodyLen", bodyLen)
 	written, err := io.CopyN(bw, body, bodyLen)
 	if err != nil {
+		slog.Error("doPut: body write failed", "written", written, "bodyLen", bodyLen, "error", err)
 		_ = s.Close()
 		return quicproto.Header{}, nil, fmt.Errorf("write body: %w (wrote %d of %d)", err, written, bodyLen)
 	}
+	slog.Debug("doPut: body written", "written", written)
 
 	// Flush the body
 	if err := bw.Flush(); err != nil {
+		slog.Error("doPut: flush body failed", "error", err)
 		_ = s.Close()
 		return quicproto.Header{}, nil, fmt.Errorf("flush body: %w", err)
 	}
+	slog.Debug("doPut: body flushed, waiting for response")
 
 	// Read response header
 	respHdr, err := quicproto.ReadHeader(br)
 	if err != nil {
+		slog.Error("doPut: read response header failed", "error", err)
 		_ = s.Close()
 		return quicproto.Header{}, nil, fmt.Errorf("read response header: %w", err)
 	}
+	slog.Debug("doPut: response header received", "status", respHdr.Status, "metaLen", respHdr.MetaLen)
 
 	// Read response metadata
 	var respMeta []byte
@@ -149,7 +182,13 @@ func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader,
 		}
 	}
 
+	// Close both sides of the stream to fully release it:
+	// - CancelRead(0): close read side (we've read all expected data)
+	// - Close(): close write side (sends FIN)
+	// Both are needed for the stream to be fully released in QUIC.
+	s.CancelRead(0)
 	_ = s.Close()
+	slog.Debug("doPut: stream closed", "streamID", s.StreamID())
 	return respHdr, respMeta, nil
 }
 
@@ -237,70 +276,118 @@ func (c *Client) doDelete(ctx context.Context, requestBytes []byte) (quicproto.H
 		}
 	}
 
+	// Close both sides of the stream to fully release it
+	s.CancelRead(0)
 	_ = s.Close()
 	return respHdr, respMeta, nil
 }
 
-// Get retrieves a full shard from the QUIC server
-func (c *Client) Get(ctx context.Context, objectRequest quicserver.ObjectRequest) (r io.Reader, err error) {
+// Get retrieves a full shard from the QUIC server.
+// IMPORTANT: The returned io.ReadCloser MUST be closed by the caller to release the QUIC stream.
+func (c *Client) Get(ctx context.Context, objectRequest quicserver.ObjectRequest) (io.ReadCloser, error) {
 	objectRequestMarshalled, err := json.Marshal(objectRequest)
 	if err != nil {
 		return nil, fmt.Errorf("marshal object request: %w", err)
 	}
 
-	rh, r, err := c.do(ctx, quicproto.MethodGET, objectRequestMarshalled, nil, 0)
+	rh, rc, err := c.do(ctx, quicproto.MethodGET, objectRequestMarshalled, nil, 0)
 	if err != nil {
 		return nil, err
 	}
 
 	if rh.Status != quicproto.StatusOK {
+		if rc != nil {
+			rc.Close()
+		}
 		return nil, fmt.Errorf("get: status %d (expected %d)", rh.Status, quicproto.StatusOK)
 	}
 
-	return r, nil
+	return rc, nil
+}
+
+// limitedReadCloser wraps a limited reader and the underlying closer.
+type limitedReadCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (l *limitedReadCloser) Close() error {
+	if l.closer != nil {
+		return l.closer.Close()
+	}
+	return nil
 }
 
 // GetRange retrieves a byte range from a shard on the QUIC server.
 // This is an optimized path for partial reads (e.g., viperblock pread operations).
-func (c *Client) GetRange(ctx context.Context, objectRequest quicserver.ObjectRequest) (io.Reader, error) {
+// IMPORTANT: The returned io.ReadCloser MUST be closed by the caller to release the QUIC stream.
+func (c *Client) GetRange(ctx context.Context, objectRequest quicserver.ObjectRequest) (io.ReadCloser, error) {
 	// ObjectRequest now includes RangeStart and RangeEnd fields
 	objectRequestMarshalled, err := json.Marshal(objectRequest)
 	if err != nil {
 		return nil, fmt.Errorf("marshal object request: %w", err)
 	}
 
-	rh, r, err := c.do(ctx, quicproto.MethodGET, objectRequestMarshalled, nil, 0)
+	rh, rc, err := c.do(ctx, quicproto.MethodGET, objectRequestMarshalled, nil, 0)
 	if err != nil {
 		return nil, err
 	}
 
 	if rh.Status != quicproto.StatusOK {
+		if rc != nil {
+			rc.Close()
+		}
 		return nil, fmt.Errorf("get range: status %d (expected %d)", rh.Status, quicproto.StatusOK)
 	}
 
-	// Return a limited reader for the expected response size
+	// Return a limited reader that also closes the underlying stream when done
 	if rh.BodyLen > 0 {
-		return io.LimitReader(r, int64(rh.BodyLen)), nil
+		return &limitedReadCloser{
+			Reader: io.LimitReader(rc, int64(rh.BodyLen)),
+			closer: rc,
+		}, nil
 	}
 
-	return r, nil
+	return rc, nil
+}
+
+// streamReadCloser wraps a reader and a QUIC stream, closing the stream when done.
+// This is CRITICAL for connection pooling - unclosed streams will accumulate
+// and eventually block OpenStreamSync() when the stream limit is reached.
+type streamReadCloser struct {
+	r      io.Reader
+	stream *quic.Stream
+}
+
+func (s *streamReadCloser) Read(p []byte) (int, error) {
+	return s.r.Read(p)
+}
+
+func (s *streamReadCloser) Close() error {
+	if s.stream != nil {
+		// Close both sides of the stream to fully release it:
+		// - CancelRead(0): close read side (caller is done reading)
+		// - Close(): close write side (sends FIN)
+		s.stream.CancelRead(0)
+		return s.stream.Close()
+	}
+	return nil
 }
 
 // do performs one RPC on one stream.
 // request: header + key + meta + optional body
 // response: header + meta + optional body (returned as ReadCloser)
-func (c *Client) do(ctx context.Context, method uint8, objectRequest []byte, body []byte, bodyLen int64) (quicproto.Header, io.Reader, error) {
+//
+// IMPORTANT: The returned io.ReadCloser MUST be closed by the caller to release
+// the QUIC stream. Failure to close will cause stream exhaustion with pooled connections.
+func (c *Client) do(ctx context.Context, method uint8, objectRequest []byte, body []byte, bodyLen int64) (quicproto.Header, io.ReadCloser, error) {
 	s, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
 		return quicproto.Header{}, nil, err
 	}
 
-	// TODO: Optimise
 	br := bufio.NewReaderSize(s, 128*1024)
 	bw := bufio.NewWriterSize(s, 128*1024)
-
-	//br := bufio.NewReader(s)
-	//bw := bufio.NewWriter(s)
 
 	reqID := c.nextID()
 	h := quicproto.Header{
@@ -336,21 +423,20 @@ func (c *Client) do(ctx context.Context, method uint8, objectRequest []byte, bod
 
 	// Read response header + meta, then body stream (if any).
 	respHdr, err := quicproto.ReadHeader(br)
-
 	if err != nil {
 		_ = s.Close()
 		return quicproto.Header{}, nil, err
 	}
 
-	//var rc io.ReadCloser = nopReadCloser{r: br, closer: s}
-
 	if respHdr.BodyLen == 0 {
-		fmt.Println("No body expected")
-		// No body expected. Close the stream.
+		// No body expected. Close both sides of the stream now.
+		s.CancelRead(0)
 		_ = s.Close()
-		//rc = nil
+		return respHdr, nil, nil
 	}
-	return respHdr, br, nil
+
+	// Return a ReadCloser that will close the stream when the caller is done reading
+	return respHdr, &streamReadCloser{r: br, stream: s}, nil
 }
 
 type nopReadCloser struct {

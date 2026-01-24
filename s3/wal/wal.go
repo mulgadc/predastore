@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/mulgadc/predastore/s3db"
@@ -28,6 +27,10 @@ var ShardSize uint32 = 1024 * 1024 * 4
 
 // 8kb chunk sizes
 const ChunkSize uint32 = 1024 * 8
+
+// DefaultWALSyncInterval controls periodic fsync of WAL to disk (default 200ms)
+// Inspired by PostgreSQL's wal_writer_delay, BadgerDB's SyncWrites, MongoDB's journalCommitInterval
+const DefaultWALSyncInterval = 200 * time.Millisecond
 
 const (
 	// FragmentHeaderBytes is the on-disk header size per fragment.
@@ -63,6 +66,19 @@ type WAL struct {
 
 	// Badger DB for local object to WAL/shard/offset
 	DB *s3db.S3DB
+
+	// WALSyncInterval controls periodic fsync of WAL to disk (default 200ms)
+	// Inspired by PostgreSQL's wal_writer_delay, BadgerDB's SyncWrites, MongoDB's journalCommitInterval
+	WALSyncInterval time.Duration `json:"-"`
+
+	// dirty tracks whether there are unflushed writes since last sync
+	// Uses atomic for lock-free access from write path and sync goroutine
+	dirty atomic.Bool
+
+	// WAL syncer control (background goroutine for periodic fsync)
+	walSyncTicker *time.Ticker
+	walSyncStop   chan struct{}
+	walSyncDone   chan struct{}
 }
 
 type WALState struct {
@@ -133,6 +149,9 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 			ShardSize: ShardSize,
 			ChunkSize: ChunkSize,
 		},
+
+		// Default WAL sync interval (200ms like PostgreSQL, BadgerDB, RocksDB)
+		WALSyncInterval: DefaultWALSyncInterval,
 	}
 
 	_, err = os.Stat(stateFile)
@@ -169,6 +188,9 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 		}
 
 	}
+
+	// Start background WAL syncer for periodic fsync (200ms default)
+	wal.StartWALSyncer()
 
 	return wal, err
 }
@@ -217,6 +239,97 @@ func (wal *WAL) LoadState(stateFile string) error {
 	wal.StateFile = state.StateFile
 
 	return nil
+}
+
+// StartWALSyncer starts a background goroutine that periodically fsyncs the WAL to disk.
+// This implements the "group commit" pattern used by PostgreSQL (wal_writer_delay),
+// BadgerDB (SyncWrites with ticker), and MongoDB (journalCommitInterval).
+//
+// The syncer only performs fsync when there are dirty (unflushed) writes,
+// avoiding unnecessary disk I/O when the system is idle.
+func (wal *WAL) StartWALSyncer() {
+	if wal.WALSyncInterval <= 0 {
+		slog.Debug("WAL syncer disabled (interval <= 0)")
+		return
+	}
+
+	wal.walSyncStop = make(chan struct{})
+	wal.walSyncDone = make(chan struct{})
+	wal.walSyncTicker = time.NewTicker(wal.WALSyncInterval)
+
+	go func() {
+		defer close(wal.walSyncDone)
+		defer wal.walSyncTicker.Stop()
+
+		for {
+			select {
+			case <-wal.walSyncTicker.C:
+				wal.syncWALIfDirty()
+			case <-wal.walSyncStop:
+				// Final sync before shutdown
+				wal.syncWALIfDirty()
+				return
+			}
+		}
+	}()
+
+	slog.Debug("WAL syncer started", "interval", wal.WALSyncInterval)
+}
+
+// StopWALSyncer gracefully stops the background WAL sync goroutine.
+// It signals the goroutine to stop and waits for it to complete its final sync.
+func (wal *WAL) StopWALSyncer() {
+	if wal.walSyncStop == nil {
+		return
+	}
+
+	close(wal.walSyncStop)
+	<-wal.walSyncDone
+
+	wal.walSyncStop = nil
+	wal.walSyncDone = nil
+	wal.walSyncTicker = nil
+
+	slog.Debug("WAL syncer stopped")
+}
+
+// syncWALIfDirty performs fsync on the active WAL file if there are pending writes.
+// This is the core of the periodic sync mechanism - it checks the dirty flag
+// and only syncs when necessary to avoid unnecessary I/O.
+//
+// IMPORTANT: We must NOT hold the lock during Sync() because:
+// 1. Sync() can be slow (disk I/O)
+// 2. Holding RLock during Sync() would block all Write() calls waiting for Lock()
+// 3. This would cause a deadlock-like condition under heavy write load
+//
+// Note: Only the last file in wal.Shard.DB is the active WAL being written to.
+// Previous files are closed after they're full.
+func (wal *WAL) syncWALIfDirty() {
+	// Fast path: check dirty flag without lock
+	if !wal.dirty.Load() {
+		return
+	}
+
+	// Clear dirty flag before sync (writes during sync will re-set it)
+	wal.dirty.Store(false)
+
+	// Get file handle under lock, but release BEFORE calling Sync()
+	// This prevents blocking Write() operations during slow disk I/O
+	var fileToSync *os.File
+	wal.mu.RLock()
+	if len(wal.Shard.DB) > 0 {
+		fileToSync = wal.Shard.DB[len(wal.Shard.DB)-1]
+	}
+	wal.mu.RUnlock()
+
+	// Sync OUTSIDE of lock to prevent blocking writes
+	if fileToSync != nil {
+		if err := fileToSync.Sync(); err != nil {
+			slog.Error("WAL sync failed", "error", err)
+			// Re-mark as dirty so next tick retries
+			wal.dirty.Store(true)
+		}
+	}
 }
 
 /*
@@ -355,7 +468,9 @@ func (wal *WAL) createWALUnlocked(filename string) error {
 	}
 
 	// Open or create the file
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR|syscall.O_SYNC, 0640)
+	// Removed syscall.O_SYNC - using periodic fsync (200ms) for better performance
+	// This follows PostgreSQL, BadgerDB, RocksDB best practices for WAL writes
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0640)
 	if err != nil {
 		return err
 	}
@@ -696,16 +811,23 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 		return fmt.Errorf("failed to write to WAL file: %v", err)
 	}
 
+	// Mark WAL as dirty for periodic sync goroutine
+	wal.dirty.Store(true)
+
 	return nil
 }
 
 func (wal *WAL) Close() (err error) {
+	// Stop the WAL syncer goroutine (performs final sync before stopping)
+	wal.StopWALSyncer()
 
 	// Close the Badger DB
 	defer wal.DB.Close()
 
 	// Loop through each file
 	for _, v := range wal.Shard.DB {
+		// Final sync before close to ensure durability
+		v.Sync()
 		v.Close()
 	}
 
