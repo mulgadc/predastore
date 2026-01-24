@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/pprof"
 	"sync"
 	"syscall"
 	"time"
@@ -50,6 +51,11 @@ type Server struct {
 	backend    backend.Backend
 	dbServers  []*s3db.Server
 	quicCancel context.CancelFunc
+
+	// Profiling
+	pprofEnabled  bool
+	pprofFile     *os.File
+	pprofOutputPath string
 
 	// Lifecycle
 	mu       sync.Mutex
@@ -154,6 +160,20 @@ func WithNodeID(nodeID int) Option {
 	}
 }
 
+// WithPprof enables CPU profiling.
+// The profile is written to a temp file during operation and saved to outputPath on shutdown.
+// If outputPath is empty, it defaults to /tmp/predastore-cpu.prof
+func WithPprof(enabled bool, outputPath string) Option {
+	return func(s *Server) error {
+		s.pprofEnabled = enabled
+		if outputPath == "" {
+			outputPath = "/tmp/predastore-cpu.prof"
+		}
+		s.pprofOutputPath = outputPath
+		return nil
+	}
+}
+
 // init initializes the server components
 func (s *Server) init() error {
 	// Auto-tune GOMAXPROCS for cgroups
@@ -162,6 +182,25 @@ func (s *Server) init() error {
 		slog.Warn("Failed to set GOMAXPROCS", "error", err)
 	} else {
 		defer undo()
+	}
+
+	// Check environment variable for pprof if not already enabled
+	if !s.pprofEnabled && os.Getenv("PPROF_ENABLED") == "1" {
+		s.pprofEnabled = true
+		if s.pprofOutputPath == "" {
+			s.pprofOutputPath = os.Getenv("PPROF_OUTPUT")
+			if s.pprofOutputPath == "" {
+				s.pprofOutputPath = "/tmp/predastore-cpu.prof"
+			}
+		}
+	}
+
+	// Start CPU profiling if enabled
+	if s.pprofEnabled {
+		if err := s.startProfiling(); err != nil {
+			slog.Error("Failed to start CPU profiling", "error", err)
+			// Don't fail server start, just log the error
+		}
 	}
 
 	// Create and load configuration
@@ -692,6 +731,73 @@ func (s *Server) ListenAndServeAsync() error {
 	return nil
 }
 
+// startProfiling starts CPU profiling to a temp file
+func (s *Server) startProfiling() error {
+	// Create temp file for profiling
+	tmpFile, err := os.CreateTemp("", "predastore-cpu-*.prof.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create temp profile file: %w", err)
+	}
+	s.pprofFile = tmpFile
+
+	if err := pprof.StartCPUProfile(tmpFile); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return fmt.Errorf("failed to start CPU profile: %w", err)
+	}
+
+	slog.Info("CPU profiling started", "tempFile", tmpFile.Name(), "outputPath", s.pprofOutputPath)
+	return nil
+}
+
+// stopProfiling stops CPU profiling and saves the profile to the output path
+func (s *Server) stopProfiling() error {
+	if s.pprofFile == nil {
+		return nil
+	}
+
+	pprof.StopCPUProfile()
+	tempPath := s.pprofFile.Name()
+	s.pprofFile.Close()
+
+	// Copy temp file to output path
+	if err := copyFile(tempPath, s.pprofOutputPath); err != nil {
+		slog.Error("Failed to save CPU profile", "error", err, "tempPath", tempPath)
+		return err
+	}
+
+	// Remove temp file
+	os.Remove(tempPath)
+
+	slog.Info("CPU profile saved", "path", s.pprofOutputPath)
+	return nil
+}
+
+// copyFile copies a file from src to dst
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	// Ensure output directory exists
+	if err := os.MkdirAll(filepath.Dir(dst), 0750); err != nil {
+		return err
+	}
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	if _, err := dstFile.ReadFrom(srcFile); err != nil {
+		return err
+	}
+	return dstFile.Sync()
+}
+
 // Shutdown gracefully shuts down the server
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
@@ -716,6 +822,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Shutdown DB servers
 	for _, srv := range s.dbServers {
 		srv.Shutdown()
+	}
+
+	// Stop profiling and save profile
+	if s.pprofEnabled {
+		if err := s.stopProfiling(); err != nil {
+			slog.Error("Error stopping CPU profile", "error", err)
+		}
 	}
 
 	s.running = false

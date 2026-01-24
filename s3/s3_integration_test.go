@@ -16,7 +16,6 @@ import (
 	"time"
 
 	awsv2 "github.com/aws/aws-sdk-go-v2/aws"
-	v2config "github.com/aws/aws-sdk-go-v2/config"
 	v2credentials "github.com/aws/aws-sdk-go-v2/credentials"
 	awss3v2 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awss3v2types "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -144,31 +143,14 @@ func createS3ClientV2(t *testing.T) *awss3v2.Client {
 
 	cfg := loadTestConfig(t)
 
-	awsCfg, err := v2config.LoadDefaultConfig(
-		context.Background(),
-		v2config.WithRegion(cfg.Region),
-		v2config.WithHTTPClient(httpClient),
-		v2config.WithEndpointResolverWithOptions(
-			awsv2.EndpointResolverWithOptionsFunc(func(service, region string, _ ...interface{}) (awsv2.Endpoint, error) {
-				if service == awss3v2.ServiceID {
-					return awsv2.Endpoint{
-						URL:               S3_ENDPOINT,
-						HostnameImmutable: true,
-					}, nil
-				}
-				return awsv2.Endpoint{}, &awsv2.EndpointNotFoundError{}
-			}),
-		),
-		v2config.WithCredentialsProvider(v2credentials.NewStaticCredentialsProvider(
-			cfg.Auth[0].AccessKeyID,
-			cfg.Auth[0].SecretAccessKey,
-			"",
-		)),
-	)
-	require.NoError(t, err, "Failed to create AWS v2 config")
-
-	client := awss3v2.NewFromConfig(awsCfg, func(o *awss3v2.Options) {
-		o.UsePathStyle = true
+	// Create S3 client directly with options to avoid LoadDefaultConfig issues
+	// with custom HTTP clients that don't implement WithTransportOptions
+	client := awss3v2.New(awss3v2.Options{
+		Region:      cfg.Region,
+		Credentials: v2credentials.NewStaticCredentialsProvider(cfg.Auth[0].AccessKeyID, cfg.Auth[0].SecretAccessKey, ""),
+		HTTPClient:  httpClient,
+		BaseEndpoint: awsv2.String(S3_ENDPOINT),
+		UsePathStyle: true,
 	})
 	return client
 }
