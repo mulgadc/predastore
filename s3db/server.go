@@ -1,22 +1,32 @@
 package s3db
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/mulgadc/predastore/auth"
 )
 
 // Server provides HTTP REST API for the distributed database
 type Server struct {
 	config *ServerConfig
-	app    *fiber.App
+	router chi.Router
+	server *http.Server
 	node   *RaftNode
 }
 
@@ -68,21 +78,13 @@ func NewServer(config *ServerConfig) (*Server, error) {
 	s := &Server{
 		config: config,
 		node:   node,
+		router: chi.NewRouter(),
 	}
 
-	// Setup Fiber app
-	s.app = fiber.New(fiber.Config{
-		ReadTimeout:  config.ReadTimeout,
-		WriteTimeout: config.WriteTimeout,
-		IdleTimeout:  config.IdleTimeout,
-		ErrorHandler: s.errorHandler,
-	})
-
-	// Middleware
-	s.app.Use(logger.New(logger.Config{
-		Format:     "${time} | ${status} | ${latency} | ${ip} | ${method} | ${path}\n",
-		TimeFormat: "15:04:05",
-	}))
+	// Setup middleware
+	s.router.Use(middleware.Logger)
+	s.router.Use(middleware.Recoverer)
+	s.router.Use(s.authMiddleware)
 
 	// Setup routes
 	s.setupRoutes()
@@ -92,74 +94,95 @@ func NewServer(config *ServerConfig) (*Server, error) {
 
 // setupRoutes configures all HTTP endpoints
 func (s *Server) setupRoutes() {
-	// Health check (no auth required)
-	s.app.Get("/health", s.handleHealth)
+	// Health check (no auth required - handled in middleware)
+	s.router.Get("/health", s.handleHealth)
 
-	// Status endpoint (no auth required)
-	s.app.Get("/status", s.handleStatus)
+	// Status endpoint (no auth required - handled in middleware)
+	s.router.Get("/status", s.handleStatus)
 
 	// Database operations (auth required)
-	api := s.app.Group("/v1", s.authMiddleware)
+	s.router.Route("/v1", func(r chi.Router) {
+		// Key-value operations
+		r.Get("/get/{table}/{key}", s.handleGet)
+		r.Post("/put/{table}/{key}", s.handlePut)
+		r.Delete("/delete/{table}/{key}", s.handleDelete)
 
-	// Key-value operations
-	api.Get("/get/:table/:key", s.handleGet)
-	api.Post("/put/:table/:key", s.handlePut)
-	api.Delete("/delete/:table/:key", s.handleDelete)
+		// Scan operations
+		r.Get("/scan/{table}", s.handleScan)
 
-	// Scan operations
-	api.Get("/scan/:table", s.handleScan)
-
-	// Cluster management
-	api.Post("/join", s.handleJoin)
-	api.Get("/leader", s.handleLeader)
+		// Cluster management
+		r.Post("/join", s.handleJoin)
+		r.Get("/leader", s.handleLeader)
+	})
 }
 
 // authMiddleware validates AWS Signature V4 authentication
-func (s *Server) authMiddleware(c *fiber.Ctx) error {
-	// Skip auth if no credentials configured
-	if len(s.config.Credentials) == 0 {
-		return c.Next()
-	}
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip auth for health and status endpoints
+		if r.URL.Path == "/health" || r.URL.Path == "/status" {
+			next.ServeHTTP(w, r)
+			return
+		}
 
-	// Get region and service, with defaults
-	region := s.config.Region
-	if region == "" {
-		region = DefaultRegion
-	}
-	service := s.config.Service
-	if service == "" {
-		service = DefaultService
-	}
+		// Skip auth if no credentials configured
+		if len(s.config.Credentials) == 0 {
+			next.ServeHTTP(w, r)
+			return
+		}
 
-	// Validate the signature
-	accessKey, err := ValidateSignature(c, s.config.Credentials, region, service)
-	if err != nil {
-		slog.Debug("Auth failed", "error", err)
-		return c.Status(http.StatusForbidden).JSON(ErrorResponse{
-			Error:   "AccessDenied",
-			Message: err.Error(),
-		})
-	}
+		// Get region and service, with defaults
+		region := s.config.Region
+		if region == "" {
+			region = DefaultRegion
+		}
+		service := s.config.Service
+		if service == "" {
+			service = DefaultService
+		}
 
-	// Store authenticated access key in context for potential audit logging
-	c.Locals("accessKey", accessKey)
+		// Validate the signature
+		accessKey, err := ValidateSignatureHTTP(r, s.config.Credentials, region, service)
+		if err != nil {
+			slog.Debug("Auth failed", "error", err)
+			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
+				Error:   "AccessDenied",
+				Message: err.Error(),
+			})
+			return
+		}
 
-	return c.Next()
+		// Store authenticated access key in context
+		ctx := context.WithValue(r.Context(), contextKeyAccessKey, accessKey)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// contextKey for storing values in request context
+type contextKey string
+
+const contextKeyAccessKey contextKey = "accessKey"
+
+// writeJSON writes a JSON response
+func (s *Server) writeJSON(w http.ResponseWriter, statusCode int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(v)
 }
 
 // handleHealth returns server health status
-func (s *Server) handleHealth(c *fiber.Ctx) error {
-	return c.JSON(fiber.Map{
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status": "healthy",
 		"time":   time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
 // handleStatus returns detailed server status
-func (s *Server) handleStatus(c *fiber.Ctx) error {
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	stats := s.node.Stats()
 
-	return c.JSON(StatusResponse{
+	s.writeJSON(w, http.StatusOK, StatusResponse{
 		NodeID:     fmt.Sprintf("%d", s.config.ClusterConfig.NodeID),
 		State:      stats["state"],
 		Leader:     s.node.LeaderID(),
@@ -172,43 +195,47 @@ func (s *Server) handleStatus(c *fiber.Ctx) error {
 }
 
 // handleGet retrieves a value by key
-func (s *Server) handleGet(c *fiber.Ctx) error {
-	table := c.Params("table")
-	hexKey := c.Params("key")
+func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
+	table := chi.URLParam(r, "table")
+	hexKey := chi.URLParam(r, "key")
 
 	if table == "" || hexKey == "" {
-		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Table and key are required",
 		})
+		return
 	}
 
 	// Hex-decode the key (client sends hex-encoded keys)
 	keyBytes, err := hex.DecodeString(hexKey)
 	if err != nil {
-		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Invalid hex-encoded key",
 		})
+		return
 	}
 	key := string(keyBytes)
 
 	value, err := s.node.Get(table, key)
 	if err != nil {
 		if err == badger.ErrKeyNotFound {
-			return c.Status(http.StatusNotFound).JSON(ErrorResponse{
+			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
 				Error:   "KeyNotFound",
 				Message: fmt.Sprintf("Key '%s' not found in table '%s'", key, table),
 			})
+			return
 		}
 		slog.Error("Get failed", "table", table, "key", key, "error", err)
-		return c.Status(http.StatusInternalServerError).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "InternalError",
 			Message: err.Error(),
 		})
+		return
 	}
 
-	return c.JSON(GetResponse{
+	s.writeJSON(w, http.StatusOK, GetResponse{
 		Table: table,
 		Key:   key,
 		Value: value,
@@ -216,54 +243,66 @@ func (s *Server) handleGet(c *fiber.Ctx) error {
 }
 
 // handlePut stores a key-value pair
-func (s *Server) handlePut(c *fiber.Ctx) error {
-	table := c.Params("table")
-	hexKey := c.Params("key")
+func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
+	table := chi.URLParam(r, "table")
+	hexKey := chi.URLParam(r, "key")
 
 	if table == "" || hexKey == "" {
-		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Table and key are required",
 		})
+		return
 	}
 
 	// Hex-decode the key (client sends hex-encoded keys)
 	keyBytes, err := hex.DecodeString(hexKey)
 	if err != nil {
-		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Invalid hex-encoded key",
 		})
+		return
 	}
 	key := string(keyBytes)
 
-	value := c.Body()
+	value, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "InvalidRequest",
+			Message: "Failed to read request body",
+		})
+		return
+	}
 	if len(value) == 0 {
-		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Request body (value) is required",
 		})
+		return
 	}
 
 	// Writes must go through leader
 	if !s.node.IsLeader() {
-		return c.Status(http.StatusTemporaryRedirect).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusTemporaryRedirect, ErrorResponse{
 			Error:   "NotLeader",
 			Message: "This node is not the leader",
 			Leader:  s.node.LeaderAddr(),
 		})
+		return
 	}
 
 	if err := s.node.Put(table, key, value); err != nil {
 		slog.Error("Put failed", "table", table, "key", key, "error", err)
-		return c.Status(http.StatusInternalServerError).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "InternalError",
 			Message: err.Error(),
 		})
+		return
 	}
 
 	slog.Info("Put succeeded", "table", table, "key", key, "size", len(value))
-	return c.Status(http.StatusCreated).JSON(PutResponse{
+	s.writeJSON(w, http.StatusCreated, PutResponse{
 		Table: table,
 		Key:   key,
 		Size:  len(value),
@@ -271,59 +310,70 @@ func (s *Server) handlePut(c *fiber.Ctx) error {
 }
 
 // handleDelete removes a key
-func (s *Server) handleDelete(c *fiber.Ctx) error {
-	table := c.Params("table")
-	hexKey := c.Params("key")
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
+	table := chi.URLParam(r, "table")
+	hexKey := chi.URLParam(r, "key")
 
 	if table == "" || hexKey == "" {
-		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Table and key are required",
 		})
+		return
 	}
 
 	// Hex-decode the key (client sends hex-encoded keys)
 	keyBytes, err := hex.DecodeString(hexKey)
 	if err != nil {
-		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Invalid hex-encoded key",
 		})
+		return
 	}
 	key := string(keyBytes)
 
 	// Writes must go through leader
 	if !s.node.IsLeader() {
-		return c.Status(http.StatusTemporaryRedirect).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusTemporaryRedirect, ErrorResponse{
 			Error:   "NotLeader",
 			Message: "This node is not the leader",
 			Leader:  s.node.LeaderAddr(),
 		})
+		return
 	}
 
 	if err := s.node.Delete(table, key); err != nil {
 		slog.Error("Delete failed", "table", table, "key", key, "error", err)
-		return c.Status(http.StatusInternalServerError).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "InternalError",
 			Message: err.Error(),
 		})
+		return
 	}
 
 	slog.Info("Delete succeeded", "table", table, "key", key)
-	return c.Status(http.StatusNoContent).Send(nil)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleScan lists keys with optional prefix
-func (s *Server) handleScan(c *fiber.Ctx) error {
-	table := c.Params("table")
-	prefix := c.Query("prefix", "")
-	limit := c.QueryInt("limit", 1000)
+func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
+	table := chi.URLParam(r, "table")
+	prefix := r.URL.Query().Get("prefix")
+	limitStr := r.URL.Query().Get("limit")
+	limit := 1000
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil {
+			limit = l
+		}
+	}
 
 	if table == "" {
-		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Table is required",
 		})
+		return
 	}
 
 	var items []ScanItem
@@ -342,13 +392,14 @@ func (s *Server) handleScan(c *fiber.Ctx) error {
 
 	if err != nil {
 		slog.Error("Scan failed", "table", table, "prefix", prefix, "error", err)
-		return c.Status(http.StatusInternalServerError).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "InternalError",
 			Message: err.Error(),
 		})
+		return
 	}
 
-	return c.JSON(ScanResponse{
+	s.writeJSON(w, http.StatusOK, ScanResponse{
 		Table:  table,
 		Prefix: prefix,
 		Count:  len(items),
@@ -357,70 +408,114 @@ func (s *Server) handleScan(c *fiber.Ctx) error {
 }
 
 // handleJoin adds a new node to the cluster
-func (s *Server) handleJoin(c *fiber.Ctx) error {
+func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
+			Error:   "InvalidRequest",
+			Message: "Failed to read request body",
+		})
+		return
+	}
+
 	var req JoinRequest
-	if err := json.Unmarshal(c.Body(), &req); err != nil {
-		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+	if err := json.Unmarshal(body, &req); err != nil {
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "Invalid JSON body",
 		})
+		return
 	}
 
 	if req.NodeID == "" || req.Addr == "" {
-		return c.Status(http.StatusBadRequest).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusBadRequest, ErrorResponse{
 			Error:   "InvalidRequest",
 			Message: "node_id and addr are required",
 		})
+		return
 	}
 
 	if !s.node.IsLeader() {
-		return c.Status(http.StatusTemporaryRedirect).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusTemporaryRedirect, ErrorResponse{
 			Error:   "NotLeader",
 			Message: "This node is not the leader",
 			Leader:  s.node.LeaderAddr(),
 		})
+		return
 	}
 
 	if err := s.node.Join(req.NodeID, req.Addr); err != nil {
 		slog.Error("Join failed", "node_id", req.NodeID, "addr", req.Addr, "error", err)
-		return c.Status(http.StatusInternalServerError).JSON(ErrorResponse{
+		s.writeJSON(w, http.StatusInternalServerError, ErrorResponse{
 			Error:   "InternalError",
 			Message: err.Error(),
 		})
+		return
 	}
 
 	slog.Info("Node joined cluster", "node_id", req.NodeID, "addr", req.Addr)
-	return c.JSON(fiber.Map{
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":  "joined",
 		"node_id": req.NodeID,
 	})
 }
 
 // handleLeader returns the current leader information
-func (s *Server) handleLeader(c *fiber.Ctx) error {
-	return c.JSON(fiber.Map{
+func (s *Server) handleLeader(w http.ResponseWriter, r *http.Request) {
+	s.writeJSON(w, http.StatusOK, map[string]interface{}{
 		"leader_id":   s.node.LeaderID(),
 		"leader_addr": s.node.LeaderAddr(),
 		"is_leader":   s.node.IsLeader(),
 	})
 }
 
-// errorHandler handles Fiber errors
-func (s *Server) errorHandler(c *fiber.Ctx, err error) error {
-	code := http.StatusInternalServerError
-	if e, ok := err.(*fiber.Error); ok {
-		code = e.Code
-	}
-	return c.Status(code).JSON(ErrorResponse{
-		Error:   "InternalError",
-		Message: err.Error(),
-	})
-}
-
-// Start begins listening for HTTPS requests with TLS
+// Start begins listening for HTTPS requests with TLS and HTTP/2 support
 func (s *Server) Start() error {
-	slog.Info("Starting database server with TLS", "addr", s.config.Addr, "node_id", s.config.ClusterConfig.NodeID)
-	return s.app.ListenTLS(s.config.Addr, s.config.TLSCert, s.config.TLSKey)
+	slog.Info("Starting database server with TLS/HTTP2", "addr", s.config.Addr, "node_id", s.config.ClusterConfig.NodeID)
+
+	// Load TLS certificates
+	cert, err := tls.LoadX509KeyPair(s.config.TLSCert, s.config.TLSKey)
+	if err != nil {
+		return fmt.Errorf("failed to load TLS certificate: %w", err)
+	}
+
+	// Configure TLS with HTTP/2 support
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		// NextProtos enables ALPN for HTTP/2 negotiation
+		NextProtos: []string{"h2", "http/1.1"},
+		MinVersion: tls.VersionTLS12,
+		// Optimized cipher suites for performance
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		},
+		// Session resumption for faster reconnects
+		SessionTicketsDisabled: false,
+	}
+
+	s.server = &http.Server{
+		Addr:              s.config.Addr,
+		Handler:           s.router,
+		TLSConfig:         tlsConfig,
+		ReadTimeout:       s.config.ReadTimeout,
+		WriteTimeout:      s.config.WriteTimeout,
+		IdleTimeout:       s.config.IdleTimeout,
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1MB
+	}
+
+	ln, err := net.Listen("tcp", s.config.Addr)
+	if err != nil {
+		return err
+	}
+
+	tlsListener := tls.NewListener(ln, tlsConfig)
+	return s.server.Serve(tlsListener)
 }
 
 // Shutdown gracefully stops the server
@@ -428,8 +523,12 @@ func (s *Server) Shutdown() error {
 	slog.Info("DBServer: shutting down", "node_id", s.config.ClusterConfig.NodeID)
 
 	slog.Info("DBServer: stopping HTTP server")
-	if err := s.app.Shutdown(); err != nil {
-		slog.Warn("DBServer: HTTP shutdown error", "error", err)
+	if s.server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.server.Shutdown(ctx); err != nil {
+			slog.Warn("DBServer: HTTP shutdown error", "error", err)
+		}
 	}
 
 	slog.Info("DBServer: closing Raft node")
@@ -454,6 +553,11 @@ func (s *Server) IsLeader() bool {
 // Node returns the underlying Raft node
 func (s *Server) Node() *RaftNode {
 	return s.node
+}
+
+// GetRouter returns the chi router for testing
+func (s *Server) GetRouter() chi.Router {
+	return s.router
 }
 
 // Response types
@@ -509,4 +613,171 @@ type ScanResponse struct {
 type JoinRequest struct {
 	NodeID string `json:"node_id"`
 	Addr   string `json:"addr"`
+}
+
+// ValidateSignatureHTTP validates an AWS Signature V4 authorization header for net/http
+// Returns the access key if valid, or an error if invalid
+func ValidateSignatureHTTP(r *http.Request, credentials map[string]string, region, service string) (string, error) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return "", fmt.Errorf("missing Authorization header")
+	}
+
+	// Parse authorization header
+	// Format: AWS4-HMAC-SHA256 Credential=ACCESS/DATE/REGION/SERVICE/aws4_request, SignedHeaders=..., Signature=...
+	parts := strings.Split(authHeader, ", ")
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid Authorization header format")
+	}
+
+	// Parse credential
+	credPart := strings.TrimPrefix(parts[0], "AWS4-HMAC-SHA256 Credential=")
+	creds := strings.Split(credPart, "/")
+	if len(creds) != 5 {
+		return "", fmt.Errorf("invalid credential scope")
+	}
+	accessKey, date, reqRegion, reqService := creds[0], creds[1], creds[2], creds[3]
+
+	// Lookup secret key
+	secretKey, ok := credentials[accessKey]
+	if !ok {
+		return "", fmt.Errorf("invalid access key")
+	}
+
+	// Parse signed headers and signature
+	signedHeaders := strings.TrimPrefix(parts[1], "SignedHeaders=")
+	signature := strings.TrimPrefix(parts[2], "Signature=")
+
+	// Get timestamp
+	timestamp := r.Header.Get("X-Amz-Date")
+	if timestamp == "" {
+		return "", fmt.Errorf("missing X-Amz-Date header")
+	}
+
+	// Build canonical URI
+	canonicalURI := r.URL.Path
+	if canonicalURI == "" {
+		canonicalURI = "/"
+	}
+	canonicalURI = auth.UriEncode(canonicalURI, false)
+
+	// Build canonical query string
+	queryUrl := r.URL.Query()
+	for key := range queryUrl {
+		sort.Strings(queryUrl[key])
+	}
+	canonicalQueryString := strings.Replace(queryUrl.Encode(), "+", "%20", -1)
+
+	// Build canonical headers
+	// Note: Go's net/http moves Host header to r.Host, not r.Header
+	headers := strings.Split(signedHeaders, ";")
+	sort.Strings(headers)
+
+	canonicalHeaders := ""
+	for _, header := range headers {
+		var value string
+		if header == "host" {
+			// Host header is in r.Host, not r.Header in net/http
+			value = r.Host
+		} else {
+			value = r.Header.Get(header)
+		}
+		canonicalHeaders += fmt.Sprintf("%s:%s\n", header, strings.TrimSpace(value))
+	}
+
+	// Calculate payload hash
+	var body []byte
+	if r.Body != nil {
+		var err error
+		body, err = io.ReadAll(r.Body)
+		if err != nil {
+			return "", fmt.Errorf("failed to read request body: %w", err)
+		}
+		// Put body back for handlers
+		r.Body = io.NopCloser(strings.NewReader(string(body)))
+	}
+	payloadHash := auth.HashSHA256(string(body))
+
+	// Build canonical request
+	canonicalRequest := fmt.Sprintf(
+		"%s\n%s\n%s\n%s\n%s\n%s",
+		r.Method,
+		canonicalURI,
+		canonicalQueryString,
+		canonicalHeaders,
+		signedHeaders,
+		payloadHash,
+	)
+
+	// Hash canonical request
+	hashedCanonicalRequest := auth.HashSHA256(canonicalRequest)
+
+	// Create string to sign - use the region from the request for validation
+	scope := fmt.Sprintf("%s/%s/%s/aws4_request", date, reqRegion, reqService)
+	stringToSign := fmt.Sprintf(
+		"AWS4-HMAC-SHA256\n%s\n%s\n%s",
+		timestamp,
+		scope,
+		hashedCanonicalRequest,
+	)
+
+	// Derive signing key and calculate expected signature
+	signingKey := auth.GetSigningKey(secretKey, date, reqRegion, reqService)
+	expectedSig := auth.HmacSHA256Hex(signingKey, stringToSign)
+
+	// Compare signatures
+	if expectedSig != signature {
+		return "", fmt.Errorf("signature mismatch")
+	}
+
+	return accessKey, nil
+}
+
+// UriEncode follows AWS's specific requirements for canonical URI encoding
+func UriEncode(input string, encodeSlash bool) string {
+	var builder strings.Builder
+	builder.Grow(len(input) * 3) // Pre-allocate space for worst case
+
+	for _, b := range []byte(input) {
+		// AWS's unreserved characters
+		if (b >= 'A' && b <= 'Z') ||
+			(b >= 'a' && b <= 'z') ||
+			(b >= '0' && b <= '9') ||
+			b == '-' || b == '.' || b == '_' || b == '~' {
+			builder.WriteByte(b)
+		} else if b == '/' && !encodeSlash {
+			builder.WriteByte(b)
+		} else {
+			// URI encode everything else
+			builder.WriteString(fmt.Sprintf("%%%02X", b))
+		}
+	}
+
+	return builder.String()
+}
+
+// CanonicalQueryString creates the canonical query string according to AWS specs
+func CanonicalQueryString(queryParams url.Values) string {
+	// 1. Sort parameter names in ascending order
+	keys := make([]string, 0, len(queryParams))
+	for k := range queryParams {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// 2. Build canonical query string
+	var pairs []string
+	for _, key := range keys {
+		values := queryParams[key]
+		sort.Strings(values) // Sort values for each key
+
+		// URI encode both key and values
+		encodedKey := UriEncode(key, true)
+		for _, v := range values {
+			encodedValue := UriEncode(v, true)
+			pairs = append(pairs, fmt.Sprintf("%s=%s", encodedKey, encodedValue))
+		}
+	}
+
+	return strings.Join(pairs, "&")
 }

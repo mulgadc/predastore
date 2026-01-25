@@ -10,18 +10,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestPutObject(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Create test content to upload
 	testContent := []byte("This is a test file created during unit testing")
@@ -30,24 +30,21 @@ func TestPutObject(t *testing.T) {
 	req := httptest.NewRequest("PUT", "/test-bucket01/test_upload.txt", bytes.NewReader(testContent))
 
 	// Add authentication headers using the credentials from server.toml
-	if len(s3.Auth) > 0 {
-		// Use the first auth entry from the config
-		authEntry := s3.Auth[0]
-
-		// Use our utility function to generate a valid authorization header
+	if len(config.Auth) > 0 {
+		authEntry := config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
 
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, config.Region, "s3", req)
 		assert.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 200, resp.StatusCode, "Status code should be 200")
+	assert.Equal(t, 200, rr.Code, "Status code should be 200")
 
 	// Verify the file was created with the correct content
-	uploadedPath := filepath.Join(s3.Buckets[0].Pathname, "test_upload.txt")
+	uploadedPath := filepath.Join(config.Buckets[0].Pathname, "test_upload.txt")
 	defer os.Remove(uploadedPath) // Clean up after test
 
 	// Check if file exists
@@ -63,14 +60,13 @@ func TestPutObject(t *testing.T) {
 // Test put object to a private bucket, with no auth
 
 func TestPutObjectPublicBucketNoAuth(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Create test content to upload
 	testContent := []byte("This is a test file created during unit testing")
@@ -78,22 +74,20 @@ func TestPutObjectPublicBucketNoAuth(t *testing.T) {
 	// Make a PUT request
 	req := httptest.NewRequest("PUT", "/test-bucket01/test_upload.txt", bytes.NewReader(testContent))
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 403, resp.StatusCode, "Status code should be 403")
-
+	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 }
 
 func TestPutObjectPrivateBucketNoAuth(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Create test content to upload
 	testContent := []byte("This is a test file created during unit testing")
@@ -101,22 +95,20 @@ func TestPutObjectPrivateBucketNoAuth(t *testing.T) {
 	// Make a PUT request
 	req := httptest.NewRequest("PUT", "/private/test_upload.txt", bytes.NewReader(testContent))
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 403, resp.StatusCode, "Status code should be 403")
-
+	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 }
 
 func TestPutObjectBinary(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Create binary test content (10 KB of random data)
 	testContent := make([]byte, 10240)
@@ -128,24 +120,21 @@ func TestPutObjectBinary(t *testing.T) {
 	req := httptest.NewRequest("PUT", "/test-bucket01/test_binary_upload.dat", bytes.NewReader(testContent))
 
 	// Add authentication headers using the credentials from server.toml
-	if len(s3.Auth) > 0 {
-		// Use the first auth entry from the config
-		authEntry := s3.Auth[0]
-
-		// Use our utility function to generate a valid authorization header
+	if len(config.Auth) > 0 {
+		authEntry := config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
 
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, config.Region, "s3", req)
 		assert.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 200, resp.StatusCode, "Status code should be 200")
+	assert.Equal(t, 200, rr.Code, "Status code should be 200")
 
 	// Verify the file was created with the correct content
-	uploadedPath := filepath.Join(s3.Buckets[0].Pathname, "test_binary_upload.dat")
+	uploadedPath := filepath.Join(config.Buckets[0].Pathname, "test_binary_upload.dat")
 	defer os.Remove(uploadedPath) // Clean up after test
 
 	// Check if file exists
@@ -159,14 +148,13 @@ func TestPutObjectBinary(t *testing.T) {
 }
 
 func TestPutObjectInvalidBucket(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Create test content to upload
 	testContent := []byte("This is a test file for an invalid bucket")
@@ -175,24 +163,21 @@ func TestPutObjectInvalidBucket(t *testing.T) {
 	req := httptest.NewRequest("PUT", "/nonexistent/test_upload.txt", bytes.NewReader(testContent))
 
 	// Add authentication headers using the credentials from server.toml
-	if len(s3.Auth) > 0 {
-		// Use the first auth entry from the config
-		authEntry := s3.Auth[0]
-
-		// Use our utility function to generate a valid authorization header
+	if len(config.Auth) > 0 {
+		authEntry := config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
 
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, config.Region, "s3", req)
 		assert.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should complete")
-	assert.Equal(t, 404, resp.StatusCode, "Status code should be 404")
+	assert.Equal(t, 404, rr.Code, "Status code should be 404")
 
 	// Read response body
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(rr.Body)
 	assert.NoError(t, err, "Reading body should not error")
 	var s3error S3Error
 
@@ -202,7 +187,6 @@ func TestPutObjectInvalidBucket(t *testing.T) {
 
 	assert.Equal(t, s3error.Code, "NoSuchBucket", "Error message should indicate invalid bucket")
 	assert.Equal(t, s3error.Message, "The specified bucket does not exist")
-
 }
 
 // TODO: Add multipart upload tests

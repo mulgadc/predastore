@@ -3,13 +3,24 @@ package s3
 import (
 	"bytes"
 	"encoding/xml"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
+	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// doRequest is a helper function to execute requests against a TestBackend
+func doRequest(t *testing.T, tb *TestBackend, req *http.Request) *http.Response {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	tb.Handler.ServeHTTP(rr, req)
+	return rr.Result()
+}
 
 // TestCRUD tests basic CRUD operations with all backends
 func TestCRUD(t *testing.T) {
@@ -35,12 +46,11 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err := tb.App.Test(req)
-	require.NoError(t, err, "PUT request should not error")
+	resp := doRequest(t, tb, req)
 	assert.Equal(t, 200, resp.StatusCode, "PUT should return 200")
 
 	// Test GET
@@ -49,19 +59,17 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err = tb.App.Test(req)
-	require.NoError(t, err, "GET request should not error")
+	resp = doRequest(t, tb, req)
 	assert.Equal(t, 200, resp.StatusCode, "GET should return 200")
 
 	// Verify content
-	buf := new(bytes.Buffer)
-	_, err = buf.ReadFrom(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err, "Reading response body should not error")
-	assert.Equal(t, testContent, buf.Bytes(), "Content should match")
+	assert.Equal(t, testContent, body, "Content should match")
 
 	// Test HEAD
 	req = httptest.NewRequest("HEAD", "/"+bucketName+"/"+objectKey, nil)
@@ -69,12 +77,11 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err = tb.App.Test(req)
-	require.NoError(t, err, "HEAD request should not error")
+	resp = doRequest(t, tb, req)
 	assert.Equal(t, 200, resp.StatusCode, "HEAD should return 200")
 	assert.NotEmpty(t, resp.Header.Get("Content-Length"), "Content-Length should be set")
 
@@ -84,12 +91,11 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err = tb.App.Test(req)
-	require.NoError(t, err, "DELETE request should not error")
+	resp = doRequest(t, tb, req)
 	assert.Equal(t, 204, resp.StatusCode, "DELETE should return 204")
 
 	// Verify object is gone
@@ -98,12 +104,11 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err = tb.App.Test(req)
-	require.NoError(t, err, "GET after DELETE should not error")
+	resp = doRequest(t, tb, req)
 	assert.Equal(t, 404, resp.StatusCode, "GET after DELETE should return 404")
 }
 
@@ -115,16 +120,15 @@ func TestListBucketsAllBackends(t *testing.T) {
 		if len(tb.Config.Auth) > 0 {
 			authEntry := tb.Config.Auth[0]
 			timestamp := time.Now().UTC().Format("20060102T150405Z")
-			err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+			err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 			require.NoError(t, err, "Error generating auth header")
 		}
 
-		resp, err := tb.App.Test(req)
-		require.NoError(t, err, "ListBuckets request should not error")
+		resp := doRequest(t, tb, req)
 		assert.Equal(t, 200, resp.StatusCode, "ListBuckets should return 200")
 
 		var result ListBuckets
-		err = xml.NewDecoder(resp.Body).Decode(&result)
+		err := xml.NewDecoder(resp.Body).Decode(&result)
 		require.NoError(t, err, "XML parsing should not error")
 		assert.NotEmpty(t, result.Buckets, "Should have buckets")
 	})
@@ -140,16 +144,15 @@ func TestListObjectsAllBackends(t *testing.T) {
 		if len(tb.Config.Auth) > 0 {
 			authEntry := tb.Config.Auth[0]
 			timestamp := time.Now().UTC().Format("20060102T150405Z")
-			err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+			err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 			require.NoError(t, err, "Error generating auth header")
 		}
 
-		resp, err := tb.App.Test(req)
-		require.NoError(t, err, "ListObjects request should not error")
+		resp := doRequest(t, tb, req)
 		assert.Equal(t, 200, resp.StatusCode, "ListObjects should return 200")
 
 		var result ListObjectsV2
-		err = xml.NewDecoder(resp.Body).Decode(&result)
+		err := xml.NewDecoder(resp.Body).Decode(&result)
 		require.NoError(t, err, "XML parsing should not error")
 		assert.Equal(t, bucketName, result.Name, "Bucket name should match")
 	})
@@ -199,12 +202,11 @@ func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err := tb.App.Test(req)
-	require.NoError(t, err, "PUT request should not error")
+	resp := doRequest(t, tb, req)
 	require.Equal(t, 200, resp.StatusCode, "PUT should return 200")
 
 	// LIST objects and verify size
@@ -212,16 +214,15 @@ func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err = tb.App.Test(req)
-	require.NoError(t, err, "ListObjects request should not error")
+	resp = doRequest(t, tb, req)
 	require.Equal(t, 200, resp.StatusCode, "ListObjects should return 200")
 
 	var result ListObjectsV2
-	err = xml.NewDecoder(resp.Body).Decode(&result)
+	err := xml.NewDecoder(resp.Body).Decode(&result)
 	require.NoError(t, err, "XML parsing should not error")
 
 	// Find our object in the list
@@ -243,12 +244,11 @@ func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err = tb.App.Test(req)
-	require.NoError(t, err, "DELETE request should not error")
+	resp = doRequest(t, tb, req)
 	assert.Equal(t, 204, resp.StatusCode, "DELETE should return 204")
 }
 
@@ -268,12 +268,11 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err := tb.App.Test(req)
-	require.NoError(t, err, "Initial PUT request should not error")
+	resp := doRequest(t, tb, req)
 	require.Equal(t, 200, resp.StatusCode, "Initial PUT should return 200")
 
 	// GET and verify initial content
@@ -281,18 +280,16 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err = tb.App.Test(req)
-	require.NoError(t, err, "GET request should not error")
+	resp = doRequest(t, tb, req)
 	require.Equal(t, 200, resp.StatusCode, "GET should return 200")
 
-	buf := new(bytes.Buffer)
-	_, err = buf.ReadFrom(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err, "Reading response body should not error")
-	require.Equal(t, 0, bytes.Compare(initialContent, buf.Bytes()), "Initial content should match exactly")
+	require.Equal(t, 0, bytes.Compare(initialContent, body), "Initial content should match exactly")
 
 	// Create modified content (change some bytes in the middle and end)
 	modifiedContent := make([]byte, len(initialContent))
@@ -314,12 +311,11 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err = tb.App.Test(req)
-	require.NoError(t, err, "Overwrite PUT request should not error")
+	resp = doRequest(t, tb, req)
 	require.Equal(t, 200, resp.StatusCode, "Overwrite PUT should return 200")
 
 	// GET and verify modified content
@@ -327,22 +323,20 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err = tb.App.Test(req)
-	require.NoError(t, err, "GET after overwrite should not error")
+	resp = doRequest(t, tb, req)
 	require.Equal(t, 200, resp.StatusCode, "GET after overwrite should return 200")
 
-	buf = new(bytes.Buffer)
-	_, err = buf.ReadFrom(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	require.NoError(t, err, "Reading response body should not error")
 
 	// Verify the content is the modified version, not the initial
-	require.Equal(t, 0, bytes.Compare(modifiedContent, buf.Bytes()),
+	require.Equal(t, 0, bytes.Compare(modifiedContent, body),
 		"Content after overwrite should match modified content exactly")
-	require.NotEqual(t, 0, bytes.Compare(initialContent, buf.Bytes()),
+	require.NotEqual(t, 0, bytes.Compare(initialContent, body),
 		"Content after overwrite should NOT match initial content")
 
 	// Cleanup: delete the test object
@@ -350,11 +344,10 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
 		require.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err = tb.App.Test(req)
-	require.NoError(t, err, "DELETE request should not error")
+	resp = doRequest(t, tb, req)
 	require.Equal(t, 204, resp.StatusCode, "DELETE should return 204")
 }

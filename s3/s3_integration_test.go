@@ -59,24 +59,24 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	wg.Add(1)
 
 	// Create and configure the S3 server
-	s3server := New(&Config{
+	s3config := New(&Config{
 		ConfigPath: "./tests/config/server.toml",
 	})
-	err := s3server.ReadConfig()
+	err := s3config.ReadConfig()
 	require.NoError(t, err, "Failed to read config file")
 
-	// Setup routes
-	app := s3server.SetupRoutes()
+	// Setup HTTP/2 server
+	server := NewHTTP2Server(s3config)
 
 	// Start the server in a goroutine
 	go func() {
 		defer wg.Done()
 
-		// Start the Fiber app directly with ListenTLS
-		err := app.ListenTLS(":6443", "../config/server.pem", "../config/server.key")
+		// Start the HTTP/2 server with TLS
+		err := server.ListenAndServe(":6443", "../config/server.pem", "../config/server.key")
 
 		// Only report errors other than server closed
-		if err != nil {
+		if err != nil && err != http.ErrServerClosed {
 			t.Logf("Server error: %v", err)
 		}
 	}()
@@ -89,7 +89,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 		defer shutdownCancel()
 
 		// Shutdown gracefully
-		if err := app.ShutdownWithContext(shutdownCtx); err != nil {
+		if err := server.Shutdown(shutdownCtx); err != nil {
 			fmt.Printf("Error shutting down server: %v\n", err)
 		}
 	}()
@@ -146,9 +146,9 @@ func createS3ClientV2(t *testing.T) *awss3v2.Client {
 	// Create S3 client directly with options to avoid LoadDefaultConfig issues
 	// with custom HTTP clients that don't implement WithTransportOptions
 	client := awss3v2.New(awss3v2.Options{
-		Region:      cfg.Region,
-		Credentials: v2credentials.NewStaticCredentialsProvider(cfg.Auth[0].AccessKeyID, cfg.Auth[0].SecretAccessKey, ""),
-		HTTPClient:  httpClient,
+		Region:       cfg.Region,
+		Credentials:  v2credentials.NewStaticCredentialsProvider(cfg.Auth[0].AccessKeyID, cfg.Auth[0].SecretAccessKey, ""),
+		HTTPClient:   httpClient,
 		BaseEndpoint: awsv2.String(S3_ENDPOINT),
 		UsePathStyle: true,
 	})

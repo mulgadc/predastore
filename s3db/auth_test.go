@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/go-chi/chi/v5"
 	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 )
@@ -67,7 +67,7 @@ func TestSignRequest(t *testing.T) {
 	}
 }
 
-func TestValidateSignature(t *testing.T) {
+func TestValidateSignatureHTTP(t *testing.T) {
 	credentials := map[string]string{
 		"TESTACCESSKEY": "TESTSECRETKEY",
 	}
@@ -75,12 +75,12 @@ func TestValidateSignature(t *testing.T) {
 	service := "s3db"
 
 	tests := []struct {
-		name         string
-		method       string
-		path         string
-		setupHeaders func(req *http.Request)
+		name          string
+		method        string
+		path          string
+		setupHeaders  func(req *http.Request)
 		wantAccessKey string
-		wantErr      bool
+		wantErr       bool
 	}{
 		{
 			name:   "Missing Authorization header",
@@ -159,17 +159,6 @@ func TestValidateSignature(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create Fiber app for test
-			app := fiber.New()
-
-			var gotAccessKey string
-			var gotErr error
-
-			app.All("*", func(c *fiber.Ctx) error {
-				gotAccessKey, gotErr = ValidateSignature(c, credentials, region, service)
-				return c.SendString("OK")
-			})
-
 			// Create request
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			req.Host = "localhost:6660"
@@ -177,9 +166,8 @@ func TestValidateSignature(t *testing.T) {
 				tt.setupHeaders(req)
 			}
 
-			// Perform request
-			_, err := app.Test(req)
-			assert.NoError(t, err)
+			// Validate signature
+			gotAccessKey, gotErr := ValidateSignatureHTTP(req, credentials, region, service)
 
 			if tt.wantErr {
 				assert.Error(t, gotErr)
@@ -191,7 +179,7 @@ func TestValidateSignature(t *testing.T) {
 	}
 }
 
-func TestValidateSignature_Integration(t *testing.T) {
+func TestValidateSignatureHTTP_Integration(t *testing.T) {
 	// Test full round-trip: sign request on client side, validate on server side
 	credentials := map[string]string{
 		"TESTACCESSKEY": "TESTSECRETKEY",
@@ -199,26 +187,31 @@ func TestValidateSignature_Integration(t *testing.T) {
 	region := "us-east-1"
 	service := "s3db"
 
-	// Create Fiber app that uses the auth middleware
-	app := fiber.New()
+	// Create chi router with auth middleware
+	r := chi.NewRouter()
 
-	app.Use(func(c *fiber.Ctx) error {
-		accessKey, err := ValidateSignature(c, credentials, region, service)
-		if err != nil {
-			return c.Status(http.StatusForbidden).JSON(fiber.Map{
-				"error":   "AccessDenied",
-				"message": err.Error(),
-			})
-		}
-		c.Locals("accessKey", accessKey)
-		return c.Next()
+	r.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			accessKey, err := ValidateSignatureHTTP(r, credentials, region, service)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				w.Write([]byte(`{"error":"AccessDenied","message":"` + err.Error() + `"}`))
+				return
+			}
+			// Store access key in context
+			ctx := r.Context()
+			ctx = chi.NewRouteContext()
+			r = r.WithContext(ctx)
+			w.Header().Set("X-Access-Key", accessKey)
+			next.ServeHTTP(w, r)
+		})
 	})
 
-	app.Get("/v1/get/:table/:key", func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{
-			"status":    "success",
-			"accessKey": c.Locals("accessKey"),
-		})
+	r.Get("/v1/get/{table}/{key}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"success"}`))
 	})
 
 	// Create a signed request
@@ -237,9 +230,11 @@ func TestValidateSignature_Integration(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Perform request
-	resp, err := app.Test(req)
-	assert.NoError(t, err)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, "TESTACCESSKEY", rr.Header().Get("X-Access-Key"))
 }
 
 func TestDefaultConstants(t *testing.T) {

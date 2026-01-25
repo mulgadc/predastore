@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/backend/filesystem"
@@ -46,15 +45,15 @@ type Server struct {
 	nodeID      int // For distributed mode: specific node to run (-1 = dev mode)
 
 	// Runtime state
-	config     *Config
-	app        *fiber.App
-	backend    backend.Backend
-	dbServers  []*s3db.Server
-	quicCancel context.CancelFunc
+	config  *Config
+	server  *HTTP2Server
+	backend backend.Backend
+	dbServers   []*s3db.Server
+	quicCancel  context.CancelFunc
 
 	// Profiling
-	pprofEnabled  bool
-	pprofFile     *os.File
+	pprofEnabled    bool
+	pprofFile       *os.File
 	pprofOutputPath string
 
 	// Lifecycle
@@ -174,6 +173,7 @@ func WithPprof(enabled bool, outputPath string) Option {
 	}
 }
 
+
 // init initializes the server components
 func (s *Server) init() error {
 	// Auto-tune GOMAXPROCS for cgroups
@@ -257,8 +257,10 @@ func (s *Server) init() error {
 		return fmt.Errorf("unknown backend type: %s", s.backendType)
 	}
 
-	// Setup HTTP routes with the backend
-	s.app = s.config.SetupRoutesWithBackend(s.backend)
+	// Setup HTTP routes with the backend using HTTP/2 server
+	slog.Info("Server init", "backendType", s.backendType)
+	s.server = NewHTTP2ServerWithBackend(s.config, s.backend)
+	slog.Info("HTTP/2 server initialized - using net/http for connection multiplexing")
 
 	return nil
 }
@@ -721,10 +723,12 @@ func (s *Server) ListenAndServe() error {
 	addr := fmt.Sprintf("%s:%d", s.host, s.port)
 	slog.Info("Starting S3 server", "host", s.host, "port", s.port, "backend", s.backendType)
 
-	if s.tlsCert != "" && s.tlsKey != "" {
-		return s.app.ListenTLS(addr, s.tlsCert, s.tlsKey)
+	if s.tlsCert == "" || s.tlsKey == "" {
+		return fmt.Errorf("TLS is required - set tlsCert and tlsKey")
 	}
-	return s.app.Listen(addr)
+
+	slog.Info(">>> USING HTTP/2 SERVER (net/http + chi) <<<", "addr", addr)
+	return s.server.ListenAndServe(addr, s.tlsCert, s.tlsKey)
 }
 
 // ListenAndServeAsync starts the server in a goroutine
@@ -738,16 +742,15 @@ func (s *Server) ListenAndServeAsync() error {
 	s.mu.Unlock()
 
 	addr := fmt.Sprintf("%s:%d", s.host, s.port)
-	slog.Info("Starting S3 server", "host", s.host, "port", s.port, "backend", s.backendType)
+	slog.Info("Starting S3 server (async)", "host", s.host, "port", s.port, "backend", s.backendType)
+
+	if s.tlsCert == "" || s.tlsKey == "" {
+		return fmt.Errorf("TLS is required - set tlsCert and tlsKey")
+	}
 
 	go func() {
-		var err error
-		if s.tlsCert != "" && s.tlsKey != "" {
-			err = s.app.ListenTLS(addr, s.tlsCert, s.tlsKey)
-		} else {
-			err = s.app.Listen(addr)
-		}
-		if err != nil {
+		slog.Info(">>> USING HTTP/2 SERVER (net/http + chi) <<<", "addr", addr)
+		if err := s.server.ListenAndServe(addr, s.tlsCert, s.tlsKey); err != nil {
 			slog.Error("Server error", "error", err)
 		}
 	}()
@@ -835,8 +838,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	// Shutdown HTTP server first (stop accepting new requests)
 	slog.Info("Shutting down HTTP server...")
-	if err := s.app.ShutdownWithContext(ctx); err != nil {
-		slog.Error("Error shutting down HTTP server", "error", err)
+	if s.server != nil {
+		if err := s.server.Shutdown(ctx); err != nil {
+			slog.Error("Error shutting down HTTP server", "error", err)
+		}
 	}
 
 	// Close backend (stops accepting new storage operations)

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/backend/filesystem"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -87,4 +89,100 @@ func (s3 *Config) ToFilesystemConfig() interface{} {
 	// Import dynamically to avoid circular imports
 	// The actual conversion happens in the routes setup
 	return s3
+}
+
+// validatePublicBucketPermission checks if the request is allowed for a public bucket
+// Returns nil if the request is allowed, otherwise returns an error
+func (s3 *Config) validatePublicBucketPermission(method, path string) error {
+	// Extract bucket name from path
+	parts := filepath.SplitList(path)
+	if len(parts) == 0 {
+		return errors.New("invalid path")
+	}
+
+	// Remove leading slash and get first component (bucket name)
+	cleanPath := path
+	if len(path) > 0 && path[0] == '/' {
+		cleanPath = path[1:]
+	}
+
+	pathParts := filepath.SplitList(cleanPath)
+	if len(pathParts) == 0 {
+		// Root path (list buckets) - not public
+		return errors.New("listing buckets requires authentication")
+	}
+
+	// Get bucket name by splitting on /
+	bucketName := cleanPath
+	if idx := findSlash(cleanPath); idx != -1 {
+		bucketName = cleanPath[:idx]
+	}
+
+	// Find bucket configuration
+	var bucket *S3_Buckets
+	for _, b := range s3.Buckets {
+		if b.Name == bucketName {
+			bucket = &b
+			break
+		}
+	}
+
+	if bucket == nil {
+		return errors.New("bucket not found")
+	}
+
+	// Check if bucket is public
+	if !bucket.Public {
+		return errors.New("bucket is not public")
+	}
+
+	// For public buckets:
+	// - Allow GET operations (read)
+	// - Allow HEAD operations (metadata)
+	// - Deny PUT, POST, DELETE without auth
+	switch method {
+	case "GET", "HEAD":
+		return nil // Allow public read
+	default:
+		return errors.New("public buckets only allow read operations")
+	}
+}
+
+// findSlash finds the first / in a string
+func findSlash(s string) int {
+	for i, c := range s {
+		if c == '/' {
+			return i
+		}
+	}
+	return -1
+}
+
+// createFilesystemBackend creates a filesystem backend from the configuration.
+// This is primarily used for testing.
+func (s3 *Config) createFilesystemBackend() backend.Backend {
+	buckets := make([]filesystem.BucketConfig, len(s3.Buckets))
+	for i, b := range s3.Buckets {
+		buckets[i] = filesystem.BucketConfig{
+			Name:     b.Name,
+			Pathname: b.Pathname,
+			Region:   b.Region,
+			Type:     b.Type,
+			Public:   b.Public,
+		}
+	}
+
+	fsConfig := &filesystem.Config{
+		Buckets:   buckets,
+		OwnerID:   "predastore",
+		OwnerName: "predastore",
+	}
+
+	be, err := filesystem.New(fsConfig)
+	if err != nil {
+		slog.Error("Failed to create filesystem backend", "error", err)
+		return nil
+	}
+
+	return be
 }

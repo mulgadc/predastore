@@ -2,12 +2,12 @@ package s3
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/quic/quicserver"
@@ -16,11 +16,12 @@ import (
 
 // Note: BackendType, BackendFilesystem, and BackendDistributed are defined in server.go
 
-// TestBackend holds the configuration and app for a specific backend
+// TestBackend holds the configuration and server for a specific backend
 type TestBackend struct {
 	Type        BackendType
 	Config      *Config
-	App         *fiber.App
+	Server      *HTTP2Server
+	Handler     http.Handler
 	Backend     backend.Backend
 	QuicServers []*quicserver.QuicServer
 	Cleanup     func()
@@ -37,12 +38,13 @@ func setupFilesystemBackend(t *testing.T) *TestBackend {
 	require.NoError(t, err, "Should read config without error")
 
 	be := s3.createFilesystemBackend()
-	app := s3.SetupRoutesWithBackend(be)
+	server := NewHTTP2ServerWithBackend(s3, be)
 
 	return &TestBackend{
 		Type:    BackendFilesystem,
 		Config:  s3,
-		App:     app,
+		Server:  server,
+		Handler: server.GetHandler(),
 		Backend: be,
 		Cleanup: func() {
 			be.Close()
@@ -119,12 +121,13 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 	// Allow QUIC servers time to start
 	time.Sleep(100 * time.Millisecond)
 
-	app := s3.SetupRoutesWithBackend(be)
+	server := NewHTTP2ServerWithBackend(s3, be)
 
 	return &TestBackend{
 		Type:        BackendDistributed,
 		Config:      s3,
-		App:         app,
+		Server:      server,
+		Handler:     server.GetHandler(),
 		Backend:     be,
 		QuicServers: quicServers,
 		Cleanup: func() {

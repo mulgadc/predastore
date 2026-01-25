@@ -8,46 +8,43 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestListBuckets(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Make a request to list buckets
 	req := httptest.NewRequest("GET", "/", nil)
 
 	// Add authentication headers using the credentials from server.toml
-	if len(s3.Auth) > 0 {
-		// Use the first auth entry from the config
-		authEntry := s3.Auth[0]
-
-		// Use our utility function to generate a valid authorization header
+	if len(config.Auth) > 0 {
+		authEntry := config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
 
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, config.Region, "s3", req)
 		assert.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 200, resp.StatusCode, "Status code should be 200")
+	assert.Equal(t, 200, rr.Code, "Status code should be 200")
 
 	// Parse the XML response
 	var result ListBuckets
-	err = xml.NewDecoder(resp.Body).Decode(&result)
+	err = xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
 
 	// Verify the response contains our test bucket
-	assert.Equal(t, len(result.Buckets), 5, "Should have 4 buckets")
+	assert.Equal(t, len(result.Buckets), 5, "Should have 5 buckets")
 
 	t.Log("Buckets", result.Buckets)
 
@@ -58,64 +55,56 @@ func TestListBuckets(t *testing.T) {
 		assert.Equal(t, result.Buckets[3].Name, "local", "Local bucket should be in the list")
 		assert.Equal(t, result.Buckets[4].Name, "predastore", "Predastore bucket should be in the list")
 	}
-
 }
 
 // Test list buckets with no authentication, should fail.
 func TestListBucketsNoAuth(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Make a request to list buckets
 	req := httptest.NewRequest("GET", "/", nil)
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 403, resp.StatusCode, "Status code should be 403")
-
+	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 }
 
 func TestListObjectsV2Handler(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Make a request to list objects in the test bucket
 	req := httptest.NewRequest("GET", "/test-bucket01", nil)
 
 	// Add auth for non-public buckets (testbucket is public, but adding auth won't hurt)
-	if len(s3.Auth) > 0 {
-		// Use the first auth entry from the config
-		authEntry := s3.Auth[0]
-
-		// Use our utility function to generate a valid authorization header
+	if len(config.Auth) > 0 {
+		authEntry := config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
 
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, config.Region, "s3", req)
 		assert.NoError(t, err, "Error generating auth header")
-
 	}
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 200, resp.StatusCode, "Status code should be 200")
+	assert.Equal(t, 200, rr.Code, "Status code should be 200")
 
 	// Parse the XML response
 	var result ListObjectsV2
-	err = xml.NewDecoder(resp.Body).Decode(&result)
+	err = xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
 
 	// Verify response
@@ -143,40 +132,38 @@ func TestListObjectsV2Handler(t *testing.T) {
 
 // Test list objects to a private bucket, with no auth
 func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Make a request to list objects in the test bucket
 	req := httptest.NewRequest("GET", "/private", nil)
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 403, resp.StatusCode, "Status code should be 403")
+	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 
 	// Parse the XML response
 	var result S3Error
-	err = xml.NewDecoder(resp.Body).Decode(&result)
+	err = xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
 
 	assert.Equal(t, result.Code, "AccessDenied", "Error message should indicate access denied")
 }
 
 func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Make a request to list objects in the test bucket
 	req := httptest.NewRequest("GET", "/private", nil)
@@ -184,17 +171,17 @@ func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 	// Use our utility function to generate a valid authorization header
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
 
-	err = GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, s3.Region, "s3", req)
+	err = auth.GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, config.Region, "s3", req)
 	assert.NoError(t, err, "Error generating auth header")
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 403, resp.StatusCode, "Status code should be 403")
+	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 
 	// Parse the XML response
 	var result S3Error
-	err = xml.NewDecoder(resp.Body).Decode(&result)
+	err = xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
 
 	assert.Equal(t, result.Code, "AccessDenied", "Error message should indicate access denied")
@@ -202,26 +189,25 @@ func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 
 // Test list objects to a public bucket, with no auth
 func TestListObjectsV2HandlerPublicBucketNoAuth(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Make a request to list objects in the test bucket
 	req := httptest.NewRequest("GET", "/test-bucket01", nil)
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 200, resp.StatusCode, "Status code should be 200")
+	assert.Equal(t, 200, rr.Code, "Status code should be 200")
 
 	// Parse the XML response
 	var result ListObjectsV2
-	err = xml.NewDecoder(resp.Body).Decode(&result)
+	err = xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
 
 	foundText := false
@@ -235,43 +221,37 @@ func TestListObjectsV2HandlerPublicBucketNoAuth(t *testing.T) {
 	}
 
 	assert.True(t, foundText, "test.txt should be in the bucket")
-
 }
 
 func TestListObjectsWithPrefix(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Make a request to list objects with prefix
 	req := httptest.NewRequest("GET", "/test-bucket01?prefix=test", nil)
 
 	// Add auth for non-public buckets (testbucket is public, but adding auth won't hurt)
-	if len(s3.Auth) > 0 {
-		// Use the first auth entry from the config
-		authEntry := s3.Auth[0]
-
-		// Use our utility function to generate a valid authorization header
+	if len(config.Auth) > 0 {
+		authEntry := config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
 
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, config.Region, "s3", req)
 		assert.NoError(t, err, "Error generating auth header")
-
 	}
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 200, resp.StatusCode, "Status code should be 200")
+	assert.Equal(t, 200, rr.Code, "Status code should be 200")
 
 	// Parse the XML response
 	var result ListObjectsV2
-	err = xml.NewDecoder(resp.Body).Decode(&result)
+	err = xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
 
 	// Verify only test.txt is in the response
@@ -297,37 +277,33 @@ func TestListObjectsWithPrefix(t *testing.T) {
 }
 
 func TestListInvalidBucket(t *testing.T) {
-	s3 := New(&Config{
+	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
 	})
-	err := s3.ReadConfig()
+	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	// Setup Fiber app using SetupRoutes
-	app := s3.SetupRoutes()
+	server := NewHTTP2Server(config)
 
 	// Make a request to list objects in an invalid bucket
 	req := httptest.NewRequest("GET", "/invalidbucket", nil)
 
 	// Add authentication headers since routes.go may require it
-	if len(s3.Auth) > 0 {
-		// Use the first auth entry from the config
-		authEntry := s3.Auth[0]
-
-		// Use our utility function to generate a valid authorization header
+	if len(config.Auth) > 0 {
+		authEntry := config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
 
-		err := GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, s3.Region, "s3", req)
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, config.Region, "s3", req)
 		assert.NoError(t, err, "Error generating auth header")
 	}
 
-	resp, err := app.Test(req)
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
 
-	assert.NoError(t, err, "Request should not error")
-	assert.Equal(t, 404, resp.StatusCode, "Status code should be 404")
+	assert.Equal(t, 404, rr.Code, "Status code should be 404")
 
 	// Read response body
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(rr.Body)
 	assert.NoError(t, err, "Reading body should not error")
 	var s3error S3Error
 

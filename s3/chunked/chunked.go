@@ -2,15 +2,14 @@ package chunked
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"hash"
 	"io"
+	"net/http"
 	"strings"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/minio/crc64nvme"
 )
 
@@ -249,15 +248,7 @@ func parseHexInt64(s string) (int64, error) {
 	return n, nil
 }
 
-//
-
-func RequestBodyReader(c *fiber.Ctx) io.Reader {
-	// Try streaming first
-	if r := c.Context().RequestBodyStream(); r != nil {
-		return r
-	}
-
-	// Fallback: use the buffered body without converting to string
-	body := c.Body()             // []byte
-	return bytes.NewReader(body) // no extra copy beyond Fiber’s buffer
+// NewHTTPBodyReader returns an io.Reader for net/http request bodies.
+func NewHTTPBodyReader(r *http.Request) io.Reader {
+	return r.Body
 }

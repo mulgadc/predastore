@@ -25,17 +25,17 @@ func startBenchServer(tb testing.TB) (context.CancelFunc, *sync.WaitGroup) {
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 
-	s3server := New(&Config{
+	s3config := New(&Config{
 		ConfigPath: "./tests/config/server.toml",
 	})
-	require.NoError(tb, s3server.ReadConfig(), "Failed to read config file")
+	require.NoError(tb, s3config.ReadConfig(), "Failed to read config file")
 
-	s3server.DisableLogging = true
-	app := s3server.SetupRoutes()
+	s3config.DisableLogging = true
+	server := NewHTTP2Server(s3config)
 
 	go func() {
 		defer wg.Done()
-		if err := app.ListenTLS(":8443", "../config/server.pem", "../config/server.key"); err != nil {
+		if err := server.ListenAndServe(":8443", "../config/server.pem", "../config/server.key"); err != nil {
 			tb.Logf("Server error: %v", err)
 		}
 	}()
@@ -44,7 +44,7 @@ func startBenchServer(tb testing.TB) (context.CancelFunc, *sync.WaitGroup) {
 		<-ctx.Done()
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
-		if err := app.ShutdownWithContext(shutdownCtx); err != nil {
+		if err := server.Shutdown(shutdownCtx); err != nil {
 			tb.Logf("Error shutting down server: %v", err)
 		}
 	}()

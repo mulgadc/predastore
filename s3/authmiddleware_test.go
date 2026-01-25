@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
+	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -18,6 +18,15 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 	// Create a test S3 config with known auth credentials
 	s3Config := &Config{
 		Region: "ap-southeast-2",
+		Buckets: []S3_Buckets{
+			{
+				Name:     "test-bucket01",
+				Region:   "ap-southeast-2",
+				Type:     "fs",
+				Pathname: "tests/data/test-bucket01",
+				Public:   false, // Not public - requires authentication
+			},
+		},
 		Auth: []AuthEntry{
 			{
 				AccessKeyID:     "TESTACCESSKEY",
@@ -49,7 +58,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			setupHeaders: func(req *http.Request) {
 				// No auth header
 			},
-			expectStatus:   fiber.StatusForbidden,
+			expectStatus:   http.StatusForbidden,
 			expectResponse: "Missing Authorization header",
 			query:          url.Values{}, // add S3 query param
 		},
@@ -63,7 +72,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				timestamp := time.Now().UTC().Format("20060102T150405Z")
 
 				// Generate valid auth header
-				err := GenerateAuthHeaderReq(
+				err := auth.GenerateAuthHeaderReq(
 					"TESTACCESSKEY",
 					"TESTSECRETKEY",
 					timestamp,
@@ -77,8 +86,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				}
 
 			},
-			expectStatus:   fiber.StatusOK,
-			expectResponse: "Request authenticated",
+			expectStatus:   http.StatusOK,
+			expectResponse: "", // Response is XML ListBucketResult, just check status
 		},
 
 		{
@@ -90,7 +99,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				timestamp := time.Now().UTC().Format("20060102T150405Z")
 
 				// Generate valid auth header
-				err := GenerateAuthHeaderReq(
+				err := auth.GenerateAuthHeaderReq(
 					"TESTACCESSKEY",
 					"TESTSECRETKEY",
 					timestamp,
@@ -104,7 +113,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				}
 
 			},
-			expectStatus:   fiber.StatusForbidden,
+			expectStatus:   http.StatusForbidden,
 			expectResponse: "Request authenticated",
 		},
 
@@ -116,7 +125,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				timestamp := time.Now().UTC().Format("20060102T150405Z")
 
 				// Generate auth header with invalid access key
-				err := GenerateAuthHeaderReq(
+				err := auth.GenerateAuthHeaderReq(
 					"INVALIDACCESSKEY",
 					"TESTSECRETKEY",
 					timestamp,
@@ -130,7 +139,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				}
 
 			},
-			expectStatus:   fiber.StatusForbidden,
+			expectStatus:   http.StatusForbidden,
 			expectResponse: "Invalid access key",
 		},
 		{
@@ -141,7 +150,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				timestamp := time.Now().UTC().Format("20060102T150405Z")
 
 				// Generate valid header first
-				err := GenerateAuthHeaderReq(
+				err := auth.GenerateAuthHeaderReq(
 					"TESTACCESSKEY",
 					"WRONGSECRETKEY", // Wrong secret key
 					timestamp,
@@ -155,30 +164,15 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				}
 
 			},
-			expectStatus:   fiber.StatusForbidden,
+			expectStatus:   http.StatusForbidden,
 			expectResponse: "Invalid signature",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create a new Fiber app
-			app := fiber.New(fiber.Config{
-
-				// Set the body limit for S3 specs to 5GiB
-				BodyLimit: 5 * 1024 * 1024 * 1024,
-
-				// Override default error handler
-				ErrorHandler: func(ctx *fiber.Ctx, err error) error {
-					return s3Config.ErrorHandler(ctx, err)
-				}})
-
-			// Add middleware and test endpoint
-			app.Use(s3Config.SigV4AuthMiddleware)
-			app.All("*", func(c *fiber.Ctx) error {
-
-				return c.SendString("Request authenticated")
-			})
+			// Create an HTTP/2 server for testing
+			server := NewHTTP2Server(s3Config)
 
 			// Create request
 			req := httptest.NewRequest(tt.method, tt.path, nil)
@@ -187,22 +181,11 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			}
 
 			// Perform request
-			resp, err := app.Test(req)
-			assert.NoError(t, err)
+			rr := httptest.NewRecorder()
+			server.GetHandler().ServeHTTP(rr, req)
 
 			// Check status code
-			assert.Equal(t, tt.expectStatus, resp.StatusCode)
-
-			// If we're expecting a specific response, check it
-			/*
-				if tt.expectResponse != "" {
-					body := make([]byte, 1024)
-					n, err := resp.Body.Read(body)
-					assert.NoError(t, err, "Error reading response body")
-					assert.Contains(t, string(body[:n]), tt.expectResponse)
-				}
-			*/
-
+			assert.Equal(t, tt.expectStatus, rr.Code)
 		})
 	}
 }
@@ -220,7 +203,7 @@ func TestGetSigningKey(t *testing.T) {
 	expectedKey := "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
 
 	// Generate the signing key
-	signingKey := getSigningKey(secret, date, region, service)
+	signingKey := auth.GetSigningKey(secret, date, region, service)
 	actualKey := hex.EncodeToString(signingKey)
 
 	// Verify the key matches the expected value
@@ -236,7 +219,7 @@ func TestHmacSHA256(t *testing.T) {
 	expectedHmac := "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
 
 	// Calculate HMAC-SHA256
-	hmac := hmacSHA256(key, data)
+	hmac := auth.HmacSHA256(key, data)
 	actualHmac := hex.EncodeToString(hmac)
 
 	// Verify the HMAC matches the expected value
@@ -251,7 +234,7 @@ func TestHashSHA256(t *testing.T) {
 	expectedHash := "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
 
 	// Calculate SHA256
-	actualHash := hashSHA256(data)
+	actualHash := auth.HashSHA256(data)
 
 	// Verify the hash matches the expected value
 	assert.Equal(t, expectedHash, actualHash)
