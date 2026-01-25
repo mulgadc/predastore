@@ -425,10 +425,20 @@ func (s *Server) Start() error {
 
 // Shutdown gracefully stops the server
 func (s *Server) Shutdown() error {
+	slog.Info("DBServer: shutting down", "node_id", s.config.ClusterConfig.NodeID)
+
+	slog.Info("DBServer: stopping HTTP server")
 	if err := s.app.Shutdown(); err != nil {
-		return err
+		slog.Warn("DBServer: HTTP shutdown error", "error", err)
 	}
-	return s.node.Close()
+
+	slog.Info("DBServer: closing Raft node")
+	if err := s.node.Close(); err != nil {
+		slog.Warn("DBServer: Raft node close error", "error", err)
+	}
+
+	slog.Info("DBServer: shutdown complete", "node_id", s.config.ClusterConfig.NodeID)
+	return nil
 }
 
 // WaitForLeader blocks until a leader is elected

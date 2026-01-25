@@ -833,19 +833,49 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	slog.Info("Shutting down S3 server...")
 
-	// Shutdown HTTP server
+	// Shutdown HTTP server first (stop accepting new requests)
+	slog.Info("Shutting down HTTP server...")
 	if err := s.app.ShutdownWithContext(ctx); err != nil {
 		slog.Error("Error shutting down HTTP server", "error", err)
 	}
 
-	// Close backend
+	// Close backend (stops accepting new storage operations)
 	if s.backend != nil {
+		slog.Info("Closing storage backend...")
 		s.backend.Close()
 	}
 
-	// Shutdown DB servers
-	for _, srv := range s.dbServers {
-		srv.Shutdown()
+	// Shutdown DB servers in parallel with timeout
+	// Each Raft node has its own 5s timeout, but we also impose an overall limit
+	if len(s.dbServers) > 0 {
+		slog.Info("Shutting down DB servers...", "count", len(s.dbServers))
+
+		var wg sync.WaitGroup
+		for i, srv := range s.dbServers {
+			wg.Add(1)
+			go func(idx int, server *s3db.Server) {
+				defer wg.Done()
+				slog.Info("Shutting down DB server", "index", idx)
+				server.Shutdown()
+				slog.Info("DB server shutdown complete", "index", idx)
+			}(i, srv)
+		}
+
+		// Wait for all servers with overall timeout
+		done := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		select {
+		case <-done:
+			slog.Info("All DB servers shut down successfully")
+		case <-time.After(15 * time.Second):
+			slog.Warn("DB server shutdown timed out after 15s, continuing...")
+		case <-ctx.Done():
+			slog.Warn("Shutdown context cancelled, continuing...")
+		}
 	}
 
 	// Stop profiling and save profile
@@ -858,6 +888,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.running = false
 	close(s.shutdown)
 
+	slog.Info("S3 server shutdown complete")
 	return nil
 }
 

@@ -266,27 +266,60 @@ func (n *RaftNode) Stats() map[string]string {
 	return n.raft.Stats()
 }
 
-// Close shuts down the Raft node cleanly
+// Close shuts down the Raft node cleanly with a timeout.
+// The shutdown process:
+// 1. Close transport first to stop network activity immediately
+// 2. Attempt graceful Raft shutdown with 5s timeout
+// 3. Close BoltDB log store
+// 4. Close Badger FSM storage
 func (n *RaftNode) Close() error {
-	if n.raft != nil {
-		future := n.raft.Shutdown()
-		if err := future.Error(); err != nil {
-			return err
-		}
-	}
+	slog.Info("RaftNode: starting shutdown")
 
+	// Close transport first to stop all network activity.
+	// This prevents election loops when other nodes have already stopped,
+	// and causes immediate connection errors instead of timeouts.
 	if n.transport != nil {
+		slog.Info("RaftNode: closing transport")
 		n.transport.Close()
 	}
 
+	// Shutdown Raft with a timeout to avoid blocking forever
+	// when we can't reach quorum (other nodes already stopped)
+	if n.raft != nil {
+		slog.Info("RaftNode: initiating raft shutdown")
+		future := n.raft.Shutdown()
+
+		// Wait for shutdown with timeout
+		done := make(chan error, 1)
+		go func() {
+			done <- future.Error()
+		}()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				slog.Warn("RaftNode: raft shutdown returned error", "error", err)
+			} else {
+				slog.Info("RaftNode: raft shutdown completed gracefully")
+			}
+		case <-time.After(5 * time.Second):
+			slog.Warn("RaftNode: raft shutdown timed out after 5s, forcing close")
+		}
+	}
+
+	// Close BoltDB log store
 	if store, ok := n.logStore.(*raftboltdb.BoltStore); ok {
+		slog.Info("RaftNode: closing BoltDB log store")
 		store.Close()
 	}
 
+	// Close Badger FSM storage
 	if n.badgerDB != nil {
+		slog.Info("RaftNode: closing Badger DB")
 		n.badgerDB.Close()
 	}
 
+	slog.Info("RaftNode: shutdown complete")
 	return nil
 }
 

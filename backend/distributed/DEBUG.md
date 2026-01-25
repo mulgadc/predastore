@@ -1291,3 +1291,170 @@ The QUIC model is working as intended:
 No changes needed to the connection/stream model. The 5.99% TLS overhead is from initial connections and occasional reconnects, not per-shard handshakes.
 
 ---
+
+## Session: 2026-01-25 (Graceful Shutdown Implementation)
+
+### Issue: Raft Election Loop on Shutdown
+
+**Symptom:** When stopping predastore (via `stop-dev.sh` or SIGTERM), Raft nodes get stuck in an infinite election loop:
+
+```
+raft: heartbeat timeout reached, starting election
+raft: entering candidate state
+raft: RequestVoteRequest to 127.0.0.1:39992 rejected, error: dial tcp: connection refused
+raft: RequestVoteRequest to 127.0.0.1:39993 rejected, error: dial tcp: connection refused
+```
+
+This repeats indefinitely because:
+1. Shutdown triggers, HTTP server stops
+2. `RaftNode.Close()` calls `raft.Shutdown()` which waits for clean shutdown
+3. But other Raft nodes have already stopped, so this node can't reach quorum
+4. `raft.Shutdown()` blocks forever waiting for an election it can never win
+
+### Root Cause
+
+The original `Close()` implementation called `raft.Shutdown()` first, which waits indefinitely for Raft consensus operations to complete. With other nodes already stopped, it can never reach quorum.
+
+```go
+// BEFORE (blocking forever):
+func (n *RaftNode) Close() error {
+    if n.raft != nil {
+        future := n.raft.Shutdown()
+        if err := future.Error(); err != nil {  // BLOCKS FOREVER
+            return err
+        }
+    }
+    if n.transport != nil {
+        n.transport.Close()  // Never reached
+    }
+    // ...
+}
+```
+
+### Solution
+
+1. **Close transport FIRST** - Stops all network activity immediately, causing other nodes to see connection errors instead of timeouts
+
+2. **Add timeout to Raft shutdown** - If Raft doesn't shut down in 5 seconds, force continue
+
+3. **Parallel shutdown of DB servers** - All Raft nodes shut down concurrently with overall 15s timeout
+
+**Modified Files:**
+
+**`s3db/raft.go` - RaftNode.Close()**
+```go
+func (n *RaftNode) Close() error {
+    slog.Info("RaftNode: starting shutdown")
+
+    // Close transport FIRST to stop all network activity.
+    // This prevents election loops when other nodes have already stopped.
+    if n.transport != nil {
+        slog.Info("RaftNode: closing transport")
+        n.transport.Close()
+    }
+
+    // Shutdown Raft with timeout to avoid blocking forever
+    if n.raft != nil {
+        slog.Info("RaftNode: initiating raft shutdown")
+        future := n.raft.Shutdown()
+
+        done := make(chan error, 1)
+        go func() {
+            done <- future.Error()
+        }()
+
+        select {
+        case err := <-done:
+            if err != nil {
+                slog.Warn("RaftNode: raft shutdown returned error", "error", err)
+            }
+        case <-time.After(5 * time.Second):
+            slog.Warn("RaftNode: raft shutdown timed out after 5s, forcing close")
+        }
+    }
+
+    // Close BoltDB and Badger
+    // ...
+}
+```
+
+**`s3db/server.go` - Server.Shutdown()**
+```go
+func (s *Server) Shutdown() error {
+    slog.Info("DBServer: shutting down", "node_id", s.config.ClusterConfig.NodeID)
+
+    slog.Info("DBServer: stopping HTTP server")
+    if err := s.app.Shutdown(); err != nil {
+        slog.Warn("DBServer: HTTP shutdown error", "error", err)
+    }
+
+    slog.Info("DBServer: closing Raft node")
+    if err := s.node.Close(); err != nil {
+        slog.Warn("DBServer: Raft node close error", "error", err)
+    }
+
+    slog.Info("DBServer: shutdown complete")
+    return nil
+}
+```
+
+**`s3/server.go` - Server.Shutdown()**
+```go
+// Shutdown DB servers in parallel with timeout
+if len(s.dbServers) > 0 {
+    slog.Info("Shutting down DB servers...", "count", len(s.dbServers))
+
+    var wg sync.WaitGroup
+    for i, srv := range s.dbServers {
+        wg.Add(1)
+        go func(idx int, server *s3db.Server) {
+            defer wg.Done()
+            server.Shutdown()
+        }(i, srv)
+    }
+
+    // Wait with overall timeout
+    done := make(chan struct{})
+    go func() {
+        wg.Wait()
+        close(done)
+    }()
+
+    select {
+    case <-done:
+        slog.Info("All DB servers shut down successfully")
+    case <-time.After(15 * time.Second):
+        slog.Warn("DB server shutdown timed out after 15s, continuing...")
+    case <-ctx.Done():
+        slog.Warn("Shutdown context cancelled, continuing...")
+    }
+}
+```
+
+### Shutdown Flow (After Fix)
+
+1. **Signal received** (SIGTERM/SIGINT)
+2. **HTTP server stops** - No new requests accepted
+3. **Backend closes** - Stops storage operations
+4. **DB servers shutdown in parallel**:
+   - Each server stops its HTTP server
+   - Each RaftNode closes transport (stops network I/O)
+   - Each RaftNode attempts Raft shutdown (5s timeout per node)
+   - Each RaftNode closes BoltDB and Badger
+5. **Overall timeout** - If parallel shutdown takes > 15s, continue anyway
+6. **Process exits cleanly**
+
+### Key Insights
+
+1. **Transport Must Close First**: Raft elections require network communication. Closing the transport immediately stops all Raft network activity, preventing the election loop.
+
+2. **Timeouts Are Essential**: In a distributed system, graceful shutdown may be impossible (other nodes down, network partitioned). Timeouts ensure the process eventually exits.
+
+3. **Parallel Shutdown**: With multiple Raft nodes per process (e.g., dev mode), shutting them down sequentially could take 5s × N nodes. Parallel shutdown with overall timeout is faster and more robust.
+
+4. **Order Matters**:
+   - Transport closes BEFORE Raft shutdown (stops network activity)
+   - Raft shuts down BEFORE BoltDB (pending log writes complete)
+   - BoltDB closes BEFORE Badger (Raft log store before FSM storage)
+
+---
