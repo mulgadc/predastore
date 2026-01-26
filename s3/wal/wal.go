@@ -456,12 +456,11 @@ func (wal *WAL) getCurrentWALFileSize() (int64, error) {
 
 	// Return size minus WAL header
 	walHeaderSize := int64(wal.WALHeaderSize())
-	fileSize := stat.Size()
-	if fileSize < walHeaderSize {
+	if stat.Size() < walHeaderSize {
 		return 0, nil
 	}
 
-	return fileSize - walHeaderSize, nil
+	return stat.Size() - walHeaderSize, nil
 }
 
 // ensureWALFile ensures we have a WAL file open and returns its index
@@ -623,19 +622,17 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 			if walIndex < len(wal.Shard.DB) {
 				activeWal := wal.Shard.DB[walIndex]
 				stat, err := activeWal.Stat()
-				if err == nil {
-					// Offset is where we start writing this object's data
-					// For a brand new file, this is 0 (right after WAL header)
-					// For an existing file, it's the current position
-					currentFileSize := stat.Size()
-					walHeaderSize := int64(wal.WALHeaderSize())
-					if currentFileSize <= walHeaderSize {
-						// Brand new file, offset is 0
-						newOffset = 0
-					} else {
-						// Existing file, offset is current position (excluding WAL header)
-						newOffset = currentFileSize - walHeaderSize
-					}
+				if err != nil {
+					return nil, fmt.Errorf("failed to stat WAL file: %v", err)
+				}
+				currentFileSize := stat.Size()
+				walHeaderSize := int64(wal.WALHeaderSize())
+				if currentFileSize <= walHeaderSize {
+					// Brand new file, offset is 0
+					newOffset = 0
+				} else {
+					// Existing file, offset is current position (excluding WAL header)
+					newOffset = currentFileSize - walHeaderSize
 				}
 			}
 
@@ -677,15 +674,15 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 		activeWal := wal.Shard.DB[currentWALIndex]
 		stat, err := activeWal.Stat()
 		if err != nil {
-			return nil, fmt.Errorf("failed to get WAL file stat: %v", err)
+			return nil, fmt.Errorf("failed to stat WAL file: %v", err)
 		}
+		currentTotalSize := stat.Size()
 
 		// Check if this chunk fits in current WAL file
 		// MaxFileSize() = ShardSize (data) + header overhead
 		// NOTE: On-disk payload is ALWAYS ChunkSize bytes (padded with zeros when actualChunkSize < ChunkSize),
 		// so every fragment consumes a fixed size on disk.
 		chunkSizeWithHeader := int64(FragmentHeaderBytes + ChunkSize)
-		currentTotalSize := stat.Size()
 		maxFileSize := wal.MaxFileSize()
 		// Use strict check: if adding this chunk would exceed max file size, create a new file
 		if currentTotalSize+chunkSizeWithHeader > maxFileSize {
@@ -708,16 +705,17 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 			if walIndex < len(wal.Shard.DB) {
 				activeWal := wal.Shard.DB[walIndex]
 				stat, err := activeWal.Stat()
-				if err == nil {
-					currentFileSize := stat.Size()
-					walHeaderSize := int64(wal.WALHeaderSize())
-					if currentFileSize <= walHeaderSize {
-						// Brand new file, offset is 0
-						newOffset = 0
-					} else {
-						// Existing file, offset is current position (excluding WAL header)
-						newOffset = currentFileSize - walHeaderSize
-					}
+				if err != nil {
+					return nil, fmt.Errorf("failed to stat WAL file: %v", err)
+				}
+				currentFileSize := stat.Size()
+				walHeaderSize := int64(wal.WALHeaderSize())
+				if currentFileSize <= walHeaderSize {
+					// Brand new file, offset is 0
+					newOffset = 0
+				} else {
+					// Existing file, offset is current position (excluding WAL header)
+					newOffset = currentFileSize - walHeaderSize
 				}
 			}
 
@@ -733,12 +731,13 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 			if currentWALIndex < len(wal.Shard.DB) {
 				activeWal := wal.Shard.DB[currentWALIndex]
 				stat, err := activeWal.Stat()
-				if err == nil {
-					currentTotalSize = stat.Size()
-					if currentTotalSize+chunkSizeWithHeader > maxFileSize {
-						return nil, fmt.Errorf("new WAL file %d already too full: %d + %d > %d",
-							currentWALIndex, currentTotalSize, chunkSizeWithHeader, maxFileSize)
-					}
+				if err != nil {
+					return nil, fmt.Errorf("failed to stat WAL file: %v", err)
+				}
+				currentTotalSize = stat.Size()
+				if currentTotalSize+chunkSizeWithHeader > maxFileSize {
+					return nil, fmt.Errorf("new WAL file %d already too full: %d + %d > %d",
+						currentWALIndex, currentTotalSize, chunkSizeWithHeader, maxFileSize)
 				}
 			}
 		}

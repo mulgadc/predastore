@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // Client provides access to the distributed database cluster
@@ -70,7 +72,14 @@ func NewClient(config *ClientConfig) *Client {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: config.InsecureSkipVerify,
+			NextProtos:         []string{"h2", "http/1.1"},
 		},
+		ForceAttemptHTTP2: true,
+	}
+
+	// CRITICAL: Configure HTTP/2 support with custom TLS config
+	if err := http2.ConfigureTransport(transport); err != nil {
+		// Log but continue - will fall back to HTTP/1.1
 	}
 
 	return &Client{

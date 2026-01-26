@@ -1,3 +1,4 @@
+nbdkit-perf*
 .gocache
 s3/tests/data/distributed/
 .DS_Store

@@ -614,7 +614,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		return
 	}
 
-	slog.Info("handlePUTShard: stored shard",
+	slog.Debug("handlePUTShard: stored shard",
 		"bucket", putReq.Bucket,
 		"object", putReq.Object,
 		"shardIndex", putReq.ShardIndex,
@@ -732,7 +732,7 @@ func (qs *QuicServer) handleDELETEShard(bw *bufio.Writer, req quicproto.Header, 
 		return
 	}
 
-	slog.Info("handleDELETEShard: deleted shard",
+	slog.Debug("handleDELETEShard: deleted shard",
 		"bucket", delReq.Bucket,
 		"object", delReq.Object,
 		"walFiles", len(objectWriteResult.WriteResult.WALFiles),

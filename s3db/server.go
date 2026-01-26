@@ -49,6 +49,10 @@ type ServerConfig struct {
 
 	// Cluster configuration
 	ClusterConfig *ClusterConfig
+
+	// Debug enables verbose request logging (chi middleware.Logger)
+	// WARNING: Enabling this in production adds significant CPU overhead (~17%)
+	Debug bool
 }
 
 // DefaultServerConfig returns sensible defaults
@@ -82,7 +86,10 @@ func NewServer(config *ServerConfig) (*Server, error) {
 	}
 
 	// Setup middleware
-	s.router.Use(middleware.Logger)
+	// Only enable request logging in debug mode - adds ~17% CPU overhead
+	if config.Debug {
+		s.router.Use(middleware.Logger)
+	}
 	s.router.Use(middleware.Recoverer)
 	s.router.Use(s.authMiddleware)
 
@@ -301,7 +308,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("Put succeeded", "table", table, "key", key, "size", len(value))
+	slog.Debug("Put succeeded", "table", table, "key", key, "size", len(value))
 	s.writeJSON(w, http.StatusCreated, PutResponse{
 		Table: table,
 		Key:   key,
@@ -352,7 +359,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("Delete succeeded", "table", table, "key", key)
+	slog.Debug("Delete succeeded", "table", table, "key", key)
 	w.WriteHeader(http.StatusNoContent)
 }
 

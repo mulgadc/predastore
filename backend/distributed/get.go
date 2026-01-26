@@ -74,7 +74,7 @@ func (b *Backend) handleRangeRequest(ctx context.Context, req *backend.GetObject
 		endShardIdx = b.rsDataShard - 1
 	}
 
-	slog.Info("Range request",
+	slog.Debug("Range request",
 		"bucket", req.Bucket,
 		"key", req.Key,
 		"start", start,
@@ -280,11 +280,11 @@ func (b *Backend) getFullObject(ctx context.Context, req *backend.GetObjectReque
 
 	// Create response with io.ReadCloser wrapper
 	return &backend.GetObjectResponse{
-		Body:         io.NopCloser(bytes.NewReader(out.Bytes())),
-		ContentType:  "application/octet-stream",
-		Size:         int64(out.Len()),
-		ETag:         generateDistributedETag(req.Bucket, req.Key),
-		StatusCode:   200,
+		Body:        io.NopCloser(bytes.NewReader(out.Bytes())),
+		ContentType: "application/octet-stream",
+		Size:        int64(out.Len()),
+		ETag:        generateDistributedETag(req.Bucket, req.Key),
+		StatusCode:  200,
 	}, nil
 }
 

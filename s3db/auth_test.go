@@ -199,10 +199,7 @@ func TestValidateSignatureHTTP_Integration(t *testing.T) {
 				w.Write([]byte(`{"error":"AccessDenied","message":"` + err.Error() + `"}`))
 				return
 			}
-			// Store access key in context
-			ctx := r.Context()
-			ctx = chi.NewRouteContext()
-			r = r.WithContext(ctx)
+			// Store access key in header (context not needed for this test)
 			w.Header().Set("X-Access-Key", accessKey)
 			next.ServeHTTP(w, r)
 		})
