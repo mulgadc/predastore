@@ -244,10 +244,12 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 			require.NoError(t, err)
 			defer os.RemoveAll(tmpDir)
 
+			testBasePort := 49991
 			cfg := &Config{
 				BadgerDir:      tmpDir,
 				PartitionCount: 11,
 				UseQUIC:        true,
+				QuicBasePort:   testBasePort,
 			}
 			b, err := New(cfg)
 			require.NoError(t, err)
@@ -271,7 +273,7 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 				require.NoError(t, os.MkdirAll(nodeDir, 0750))
 
 				// Spin up a QUIC server for this node
-				quicServers[i] = quicserver.New(nodeDir, fmt.Sprintf("127.0.0.1:%d", 9991+i))
+				quicServers[i] = quicserver.New(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i))
 			}
 			defer func() {
 				for _, qs := range quicServers {
