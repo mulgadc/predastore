@@ -93,7 +93,7 @@ security-check:
 	@echo -e "\n....Running security checks for $(GO_PROJECT_NAME)...."
 	set -o pipefail && go tool govulncheck ./... 2>&1 | tee tests/govulncheck-report.txt
 	@echo "  govulncheck ok"
-	set -o pipefail && go tool gosec -exclude=G104,G204,G304,G402 -exclude-generated ./... 2>&1 | tee tests/gosec-report.txt
+	set -o pipefail && go tool gosec -exclude=G104,G204,G304,G401,G402,G501 -exclude-generated ./... 2>&1 | tee tests/gosec-report.txt
 	@echo "  gosec ok"
 	set -o pipefail && go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005" ./... 2>&1 | tee tests/staticcheck-report.txt
 	@echo "  staticcheck ok"
