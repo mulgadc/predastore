@@ -45,11 +45,11 @@ type Server struct {
 	nodeID      int // For distributed mode: specific node to run (-1 = dev mode)
 
 	// Runtime state
-	config  *Config
-	server  *HTTP2Server
-	backend backend.Backend
-	dbServers   []*s3db.Server
-	quicCancel  context.CancelFunc
+	config     *Config
+	server     *HTTP2Server
+	backend    backend.Backend
+	dbServers  []*s3db.Server
+	quicCancel context.CancelFunc
 
 	// Profiling
 	pprofEnabled    bool
@@ -172,7 +172,6 @@ func WithPprof(enabled bool, outputPath string) Option {
 		return nil
 	}
 }
-
 
 // init initializes the server components
 func (s *Server) init() error {

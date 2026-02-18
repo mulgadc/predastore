@@ -548,4 +548,3 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadI
 
 	return nil
 }
-

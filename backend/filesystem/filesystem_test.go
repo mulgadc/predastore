@@ -647,13 +647,13 @@ func TestValidateBucketName(t *testing.T) {
 		{"valid-bucket", false},
 		{"bucket123", false},
 		{"my.bucket.name", false},
-		{"ab", true},                                              // Too short
-		{"a" + strings.Repeat("b", 64), true},                     // Too long
-		{"Invalid-Bucket", true},                                  // Uppercase
-		{"bucket_name", true},                                     // Underscore
-		{"192.168.1.1", true},                                     // IP address
-		{"xn--bucket", true},                                      // Reserved prefix
-		{"bucket-s3alias", true},                                  // Reserved suffix
+		{"ab", true},                          // Too short
+		{"a" + strings.Repeat("b", 64), true}, // Too long
+		{"Invalid-Bucket", true},              // Uppercase
+		{"bucket_name", true},                 // Underscore
+		{"192.168.1.1", true},                 // IP address
+		{"xn--bucket", true},                  // Reserved prefix
+		{"bucket-s3alias", true},              // Reserved suffix
 	}
 
 	for _, tt := range tests {

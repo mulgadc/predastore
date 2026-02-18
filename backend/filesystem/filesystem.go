@@ -16,9 +16,9 @@ import (
 
 // Config holds filesystem backend configuration
 type Config struct {
-	Buckets  []BucketConfig
-	TempDir  string // Directory for multipart uploads (defaults to os.TempDir())
-	OwnerID  string
+	Buckets   []BucketConfig
+	TempDir   string // Directory for multipart uploads (defaults to os.TempDir())
+	OwnerID   string
 	OwnerName string
 }
 

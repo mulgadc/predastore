@@ -38,11 +38,11 @@ const (
 
 // UploadMetadata contains metadata about an active multipart upload
 type UploadMetadata struct {
-	UploadID    string    `json:"upload_id"`
-	Bucket      string    `json:"bucket"`
-	Key         string    `json:"key"`
-	ContentType string    `json:"content_type,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
+	UploadID    string         `json:"upload_id"`
+	Bucket      string         `json:"bucket"`
+	Key         string         `json:"key"`
+	ContentType string         `json:"content_type,omitempty"`
+	CreatedAt   time.Time      `json:"created_at"`
 	Parts       []PartMetadata `json:"parts,omitempty"`
 }
 

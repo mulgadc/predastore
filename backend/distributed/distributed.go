@@ -87,7 +87,7 @@ type Backend struct {
 	hashRing      *consistent.Consistent
 	dataDir       string
 	badgerDir     string
-	globalState   GlobalState    // abstraction for global state storage (local or distributed)
+	globalState   GlobalState // abstraction for global state storage (local or distributed)
 	quicBasePort  int
 	nodeAddrs     map[int]string // node ID -> "host:port"
 	buckets       []BucketConfig // bucket configurations

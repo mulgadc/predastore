@@ -20,10 +20,10 @@ type Pool struct {
 }
 
 type pooledConn struct {
-	client    *Client
-	lastUsed  time.Time
-	useCount  int64
-	mu        sync.Mutex
+	client   *Client
+	lastUsed time.Time
+	useCount int64
+	mu       sync.Mutex
 }
 
 // NewPool creates a new connection pool.

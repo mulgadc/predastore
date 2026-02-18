@@ -316,15 +316,15 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 // without requiring QUIC servers. This tests the math for shard-aware range requests.
 func TestRangeRequestLogic(t *testing.T) {
 	testCases := []struct {
-		name          string
-		totalSize     int64
-		dataShards    int
-		rangeStart    int64
-		rangeEnd      int64
-		expectShard   int    // Which shard should be targeted
-		expectOffset  int64  // Offset within that shard
-		expectLength  int64  // Length of data to read from shard
-		spanMultiple  bool   // Does the range span multiple shards?
+		name         string
+		totalSize    int64
+		dataShards   int
+		rangeStart   int64
+		rangeEnd     int64
+		expectShard  int   // Which shard should be targeted
+		expectOffset int64 // Offset within that shard
+		expectLength int64 // Length of data to read from shard
+		spanMultiple bool  // Does the range span multiple shards?
 	}{
 		{
 			name:         "First 512 bytes of 128KB file with 2 data shards",
@@ -343,7 +343,7 @@ func TestRangeRequestLogic(t *testing.T) {
 			dataShards:   2,
 			rangeStart:   70000, // ~68KB, in second shard (64KB+)
 			rangeEnd:     70511,
-			expectShard:  1,     // Second shard
+			expectShard:  1,             // Second shard
 			expectOffset: 70000 - 65536, // Offset within second shard
 			expectLength: 512,
 			spanMultiple: false,
@@ -422,10 +422,10 @@ func TestHandleRangeWithFullReconstructionFallback(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name       string
-		start      int64
-		end        int64
-		expectLen  int
+		name      string
+		start     int64
+		end       int64
+		expectLen int
 	}{
 		{"First 100 bytes", 0, 99, 100},
 		{"Middle 200 bytes", 400, 599, 200},
@@ -444,7 +444,7 @@ func TestHandleRangeWithFullReconstructionFallback(t *testing.T) {
 
 			// Verify content
 			for i, b := range rangeData {
-				expected := byte((int64(i)+tc.start+int64(size)) % 251)
+				expected := byte((int64(i) + tc.start + int64(size)) % 251)
 				require.Equal(t, expected, b, "byte at position %d", i)
 			}
 		})
@@ -565,4 +565,3 @@ func TestGetObjectByteRange(t *testing.T) {
 		})
 	}
 }
-

@@ -10,8 +10,8 @@ type DBNodeConfig struct {
 	ID              uint64 `toml:"id"`
 	Host            string `toml:"host"`
 	Port            int    `toml:"port"`
-	RaftPort        int    `toml:"raft_port"`       // Separate port for Raft transport
-	AdvertiseHost   string `toml:"advertise_host"`  // Address to advertise to other nodes (defaults to Host if empty, or 127.0.0.1 if Host is 0.0.0.0)
+	RaftPort        int    `toml:"raft_port"`      // Separate port for Raft transport
+	AdvertiseHost   string `toml:"advertise_host"` // Address to advertise to other nodes (defaults to Host if empty, or 127.0.0.1 if Host is 0.0.0.0)
 	Path            string `toml:"path"`
 	AccessKeyID     string `toml:"access_key_id"`
 	SecretAccessKey string `toml:"secret_access_key"`

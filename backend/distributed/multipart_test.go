@@ -481,9 +481,9 @@ func TestDistributed_MultipartUpload_FullWorkflow(t *testing.T) {
 	const key = "full-workflow-test.bin"
 
 	// Create deterministic test data
-	part1Size := multipart.MinPartSize         // 5MB
-	part2Size := multipart.MinPartSize * 2     // 10MB
-	part3Size := int64(1024 * 1024)            // 1MB (last part can be small)
+	part1Size := multipart.MinPartSize     // 5MB
+	part2Size := multipart.MinPartSize * 2 // 10MB
+	part3Size := int64(1024 * 1024)        // 1MB (last part can be small)
 
 	part1Data := make([]byte, part1Size)
 	part2Data := make([]byte, part2Size)

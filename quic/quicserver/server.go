@@ -31,9 +31,9 @@ import (
 )
 
 const (
-	alpn               = "mulga-repl-v1"
-	maxKeyLen   uint32 = 4 * 1024
-	maxMetaLen  uint32 = 64 * 1024
+	alpn              = "mulga-repl-v1"
+	maxKeyLen  uint32 = 4 * 1024
+	maxMetaLen uint32 = 64 * 1024
 )
 
 // makeShardKey creates a unique key for storing a specific shard's metadata.
@@ -145,9 +145,9 @@ func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, erro
 	var l *quic.Listener
 	for i := 0; i < maxRetries; i++ {
 		l, err = quic.ListenAddr(addr, tlsConf, &quic.Config{
-			KeepAlivePeriod:      15 * time.Second,
-			MaxIdleTimeout:       60 * time.Second,
-			MaxIncomingStreams:   1000, // Allow more concurrent streams
+			KeepAlivePeriod:       15 * time.Second,
+			MaxIdleTimeout:        60 * time.Second,
+			MaxIncomingStreams:    1000, // Allow more concurrent streams
 			MaxIncomingUniStreams: 1000,
 		})
 		if err == nil {

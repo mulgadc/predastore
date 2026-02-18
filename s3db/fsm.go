@@ -22,7 +22,7 @@ const (
 type Command struct {
 	Type  CommandType `json:"type"`
 	Table string      `json:"table"`
-	Key   []byte      `json:"key"`   // []byte for safe JSON base64 encoding of binary keys
+	Key   []byte      `json:"key"` // []byte for safe JSON base64 encoding of binary keys
 	Value []byte      `json:"value,omitempty"`
 }
 

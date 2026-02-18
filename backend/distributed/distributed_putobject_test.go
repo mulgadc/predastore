@@ -71,10 +71,10 @@ func TestPutObjectWithTempFile(t *testing.T) {
 	// Create deterministic content (simulating viperblock chunk with header)
 	orig := make([]byte, objectSize)
 	// First 10 bytes: chunk header (VBCH magic + version + block size)
-	copy(orig[0:4], []byte("VBCH"))  // Magic
-	orig[4] = 0x01                   // Version high byte
-	orig[5] = 0x00                   // Version low byte
-	orig[6] = 0x00                   // Block size bytes
+	copy(orig[0:4], []byte("VBCH")) // Magic
+	orig[4] = 0x01                  // Version high byte
+	orig[5] = 0x00                  // Version low byte
+	orig[6] = 0x00                  // Block size bytes
 	orig[7] = 0x10
 	orig[8] = 0x00
 	orig[9] = 0x00
