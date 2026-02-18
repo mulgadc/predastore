@@ -65,7 +65,7 @@ func TestCreateBucket(t *testing.T) {
 
 	t.Run("returns error for invalid bucket name", func(t *testing.T) {
 		_, err := be.CreateBucket(ctx, &backend.CreateBucketRequest{
-			Bucket:  "A",  // Too short and uppercase
+			Bucket:  "A", // Too short and uppercase
 			OwnerID: "AKIAEXAMPLE",
 		})
 		require.Error(t, err)

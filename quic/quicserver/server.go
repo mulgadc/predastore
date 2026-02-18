@@ -27,13 +27,14 @@ import (
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/s3/wal"
 	"github.com/mulgadc/predastore/s3db"
+	"github.com/mulgadc/predastore/utils"
 	quic "github.com/quic-go/quic-go"
 )
 
 const (
-	alpn               = "mulga-repl-v1"
-	maxKeyLen   uint32 = 4 * 1024
-	maxMetaLen  uint32 = 64 * 1024
+	alpn              = "mulga-repl-v1"
+	maxKeyLen  uint32 = 4 * 1024
+	maxMetaLen uint32 = 64 * 1024
 )
 
 // makeShardKey creates a unique key for storing a specific shard's metadata.
@@ -43,7 +44,7 @@ func makeShardKey(objectHash [32]byte, shardIndex int) []byte {
 	// Append shard index as 4 bytes to the 32-byte hash
 	key := make([]byte, 36)
 	copy(key[:32], objectHash[:])
-	binary.BigEndian.PutUint32(key[32:], uint32(shardIndex))
+	binary.BigEndian.PutUint32(key[32:], utils.IntToUint32(shardIndex))
 	return key
 }
 
@@ -145,9 +146,9 @@ func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, erro
 	var l *quic.Listener
 	for i := 0; i < maxRetries; i++ {
 		l, err = quic.ListenAddr(addr, tlsConf, &quic.Config{
-			KeepAlivePeriod:      15 * time.Second,
-			MaxIdleTimeout:       60 * time.Second,
-			MaxIncomingStreams:   1000, // Allow more concurrent streams
+			KeepAlivePeriod:       15 * time.Second,
+			MaxIdleTimeout:        60 * time.Second,
+			MaxIncomingStreams:    1000, // Allow more concurrent streams
 			MaxIncomingUniStreams: 1000,
 		})
 		if err == nil {
@@ -343,7 +344,7 @@ func (qs *QuicServer) handleSTATUS(bw *bufio.Writer, req quicproto.Header) {
 		Status:  quicproto.StatusOK,
 		ReqID:   req.ReqID,
 		KeyLen:  0,
-		MetaLen: uint32(len(b)),
+		MetaLen: utils.IntToUint32(len(b)),
 		BodyLen: 0,
 	}
 	_ = quicproto.WriteHeader(bw, rh)
@@ -412,7 +413,7 @@ func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRe
 		ReqID:   req.ReqID,
 		KeyLen:  0,
 		MetaLen: 0,
-		BodyLen: uint64(responseSize),
+		BodyLen: utils.Int64ToUint64(responseSize),
 	}
 	if err := quicproto.WriteHeader(bw, rh); err != nil {
 		slog.Error("handleGET: write header failed", "error", err)
@@ -583,7 +584,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 	// Determine how many bytes to read
 	var bodyLen int
 	if req.BodyLen > 0 {
-		bodyLen = int(req.BodyLen)
+		bodyLen = utils.Uint64ToInt(req.BodyLen)
 	} else if putReq.ShardSize > 0 {
 		bodyLen = putReq.ShardSize
 	} else {
@@ -638,7 +639,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		Status:  quicproto.StatusOK,
 		ReqID:   req.ReqID,
 		KeyLen:  0,
-		MetaLen: uint32(len(respBytes)),
+		MetaLen: utils.IntToUint32(len(respBytes)),
 		BodyLen: 0,
 	}
 	if err := quicproto.WriteHeader(bw, rh); err != nil {
@@ -754,7 +755,7 @@ func (qs *QuicServer) sendDeleteResponse(bw *bufio.Writer, req quicproto.Header,
 		Status:  quicproto.StatusOK,
 		ReqID:   req.ReqID,
 		KeyLen:  0,
-		MetaLen: uint32(len(respBytes)),
+		MetaLen: utils.IntToUint32(len(respBytes)),
 		BodyLen: 0,
 	}
 	_ = quicproto.WriteHeader(bw, rh)
@@ -769,7 +770,7 @@ func writeErr(bw *bufio.Writer, req quicproto.Header, code uint16, msg string) {
 		Method:  req.Method,
 		Status:  code,
 		ReqID:   req.ReqID,
-		MetaLen: uint32(len(meta)),
+		MetaLen: utils.IntToUint32(len(meta)),
 		BodyLen: 0,
 	}
 	_ = quicproto.WriteHeader(bw, rh)

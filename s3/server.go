@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mulgadc/predastore/utils"
+
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/backend/filesystem"
@@ -45,11 +47,11 @@ type Server struct {
 	nodeID      int // For distributed mode: specific node to run (-1 = dev mode)
 
 	// Runtime state
-	config  *Config
-	server  *HTTP2Server
-	backend backend.Backend
-	dbServers   []*s3db.Server
-	quicCancel  context.CancelFunc
+	config     *Config
+	server     *HTTP2Server
+	backend    backend.Backend
+	dbServers  []*s3db.Server
+	quicCancel context.CancelFunc
 
 	// Profiling
 	pprofEnabled    bool
@@ -172,7 +174,6 @@ func WithPprof(enabled bool, outputPath string) Option {
 		return nil
 	}
 }
-
 
 // init initializes the server components
 func (s *Server) init() error {
@@ -334,7 +335,7 @@ func (s *Server) launchDBServers() []*s3db.Server {
 		nodePath := checkBaseDir(s.basePath, n.Path)
 
 		dbNodes[i] = s3db.DBNodeConfig{
-			ID:              uint64(n.ID),
+			ID:              utils.IntToUint64(n.ID),
 			Host:            n.Host,
 			Port:            n.Port,
 			RaftPort:        n.RaftPort,
@@ -362,7 +363,7 @@ func (s *Server) launchDBServers() []*s3db.Server {
 	var nodesToLaunch []s3db.DBNodeConfig
 	if s.nodeID > 0 {
 		for _, n := range dbNodes {
-			if n.ID == uint64(s.nodeID) {
+			if n.ID == utils.IntToUint64(s.nodeID) {
 				nodesToLaunch = append(nodesToLaunch, n)
 				break
 			}

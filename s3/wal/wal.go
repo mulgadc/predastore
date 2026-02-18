@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/s3db"
+	"github.com/mulgadc/predastore/utils"
 )
 
 // ShardSize is the max DATA size per WAL file (not including headers).
@@ -280,7 +281,7 @@ func (wal *WAL) SaveState() error {
 		filename = wal.StateFile
 	}
 
-	return os.WriteFile(filename, stateData, 0640)
+	return os.WriteFile(filename, stateData, 0600)
 }
 
 // LoadState loads the WAL state from disk
@@ -533,7 +534,7 @@ func (wal *WAL) createWALUnlocked(filename string) error {
 	// Open or create the file
 	// Removed syscall.O_SYNC - using periodic fsync (200ms) for better performance
 	// This follows PostgreSQL, BadgerDB, RocksDB best practices for WAL writes
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0640)
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
@@ -843,7 +844,7 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 	fragment.SeqNum = seqNum
 	fragment.ShardNum = shardNum
 	fragment.ShardFragment = shardFragment
-	fragment.Length = uint32(len(chunk))
+	fragment.Length = utils.IntToUint32(len(chunk))
 
 	if isLast {
 		fragment.Flags |= FlagEndOfShard
@@ -1120,27 +1121,29 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 		}
 
 		// Clamp payloadSize to what's logically remaining in the object
-		if uint32(payloadSize) > remaining {
+		ps := utils.IntToUint32(payloadSize)
+		if ps > remaining {
 			payloadSize = int(remaining)
+			ps = remaining
 		}
 
 		// Validate end-of-shard flag before reading
 		if fragment.Flags&FlagEndOfShard != 0 {
 			// This is the last fragment for this shard
 			// Verify that the fragment length matches remaining bytes
-			if uint32(payloadSize) != remaining {
+			if ps != remaining {
 				return nil, fmt.Errorf("end-of-shard flag set but fragment length %d doesn't match remaining bytes %d", payloadSize, remaining)
 			}
 		}
 
 		// Bounds-safe copy
 		copy(
-			data[bytesRead:bytesRead+uint32(payloadSize)],
+			data[bytesRead:bytesRead+ps],
 			fullChunkBuffer[:payloadSize],
 		)
 
-		remaining -= uint32(payloadSize)
-		bytesRead += uint32(payloadSize)
+		remaining -= ps
+		bytesRead += ps
 
 		// If end-of-shard flag was set, verify we've read all expected bytes and break
 		if fragment.Flags&FlagEndOfShard != 0 {

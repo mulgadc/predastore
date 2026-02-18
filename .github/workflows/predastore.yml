@@ -1,13 +1,27 @@
-name: Build and Test Predastore
+name: Predastore Build and Test
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
+      - dev
+    paths:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/predastore.yml
   pull_request:
+    paths:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+      - Makefile
+      - .github/workflows/predastore.yml
   workflow_dispatch:
 
 jobs:
-  predastore_build_and_test:
+  build_and_test:
     name: Predastore Build and Test
     runs-on: ubuntu-24.04
 
@@ -21,20 +35,31 @@ jobs:
           cache-dependency-path: "go.sum"
           go-version-file: "go.mod"
 
+      - name: Build Predastore
+        run: make build
+
       - name: Run Tests
-        run: LOG_IGNORE=1 go test -v ./...
+        run: make test
 
-      # - name: Go Vet
-      #   run: go vet ./...
+  lint_and_security:
+    name: Predastore Lint and Security
+    runs-on: ubuntu-24.04
 
-      # - name: Static Check
-      #   run: 	go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005" ./...
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
 
-      - name: Go Vulnerability Check
-        run: go tool govulncheck ./...
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          cache-dependency-path: "go.sum"
+          go-version-file: "go.mod"
 
-      # - name: Gosec Security Scanner
-      #   run: go tool gosec -exclude-generated ./...
+      - name: Check Format
+        run: make check-format
 
-      - name: Build
-        run: make go_build
+      - name: Go Vet
+        run: make vet
+
+      - name: Security Checks
+        run: make security-check

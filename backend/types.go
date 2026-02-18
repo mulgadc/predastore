@@ -164,12 +164,12 @@ type HeadObjectResponse struct {
 
 // CreateBucketRequest contains parameters for CreateBucket operation
 type CreateBucketRequest struct {
-	Bucket             string
-	Region             string // From LocationConstraint in request body
-	OwnerID            string // Access key ID of the authenticated user
-	OwnerDisplayName   string // Display name (optional)
-	ObjectLockEnabled  bool   // For object lock (future)
-	ObjectOwnership    string // BucketOwnerEnforced, BucketOwnerPreferred, ObjectWriter
+	Bucket            string
+	Region            string // From LocationConstraint in request body
+	OwnerID           string // Access key ID of the authenticated user
+	OwnerDisplayName  string // Display name (optional)
+	ObjectLockEnabled bool   // For object lock (future)
+	ObjectOwnership   string // BucketOwnerEnforced, BucketOwnerPreferred, ObjectWriter
 }
 
 // CreateBucketResponse contains the result of CreateBucket operation
@@ -196,12 +196,12 @@ type HeadBucketResponse struct {
 
 // BucketMetadata contains complete bucket metadata stored in s3db
 type BucketMetadata struct {
-	Name           string    `json:"name"`
-	Region         string    `json:"region"`
-	OwnerID        string    `json:"owner_id"`         // Access key ID of owner
-	OwnerDisplay   string    `json:"owner_display"`    // Display name
-	CreationDate   time.Time `json:"creation_date"`
-	Public         bool      `json:"public"`           // Allow anonymous access
-	ObjectLock     bool      `json:"object_lock"`      // Object lock enabled
-	Versioning     string    `json:"versioning"`       // Enabled, Suspended, or empty
+	Name         string    `json:"name"`
+	Region       string    `json:"region"`
+	OwnerID      string    `json:"owner_id"`      // Access key ID of owner
+	OwnerDisplay string    `json:"owner_display"` // Display name
+	CreationDate time.Time `json:"creation_date"`
+	Public       bool      `json:"public"`      // Allow anonymous access
+	ObjectLock   bool      `json:"object_lock"` // Object lock enabled
+	Versioning   string    `json:"versioning"`  // Enabled, Suspended, or empty
 }

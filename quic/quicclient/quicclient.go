@@ -13,6 +13,7 @@ import (
 
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/quic/quicserver"
+	"github.com/mulgadc/predastore/utils"
 	"github.com/quic-go/quic-go"
 )
 
@@ -122,9 +123,9 @@ func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader,
 		Method:  quicproto.MethodPUT,
 		Status:  0,
 		ReqID:   reqID,
-		KeyLen:  uint32(len(requestBytes)),
+		KeyLen:  utils.IntToUint32(len(requestBytes)),
 		MetaLen: 0,
-		BodyLen: uint64(bodyLen),
+		BodyLen: utils.Int64ToUint64(bodyLen),
 	}
 
 	// Write request header
@@ -236,7 +237,7 @@ func (c *Client) doDelete(ctx context.Context, requestBytes []byte) (quicproto.H
 		Method:  quicproto.MethodDELETE,
 		Status:  0,
 		ReqID:   reqID,
-		KeyLen:  uint32(len(requestBytes)),
+		KeyLen:  utils.IntToUint32(len(requestBytes)),
 		MetaLen: 0,
 		BodyLen: 0,
 	}
@@ -343,7 +344,7 @@ func (c *Client) GetRange(ctx context.Context, objectRequest quicserver.ObjectRe
 	// Return a limited reader that also closes the underlying stream when done
 	if rh.BodyLen > 0 {
 		return &limitedReadCloser{
-			Reader: io.LimitReader(rc, int64(rh.BodyLen)),
+			Reader: io.LimitReader(rc, utils.Uint64ToInt64(rh.BodyLen)),
 			closer: rc,
 		}, nil
 	}
@@ -395,7 +396,7 @@ func (c *Client) do(ctx context.Context, method uint8, objectRequest []byte, bod
 		Method:  method,
 		Status:  0,
 		ReqID:   reqID,
-		KeyLen:  uint32(len(objectRequest)),
+		KeyLen:  utils.IntToUint32(len(objectRequest)),
 		MetaLen: 0,
 		BodyLen: 0,
 	}

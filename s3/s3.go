@@ -7,9 +7,9 @@ import (
 
 type ACL struct {
 	AccessKeyId     string `toml:"access_key_id"`
-	SecretAccessKey string `toml:"secret_access_key`
-	Owner           string `toml:"owner`
-	Permissions     int    `toml:"permissions`
+	SecretAccessKey string `toml:"secret_access_key"`
+	Owner           string `toml:"owner"`
+	Permissions     int    `toml:"permissions"`
 }
 
 type S3_Buckets struct {

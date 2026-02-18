@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// multipartPortCounter gives each test invocation a unique port range to avoid
+// bind conflicts when the OS hasn't fully released UDP ports from the prior test.
+var multipartPortCounter atomic.Int32
+
 // setupMultipartTestBackend creates a distributed backend with QUIC servers for testing
 func setupMultipartTestBackend(t *testing.T) (*Backend, func()) {
 	t.Helper()
@@ -25,8 +30,8 @@ func setupMultipartTestBackend(t *testing.T) (*Backend, func()) {
 	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("multipart-test-%d", time.Now().UnixNano()))
 	require.NoError(t, err)
 
-	// Use high ports to avoid conflicts
-	testBasePort := 39991
+	// Each invocation gets a unique port range to avoid bind conflicts
+	testBasePort := 39991 + int(multipartPortCounter.Add(1)-1)*10
 
 	cfg := &Config{
 		BadgerDir:      tmpDir,
@@ -481,9 +486,9 @@ func TestDistributed_MultipartUpload_FullWorkflow(t *testing.T) {
 	const key = "full-workflow-test.bin"
 
 	// Create deterministic test data
-	part1Size := multipart.MinPartSize         // 5MB
-	part2Size := multipart.MinPartSize * 2     // 10MB
-	part3Size := int64(1024 * 1024)            // 1MB (last part can be small)
+	part1Size := multipart.MinPartSize     // 5MB
+	part2Size := multipart.MinPartSize * 2 // 10MB
+	part3Size := int64(1024 * 1024)        // 1MB (last part can be small)
 
 	part1Data := make([]byte, part1Size)
 	part2Data := make([]byte, part2Size)

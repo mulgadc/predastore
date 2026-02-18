@@ -132,7 +132,7 @@ func main() {
 
 	// Write to output file or stdout
 	if opts.OutputFile != "" {
-		err = os.WriteFile(opts.OutputFile, responseBody, 0644)
+		err = os.WriteFile(opts.OutputFile, responseBody, 0600)
 		if err != nil {
 			fmt.Printf("Error writing to output file: %v\n", err)
 			os.Exit(1)
