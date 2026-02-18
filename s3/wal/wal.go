@@ -281,7 +281,7 @@ func (wal *WAL) SaveState() error {
 		filename = wal.StateFile
 	}
 
-	return os.WriteFile(filename, stateData, 0640)
+	return os.WriteFile(filename, stateData, 0600)
 }
 
 // LoadState loads the WAL state from disk
@@ -534,7 +534,7 @@ func (wal *WAL) createWALUnlocked(filename string) error {
 	// Open or create the file
 	// Removed syscall.O_SYNC - using periodic fsync (200ms) for better performance
 	// This follows PostgreSQL, BadgerDB, RocksDB best practices for WAL writes
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0640)
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}

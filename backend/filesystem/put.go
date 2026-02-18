@@ -30,7 +30,7 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	}
 
 	// Ensure the directory exists
-	if err := os.MkdirAll(filepath.Dir(pathname), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(pathname), 0750); err != nil {
 		slog.Error("Error creating directories", "path", filepath.Dir(pathname), "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to create directory", 500)
 	}

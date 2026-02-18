@@ -38,7 +38,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.Create
 	uploadID := uuid.New().String()
 	uploadDir := filepath.Join(b.config.TempDir, uploadID)
 
-	if err := os.MkdirAll(uploadDir, 0755); err != nil {
+	if err := os.MkdirAll(uploadDir, 0750); err != nil {
 		slog.Error("Failed to create upload directory", "dir", uploadDir, "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to initialize upload", 500)
 	}
@@ -172,7 +172,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	}
 
 	// Ensure directory exists
-	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(destPath), 0750); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to create directory", 500)
 	}
 
