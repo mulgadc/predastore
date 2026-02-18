@@ -439,26 +439,3 @@ func (c *Client) do(ctx context.Context, method uint8, objectRequest []byte, bod
 	// Return a ReadCloser that will close the stream when the caller is done reading
 	return respHdr, &streamReadCloser{r: br, stream: s}, nil
 }
-
-type nopReadCloser struct {
-	r      io.Reader
-	closer interface{ Close() error }
-}
-
-func (n nopReadCloser) Read(p []byte) (int, error) { return n.r.Read(p) }
-func (n nopReadCloser) Close() error               { return n.closer.Close() }
-
-func bytesReader(b []byte) io.Reader {
-	return &byteReader{b: b}
-}
-
-type byteReader struct{ b []byte }
-
-func (r *byteReader) Read(p []byte) (int, error) {
-	if len(r.b) == 0 {
-		return 0, io.EOF
-	}
-	n := copy(p, r.b)
-	r.b = r.b[n:]
-	return n, nil
-}

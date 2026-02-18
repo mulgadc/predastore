@@ -364,7 +364,7 @@ func (n *RaftNode) Leave() error {
 		// Transfer leadership first
 		future := n.raft.LeadershipTransfer()
 		if err := future.Error(); err != nil {
-			// Non-fatal, continue with removal
+			slog.Error("failed to transfer leadership before leaving cluster", "error", err)
 		}
 	}
 

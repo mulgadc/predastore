@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -515,22 +514,4 @@ func TestByteRangeRequests(t *testing.T) {
 
 	// Verify we got the right bytes
 	assert.Equal(t, fullText[:10], partialContent, "Partial content should match first 10 bytes")
-}
-
-// Helper function to check file SHA256
-func checkFileSHA256(t *testing.T, filename string, expectedSHA string) {
-	// This function would calculate the SHA256 of a file and compare it
-	// For simplicity, we're just checking against the pre-calculated values
-	var actualSHA string
-
-	switch {
-	case strings.HasSuffix(filename, "test.txt"):
-		actualSHA = TEXT_FILE_SHA
-	case strings.HasSuffix(filename, "binary.dat"):
-		actualSHA = BINARY_FILE_SHA
-	default:
-		t.Fatalf("Unknown test file: %s", filename)
-	}
-
-	assert.Equal(t, expectedSHA, actualSHA, "File SHA256 should match expected value")
 }

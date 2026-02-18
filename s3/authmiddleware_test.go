@@ -12,8 +12,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-const host = "example.com"
-
 func TestSigV4AuthMiddleware(t *testing.T) {
 	// Create a test S3 config with known auth credentials
 	s3Config := &Config{

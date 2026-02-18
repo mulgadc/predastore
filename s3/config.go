@@ -81,7 +81,7 @@ func (s3 *Config) BucketConfig(bucket string) (S3_Buckets, error) {
 		}
 	}
 
-	return S3_Buckets{}, errors.New("Bucket not found")
+	return S3_Buckets{}, errors.New("bucket not found")
 }
 
 // ToFilesystemConfig converts s3.Config to filesystem backend config

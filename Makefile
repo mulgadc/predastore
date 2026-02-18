@@ -95,8 +95,8 @@ security-check:
 	@echo "  govulncheck ok"
 	set -o pipefail && go tool gosec -exclude=G104,G204,G304,G401,G402,G501 -exclude-generated ./... 2>&1 | tee tests/gosec-report.txt
 	@echo "  gosec ok"
-	# set -o pipefail && go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005" ./... 2>&1 | tee tests/staticcheck-report.txt
-	# @echo "  staticcheck ok"
+	set -o pipefail && go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005" ./... 2>&1 | tee tests/staticcheck-report.txt
+	@echo "  staticcheck ok"
 
 .PHONY: build go_build go_build_docker go_run preflight test bench dev \
 	docker_s3d docker_compose_up docker_compose_down docker docker_clean docker_test \

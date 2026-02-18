@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -45,11 +46,11 @@ func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.Lis
 		}
 
 		// Filter by owner if ownerID is provided
-		if ownerID != "" && metadata.OwnerID != ownerID {
-			// Check if bucket is public or if we should show it anyway
-			// For now, show all buckets but mark ownership
-			// The auth middleware should handle access control
-		}
+		// if ownerID != "" && metadata.OwnerID != ownerID {
+		// Check if bucket is public or if we should show it anyway
+		// For now, show all buckets but mark ownership
+		// The auth middleware should handle access control
+		// }
 
 		// Add or update (s3db takes precedence for metadata)
 		bucketMap[metadata.Name] = backend.BucketInfo{
@@ -62,6 +63,7 @@ func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.Lis
 	})
 
 	if err != nil {
+		slog.Error("failed to scan buckets from global state", "error", err)
 		// Log error but don't fail - return what we have from config
 	}
 
@@ -185,14 +187,4 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 		Contents:       contents,
 		CommonPrefixes: commonPrefixes,
 	}, nil
-}
-
-// getBucketConfig returns the bucket configuration for a given bucket name
-func (b *Backend) getBucketConfig(name string) *BucketConfig {
-	for _, bucket := range b.buckets {
-		if bucket.Name == name {
-			return &bucket
-		}
-	}
-	return nil
 }

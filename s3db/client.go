@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -77,9 +78,9 @@ func NewClient(config *ClientConfig) *Client {
 		ForceAttemptHTTP2: true,
 	}
 
-	// CRITICAL: Configure HTTP/2 support with custom TLS config
+	// Configure HTTP/2 support with custom TLS config
 	if err := http2.ConfigureTransport(transport); err != nil {
-		// Log but continue - will fall back to HTTP/1.1
+		slog.Error("failed to configure HTTP/2 transport, falling back to HTTP/1.1", "error", err)
 	}
 
 	return &Client{

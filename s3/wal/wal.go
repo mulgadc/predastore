@@ -441,28 +441,28 @@ func (wal *WAL) CreateWAL(filename string) (err error) {
 */
 
 // getCurrentWALFileSize returns the current size of the active WAL file (excluding header)
-func (wal *WAL) getCurrentWALFileSize() (int64, error) {
-	wal.mu.RLock()
-	defer wal.mu.RUnlock()
+// func (wal *WAL) getCurrentWALFileSize() (int64, error) {
+// 	wal.mu.RLock()
+// 	defer wal.mu.RUnlock()
 
-	if len(wal.Shard.DB) == 0 {
-		return 0, errors.New("no WAL files open")
-	}
+// 	if len(wal.Shard.DB) == 0 {
+// 		return 0, errors.New("no WAL files open")
+// 	}
 
-	activeWal := wal.Shard.DB[len(wal.Shard.DB)-1]
-	stat, err := activeWal.Stat()
-	if err != nil {
-		return 0, err
-	}
+// 	activeWal := wal.Shard.DB[len(wal.Shard.DB)-1]
+// 	stat, err := activeWal.Stat()
+// 	if err != nil {
+// 		return 0, err
+// 	}
 
-	// Return size minus WAL header
-	walHeaderSize := int64(wal.WALHeaderSize())
-	if stat.Size() < walHeaderSize {
-		return 0, nil
-	}
+// 	// Return size minus WAL header
+// 	walHeaderSize := int64(wal.WALHeaderSize())
+// 	if stat.Size() < walHeaderSize {
+// 		return 0, nil
+// 	}
 
-	return stat.Size() - walHeaderSize, nil
-}
+// 	return stat.Size() - walHeaderSize, nil
+// }
 
 // ensureWALFile ensures we have a WAL file open and returns its index
 // Caller must hold wal.mu lock
@@ -548,8 +548,7 @@ func (wal *WAL) createWALUnlocked(filename string) error {
 
 	// If file is empty, write WAL header
 	if stat.Size() == 0 {
-		var headers []byte
-		headers = wal.WALHeader()
+		headers := wal.WALHeader()
 
 		_, err = file.Write(headers)
 		if err != nil {
@@ -884,6 +883,7 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 	_, err := activeWal.Write(payload)
 
 	// Return buffer to pool immediately after write
+	//lint:ignore SA6002 TODO: switch to *[]byte pool to avoid boxing allocation
 	fragmentBufferPool.Put(payload)
 
 	if err != nil {
@@ -1096,7 +1096,7 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 		// Read the full on-disk chunk payload (fixed ChunkSize), then use fragment.Length as logical size.
 		fullChunkBuffer := make([]byte, wal.Shard.ChunkSize)
 
-		n, err = io.ReadFull(f, fullChunkBuffer) // exactly ChunkSize bytes per fragment on disk
+		_, err = io.ReadFull(f, fullChunkBuffer) // exactly ChunkSize bytes per fragment on disk
 
 		// Confirm, check EOF
 		if err != nil {
@@ -1323,13 +1323,6 @@ func (wal *WAL) ReadFromWriteResultStream(result *WriteResult) (io.Reader, error
 	}()
 
 	return pr, nil
-}
-
-func numFragments(size int) int {
-	if size == 0 {
-		return 0
-	}
-	return (size + int(ChunkSize) - 1) / int(ChunkSize)
 }
 
 func ReadChunk(r io.Reader) (chunk []byte, err error) {
