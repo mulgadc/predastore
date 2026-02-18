@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/s3db"
+	"github.com/mulgadc/predastore/utils"
 )
 
 // ShardSize is the max DATA size per WAL file (not including headers).
@@ -843,7 +844,7 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 	fragment.SeqNum = seqNum
 	fragment.ShardNum = shardNum
 	fragment.ShardFragment = shardFragment
-	fragment.Length = uint32(len(chunk))
+	fragment.Length = utils.IntToUint32(len(chunk))
 
 	if isLast {
 		fragment.Flags |= FlagEndOfShard
@@ -1120,27 +1121,29 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 		}
 
 		// Clamp payloadSize to what's logically remaining in the object
-		if uint32(payloadSize) > remaining {
+		ps := utils.IntToUint32(payloadSize)
+		if ps > remaining {
 			payloadSize = int(remaining)
+			ps = remaining
 		}
 
 		// Validate end-of-shard flag before reading
 		if fragment.Flags&FlagEndOfShard != 0 {
 			// This is the last fragment for this shard
 			// Verify that the fragment length matches remaining bytes
-			if uint32(payloadSize) != remaining {
+			if ps != remaining {
 				return nil, fmt.Errorf("end-of-shard flag set but fragment length %d doesn't match remaining bytes %d", payloadSize, remaining)
 			}
 		}
 
 		// Bounds-safe copy
 		copy(
-			data[bytesRead:bytesRead+uint32(payloadSize)],
+			data[bytesRead:bytesRead+ps],
 			fullChunkBuffer[:payloadSize],
 		)
 
-		remaining -= uint32(payloadSize)
-		bytesRead += uint32(payloadSize)
+		remaining -= ps
+		bytesRead += ps
 
 		// If end-of-shard flag was set, verify we've read all expected bytes and break
 		if fragment.Flags&FlagEndOfShard != 0 {

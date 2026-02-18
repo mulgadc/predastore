@@ -23,6 +23,7 @@ import (
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3/wal"
 	s3db "github.com/mulgadc/predastore/s3db"
+	"github.com/mulgadc/predastore/utils"
 )
 
 // NodeConfig holds configuration for a single node
@@ -806,5 +807,5 @@ func NodeToUint32(value string) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	return uint32(vint), nil
+	return utils.IntToUint32(vint), nil
 }
