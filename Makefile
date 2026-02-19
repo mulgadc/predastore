@@ -82,7 +82,8 @@ check-format:
 	@echo "  gofmt ok"
 
 # Excluded: newexpr (replaces aws.String with new, not idiomatic for AWS SDK)
-GOFIX_EXCLUDE := -newexpr=false
+# Excluded: stringsbuilder (replaces string += in loops with strings.Builder, not worth the complexity for small loops)
+GOFIX_EXCLUDE := -newexpr=false -stringsbuilder=false
 
 modernize:
 	@echo "Applying go fix modernizations..."
