@@ -69,7 +69,7 @@ func createBenchClientV2(tb testing.TB) *awss3v2.Client {
 		v2config.WithRegion(cfg.Region),
 		v2config.WithHTTPClient(httpClient),
 		v2config.WithEndpointResolverWithOptions(
-			awsv2.EndpointResolverWithOptionsFunc(func(service, region string, _ ...interface{}) (awsv2.Endpoint, error) {
+			awsv2.EndpointResolverWithOptionsFunc(func(service, region string, _ ...any) (awsv2.Endpoint, error) {
 				if service == awss3v2.ServiceID {
 					return awsv2.Endpoint{
 						URL:               S3_ENDPOINT,
@@ -102,10 +102,7 @@ func multipartUpload(tb testing.TB, client *awss3v2.Client, bucket, key string, 
 	var completedParts []awss3v2types.CompletedPart
 	const chunkSize = 5 * 1024 * 1024
 	for i := 0; i < len(data); i += chunkSize {
-		end := i + chunkSize
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(i+chunkSize, len(data))
 		partNumber := int32(len(completedParts) + 1)
 		uploadResp, err := client.UploadPart(context.Background(), &awss3v2.UploadPartInput{
 			Bucket:     awsv2.String(bucket),
@@ -145,7 +142,6 @@ func BenchmarkS3PutV2(b *testing.B) {
 	}
 
 	for _, size := range sizes {
-		size := size
 		b.Run(fmt.Sprintf("BenchmarkS3PutV2-%s", prettySize(size)), func(b *testing.B) {
 			cancel, wg := startBenchServer(b)
 			defer func() {
@@ -190,7 +186,6 @@ func BenchmarkS3GetV2(b *testing.B) {
 	}
 
 	for _, size := range sizes {
-		size := size
 		b.Run(fmt.Sprintf("BenchmarkS3GetV2-%s", prettySize(size)), func(b *testing.B) {
 			cancel, wg := startBenchServer(b)
 			defer func() {
@@ -239,7 +234,6 @@ func BenchmarkS3MultipartV2(b *testing.B) {
 	}
 
 	for _, size := range sizes {
-		size := size
 		b.Run(fmt.Sprintf("BenchmarkS3MultipartV2-%s", prettySize(size)), func(b *testing.B) {
 			cancel, wg := startBenchServer(b)
 			defer func() {

@@ -39,7 +39,7 @@ func NewFSM(db *badger.DB) *FSM {
 
 // Apply is called once a log entry is committed by Raft
 // It applies the command to the Badger database
-func (f *FSM) Apply(log *raft.Log) interface{} {
+func (f *FSM) Apply(log *raft.Log) any {
 	var cmd Command
 	if err := json.Unmarshal(log.Data, &cmd); err != nil {
 		return fmt.Errorf("failed to unmarshal command: %w", err)

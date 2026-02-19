@@ -38,7 +38,7 @@ type Backend struct {
 }
 
 // New creates a new filesystem backend
-func New(config interface{}) (backend.Backend, error) {
+func New(config any) (backend.Backend, error) {
 	cfg, ok := config.(*Config)
 	if !ok {
 		return nil, errors.New("invalid configuration type for filesystem backend")

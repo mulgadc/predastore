@@ -55,7 +55,7 @@ func TestSingleNodeRaft(t *testing.T) {
 	assert.Equal(t, []byte("value1-updated"), value)
 
 	// Test multiple keys
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		key := fmt.Sprintf("key-%d", i)
 		val := fmt.Sprintf("value-%d", i)
 		err = node.Put("test-table", key, []byte(val))
@@ -333,11 +333,11 @@ func TestConcurrentWrites(t *testing.T) {
 	var wg sync.WaitGroup
 	errors := make(chan error, numWriters*numWrites)
 
-	for w := 0; w < numWriters; w++ {
+	for w := range numWriters {
 		wg.Add(1)
 		go func(writerID int) {
 			defer wg.Done()
-			for i := 0; i < numWrites; i++ {
+			for i := range numWrites {
 				key := fmt.Sprintf("writer-%d-key-%d", writerID, i)
 				value := fmt.Sprintf("writer-%d-value-%d", writerID, i)
 				if err := node.Put("concurrent", key, []byte(value)); err != nil {
@@ -356,8 +356,8 @@ func TestConcurrentWrites(t *testing.T) {
 	}
 
 	// Verify all writes
-	for w := 0; w < numWriters; w++ {
-		for i := 0; i < numWrites; i++ {
+	for w := range numWriters {
+		for i := range numWrites {
 			key := fmt.Sprintf("writer-%d-key-%d", w, i)
 			expectedValue := fmt.Sprintf("writer-%d-value-%d", w, i)
 			value, err := node.Get("concurrent", key)

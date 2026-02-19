@@ -51,6 +51,9 @@ jobs:
       - name: Check Format
         run: make check-format
 
+      - name: Check Modernize
+        run: make check-modernize
+
       - name: Go Vet
         run: make vet
 

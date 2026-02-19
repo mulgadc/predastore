@@ -321,7 +321,7 @@ func TestMultipartETagFormat(t *testing.T) {
 	// Create deterministic test data
 	part1MD5 := make([]byte, 16)
 	part2MD5 := make([]byte, 16)
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		part1MD5[i] = byte(i)
 		part2MD5[i] = byte(i + 16)
 	}

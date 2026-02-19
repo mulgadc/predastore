@@ -189,6 +189,6 @@ func detectContentType(path string) (string, error) {
 // generateETag creates an ETag for an object
 func generateETag(bucket, name string, modTime time.Time) string {
 	hash := md5.New()
-	hash.Write([]byte(fmt.Sprintf("%s/%s:(%s)", bucket, name, modTime.String())))
+	hash.Write(fmt.Appendf(nil, "%s/%s:(%s)", bucket, name, modTime.String()))
 	return hex.EncodeToString(hash.Sum(nil))
 }

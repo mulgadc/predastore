@@ -85,7 +85,7 @@ func (s3 *Config) BucketConfig(bucket string) (S3_Buckets, error) {
 }
 
 // ToFilesystemConfig converts s3.Config to filesystem backend config
-func (s3 *Config) ToFilesystemConfig() interface{} {
+func (s3 *Config) ToFilesystemConfig() any {
 	// Import dynamically to avoid circular imports
 	// The actual conversion happens in the routes setup
 	return s3

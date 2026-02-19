@@ -20,9 +20,9 @@ go_run:
 	@echo -e "\n....Running $(GO_PROJECT_NAME)...."
 	$(GOPATH)/bin/$(GO_PROJECT_NAME)
 
-# Preflight — runs the same checks as GitHub Actions (format + lint + security + tests).
+# Preflight — runs the same checks as GitHub Actions (format + modernize + lint + security + tests).
 # Use this before committing to catch CI failures locally.
-preflight: check-format vet security-check test
+preflight: check-format check-modernize vet security-check test
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
 # Run unit tests
@@ -81,6 +81,24 @@ check-format:
 	fi
 	@echo "  gofmt ok"
 
+# Excluded: newexpr (replaces aws.String with new, not idiomatic for AWS SDK)
+GOFIX_EXCLUDE := -newexpr=false
+
+modernize:
+	@echo "Applying go fix modernizations..."
+	go fix $(GOFIX_EXCLUDE) ./...
+	@echo "  go fix applied"
+
+check-modernize:
+	@echo "Checking go fix modernizations..."
+	@DIFF=$$(go fix $(GOFIX_EXCLUDE) -diff ./... 2>&1); \
+	if [ -n "$$DIFF" ]; then \
+		echo "$$DIFF"; \
+		echo "Run 'make modernize' to fix."; \
+		exit 1; \
+	fi
+	@echo "  go fix ok"
+
 # Go vet (fails on issues, matches CI)
 vet:
 	@echo "Running go vet..."
@@ -100,4 +118,4 @@ security-check:
 
 .PHONY: build go_build go_build_docker go_run preflight test bench dev \
 	docker_s3d docker_compose_up docker_compose_down docker docker_clean docker_test \
-	run clean format check-format vet security-check
+	run clean format check-format modernize check-modernize vet security-check

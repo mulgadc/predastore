@@ -49,7 +49,7 @@ func TestPutObjectWithTempFile(t *testing.T) {
 
 	// Start QUIC servers for nodes 0-4 on test ports
 	quicServers := make([]*quicserver.QuicServer, 5)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 

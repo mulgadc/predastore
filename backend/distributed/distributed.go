@@ -141,7 +141,7 @@ func (w *bytesBufferWriter) Write(p []byte) (n int, err error) {
 }
 
 // New creates a new distributed backend
-func New(config interface{}) (backend.Backend, error) {
+func New(config any) (backend.Backend, error) {
 	cfg, ok := config.(*Config)
 	if !ok {
 		return nil, errors.New("invalid configuration type for distributed backend")

@@ -122,7 +122,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 
 			// Generate ETag
 			hash := md5.New()
-			hash.Write([]byte(fmt.Sprintf("%s/%s:(%s)", req.Bucket, name, info.ModTime().String())))
+			hash.Write(fmt.Appendf(nil, "%s/%s:(%s)", req.Bucket, name, info.ModTime().String()))
 			etag := hex.EncodeToString(hash.Sum(nil))
 
 			objects = append(objects, backend.ObjectInfo{

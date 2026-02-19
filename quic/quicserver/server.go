@@ -144,7 +144,7 @@ func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, erro
 
 	// Retry port binding with exponential backoff
 	var l *quic.Listener
-	for i := 0; i < maxRetries; i++ {
+	for i := range maxRetries {
 		l, err = quic.ListenAddr(addr, tlsConf, &quic.Config{
 			KeepAlivePeriod:       15 * time.Second,
 			MaxIdleTimeout:        60 * time.Second,

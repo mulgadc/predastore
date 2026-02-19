@@ -354,7 +354,7 @@ func (s *HTTP2Server) writeS3Error(w http.ResponseWriter, r *http.Request, statu
 }
 
 // writeXML writes an XML response
-func (s *HTTP2Server) writeXML(w http.ResponseWriter, statusCode int, v interface{}) error {
+func (s *HTTP2Server) writeXML(w http.ResponseWriter, statusCode int, v any) error {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(statusCode)
 	return xml.NewEncoder(w).Encode(v)

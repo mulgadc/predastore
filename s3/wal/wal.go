@@ -45,7 +45,7 @@ const (
 // This pool is critical for performance - writeFragment is called thousands of times
 // per shard write, and allocating 8KB+ per call causes significant GC overhead.
 var fragmentBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return make([]byte, FragmentHeaderBytes+ChunkSize)
 	},
 }
@@ -489,7 +489,7 @@ func (wal *WAL) ensureWALFile() (int, error) {
 	// Need to create a new WAL file
 	// Keep incrementing until we find an empty file or one with space
 	maxAttempts := 100
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	for attempt := range maxAttempts {
 		filename := filepath.Join(wal.WalDir, FormatWalFile(wal.WalNum.Load()))
 
 		err := wal.createWALUnlocked(filename)
@@ -998,10 +998,7 @@ func (wal *WAL) ReadFromWriteResult(result *WriteResult) (data []byte, err error
 
 			// Copy to output buffer
 			remaining := result.TotalSize - bytesRead
-			copySize := payloadSize
-			if copySize > remaining {
-				copySize = remaining
-			}
+			copySize := min(payloadSize, remaining)
 			copy(data[bytesRead:bytesRead+copySize], fullChunkBuffer[:copySize])
 			bytesRead += copySize
 			fileBytesRead += int64(FragmentHeaderBytes + n) // header + fixed payload
@@ -1283,10 +1280,7 @@ func (wal *WAL) ReadFromWriteResultStream(result *WriteResult) (io.Reader, error
 						return
 					}
 
-					toWrite := int(length)
-					if toWrite > remaining {
-						toWrite = remaining
-					}
+					toWrite := min(int(length), remaining)
 
 					if toWrite > 0 {
 						if _, err := pw.Write(fullChunkBuffer[:toWrite]); err != nil {

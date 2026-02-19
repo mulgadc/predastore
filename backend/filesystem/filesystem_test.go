@@ -58,7 +58,7 @@ func createTestFile(t *testing.T, be *Backend, key string, content []byte) {
 func TestNew(t *testing.T) {
 	tests := []struct {
 		name    string
-		config  interface{}
+		config  any
 		wantErr bool
 	}{
 		{

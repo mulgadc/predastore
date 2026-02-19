@@ -262,7 +262,7 @@ func TestNewWithStateFile(t *testing.T) {
 	// Write some test data
 
 	for range 10 {
-		testData := []byte(fmt.Sprintf("Hello %d, World! This is test data for checksum validation.", time.Now().UnixNano()))
+		testData := fmt.Appendf(nil, "Hello %d, World! This is test data for checksum validation.", time.Now().UnixNano())
 
 		testDataReader := bytes.NewReader(testData)
 
@@ -288,7 +288,7 @@ func TestNewWithStateFile(t *testing.T) {
 
 	// Next, write more data, confirm state increments
 	for range 10 {
-		testData := []byte(fmt.Sprintf("Hello %d, World! This is test data for checksum validation.", time.Now().UnixNano()))
+		testData := fmt.Appendf(nil, "Hello %d, World! This is test data for checksum validation.", time.Now().UnixNano())
 
 		testDataReader := bytes.NewReader(testData)
 
@@ -1051,12 +1051,12 @@ func TestConcurrentWritesWithSync(t *testing.T) {
 	timeout := time.After(30 * time.Second)
 
 	// Start concurrent writers
-	for i := 0; i < numWriters; i++ {
+	for i := range numWriters {
 		go func(writerID int) {
-			for j := 0; j < writesPerWriter; j++ {
+			for j := range writesPerWriter {
 				data := make([]byte, dataSize)
 				// Fill with identifiable data
-				for k := 0; k < len(data); k++ {
+				for k := range data {
 					data[k] = byte((writerID*256 + j + k) % 256)
 				}
 

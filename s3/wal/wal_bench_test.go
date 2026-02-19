@@ -37,7 +37,6 @@ const (
 
 func BenchmarkWAL_Write(b *testing.B) {
 	for _, sz := range benchSizes() {
-		sz := sz
 		b.Run(fmt.Sprintf("write/%s", humanBytes(sz)), func(b *testing.B) {
 			b.ReportAllocs()
 
@@ -75,7 +74,6 @@ func BenchmarkWAL_Write(b *testing.B) {
 
 func BenchmarkWAL_Read(b *testing.B) {
 	for _, sz := range benchSizes() {
-		sz := sz
 		b.Run(fmt.Sprintf("read/%s", humanBytes(sz)), func(b *testing.B) {
 			b.ReportAllocs()
 
@@ -98,7 +96,7 @@ func BenchmarkWAL_Read(b *testing.B) {
 				}
 
 				var r bytes.Reader
-				for i := 0; i < records; i++ {
+				for i := range records {
 					seed := uint64(i + 1)
 					buf := make([]byte, sz)
 					fillPayload(buf, seed)
@@ -172,14 +170,9 @@ func benchRecordsForSize(recordSize int) int {
 	if recordSize <= 0 {
 		return 2
 	}
-	// Cap to keep setup quick and memory bounded.
-	records := (16 << 20) / recordSize // aim ~16MiB logical data in setup
-	if records < 2 {
-		records = 2
-	}
-	if records > benchMaxRecords {
-		records = benchMaxRecords
-	}
+	// Cap to keep setup quick and memory bounded (~16MiB logical data).
+	records := max((16<<20)/recordSize, 2)
+	records = min(records, benchMaxRecords)
 	return records
 }
 

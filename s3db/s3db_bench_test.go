@@ -95,10 +95,10 @@ func setupFixture(b *testing.B) *benchFixture {
 			fixture.buckets[accountID] = append(fixture.buckets[accountID], bucketName)
 			baseARN := fmt.Sprintf("arn:aws:s3::%s:%s", accountID, bucketName)
 
-			for objIdx := 0; objIdx < objCount; objIdx++ {
+			for objIdx := range objCount {
 				objectKey := generateObjectKey(bucketName, objIdx, objCount)
 				objectARN := fmt.Sprintf("%s/%s", baseARN, objectKey)
-				value := []byte(fmt.Sprintf("content-%s-%d", bucketName, objIdx))
+				value := fmt.Appendf(nil, "content-%s-%d", bucketName, objIdx)
 
 				if err := db.Set([]byte(objectARN), value); err != nil {
 					b.Fatalf("Failed to populate: %v", err)
@@ -338,10 +338,10 @@ func BenchmarkGet(b *testing.B) {
 
 	// Prepare test keys that we know exist in the fixture
 	testKeys := [][]byte{
-		[]byte(fmt.Sprintf("arn:aws:s3::%s:images/image-00000.jpg", accountID)),
-		[]byte(fmt.Sprintf("arn:aws:s3::%s:images/image-00050.jpg", accountID)),
-		[]byte(fmt.Sprintf("arn:aws:s3::%s:documents/doc-2024-001-00000.pdf", accountID)),
-		[]byte(fmt.Sprintf("arn:aws:s3::%s:archive/archive/2024/01/01/file-00000.dat", accountID)),
+		fmt.Appendf(nil, "arn:aws:s3::%s:images/image-00000.jpg", accountID),
+		fmt.Appendf(nil, "arn:aws:s3::%s:images/image-00050.jpg", accountID),
+		fmt.Appendf(nil, "arn:aws:s3::%s:documents/doc-2024-001-00000.pdf", accountID),
+		fmt.Appendf(nil, "arn:aws:s3::%s:archive/archive/2024/01/01/file-00000.dat", accountID),
 	}
 
 	// Verify keys exist
@@ -384,8 +384,8 @@ func BenchmarkMixedWorkload(b *testing.B) {
 	for _, pattern := range patterns {
 		b.Run(pattern.name, func(b *testing.B) {
 			value := []byte("test-data-mixed-workload")
-			readKey := []byte(fmt.Sprintf("arn:aws:s3::%s:images/image-00050.jpg", accountID))
-			scanPrefix := []byte(fmt.Sprintf("arn:aws:s3::%s:images/image-", accountID))
+			readKey := fmt.Appendf(nil, "arn:aws:s3::%s:images/image-00050.jpg", accountID)
+			scanPrefix := fmt.Appendf(nil, "arn:aws:s3::%s:images/image-", accountID)
 
 			b.ResetTimer()
 			b.ReportAllocs()
@@ -403,7 +403,7 @@ func BenchmarkMixedWorkload(b *testing.B) {
 					}
 				} else {
 					// Write operation
-					key := []byte(fmt.Sprintf("arn:aws:s3::%s:test-mixed/obj-%d.dat", accountID, i))
+					key := fmt.Appendf(nil, "arn:aws:s3::%s:test-mixed/obj-%d.dat", accountID, i)
 					_ = fixture.db.Set(key, value)
 				}
 			}
@@ -417,7 +417,7 @@ func BenchmarkConcurrentPrefixScan(b *testing.B) {
 	defer fixture.teardown()
 
 	accountID := fixture.accounts[0]
-	prefix := []byte(fmt.Sprintf("arn:aws:s3::%s:images/", accountID))
+	prefix := fmt.Appendf(nil, "arn:aws:s3::%s:images/", accountID)
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -493,7 +493,7 @@ func BenchmarkMultiAccountScan(b *testing.B) {
 		}
 
 		b.Run(fmt.Sprintf("account-%d", idx+1), func(b *testing.B) {
-			prefix := []byte(fmt.Sprintf("arn:aws:s3::%s:", accountID))
+			prefix := fmt.Appendf(nil, "arn:aws:s3::%s:", accountID)
 
 			keys, err := fixture.db.ListKeys(prefix)
 			if err != nil {
@@ -528,12 +528,12 @@ func BenchmarkConcurrentScans(b *testing.B) {
 		name   string
 		prefix []byte
 	}{
-		{"images", []byte(fmt.Sprintf("arn:aws:s3::%s:images/", accountID))},
-		{"documents", []byte(fmt.Sprintf("arn:aws:s3::%s:documents/", accountID))},
-		{"archive", []byte(fmt.Sprintf("arn:aws:s3::%s:archive/", accountID))},
-		{"image-prefix", []byte(fmt.Sprintf("arn:aws:s3::%s:images/image-", accountID))},
-		{"doc-prefix", []byte(fmt.Sprintf("arn:aws:s3::%s:documents/doc-2024-", accountID))},
-		{"archive-month", []byte(fmt.Sprintf("arn:aws:s3::%s:archive/archive/2024/06/", accountID))},
+		{"images", fmt.Appendf(nil, "arn:aws:s3::%s:images/", accountID)},
+		{"documents", fmt.Appendf(nil, "arn:aws:s3::%s:documents/", accountID)},
+		{"archive", fmt.Appendf(nil, "arn:aws:s3::%s:archive/", accountID)},
+		{"image-prefix", fmt.Appendf(nil, "arn:aws:s3::%s:images/image-", accountID)},
+		{"doc-prefix", fmt.Appendf(nil, "arn:aws:s3::%s:documents/doc-2024-", accountID)},
+		{"archive-month", fmt.Appendf(nil, "arn:aws:s3::%s:archive/archive/2024/06/", accountID)},
 	}
 
 	// Verify all prefixes exist and get expected counts
@@ -586,16 +586,16 @@ func BenchmarkConcurrentMixedOperations(b *testing.B) {
 
 	// Prefixes for reading
 	readPrefixes := [][]byte{
-		[]byte(fmt.Sprintf("arn:aws:s3::%s:images/image-", accountID)),
-		[]byte(fmt.Sprintf("arn:aws:s3::%s:documents/doc-2024-", accountID)),
-		[]byte(fmt.Sprintf("arn:aws:s3::%s:archive/archive/2024/", accountID)),
+		fmt.Appendf(nil, "arn:aws:s3::%s:images/image-", accountID),
+		fmt.Appendf(nil, "arn:aws:s3::%s:documents/doc-2024-", accountID),
+		fmt.Appendf(nil, "arn:aws:s3::%s:archive/archive/2024/", accountID),
 	}
 
 	// Test keys for point reads
 	testKeys := [][]byte{
-		[]byte(fmt.Sprintf("arn:aws:s3::%s:images/image-00000.jpg", accountID)),
-		[]byte(fmt.Sprintf("arn:aws:s3::%s:documents/doc-2024-001-00000.pdf", accountID)),
-		[]byte(fmt.Sprintf("arn:aws:s3::%s:archive/archive/2024/01/01/file-00000.dat", accountID)),
+		fmt.Appendf(nil, "arn:aws:s3::%s:images/image-00000.jpg", accountID),
+		fmt.Appendf(nil, "arn:aws:s3::%s:documents/doc-2024-001-00000.pdf", accountID),
+		fmt.Appendf(nil, "arn:aws:s3::%s:archive/archive/2024/01/01/file-00000.dat", accountID),
 	}
 
 	goroutineCounts := []int{2, 4, 8}
@@ -625,7 +625,7 @@ func BenchmarkConcurrentMixedOperations(b *testing.B) {
 
 					case 2:
 						// Write operation
-						key := []byte(fmt.Sprintf("arn:aws:s3::%s:concurrent-test/obj-%d.dat", accountID, opCount))
+						key := fmt.Appendf(nil, "arn:aws:s3::%s:concurrent-test/obj-%d.dat", accountID, opCount)
 						_ = fixture.db.Set(key, value)
 
 					case 3:
@@ -649,7 +649,7 @@ func BenchmarkConcurrentScansWithContention(b *testing.B) {
 	accountID := fixture.accounts[0]
 
 	// Single prefix that all goroutines will access simultaneously (high contention)
-	contentionPrefix := []byte(fmt.Sprintf("arn:aws:s3::%s:images/", accountID))
+	contentionPrefix := fmt.Appendf(nil, "arn:aws:s3::%s:images/", accountID)
 
 	// Verify prefix exists
 	keys, err := fixture.db.ListKeys(contentionPrefix)

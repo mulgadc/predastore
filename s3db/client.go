@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -396,10 +397,8 @@ func (c *Client) AddNode(addr string) {
 	defer c.mu.Unlock()
 
 	// Check if already exists
-	for _, n := range c.nodes {
-		if n == addr {
-			return
-		}
+	if slices.Contains(c.nodes, addr) {
+		return
 	}
 	c.nodes = append(c.nodes, addr)
 }

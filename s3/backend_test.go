@@ -146,7 +146,6 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 // RunWithBackends runs a test function against multiple backends
 func RunWithBackends(t *testing.T, backends []BackendType, testFn func(t *testing.T, tb *TestBackend)) {
 	for _, backendType := range backends {
-		backendType := backendType // capture range variable
 		t.Run(string(backendType), func(t *testing.T) {
 			var tb *TestBackend
 			switch backendType {

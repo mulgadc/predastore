@@ -148,14 +148,11 @@ func TestS3DB_ObjectsByPrefix(t *testing.T) {
 	for i, prefix := range prefixes {
 		// Each prefix gets 10 + (i * 4) objects, so prefix1 gets 10, prefix2 gets 14, etc.
 		// This gives us a range from 10 to 46 objects per prefix
-		objectCount := 10 + (i * 4)
-		if objectCount > 50 {
-			objectCount = 50
-		}
+		objectCount := min(10+(i*4), 50)
 		expectedCounts[prefix] = objectCount
 
 		// Create objects at different levels
-		for j := 0; j < objectCount; j++ {
+		for j := range objectCount {
 			var objectKey string
 			var objectARN string
 
@@ -172,7 +169,7 @@ func TestS3DB_ObjectsByPrefix(t *testing.T) {
 			}
 
 			objectARN = fmt.Sprintf("%s/%s", baseARN, objectKey)
-			value := []byte(fmt.Sprintf("content-%s-%d", prefix, j))
+			value := fmt.Appendf(nil, "content-%s-%d", prefix, j)
 
 			err := db.Set([]byte(objectARN), value)
 			assert.NoError(t, err, "Failed to set object: %s", objectARN)
@@ -286,12 +283,9 @@ func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
 		baseARN := fmt.Sprintf("arn:aws:s3::%s:%s", accountID, bucket)
 
 		for i, prefix := range prefixes {
-			objectCount := 10 + (i * 4)
-			if objectCount > 50 {
-				objectCount = 50
-			}
+			objectCount := min(10+(i*4), 50)
 
-			for j := 0; j < objectCount; j++ {
+			for j := range objectCount {
 				var objectKey string
 				if j%3 == 0 {
 					objectKey = fmt.Sprintf("%s/file%d.txt", prefix, j)
@@ -302,7 +296,7 @@ func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
 				}
 
 				objectARN := fmt.Sprintf("%s/%s", baseARN, objectKey)
-				value := []byte(fmt.Sprintf("content-%s-%s-%d", bucket, prefix, j))
+				value := fmt.Appendf(nil, "content-%s-%s-%d", bucket, prefix, j)
 
 				err := db.Set([]byte(objectARN), value)
 				assert.NoError(t, err, "Failed to set object: %s", objectARN)
@@ -318,7 +312,7 @@ func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
 		totalObjects, len(buckets), len(prefixes))
 
 	// Test: Filter by account ID - should get all objects from all buckets
-	accountPrefix := []byte(fmt.Sprintf("arn:aws:s3::%s:", accountID))
+	accountPrefix := fmt.Appendf(nil, "arn:aws:s3::%s:", accountID)
 	allAccountKeys, err := db.ListKeys(accountPrefix)
 	assert.NoError(t, err, "Failed to list all keys for account")
 
@@ -355,7 +349,7 @@ func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
 
 	// Calculate expected deep count (objects where j%3 == 2)
 	expectedDeepCount := 0
-	for j := 0; j < expectedCount; j++ {
+	for j := range expectedCount {
 		if j%3 == 2 {
 			expectedDeepCount++
 		}

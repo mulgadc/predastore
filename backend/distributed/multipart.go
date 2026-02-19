@@ -27,7 +27,7 @@ func multipartUploadKey(uploadID string) []byte {
 
 // multipartPartKey generates the key for storing part metadata
 func multipartPartKey(uploadID string, partNumber int) []byte {
-	return []byte(fmt.Sprintf("%s:%05d", uploadID, partNumber))
+	return fmt.Appendf(nil, "%s:%05d", uploadID, partNumber)
 }
 
 // multipartPartsPrefix returns the prefix for all parts of an upload

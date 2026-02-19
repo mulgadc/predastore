@@ -171,7 +171,7 @@ type contextKey string
 const contextKeyAccessKey contextKey = "accessKey"
 
 // writeJSON writes a JSON response
-func (s *Server) writeJSON(w http.ResponseWriter, statusCode int, v interface{}) {
+func (s *Server) writeJSON(w http.ResponseWriter, statusCode int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(v)
@@ -179,7 +179,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, statusCode int, v interface{})
 
 // handleHealth returns server health status
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"status": "healthy",
 		"time":   time.Now().UTC().Format(time.RFC3339),
 	})
@@ -461,7 +461,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("Node joined cluster", "node_id", req.NodeID, "addr", req.Addr)
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"status":  "joined",
 		"node_id": req.NodeID,
 	})
@@ -469,7 +469,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 
 // handleLeader returns the current leader information
 func (s *Server) handleLeader(w http.ResponseWriter, r *http.Request) {
-	s.writeJSON(w, http.StatusOK, map[string]interface{}{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"leader_id":   s.node.LeaderID(),
 		"leader_addr": s.node.LeaderAddr(),
 		"is_leader":   s.node.IsLeader(),

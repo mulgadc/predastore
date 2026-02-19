@@ -38,7 +38,7 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 	backend.SetDataDir(filepath.Join(tmp, "nodes"))
 
 	// `New()` uses PartitionCount=5 by default and names nodes as node-0..node-4.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		require.NoError(t, os.MkdirAll(filepath.Join(backend.DataDir(), fmt.Sprintf("node-%d", i)), 0750))
 	}
 
@@ -88,7 +88,7 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 	totalShards := backend.RsDataShard() + backend.RsParityShard()
 	shardBytes := make([][]byte, totalShards)
 
-	for i := 0; i < totalShards; i++ {
+	for i := range totalShards {
 		nodeDir := backend.nodeDir(hashRingShards[i].String())
 		w, err := wal.New(filepath.Join(nodeDir, "state.json"), nodeDir)
 		require.NoError(t, err)
@@ -155,7 +155,7 @@ func TestReadFromWriteResultStream_RoundTripJoin(t *testing.T) {
 	backend.SetDataDir(filepath.Join(tmp, "nodes"))
 
 	// `New()` uses PartitionCount=5 by default and names nodes as node-0..node-4.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		require.NoError(t, os.MkdirAll(filepath.Join(backend.DataDir(), fmt.Sprintf("node-%d", i)), 0750))
 	}
 
@@ -199,7 +199,7 @@ func TestReadFromWriteResultStream_RoundTripJoin(t *testing.T) {
 		}
 	})
 
-	for i := 0; i < totalShards; i++ {
+	for i := range totalShards {
 		nodeDir := backend.nodeDir(hashRingShards[i].String())
 		w, err := wal.New(filepath.Join(nodeDir, "state.json"), nodeDir)
 		require.NoError(t, err)
@@ -267,7 +267,7 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 			// `New()` uses PartitionCount=11 and names nodes as node-0..node-10.
 			// Store server references for shutdown before direct WAL access.
 			quicServers := make([]*quicserver.QuicServer, 11)
-			for i := 0; i < 11; i++ {
+			for i := range 11 {
 				nodeDir := filepath.Join(backend.DataDir(), fmt.Sprintf("node-%d", i))
 				t.Log("Creating node directory", nodeDir)
 				require.NoError(t, os.MkdirAll(nodeDir, 0750))
@@ -487,7 +487,7 @@ func TestGetObjectByteRange(t *testing.T) {
 
 	// Start QUIC servers for nodes 0-4 on test ports
 	quicServers := make([]*quicserver.QuicServer, 5)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 

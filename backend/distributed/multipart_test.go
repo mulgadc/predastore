@@ -49,7 +49,7 @@ func setupMultipartTestBackend(t *testing.T) (*Backend, func()) {
 
 	// Start QUIC servers
 	quicServers := make([]*quicserver.QuicServer, 5)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 
@@ -615,7 +615,7 @@ func TestDistributed_MultipartUpload_LargeNumberOfParts(t *testing.T) {
 	parts := make([]backend.CompletedPart, numParts)
 	partSizes := make([]int64, numParts)
 
-	for i := 0; i < numParts; i++ {
+	for i := range numParts {
 		var partData []byte
 		if i < numParts-1 {
 			// Non-last parts must be at least 5MB

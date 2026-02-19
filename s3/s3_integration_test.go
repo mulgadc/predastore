@@ -367,7 +367,7 @@ func runIntegrationSuite(t *testing.T, client s3Adapter) {
 		}
 
 		var parts [][]byte
-		for i := 0; i < partCount; i++ {
+		for i := range partCount {
 			start := i * partSize
 			end := start + partSize
 			parts = append(parts, data[start:end])
@@ -422,7 +422,6 @@ func TestS3Integration(t *testing.T) {
 			client: newS3AdapterV2,
 		},
 	} {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			runIntegrationSuite(t, tc.client(t))
 		})
