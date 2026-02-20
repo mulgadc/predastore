@@ -22,13 +22,31 @@ go_run:
 
 # Preflight — runs the same checks as GitHub Actions (format + modernize + lint + security + tests).
 # Use this before committing to catch CI failures locally.
-preflight: check-format check-modernize vet security-check test
+preflight: check-format check-modernize vet security-check test-cover diff-coverage test-race
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
 # Run unit tests
 test:
 	@echo -e "\n....Running tests for $(GO_PROJECT_NAME)...."
 	LOG_IGNORE=1 go test -v -timeout 120s ./...
+
+# Run unit tests with coverage profile
+COVERPROFILE ?= coverage.out
+test-cover:
+	@echo -e "\n....Running tests with coverage for $(GO_PROJECT_NAME)...."
+	LOG_IGNORE=1 go test -v -timeout 120s -coverprofile=$(COVERPROFILE) -covermode=atomic ./...
+	@echo ""
+	@echo "=== Total Coverage ==="
+	@go tool cover -func=$(COVERPROFILE) | tail -1
+
+# Run unit tests with race detector
+test-race:
+	@echo -e "\n....Running tests with race detector for $(GO_PROJECT_NAME)...."
+	LOG_IGNORE=1 go test -race -timeout 300s ./...
+
+# Check that new/changed code meets coverage threshold (runs tests first)
+diff-coverage: test-cover
+	@scripts/diff-coverage.sh $(COVERPROFILE)
 
 bench:
 	@echo -e "\n....Running benchmarks for $(GO_PROJECT_NAME)...."
@@ -117,6 +135,6 @@ security-check:
 	set -o pipefail && go tool staticcheck -checks="all,-ST1000,-ST1003,-ST1016,-ST1020,-ST1021,-ST1022,-SA1019,-SA9005" ./... 2>&1 | tee tests/staticcheck-report.txt
 	@echo "  staticcheck ok"
 
-.PHONY: build go_build go_build_docker go_run preflight test bench dev \
+.PHONY: build go_build go_build_docker go_run preflight test test-cover test-race diff-coverage bench dev \
 	docker_s3d docker_compose_up docker_compose_down docker docker_clean docker_test \
 	run clean format check-format modernize check-modernize vet security-check

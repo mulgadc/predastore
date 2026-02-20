@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
 
       - name: Setup Go
         uses: actions/setup-go@v6
@@ -31,8 +33,28 @@ jobs:
       - name: Build Predastore
         run: make build
 
-      - name: Run Tests
-        run: make test
+      - name: Run Tests with Coverage
+        run: make test-cover
+
+      - name: Check Diff Coverage
+        run: scripts/diff-coverage.sh coverage.out --base HEAD~1
+
+  race_detection:
+    name: Predastore Race Detection
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          cache-dependency-path: "go.sum"
+          go-version-file: "go.mod"
+
+      - name: Run Tests with Race Detector
+        run: make test-race
 
   lint_and_security:
     name: Predastore Lint and Security
