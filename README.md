@@ -1,6 +1,6 @@
 # Predastore
 
-Predastore is a distributed, S3-compatible object storage system with Reed-Solomon erasure coding, built for bare-metal, edge, and on-premise deployments. It is the storage backend for [Hive](https://github.com/mulgadc/hive) — an AWS-compatible infrastructure stack for private clouds.
+Predastore developed by [Mulga Defense Corporation](https://mulgadc.com/) is a distributed, S3-compatible object storage system with Reed-Solomon erasure coding, built for bare-metal, edge, and on-premise deployments. It is the storage backend for [Hive](https://github.com/mulgadc/hive) — an AWS-compatible infrastructure stack for private clouds.
 
 Predastore can run as a single-node server with local filesystem storage, or scale out to a multi-node cluster with erasure-coded shards, Raft-consensus metadata, and QUIC-based inter-node transport.
 
