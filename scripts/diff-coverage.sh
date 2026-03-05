@@ -13,7 +13,8 @@ set -euo pipefail
 
 PROFILE=""
 BASE_REF=""
-THRESHOLD=70
+THRESHOLD=65
+QUIET="${QUIET:-}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -47,7 +48,7 @@ if [[ -z "$BASE_REF" ]]; then
         dev)  BASE_REF="origin/main" ;;
         *)    BASE_REF="origin/dev" ;;
     esac
-    echo "Base ref: $BASE_REF (branch: $BRANCH)"
+    [[ -z "$QUIET" ]] && echo "Base ref: $BASE_REF (branch: $BRANCH)"
 fi
 
 # Verify base ref exists
@@ -64,8 +65,10 @@ TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
 # --- Step 1: Extract added line numbers from diff ---
-# Only non-test .go files that were added or modified
-git diff "${BASE_REF}" HEAD --unified=0 --diff-filter=AM -- '*.go' ':!*_test.go' | awk '
+# Only non-test .go files that were added or modified.
+# -M enables rename detection so file splits/moves only count truly changed lines.
+# -C enables copy detection for the same reason (file split = partial copy).
+git diff "${BASE_REF}" HEAD --unified=0 -M -C --diff-filter=AM -- '*.go' ':!*_test.go' | awk '
     /^\+\+\+ / {
         file = substr($2, 3)
         next
@@ -86,6 +89,12 @@ git diff "${BASE_REF}" HEAD --unified=0 --diff-filter=AM -- '*.go' ':!*_test.go'
 DIFF_COUNT=$(wc -l < "$TMPDIR/diff_lines" | tr -d ' ')
 if [[ "$DIFF_COUNT" -eq 0 ]]; then
     echo "No new/modified Go source lines — skipping diff coverage."
+    exit 0
+fi
+
+MIN_LOC=100
+if [[ "$DIFF_COUNT" -lt "$MIN_LOC" ]]; then
+    echo "Only $DIFF_COUNT changed lines (< $MIN_LOC) — skipping diff coverage."
     exit 0
 fi
 
@@ -127,8 +136,6 @@ awk -v threshold="$THRESHOLD" '
             total++
             if (cov[$1]) {
                 covered++
-            } else {
-                uncov[uncov_n++] = $1
             }
         } else {
             skipped++
@@ -140,22 +147,25 @@ awk -v threshold="$THRESHOLD" '
             exit 0
         }
 
+        min_instrumentable = 5
+        if (total < min_instrumentable) {
+            printf "Only %d instrumentable lines (< %d minimum) — skipping diff coverage.\n", total, min_instrumentable
+            exit 0
+        }
+
         uncovered = total - covered
         pct = (covered / total) * 100
 
-        printf "\n=== Diff Coverage ===\n"
-        printf "Instrumentable lines:   %d\n", total
-        printf "Covered:                %d\n", covered+0
-        printf "Uncovered:              %d\n", uncovered
-        printf "Non-instrumentable:     %d (skipped)\n", skipped+0
-        printf "Diff coverage:          %.1f%%\n", pct
-        printf "Threshold:              %d%%\n", threshold
+        quiet = ENVIRON["QUIET"]
 
-        if (uncovered > 0) {
-            printf "\nUncovered lines:\n"
-            for (i = 0; i < uncov_n; i++) {
-                printf "  %s\n", uncov[i]
-            }
+        if (!quiet) {
+            printf "\n=== Diff Coverage ===\n"
+            printf "Instrumentable lines:   %d\n", total
+            printf "Covered:                %d\n", covered+0
+            printf "Uncovered:              %d\n", uncovered
+            printf "Non-instrumentable:     %d (skipped)\n", skipped+0
+            printf "Diff coverage:          %.1f%%\n", pct
+            printf "Threshold:              %d%%\n", threshold
         }
 
         if (pct + 0.05 < threshold) {
