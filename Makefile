@@ -130,7 +130,7 @@ modernize:
 
 check-modernize:
 	@echo "Checking go fix modernizations..."
-	@DIFF=$$(go fix $(GOFIX_EXCLUDE) -diff ./... 2>&1); \
+	@DIFF=$$(go fix $(GOFIX_EXCLUDE) -diff ./...); \
 	if [ -n "$$DIFF" ]; then \
 		echo "$$DIFF"; \
 		echo "Run 'make modernize' to fix."; \
