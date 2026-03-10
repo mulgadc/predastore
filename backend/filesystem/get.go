@@ -125,13 +125,17 @@ func (b *Backend) handleRangeRequest(file *os.File, info os.FileInfo, req *backe
 
 	// Validate range
 	if start > end || start >= fileSize {
-		file.Close()
+		if closeErr := file.Close(); closeErr != nil {
+			slog.Debug("Failed to close file after invalid range", "error", closeErr)
+		}
 		return nil, backend.ErrInvalidRangeError
 	}
 
 	// Seek to start position
 	if _, err := file.Seek(start, io.SeekStart); err != nil {
-		file.Close()
+		if closeErr := file.Close(); closeErr != nil {
+			slog.Debug("Failed to close file after seek error", "error", closeErr)
+		}
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 

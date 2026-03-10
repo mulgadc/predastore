@@ -769,8 +769,12 @@ func (s *Server) startProfiling() error {
 	s.pprofFile = tmpFile
 
 	if err := pprof.StartCPUProfile(tmpFile); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpFile.Name())
+		if closeErr := tmpFile.Close(); closeErr != nil {
+			slog.Debug("Failed to close temp profile file", "error", closeErr)
+		}
+		if removeErr := os.Remove(tmpFile.Name()); removeErr != nil {
+			slog.Debug("Failed to remove temp profile file", "error", removeErr)
+		}
 		return fmt.Errorf("failed to start CPU profile: %w", err)
 	}
 
@@ -786,7 +790,9 @@ func (s *Server) stopProfiling() error {
 
 	pprof.StopCPUProfile()
 	tempPath := s.pprofFile.Name()
-	s.pprofFile.Close()
+	if err := s.pprofFile.Close(); err != nil {
+		slog.Warn("Failed to close pprof file", "error", err)
+	}
 
 	// Copy temp file to output path
 	if err := copyFile(tempPath, s.pprofOutputPath); err != nil {
@@ -795,7 +801,9 @@ func (s *Server) stopProfiling() error {
 	}
 
 	// Remove temp file
-	os.Remove(tempPath)
+	if err := os.Remove(tempPath); err != nil {
+		slog.Debug("Failed to remove temp profile file", "path", tempPath, "error", err)
+	}
 
 	slog.Info("CPU profile saved", "path", s.pprofOutputPath)
 	return nil
@@ -848,7 +856,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	// Close backend (stops accepting new storage operations)
 	if s.backend != nil {
 		slog.Info("Closing storage backend...")
-		s.backend.Close()
+		if err := s.backend.Close(); err != nil {
+			slog.Warn("Error closing storage backend", "error", err)
+		}
 	}
 
 	// Shutdown DB servers in parallel with timeout
@@ -862,7 +872,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			go func(idx int, server *s3db.Server) {
 				defer wg.Done()
 				slog.Info("Shutting down DB server", "index", idx)
-				server.Shutdown()
+				if err := server.Shutdown(); err != nil {
+					slog.Warn("Error shutting down DB server", "index", idx, "error", err)
+				}
 				slog.Info("DB server shutdown complete", "index", idx)
 			}(i, srv)
 		}

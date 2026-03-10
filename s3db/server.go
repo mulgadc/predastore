@@ -174,7 +174,9 @@ const contextKeyAccessKey contextKey = "accessKey"
 func (s *Server) writeJSON(w http.ResponseWriter, statusCode int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Debug("Failed to encode JSON response", "error", err)
+	}
 }
 
 // handleHealth returns server health status

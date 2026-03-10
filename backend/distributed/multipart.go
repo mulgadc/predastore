@@ -166,7 +166,9 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 	if _, err := tmpFile.Write(data); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to write temp file", 500)
 	}
-	tmpFile.Close()
+	if closeErr := tmpFile.Close(); closeErr != nil {
+		slog.Debug("Failed to close temp file", "path", tmpPath, "error", closeErr)
+	}
 
 	// Store via QUIC (or local WAL if QUIC disabled)
 	if b.useQUIC {
@@ -367,7 +369,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 		}
 	}
 
-	tmpFile.Close()
+	if closeErr := tmpFile.Close(); closeErr != nil {
+		slog.Debug("Failed to close temp file", "path", tmpFile.Name(), "error", closeErr)
+	}
 
 	// Store the final object using PutObject mechanism
 	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)

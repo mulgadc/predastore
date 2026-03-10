@@ -59,7 +59,9 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	if err != nil {
 		slog.Error("Error writing file", "path", pathname, "error", err)
 		// Clean up partial file
-		os.Remove(pathname)
+		if removeErr := os.Remove(pathname); removeErr != nil {
+			slog.Debug("Failed to clean up partial file", "path", pathname, "error", removeErr)
+		}
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to write file", 500)
 	}
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 
 	"github.com/dgraph-io/badger/v4"
@@ -219,7 +220,9 @@ func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	}()
 
 	if err != nil {
-		sink.Cancel()
+		if cerr := sink.Cancel(); cerr != nil {
+			slog.Warn("Failed to cancel snapshot sink", "error", cerr)
+		}
 	}
 	return err
 }

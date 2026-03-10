@@ -73,7 +73,9 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 		}
 	}
-	tmpFile.Close()
+	if closeErr := tmpFile.Close(); closeErr != nil {
+		slog.Debug("Failed to close temp file", "path", tmpFile.Name(), "error", closeErr)
+	}
 	slog.Debug("distributed.PutObject: temp file created", "path", tmpFile.Name())
 
 	// Split and write shards (either locally or via QUIC)

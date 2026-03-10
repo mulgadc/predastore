@@ -350,7 +350,9 @@ func (s *HTTP2Server) writeS3Error(w http.ResponseWriter, r *http.Request, statu
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(statusCode)
-	xml.NewEncoder(w).Encode(s3error)
+	if err := xml.NewEncoder(w).Encode(s3error); err != nil {
+		slog.Debug("failed to encode XML error response", "error", err)
+	}
 }
 
 // writeXML writes an XML response
@@ -394,7 +396,9 @@ func (s *HTTP2Server) handleError(w http.ResponseWriter, r *http.Request, err er
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(statusCode)
-	xml.NewEncoder(w).Encode(s3error)
+	if err := xml.NewEncoder(w).Encode(s3error); err != nil {
+		slog.Debug("failed to encode XML error response", "error", err)
+	}
 }
 
 // Route handlers
@@ -425,7 +429,9 @@ func (s *HTTP2Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	s.writeXML(w, http.StatusOK, result)
+	if err := s.writeXML(w, http.StatusOK, result); err != nil {
+		slog.Debug("failed to write XML response", "error", err)
+	}
 }
 
 func (s *HTTP2Server) createBucket(w http.ResponseWriter, r *http.Request) {
@@ -537,7 +543,9 @@ func (s *HTTP2Server) listObjects(w http.ResponseWriter, r *http.Request) {
 		CommonPrefixes: &prefixes,
 	}
 
-	s.writeXML(w, http.StatusOK, result)
+	if err := s.writeXML(w, http.StatusOK, result); err != nil {
+		slog.Debug("failed to write XML response", "error", err)
+	}
 }
 
 func (s *HTTP2Server) headObject(w http.ResponseWriter, r *http.Request) {
@@ -605,7 +613,9 @@ func (s *HTTP2Server) getObject(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}
 
-	io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		slog.Debug("failed to copy response body", "error", err)
+	}
 }
 
 func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
@@ -678,11 +688,13 @@ func (s *HTTP2Server) postObject(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("x-amz-server-side-encryption", "AES256")
-		s.writeXML(w, http.StatusOK, InitiateMultipartUploadResult{
+		if err := s.writeXML(w, http.StatusOK, InitiateMultipartUploadResult{
 			Bucket:   resp.Bucket,
 			Key:      resp.Key,
 			UploadId: resp.UploadID,
-		})
+		}); err != nil {
+			slog.Debug("failed to write XML response", "error", err)
+		}
 		return
 	}
 
@@ -718,12 +730,14 @@ func (s *HTTP2Server) postObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.writeXML(w, http.StatusOK, CompleteMultipartUploadResult{
+	if err := s.writeXML(w, http.StatusOK, CompleteMultipartUploadResult{
 		Location: fmt.Sprintf("https://%s%s", r.Host, resp.Location),
 		Bucket:   resp.Bucket,
 		Key:      resp.Key,
 		ETag:     resp.ETag,
-	})
+	}); err != nil {
+		slog.Debug("failed to write XML response", "error", err)
+	}
 }
 
 func (s *HTTP2Server) deleteObject(w http.ResponseWriter, r *http.Request) {

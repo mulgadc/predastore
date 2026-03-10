@@ -96,7 +96,9 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 	written, err := io.Copy(multiWriter, reader)
 	if err != nil {
 		slog.Error("Failed to write part", "path", partFile, "error", err)
-		os.Remove(partFile)
+		if removeErr := os.Remove(partFile); removeErr != nil {
+			slog.Debug("Failed to clean up part file", "path", partFile, "error", removeErr)
+		}
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to write part", 500)
 	}
 
@@ -189,16 +191,22 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 		partFile := filepath.Join(uploadDir, fmt.Sprintf("%s.%d", filepath.Base(req.Key), part.PartNumber))
 		if err := appendFile(destFile, partFile); err != nil {
 			slog.Error("Failed to concatenate part", "part", part.PartNumber, "error", err)
-			os.Remove(destPath)
+			if removeErr := os.Remove(destPath); removeErr != nil {
+				slog.Debug("Failed to clean up destination file", "path", destPath, "error", removeErr)
+			}
 			return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to assemble file", 500)
 		}
 
 		// Clean up part file
-		os.Remove(partFile)
+		if removeErr := os.Remove(partFile); removeErr != nil {
+			slog.Debug("Failed to clean up part file", "path", partFile, "error", removeErr)
+		}
 	}
 
 	// Clean up upload directory
-	os.RemoveAll(uploadDir)
+	if removeErr := os.RemoveAll(uploadDir); removeErr != nil {
+		slog.Debug("Failed to clean up upload directory", "dir", uploadDir, "error", removeErr)
+	}
 
 	// Calculate multipart ETag
 	finalETag := calculateMultipartETag(partETags, len(req.Parts))

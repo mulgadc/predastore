@@ -91,7 +91,9 @@ func (p *Pool) createConnection(ctx context.Context, addr string) (*Client, erro
 		}
 		// Connection is dead, clean it up
 		if pc.client != nil {
-			pc.client.Close()
+			if err := pc.client.Close(); err != nil {
+				slog.Debug("failed to close dead pooled connection", "addr", addr, "error", err)
+			}
 		}
 		delete(p.connections, addr)
 		pc.mu.Unlock()
@@ -129,7 +131,9 @@ func (p *Pool) Invalidate(addr string) {
 	if pc, exists := p.connections[addr]; exists {
 		pc.mu.Lock()
 		if pc.client != nil {
-			pc.client.Close()
+			if err := pc.client.Close(); err != nil {
+				slog.Debug("failed to close invalidated pooled connection", "addr", addr, "error", err)
+			}
 		}
 		pc.mu.Unlock()
 		delete(p.connections, addr)
@@ -149,7 +153,9 @@ func (p *Pool) Close() {
 	for addr, pc := range p.connections {
 		pc.mu.Lock()
 		if pc.client != nil {
-			pc.client.Close()
+			if err := pc.client.Close(); err != nil {
+				slog.Debug("failed to close pooled connection during pool shutdown", "addr", addr, "error", err)
+			}
 		}
 		pc.mu.Unlock()
 		delete(p.connections, addr)
@@ -181,7 +187,9 @@ func (p *Pool) cleanup() {
 		isClosed := pc.client == nil || pc.client.conn == nil || pc.client.conn.Context().Err() != nil
 		if isIdle || isClosed {
 			if pc.client != nil {
-				pc.client.Close()
+				if err := pc.client.Close(); err != nil {
+					slog.Debug("failed to close idle/dead pooled connection during cleanup", "addr", addr, "error", err)
+				}
 			}
 			delete(p.connections, addr)
 		}

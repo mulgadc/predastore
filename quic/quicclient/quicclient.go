@@ -298,7 +298,9 @@ func (c *Client) Get(ctx context.Context, objectRequest quicserver.ObjectRequest
 
 	if rh.Status != quicproto.StatusOK {
 		if rc != nil {
-			rc.Close()
+			if err := rc.Close(); err != nil {
+				slog.Debug("failed to close response body after status error", "error", err)
+			}
 		}
 		return nil, fmt.Errorf("get: status %d (expected %d)", rh.Status, quicproto.StatusOK)
 	}
@@ -336,7 +338,9 @@ func (c *Client) GetRange(ctx context.Context, objectRequest quicserver.ObjectRe
 
 	if rh.Status != quicproto.StatusOK {
 		if rc != nil {
-			rc.Close()
+			if err := rc.Close(); err != nil {
+				slog.Debug("failed to close response body after range status error", "error", err)
+			}
 		}
 		return nil, fmt.Errorf("get range: status %d (expected %d)", rh.Status, quicproto.StatusOK)
 	}

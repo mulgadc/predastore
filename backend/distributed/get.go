@@ -343,7 +343,9 @@ func (b *Backend) reconstructObject(ctx context.Context, bucket, key string, sha
 	// Close reconstruction writers
 	for i := range files {
 		if files[i] != nil {
-			files[i].Close()
+			if closeErr := files[i].Close(); closeErr != nil {
+				slog.Debug("Failed to close reconstruction file", "index", i, "error", closeErr)
+			}
 		}
 	}
 

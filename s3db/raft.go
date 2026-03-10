@@ -79,14 +79,18 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 
 	tcpAddr, err := net.ResolveTCPAddr("tcp", advertiseAddr)
 	if err != nil {
-		node.badgerDB.Close()
+		if cerr := node.badgerDB.Close(); cerr != nil {
+			slog.Debug("Failed to close badger during cleanup", "error", cerr)
+		}
 		return nil, fmt.Errorf("failed to resolve TCP address: %w", err)
 	}
 
 	slog.Info("Setting up Raft transport", "bindAddr", bindAddr, "advertiseAddr", advertiseAddr)
 	node.transport, err = raft.NewTCPTransport(bindAddr, tcpAddr, 3, 10*time.Second, os.Stderr)
 	if err != nil {
-		node.badgerDB.Close()
+		if cerr := node.badgerDB.Close(); cerr != nil {
+			slog.Debug("Failed to close badger during cleanup", "error", cerr)
+		}
 		return nil, fmt.Errorf("failed to create transport: %w", err)
 	}
 
@@ -94,7 +98,9 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 	boltDBPath := filepath.Join(dataDir, "raft.db")
 	boltStore, err := raftboltdb.NewBoltStore(boltDBPath)
 	if err != nil {
-		node.Close()
+		if cerr := node.Close(); cerr != nil {
+			slog.Debug("Failed to close node during cleanup", "error", cerr)
+		}
 		return nil, fmt.Errorf("failed to create bolt store: %w", err)
 	}
 	node.logStore = boltStore
@@ -104,21 +110,27 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 	snapshotDir := filepath.Join(dataDir, "snapshots")
 	node.snapshots, err = raft.NewFileSnapshotStore(snapshotDir, 2, os.Stderr)
 	if err != nil {
-		node.Close()
+		if cerr := node.Close(); cerr != nil {
+			slog.Debug("Failed to close node during cleanup", "error", cerr)
+		}
 		return nil, fmt.Errorf("failed to create snapshot store: %w", err)
 	}
 
 	// Create Raft instance
 	node.raft, err = raft.NewRaft(raftConfig, node.fsm, node.logStore, node.stable, node.snapshots, node.transport)
 	if err != nil {
-		node.Close()
+		if cerr := node.Close(); cerr != nil {
+			slog.Debug("Failed to close node during cleanup", "error", cerr)
+		}
 		return nil, fmt.Errorf("failed to create raft: %w", err)
 	}
 
 	// Bootstrap cluster if requested
 	if config.Bootstrap {
 		if err := node.bootstrap(); err != nil {
-			node.Close()
+			if cerr := node.Close(); cerr != nil {
+				slog.Debug("Failed to close node during cleanup", "error", cerr)
+			}
 			return nil, fmt.Errorf("failed to bootstrap cluster: %w", err)
 		}
 	}
@@ -280,7 +292,9 @@ func (n *RaftNode) Close() error {
 	// and causes immediate connection errors instead of timeouts.
 	if n.transport != nil {
 		slog.Info("RaftNode: closing transport")
-		n.transport.Close()
+		if err := n.transport.Close(); err != nil {
+			slog.Warn("RaftNode: failed to close transport", "error", err)
+		}
 	}
 
 	// Shutdown Raft with a timeout to avoid blocking forever
@@ -310,13 +324,17 @@ func (n *RaftNode) Close() error {
 	// Close BoltDB log store
 	if store, ok := n.logStore.(*raftboltdb.BoltStore); ok {
 		slog.Info("RaftNode: closing BoltDB log store")
-		store.Close()
+		if err := store.Close(); err != nil {
+			slog.Warn("RaftNode: failed to close BoltDB log store", "error", err)
+		}
 	}
 
 	// Close Badger FSM storage
 	if n.badgerDB != nil {
 		slog.Info("RaftNode: closing Badger DB")
-		n.badgerDB.Close()
+		if err := n.badgerDB.Close(); err != nil {
+			slog.Warn("RaftNode: failed to close Badger DB", "error", err)
+		}
 	}
 
 	slog.Info("RaftNode: shutdown complete")

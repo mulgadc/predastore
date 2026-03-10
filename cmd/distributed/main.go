@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 
 	"github.com/mulgadc/predastore/backend/distributed"
@@ -61,7 +62,9 @@ func main() {
 		if err := d.GetFromPath(ctx, "test-bucket", *filename, &buf); err != nil {
 			fmt.Println("Error downloading object:", err)
 		} else {
-			outW.Write(buf.Bytes())
+			if _, writeErr := outW.Write(buf.Bytes()); writeErr != nil {
+				slog.Error("Failed to write output", "error", writeErr)
+			}
 		}
 	}
 }

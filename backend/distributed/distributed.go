@@ -217,7 +217,9 @@ func New(config any) (backend.Backend, error) {
 		for _, node := range cfg.Nodes {
 			nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", node.ID))
 			if err := os.MkdirAll(nodeDir, 0750); err != nil {
-				globalState.Close()
+				if closeErr := globalState.Close(); closeErr != nil {
+					slog.Debug("Failed to close global state during cleanup", "error", closeErr)
+				}
 				return nil, fmt.Errorf("failed to create node directory: %w", err)
 			}
 			hashRing.Add(myMember(fmt.Sprintf("node-%d", node.ID)))
@@ -227,7 +229,9 @@ func New(config any) (backend.Backend, error) {
 		for i := 0; i < partitionCount; i++ {
 			nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
 			if err := os.MkdirAll(nodeDir, 0750); err != nil {
-				globalState.Close()
+				if closeErr := globalState.Close(); closeErr != nil {
+					slog.Debug("Failed to close global state during cleanup", "error", closeErr)
+				}
 				return nil, fmt.Errorf("failed to create node directory: %w", err)
 			}
 			hashRing.Add(myMember(fmt.Sprintf("node-%d", i)))
@@ -400,7 +404,9 @@ func (b *Backend) putObjectToWAL(bucket string, objectPath string, objectHash [3
 			res, werr := walFiles[idx].Write(r, shardSize)
 
 			if werr == nil {
-				walFiles[idx].UpdateObjectToWAL(objectHash, res)
+				if updateErr := walFiles[idx].UpdateObjectToWAL(objectHash, res); updateErr != nil {
+					slog.Warn("Failed to update object in WAL", "shard", idx, "error", updateErr)
+				}
 			}
 
 			dataCh <- shardWriteOutcome{shardIndex: idx, result: res, err: werr}
@@ -466,7 +472,9 @@ func (b *Backend) putObjectToWAL(bucket string, objectPath string, objectHash [3
 			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: res, err: werr}
 
 			if werr == nil {
-				walFiles[walIndex].UpdateObjectToWAL(objectHash, res)
+				if updateErr := walFiles[walIndex].UpdateObjectToWAL(objectHash, res); updateErr != nil {
+					slog.Warn("Failed to update parity object in WAL", "walIndex", walIndex, "error", updateErr)
+				}
 			}
 		}(i, walIdx, pr)
 	}
@@ -787,7 +795,9 @@ func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShar
 		// Buffer the shard data into memory before closing the stream.
 		// This prevents "stream closed" errors when the caller reads.
 		data, err := io.ReadAll(reader)
-		reader.Close() // CRITICAL: Close the STREAM (not the connection) to release it back to pool
+		if closeErr := reader.Close(); closeErr != nil {
+			slog.Debug("Failed to close QUIC stream reader", "node", nodeNum, "error", closeErr)
+		}
 
 		if err != nil {
 			slog.Error("Error buffering shard data", "node", nodeNum, "err", err)

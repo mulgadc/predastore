@@ -227,7 +227,9 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 		wal.WalNum.Add(1)
 	} else {
 
-		wal.LoadState(stateFile)
+		if err := wal.LoadState(stateFile); err != nil {
+			slog.Warn("Failed to load WAL state", "file", stateFile, "error", err)
+		}
 
 	}
 
@@ -542,7 +544,9 @@ func (wal *WAL) createWALUnlocked(filename string) error {
 	// Check if file is empty (new file) or has existing data
 	stat, err := file.Stat()
 	if err != nil {
-		file.Close()
+		if closeErr := file.Close(); closeErr != nil {
+			slog.Debug("Failed to close WAL file after stat error", "error", closeErr)
+		}
 		return err
 	}
 
@@ -552,7 +556,9 @@ func (wal *WAL) createWALUnlocked(filename string) error {
 
 		_, err = file.Write(headers)
 		if err != nil {
-			file.Close()
+			if closeErr := file.Close(); closeErr != nil {
+				slog.Debug("Failed to close WAL file after header write error", "error", closeErr)
+			}
 			slog.Error("Could not write headers")
 			return err
 		}
@@ -561,7 +567,9 @@ func (wal *WAL) createWALUnlocked(filename string) error {
 		maxFragmentSize := int64(FragmentHeaderBytes + ChunkSize)
 		if stat.Size()+maxFragmentSize > wal.MaxFileSize() {
 			// File doesn't have enough space, close it and return error
-			file.Close()
+			if closeErr := file.Close(); closeErr != nil {
+				slog.Debug("Failed to close WAL file with insufficient space", "error", closeErr)
+			}
 			return fmt.Errorf("WAL file %s doesn't have enough space (%d + %d > %d)",
 				filename, stat.Size(), maxFragmentSize, wal.MaxFileSize())
 		}
@@ -906,8 +914,12 @@ func (wal *WAL) Close() (err error) {
 	// Loop through each file
 	for _, v := range wal.Shard.DB {
 		// Final sync before close to ensure durability
-		v.Sync()
-		v.Close()
+		if err := v.Sync(); err != nil {
+			slog.Warn("Failed to sync WAL file during close", "error", err)
+		}
+		if err := v.Close(); err != nil {
+			slog.Warn("Failed to close WAL file", "error", err)
+		}
 	}
 
 	// Write the state file to disk, current WAL, Shard Num, etc

@@ -53,7 +53,9 @@ func (s3 *Config) ReadConfig() (err error) {
 
 		// Check if the directory exists, otherwise create it
 		if _, err := os.Stat(s3.Buckets[k].Pathname); os.IsNotExist(err) {
-			os.MkdirAll(s3.Buckets[k].Pathname, 0750)
+			if mkErr := os.MkdirAll(s3.Buckets[k].Pathname, 0750); mkErr != nil {
+				slog.Warn("Failed to create bucket directory", "path", s3.Buckets[k].Pathname, "error", mkErr)
+			}
 		}
 
 		// Add to our valid buckets
