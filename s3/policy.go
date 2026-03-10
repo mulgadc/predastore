@@ -5,28 +5,23 @@ import (
 	"strings"
 )
 
-// s3ActionMap maps HTTP method + path pattern to IAM S3 actions.
+// s3Action maps HTTP method + path to the corresponding IAM S3 action.
 func s3Action(method, path string) string {
+	cleanPath := strings.TrimPrefix(path, "/")
 	hasKey := false
-	// Strip bucket name — if there's content after /{bucket}/, it's an object key
-	cleanPath := path
-	if len(cleanPath) > 0 && cleanPath[0] == '/' {
-		cleanPath = cleanPath[1:]
-	}
 	if idx := strings.IndexByte(cleanPath, '/'); idx >= 0 && idx < len(cleanPath)-1 {
 		hasKey = true
 	}
 
 	switch method {
 	case http.MethodGet:
-		if cleanPath == "" || !strings.Contains(cleanPath, "/") {
-			// Root path = ListAllMyBuckets, bucket path = ListBucket
-			if cleanPath == "" {
-				return "s3:ListAllMyBuckets"
-			}
-			return "s3:ListBucket"
+		if cleanPath == "" {
+			return "s3:ListAllMyBuckets"
 		}
-		return "s3:GetObject"
+		if hasKey {
+			return "s3:GetObject"
+		}
+		return "s3:ListBucket"
 	case http.MethodHead:
 		if hasKey {
 			return "s3:GetObject"
@@ -51,11 +46,7 @@ func s3Action(method, path string) string {
 
 // s3Resource builds the ARN for the resource being accessed.
 func s3Resource(path string) string {
-	cleanPath := path
-	if len(cleanPath) > 0 && cleanPath[0] == '/' {
-		cleanPath = cleanPath[1:]
-	}
-
+	cleanPath := strings.TrimPrefix(path, "/")
 	if cleanPath == "" {
 		return "*"
 	}

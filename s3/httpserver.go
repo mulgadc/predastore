@@ -327,7 +327,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		if !credResult.SkipPolicyCheck {
 			action := s3Action(method, path)
 			resource := s3Resource(path)
-			if action != "" && !evaluateS3Access(action, resource, credResult.PolicyDocuments) {
+			if action == "" || !evaluateS3Access(action, resource, credResult.PolicyDocuments) {
 				s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 				return
 			}

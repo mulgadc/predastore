@@ -211,7 +211,7 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	}
 
 	// Start KV watcher for cache invalidation
-	watcher, err := akBucket.WatchAll(nats.IgnoreDeletes())
+	watcher, err := akBucket.WatchAll()
 	if err != nil {
 		slog.Warn("Failed to start NATS KV watcher for cache invalidation", "error", err)
 	} else {
