@@ -50,6 +50,7 @@ type Server struct {
 	config    *Config
 	server    *HTTP2Server
 	backend   backend.Backend
+	credProv  CredentialProvider
 	dbServers []*s3db.Server
 	// quicCancel context.CancelFunc
 
@@ -258,9 +259,12 @@ func (s *Server) init() error {
 		return fmt.Errorf("unknown backend type: %s", s.backendType)
 	}
 
+	// Initialize credential provider
+	s.credProv = s.initCredentialProvider()
+
 	// Setup HTTP routes with the backend using HTTP/2 server
 	slog.Info("Server init", "backendType", s.backendType)
-	s.server = NewHTTP2ServerWithBackend(s.config, s.backend)
+	s.server = NewHTTP2ServerWithBackend(s.config, s.backend, s.credProv)
 	slog.Info("HTTP/2 server initialized - using net/http for connection multiplexing")
 
 	return nil
@@ -711,6 +715,27 @@ func (s *Server) launchQUICServers() {
 	}
 }
 
+// initCredentialProvider creates the appropriate CredentialProvider based on config.
+// If [iam] is configured, uses NATS KV with config fallback (ChainProvider).
+// Otherwise, uses config-only (ConfigProvider).
+func (s *Server) initCredentialProvider() CredentialProvider {
+	configProv := NewConfigProvider(s.config.Auth)
+
+	if s.config.IAM == nil {
+		slog.Info("IAM not configured, using config-only auth")
+		return configProv
+	}
+
+	natsProv, err := NewNATSIAMProvider(s.config.IAM)
+	if err != nil {
+		slog.Warn("Failed to initialize NATS IAM provider, falling back to config-only auth", "error", err)
+		return configProv
+	}
+
+	slog.Info("Using NATS IAM + config chain auth")
+	return NewChainProvider(natsProv, configProv)
+}
+
 // ListenAndServe starts the server and blocks until shutdown
 func (s *Server) ListenAndServe() error {
 	s.mu.Lock()
@@ -894,6 +919,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-ctx.Done():
 			slog.Warn("Shutdown context cancelled, continuing...")
 		}
+	}
+
+	// Close credential provider (NATS connections, watchers)
+	if s.credProv != nil {
+		s.credProv.Close()
 	}
 
 	// Stop profiling and save profile

@@ -38,7 +38,7 @@ func setupFilesystemBackend(t *testing.T) *TestBackend {
 	require.NoError(t, err, "Should read config without error")
 
 	be := s3.createFilesystemBackend()
-	server := NewHTTP2ServerWithBackend(s3, be)
+	server := NewHTTP2ServerWithBackend(s3, be, NewConfigProvider(s3.Auth))
 
 	return &TestBackend{
 		Type:    BackendFilesystem,
@@ -121,7 +121,7 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 	// Allow QUIC servers time to start
 	time.Sleep(100 * time.Millisecond)
 
-	server := NewHTTP2ServerWithBackend(s3, be)
+	server := NewHTTP2ServerWithBackend(s3, be, NewConfigProvider(s3.Auth))
 
 	return &TestBackend{
 		Type:        BackendDistributed,

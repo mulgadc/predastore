@@ -33,17 +33,19 @@ import (
 
 // HTTP2Server is an HTTP/2 compatible S3 server using net/http
 type HTTP2Server struct {
-	config  *Config
-	backend backend.Backend
-	router  chi.Router
-	server  *http.Server
+	config   *Config
+	backend  backend.Backend
+	router   chi.Router
+	server   *http.Server
+	credProv CredentialProvider
 }
 
 // NewHTTP2Server creates a new HTTP/2 compatible S3 server
 func NewHTTP2Server(config *Config) *HTTP2Server {
 	s := &HTTP2Server{
-		config: config,
-		router: chi.NewRouter(),
+		config:   config,
+		router:   chi.NewRouter(),
+		credProv: NewConfigProvider(config.Auth),
 	}
 
 	// Create backend based on config
@@ -58,11 +60,12 @@ func NewHTTP2Server(config *Config) *HTTP2Server {
 }
 
 // NewHTTP2ServerWithBackend creates a new HTTP/2 server with an existing backend
-func NewHTTP2ServerWithBackend(config *Config, be backend.Backend) *HTTP2Server {
+func NewHTTP2ServerWithBackend(config *Config, be backend.Backend, credProv CredentialProvider) *HTTP2Server {
 	s := &HTTP2Server{
-		config:  config,
-		backend: be,
-		router:  chi.NewRouter(),
+		config:   config,
+		backend:  be,
+		router:   chi.NewRouter(),
+		credProv: credProv,
 	}
 	s.setupRoutes()
 	return s
@@ -231,18 +234,12 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		accessKey, date, region, svc := creds[0], creds[1], creds[2], creds[3]
 
-		var secretKey string
-		for _, auth := range s.config.Auth {
-			if auth.AccessKeyID == accessKey {
-				secretKey = auth.SecretAccessKey
-				break
-			}
-		}
-
-		if secretKey == "" {
+		credResult, err := s.credProv.LookupCredentials(accessKey)
+		if err != nil {
 			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid access key")
 			return
 		}
+		secretKey := credResult.SecretAccessKey
 
 		signedHeaders := strings.TrimPrefix(parts[1], "SignedHeaders=")
 		signature := strings.TrimPrefix(parts[2], "Signature=")
@@ -326,14 +323,19 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Store authenticated user info in context
-		ctx := context.WithValue(r.Context(), ContextKeyAccessKeyID, accessKey)
-		for _, auth := range s.config.Auth {
-			if auth.AccessKeyID == accessKey {
-				ctx = context.WithValue(ctx, ContextKeyAccountID, auth.AccountID)
-				break
+		// Check IAM policy authorization for NATS-sourced credentials
+		if !credResult.SkipPolicyCheck {
+			action := s3Action(method, path)
+			resource := s3Resource(path)
+			if action != "" && !evaluateS3Access(action, resource, credResult.PolicyDocuments) {
+				s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
+				return
 			}
 		}
+
+		// Store authenticated user info in context
+		ctx := context.WithValue(r.Context(), ContextKeyAccessKeyID, accessKey)
+		ctx = context.WithValue(ctx, ContextKeyAccountID, credResult.AccountID)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})

@@ -20,7 +20,7 @@ func setupBucketHandlerServer(t *testing.T) *TestBackend {
 	require.NoError(t, err)
 
 	be := s3.createFilesystemBackend()
-	server := NewHTTP2ServerWithBackend(s3, be)
+	server := NewHTTP2ServerWithBackend(s3, be, NewConfigProvider(s3.Auth))
 	return &TestBackend{
 		Config:  s3,
 		Server:  server,

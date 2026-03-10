@@ -69,6 +69,9 @@ type Config struct {
 	AllowAnonymousListing bool        `toml:"allow_anonymous_listing"`
 	AllowAnonymousAccess  bool        `toml:"allow_anonymous_access"`
 
+	// IAM authentication via NATS KV (optional, enables multi-account S3 access)
+	IAM *IAMConfig `toml:"iam"`
+
 	// Only needed on local (filesystem)
 	Port int    `toml:"port"`
 	Host string `toml:"host"`
@@ -217,6 +220,14 @@ const (
 	// ContextKeyAccountID is the context key for the authenticated user's account ID
 	ContextKeyAccountID contextKey = "accountID"
 )
+
+// IAMConfig configures IAM authentication via NATS KV.
+type IAMConfig struct {
+	NATSUrl          string `toml:"nats_url"`
+	NATSToken        string `toml:"nats_token"`
+	MasterKeyPath    string `toml:"master_key_path"`
+	AccessKeysBucket string `toml:"access_keys_bucket"`
+}
 
 func New(ConfigSettings *Config) *Config {
 	return ConfigSettings
