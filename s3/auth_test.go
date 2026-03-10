@@ -59,55 +59,56 @@ func (m *mockProvider) LookupCredentials(_ string) (*CredentialResult, error) {
 
 func (m *mockProvider) Close() {}
 
-func TestChainProvider_PrimarySuccess(t *testing.T) {
-	primary := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-primary", AccountID: "acct-1"}}
-	fallback := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-fallback", AccountID: "acct-2"}}
+func TestChainProvider_ConfigWins(t *testing.T) {
+	// Config entries (service accounts) take priority over NATS IAM
+	iam := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-iam", AccountID: "acct-1"}}
+	config := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-config", AccountID: "acct-1", SkipPolicyCheck: true}}
 
-	chain := NewChainProvider(primary, fallback)
+	chain := NewChainProvider(iam, config)
 	result, err := chain.LookupCredentials("AK1")
 	require.NoError(t, err)
-	assert.Equal(t, "from-primary", result.SecretAccessKey)
+	assert.Equal(t, "from-config", result.SecretAccessKey)
+	assert.True(t, result.SkipPolicyCheck, "config entries should skip policy check")
 }
 
-func TestChainProvider_FallbackOnNotFound(t *testing.T) {
-	// ErrKeyNotFound from primary should fall back to config
-	primary := &mockProvider{err: fmt.Errorf("%w: AK1", ErrKeyNotFound)}
-	fallback := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-fallback", AccountID: "acct-2", SkipPolicyCheck: true}}
+func TestChainProvider_IAMFallback(t *testing.T) {
+	// Key not in config → NATS IAM resolves it with policies
+	iam := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-iam", AccountID: "acct-2"}}
+	config := &mockProvider{err: ErrKeyNotFound}
 
-	chain := NewChainProvider(primary, fallback)
+	chain := NewChainProvider(iam, config)
 	result, err := chain.LookupCredentials("AK1")
 	require.NoError(t, err)
-	assert.Equal(t, "from-fallback", result.SecretAccessKey)
-	assert.True(t, result.SkipPolicyCheck)
+	assert.Equal(t, "from-iam", result.SecretAccessKey)
 }
 
-func TestChainProvider_NoFallbackOnInfraError(t *testing.T) {
-	// Non-ErrKeyNotFound errors (infra failures, inactive keys, etc.) must NOT fall back
-	primary := &mockProvider{err: errors.New("NATS connection timeout")}
-	fallback := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-fallback", AccountID: "acct-2"}}
+func TestChainProvider_IAMInfraError(t *testing.T) {
+	// Config miss + NATS infra error must surface the error
+	iam := &mockProvider{err: errors.New("NATS connection timeout")}
+	config := &mockProvider{err: ErrKeyNotFound}
 
-	chain := NewChainProvider(primary, fallback)
+	chain := NewChainProvider(iam, config)
 	_, err := chain.LookupCredentials("AK1")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "NATS connection timeout")
 }
 
-func TestChainProvider_NoFallbackOnInactiveKey(t *testing.T) {
-	// Inactive key errors must NOT fall back to config
-	primary := &mockProvider{err: fmt.Errorf("access key AK1 is inactive (status: Inactive)")}
-	fallback := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-fallback", AccountID: "acct-2", SkipPolicyCheck: true}}
+func TestChainProvider_IAMInactiveKey(t *testing.T) {
+	// Config miss + inactive key in NATS must surface the error
+	iam := &mockProvider{err: fmt.Errorf("access key AK1 is inactive (status: Inactive)")}
+	config := &mockProvider{err: ErrKeyNotFound}
 
-	chain := NewChainProvider(primary, fallback)
+	chain := NewChainProvider(iam, config)
 	_, err := chain.LookupCredentials("AK1")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "inactive")
 }
 
 func TestChainProvider_BothNotFound(t *testing.T) {
-	primary := &mockProvider{err: ErrKeyNotFound}
-	fallback := &mockProvider{err: ErrKeyNotFound}
+	iam := &mockProvider{err: ErrKeyNotFound}
+	config := &mockProvider{err: ErrKeyNotFound}
 
-	chain := NewChainProvider(primary, fallback)
+	chain := NewChainProvider(iam, config)
 	_, err := chain.LookupCredentials("AK1")
 	assert.Error(t, err)
 	assert.ErrorIs(t, err, ErrKeyNotFound)

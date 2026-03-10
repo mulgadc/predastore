@@ -465,39 +465,46 @@ func (p *NATSIAMProvider) Close() {
 
 // --- ChainProvider ---
 
-// ChainProvider tries NATS first, then falls back to config.
+// ChainProvider checks config first (service accounts with SkipPolicyCheck),
+// then falls back to NATS IAM for user credentials. Config entries take priority
+// because the system root key exists in both config and NATS KV but the NATS
+// copy has no policies attached (implicit deny), while config entries get full access.
 type ChainProvider struct {
-	primary  CredentialProvider
-	fallback CredentialProvider
+	config CredentialProvider
+	iam    CredentialProvider
 }
 
-// NewChainProvider creates a provider that tries primary first, then fallback.
-func NewChainProvider(primary, fallback CredentialProvider) *ChainProvider {
-	return &ChainProvider{primary: primary, fallback: fallback}
+// NewChainProvider creates a provider that tries config first, then NATS IAM.
+func NewChainProvider(iam, config CredentialProvider) *ChainProvider {
+	return &ChainProvider{config: config, iam: iam}
 }
 
 func (p *ChainProvider) LookupCredentials(accessKeyID string) (*CredentialResult, error) {
-	result, err := p.primary.LookupCredentials(accessKeyID)
+	// Config entries are trusted service accounts — check first.
+	result, err := p.config.LookupCredentials(accessKeyID)
 	if err == nil {
 		return result, nil
 	}
 
-	// Only fall back to config for "not found" errors.
-	// Infrastructure failures, inactive keys, decryption errors, etc.
-	// must NOT silently fall through to config.
+	// Not in config — try NATS IAM for user credentials.
+	result, err = p.iam.LookupCredentials(accessKeyID)
+	if err == nil {
+		return result, nil
+	}
+
+	// Distinguish "key not found anywhere" from infrastructure errors.
 	if !errors.Is(err, ErrKeyNotFound) {
-		slog.Warn("NATS IAM lookup failed (not falling back to config)",
+		slog.Warn("NATS IAM lookup failed",
 			"accessKeyID", accessKeyID, "error", err)
 		return nil, err
 	}
 
-	slog.Debug("Access key not in NATS KV, trying config", "accessKeyID", accessKeyID)
-	return p.fallback.LookupCredentials(accessKeyID)
+	return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, accessKeyID)
 }
 
 func (p *ChainProvider) Close() {
-	p.primary.Close()
-	p.fallback.Close()
+	p.iam.Close()
+	p.config.Close()
 }
 
 // --- Helpers ---
