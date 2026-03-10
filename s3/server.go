@@ -722,7 +722,9 @@ func (s *Server) launchQUICServers() {
 // initCredentialProvider creates the appropriate CredentialProvider based on config.
 // If [iam] is configured, uses NATS KV with config fallback (ChainProvider).
 // Otherwise, uses config-only (ConfigProvider).
-// Returns an error if [iam] is explicitly configured but fails to initialize.
+// Returns an error if [iam] is explicitly configured but NATS connection or crypto
+// setup fails. Missing KV buckets are handled gracefully via lazy initialization
+// (the hive daemon may create them after predastore starts).
 func (s *Server) initCredentialProvider() (CredentialProvider, error) {
 	configProv := NewConfigProvider(s.config.Auth)
 

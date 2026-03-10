@@ -263,6 +263,36 @@ func TestErrKeyNotFound_IsDetectable(t *testing.T) {
 
 // --- IAMConfig validation tests ---
 
+// --- Lazy bucket init tests ---
+
+func TestNATSIAMProvider_LazyBucketsNotReady(t *testing.T) {
+	// When buckets aren't ready, LookupCredentials should return ErrKeyNotFound
+	// so ChainProvider falls back to config.
+	key := make([]byte, 32)
+	_, err := rand.Read(key)
+	require.NoError(t, err)
+
+	block, err := aes.NewCipher(key)
+	require.NoError(t, err)
+	gcm, err := cipher.NewGCM(block)
+	require.NoError(t, err)
+
+	p := &NATSIAMProvider{
+		gcm:          gcm,
+		bucketName:   "hive-iam-access-keys",
+		bucketsReady: false,
+		cache:        make(map[string]*cachedCredential),
+		done:         make(chan struct{}),
+	}
+
+	_, err = p.LookupCredentials("AKIAEXAMPLE")
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrKeyNotFound),
+		"should return ErrKeyNotFound when buckets not ready so chain falls back to config")
+}
+
+// --- IAMConfig validation tests ---
+
 func TestNewNATSIAMProvider_MissingNATSUrl(t *testing.T) {
 	_, err := NewNATSIAMProvider(&IAMConfig{
 		MasterKeyPath: "/tmp/master.key",

@@ -136,21 +136,30 @@ type cachedCredential struct {
 }
 
 // NATSIAMProvider looks up credentials from NATS KV and decrypts secrets.
+// Buckets are lazily initialized to handle the bootstrap case where predastore
+// starts before the hive daemon creates IAM KV buckets.
 type NATSIAMProvider struct {
-	conn             *nats.Conn
-	accessKeysBucket nats.KeyValue
-	usersBucket      nats.KeyValue
-	policiesBucket   nats.KeyValue
-	gcm              cipher.AEAD
+	conn       *nats.Conn
+	js         nats.JetStreamContext
+	gcm        cipher.AEAD
+	bucketName string // access keys bucket name
 
 	mu    sync.RWMutex
 	cache map[string]*cachedCredential
+
+	// Lazy-initialized KV buckets — nil until hive daemon creates them.
+	accessKeysBucket nats.KeyValue
+	usersBucket      nats.KeyValue
+	policiesBucket   nats.KeyValue
+	bucketsReady     bool
 
 	watcher nats.KeyWatcher
 	done    chan struct{}
 }
 
 // NewNATSIAMProvider creates a provider that looks up IAM credentials from NATS KV.
+// The provider connects to NATS eagerly but opens KV buckets lazily — this allows
+// predastore to start before the hive daemon creates the IAM buckets during bootstrap.
 func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	if cfg.NATSUrl == "" {
 		return nil, fmt.Errorf("iam.nats_url is required")
@@ -196,33 +205,58 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 		bucketName = "hive-iam-access-keys"
 	}
 
-	akBucket, err := js.KeyValue(bucketName)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("open access keys bucket %q: %w", bucketName, err)
-	}
-
-	usersBucket, err := js.KeyValue(kvBucketUsers)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("open users bucket: %w", err)
-	}
-
-	policiesBucket, err := js.KeyValue(kvBucketPolicies)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("open policies bucket: %w", err)
-	}
-
 	p := &NATSIAMProvider{
-		conn:             conn,
-		accessKeysBucket: akBucket,
-		usersBucket:      usersBucket,
-		policiesBucket:   policiesBucket,
-		gcm:              gcm,
-		cache:            make(map[string]*cachedCredential),
-		done:             make(chan struct{}),
+		conn:       conn,
+		js:         js,
+		gcm:        gcm,
+		bucketName: bucketName,
+		cache:      make(map[string]*cachedCredential),
+		done:       make(chan struct{}),
 	}
+
+	// Try to open KV buckets now. If they don't exist yet (hive daemon hasn't
+	// bootstrapped), we'll retry on each lookup until they appear.
+	if err := p.ensureBuckets(); err != nil {
+		slog.Warn("IAM KV buckets not available yet — IAM auth will activate once "+
+			"hive daemon creates them (config-based auth works immediately)",
+			"error", err)
+	}
+
+	slog.Info("NATS IAM provider initialized", "nats_url", cfg.NATSUrl, "bucket", bucketName,
+		"bucketsReady", p.bucketsReady)
+	return p, nil
+}
+
+// ensureBuckets attempts to open the three IAM KV buckets and start the watcher.
+// Returns nil if all buckets are ready, or an error describing what's missing.
+// Safe to call multiple times — no-ops once buckets are ready.
+func (p *NATSIAMProvider) ensureBuckets() error {
+	if p.bucketsReady {
+		return nil
+	}
+	if p.js == nil {
+		return fmt.Errorf("JetStream context not available")
+	}
+
+	akBucket, err := p.js.KeyValue(p.bucketName)
+	if err != nil {
+		return fmt.Errorf("open access keys bucket %q: %w", p.bucketName, err)
+	}
+
+	usersBucket, err := p.js.KeyValue(kvBucketUsers)
+	if err != nil {
+		return fmt.Errorf("open users bucket: %w", err)
+	}
+
+	policiesBucket, err := p.js.KeyValue(kvBucketPolicies)
+	if err != nil {
+		return fmt.Errorf("open policies bucket: %w", err)
+	}
+
+	p.accessKeysBucket = akBucket
+	p.usersBucket = usersBucket
+	p.policiesBucket = policiesBucket
+	p.bucketsReady = true
 
 	// Start KV watcher for cache invalidation
 	watcher, err := akBucket.WatchAll()
@@ -235,8 +269,8 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 		go p.watchChanges()
 	}
 
-	slog.Info("NATS IAM provider initialized", "nats_url", cfg.NATSUrl, "bucket", bucketName)
-	return p, nil
+	slog.Info("IAM KV buckets now available — IAM authentication is active")
+	return nil
 }
 
 func (p *NATSIAMProvider) watchChanges() {
@@ -273,6 +307,19 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 		return cached.result, nil
 	}
 	p.mu.RUnlock()
+
+	// Lazy bucket init: if buckets aren't ready yet, try to open them.
+	// This handles the bootstrap case where predastore starts before the
+	// hive daemon creates IAM KV buckets.
+	p.mu.Lock()
+	if !p.bucketsReady {
+		if err := p.ensureBuckets(); err != nil {
+			p.mu.Unlock()
+			// Buckets still not available — key can't exist there yet
+			return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, accessKeyID)
+		}
+	}
+	p.mu.Unlock()
 
 	// Lookup access key in NATS KV
 	entry, err := p.accessKeysBucket.Get(accessKeyID)
