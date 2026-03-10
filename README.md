@@ -8,7 +8,7 @@ Predastore can run as a single-node server with local filesystem storage, or sca
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     S3 Client (AWS CLI/SDK)                      │
+│                     S3 Client (AWS CLI/SDK)                     │
 └──────────────────────────────┬──────────────────────────────────┘
                                │
                                ▼
@@ -20,11 +20,11 @@ Predastore can run as a single-node server with local filesystem storage, or sca
          ▼                                   ▼
 ┌─────────────────────┐       ┌──────────────────────────────────┐
 │  s3db Cluster       │       │  QUIC Shard Nodes                │
-│  (Raft Consensus)   │       │  ┌────────┐┌────────┐┌────────┐ │
-│                     │       │  │ Node 0 ││ Node 1 ││ Node 2 │ │
-│  BoltDB (Raft log)  │       │  │  WAL   ││  WAL   ││  WAL   │ │
-│  BadgerDB (FSM)     │       │  │ Badger ││ Badger ││ Badger │ │
-└─────────────────────┘       │  └────────┘└────────┘└────────┘ │
+│  (Raft Consensus)   │       │  ┌────────┐┌────────┐┌────────┐  │
+│                     │       │  │ Node 0 ││ Node 1 ││ Node 2 │  │
+│  BoltDB (Raft log)  │       │  │  WAL   ││  WAL   ││  WAL   │  │
+│  BadgerDB (FSM)     │       │  │ Badger ││ Badger ││ Badger │  │
+└─────────────────────┘       │  └────────┘└────────┘└────────┘  │
                               └──────────────────────────────────┘
 ```
 
