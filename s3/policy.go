@@ -48,7 +48,9 @@ func s3Action(method, path string) string {
 func s3Resource(path string) string {
 	cleanPath := strings.TrimPrefix(path, "/")
 	if cleanPath == "" {
-		return "*"
+		// ListAllMyBuckets — use ARN wildcard so policies with
+		// Resource: "arn:aws:s3:::*" match correctly.
+		return "arn:aws:s3:::*"
 	}
 
 	// For bucket-level operations: arn:aws:s3:::bucket-name
@@ -64,10 +66,12 @@ func evaluateS3Access(action, resource string, policies []iamPolicyDocument) boo
 		for j := range policies[i].Statement {
 			stmt := &policies[i].Statement[j]
 
-			if !matchesAnyPattern(stmt.Action, action) {
+			// Actions are case-insensitive per AWS IAM spec.
+			if !matchesAnyPattern(stmt.Action, action, true) {
 				continue
 			}
-			if !matchesAnyPattern(stmt.Resource, resource) {
+			// Resource ARNs are case-sensitive per AWS IAM spec.
+			if !matchesAnyPattern(stmt.Resource, resource, false) {
 				continue
 			}
 			switch stmt.Effect {
@@ -82,9 +86,9 @@ func evaluateS3Access(action, resource string, policies []iamPolicyDocument) boo
 }
 
 // matchesAnyPattern returns true if any pattern matches the given value.
-func matchesAnyPattern(patterns []string, value string) bool {
+func matchesAnyPattern(patterns []string, value string, caseInsensitive bool) bool {
 	for _, p := range patterns {
-		if matchWildcardPattern(p, value) {
+		if matchWildcardPattern(p, value, caseInsensitive) {
 			return true
 		}
 	}
@@ -93,13 +97,21 @@ func matchesAnyPattern(patterns []string, value string) bool {
 
 // matchWildcardPattern performs simple wildcard matching where "*" can appear
 // at the end of a pattern as a suffix wildcard, or alone to match everything.
-func matchWildcardPattern(pattern, value string) bool {
+// When caseInsensitive is true, matching ignores case (used for IAM actions).
+// When false, matching is exact (used for resource ARNs).
+func matchWildcardPattern(pattern, value string, caseInsensitive bool) bool {
 	if pattern == "*" {
 		return true
 	}
 	if strings.HasSuffix(pattern, "*") {
-		prefix := strings.ToLower(pattern[:len(pattern)-1])
-		return strings.HasPrefix(strings.ToLower(value), prefix)
+		prefix := pattern[:len(pattern)-1]
+		if caseInsensitive {
+			return strings.HasPrefix(strings.ToLower(value), strings.ToLower(prefix))
+		}
+		return strings.HasPrefix(value, prefix)
 	}
-	return strings.EqualFold(pattern, value)
+	if caseInsensitive {
+		return strings.EqualFold(pattern, value)
+	}
+	return pattern == value
 }

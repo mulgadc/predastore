@@ -40,7 +40,7 @@ func TestS3Resource(t *testing.T) {
 		path string
 		want string
 	}{
-		{"/", "*"},
+		{"/", "arn:aws:s3:::*"},
 		{"/my-bucket", "arn:aws:s3:::my-bucket"},
 		{"/my-bucket/key.txt", "arn:aws:s3:::my-bucket/key.txt"},
 		{"/my-bucket/path/to/key.txt", "arn:aws:s3:::my-bucket/path/to/key.txt"},
@@ -133,7 +133,7 @@ func TestEvaluateS3Access_CaseInsensitive(t *testing.T) {
 
 // --- matchWildcardPattern tests ---
 
-func TestMatchWildcardPattern(t *testing.T) {
+func TestMatchWildcardPattern_CaseInsensitive(t *testing.T) {
 	tests := []struct {
 		pattern string
 		value   string
@@ -151,7 +151,26 @@ func TestMatchWildcardPattern(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := matchWildcardPattern(tt.pattern, tt.value)
-		assert.Equal(t, tt.want, got, "matchWildcardPattern(%q, %q)", tt.pattern, tt.value)
+		got := matchWildcardPattern(tt.pattern, tt.value, true)
+		assert.Equal(t, tt.want, got, "matchWildcardPattern(%q, %q, true)", tt.pattern, tt.value)
+	}
+}
+
+func TestMatchWildcardPattern_CaseSensitive(t *testing.T) {
+	tests := []struct {
+		pattern string
+		value   string
+		want    bool
+	}{
+		{"*", "anything", true},
+		{"arn:aws:s3:::my-bucket/*", "arn:aws:s3:::my-bucket/key.txt", true},
+		{"arn:aws:s3:::my-bucket/*", "arn:aws:s3:::other-bucket/key.txt", false},
+		{"arn:aws:s3:::MyBucket", "arn:aws:s3:::MyBucket", true},
+		{"arn:aws:s3:::MyBucket", "arn:aws:s3:::mybucket", false}, // case-sensitive
+	}
+
+	for _, tt := range tests {
+		got := matchWildcardPattern(tt.pattern, tt.value, false)
+		assert.Equal(t, tt.want, got, "matchWildcardPattern(%q, %q, false)", tt.pattern, tt.value)
 	}
 }

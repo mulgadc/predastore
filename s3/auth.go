@@ -153,8 +153,9 @@ type NATSIAMProvider struct {
 	policiesBucket   nats.KeyValue
 	bucketsReady     bool
 
-	watcher nats.KeyWatcher
-	done    chan struct{}
+	watcher   nats.KeyWatcher
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewNATSIAMProvider creates a provider that looks up IAM credentials from NATS KV.
@@ -452,15 +453,17 @@ func (p *NATSIAMProvider) decrypt(ciphertext string) (string, error) {
 }
 
 func (p *NATSIAMProvider) Close() {
-	close(p.done)
-	if p.watcher != nil {
-		if err := p.watcher.Stop(); err != nil {
-			slog.Warn("Failed to stop NATS KV watcher during cleanup", "error", err)
+	p.closeOnce.Do(func() {
+		close(p.done)
+		if p.watcher != nil {
+			if err := p.watcher.Stop(); err != nil {
+				slog.Warn("Failed to stop NATS KV watcher during cleanup", "error", err)
+			}
 		}
-	}
-	if p.conn != nil {
-		p.conn.Close()
-	}
+		if p.conn != nil {
+			p.conn.Close()
+		}
+	})
 }
 
 // --- ChainProvider ---

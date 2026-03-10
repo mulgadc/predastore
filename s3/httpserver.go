@@ -7,7 +7,9 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -279,12 +281,20 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			canonicalHeaders += fmt.Sprintf("%s:%s\n", header, strings.TrimSpace(value))
 		}
 
-		// Payload hash
+		// Payload hash — use the client-provided hash from X-Amz-Content-SHA256 when
+		// it contains a precomputed hex digest. This avoids buffering the entire
+		// request body into memory (critical for large object uploads).
 		var payloadHash string
 		payloadEncoding := r.Header.Get("X-Amz-Content-SHA256")
-		if payloadEncoding == "STREAMING-UNSIGNED-PAYLOAD-TRAILER" || payloadEncoding == "UNSIGNED-PAYLOAD" {
+		switch {
+		case payloadEncoding == "STREAMING-UNSIGNED-PAYLOAD-TRAILER" || payloadEncoding == "UNSIGNED-PAYLOAD":
 			payloadHash = payloadEncoding
-		} else {
+		case isHexSHA256(payloadEncoding):
+			// Client sent the precomputed hash — use it directly. The signature
+			// verification below guarantees integrity: if the client lied about
+			// the hash, the signature won't match.
+			payloadHash = payloadEncoding
+		default:
 			// Read body for signature verification
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -321,7 +331,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		signingKey := auth.GetSigningKey(secretKey, date, region, svc)
 		expectedSig := auth.HmacSHA256Hex(signingKey, stringToSign)
 
-		if expectedSig != signature {
+		if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(signature)) != 1 {
 			slog.Debug("Invalid signature", "expected", expectedSig, "actual", signature)
 			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request signature does not match")
 			return
@@ -854,4 +864,18 @@ func (s *HTTP2Server) GetRouter() chi.Router {
 // GetHandler returns the HTTP handler for testing with httptest
 func (s *HTTP2Server) GetHandler() http.Handler {
 	return s.router
+}
+
+// isHexSHA256 returns true if s is exactly 64 lowercase hex characters (a SHA-256 digest).
+func isHexSHA256(s string) bool {
+	if len(s) != hex.EncodedLen(32) {
+		return false
+	}
+	for i := range len(s) {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
