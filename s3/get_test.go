@@ -70,7 +70,7 @@ func TestGetObjectNoBucketPermissions(t *testing.T) {
 	err = xml.Unmarshal(body, &s3error)
 	assert.NoError(t, err, "XML parsing failed")
 
-	assert.Equal(t, "AccessDenied", s3error.Code, "Error message should indicate access denied")
+	assert.Equal(t, "InvalidAccessKeyId", s3error.Code, "Error message should indicate invalid access key")
 }
 
 func TestGetObjectBucketPermissions(t *testing.T) {

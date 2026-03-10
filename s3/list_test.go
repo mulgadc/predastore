@@ -184,7 +184,7 @@ func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 	err = xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
 
-	assert.Equal(t, result.Code, "AccessDenied", "Error message should indicate access denied")
+	assert.Equal(t, "InvalidAccessKeyId", result.Code, "Error message should indicate invalid access key")
 }
 
 // Test list objects to a public bucket, with no auth

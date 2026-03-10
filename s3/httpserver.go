@@ -7,7 +7,9 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -31,19 +33,25 @@ import (
 	"github.com/mulgadc/predastore/s3/chunked"
 )
 
+// maxClockSkew is the maximum allowed difference between the request
+// timestamp and the server's current time. Matches hive gateway (5 min).
+const maxClockSkew = 5 * time.Minute
+
 // HTTP2Server is an HTTP/2 compatible S3 server using net/http
 type HTTP2Server struct {
-	config  *Config
-	backend backend.Backend
-	router  chi.Router
-	server  *http.Server
+	config   *Config
+	backend  backend.Backend
+	router   chi.Router
+	server   *http.Server
+	credProv CredentialProvider
 }
 
 // NewHTTP2Server creates a new HTTP/2 compatible S3 server
 func NewHTTP2Server(config *Config) *HTTP2Server {
 	s := &HTTP2Server{
-		config: config,
-		router: chi.NewRouter(),
+		config:   config,
+		router:   chi.NewRouter(),
+		credProv: NewConfigProvider(config.Auth),
 	}
 
 	// Create backend based on config
@@ -58,11 +66,12 @@ func NewHTTP2Server(config *Config) *HTTP2Server {
 }
 
 // NewHTTP2ServerWithBackend creates a new HTTP/2 server with an existing backend
-func NewHTTP2ServerWithBackend(config *Config, be backend.Backend) *HTTP2Server {
+func NewHTTP2ServerWithBackend(config *Config, be backend.Backend, credProv CredentialProvider) *HTTP2Server {
 	s := &HTTP2Server{
-		config:  config,
-		backend: be,
-		router:  chi.NewRouter(),
+		config:   config,
+		backend:  be,
+		router:   chi.NewRouter(),
+		credProv: credProv,
 	}
 	s.setupRoutes()
 	return s
@@ -231,18 +240,46 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		accessKey, date, region, svc := creds[0], creds[1], creds[2], creds[3]
 
-		var secretKey string
-		for _, auth := range s.config.Auth {
-			if auth.AccessKeyID == accessKey {
-				secretKey = auth.SecretAccessKey
-				break
-			}
-		}
-
-		if secretKey == "" {
-			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid access key")
+		// Validate X-Amz-Date timestamp to prevent replay attacks
+		amzDate := r.Header.Get("x-amz-date")
+		if amzDate == "" {
+			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing required header: X-Amz-Date")
 			return
 		}
+		parsedTime, err := time.Parse(auth.TimeFormat, amzDate)
+		if err != nil {
+			slog.Debug("Invalid X-Amz-Date format", "timestamp", amzDate)
+			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid X-Amz-Date header format")
+			return
+		}
+		if time.Since(parsedTime).Abs() > maxClockSkew {
+			slog.Debug("Request timestamp outside allowed skew",
+				"timestamp", amzDate, "skew", time.Since(parsedTime))
+			s.writeS3Error(w, r, http.StatusForbidden, "RequestTimeTooSkewed",
+				"The difference between the request time and the current time is too large")
+			return
+		}
+
+		credResult, err := s.credProv.LookupCredentials(accessKey)
+		if err != nil {
+			if errors.Is(err, ErrKeyNotFound) {
+				slog.Warn("Unknown access key",
+					"accessKeyID", accessKey,
+					"remoteAddr", r.RemoteAddr)
+				s.writeS3Error(w, r, http.StatusForbidden, "InvalidAccessKeyId",
+					"The AWS Access Key Id you provided does not exist in our records")
+			} else {
+				// Infrastructure error (NATS down, etc.) — return 500 so AWS SDKs retry.
+				slog.Error("Credential lookup infrastructure error",
+					"accessKeyID", accessKey,
+					"error", err,
+					"remoteAddr", r.RemoteAddr)
+				s.writeS3Error(w, r, http.StatusInternalServerError, "InternalError",
+					"An internal error occurred while validating credentials")
+			}
+			return
+		}
+		secretKey := credResult.SecretAccessKey
 
 		signedHeaders := strings.TrimPrefix(parts[1], "SignedHeaders=")
 		signature := strings.TrimPrefix(parts[2], "Signature=")
@@ -278,12 +315,20 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			canonicalHeaders += fmt.Sprintf("%s:%s\n", header, strings.TrimSpace(value))
 		}
 
-		// Payload hash
+		// Payload hash — use the client-provided hash from X-Amz-Content-SHA256 when
+		// it contains a precomputed hex digest. This avoids buffering the entire
+		// request body into memory (critical for large object uploads).
 		var payloadHash string
 		payloadEncoding := r.Header.Get("X-Amz-Content-SHA256")
-		if payloadEncoding == "STREAMING-UNSIGNED-PAYLOAD-TRAILER" || payloadEncoding == "UNSIGNED-PAYLOAD" {
+		switch {
+		case payloadEncoding == "STREAMING-UNSIGNED-PAYLOAD-TRAILER" || payloadEncoding == "UNSIGNED-PAYLOAD":
 			payloadHash = payloadEncoding
-		} else {
+		case isHexSHA256(payloadEncoding):
+			// Client sent the precomputed hash — use it directly. The signature
+			// verification below guarantees integrity: if the client lied about
+			// the hash, the signature won't match.
+			payloadHash = payloadEncoding
+		default:
 			// Read body for signature verification
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -307,12 +352,11 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		hashedCanonicalRequest := auth.HashSHA256(canonicalRequest)
 
-		timestamp := r.Header.Get("x-amz-date")
 		scope := fmt.Sprintf("%s/%s/%s/aws4_request", date, s.config.Region, svc)
 
 		stringToSign := fmt.Sprintf(
 			"AWS4-HMAC-SHA256\n%s\n%s\n%s",
-			timestamp,
+			amzDate,
 			scope,
 			hashedCanonicalRequest,
 		)
@@ -320,20 +364,38 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		signingKey := auth.GetSigningKey(secretKey, date, region, svc)
 		expectedSig := auth.HmacSHA256Hex(signingKey, stringToSign)
 
-		if expectedSig != signature {
+		if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(signature)) != 1 {
 			slog.Debug("Invalid signature", "expected", expectedSig, "actual", signature)
 			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request signature does not match")
 			return
 		}
 
-		// Store authenticated user info in context
-		ctx := context.WithValue(r.Context(), ContextKeyAccessKeyID, accessKey)
-		for _, auth := range s.config.Auth {
-			if auth.AccessKeyID == accessKey {
-				ctx = context.WithValue(ctx, ContextKeyAccountID, auth.AccountID)
-				break
+		// Check IAM policy authorization for NATS-sourced credentials
+		if !credResult.SkipPolicyCheck {
+			action := s3Action(method, path)
+			if action == "" {
+				slog.Warn("Unsupported HTTP method for S3 action mapping",
+					"method", method, "path", path, "remoteAddr", r.RemoteAddr)
+				s.writeS3Error(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed", "The specified method is not allowed")
+				return
+			}
+			resource := s3Resource(path)
+			if len(credResult.PolicyDocuments) == 0 {
+				slog.Debug("No policies resolved for user, implicit deny",
+					"accessKeyID", accessKey, "accountID", credResult.AccountID)
+			}
+			if !evaluateS3Access(action, resource, credResult.PolicyDocuments) {
+				slog.Debug("S3 access denied by policy",
+					"action", action, "resource", resource,
+					"accessKeyID", accessKey, "policyCount", len(credResult.PolicyDocuments))
+				s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
+				return
 			}
 		}
+
+		// Store authenticated user info in context
+		ctx := context.WithValue(r.Context(), ContextKeyAccessKeyID, accessKey)
+		ctx = context.WithValue(ctx, ContextKeyAccountID, credResult.AccountID)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -835,4 +897,18 @@ func (s *HTTP2Server) GetRouter() chi.Router {
 // GetHandler returns the HTTP handler for testing with httptest
 func (s *HTTP2Server) GetHandler() http.Handler {
 	return s.router
+}
+
+// isHexSHA256 returns true if s is exactly 64 lowercase hex characters (a SHA-256 digest).
+func isHexSHA256(s string) bool {
+	if len(s) != hex.EncodedLen(32) {
+		return false
+	}
+	for i := range len(s) {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }

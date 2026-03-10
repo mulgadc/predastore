@@ -50,6 +50,7 @@ type Server struct {
 	config    *Config
 	server    *HTTP2Server
 	backend   backend.Backend
+	credProv  CredentialProvider
 	dbServers []*s3db.Server
 	// quicCancel context.CancelFunc
 
@@ -258,9 +259,16 @@ func (s *Server) init() error {
 		return fmt.Errorf("unknown backend type: %s", s.backendType)
 	}
 
+	// Initialize credential provider
+	credProv, err := s.initCredentialProvider()
+	if err != nil {
+		return fmt.Errorf("failed to initialize credential provider: %w", err)
+	}
+	s.credProv = credProv
+
 	// Setup HTTP routes with the backend using HTTP/2 server
 	slog.Info("Server init", "backendType", s.backendType)
-	s.server = NewHTTP2ServerWithBackend(s.config, s.backend)
+	s.server = NewHTTP2ServerWithBackend(s.config, s.backend, s.credProv)
 	slog.Info("HTTP/2 server initialized - using net/http for connection multiplexing")
 
 	return nil
@@ -711,6 +719,29 @@ func (s *Server) launchQUICServers() {
 	}
 }
 
+// initCredentialProvider creates the appropriate CredentialProvider based on config.
+// If [iam] is configured, uses NATS KV with config fallback (ChainProvider).
+// Otherwise, uses config-only (ConfigProvider).
+// Returns an error if [iam] is explicitly configured but NATS connection or crypto
+// setup fails. Missing KV buckets are handled gracefully via lazy initialization
+// (the hive daemon may create them after predastore starts).
+func (s *Server) initCredentialProvider() (CredentialProvider, error) {
+	configProv := NewConfigProvider(s.config.Auth)
+
+	if s.config.IAM == nil {
+		slog.Info("IAM not configured, using config-only auth")
+		return configProv, nil
+	}
+
+	natsProv, err := NewNATSIAMProvider(s.config.IAM)
+	if err != nil {
+		return nil, fmt.Errorf("IAM configured but NATS provider failed to initialize: %w", err)
+	}
+
+	slog.Info("Using NATS IAM + config chain auth")
+	return NewChainProvider(natsProv, configProv), nil
+}
+
 // ListenAndServe starts the server and blocks until shutdown
 func (s *Server) ListenAndServe() error {
 	s.mu.Lock()
@@ -894,6 +925,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-ctx.Done():
 			slog.Warn("Shutdown context cancelled, continuing...")
 		}
+	}
+
+	// Close credential provider (NATS connections, watchers)
+	if s.credProv != nil {
+		s.credProv.Close()
 	}
 
 	// Stop profiling and save profile
