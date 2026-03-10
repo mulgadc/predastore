@@ -316,8 +316,15 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 	if !p.bucketsReady {
 		if err := p.ensureBuckets(); err != nil {
 			p.mu.Unlock()
-			// Buckets still not available — key can't exist there yet
-			return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, accessKeyID)
+			// Distinguish "buckets don't exist yet" (bootstrap) from NATS infra errors.
+			// Bucket/stream-not-found means hive daemon hasn't created them yet — treat
+			// as key-not-found so ChainProvider falls back to config.
+			// Any other error (NATS down, auth failure) must propagate so callers
+			// return 500 instead of a misleading 403.
+			if errors.Is(err, nats.ErrBucketNotFound) || errors.Is(err, nats.ErrStreamNotFound) {
+				return nil, fmt.Errorf("%w: %s (IAM buckets not yet created)", ErrKeyNotFound, accessKeyID)
+			}
+			return nil, fmt.Errorf("IAM lookup unavailable: %w", err)
 		}
 	}
 	p.mu.Unlock()
@@ -487,6 +494,10 @@ func (p *ChainProvider) LookupCredentials(accessKeyID string) (*CredentialResult
 	result, err := p.config.LookupCredentials(accessKeyID)
 	if err == nil {
 		return result, nil
+	}
+	// Only fall through on "key not found" — propagate unexpected config errors.
+	if !errors.Is(err, ErrKeyNotFound) {
+		return nil, err
 	}
 
 	// Not in config — try NATS IAM for user credentials.

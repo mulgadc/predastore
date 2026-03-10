@@ -266,9 +266,10 @@ func TestErrKeyNotFound_IsDetectable(t *testing.T) {
 
 // --- Lazy bucket init tests ---
 
-func TestNATSIAMProvider_LazyBucketsNotReady(t *testing.T) {
-	// When buckets aren't ready, LookupCredentials should return ErrKeyNotFound
-	// so ChainProvider falls back to config.
+func TestNATSIAMProvider_LazyBucketsNotReady_InfraError(t *testing.T) {
+	// When buckets aren't ready due to infrastructure issues (no JetStream context),
+	// LookupCredentials should return an infrastructure error (NOT ErrKeyNotFound)
+	// so the caller can return 500 instead of a misleading 403.
 	key := make([]byte, 32)
 	_, err := rand.Read(key)
 	require.NoError(t, err)
@@ -288,8 +289,9 @@ func TestNATSIAMProvider_LazyBucketsNotReady(t *testing.T) {
 
 	_, err = p.LookupCredentials("AKIAEXAMPLE")
 	assert.Error(t, err)
-	assert.True(t, errors.Is(err, ErrKeyNotFound),
-		"should return ErrKeyNotFound when buckets not ready so chain falls back to config")
+	assert.False(t, errors.Is(err, ErrKeyNotFound),
+		"infrastructure errors should NOT be mapped to ErrKeyNotFound")
+	assert.Contains(t, err.Error(), "IAM lookup unavailable")
 }
 
 // --- IAMConfig validation tests ---

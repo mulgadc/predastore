@@ -238,11 +238,21 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		credResult, err := s.credProv.LookupCredentials(accessKey)
 		if err != nil {
-			slog.Warn("Credential lookup failed",
-				"accessKeyID", accessKey,
-				"error", err,
-				"remoteAddr", r.RemoteAddr)
-			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid access key")
+			if errors.Is(err, ErrKeyNotFound) {
+				slog.Warn("Unknown access key",
+					"accessKeyID", accessKey,
+					"remoteAddr", r.RemoteAddr)
+				s.writeS3Error(w, r, http.StatusForbidden, "InvalidAccessKeyId",
+					"The AWS Access Key Id you provided does not exist in our records")
+			} else {
+				// Infrastructure error (NATS down, etc.) — return 500 so AWS SDKs retry.
+				slog.Error("Credential lookup infrastructure error",
+					"accessKeyID", accessKey,
+					"error", err,
+					"remoteAddr", r.RemoteAddr)
+				s.writeS3Error(w, r, http.StatusInternalServerError, "InternalError",
+					"An internal error occurred while validating credentials")
+			}
 			return
 		}
 		secretKey := credResult.SecretAccessKey
