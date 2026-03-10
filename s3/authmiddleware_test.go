@@ -165,6 +165,81 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "Invalid signature",
 		},
+		{
+			name:   "Expired Timestamp - Too Old",
+			method: "GET",
+			path:   "/test-bucket01",
+			setupHeaders: func(req *http.Request) {
+				// 6 minutes in the past — exceeds the 5-minute maxClockSkew
+				timestamp := time.Now().UTC().Add(-6 * time.Minute).Format(auth.TimeFormat)
+				err := auth.GenerateAuthHeaderReq(
+					"TESTACCESSKEY", "TESTSECRETKEY",
+					timestamp, "ap-southeast-2", "s3", req,
+				)
+				if err != nil {
+					assert.Fail(t, "Error generating auth header: %v", err)
+				}
+			},
+			expectStatus:   http.StatusForbidden,
+			expectResponse: "RequestTimeTooSkewed",
+		},
+		{
+			name:   "Expired Timestamp - Too Far In Future",
+			method: "GET",
+			path:   "/test-bucket01",
+			setupHeaders: func(req *http.Request) {
+				// 6 minutes in the future
+				timestamp := time.Now().UTC().Add(6 * time.Minute).Format(auth.TimeFormat)
+				err := auth.GenerateAuthHeaderReq(
+					"TESTACCESSKEY", "TESTSECRETKEY",
+					timestamp, "ap-southeast-2", "s3", req,
+				)
+				if err != nil {
+					assert.Fail(t, "Error generating auth header: %v", err)
+				}
+			},
+			expectStatus:   http.StatusForbidden,
+			expectResponse: "RequestTimeTooSkewed",
+		},
+		{
+			name:   "Missing X-Amz-Date Header",
+			method: "GET",
+			path:   "/test-bucket01",
+			setupHeaders: func(req *http.Request) {
+				timestamp := time.Now().UTC().Format(auth.TimeFormat)
+				err := auth.GenerateAuthHeaderReq(
+					"TESTACCESSKEY", "TESTSECRETKEY",
+					timestamp, "ap-southeast-2", "s3", req,
+				)
+				if err != nil {
+					assert.Fail(t, "Error generating auth header: %v", err)
+				}
+				// Remove the date header after signing
+				req.Header.Del("x-amz-date")
+				req.Header.Del("X-Amz-Date")
+			},
+			expectStatus:   http.StatusForbidden,
+			expectResponse: "Missing required header",
+		},
+		{
+			name:   "Invalid X-Amz-Date Format",
+			method: "GET",
+			path:   "/test-bucket01",
+			setupHeaders: func(req *http.Request) {
+				timestamp := time.Now().UTC().Format(auth.TimeFormat)
+				err := auth.GenerateAuthHeaderReq(
+					"TESTACCESSKEY", "TESTSECRETKEY",
+					timestamp, "ap-southeast-2", "s3", req,
+				)
+				if err != nil {
+					assert.Fail(t, "Error generating auth header: %v", err)
+				}
+				// Replace with malformed date
+				req.Header.Set("x-amz-date", "not-a-valid-date")
+			},
+			expectStatus:   http.StatusForbidden,
+			expectResponse: "Invalid X-Amz-Date",
+		},
 	}
 
 	for _, tt := range tests {

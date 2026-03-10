@@ -33,6 +33,10 @@ import (
 	"github.com/mulgadc/predastore/s3/chunked"
 )
 
+// maxClockSkew is the maximum allowed difference between the request
+// timestamp and the server's current time. Matches hive gateway (5 min).
+const maxClockSkew = 5 * time.Minute
+
 // HTTP2Server is an HTTP/2 compatible S3 server using net/http
 type HTTP2Server struct {
 	config   *Config
@@ -236,6 +240,26 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		accessKey, date, region, svc := creds[0], creds[1], creds[2], creds[3]
 
+		// Validate X-Amz-Date timestamp to prevent replay attacks
+		amzDate := r.Header.Get("x-amz-date")
+		if amzDate == "" {
+			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing required header: X-Amz-Date")
+			return
+		}
+		parsedTime, err := time.Parse(auth.TimeFormat, amzDate)
+		if err != nil {
+			slog.Debug("Invalid X-Amz-Date format", "timestamp", amzDate)
+			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid X-Amz-Date header format")
+			return
+		}
+		if time.Since(parsedTime).Abs() > maxClockSkew {
+			slog.Debug("Request timestamp outside allowed skew",
+				"timestamp", amzDate, "skew", time.Since(parsedTime))
+			s.writeS3Error(w, r, http.StatusForbidden, "RequestTimeTooSkewed",
+				"The difference between the request time and the current time is too large")
+			return
+		}
+
 		credResult, err := s.credProv.LookupCredentials(accessKey)
 		if err != nil {
 			if errors.Is(err, ErrKeyNotFound) {
@@ -328,12 +352,11 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		hashedCanonicalRequest := auth.HashSHA256(canonicalRequest)
 
-		timestamp := r.Header.Get("x-amz-date")
 		scope := fmt.Sprintf("%s/%s/%s/aws4_request", date, s.config.Region, svc)
 
 		stringToSign := fmt.Sprintf(
 			"AWS4-HMAC-SHA256\n%s\n%s\n%s",
-			timestamp,
+			amzDate,
 			scope,
 			hashedCanonicalRequest,
 		)
