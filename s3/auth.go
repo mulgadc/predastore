@@ -16,6 +16,9 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+// ErrKeyNotFound is returned when an access key does not exist in the provider.
+var ErrKeyNotFound = errors.New("access key not found")
+
 // CredentialResult is the result of a credential lookup.
 type CredentialResult struct {
 	SecretAccessKey string
@@ -74,6 +77,10 @@ type iamStatement struct {
 type iamStringOrArr []string
 
 func (s *iamStringOrArr) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*s = nil
+		return nil
+	}
 	var single string
 	if err := json.Unmarshal(data, &single); err == nil {
 		*s = []string{single}
@@ -109,7 +116,7 @@ func (p *ConfigProvider) LookupCredentials(accessKeyID string) (*CredentialResul
 			}, nil
 		}
 	}
-	return nil, errors.New("access key not found")
+	return nil, ErrKeyNotFound
 }
 
 func (p *ConfigProvider) Close() {}
@@ -145,6 +152,13 @@ type NATSIAMProvider struct {
 
 // NewNATSIAMProvider creates a provider that looks up IAM credentials from NATS KV.
 func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
+	if cfg.NATSUrl == "" {
+		return nil, fmt.Errorf("iam.nats_url is required")
+	}
+	if cfg.MasterKeyPath == "" {
+		return nil, fmt.Errorf("iam.master_key_path is required")
+	}
+
 	// Load and validate master key
 	masterKey, err := loadMasterKey(cfg.MasterKeyPath)
 	if err != nil {
@@ -213,7 +227,9 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	// Start KV watcher for cache invalidation
 	watcher, err := akBucket.WatchAll()
 	if err != nil {
-		slog.Warn("Failed to start NATS KV watcher for cache invalidation", "error", err)
+		slog.Error("Failed to start NATS KV watcher — cache invalidation will not work, "+
+			"credential changes will only take effect after cache TTL expiry",
+			"error", err, "ttl", cacheTTL)
 	} else {
 		p.watcher = watcher
 		go p.watchChanges()
@@ -228,6 +244,11 @@ func (p *NATSIAMProvider) watchChanges() {
 		select {
 		case entry, ok := <-p.watcher.Updates():
 			if !ok {
+				slog.Error("NATS KV watcher channel closed unexpectedly — " +
+					"cache invalidation is disabled, cached credentials may become stale")
+				p.mu.Lock()
+				p.cache = make(map[string]*cachedCredential)
+				p.mu.Unlock()
 				return
 			}
 			if entry == nil {
@@ -256,7 +277,10 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 	// Lookup access key in NATS KV
 	entry, err := p.accessKeysBucket.Get(accessKeyID)
 	if err != nil {
-		return nil, fmt.Errorf("access key not found: %w", err)
+		if errors.Is(err, nats.ErrKeyNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, accessKeyID)
+		}
+		return nil, fmt.Errorf("NATS KV lookup failed for access key %s: %w", accessKeyID, err)
 	}
 
 	var ak iamAccessKey
@@ -265,7 +289,12 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 	}
 
 	if ak.Status != "Active" {
-		return nil, errors.New("access key is inactive")
+		slog.Warn("Authentication attempt with inactive access key",
+			"accessKeyID", accessKeyID,
+			"accountID", ak.AccountID,
+			"userName", ak.UserName,
+			"status", ak.Status)
+		return nil, fmt.Errorf("access key %s is inactive (status: %s)", accessKeyID, ak.Status)
 	}
 
 	// Decrypt the secret
@@ -317,6 +346,10 @@ func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iam
 	for _, arn := range user.AttachedPolicies {
 		policyName := extractPolicyName(arn)
 		if policyName == "" {
+			slog.Warn("Skipping unparseable policy ARN",
+				"arn", arn,
+				"accountID", accountID,
+				"userName", userName)
 			continue
 		}
 
@@ -375,10 +408,12 @@ func (p *NATSIAMProvider) Close() {
 	close(p.done)
 	if p.watcher != nil {
 		if err := p.watcher.Stop(); err != nil {
-			slog.Debug("Failed to stop NATS KV watcher", "error", err)
+			slog.Warn("Failed to stop NATS KV watcher during cleanup", "error", err)
 		}
 	}
-	p.conn.Close()
+	if p.conn != nil {
+		p.conn.Close()
+	}
 }
 
 // --- ChainProvider ---
@@ -399,6 +434,17 @@ func (p *ChainProvider) LookupCredentials(accessKeyID string) (*CredentialResult
 	if err == nil {
 		return result, nil
 	}
+
+	// Only fall back to config for "not found" errors.
+	// Infrastructure failures, inactive keys, decryption errors, etc.
+	// must NOT silently fall through to config.
+	if !errors.Is(err, ErrKeyNotFound) {
+		slog.Warn("NATS IAM lookup failed (not falling back to config)",
+			"accessKeyID", accessKeyID, "error", err)
+		return nil, err
+	}
+
+	slog.Debug("Access key not in NATS KV, trying config", "accessKeyID", accessKeyID)
 	return p.fallback.LookupCredentials(accessKeyID)
 }
 

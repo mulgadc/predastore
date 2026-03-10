@@ -260,7 +260,11 @@ func (s *Server) init() error {
 	}
 
 	// Initialize credential provider
-	s.credProv = s.initCredentialProvider()
+	credProv, err := s.initCredentialProvider()
+	if err != nil {
+		return fmt.Errorf("failed to initialize credential provider: %w", err)
+	}
+	s.credProv = credProv
 
 	// Setup HTTP routes with the backend using HTTP/2 server
 	slog.Info("Server init", "backendType", s.backendType)
@@ -718,22 +722,22 @@ func (s *Server) launchQUICServers() {
 // initCredentialProvider creates the appropriate CredentialProvider based on config.
 // If [iam] is configured, uses NATS KV with config fallback (ChainProvider).
 // Otherwise, uses config-only (ConfigProvider).
-func (s *Server) initCredentialProvider() CredentialProvider {
+// Returns an error if [iam] is explicitly configured but fails to initialize.
+func (s *Server) initCredentialProvider() (CredentialProvider, error) {
 	configProv := NewConfigProvider(s.config.Auth)
 
 	if s.config.IAM == nil {
 		slog.Info("IAM not configured, using config-only auth")
-		return configProv
+		return configProv, nil
 	}
 
 	natsProv, err := NewNATSIAMProvider(s.config.IAM)
 	if err != nil {
-		slog.Warn("Failed to initialize NATS IAM provider, falling back to config-only auth", "error", err)
-		return configProv
+		return nil, fmt.Errorf("IAM configured but NATS provider failed to initialize: %w", err)
 	}
 
 	slog.Info("Using NATS IAM + config chain auth")
-	return NewChainProvider(natsProv, configProv)
+	return NewChainProvider(natsProv, configProv), nil
 }
 
 // ListenAndServe starts the server and blocks until shutdown

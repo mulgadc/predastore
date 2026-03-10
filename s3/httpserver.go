@@ -236,6 +236,10 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		credResult, err := s.credProv.LookupCredentials(accessKey)
 		if err != nil {
+			slog.Warn("Credential lookup failed",
+				"accessKeyID", accessKey,
+				"error", err,
+				"remoteAddr", r.RemoteAddr)
 			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid access key")
 			return
 		}
@@ -326,8 +330,21 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		// Check IAM policy authorization for NATS-sourced credentials
 		if !credResult.SkipPolicyCheck {
 			action := s3Action(method, path)
+			if action == "" {
+				slog.Warn("Unsupported HTTP method for S3 action mapping",
+					"method", method, "path", path, "remoteAddr", r.RemoteAddr)
+				s.writeS3Error(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed", "The specified method is not allowed")
+				return
+			}
 			resource := s3Resource(path)
-			if action == "" || !evaluateS3Access(action, resource, credResult.PolicyDocuments) {
+			if len(credResult.PolicyDocuments) == 0 {
+				slog.Debug("No policies resolved for user, implicit deny",
+					"accessKeyID", accessKey, "accountID", credResult.AccountID)
+			}
+			if !evaluateS3Access(action, resource, credResult.PolicyDocuments) {
+				slog.Debug("S3 access denied by policy",
+					"action", action, "resource", resource,
+					"accessKeyID", accessKey, "policyCount", len(credResult.PolicyDocuments))
 				s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 				return
 			}

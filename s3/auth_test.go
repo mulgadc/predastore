@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -67,8 +69,9 @@ func TestChainProvider_PrimarySuccess(t *testing.T) {
 	assert.Equal(t, "from-primary", result.SecretAccessKey)
 }
 
-func TestChainProvider_FallbackOnPrimaryError(t *testing.T) {
-	primary := &mockProvider{err: assert.AnError}
+func TestChainProvider_FallbackOnNotFound(t *testing.T) {
+	// ErrKeyNotFound from primary should fall back to config
+	primary := &mockProvider{err: fmt.Errorf("%w: AK1", ErrKeyNotFound)}
 	fallback := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-fallback", AccountID: "acct-2", SkipPolicyCheck: true}}
 
 	chain := NewChainProvider(primary, fallback)
@@ -78,13 +81,36 @@ func TestChainProvider_FallbackOnPrimaryError(t *testing.T) {
 	assert.True(t, result.SkipPolicyCheck)
 }
 
-func TestChainProvider_BothFail(t *testing.T) {
-	primary := &mockProvider{err: assert.AnError}
-	fallback := &mockProvider{err: assert.AnError}
+func TestChainProvider_NoFallbackOnInfraError(t *testing.T) {
+	// Non-ErrKeyNotFound errors (infra failures, inactive keys, etc.) must NOT fall back
+	primary := &mockProvider{err: errors.New("NATS connection timeout")}
+	fallback := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-fallback", AccountID: "acct-2"}}
 
 	chain := NewChainProvider(primary, fallback)
 	_, err := chain.LookupCredentials("AK1")
 	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "NATS connection timeout")
+}
+
+func TestChainProvider_NoFallbackOnInactiveKey(t *testing.T) {
+	// Inactive key errors must NOT fall back to config
+	primary := &mockProvider{err: fmt.Errorf("access key AK1 is inactive (status: Inactive)")}
+	fallback := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-fallback", AccountID: "acct-2", SkipPolicyCheck: true}}
+
+	chain := NewChainProvider(primary, fallback)
+	_, err := chain.LookupCredentials("AK1")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "inactive")
+}
+
+func TestChainProvider_BothNotFound(t *testing.T) {
+	primary := &mockProvider{err: ErrKeyNotFound}
+	fallback := &mockProvider{err: ErrKeyNotFound}
+
+	chain := NewChainProvider(primary, fallback)
+	_, err := chain.LookupCredentials("AK1")
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrKeyNotFound)
 }
 
 // --- extractPolicyName tests ---
@@ -216,4 +242,39 @@ func TestIamStringOrArr_UnmarshalArray(t *testing.T) {
 	err := json.Unmarshal([]byte(`["s3:GetObject", "s3:PutObject"]`), &s)
 	require.NoError(t, err)
 	assert.Equal(t, iamStringOrArr{"s3:GetObject", "s3:PutObject"}, s)
+}
+
+func TestIamStringOrArr_UnmarshalNull(t *testing.T) {
+	var s iamStringOrArr
+	err := json.Unmarshal([]byte(`null`), &s)
+	require.NoError(t, err)
+	assert.Nil(t, s)
+}
+
+// --- ErrKeyNotFound sentinel tests ---
+
+func TestErrKeyNotFound_IsDetectable(t *testing.T) {
+	wrapped := fmt.Errorf("%w: AK123", ErrKeyNotFound)
+	assert.True(t, errors.Is(wrapped, ErrKeyNotFound))
+
+	unrelated := errors.New("NATS connection timeout")
+	assert.False(t, errors.Is(unrelated, ErrKeyNotFound))
+}
+
+// --- IAMConfig validation tests ---
+
+func TestNewNATSIAMProvider_MissingNATSUrl(t *testing.T) {
+	_, err := NewNATSIAMProvider(&IAMConfig{
+		MasterKeyPath: "/tmp/master.key",
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "nats_url is required")
+}
+
+func TestNewNATSIAMProvider_MissingMasterKeyPath(t *testing.T) {
+	_, err := NewNATSIAMProvider(&IAMConfig{
+		NATSUrl: "nats://localhost:4222",
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "master_key_path is required")
 }
