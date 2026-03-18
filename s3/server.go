@@ -714,7 +714,7 @@ func (s *Server) launchQUICServers() {
 // Otherwise, uses config-only (ConfigProvider).
 // Returns an error if [iam] is explicitly configured but NATS connection or crypto
 // setup fails. Missing KV buckets are handled gracefully via lazy initialization
-// (the hive daemon may create them after predastore starts).
+// (the spinifex daemon may create them after predastore starts).
 func (s *Server) initCredentialProvider() (CredentialProvider, error) {
 	configProv := NewConfigProvider(s.config.Auth)
 

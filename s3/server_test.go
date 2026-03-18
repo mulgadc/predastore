@@ -15,13 +15,13 @@ func TestCheckBaseDir(t *testing.T) {
 	}{
 		{
 			name:     "relative path with base-dir set",
-			baseDir:  "/home/ben/hive/predastore",
+			baseDir:  "/home/ben/spinifex/predastore",
 			path:     "distributed/db/node-1/",
-			expected: "/home/ben/hive/predastore/distributed/db/node-1", // filepath.Join normalizes trailing slashes
+			expected: "/home/ben/spinifex/predastore/distributed/db/node-1", // filepath.Join normalizes trailing slashes
 		},
 		{
 			name:     "absolute path with base-dir set (should not change)",
-			baseDir:  "/home/ben/hive/predastore",
+			baseDir:  "/home/ben/spinifex/predastore",
 			path:     "/var/data/node-1/",
 			expected: "/var/data/node-1/",
 		},
@@ -33,7 +33,7 @@ func TestCheckBaseDir(t *testing.T) {
 		},
 		{
 			name:     "empty path",
-			baseDir:  "/home/ben/hive/predastore",
+			baseDir:  "/home/ben/spinifex/predastore",
 			path:     "",
 			expected: "",
 		},
@@ -45,15 +45,15 @@ func TestCheckBaseDir(t *testing.T) {
 		},
 		{
 			name:     "relative path without trailing slash",
-			baseDir:  "/home/ben/hive/predastore",
+			baseDir:  "/home/ben/spinifex/predastore",
 			path:     "distributed/nodes/node-2",
-			expected: "/home/ben/hive/predastore/distributed/nodes/node-2",
+			expected: "/home/ben/spinifex/predastore/distributed/nodes/node-2",
 		},
 		{
 			name:     "base-dir with trailing slash",
-			baseDir:  "/home/ben/hive/predastore/",
+			baseDir:  "/home/ben/spinifex/predastore/",
 			path:     "distributed/db/node-1/",
-			expected: "/home/ben/hive/predastore/distributed/db/node-1", // filepath.Join normalizes
+			expected: "/home/ben/spinifex/predastore/distributed/db/node-1", // filepath.Join normalizes
 		},
 		{
 			name:     "simple relative path",
@@ -79,7 +79,7 @@ func TestCheckBaseDir(t *testing.T) {
 
 func TestCheckBaseDir_IntegrationScenarios(t *testing.T) {
 	// Simulate the actual config scenario from predastore.toml
-	baseDir := "/home/ben/hive/predastore"
+	baseDir := "/home/ben/spinifex/predastore"
 
 	// DB node paths from config (filepath.Join normalizes trailing slashes)
 	dbPaths := []string{
@@ -89,9 +89,9 @@ func TestCheckBaseDir_IntegrationScenarios(t *testing.T) {
 	}
 
 	expectedDBPaths := []string{
-		"/home/ben/hive/predastore/distributed/db/node-1",
-		"/home/ben/hive/predastore/distributed/db/node-2",
-		"/home/ben/hive/predastore/distributed/db/node-3",
+		"/home/ben/spinifex/predastore/distributed/db/node-1",
+		"/home/ben/spinifex/predastore/distributed/db/node-2",
+		"/home/ben/spinifex/predastore/distributed/db/node-3",
 	}
 
 	for i, path := range dbPaths {
@@ -107,9 +107,9 @@ func TestCheckBaseDir_IntegrationScenarios(t *testing.T) {
 	}
 
 	expectedQUICPaths := []string{
-		"/home/ben/hive/predastore/distributed/nodes/node-1",
-		"/home/ben/hive/predastore/distributed/nodes/node-2",
-		"/home/ben/hive/predastore/distributed/nodes/node-3",
+		"/home/ben/spinifex/predastore/distributed/nodes/node-1",
+		"/home/ben/spinifex/predastore/distributed/nodes/node-2",
+		"/home/ben/spinifex/predastore/distributed/nodes/node-3",
 	}
 
 	for i, path := range quicPaths {

@@ -1,6 +1,6 @@
 # Predastore
 
-Predastore developed by [Mulga Defense Corporation](https://mulgadc.com/) is a distributed, S3-compatible object storage system with Reed-Solomon erasure coding, built for bare-metal, edge, and on-premise deployments. It is the storage backend for [Hive](https://github.com/mulgadc/hive) — an AWS-compatible infrastructure stack for private clouds.
+Predastore developed by [Mulga Defense Corporation](https://mulgadc.com/) is a distributed, S3-compatible object storage system with Reed-Solomon erasure coding, built for bare-metal, edge, and on-premise deployments. It is the storage backend for [Spinifex](https://github.com/mulgadc/spinifex) — an AWS-compatible infrastructure stack for private clouds.
 
 Predastore can run as a single-node server with local filesystem storage, or scale out to a multi-node cluster with erasure-coded shards, Raft-consensus metadata, and QUIC-based inter-node transport.
 
@@ -131,15 +131,15 @@ The distributed backend's data model decomposes objects into chunks, shards, seg
 
 See [DESIGN.md](DESIGN.md) for full configuration reference, including database node setup, shard node setup, RS tuning, and deployment modes.
 
-## Hive Integration
+## Spinifex Integration
 
-Predastore is the default S3 storage provider for [Hive](https://github.com/mulgadc/hive). When running as part of the Hive stack, Predastore integrates via NATS messaging and provides storage for:
+Predastore is the default S3 storage provider for [Spinifex](https://github.com/mulgadc/spinifex). When running as part of the Spinifex stack, Predastore integrates via NATS messaging and provides storage for:
 
 - **EC2 AMI images** — machine images for VM launches
 - **EBS volume snapshots** — via [Viperblock](https://github.com/mulgadc/viperblock), which uses Predastore as its S3-compatible backend
 - **User data** — cloud-init configurations and system artifacts
 
-Predastore subscribes to NATS topics (`s3.putobject`, `s3.getobject`, `s3.createbucket`, etc.) for seamless integration with the rest of the Hive control plane.
+Predastore subscribes to NATS topics (`s3.putobject`, `s3.getobject`, `s3.createbucket`, etc.) for seamless integration with the rest of the Spinifex control plane.
 
 ## Development
 

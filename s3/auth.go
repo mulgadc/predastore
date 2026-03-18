@@ -34,9 +34,9 @@ type CredentialProvider interface {
 	Close()
 }
 
-// --- IAM types (subset replicated from hive/handlers/iam for NATS KV reads) ---
+// --- IAM types (subset replicated from spinifex/handlers/iam for NATS KV reads) ---
 
-// iamAccessKey mirrors the hive IAM AccessKey stored in NATS KV.
+// iamAccessKey mirrors the spinifex IAM AccessKey stored in NATS KV.
 type iamAccessKey struct {
 	AccessKeyID     string `json:"access_key_id"`
 	SecretAccessKey string `json:"secret_access_key"` // AES-256-GCM encrypted, base64-encoded
@@ -46,14 +46,14 @@ type iamAccessKey struct {
 	CreatedAt       string `json:"created_at"`
 }
 
-// iamUser mirrors the hive IAM User stored in NATS KV.
+// iamUser mirrors the spinifex IAM User stored in NATS KV.
 type iamUser struct {
 	UserName         string   `json:"user_name"`
 	AccountID        string   `json:"account_id"`
 	AttachedPolicies []string `json:"attached_policies"` // policy ARNs
 }
 
-// iamPolicy mirrors the hive IAM Policy stored in NATS KV.
+// iamPolicy mirrors the spinifex IAM Policy stored in NATS KV.
 type iamPolicy struct {
 	PolicyName     string `json:"policy_name"`
 	PolicyDocument string `json:"policy_document"` // JSON string
@@ -124,8 +124,8 @@ func (p *ConfigProvider) Close() {}
 // --- NATSIAMProvider ---
 
 const (
-	kvBucketUsers    = "hive-iam-users"
-	kvBucketPolicies = "hive-iam-policies"
+	kvBucketUsers    = "spinifex-iam-users"
+	kvBucketPolicies = "spinifex-iam-policies"
 
 	cacheTTL = 60 * time.Second
 )
@@ -137,7 +137,7 @@ type cachedCredential struct {
 
 // NATSIAMProvider looks up credentials from NATS KV and decrypts secrets.
 // Buckets are lazily initialized to handle the bootstrap case where predastore
-// starts before the hive daemon creates IAM KV buckets.
+// starts before the spinifex daemon creates IAM KV buckets.
 type NATSIAMProvider struct {
 	conn       *nats.Conn
 	js         nats.JetStreamContext
@@ -147,7 +147,7 @@ type NATSIAMProvider struct {
 	mu    sync.RWMutex
 	cache map[string]*cachedCredential
 
-	// Lazy-initialized KV buckets — nil until hive daemon creates them.
+	// Lazy-initialized KV buckets — nil until spinifex daemon creates them.
 	accessKeysBucket nats.KeyValue
 	usersBucket      nats.KeyValue
 	policiesBucket   nats.KeyValue
@@ -160,7 +160,7 @@ type NATSIAMProvider struct {
 
 // NewNATSIAMProvider creates a provider that looks up IAM credentials from NATS KV.
 // The provider connects to NATS eagerly but opens KV buckets lazily — this allows
-// predastore to start before the hive daemon creates the IAM buckets during bootstrap.
+// predastore to start before the spinifex daemon creates the IAM buckets during bootstrap.
 func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	if cfg.NATSUrl == "" {
 		return nil, fmt.Errorf("iam.nats_url is required")
@@ -203,7 +203,7 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 
 	bucketName := cfg.AccessKeysBucket
 	if bucketName == "" {
-		bucketName = "hive-iam-access-keys"
+		bucketName = "spinifex-iam-access-keys"
 	}
 
 	p := &NATSIAMProvider{
@@ -215,11 +215,11 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 		done:       make(chan struct{}),
 	}
 
-	// Try to open KV buckets now. If they don't exist yet (hive daemon hasn't
+	// Try to open KV buckets now. If they don't exist yet (spinifex daemon hasn't
 	// bootstrapped), we'll retry on each lookup until they appear.
 	if err := p.ensureBuckets(); err != nil {
 		slog.Warn("IAM KV buckets not available yet — IAM auth will activate once "+
-			"hive daemon creates them (config-based auth works immediately)",
+			"spinifex daemon creates them (config-based auth works immediately)",
 			"error", err)
 	}
 
@@ -311,13 +311,13 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 
 	// Lazy bucket init: if buckets aren't ready yet, try to open them.
 	// This handles the bootstrap case where predastore starts before the
-	// hive daemon creates IAM KV buckets.
+	// spinifex daemon creates IAM KV buckets.
 	p.mu.Lock()
 	if !p.bucketsReady {
 		if err := p.ensureBuckets(); err != nil {
 			p.mu.Unlock()
 			// Distinguish "buckets don't exist yet" (bootstrap) from NATS infra errors.
-			// Bucket/stream-not-found means hive daemon hasn't created them yet — treat
+			// Bucket/stream-not-found means spinifex daemon hasn't created them yet — treat
 			// as key-not-found so ChainProvider falls back to config.
 			// Any other error (NATS down, auth failure) must propagate so callers
 			// return 500 instead of a misleading 403.

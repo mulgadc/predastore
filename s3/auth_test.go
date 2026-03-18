@@ -281,7 +281,7 @@ func TestNATSIAMProvider_LazyBucketsNotReady_InfraError(t *testing.T) {
 
 	p := &NATSIAMProvider{
 		gcm:          gcm,
-		bucketName:   "hive-iam-access-keys",
+		bucketName:   "spinifex-iam-access-keys",
 		bucketsReady: false,
 		cache:        make(map[string]*cachedCredential),
 		done:         make(chan struct{}),
