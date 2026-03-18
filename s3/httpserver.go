@@ -34,7 +34,7 @@ import (
 )
 
 // maxClockSkew is the maximum allowed difference between the request
-// timestamp and the server's current time. Matches hive gateway (5 min).
+// timestamp and the server's current time. Matches spinifex gateway (5 min).
 const maxClockSkew = 5 * time.Minute
 
 // HTTP2Server is an HTTP/2 compatible S3 server using net/http
@@ -180,7 +180,7 @@ func (s *HTTP2Server) setupRoutes() {
 }
 
 // corsAllowedOrigins builds the set of allowed CORS origins from localhost and
-// all local non-loopback IPs on the hive-ui port (default 3000). This allows
+// all local non-loopback IPs on the spinifex-ui port (default 3000). This allows
 // the UI to be accessed from any local address, not just localhost.
 func corsAllowedOrigins() map[string]struct{} {
 	origins := map[string]struct{}{
@@ -215,7 +215,7 @@ func corsAllowedOrigins() map[string]struct{} {
 	return origins
 }
 
-// corsMiddleware handles CORS for browser requests from the hive-ui.
+// corsMiddleware handles CORS for browser requests from the spinifex-ui.
 func (s *HTTP2Server) corsMiddleware(next http.Handler) http.Handler {
 	allowed := corsAllowedOrigins()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

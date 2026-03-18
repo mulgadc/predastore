@@ -236,7 +236,7 @@ go test ./backend/distributed/... -run TestDistributed_Multipart -v -count=1
 
 ```bash
 # Stop dev environment first (CRITICAL before running unit tests)
-cd ~/Development/mulga/hive && ./scripts/stop-dev.sh
+cd ~/Development/mulga/spinifex && ./scripts/stop-dev.sh
 
 # Then run tests
 cd ~/Development/mulga/predastore-rewrite && go test ./... -count=1
@@ -244,7 +244,7 @@ cd ~/Development/mulga/predastore-rewrite && go test ./... -count=1
 
 ```bash
 # Start dev environment for E2E testing
-cd ~/Development/mulga/hive && ./scripts/start-dev.sh
+cd ~/Development/mulga/spinifex && ./scripts/start-dev.sh
 
 # Upload large file (use extended timeout for CompleteMultipartUpload)
 aws --no-verify-ssl --cli-read-timeout 600 --endpoint-url https://localhost:8443/ \
@@ -396,7 +396,7 @@ Distributed backend is **~10x slower** than filesystem backend. Uploading a ~4GB
 
 ```bash
 # Enable CPU profiling
-PPROF_ENABLED=1 PPROF_OUTPUT=/tmp/predastore-cpu.prof ./hive service predastore start ...
+PPROF_ENABLED=1 PPROF_OUTPUT=/tmp/predastore-cpu.prof ./spx service predastore start ...
 
 # After test, analyze profile
 go tool pprof -http=:8080 /tmp/predastore-cpu.prof
@@ -613,7 +613,7 @@ _ = s.Close()
 
 ## Session: 2026-01-25 (Performance Profiling)
 
-### Profile: `tests/hive.prof` (Real-world traffic: import, launch, nbdkit)
+### Profile: `tests/spinifex.prof` (Real-world traffic: import, launch, nbdkit)
 
 **Duration:** 275.92s, **CPU Sampled:** 112.30s (40.70% utilization)
 
@@ -901,14 +901,14 @@ To trace the issue, detailed logging was added throughout the PUT lifecycle:
 **To Test:**
 ```bash
 # Rebuild and restart
-cd ~/Development/mulga/hive && ./scripts/start-dev.sh
+cd ~/Development/mulga/spinifex && ./scripts/start-dev.sh
 
 # Run import with DEBUG logging
-LOG_LEVEL=debug ./bin/hive admin images import --arch x86_64 --distro ubuntu \
+LOG_LEVEL=debug ./bi./spx admin images import --arch x86_64 --distro ubuntu \
     --file ~/isos/noble-server-cloudimg-amd64.img --version 24.04
 
 # Check predastore logs
-tail -f ~/Development/mulga/hive/data/logs/predastore.log | grep -E "(PUT|stream|shard)"
+tail -f ~/Development/mulga/spinifex/data/logs/predastore.log | grep -E "(PUT|stream|shard)"
 ```
 
 **What to Look For:**
@@ -925,7 +925,7 @@ tail -f ~/Development/mulga/hive/data/logs/predastore.log | grep -E "(PUT|stream
 
 ```bash
 # Stop all services (CRITICAL before running unit tests)
-cd ~/Development/mulga/hive && ./scripts/stop-dev.sh
+cd ~/Development/mulga/spinifex && ./scripts/stop-dev.sh
 
 # Verify ports are free
 lsof -i :9991  # Should return nothing
@@ -934,10 +934,10 @@ lsof -i :9991  # Should return nothing
 cd ~/Development/mulga/predastore-rewrite && go test ./... -count=1
 
 # Start dev environment for E2E testing
-cd ~/Development/mulga/hive && ./scripts/start-dev.sh
+cd ~/Development/mulga/spinifex && ./scripts/start-dev.sh
 
 # Test image import
-./bin/hive admin images import --arch x86_64 --distro ubuntu \
+./bi./spx admin images import --arch x86_64 --distro ubuntu \
     --file ~/isos/noble-server-cloudimg-amd64.img --version 24.04
 
 # Stop when done
@@ -949,7 +949,7 @@ cd ~/Development/mulga/hive && ./scripts/start-dev.sh
 ## Session: 2026-01-25 (Profile Comparison - Before/After Optimizations)
 
 ### Profile Files
-- **Original:** `tests/hive.prof` (before optimizations)
+- **Original:** `tests/spinifex.prof` (before optimizations)
 - **Improved:** `tests/hive-improvements.prof` (after buffer pool + buffered WAL + zero-pad)
 
 ### Summary Comparison
