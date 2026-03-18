@@ -3,7 +3,6 @@ package s3
 import (
 	"context"
 	"fmt"
-	"log"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -20,7 +19,6 @@ import (
 	"github.com/mulgadc/predastore/backend/filesystem"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3db"
-	"go.uber.org/automaxprocs/maxprocs"
 )
 
 // BackendType specifies the storage backend type
@@ -178,14 +176,6 @@ func WithPprof(enabled bool, outputPath string) Option {
 
 // init initializes the server components
 func (s *Server) init() error {
-	// Auto-tune GOMAXPROCS for cgroups
-	undo, err := maxprocs.Set(maxprocs.Logger(log.Printf))
-	if err != nil {
-		slog.Warn("Failed to set GOMAXPROCS", "error", err)
-	} else {
-		defer undo()
-	}
-
 	// Check environment variable for pprof if not already enabled
 	if !s.pprofEnabled && os.Getenv("PPROF_ENABLED") == "1" {
 		s.pprofEnabled = true

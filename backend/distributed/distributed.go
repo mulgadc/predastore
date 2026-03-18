@@ -16,7 +16,7 @@ import (
 	"sync"
 
 	"github.com/buraksezer/consistent"
-	"github.com/cespare/xxhash"
+	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/quic/quicclient"

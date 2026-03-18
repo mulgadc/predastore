@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -159,10 +158,7 @@ func TestNew(t *testing.T) {
 	assert.NoError(t, err, "Read should not error")
 	assert.NotEmpty(t, d, "Data empty")
 
-	assert.True(t, bytes.Equal(origFile, d), "Data should match original")
-	if diff := cmp.Diff(origFile, d); diff != "" {
-		t.Errorf("Bytes differ (-want +got):\n%s", diff)
-	}
+	assert.Equal(t, origFile, d, "Data should match original")
 
 	wal.Close()
 }

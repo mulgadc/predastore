@@ -7,15 +7,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
 	"slices"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/net/http2"
 )
 
 // Client provides access to the distributed database cluster
@@ -77,11 +74,6 @@ func NewClient(config *ClientConfig) *Client {
 			NextProtos:         []string{"h2", "http/1.1"},
 		},
 		ForceAttemptHTTP2: true,
-	}
-
-	// Configure HTTP/2 support with custom TLS config
-	if err := http2.ConfigureTransport(transport); err != nil {
-		slog.Error("failed to configure HTTP/2 transport, falling back to HTTP/1.1", "error", err)
 	}
 
 	return &Client{
