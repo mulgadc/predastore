@@ -2,8 +2,10 @@ package s3
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -61,6 +63,7 @@ type Server struct {
 	mu       sync.Mutex
 	running  bool
 	shutdown chan struct{}
+	dbFailed chan error // signals when an embedded DB goroutine crashes
 }
 
 // Option configures a Server
@@ -77,6 +80,7 @@ func NewServer(opts ...Option) (*Server, error) {
 		backendType: BackendFilesystem,
 		nodeID:      -1, // Dev mode by default
 		shutdown:    make(chan struct{}),
+		dbFailed:    make(chan error, 1),
 	}
 
 	// Apply options
@@ -420,8 +424,13 @@ func (s *Server) launchDBServers() []*s3db.Server {
 
 		go func(srv *s3db.Server, nodeID uint64, addr string) {
 			slog.Info("Starting database server", "nodeID", nodeID, "addr", addr)
-			if err := srv.Start(); err != nil {
-				slog.Error("Database server failed", "nodeID", nodeID, "error", err)
+			if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				slog.Error("Database server failed, initiating shutdown", "nodeID", nodeID, "error", err)
+				select {
+				case s.dbFailed <- fmt.Errorf("database server (node %d) failed: %w", nodeID, err):
+				default:
+					slog.Warn("dbFailed already signalled, additional DB failure not queued", "nodeID", nodeID, "error", err)
+				}
 			}
 		}(server, node.ID, node.HTTPAddr())
 	}
@@ -488,8 +497,13 @@ func (s *Server) launchDefaultDB() []*s3db.Server {
 
 	go func() {
 		slog.Info("Starting default embedded database", "addr", dbNode.HTTPAddr())
-		if err := server.Start(); err != nil {
-			slog.Error("Default database server failed", "error", err)
+		if err := server.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("Default database server failed, initiating shutdown", "error", err)
+			select {
+			case s.dbFailed <- fmt.Errorf("default database server failed: %w", err):
+			default:
+				slog.Warn("dbFailed already signalled, additional DB failure not queued", "error", err)
+			}
 		}
 	}()
 
@@ -936,11 +950,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// WaitForShutdownSignal blocks until SIGINT or SIGTERM is received
-func (s *Server) WaitForShutdownSignal() {
+// WaitForShutdownSignal blocks until SIGINT/SIGTERM is received or the
+// embedded database crashes. Returns an error if shutdown was triggered by a
+// DB failure, nil for normal signal-based shutdown.
+func (s *Server) WaitForShutdownSignal() error {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
+	select {
+	case <-sigChan:
+		return nil
+	case err := <-s.dbFailed:
+		slog.Error("Embedded database crashed, shutting down server", "error", err)
+		return err
+	}
 }
 
 // Helper functions

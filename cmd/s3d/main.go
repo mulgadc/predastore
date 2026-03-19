@@ -71,8 +71,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Wait for shutdown signal
-	server.WaitForShutdownSignal()
+	// Wait for shutdown signal or DB failure
+	waitErr := server.WaitForShutdownSignal()
 
 	// Graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -80,6 +80,11 @@ func main() {
 
 	if err := server.Shutdown(ctx); err != nil {
 		slog.Error("Error during shutdown", "error", err)
+		os.Exit(1)
+	}
+
+	if waitErr != nil {
+		slog.Error("Exiting due to database failure", "error", waitErr)
 		os.Exit(1)
 	}
 }
