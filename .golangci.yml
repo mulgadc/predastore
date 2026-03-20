@@ -51,6 +51,8 @@ linters:
 
     errcheck:
       check-type-assertions: true
+      exclude-functions:
+        - (*github.com/quic-go/quic-go.Conn).CloseWithError # cleanup-only, errors not actionable
 
     govet:
       enable-all: true

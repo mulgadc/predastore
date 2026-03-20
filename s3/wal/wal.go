@@ -853,7 +853,10 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 	// Get a buffer from the pool to avoid allocation per fragment.
 	// On disk, every fragment payload is exactly ChunkSize bytes (padded with zeros).
 	// The header Length field stores the logical size.
-	payload := fragmentBufferPool.Get().([]byte)
+	payload, ok := fragmentBufferPool.Get().([]byte)
+	if !ok {
+		return fmt.Errorf("fragment buffer pool returned unexpected type")
+	}
 
 	// Write header fields directly to payload
 	binary.BigEndian.PutUint64(payload[0:8], fragment.SeqNum)
