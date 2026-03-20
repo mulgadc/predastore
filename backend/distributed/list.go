@@ -43,7 +43,7 @@ func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.Lis
 		dec := gob.NewDecoder(r)
 		if err := dec.Decode(&metadata); err != nil {
 			slog.Warn("Skipping corrupt bucket entry during scan", "key", string(key), "error", err)
-			return nil //nolint:nilerr // intentionally skip invalid entries during bucket scan
+			return nil
 		}
 
 		// Filter by owner if ownerID is provided
