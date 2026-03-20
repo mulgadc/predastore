@@ -53,7 +53,7 @@ func TestHeadBucket_Handler(t *testing.T) {
 	tb.Handler.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusOK, rr.Code)
-	assert.NotEmpty(t, rr.Header().Get("x-amz-bucket-region"))
+	assert.NotEmpty(t, rr.Header().Get("X-Amz-Bucket-Region"))
 }
 
 func TestHeadBucket_NotFound(t *testing.T) {

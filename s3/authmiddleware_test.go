@@ -211,7 +211,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 					assert.Fail(t, "Error generating auth header: %v", err)
 				}
 				// Remove the date header after signing
-				req.Header.Del("x-amz-date")
+				req.Header.Del("X-Amz-Date")
 				req.Header.Del("X-Amz-Date")
 			},
 			expectStatus:   http.StatusForbidden,
@@ -231,7 +231,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 					assert.Fail(t, "Error generating auth header: %v", err)
 				}
 				// Replace with malformed date
-				req.Header.Set("x-amz-date", "not-a-valid-date")
+				req.Header.Set("X-Amz-Date", "not-a-valid-date")
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "Invalid X-Amz-Date",

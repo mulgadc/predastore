@@ -286,7 +286,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		accessKey, date, region, svc := creds[0], creds[1], creds[2], creds[3]
 
 		// Validate X-Amz-Date timestamp to prevent replay attacks
-		amzDate := r.Header.Get("x-amz-date")
+		amzDate := r.Header.Get("X-Amz-Date")
 		if amzDate == "" {
 			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing required header: X-Amz-Date")
 			return
@@ -364,7 +364,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		// it contains a precomputed hex digest. This avoids buffering the entire
 		// request body into memory (critical for large object uploads).
 		var payloadHash string
-		payloadEncoding := r.Header.Get("X-Amz-Content-SHA256")
+		payloadEncoding := r.Header.Get("X-Amz-Content-Sha256")
 		switch {
 		case payloadEncoding == "STREAMING-UNSIGNED-PAYLOAD-TRAILER" || payloadEncoding == "UNSIGNED-PAYLOAD":
 			payloadHash = payloadEncoding
@@ -584,7 +584,7 @@ func (s *HTTP2Server) headBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("x-amz-bucket-region", resp.Region)
+	w.Header().Set("X-Amz-Bucket-Region", resp.Region)
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -734,7 +734,7 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 	if partNum := r.URL.Query().Get("partNumber"); partNum != "" {
 		uploadID := r.URL.Query().Get("uploadId")
 		partNumber, _ := strconv.Atoi(partNum)
-		decodedLen, _ := strconv.ParseInt(r.Header.Get("x-amz-decoded-content-length"), 10, 64)
+		decodedLen, _ := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
 
 		resp, err := s.backend.UploadPart(ctx, &backend.UploadPartRequest{
 			Bucket:          bucket,
@@ -742,8 +742,8 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 			UploadID:        uploadID,
 			PartNumber:      partNumber,
 			Body:            chunked.NewHTTPBodyReader(r),
-			ContentEncoding: r.Header.Get("content-encoding"),
-			IsChunked:       r.Header.Get("content-encoding") == "aws-chunked",
+			ContentEncoding: r.Header.Get("Content-Encoding"),
+			IsChunked:       r.Header.Get("Content-Encoding") == "aws-chunked",
 			DecodedLength:   decodedLen,
 		})
 		if err != nil {
@@ -752,20 +752,20 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 		}
 
 		w.Header().Set("ETag", resp.ETag)
-		w.Header().Set("x-amz-server-side-encryption", "AES256")
+		w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	// Regular put object
-	decodedLen, _ := strconv.ParseInt(r.Header.Get("x-amz-decoded-content-length"), 10, 64)
+	decodedLen, _ := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
 
 	resp, err := s.backend.PutObject(ctx, &backend.PutObjectRequest{
 		Bucket:          bucket,
 		Key:             key,
 		Body:            chunked.NewHTTPBodyReader(r),
-		ContentEncoding: r.Header.Get("content-encoding"),
-		IsChunked:       r.Header.Get("content-encoding") == "aws-chunked",
+		ContentEncoding: r.Header.Get("Content-Encoding"),
+		IsChunked:       r.Header.Get("Content-Encoding") == "aws-chunked",
 		DecodedLength:   decodedLen,
 	})
 	if err != nil {
@@ -794,7 +794,7 @@ func (s *HTTP2Server) postObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		w.Header().Set("x-amz-server-side-encryption", "AES256")
+		w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
 		if err := s.writeXML(w, http.StatusOK, InitiateMultipartUploadResult{
 			Bucket:   resp.Bucket,
 			Key:      resp.Key,
