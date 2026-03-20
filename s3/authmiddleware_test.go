@@ -212,7 +212,6 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				}
 				// Remove the date header after signing
 				req.Header.Del("X-Amz-Date")
-				req.Header.Del("X-Amz-Date")
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "Missing required header",
