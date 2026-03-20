@@ -2,7 +2,6 @@ package distributed
 
 import (
 	"context"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -14,9 +13,7 @@ import (
 func setupBucketTest(t *testing.T) (*Backend, func()) {
 	t.Helper()
 
-	// Create temp directory for test
-	tmpDir, err := os.MkdirTemp("", "bucket-test-*")
-	require.NoError(t, err)
+	tmpDir := t.TempDir()
 
 	badgerDir := filepath.Join(tmpDir, "badger")
 	dataDir := filepath.Join(tmpDir, "data")
@@ -36,7 +33,6 @@ func setupBucketTest(t *testing.T) (*Backend, func()) {
 
 	cleanup := func() {
 		be.Close()
-		os.RemoveAll(tmpDir)
 	}
 
 	return be.(*Backend), cleanup

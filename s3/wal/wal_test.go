@@ -129,13 +129,7 @@ func calculateWALFileSizes(dataSize int, shardSize uint32, chunkSize uint32, wal
 }
 
 func TestNew(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	assert.NoError(t, err, "MkdirTemp dir should not fail")
-
-	// Clean up any existing WAL files in this temp dir (fresh)
-	for i := 1; i <= 5; i++ {
-		os.RemoveAll(filepath.Join(tmpDir, FormatWalFile(uint64(i))))
-	}
+	tmpDir := t.TempDir()
 
 	wal, err := New("", tmpDir)
 	t.Log("tmpDir", tmpDir)
@@ -163,9 +157,8 @@ func TestNew(t *testing.T) {
 }
 
 func TestNewWriteOutput(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
+	tmpDir := t.TempDir()
 	t.Log(tmpDir)
-	assert.NoError(t, err, "MkdirTemp dir should not fail")
 
 	wal, err := New("", tmpDir)
 	assert.NoError(t, err, "Should create WAL without error")
@@ -220,29 +213,12 @@ func TestNewWriteOutput(t *testing.T) {
 	}
 
 	wal.Close()
-
-	// Delete the tmpDir
-
-	os.RemoveAll(tmpDir)
-
-	// Verify the tmpDir is deleted
-	_, err = os.Stat(tmpDir)
-	assert.Error(t, err, "tmpDir should be deleted")
-
-	// Verify the WAL files are deleted
-	for i := uint64(1); i <= wal.WalNum.Load(); i++ {
-		assert.NoFileExists(t, filepath.Join(tmpDir, FormatWalFile(i)))
-	}
 }
 
 func TestNewWithStateFile(t *testing.T) {
-	osTmpDir := os.TempDir()
-
-	tmpDir, err := os.MkdirTemp(osTmpDir, fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	assert.NoError(t, err, "MkdirTemp dir should not fail")
+	tmpDir := t.TempDir()
 
 	t.Log("tmpDir", tmpDir)
-	//defer os.RemoveAll(tmpDir) // clean up when done
 
 	wal, err := New(filepath.Join(tmpDir, "state.json"), tmpDir)
 	assert.NoError(t, err, "Should not error since state does not exist")
@@ -342,13 +318,6 @@ func TestNewWithStateFile(t *testing.T) {
 	assert.Equal(t, wal3.WalNum.Load()+2, wal4.WalNum.Load(), "WalNum should match")
 
 	wal4.Close()
-
-	// Delete the tmpDir
-	os.RemoveAll(tmpDir)
-
-	// Verify the tmpDir is deleted
-	_, err = os.Stat(tmpDir)
-	assert.Error(t, err, "tmpDir should be deleted")
 }
 
 func TestHeaderSizes(t *testing.T) {

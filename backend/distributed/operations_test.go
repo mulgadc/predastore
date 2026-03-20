@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/stretchr/testify/assert"
@@ -17,9 +16,7 @@ import (
 // setupTestBackend creates a distributed backend with local WAL (no QUIC) for testing.
 func setupTestBackend(t *testing.T) *Backend {
 	t.Helper()
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	t.Cleanup(func() { os.RemoveAll(tmpDir) })
+	tmpDir := t.TempDir()
 
 	cfg := &Config{
 		BadgerDir: tmpDir,
@@ -52,7 +49,7 @@ func putTestObject(t *testing.T, be *Backend, bucket, key string, size int) []by
 	}
 
 	// Write to temp file for PutObject
-	tmpFile, err := os.CreateTemp("", "test-obj-*")
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test-obj-*")
 	require.NoError(t, err)
 	defer os.Remove(tmpFile.Name())
 

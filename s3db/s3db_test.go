@@ -2,7 +2,6 @@ package s3db
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 
@@ -10,13 +9,9 @@ import (
 )
 
 func TestS3DB(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "s3db-test")
+	tmpDir := t.TempDir()
 
 	t.Log("tmpDir", tmpDir)
-
-	assert.NoError(t, err, "MkdirTemp should not fail")
-
-	//defer os.RemoveAll(tmpDir)
 
 	db, err := New(tmpDir)
 
@@ -39,9 +34,7 @@ func TestS3DB(t *testing.T) {
 }
 
 func TestS3DB_BucketsByAccountID(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "s3db-test-account")
-	assert.NoError(t, err, "MkdirTemp should not fail")
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	db, err := New(tmpDir)
 	assert.NoError(t, err)
@@ -109,11 +102,9 @@ func TestS3DB_BucketsByAccountID(t *testing.T) {
 }
 
 func TestS3DB_ObjectsByPrefix(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "s3db-test-prefix")
-	assert.NoError(t, err, "MkdirTemp should not fail")
+	tmpDir := t.TempDir()
 
 	t.Log("tmpDir", tmpDir)
-	//defer os.RemoveAll(tmpDir)
 
 	db, err := New(tmpDir)
 	assert.NoError(t, err)
@@ -255,11 +246,9 @@ func TestS3DB_ObjectsByPrefix(t *testing.T) {
 }
 
 func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "s3db-test-multi")
-	assert.NoError(t, err, "MkdirTemp should not fail")
+	tmpDir := t.TempDir()
 
 	t.Log("tmpDir", tmpDir)
-	//defer os.RemoveAll(tmpDir)
 
 	db, err := New(tmpDir)
 	assert.NoError(t, err)

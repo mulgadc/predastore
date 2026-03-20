@@ -73,7 +73,7 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v2
+          version: v2.11.3
 
       - name: Govulncheck
         run: go tool govulncheck ./...

@@ -1,7 +1,6 @@
 package distributed
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -11,8 +10,7 @@ import (
 
 func setupLocalState(t *testing.T) (*LocalState, func()) {
 	t.Helper()
-	tmpDir, err := os.MkdirTemp("", "localstate-test-*")
-	require.NoError(t, err)
+	tmpDir := t.TempDir()
 
 	dbDir := filepath.Join(tmpDir, "db")
 	state, err := NewLocalState(dbDir)
@@ -20,7 +18,6 @@ func setupLocalState(t *testing.T) (*LocalState, func()) {
 
 	cleanup := func() {
 		state.Close()
-		os.RemoveAll(tmpDir)
 	}
 	return state, cleanup
 }

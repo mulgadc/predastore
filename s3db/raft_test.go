@@ -2,7 +2,6 @@ package s3db
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -14,9 +13,7 @@ import (
 
 // TestSingleNodeRaft tests basic operations on a single Raft node
 func TestSingleNodeRaft(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "raft-test-single-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	config := DefaultClusterConfig()
 	config.NodeID = 1
@@ -86,9 +83,7 @@ func TestSingleNodeRaft(t *testing.T) {
 
 // TestMultipleTablesIsolation tests that tables are isolated from each other
 func TestMultipleTablesIsolation(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "raft-test-tables-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	config := DefaultClusterConfig()
 	config.NodeID = 1
@@ -139,9 +134,7 @@ func TestThreeNodeCluster(t *testing.T) {
 		t.Skip("Skipping cluster test in short mode")
 	}
 
-	tmpDir, err := os.MkdirTemp("", "raft-test-cluster-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	// Create 3-node cluster config
 	nodes := []DBNodeConfig{
@@ -187,7 +180,7 @@ func TestThreeNodeCluster(t *testing.T) {
 	t.Logf("Leader: node %s", leader.LeaderID())
 
 	// Write to leader
-	err = leader.Put("test", "cluster-key", []byte("cluster-value"))
+	err := leader.Put("test", "cluster-key", []byte("cluster-value"))
 	require.NoError(t, err)
 
 	// Wait for replication
@@ -207,9 +200,7 @@ func TestLeaderFailover(t *testing.T) {
 		t.Skip("Skipping failover test in short mode")
 	}
 
-	tmpDir, err := os.MkdirTemp("", "raft-test-failover-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	// Create 3-node cluster config
 	nodes := []DBNodeConfig{
@@ -261,7 +252,7 @@ func TestLeaderFailover(t *testing.T) {
 	}
 
 	leader := raftNodes[leaderIdx]
-	err = leader.Put("test", "failover-key", []byte("before-failover"))
+	err := leader.Put("test", "failover-key", []byte("before-failover"))
 	require.NoError(t, err)
 
 	// Wait for replication
@@ -308,9 +299,7 @@ func TestLeaderFailover(t *testing.T) {
 
 // TestConcurrentWrites tests concurrent writes to the cluster
 func TestConcurrentWrites(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "raft-test-concurrent-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	config := DefaultClusterConfig()
 	config.NodeID = 1
@@ -371,9 +360,7 @@ func TestConcurrentWrites(t *testing.T) {
 
 // TestLargeValues tests storing large values
 func TestLargeValues(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "raft-test-large-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	config := DefaultClusterConfig()
 	config.NodeID = 1

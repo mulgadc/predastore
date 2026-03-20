@@ -27,8 +27,7 @@ var multipartPortCounter atomic.Int32
 func setupMultipartTestBackend(t *testing.T) (*Backend, func()) {
 	t.Helper()
 
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("multipart-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
+	tmpDir := t.TempDir()
 
 	// Each invocation gets a unique port range to avoid bind conflicts
 	testBasePort := 39991 + int(multipartPortCounter.Add(1)-1)*10
@@ -68,7 +67,6 @@ func setupMultipartTestBackend(t *testing.T) (*Backend, func()) {
 			}
 		}
 		be.Close()
-		os.RemoveAll(tmpDir)
 	}
 
 	return be, cleanup

@@ -23,9 +23,7 @@ func TestPutObjectWithTempFile(t *testing.T) {
 	const objectKey = "vol-xxx/chunks/chunk.00000000.bin" // Simulates viperblock S3 key
 	const objectSize = 128 * 1024                         // 128KB
 
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	// Use high ports to avoid conflicts with running services
 	testBasePort := 29991

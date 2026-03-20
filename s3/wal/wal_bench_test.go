@@ -4,11 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 )
 
 // Benchmarks are designed to feel like `dd` throughput tests:
@@ -45,7 +43,6 @@ func BenchmarkWAL_Write(b *testing.B) {
 
 			// Isolate benchmark storage and WAL instance from timed section.
 			walDir := mustMkdirTemp(b)
-			b.Cleanup(func() { _ = os.RemoveAll(walDir) })
 			stateFile := filepath.Join(walDir, "state.json")
 
 			withBenchShardSize(func() {
@@ -81,7 +78,6 @@ func BenchmarkWAL_Read(b *testing.B) {
 			b.SetBytes(int64(sz))
 
 			walDir := mustMkdirTemp(b)
-			b.Cleanup(func() { _ = os.RemoveAll(walDir) })
 			stateFile := filepath.Join(walDir, "state.json")
 
 			records := benchRecordsForSize(sz)
@@ -221,12 +217,7 @@ func validateMarker(buf []byte, seed uint64) bool {
 
 func mustMkdirTemp(b *testing.B) string {
 	b.Helper()
-	// include timestamp to reduce any chance of reuse/collision
-	dir, err := os.MkdirTemp("", fmt.Sprintf("wal-bench-%d-", time.Now().UnixNano()))
-	if err != nil {
-		b.Fatal(err)
-	}
-	return dir
+	return b.TempDir()
 }
 
 var benchShardMu sync.Mutex

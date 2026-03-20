@@ -57,8 +57,7 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 	t.Helper()
 
 	// Create temporary directories for badger and node data
-	tmpDir, err := os.MkdirTemp("", "distributed-test-*")
-	require.NoError(t, err, "Should create temp directory")
+	tmpDir := t.TempDir()
 
 	nodeDataDir := filepath.Join(tmpDir, "nodes")
 	badgerDir := filepath.Join(tmpDir, "db")
@@ -68,7 +67,7 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 	s3 := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "cluster.toml"),
 	})
-	err = s3.ReadConfig()
+	err := s3.ReadConfig()
 	require.NoError(t, err, "Should read config without error")
 
 	// Override badger dir with temp directory
@@ -138,7 +137,6 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 				}
 			}
 			be.Close()
-			os.RemoveAll(tmpDir)
 		},
 	}
 }
