@@ -197,7 +197,7 @@ func TestCanonicalQueryString(t *testing.T) {
 
 func TestGenerateAuthHeaderReq(t *testing.T) {
 	t.Run("GET request without body", func(t *testing.T) {
-		req, _ := http.NewRequest("GET", "https://s3.us-east-1.amazonaws.com/my-bucket?list-type=2", nil)
+		req, _ := http.NewRequest(http.MethodGet, "https://s3.us-east-1.amazonaws.com/my-bucket?list-type=2", nil)
 		err := GenerateAuthHeaderReq("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
 			"20150830T123600Z", "us-east-1", "s3", req)
 
@@ -213,7 +213,7 @@ func TestGenerateAuthHeaderReq(t *testing.T) {
 
 	t.Run("PUT request with body", func(t *testing.T) {
 		body := []byte(`{"key": "value"}`)
-		req, _ := http.NewRequest("PUT", "https://s3.us-east-1.amazonaws.com/my-bucket/my-key", bytes.NewReader(body))
+		req, _ := http.NewRequest(http.MethodPut, "https://s3.us-east-1.amazonaws.com/my-bucket/my-key", bytes.NewReader(body))
 		err := GenerateAuthHeaderReq("AKID", "SECRET", "20240101T000000Z", "us-east-1", "s3", req)
 
 		require.NoError(t, err)
@@ -227,7 +227,7 @@ func TestGenerateAuthHeaderReq(t *testing.T) {
 	})
 
 	t.Run("request with explicit Host", func(t *testing.T) {
-		req, _ := http.NewRequest("GET", "https://s3.amazonaws.com/", nil)
+		req, _ := http.NewRequest(http.MethodGet, "https://s3.amazonaws.com/", nil)
 		req.Host = "custom-host.example.com"
 		err := GenerateAuthHeaderReq("AKID", "SECRET", "20240101T000000Z", "us-east-1", "s3", req)
 
@@ -237,7 +237,7 @@ func TestGenerateAuthHeaderReq(t *testing.T) {
 
 	t.Run("deterministic signatures", func(t *testing.T) {
 		makeReq := func() *http.Request {
-			r, _ := http.NewRequest("GET", "https://s3.us-east-1.amazonaws.com/bucket/key", nil)
+			r, _ := http.NewRequest(http.MethodGet, "https://s3.us-east-1.amazonaws.com/bucket/key", nil)
 			return r
 		}
 
@@ -251,15 +251,15 @@ func TestGenerateAuthHeaderReq(t *testing.T) {
 	})
 
 	t.Run("empty path defaults to root", func(t *testing.T) {
-		req, _ := http.NewRequest("GET", "https://s3.amazonaws.com", nil)
+		req, _ := http.NewRequest(http.MethodGet, "https://s3.amazonaws.com", nil)
 		err := GenerateAuthHeaderReq("AKID", "SECRET", "20240101T000000Z", "us-east-1", "s3", req)
 		require.NoError(t, err)
 		assert.Contains(t, req.Header.Get("Authorization"), "Signature=")
 	})
 
 	t.Run("query parameters are canonicalized", func(t *testing.T) {
-		req1, _ := http.NewRequest("GET", "https://s3.amazonaws.com/?b=2&a=1", nil)
-		req2, _ := http.NewRequest("GET", "https://s3.amazonaws.com/?a=1&b=2", nil)
+		req1, _ := http.NewRequest(http.MethodGet, "https://s3.amazonaws.com/?b=2&a=1", nil)
+		req2, _ := http.NewRequest(http.MethodGet, "https://s3.amazonaws.com/?a=1&b=2", nil)
 
 		_ = GenerateAuthHeaderReq("AKID", "SECRET", "20240101T000000Z", "us-east-1", "s3", req1)
 		_ = GenerateAuthHeaderReq("AKID", "SECRET", "20240101T000000Z", "us-east-1", "s3", req2)
@@ -268,7 +268,7 @@ func TestGenerateAuthHeaderReq(t *testing.T) {
 	})
 
 	t.Run("path with special characters", func(t *testing.T) {
-		req, _ := http.NewRequest("GET", "https://s3.amazonaws.com/bucket/path+with spaces", nil)
+		req, _ := http.NewRequest(http.MethodGet, "https://s3.amazonaws.com/bucket/path+with spaces", nil)
 		// URL-encode the path properly
 		req.URL.Path = "/bucket/path+with spaces"
 		err := GenerateAuthHeaderReq("AKID", "SECRET", "20240101T000000Z", "us-east-1", "s3", req)
@@ -285,7 +285,7 @@ func TestTimeFormatConstants(t *testing.T) {
 func TestGenerateAuthHeaderReq_URLHostFallback(t *testing.T) {
 	// When req.Host is empty, should use req.URL.Host
 	req := &http.Request{
-		Method: "GET",
+		Method: http.MethodGet,
 		URL: &url.URL{
 			Scheme: "https",
 			Host:   "url-host.example.com",

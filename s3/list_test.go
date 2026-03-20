@@ -22,7 +22,7 @@ func TestListBuckets(t *testing.T) {
 	server := NewHTTP2Server(config)
 
 	// Make a request to list buckets
-	req := httptest.NewRequest("GET", "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
 
 	// Add authentication headers using the credentials from server.toml
 	if len(config.Auth) > 0 {
@@ -68,7 +68,7 @@ func TestListBucketsNoAuth(t *testing.T) {
 	server := NewHTTP2Server(config)
 
 	// Make a request to list buckets
-	req := httptest.NewRequest("GET", "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
 
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
@@ -86,7 +86,7 @@ func TestListObjectsV2Handler(t *testing.T) {
 	server := NewHTTP2Server(config)
 
 	// Make a request to list objects in the test bucket
-	req := httptest.NewRequest("GET", "/test-bucket01", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test-bucket01", nil)
 
 	// Add auth for non-public buckets (testbucket is public, but adding auth won't hurt)
 	if len(config.Auth) > 0 {
@@ -141,7 +141,7 @@ func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
 	server := NewHTTP2Server(config)
 
 	// Make a request to list objects in the test bucket
-	req := httptest.NewRequest("GET", "/private", nil)
+	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
@@ -166,7 +166,7 @@ func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 	server := NewHTTP2Server(config)
 
 	// Make a request to list objects in the test bucket
-	req := httptest.NewRequest("GET", "/private", nil)
+	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 
 	// Use our utility function to generate a valid authorization header
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -198,7 +198,7 @@ func TestListObjectsV2HandlerPublicBucketNoAuth(t *testing.T) {
 	server := NewHTTP2Server(config)
 
 	// Make a request to list objects in the test bucket
-	req := httptest.NewRequest("GET", "/test-bucket01", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test-bucket01", nil)
 
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
@@ -233,7 +233,7 @@ func TestListObjectsWithPrefix(t *testing.T) {
 	server := NewHTTP2Server(config)
 
 	// Make a request to list objects with prefix
-	req := httptest.NewRequest("GET", "/test-bucket01?prefix=test", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test-bucket01?prefix=test", nil)
 
 	// Add auth for non-public buckets (testbucket is public, but adding auth won't hurt)
 	if len(config.Auth) > 0 {
@@ -286,7 +286,7 @@ func TestListInvalidBucket(t *testing.T) {
 	server := NewHTTP2Server(config)
 
 	// Make a request to list objects in an invalid bucket
-	req := httptest.NewRequest("GET", "/invalidbucket", nil)
+	req := httptest.NewRequest(http.MethodGet, "/invalidbucket", nil)
 
 	// Add authentication headers since routes.go may require it
 	if len(config.Auth) > 0 {

@@ -713,9 +713,9 @@ func (s *HTTP2Server) getObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", resp.Size))
 	w.Header().Set("ETag", resp.ETag)
 
-	if resp.StatusCode == 206 {
+	if resp.StatusCode == http.StatusPartialContent {
 		w.Header().Set("Content-Range", resp.ContentRange)
-		w.WriteHeader(206)
+		w.WriteHeader(http.StatusPartialContent)
 	} else {
 		w.WriteHeader(http.StatusOK)
 	}

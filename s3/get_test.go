@@ -29,7 +29,7 @@ func TestGetObjectHead(t *testing.T) {
 	server := setupTestServer(t)
 
 	// Make a HEAD request
-	req := httptest.NewRequest("HEAD", "/test-bucket01/test.txt", nil)
+	req := httptest.NewRequest(http.MethodHead, "/test-bucket01/test.txt", nil)
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
 
@@ -50,7 +50,7 @@ func TestGetObjectNoBucketPermissions(t *testing.T) {
 	server := setupTestServer(t)
 
 	// Make a GET request
-	req := httptest.NewRequest("GET", "/private/note.txt", nil)
+	req := httptest.NewRequest(http.MethodGet, "/private/note.txt", nil)
 
 	// Use our utility function to generate a valid authorization header
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -82,7 +82,7 @@ func TestGetObjectBucketPermissions(t *testing.T) {
 	assert.NoError(t, err, "Should read config without error")
 
 	// Make a GET request
-	req := httptest.NewRequest("GET", "/private/note.txt", nil)
+	req := httptest.NewRequest(http.MethodGet, "/private/note.txt", nil)
 
 	// Add authentication headers using the credentials from server.toml
 	if len(config.Auth) > 0 {
@@ -113,7 +113,7 @@ func TestGetObjectPublicBucketAuthHeader(t *testing.T) {
 	assert.NoError(t, err, "Should read config without error")
 
 	// Make a GET request for the text file
-	req := httptest.NewRequest("GET", "/test-bucket01/test.txt", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test-bucket01/test.txt", nil)
 
 	// Add authentication headers using the credentials from server.toml
 	if len(config.Auth) > 0 {
@@ -142,7 +142,7 @@ func TestGetObject(t *testing.T) {
 	server := setupTestServer(t)
 
 	// Make a GET request for the text file
-	req := httptest.NewRequest("GET", "/test-bucket01/test.txt", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test-bucket01/test.txt", nil)
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
 
@@ -161,7 +161,7 @@ func TestGetObjectWithRange(t *testing.T) {
 	server := setupTestServer(t)
 
 	// Make a GET request with a Range header
-	req := httptest.NewRequest("GET", "/test-bucket01/test.txt", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test-bucket01/test.txt", nil)
 	req.Header.Set("Range", "bytes=0-9") // Get the first 10 bytes
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
@@ -186,7 +186,7 @@ func TestGetObjectNonExistent(t *testing.T) {
 	server := setupTestServer(t)
 
 	// Make a GET request for a non-existent file
-	req := httptest.NewRequest("GET", "/test-bucket01/nonexistent.txt", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test-bucket01/nonexistent.txt", nil)
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
 
@@ -203,7 +203,7 @@ func TestGetInvalidBucket(t *testing.T) {
 	server := NewHTTP2Server(config)
 
 	// Make a request to a non-existent bucket
-	req := httptest.NewRequest("GET", "/invalidbucket/file.txt", nil)
+	req := httptest.NewRequest(http.MethodGet, "/invalidbucket/file.txt", nil)
 
 	// Add authentication headers - needed to get NoSuchBucket instead of AccessDenied
 	if len(config.Auth) > 0 {
@@ -235,7 +235,7 @@ func TestGetInvalidObjectKey(t *testing.T) {
 	server := setupTestServer(t)
 
 	// Make a request to list objects in the test bucket with an invalid key
-	req := httptest.NewRequest("GET", fmt.Sprintf("/test-bucket01/%s", string([]byte{0x80, 0x80})), nil)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/test-bucket01/%s", string([]byte{0x80, 0x80})), nil)
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
 

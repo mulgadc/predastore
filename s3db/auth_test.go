@@ -212,7 +212,7 @@ func TestValidateSignatureHTTP_Integration(t *testing.T) {
 	})
 
 	// Create a signed request
-	req := httptest.NewRequest("GET", "/v1/get/test-table/test-key", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/get/test-table/test-key", nil)
 	req.Host = "localhost:6660"
 
 	timestamp := time.Now().UTC().Format(auth.TimeFormat)

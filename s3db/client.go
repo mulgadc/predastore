@@ -217,7 +217,7 @@ func (c *Client) doRead(path string) ([]byte, error) {
 	for i := 0; i < c.maxRetries; i++ {
 		for _, node := range orderedNodes {
 			reqURL := "https://" + node + path
-			req, err := http.NewRequest("GET", reqURL, nil)
+			req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 			if err != nil {
 				lastErr = err
 				continue

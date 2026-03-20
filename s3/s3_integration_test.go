@@ -448,7 +448,7 @@ func TestGetObjectHeadIntegration(t *testing.T) {
 	client := &http.Client{Transport: tr}
 
 	// Create HEAD request
-	req, err := http.NewRequest("HEAD", S3_ENDPOINT+"/"+S3_BUCKET+"/test.txt", nil)
+	req, err := http.NewRequest(http.MethodHead, S3_ENDPOINT+"/"+S3_BUCKET+"/test.txt", nil)
 	require.NoError(t, err, "Creating HEAD request should not error")
 
 	// Send request
@@ -492,7 +492,7 @@ func TestByteRangeRequests(t *testing.T) {
 	require.NoError(t, err, "Reading text file should not error")
 
 	// Test range request
-	req, err := http.NewRequest("GET", S3_ENDPOINT+"/"+S3_BUCKET+"/test.txt", nil)
+	req, err := http.NewRequest(http.MethodGet, S3_ENDPOINT+"/"+S3_BUCKET+"/test.txt", nil)
 	require.NoError(t, err, "Creating range request should not error")
 
 	// Request first 10 bytes

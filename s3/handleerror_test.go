@@ -27,7 +27,7 @@ func setupHandleErrorServer(t *testing.T) *HTTP2Server {
 
 func TestHandleError_BackendS3Error(t *testing.T) {
 	server := setupHandleErrorServer(t)
-	req := httptest.NewRequest("GET", "/bucket/key", nil)
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
 	rr := httptest.NewRecorder()
 
 	s3Err := backend.NewS3Error(backend.ErrNoSuchBucket, "Bucket not found", 404)
@@ -43,7 +43,7 @@ func TestHandleError_BackendS3Error(t *testing.T) {
 
 func TestHandleError_NoSuchBucketString(t *testing.T) {
 	server := setupHandleErrorServer(t)
-	req := httptest.NewRequest("GET", "/bucket/key", nil)
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
 	rr := httptest.NewRecorder()
 
 	server.handleError(rr, req, errors.New("NoSuchBucket: bucket does not exist"))
@@ -56,7 +56,7 @@ func TestHandleError_NoSuchBucketString(t *testing.T) {
 
 func TestHandleError_AccessDenied(t *testing.T) {
 	server := setupHandleErrorServer(t)
-	req := httptest.NewRequest("GET", "/bucket/key", nil)
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
 	rr := httptest.NewRecorder()
 
 	server.handleError(rr, req, errors.New("AccessDenied: not allowed"))
@@ -69,7 +69,7 @@ func TestHandleError_AccessDenied(t *testing.T) {
 
 func TestHandleError_NoSuchKey(t *testing.T) {
 	server := setupHandleErrorServer(t)
-	req := httptest.NewRequest("GET", "/bucket/key", nil)
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
 	rr := httptest.NewRecorder()
 
 	server.handleError(rr, req, errors.New("NoSuchKey: object not found"))
@@ -79,7 +79,7 @@ func TestHandleError_NoSuchKey(t *testing.T) {
 
 func TestHandleError_OsNotExist(t *testing.T) {
 	server := setupHandleErrorServer(t)
-	req := httptest.NewRequest("GET", "/bucket/key", nil)
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
 	rr := httptest.NewRecorder()
 
 	server.handleError(rr, req, os.ErrNotExist)
@@ -89,7 +89,7 @@ func TestHandleError_OsNotExist(t *testing.T) {
 
 func TestHandleError_BucketNotFoundString(t *testing.T) {
 	server := setupHandleErrorServer(t)
-	req := httptest.NewRequest("GET", "/bucket/key", nil)
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
 	rr := httptest.NewRecorder()
 
 	server.handleError(rr, req, errors.New("Bucket not found"))
@@ -99,7 +99,7 @@ func TestHandleError_BucketNotFoundString(t *testing.T) {
 
 func TestHandleError_GenericError(t *testing.T) {
 	server := setupHandleErrorServer(t)
-	req := httptest.NewRequest("GET", "/bucket/key", nil)
+	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
 	rr := httptest.NewRecorder()
 
 	server.handleError(rr, req, errors.New("something unexpected"))
@@ -141,7 +141,7 @@ func TestCorsMiddleware_Options(t *testing.T) {
 	server := setupHandleErrorServer(t)
 	handler := server.GetHandler()
 
-	req := httptest.NewRequest("OPTIONS", "/test-bucket01/key", nil)
+	req := httptest.NewRequest(http.MethodOptions, "/test-bucket01/key", nil)
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, req)
 
