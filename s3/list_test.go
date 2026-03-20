@@ -3,6 +3,7 @@ package s3
 import (
 	"encoding/xml"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"

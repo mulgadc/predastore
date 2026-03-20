@@ -114,6 +114,16 @@ linters:
           - errchkjson
           - gosec
 
+      # cmd/: CLI glue code — type assertions and error returns not actionable
+      - path: "cmd/"
+        linters:
+          - errcheck
+
+      # quic server: json.Marshal on known-safe types, errors not actionable
+      - path: "quic/quicserver/"
+        linters:
+          - errchkjson
+
       # predastore-specific gosec exclusions
       - text: "G204"
         linters: [gosec]  # subprocess execution

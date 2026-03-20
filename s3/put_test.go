@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/xml"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
