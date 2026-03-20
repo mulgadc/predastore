@@ -42,7 +42,7 @@ func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.Lis
 		r := bytes.NewReader(value)
 		dec := gob.NewDecoder(r)
 		if err := dec.Decode(&metadata); err != nil {
-			return nil // Skip invalid entries
+			return nil //nolint:nilerr // intentionally skip invalid entries during bucket scan
 		}
 
 		// Filter by owner if ownerID is provided
