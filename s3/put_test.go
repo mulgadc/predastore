@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/xml"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -27,7 +28,7 @@ func TestPutObject(t *testing.T) {
 	testContent := []byte("This is a test file created during unit testing")
 
 	// Make a PUT request
-	req := httptest.NewRequest("PUT", "/test-bucket01/test_upload.txt", bytes.NewReader(testContent))
+	req := httptest.NewRequest(http.MethodPut, "/test-bucket01/test_upload.txt", bytes.NewReader(testContent))
 
 	// Add authentication headers using the credentials from server.toml
 	if len(config.Auth) > 0 {
@@ -72,7 +73,7 @@ func TestPutObjectPublicBucketNoAuth(t *testing.T) {
 	testContent := []byte("This is a test file created during unit testing")
 
 	// Make a PUT request
-	req := httptest.NewRequest("PUT", "/test-bucket01/test_upload.txt", bytes.NewReader(testContent))
+	req := httptest.NewRequest(http.MethodPut, "/test-bucket01/test_upload.txt", bytes.NewReader(testContent))
 
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
@@ -93,7 +94,7 @@ func TestPutObjectPrivateBucketNoAuth(t *testing.T) {
 	testContent := []byte("This is a test file created during unit testing")
 
 	// Make a PUT request
-	req := httptest.NewRequest("PUT", "/private/test_upload.txt", bytes.NewReader(testContent))
+	req := httptest.NewRequest(http.MethodPut, "/private/test_upload.txt", bytes.NewReader(testContent))
 
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
@@ -117,7 +118,7 @@ func TestPutObjectBinary(t *testing.T) {
 	}
 
 	// Make a PUT request
-	req := httptest.NewRequest("PUT", "/test-bucket01/test_binary_upload.dat", bytes.NewReader(testContent))
+	req := httptest.NewRequest(http.MethodPut, "/test-bucket01/test_binary_upload.dat", bytes.NewReader(testContent))
 
 	// Add authentication headers using the credentials from server.toml
 	if len(config.Auth) > 0 {
@@ -160,7 +161,7 @@ func TestPutObjectInvalidBucket(t *testing.T) {
 	testContent := []byte("This is a test file for an invalid bucket")
 
 	// Make a PUT request to a non-existent bucket
-	req := httptest.NewRequest("PUT", "/nonexistent/test_upload.txt", bytes.NewReader(testContent))
+	req := httptest.NewRequest(http.MethodPut, "/nonexistent/test_upload.txt", bytes.NewReader(testContent))
 
 	// Add authentication headers using the credentials from server.toml
 	if len(config.Auth) > 0 {

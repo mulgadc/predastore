@@ -35,7 +35,6 @@ func TestReadConfig(t *testing.T) {
 	assert.Equal(t, "predastore", s3.Buckets[4].Name, "Bucket name should match")
 	assert.Contains(t, s3.Buckets[4].Pathname, "tests/data/predastore", "Path should match")
 	assert.False(t, s3.Buckets[4].Public, "Bucket should be private")
-
 }
 
 func TestBucketConfig(t *testing.T) {
@@ -54,7 +53,6 @@ func TestBucketConfig(t *testing.T) {
 }
 
 func TestBasePathConfig(t *testing.T) {
-
 	tmpDir := t.TempDir()
 
 	s3 := New(&Config{
@@ -72,7 +70,6 @@ func TestBasePathConfig(t *testing.T) {
 	assert.Error(t, err, "Should return error for nonexistent bucket")
 
 	assert.Contains(t, bucket.Pathname, tmpDir, "Path should contain base path")
-
 }
 
 func TestReadInvalidConfig(t *testing.T) {
@@ -85,5 +82,4 @@ func TestReadInvalidConfig(t *testing.T) {
 
 	// Test no buckets, config file all invalid
 	assert.Zero(t, len(s3.Buckets))
-
 }

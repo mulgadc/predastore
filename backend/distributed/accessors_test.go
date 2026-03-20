@@ -1,19 +1,14 @@
 package distributed
 
 import (
-	"fmt"
-	"os"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestBackend_Type(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	b, err := New(&Config{BadgerDir: tmpDir})
 	require.NoError(t, err)
@@ -23,9 +18,7 @@ func TestBackend_Type(t *testing.T) {
 }
 
 func TestBackend_DB_LocalState(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	b, err := New(&Config{BadgerDir: tmpDir})
 	require.NoError(t, err)
@@ -37,9 +30,7 @@ func TestBackend_DB_LocalState(t *testing.T) {
 }
 
 func TestBackend_GlobalState(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	b, err := New(&Config{BadgerDir: tmpDir})
 	require.NoError(t, err)
@@ -67,9 +58,7 @@ func TestBackend_GlobalState(t *testing.T) {
 }
 
 func TestBackend_DataDir(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	b, err := New(&Config{BadgerDir: tmpDir})
 	require.NoError(t, err)
@@ -83,9 +72,7 @@ func TestBackend_DataDir(t *testing.T) {
 }
 
 func TestBackend_RsShards(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	b, err := New(&Config{BadgerDir: tmpDir, DataShards: 3, ParityShards: 2})
 	require.NoError(t, err)
@@ -97,9 +84,7 @@ func TestBackend_RsShards(t *testing.T) {
 }
 
 func TestBackend_HashRing(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	b, err := New(&Config{BadgerDir: tmpDir})
 	require.NoError(t, err)
@@ -110,9 +95,7 @@ func TestBackend_HashRing(t *testing.T) {
 }
 
 func TestBackend_Close(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	b, err := New(&Config{BadgerDir: tmpDir})
 	require.NoError(t, err)

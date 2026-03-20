@@ -35,7 +35,7 @@ func TestCreateBucket_Handler(t *testing.T) {
 	defer tb.Cleanup()
 
 	// Filesystem backend doesn't support creating buckets, should return error
-	req := httptest.NewRequest("PUT", "/new-test-bucket", nil)
+	req := httptest.NewRequest(http.MethodPut, "/new-test-bucket", nil)
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
 
@@ -48,19 +48,19 @@ func TestHeadBucket_Handler(t *testing.T) {
 	defer tb.Cleanup()
 
 	// Head an existing bucket
-	req := httptest.NewRequest("HEAD", "/test-bucket01", nil)
+	req := httptest.NewRequest(http.MethodHead, "/test-bucket01", nil)
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusOK, rr.Code)
-	assert.NotEmpty(t, rr.Header().Get("x-amz-bucket-region"))
+	assert.NotEmpty(t, rr.Header().Get("X-Amz-Bucket-Region"))
 }
 
 func TestHeadBucket_NotFound(t *testing.T) {
 	tb := setupBucketHandlerServer(t)
 	defer tb.Cleanup()
 
-	req := httptest.NewRequest("HEAD", "/nonexistent-bucket-xyz", nil)
+	req := httptest.NewRequest(http.MethodHead, "/nonexistent-bucket-xyz", nil)
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
 
@@ -73,7 +73,7 @@ func TestDeleteBucket_Handler(t *testing.T) {
 	defer tb.Cleanup()
 
 	// Filesystem backend doesn't support deleting buckets
-	req := httptest.NewRequest("DELETE", "/test-bucket01", nil)
+	req := httptest.NewRequest(http.MethodDelete, "/test-bucket01", nil)
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
 
@@ -86,7 +86,7 @@ func TestCreateBucket_WithLocationConstraint(t *testing.T) {
 	defer tb.Cleanup()
 
 	body := `<CreateBucketConfiguration><LocationConstraint>eu-west-1</LocationConstraint></CreateBucketConfiguration>`
-	req := httptest.NewRequest("PUT", "/new-bucket-region", strings.NewReader(body))
+	req := httptest.NewRequest(http.MethodPut, "/new-bucket-region", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/xml")
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)

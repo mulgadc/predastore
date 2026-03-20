@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -365,7 +366,7 @@ func TestDecoder_NoDecodedLenHint(t *testing.T) {
 
 func TestNewHTTPBodyReader(t *testing.T) {
 	body := strings.NewReader("test body")
-	req := httptest.NewRequest("PUT", "/bucket/key", body)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/key", body)
 
 	reader := NewHTTPBodyReader(req)
 	data, err := io.ReadAll(reader)

@@ -311,6 +311,7 @@ func (c *Client) Get(ctx context.Context, objectRequest quicserver.ObjectRequest
 // limitedReadCloser wraps a limited reader and the underlying closer.
 type limitedReadCloser struct {
 	io.Reader
+
 	closer io.Closer
 }
 

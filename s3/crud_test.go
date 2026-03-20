@@ -40,7 +40,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	testContent := []byte("Test content for CRUD operations")
 	objectKey := "crud-test-" + time.Now().Format("20060102150405") + ".txt"
 
-	req := httptest.NewRequest("PUT", "/"+bucketName+"/"+objectKey, bytes.NewReader(testContent))
+	req := httptest.NewRequest(http.MethodPut, "/"+bucketName+"/"+objectKey, bytes.NewReader(testContent))
 
 	// Add authentication
 	if len(tb.Config.Auth) > 0 {
@@ -54,7 +54,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	assert.Equal(t, 200, resp.StatusCode, "PUT should return 200")
 
 	// Test GET
-	req = httptest.NewRequest("GET", "/"+bucketName+"/"+objectKey, nil)
+	req = httptest.NewRequest(http.MethodGet, "/"+bucketName+"/"+objectKey, nil)
 
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
@@ -72,7 +72,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	assert.Equal(t, testContent, body, "Content should match")
 
 	// Test HEAD
-	req = httptest.NewRequest("HEAD", "/"+bucketName+"/"+objectKey, nil)
+	req = httptest.NewRequest(http.MethodHead, "/"+bucketName+"/"+objectKey, nil)
 
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
@@ -86,7 +86,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	assert.NotEmpty(t, resp.Header.Get("Content-Length"), "Content-Length should be set")
 
 	// Test DELETE
-	req = httptest.NewRequest("DELETE", "/"+bucketName+"/"+objectKey, nil)
+	req = httptest.NewRequest(http.MethodDelete, "/"+bucketName+"/"+objectKey, nil)
 
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
@@ -99,7 +99,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	assert.Equal(t, 204, resp.StatusCode, "DELETE should return 204")
 
 	// Verify object is gone
-	req = httptest.NewRequest("GET", "/"+bucketName+"/"+objectKey, nil)
+	req = httptest.NewRequest(http.MethodGet, "/"+bucketName+"/"+objectKey, nil)
 
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
@@ -115,7 +115,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 // TestListBucketsAllBackends tests ListBuckets with all backends
 func TestListBucketsAllBackends(t *testing.T) {
 	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
-		req := httptest.NewRequest("GET", "/", nil)
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
 
 		if len(tb.Config.Auth) > 0 {
 			authEntry := tb.Config.Auth[0]
@@ -139,7 +139,7 @@ func TestListObjectsAllBackends(t *testing.T) {
 	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
 		bucketName := getBucketForBackend(tb.Type)
 
-		req := httptest.NewRequest("GET", "/"+bucketName, nil)
+		req := httptest.NewRequest(http.MethodGet, "/"+bucketName, nil)
 
 		if len(tb.Config.Auth) > 0 {
 			authEntry := tb.Config.Auth[0]
@@ -198,7 +198,7 @@ func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
 	t.Logf("Uploading object with size %d bytes", expectedSize)
 
 	// PUT the object
-	req := httptest.NewRequest("PUT", "/"+bucketName+"/"+objectKey, bytes.NewReader(testContent))
+	req := httptest.NewRequest(http.MethodPut, "/"+bucketName+"/"+objectKey, bytes.NewReader(testContent))
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -210,7 +210,7 @@ func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
 	require.Equal(t, 200, resp.StatusCode, "PUT should return 200")
 
 	// LIST objects and verify size
-	req = httptest.NewRequest("GET", "/"+bucketName+"?list-type=2&prefix=size-test-", nil)
+	req = httptest.NewRequest(http.MethodGet, "/"+bucketName+"?list-type=2&prefix=size-test-", nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -240,7 +240,7 @@ func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
 	assert.Equal(t, expectedSize, foundObject.Size, "Object size should match expected size")
 
 	// Cleanup: delete the test object
-	req = httptest.NewRequest("DELETE", "/"+bucketName+"/"+objectKey, nil)
+	req = httptest.NewRequest(http.MethodDelete, "/"+bucketName+"/"+objectKey, nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -264,7 +264,7 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	initialContent := []byte("This is the initial content for overwrite testing. AAAAAAAAAA")
 
 	// PUT initial content
-	req := httptest.NewRequest("PUT", "/"+bucketName+"/"+objectKey, bytes.NewReader(initialContent))
+	req := httptest.NewRequest(http.MethodPut, "/"+bucketName+"/"+objectKey, bytes.NewReader(initialContent))
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -276,7 +276,7 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	require.Equal(t, 200, resp.StatusCode, "Initial PUT should return 200")
 
 	// GET and verify initial content
-	req = httptest.NewRequest("GET", "/"+bucketName+"/"+objectKey, nil)
+	req = httptest.NewRequest(http.MethodGet, "/"+bucketName+"/"+objectKey, nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -307,7 +307,7 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	require.NotEqual(t, 0, bytes.Compare(initialContent, modifiedContent), "Modified content should differ from initial")
 
 	// PUT modified content (overwrite)
-	req = httptest.NewRequest("PUT", "/"+bucketName+"/"+objectKey, bytes.NewReader(modifiedContent))
+	req = httptest.NewRequest(http.MethodPut, "/"+bucketName+"/"+objectKey, bytes.NewReader(modifiedContent))
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -319,7 +319,7 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	require.Equal(t, 200, resp.StatusCode, "Overwrite PUT should return 200")
 
 	// GET and verify modified content
-	req = httptest.NewRequest("GET", "/"+bucketName+"/"+objectKey, nil)
+	req = httptest.NewRequest(http.MethodGet, "/"+bucketName+"/"+objectKey, nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -340,7 +340,7 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 		"Content after overwrite should NOT match initial content")
 
 	// Cleanup: delete the test object
-	req = httptest.NewRequest("DELETE", "/"+bucketName+"/"+objectKey, nil)
+	req = httptest.NewRequest(http.MethodDelete, "/"+bucketName+"/"+objectKey, nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")

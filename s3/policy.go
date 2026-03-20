@@ -64,7 +64,7 @@ func evaluateS3Access(action, resource string, policies []iamPolicyDocument) boo
 	hasAllow := false
 	for i := range policies {
 		for j := range policies[i].Statement {
-			stmt := &policies[i].Statement[j]
+			stmt := &policies[i].Statement[j] //nolint:gosec // G602: j is bounded by range, no out-of-bounds risk
 
 			// Actions are case-insensitive per AWS IAM spec.
 			if !matchesAnyPattern(stmt.Action, action, true) {

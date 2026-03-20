@@ -2,7 +2,6 @@ package s3db
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 
@@ -10,14 +9,9 @@ import (
 )
 
 func TestS3DB(t *testing.T) {
-
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "s3db-test")
+	tmpDir := t.TempDir()
 
 	t.Log("tmpDir", tmpDir)
-
-	assert.NoError(t, err, "MkdirTemp should not fail")
-
-	//defer os.RemoveAll(tmpDir)
 
 	db, err := New(tmpDir)
 
@@ -37,13 +31,10 @@ func TestS3DB(t *testing.T) {
 	}
 
 	assert.Equal(t, []byte("test"), value)
-
 }
 
 func TestS3DB_BucketsByAccountID(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "s3db-test-account")
-	assert.NoError(t, err, "MkdirTemp should not fail")
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	db, err := New(tmpDir)
 	assert.NoError(t, err)
@@ -111,11 +102,9 @@ func TestS3DB_BucketsByAccountID(t *testing.T) {
 }
 
 func TestS3DB_ObjectsByPrefix(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "s3db-test-prefix")
-	assert.NoError(t, err, "MkdirTemp should not fail")
+	tmpDir := t.TempDir()
 
 	t.Log("tmpDir", tmpDir)
-	//defer os.RemoveAll(tmpDir)
 
 	db, err := New(tmpDir)
 	assert.NoError(t, err)
@@ -157,13 +146,14 @@ func TestS3DB_ObjectsByPrefix(t *testing.T) {
 			var objectARN string
 
 			// Distribute objects across different depth levels
-			if j%3 == 0 {
+			switch j % 3 {
+			case 0:
 				// Level 1: prefix/file.txt
 				objectKey = fmt.Sprintf("%s/file%d.txt", prefix, j)
-			} else if j%3 == 1 {
+			case 1:
 				// Level 2: prefix/level2/file.txt
 				objectKey = fmt.Sprintf("%s/level2/file%d.txt", prefix, j)
-			} else {
+			default:
 				// Level 3: prefix/level2/level3/file.txt
 				objectKey = fmt.Sprintf("%s/level2/level3/file%d.txt", prefix, j)
 			}
@@ -256,11 +246,9 @@ func TestS3DB_ObjectsByPrefix(t *testing.T) {
 }
 
 func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "s3db-test-multi")
-	assert.NoError(t, err, "MkdirTemp should not fail")
+	tmpDir := t.TempDir()
 
 	t.Log("tmpDir", tmpDir)
-	//defer os.RemoveAll(tmpDir)
 
 	db, err := New(tmpDir)
 	assert.NoError(t, err)
@@ -287,11 +275,12 @@ func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
 
 			for j := range objectCount {
 				var objectKey string
-				if j%3 == 0 {
+				switch j % 3 {
+				case 0:
 					objectKey = fmt.Sprintf("%s/file%d.txt", prefix, j)
-				} else if j%3 == 1 {
+				case 1:
 					objectKey = fmt.Sprintf("%s/level2/file%d.txt", prefix, j)
-				} else {
+				default:
 					objectKey = fmt.Sprintf("%s/level2/level3/file%d.txt", prefix, j)
 				}
 

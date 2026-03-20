@@ -2,12 +2,10 @@ package wal
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -258,9 +256,7 @@ func TestReadFromWriteResultStream_EndOfShardMismatch(t *testing.T) {
 }
 
 func TestReadFromWriteResultStream_MultipleObjects(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	w, err := New("", tmpDir)
 	require.NoError(t, err)

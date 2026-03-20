@@ -8,7 +8,6 @@ import (
 )
 
 func TestIsValidKeyName(t *testing.T) {
-
 	tests := []struct {
 		name string
 		key  []byte
@@ -54,7 +53,6 @@ func TestIsValidKeyName(t *testing.T) {
 	}
 }
 func TestIsValidBucketName(t *testing.T) {
-
 	tests := []struct {
 		name   string
 		bucket string
@@ -188,7 +186,6 @@ func TestIsValidBucketName(t *testing.T) {
 
 			// Use assert to check if the error is as expected
 			assert.Equal(t, test.want, err)
-
 		})
 	}
 }

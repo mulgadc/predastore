@@ -26,7 +26,6 @@ package s3db
 
 import (
 	"fmt"
-	"os"
 	"testing"
 	"time"
 )
@@ -43,14 +42,10 @@ type benchFixture struct {
 func setupFixture(b *testing.B) *benchFixture {
 	b.Helper()
 
-	tmpDir, err := os.MkdirTemp("", fmt.Sprintf("s3db-bench-%d-", time.Now().UnixNano()))
-	if err != nil {
-		b.Fatalf("Failed to create temp dir: %v", err)
-	}
+	tmpDir := b.TempDir()
 
 	db, err := New(tmpDir)
 	if err != nil {
-		os.RemoveAll(tmpDir)
 		b.Fatalf("Failed to create DB: %v", err)
 	}
 
@@ -119,9 +114,6 @@ func (f *benchFixture) teardown() {
 	if f.db != nil {
 		f.db.Close()
 	}
-	if f.tmpDir != "" {
-		os.RemoveAll(f.tmpDir)
-	}
 }
 
 // generateObjectKey creates realistic S3 object keys with various patterns
@@ -164,11 +156,7 @@ func generateObjectKey(bucketName string, fileIdx int, totalFiles int) string {
 
 // BenchmarkInsert tests insert performance
 func BenchmarkInsert(b *testing.B) {
-	tmpDir, err := os.MkdirTemp("", "s3db-bench-insert-")
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
+	tmpDir := b.TempDir()
 
 	db, err := New(tmpDir)
 	if err != nil {

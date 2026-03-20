@@ -97,7 +97,7 @@ func escapePathSegment(s string) string {
 	// url.PathEscape doesn't encode +, but we need it encoded for signatures
 	escaped := url.PathEscape(s)
 	// Replace any remaining + with %2B
-	return strings.Replace(escaped, "+", "%2B", -1)
+	return strings.ReplaceAll(escaped, "+", "%2B")
 }
 
 // hexEncodeKey hex-encodes a key for safe transport in URL paths.
@@ -217,7 +217,7 @@ func (c *Client) doRead(path string) ([]byte, error) {
 	for i := 0; i < c.maxRetries; i++ {
 		for _, node := range orderedNodes {
 			reqURL := "https://" + node + path
-			req, err := http.NewRequest("GET", reqURL, nil)
+			req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 			if err != nil {
 				lastErr = err
 				continue

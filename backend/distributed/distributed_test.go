@@ -21,9 +21,7 @@ import (
 )
 
 func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	cfg := &Config{BadgerDir: tmpDir}
 	b, err := New(cfg)
@@ -138,9 +136,7 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 }
 
 func TestReadFromWriteResultStream_RoundTripJoin(t *testing.T) {
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	cfg := &Config{BadgerDir: tmpDir}
 	b, err := New(cfg)
@@ -240,9 +236,7 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-			require.NoError(t, err)
-			defer os.RemoveAll(tmpDir)
+			tmpDir := t.TempDir()
 
 			testBasePort := 49991
 			cfg := &Config{
@@ -461,9 +455,7 @@ func TestGetObjectByteRange(t *testing.T) {
 	const bucket = "test-bucket"
 	const objectSize = 128 * 1024 // 128KB
 
-	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
-	require.NoError(t, err)
-	defer os.RemoveAll(tmpDir)
+	tmpDir := t.TempDir()
 
 	// Use high ports to avoid conflicts with running services
 	testBasePort := 19991
