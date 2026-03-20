@@ -70,14 +70,10 @@ jobs:
           cache-dependency-path: "go.sum"
           go-version-file: "go.mod"
 
-      - name: Check Format
-        run: make check-format
+      - name: Lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2
 
-      - name: Check Modernize
-        run: make check-modernize
-
-      - name: Go Vet
-        run: make vet
-
-      - name: Security Checks
-        run: make security-check
+      - name: Govulncheck
+        run: go tool govulncheck ./...
