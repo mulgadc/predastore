@@ -97,7 +97,7 @@ func escapePathSegment(s string) string {
 	// url.PathEscape doesn't encode +, but we need it encoded for signatures
 	escaped := url.PathEscape(s)
 	// Replace any remaining + with %2B
-	return strings.Replace(escaped, "+", "%2B", -1)
+	return strings.ReplaceAll(escaped, "+", "%2B")
 }
 
 // hexEncodeKey hex-encodes a key for safe transport in URL paths.

@@ -341,7 +341,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		for key := range queryUrl {
 			sort.Strings(queryUrl[key])
 		}
-		canonicalQueryString := strings.Replace(queryUrl.Encode(), "+", "%20", -1)
+		canonicalQueryString := strings.ReplaceAll(queryUrl.Encode(), "+", "%20")
 
 		// Canonical headers
 		// Note: Go's net/http moves Host header from r.Header to r.Host
@@ -951,7 +951,7 @@ func isHexSHA256(s string) bool {
 	}
 	for i := range len(s) {
 		c := s[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}

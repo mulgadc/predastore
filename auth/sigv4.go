@@ -63,7 +63,7 @@ func UriEncode(input string, encodeSlash bool) string {
 		} else if b == '/' && !encodeSlash {
 			builder.WriteByte(b)
 		} else {
-			builder.WriteString(fmt.Sprintf("%%%02X", b))
+			fmt.Fprintf(&builder, "%%%02X", b)
 		}
 	}
 
@@ -124,7 +124,7 @@ func GenerateAuthHeaderReq(accessKey, secretKey, timestamp, region, service stri
 	for key := range queryUrl {
 		sort.Strings(queryUrl[key])
 	}
-	canonicalQueryString := strings.Replace(queryUrl.Encode(), "+", "%20", -1)
+	canonicalQueryString := strings.ReplaceAll(queryUrl.Encode(), "+", "%20")
 
 	// URI-encode the path for canonical request (required by AWS Signature V4)
 	// This encodes all special characters except forward slashes

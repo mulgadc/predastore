@@ -606,7 +606,7 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 	remaining := totalSize
 	var actualBytesWritten int
 	var shardFragment uint32
-	var currentWALIndex int = -1
+	var currentWALIndex = -1
 	var currentWALFileSize int64 = 0
 
 	for remaining > 0 {
@@ -891,8 +891,7 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 	_, err := activeWal.Write(payload)
 
 	// Return buffer to pool immediately after write
-	//lint:ignore SA6002 TODO: switch to *[]byte pool to avoid boxing allocation
-	fragmentBufferPool.Put(payload)
+	fragmentBufferPool.Put(payload) //nolint:staticcheck // SA6002: TODO switch to *[]byte pool to avoid boxing allocation
 
 	if err != nil {
 		return fmt.Errorf("failed to write to WAL file: %v", err)

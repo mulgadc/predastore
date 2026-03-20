@@ -675,7 +675,7 @@ func ValidateSignatureHTTP(r *http.Request, credentials map[string]string, regio
 	for key := range queryUrl {
 		sort.Strings(queryUrl[key])
 	}
-	canonicalQueryString := strings.Replace(queryUrl.Encode(), "+", "%20", -1)
+	canonicalQueryString := strings.ReplaceAll(queryUrl.Encode(), "+", "%20")
 
 	// Build canonical headers
 	// Note: Go's net/http moves Host header to r.Host, not r.Header
@@ -758,7 +758,7 @@ func UriEncode(input string, encodeSlash bool) string {
 			builder.WriteByte(b)
 		} else {
 			// URI encode everything else
-			builder.WriteString(fmt.Sprintf("%%%02X", b))
+			fmt.Fprintf(&builder, "%%%02X", b)
 		}
 	}
 
