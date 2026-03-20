@@ -535,7 +535,6 @@ func (s *Server) waitForDBLeader() {
 func (s *Server) createDistributedBackend() (backend.Backend, error) {
 	nodes := make([]distributed.NodeConfig, len(s.config.Nodes))
 	for i, n := range s.config.Nodes {
-
 		n.Path = checkBaseDir(s.basePath, n.Path)
 		n.DBPath = checkBaseDir(s.basePath, n.DBPath)
 
@@ -580,7 +579,6 @@ func (s *Server) createDistributedBackend() (backend.Backend, error) {
 		} else if badgerDir == "" {
 			badgerDir = filepath.Join(s.basePath, "distributed/db")
 		}
-
 	}
 
 	if err := os.MkdirAll(badgerDir, 0750); err != nil {
@@ -995,7 +993,6 @@ func allHostsSame(nodes []Nodes) bool {
 
 // Base directory checks
 func checkBaseDir(baseDir, path string) (newpath string) {
-
 	if path == "" {
 		return
 	}

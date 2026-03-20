@@ -82,7 +82,6 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				if err != nil {
 					assert.Fail(t, "Error generating auth header: %v", err)
 				}
-
 			},
 			expectStatus:   http.StatusOK,
 			expectResponse: "", // Response is XML ListBucketResult, just check status
@@ -109,7 +108,6 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				if err != nil {
 					assert.Fail(t, "Error generating auth header: %v", err)
 				}
-
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "Request authenticated",
@@ -135,7 +133,6 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				if err != nil {
 					assert.Fail(t, "Error generating auth header: %v", err)
 				}
-
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "Invalid access key",
@@ -160,7 +157,6 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				if err != nil {
 					assert.Fail(t, "Error generating auth header: %v", err)
 				}
-
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "Invalid signature",

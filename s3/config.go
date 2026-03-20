@@ -13,7 +13,6 @@ import (
 )
 
 func (s3 *Config) ReadConfig() (err error) {
-
 	if !filepath.IsAbs(s3.BasePath) {
 		dir, err := os.Getwd()
 		if err != nil {
@@ -37,7 +36,6 @@ func (s3 *Config) ReadConfig() (err error) {
 
 	// Loop through the buckets, if a directory is relative, add the base path
 	for k, b := range s3.Buckets {
-
 		// Check if the bucket name is valid
 		err := IsValidBucketName(b.Name)
 		if err != nil {
@@ -60,7 +58,6 @@ func (s3 *Config) ReadConfig() (err error) {
 
 		// Add to our valid buckets
 		validBuckets = append(validBuckets, s3.Buckets[k])
-
 	}
 
 	if err != nil {
@@ -76,7 +73,6 @@ func (s3 *Config) ReadConfig() (err error) {
 }
 
 func (s3 *Config) BucketConfig(bucket string) (S3_Buckets, error) {
-
 	for _, b := range s3.Buckets {
 		if b.Name == bucket {
 			return b, nil

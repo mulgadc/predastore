@@ -129,7 +129,6 @@ func calculateWALFileSizes(dataSize int, shardSize uint32, chunkSize uint32, wal
 }
 
 func TestNew(t *testing.T) {
-
 	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
 	assert.NoError(t, err, "MkdirTemp dir should not fail")
 
@@ -164,7 +163,6 @@ func TestNew(t *testing.T) {
 }
 
 func TestNewWriteOutput(t *testing.T) {
-
 	tmpDir, err := os.MkdirTemp(os.TempDir(), fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
 	t.Log(tmpDir)
 	assert.NoError(t, err, "MkdirTemp dir should not fail")
@@ -194,7 +192,6 @@ func TestNewWriteOutput(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-
 			sampleSize := len(tc.data)
 			for i := range tc.data {
 				tc.data[i] = byte((i + sampleSize) % 256)
@@ -219,9 +216,7 @@ func TestNewWriteOutput(t *testing.T) {
 			assert.NotNil(t, data, "Data should not be nil")
 			assert.Equal(t, len(tc.data), len(data), "Data should be the same length as the test data")
 			assert.True(t, bytes.Equal(tc.data, data), "Data should match the test data")
-
 		})
-
 	}
 
 	wal.Close()
@@ -241,7 +236,6 @@ func TestNewWriteOutput(t *testing.T) {
 }
 
 func TestNewWithStateFile(t *testing.T) {
-
 	osTmpDir := os.TempDir()
 
 	tmpDir, err := os.MkdirTemp(osTmpDir, fmt.Sprintf("unit-test-%d", time.Now().UnixNano()))
@@ -265,7 +259,6 @@ func TestNewWithStateFile(t *testing.T) {
 		writeResult, err := wal.Write(testDataReader, len(testData))
 		assert.NoError(t, err, "Write should not error")
 		assert.NotNil(t, writeResult)
-
 	}
 
 	wal.Close()
@@ -291,7 +284,6 @@ func TestNewWithStateFile(t *testing.T) {
 		writeResult, err := wal2.Write(testDataReader, len(testData))
 		assert.NoError(t, err, "Write should not error")
 		assert.NotNil(t, writeResult)
-
 	}
 
 	// WAL, should be the same
@@ -357,11 +349,9 @@ func TestNewWithStateFile(t *testing.T) {
 	// Verify the tmpDir is deleted
 	_, err = os.Stat(tmpDir)
 	assert.Error(t, err, "tmpDir should be deleted")
-
 }
 
 func TestHeaderSizes(t *testing.T) {
-
 	fragment := Fragment{}
 
 	size := fragment.FragmentHeaderSize()
@@ -371,7 +361,6 @@ func TestHeaderSizes(t *testing.T) {
 
 	size = wal.WALHeaderSize()
 	assert.Equal(t, 14, size, "WAL header size should be 14")
-
 }
 
 func TestReadChecksumValidation(t *testing.T) {

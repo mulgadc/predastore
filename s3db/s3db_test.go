@@ -10,7 +10,6 @@ import (
 )
 
 func TestS3DB(t *testing.T) {
-
 	tmpDir, err := os.MkdirTemp(os.TempDir(), "s3db-test")
 
 	t.Log("tmpDir", tmpDir)
@@ -37,7 +36,6 @@ func TestS3DB(t *testing.T) {
 	}
 
 	assert.Equal(t, []byte("test"), value)
-
 }
 
 func TestS3DB_BucketsByAccountID(t *testing.T) {

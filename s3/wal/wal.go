@@ -196,7 +196,6 @@ type ObjectWriteResult struct {
 }
 
 func New(stateFile, walDir string) (wal *WAL, err error) {
-
 	if stateFile == "" {
 		stateFile = filepath.Join(walDir, "state.json")
 	}
@@ -226,11 +225,9 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 		wal.SeqNum.Add(1)
 		wal.WalNum.Add(1)
 	} else {
-
 		if err := wal.LoadState(stateFile); err != nil {
 			slog.Warn("Failed to load WAL state", "file", stateFile, "error", err)
 		}
-
 	}
 
 	// Create Badger DB for local object to WAL/shard/offset
@@ -247,13 +244,11 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 	_, err = os.Stat(filename)
 
 	if err != nil {
-
 		err = wal.createWALUnlocked(filename)
 		//wal.CreateWAL(filename)
 		if err != nil {
 			return wal, err
 		}
-
 	}
 
 	// Start background WAL syncer for periodic fsync (200ms default)
@@ -516,7 +511,6 @@ func (wal *WAL) ensureWALFile() (int, error) {
 
 // createWALUnlocked creates a new WAL file (must be called with lock held)
 func (wal *WAL) createWALUnlocked(filename string) error {
-
 	// Create the directory if it doesn't exist
 	//os.MkdirAll(filepath.Dir(filename), 0750)
 
@@ -794,7 +788,6 @@ func (wal *WAL) Write(r io.Reader, totalSize int) (*WriteResult, error) {
 
 // Update the ObjectToWAL record in the Badger DB
 func (wal *WAL) UpdateObjectToWAL(objectHash [32]byte, result *WriteResult) error {
-
 	objectWriteResult := ObjectWriteResult{
 		Object:      objectHash,
 		WriteResult: *result,
@@ -929,7 +922,6 @@ func (wal *WAL) Close() (err error) {
 	}
 
 	return
-
 }
 
 // ReadFromWriteResult reads an object using the WriteResult from a previous Write() call
@@ -1073,7 +1065,6 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 	data = make([]byte, filesize)
 
 	for remaining > 0 {
-
 		fragment := Fragment{}
 		headerSize := int(fragment.FragmentHeaderSize())
 
@@ -1169,7 +1160,6 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 	}
 
 	return data, nil
-
 }
 
 // The returned reader will yield result.TotalSize bytes (unless it errors early).
@@ -1367,18 +1357,15 @@ func (fragment *Fragment) FragmentHeader() []byte {
 }
 
 func (fragment *Fragment) AppendChecksum(payload []byte) []byte {
-
 	// Update the checksum since we have calculated it
 	//slog.Debug("Checksum", "v", fragment.Checksum)
 	binary.BigEndian.PutUint32(payload[28:32], fragment.Checksum)
 
 	return payload
-
 }
 
 // WALHeaderSize returns the size of the WAL header in bytes
 func (fragment *Fragment) FragmentHeaderSize() int {
-
 	/*
 		SeqNum 8
 		ShardNum 8
