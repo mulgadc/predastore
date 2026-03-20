@@ -994,7 +994,7 @@ func allHostsSame(nodes []Nodes) bool {
 // Base directory checks
 func checkBaseDir(baseDir, path string) (newpath string) {
 	if path == "" {
-		return
+		return ""
 	}
 
 	// Append base-dir if not Absolute Path in config

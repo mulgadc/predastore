@@ -859,7 +859,7 @@ func (wal *WAL) writeFragment(walIndex int, shardNum uint64, shardFragment uint3
 	binary.BigEndian.PutUint64(payload[0:8], fragment.SeqNum)
 	binary.BigEndian.PutUint64(payload[8:16], fragment.ShardNum)
 	binary.BigEndian.PutUint32(payload[16:20], fragment.ShardFragment)
-	binary.BigEndian.PutUint32(payload[20:24], uint32(fragment.Length))
+	binary.BigEndian.PutUint32(payload[20:24], fragment.Length)
 	binary.BigEndian.PutUint32(payload[24:28], uint32(fragment.Flags))
 	// Checksum field (28:32) MUST be zero for CRC calculation
 	binary.BigEndian.PutUint32(payload[28:32], 0)
@@ -921,7 +921,7 @@ func (wal *WAL) Close() (err error) {
 		return fmt.Errorf("failed to save state: %v", err)
 	}
 
-	return
+	return nil
 }
 
 // ReadFromWriteResult reads an object using the WriteResult from a previous Write() call
@@ -951,7 +951,7 @@ func (wal *WAL) ReadFromWriteResult(result *WriteResult) (data []byte, err error
 		var fileBytesRead int64 = 0
 		for fileBytesRead < walFile.Size {
 			fragment := Fragment{}
-			headerSize := int(fragment.FragmentHeaderSize())
+			headerSize := fragment.FragmentHeaderSize()
 
 			// Read the fragment header
 			headerBuf := make([]byte, headerSize)
@@ -1066,7 +1066,7 @@ func (wal *WAL) Read(walNum uint64, shardNum uint64, filesize uint32) (data []by
 
 	for remaining > 0 {
 		fragment := Fragment{}
-		headerSize := int(fragment.FragmentHeaderSize())
+		headerSize := fragment.FragmentHeaderSize()
 
 		// Read the fragment header first so we know exactly how much payload to read.
 		headerBuf := make([]byte, headerSize)

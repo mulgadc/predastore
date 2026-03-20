@@ -231,7 +231,7 @@ func TestNewWriteOutput(t *testing.T) {
 
 	// Verify the WAL files are deleted
 	for i := uint64(1); i <= wal.WalNum.Load(); i++ {
-		assert.NoFileExists(t, filepath.Join(tmpDir, FormatWalFile(uint64(i))))
+		assert.NoFileExists(t, filepath.Join(tmpDir, FormatWalFile(i)))
 	}
 }
 
