@@ -43,6 +43,7 @@ func (b *Backend) CreateBucket(ctx context.Context, req *backend.CreateBucketReq
 		Name:         req.Bucket,
 		Region:       region,
 		OwnerID:      req.OwnerID,
+		AccountID:    req.AccountID,
 		OwnerDisplay: req.OwnerDisplayName,
 		CreationDate: time.Now().UTC(),
 		Public:       false,

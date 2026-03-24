@@ -19,9 +19,8 @@ const (
 	arnObjectPrefix = "arn:aws:s3:::"
 )
 
-// ListBuckets returns a list of buckets from s3db
-// ownerID filters to only show buckets owned by the specified user (empty = all buckets)
-func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.ListBucketsResponse, error) {
+// ListBuckets returns a list of buckets from s3db filtered by account
+func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.ListBucketsResponse, error) {
 	bucketMap := make(map[string]backend.BucketInfo)
 
 	// Scan s3db for dynamically created buckets
@@ -34,14 +33,11 @@ func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.Lis
 			return nil
 		}
 
-		// Filter by owner if ownerID is provided
-		// if ownerID != "" && metadata.OwnerID != ownerID {
-		// Check if bucket is public or if we should show it anyway
-		// For now, show all buckets but mark ownership
-		// The auth middleware should handle access control
-		// }
+		// Filter by account
+		if accountID != "" && metadata.AccountID != accountID {
+			return nil
+		}
 
-		// Add or update (s3db takes precedence for metadata)
 		bucketMap[metadata.Name] = backend.BucketInfo{
 			Name:         metadata.Name,
 			Region:       metadata.Region,
@@ -53,7 +49,6 @@ func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.Lis
 
 	if err != nil {
 		slog.Error("failed to scan buckets from global state", "error", err)
-		// Log error but don't fail - return what we have from config
 	}
 
 	// Convert map to slice
@@ -63,13 +58,13 @@ func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.Lis
 	}
 
 	displayName := "Predastore"
-	if ownerID != "" {
-		displayName = ownerID
+	if accountID != "" {
+		displayName = accountID
 	}
 
 	return &backend.ListBucketsResponse{
 		Owner: backend.OwnerInfo{
-			ID:          ownerID,
+			ID:          accountID,
 			DisplayName: displayName,
 		},
 		Buckets: buckets,

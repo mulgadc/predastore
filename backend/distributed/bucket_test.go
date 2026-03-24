@@ -187,34 +187,57 @@ func TestListBuckets(t *testing.T) {
 		assert.Empty(t, resp.Buckets)
 	})
 
-	t.Run("returns created buckets", func(t *testing.T) {
-		// Create buckets
+	t.Run("returns created buckets for same account", func(t *testing.T) {
 		_, err := be.CreateBucket(ctx, &backend.CreateBucketRequest{
-			Bucket:  "bucket-a",
-			Region:  "us-east-1",
-			OwnerID: "AKIAEXAMPLE",
+			Bucket:    "bucket-a",
+			Region:    "us-east-1",
+			OwnerID:   "AKIAEXAMPLE",
+			AccountID: "111111111111",
 		})
 		require.NoError(t, err)
 
 		_, err = be.CreateBucket(ctx, &backend.CreateBucketRequest{
-			Bucket:  "bucket-b",
-			Region:  "eu-west-1",
-			OwnerID: "AKIAEXAMPLE",
+			Bucket:    "bucket-b",
+			Region:    "eu-west-1",
+			OwnerID:   "AKIAEXAMPLE",
+			AccountID: "111111111111",
 		})
 		require.NoError(t, err)
 
-		// List buckets
-		resp, err := be.ListBuckets(ctx, "AKIAEXAMPLE")
+		resp, err := be.ListBuckets(ctx, "111111111111")
 		require.NoError(t, err)
 		assert.Len(t, resp.Buckets, 2)
 
-		// Verify buckets are in list
 		bucketNames := make(map[string]bool)
 		for _, b := range resp.Buckets {
 			bucketNames[b.Name] = true
 		}
 		assert.True(t, bucketNames["bucket-a"])
 		assert.True(t, bucketNames["bucket-b"])
+	})
+
+	t.Run("filters by account ID", func(t *testing.T) {
+		_, err := be.CreateBucket(ctx, &backend.CreateBucketRequest{
+			Bucket:    "acct-b-bucket",
+			Region:    "us-east-1",
+			OwnerID:   "AKIAOTHER",
+			AccountID: "222222222222",
+		})
+		require.NoError(t, err)
+
+		// Account A should only see its own buckets
+		resp, err := be.ListBuckets(ctx, "111111111111")
+		require.NoError(t, err)
+		for _, b := range resp.Buckets {
+			assert.NotEqual(t, "acct-b-bucket", b.Name,
+				"Account A should not see Account B's bucket")
+		}
+
+		// Account B should only see its own bucket
+		resp, err = be.ListBuckets(ctx, "222222222222")
+		require.NoError(t, err)
+		assert.Len(t, resp.Buckets, 1)
+		assert.Equal(t, "acct-b-bucket", resp.Buckets[0].Name)
 	})
 }
 

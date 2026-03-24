@@ -512,12 +512,12 @@ func (s *HTTP2Server) handleError(w http.ResponseWriter, r *http.Request, err er
 
 func (s *HTTP2Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	ownerID := ""
-	if v := ctx.Value(ContextKeyAccessKeyID); v != nil {
-		ownerID, _ = v.(string)
+	accountID := ""
+	if v := ctx.Value(ContextKeyAccountID); v != nil {
+		accountID, _ = v.(string)
 	}
 
-	resp, err := s.backend.ListBuckets(ctx, ownerID)
+	resp, err := s.backend.ListBuckets(ctx, accountID)
 	if err != nil {
 		s.handleError(w, r, err)
 		return
@@ -549,6 +549,10 @@ func (s *HTTP2Server) createBucket(w http.ResponseWriter, r *http.Request) {
 	if v := ctx.Value(ContextKeyAccessKeyID); v != nil {
 		ownerID, _ = v.(string)
 	}
+	accountID := ""
+	if v := ctx.Value(ContextKeyAccountID); v != nil {
+		accountID, _ = v.(string)
+	}
 
 	region := s.config.Region
 	if r.ContentLength > 0 {
@@ -563,6 +567,7 @@ func (s *HTTP2Server) createBucket(w http.ResponseWriter, r *http.Request) {
 		Bucket:           bucket,
 		Region:           region,
 		OwnerID:          ownerID,
+		AccountID:        accountID,
 		OwnerDisplayName: ownerID,
 	})
 	if err != nil {
