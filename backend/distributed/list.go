@@ -19,24 +19,12 @@ const (
 	arnObjectPrefix = "arn:aws:s3:::"
 )
 
-// ListBuckets returns a list of buckets from both config and s3db
+// ListBuckets returns a list of buckets from s3db
 // ownerID filters to only show buckets owned by the specified user (empty = all buckets)
 func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.ListBucketsResponse, error) {
 	bucketMap := make(map[string]backend.BucketInfo)
 
-	// First add buckets from config (for backward compatibility)
-	for _, bucket := range b.buckets {
-		// Only include distributed type buckets
-		if bucket.Type == "distributed" {
-			bucketMap[bucket.Name] = backend.BucketInfo{
-				Name:         bucket.Name,
-				Region:       bucket.Region,
-				CreationDate: time.Now(), // Config buckets don't have stored creation date
-			}
-		}
-	}
-
-	// Then scan s3db for dynamically created buckets
+	// Scan s3db for dynamically created buckets
 	err := b.globalState.Scan(TableBuckets, nil, func(key, value []byte) error {
 		var metadata backend.BucketMetadata
 		r := bytes.NewReader(value)

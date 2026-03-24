@@ -218,6 +218,39 @@ func TestListBuckets(t *testing.T) {
 	})
 }
 
+func TestListBuckets_ConfigBucketsNotVisible(t *testing.T) {
+	be, cleanup := setupBucketTest(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	// Simulate config-based buckets (like the internal "predastore" bucket)
+	be.buckets = append(be.buckets, BucketConfig{
+		Name:   "predastore",
+		Region: "us-east-1",
+		Type:   "distributed",
+	})
+
+	// Config buckets should NOT appear in ListBuckets
+	resp, err := be.ListBuckets(ctx, "")
+	require.NoError(t, err)
+	for _, b := range resp.Buckets {
+		assert.NotEqual(t, "predastore", b.Name, "config-based buckets should not appear in ListBuckets")
+	}
+
+	// Create a user bucket — it should appear
+	_, err = be.CreateBucket(ctx, &backend.CreateBucketRequest{
+		Bucket:  "user-bucket",
+		Region:  "us-east-1",
+		OwnerID: "AKIAEXAMPLE",
+	})
+	require.NoError(t, err)
+
+	resp, err = be.ListBuckets(ctx, "")
+	require.NoError(t, err)
+	assert.Len(t, resp.Buckets, 1)
+	assert.Equal(t, "user-bucket", resp.Buckets[0].Name)
+}
+
 func TestBucketNameValidation(t *testing.T) {
 	testCases := []struct {
 		name      string
