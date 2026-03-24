@@ -200,7 +200,7 @@ type BucketMetadata struct {
 	Name         string    `json:"name"`
 	Region       string    `json:"region"`
 	OwnerID      string    `json:"owner_id"`      // Access key ID of owner (legacy)
-	AccountID    string    `json:"account_id"`     // 12-digit account ID of owner
+	AccountID    string    `json:"account_id"`    // 12-digit account ID of owner
 	OwnerDisplay string    `json:"owner_display"` // Display name
 	CreationDate time.Time `json:"creation_date"`
 	Public       bool      `json:"public"`      // Allow anonymous access
