@@ -29,8 +29,9 @@ func setupMultipartTestBackend(t *testing.T) (*Backend, func()) {
 
 	tmpDir := t.TempDir()
 
-	// Each invocation gets a unique port range to avoid bind conflicts
-	testBasePort := 39991 + int(multipartPortCounter.Add(1)-1)*10
+	// Each invocation gets a unique port range to avoid bind conflicts.
+	// Spacing of 20 (with 5 nodes per test) leaves headroom for OS socket teardown on CI.
+	testBasePort := 39991 + int(multipartPortCounter.Add(1)-1)*20
 
 	cfg := &Config{
 		BadgerDir:      tmpDir,
