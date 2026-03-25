@@ -48,10 +48,10 @@ func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.L
 	})
 
 	if err != nil {
-		slog.Error("failed to scan buckets from global state", "error", err)
+		return nil, backend.NewS3Error(backend.ErrInternalError, "failed to list buckets: "+err.Error(), 500)
 	}
 
-	// Convert map to slice
+	// Convert to slice
 	buckets := make([]backend.BucketInfo, 0, len(bucketMap))
 	for _, info := range bucketMap {
 		buckets = append(buckets, info)
