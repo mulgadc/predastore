@@ -19,24 +19,11 @@ const (
 	arnObjectPrefix = "arn:aws:s3:::"
 )
 
-// ListBuckets returns a list of buckets from both config and s3db
-// ownerID filters to only show buckets owned by the specified user (empty = all buckets)
-func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.ListBucketsResponse, error) {
+// ListBuckets returns a list of buckets from s3db filtered by account
+func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.ListBucketsResponse, error) {
 	bucketMap := make(map[string]backend.BucketInfo)
 
-	// First add buckets from config (for backward compatibility)
-	for _, bucket := range b.buckets {
-		// Only include distributed type buckets
-		if bucket.Type == "distributed" {
-			bucketMap[bucket.Name] = backend.BucketInfo{
-				Name:         bucket.Name,
-				Region:       bucket.Region,
-				CreationDate: time.Now(), // Config buckets don't have stored creation date
-			}
-		}
-	}
-
-	// Then scan s3db for dynamically created buckets
+	// Scan s3db for dynamically created buckets
 	err := b.globalState.Scan(TableBuckets, nil, func(key, value []byte) error {
 		var metadata backend.BucketMetadata
 		r := bytes.NewReader(value)
@@ -46,14 +33,11 @@ func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.Lis
 			return nil
 		}
 
-		// Filter by owner if ownerID is provided
-		// if ownerID != "" && metadata.OwnerID != ownerID {
-		// Check if bucket is public or if we should show it anyway
-		// For now, show all buckets but mark ownership
-		// The auth middleware should handle access control
-		// }
+		// Filter by account
+		if accountID != "" && metadata.AccountID != accountID {
+			return nil
+		}
 
-		// Add or update (s3db takes precedence for metadata)
 		bucketMap[metadata.Name] = backend.BucketInfo{
 			Name:         metadata.Name,
 			Region:       metadata.Region,
@@ -64,24 +48,23 @@ func (b *Backend) ListBuckets(ctx context.Context, ownerID string) (*backend.Lis
 	})
 
 	if err != nil {
-		slog.Error("failed to scan buckets from global state", "error", err)
-		// Log error but don't fail - return what we have from config
+		return nil, backend.NewS3Error(backend.ErrInternalError, "failed to list buckets: "+err.Error(), 500)
 	}
 
-	// Convert map to slice
+	// Convert to slice
 	buckets := make([]backend.BucketInfo, 0, len(bucketMap))
 	for _, info := range bucketMap {
 		buckets = append(buckets, info)
 	}
 
 	displayName := "Predastore"
-	if ownerID != "" {
-		displayName = ownerID
+	if accountID != "" {
+		displayName = accountID
 	}
 
 	return &backend.ListBucketsResponse{
 		Owner: backend.OwnerInfo{
-			ID:          ownerID,
+			ID:          accountID,
 			DisplayName: displayName,
 		},
 		Buckets: buckets,

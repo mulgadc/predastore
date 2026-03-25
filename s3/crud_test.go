@@ -115,6 +115,19 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 // TestListBucketsAllBackends tests ListBuckets with all backends
 func TestListBucketsAllBackends(t *testing.T) {
 	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
+		// For distributed backend, create a bucket first (config buckets are not listed)
+		if tb.Type == BackendDistributed {
+			createReq := httptest.NewRequest(http.MethodPut, "/list-test-bucket", nil)
+			if len(tb.Config.Auth) > 0 {
+				authEntry := tb.Config.Auth[0]
+				timestamp := time.Now().UTC().Format("20060102T150405Z")
+				err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", createReq)
+				require.NoError(t, err, "Error generating auth header for CreateBucket")
+			}
+			createResp := doRequest(t, tb, createReq)
+			require.Equal(t, 200, createResp.StatusCode, "CreateBucket should return 200")
+		}
+
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 
 		if len(tb.Config.Auth) > 0 {

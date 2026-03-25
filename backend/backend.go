@@ -18,7 +18,7 @@ type Backend interface {
 	CreateBucket(ctx context.Context, req *CreateBucketRequest) (*CreateBucketResponse, error)
 	DeleteBucket(ctx context.Context, req *DeleteBucketRequest) error
 	HeadBucket(ctx context.Context, req *HeadBucketRequest) (*HeadBucketResponse, error)
-	ListBuckets(ctx context.Context, ownerID string) (*ListBucketsResponse, error)
+	ListBuckets(ctx context.Context, accountID string) (*ListBucketsResponse, error)
 	ListObjects(ctx context.Context, req *ListObjectsRequest) (*ListObjectsResponse, error)
 
 	// Multipart upload operations
