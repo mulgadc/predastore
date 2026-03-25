@@ -14,6 +14,11 @@ import (
 	"github.com/mulgadc/predastore/backend"
 )
 
+var (
+	validBucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`)
+	ipAddrPatternRe   = regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`)
+)
+
 // Config holds filesystem backend configuration
 type Config struct {
 	Buckets   []BucketConfig
@@ -127,8 +132,7 @@ func validateBucketName(name string) error {
 		return errors.New("bucket name must be at most 63 characters")
 	}
 
-	validBucket := regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`)
-	if !validBucket.MatchString(name) {
+	if !validBucketNameRe.MatchString(name) {
 		return errors.New("bucket name must consist of lowercase letters, numbers, periods, and hyphens")
 	}
 
@@ -136,7 +140,7 @@ func validateBucketName(name string) error {
 		return errors.New("bucket name cannot contain consecutive periods")
 	}
 
-	if regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`).MatchString(name) {
+	if ipAddrPatternRe.MatchString(name) {
 		return errors.New("bucket name cannot be formatted as an IP address")
 	}
 

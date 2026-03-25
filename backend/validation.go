@@ -6,6 +6,11 @@ import (
 	"strings"
 )
 
+var (
+	validBucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`)
+	ipAddrPatternRe   = regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`)
+)
+
 // IsValidBucketName validates a bucket name according to S3 naming rules
 // https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
 func IsValidBucketName(bucket string) error {
@@ -20,8 +25,7 @@ func IsValidBucketName(bucket string) error {
 	// AWS bucket naming rules
 	// Bucket names must begin and end with a letter or number.
 	// Bucket names can consist only of lowercase letters, numbers, periods (.), and hyphens (-).
-	validBucket := regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`)
-	if !validBucket.MatchString(bucket) {
+	if !validBucketNameRe.MatchString(bucket) {
 		return errors.New("bucket name must consist of lowercase letters, numbers, periods (.), and hyphens (-) and must begin and end with a letter or number")
 	}
 
@@ -31,7 +35,7 @@ func IsValidBucketName(bucket string) error {
 	}
 
 	// Bucket names must not be formatted as an IP address (for example, 192.168.5.4).
-	if regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`).MatchString(bucket) {
+	if ipAddrPatternRe.MatchString(bucket) {
 		return errors.New("bucket names must not be formatted as an IP address")
 	}
 

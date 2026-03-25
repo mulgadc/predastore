@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"log"
 	"log/slog"
 	"math/big"
 	"os"
@@ -164,7 +163,7 @@ func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, erro
 	}
 
 	qs.listener = l
-	log.Printf("QUIC RPC server listening on %s (ALPN %q, WAL: %s)", addr, alpn, walDir)
+	slog.Info("QUIC RPC server listening", "addr", addr, "alpn", alpn, "walDir", walDir)
 
 	// Start accept loop in goroutine
 	go qs.acceptLoop()
@@ -179,7 +178,8 @@ func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, erro
 func New(walDir string, addr string) *QuicServer {
 	qs, err := NewWithRetry(walDir, addr, 10)
 	if err != nil {
-		log.Fatalf("failed to start QUIC server: %v", err)
+		slog.Error("failed to start QUIC server", "error", err)
+		os.Exit(1)
 	}
 	return qs
 }
