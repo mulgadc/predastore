@@ -545,6 +545,12 @@ func (s *HTTP2Server) createBucket(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	bucket := chi.URLParam(r, "bucket")
 
+	// PUT /{bucket}?policy — bucket policies are not supported
+	if r.URL.Query().Has("policy") {
+		s.writeS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "Bucket policy is not implemented")
+		return
+	}
+
 	ownerID := ""
 	if v := ctx.Value(ContextKeyAccessKeyID); v != nil {
 		ownerID, _ = v.(string)
@@ -597,6 +603,12 @@ func (s *HTTP2Server) deleteBucket(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	bucket := chi.URLParam(r, "bucket")
 
+	// DELETE /{bucket}?policy — no-op, bucket policies are not supported
+	if r.URL.Query().Has("policy") {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	ownerID := ""
 	if v := ctx.Value(ContextKeyAccessKeyID); v != nil {
 		ownerID, _ = v.(string)
@@ -618,6 +630,23 @@ func (s *HTTP2Server) listObjects(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	bucket := chi.URLParam(r, "bucket")
 	query := r.URL.Query()
+
+	// Return proper errors for unsupported bucket sub-resource operations
+	// that Terraform and other tools may call.
+	slog.Debug("listObjects called", "bucket", bucket, "query", r.URL.RawQuery)
+	if query.Has("policy") {
+		slog.Debug("returning NoSuchBucketPolicy for ?policy request", "bucket", bucket)
+		s.writeS3Error(w, r, http.StatusNotFound, "NoSuchBucketPolicy", "The bucket policy does not exist")
+		return
+	}
+	if query.Has("acl") {
+		s.writeS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "ACL is not implemented")
+		return
+	}
+	if query.Has("versioning") {
+		s.writeS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "Versioning is not implemented")
+		return
+	}
 
 	resp, err := s.backend.ListObjects(ctx, &backend.ListObjectsRequest{
 		Bucket:    bucket,
