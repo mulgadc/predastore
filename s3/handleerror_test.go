@@ -136,16 +136,3 @@ func TestHTTP2Server_GetHandler(t *testing.T) {
 	server := setupHandleErrorServer(t)
 	assert.NotNil(t, server.GetHandler())
 }
-
-func TestCorsMiddleware_Options(t *testing.T) {
-	server := setupHandleErrorServer(t)
-	handler := server.GetHandler()
-
-	req := httptest.NewRequest(http.MethodOptions, "/test-bucket01/key", nil)
-	rr := httptest.NewRecorder()
-	handler.ServeHTTP(rr, req)
-
-	assert.Equal(t, http.StatusOK, rr.Code)
-	assert.Contains(t, rr.Header().Get("Access-Control-Allow-Methods"), "GET")
-	assert.NotEmpty(t, rr.Header().Get("Access-Control-Allow-Origin"))
-}

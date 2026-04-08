@@ -159,7 +159,6 @@ func (s *HTTP2Server) setupRoutes() {
 		r.Use(middleware.Logger)
 	}
 	r.Use(middleware.Recoverer)
-	r.Use(s.corsMiddleware)
 	r.Use(s.sigV4AuthMiddleware)
 
 	// Routes
@@ -179,78 +178,9 @@ func (s *HTTP2Server) setupRoutes() {
 	r.Delete("/{bucket}/*", s.deleteObject)
 }
 
-// corsAllowedOrigins builds the set of allowed CORS origins from localhost and
-// all local non-loopback IPs on the spinifex-ui port (default 3000). This allows
-// the UI to be accessed from any local address, not just localhost.
-func corsAllowedOrigins() map[string]struct{} {
-	origins := map[string]struct{}{
-		"https://localhost:3000": {},
-	}
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return origins
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			var ip net.IP
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-			case *net.IPAddr:
-				ip = v.IP
-			}
-			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
-				continue
-			}
-			origins[fmt.Sprintf("https://%s:3000", ip.String())] = struct{}{}
-		}
-	}
-	return origins
-}
-
-// corsMiddleware handles CORS for browser requests from the spinifex-ui.
-func (s *HTTP2Server) corsMiddleware(next http.Handler) http.Handler {
-	allowed := corsAllowedOrigins()
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			origin = "https://localhost:3000"
-		}
-		if _, ok := allowed[origin]; ok {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-		} else {
-			w.Header().Set("Access-Control-Allow-Origin", "https://localhost:3000")
-		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,HEAD,OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "*")
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		w.Header().Set("Access-Control-Expose-Headers", "ETag, x-amz-server-side-encryption, x-amz-request-id, x-amz-version-id")
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
 // sigV4AuthMiddleware validates AWS Signature V4 authentication
 func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip authentication for OPTIONS requests
-		if r.Method == http.MethodOptions {
-			next.ServeHTTP(w, r)
-			return
-		}
-
 		path := r.URL.Path
 		method := r.Method
 		authHeader := r.Header.Get("Authorization")
