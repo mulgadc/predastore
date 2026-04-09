@@ -14,7 +14,9 @@ func TestBackend_Type(t *testing.T) {
 	require.NoError(t, err)
 	defer b.Close()
 
-	assert.Equal(t, "distributed", b.(*Backend).Type())
+	backend, ok := b.(*Backend)
+	require.True(t, ok, "expected *Backend")
+	assert.Equal(t, "distributed", backend.Type())
 }
 
 func TestBackend_DB_LocalState(t *testing.T) {
@@ -24,7 +26,8 @@ func TestBackend_DB_LocalState(t *testing.T) {
 	require.NoError(t, err)
 	defer b.Close()
 
-	backend := b.(*Backend)
+	backend, ok := b.(*Backend)
+	require.True(t, ok, "expected *Backend")
 	db := backend.DB()
 	assert.NotNil(t, db, "DB() should return non-nil for LocalState backend")
 }
@@ -36,7 +39,8 @@ func TestBackend_GlobalState(t *testing.T) {
 	require.NoError(t, err)
 	defer b.Close()
 
-	backend := b.(*Backend)
+	backend, ok := b.(*Backend)
+	require.True(t, ok)
 	gs := backend.GlobalState()
 	assert.NotNil(t, gs, "GlobalState() should return non-nil")
 
@@ -64,7 +68,8 @@ func TestBackend_DataDir(t *testing.T) {
 	require.NoError(t, err)
 	defer b.Close()
 
-	backend := b.(*Backend)
+	backend, ok := b.(*Backend)
+	require.True(t, ok)
 
 	customDir := "/tmp/custom-data-dir"
 	backend.SetDataDir(customDir)
@@ -78,7 +83,8 @@ func TestBackend_RsShards(t *testing.T) {
 	require.NoError(t, err)
 	defer b.Close()
 
-	backend := b.(*Backend)
+	backend, ok := b.(*Backend)
+	require.True(t, ok)
 	assert.Equal(t, 3, backend.RsDataShard())
 	assert.Equal(t, 2, backend.RsParityShard())
 }

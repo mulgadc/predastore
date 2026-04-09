@@ -43,7 +43,11 @@ func testSetup(t *testing.T) (*Backend, string, func()) {
 		be.Close()
 	}
 
-	return be.(*Backend), tmpDir, cleanup
+	backend, ok := be.(*Backend)
+	if !ok {
+		t.Fatal("expected *Backend type")
+	}
+	return backend, tmpDir, cleanup
 }
 
 // createTestFile creates a test file in the bucket

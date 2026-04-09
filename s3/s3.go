@@ -108,26 +108,26 @@ type PolicyRule struct {
 // S3 ListObjects (v2)
 
 type ListObjectsV2_Dir struct {
-	Prefix string
+	Prefix string `xml:"Prefix"`
 }
 
 type ListObjectsV2_Contents struct {
-	Key          string
-	LastModified time.Time
-	ETag         string
-	Size         int64
-	StorageClass string
+	Key          string    `xml:"Key"`
+	LastModified time.Time `xml:"LastModified"`
+	ETag         string    `xml:"ETag"`
+	Size         int64     `xml:"Size"`
+	StorageClass string    `xml:"StorageClass"`
 }
 
 type ListObjectsV2 struct {
-	XMLName        xml.Name `xml:"ListBucketResult"`
-	Name           string
-	Prefix         string
-	KeyCount       int
-	MaxKeys        int
-	IsTruncated    bool
-	Contents       *[]ListObjectsV2_Contents
-	CommonPrefixes *[]ListObjectsV2_Dir
+	XMLName        xml.Name                  `xml:"ListBucketResult"`
+	Name           string                    `xml:"Name"`
+	Prefix         string                    `xml:"Prefix"`
+	KeyCount       int                       `xml:"KeyCount"`
+	MaxKeys        int                       `xml:"MaxKeys"`
+	IsTruncated    bool                      `xml:"IsTruncated"`
+	Contents       *[]ListObjectsV2_Contents `xml:"Contents"`
+	CommonPrefixes *[]ListObjectsV2_Dir      `xml:"CommonPrefixes"`
 }
 
 /*
@@ -147,18 +147,18 @@ type ListObjectsV2 struct {
 */
 
 type BucketOwner struct {
-	ID          string
-	DisplayName string
+	ID          string `xml:"ID"`
+	DisplayName string `xml:"DisplayName"`
 }
 
 type ListBucket struct {
-	CreationDate time.Time
-	Name         string
+	CreationDate time.Time `xml:"CreationDate"`
+	Name         string    `xml:"Name"`
 }
 
 type ListBuckets struct {
-	XMLName xml.Name `xml:"ListAllMyBucketsResult"`
-	Owner   BucketOwner
+	XMLName xml.Name     `xml:"ListAllMyBucketsResult"`
+	Owner   BucketOwner  `xml:"Owner"`
 	Buckets []ListBucket `xml:"Buckets>Bucket"`
 }
 

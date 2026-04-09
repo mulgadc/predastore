@@ -98,13 +98,13 @@ type WAL struct {
 }
 
 type WALState struct {
-	WalNum   uint64
-	SeqNum   uint64
-	ShardNum uint64
-	Epoch    time.Time
+	WalNum   uint64    `json:"WalNum"`
+	SeqNum   uint64    `json:"SeqNum"`
+	ShardNum uint64    `json:"ShardNum"`
+	Epoch    time.Time `json:"Epoch"`
 
-	WalDir    string
-	StateFile string
+	WalDir    string `json:"WalDir"`
+	StateFile string `json:"StateFile"`
 }
 
 type Shard struct {
@@ -177,16 +177,16 @@ type Fragment struct {
 
 // WALFileInfo represents information about a WAL file used to store an object
 type WALFileInfo struct {
-	WALNum uint64 // WAL file number (e.g., 1, 2, 3)
-	Offset int64  // Starting offset in the WAL file (after WAL header)
-	Size   int64  // Size of data written to this WAL file
+	WALNum uint64 `json:"WALNum"` // WAL file number (e.g., 1, 2, 3)
+	Offset int64  `json:"Offset"` // Starting offset in the WAL file (after WAL header)
+	Size   int64  `json:"Size"`   // Size of data written to this WAL file
 }
 
 // WriteResult contains information about where an object was written
 type WriteResult struct {
-	ShardNum  uint64        // ShardNum for this object
-	WALFiles  []WALFileInfo // List of WAL files used (in order)
-	TotalSize int           // Total size of the object written
+	ShardNum  uint64        `json:"ShardNum"`  // ShardNum for this object
+	WALFiles  []WALFileInfo `json:"WALFiles"`  // List of WAL files used (in order)
+	TotalSize int           `json:"TotalSize"` // Total size of the object written
 }
 
 // Object to Shard / WALFileInfo tracker (stored in Badger DB)

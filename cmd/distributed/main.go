@@ -24,7 +24,10 @@ func main() {
 	defer b.Close()
 
 	// Cast to access distributed-specific methods
-	d := b.(*distributed.Backend)
+	d, ok := b.(*distributed.Backend)
+	if !ok {
+		panic("expected *distributed.Backend")
+	}
 
 	mode := flag.String("mode", "upload", "Mode: upload, download")
 	filename := flag.String("file", "", "File to upload or download")
