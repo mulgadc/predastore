@@ -35,7 +35,9 @@ func setupBucketTest(t *testing.T) (*Backend, func()) {
 		be.Close()
 	}
 
-	return be.(*Backend), cleanup
+	b, ok := be.(*Backend)
+	require.True(t, ok)
+	return b, cleanup
 }
 
 func TestCreateBucket(t *testing.T) {

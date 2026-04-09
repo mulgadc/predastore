@@ -39,7 +39,8 @@ func TestPutObjectWithTempFile(t *testing.T) {
 	require.NotNil(t, b)
 	defer b.Close()
 
-	backend := b.(*Backend)
+	backend, ok := b.(*Backend)
+	require.True(t, ok)
 
 	// Set data directory for nodes
 	dataDir := filepath.Join(tmpDir, "nodes")

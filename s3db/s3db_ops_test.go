@@ -124,7 +124,8 @@ func TestFSM_Snapshot_Empty(t *testing.T) {
 	snap, err := fsm.Snapshot()
 	require.NoError(t, err)
 
-	fsmSnap := snap.(*FSMSnapshot)
+	fsmSnap, ok := snap.(*FSMSnapshot)
+	require.True(t, ok)
 	assert.Empty(t, fsmSnap.data)
 }
 

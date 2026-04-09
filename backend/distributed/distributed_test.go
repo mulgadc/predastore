@@ -29,7 +29,8 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 	require.NotNil(t, b)
 	defer b.Close()
 
-	backend := b.(*Backend)
+	backend, ok := b.(*Backend)
+	require.True(t, ok)
 
 	// Ensure tests don't write into the repo's s3/tests/... directories.
 	tmp := t.TempDir()
@@ -119,7 +120,7 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 		verifyReaders[i] = bytes.NewReader(shardBytes[i])
 	}
 
-	ok, err := enc.Verify(verifyReaders)
+	ok, err = enc.Verify(verifyReaders)
 	t.Logf("Verify result: ok=%v, err=%v", ok, err)
 	require.NoError(t, err)
 	require.True(t, ok, "expected shards to verify")
@@ -144,7 +145,8 @@ func TestReadFromWriteResultStream_RoundTripJoin(t *testing.T) {
 	require.NotNil(t, b)
 	defer b.Close()
 
-	backend := b.(*Backend)
+	backend, ok := b.(*Backend)
+	require.True(t, ok)
 
 	// Ensure tests don't write into the repo's s3/tests/... directories.
 	tmp := t.TempDir()
@@ -250,7 +252,8 @@ func TestPutGet_ReconstructionValidation_CorruptionAndMissingWAL(t *testing.T) {
 			require.NotNil(t, b)
 			defer b.Close()
 
-			backend := b.(*Backend)
+			backend, ok := b.(*Backend)
+			require.True(t, ok)
 
 			// Ensure tests don't write into the repo's s3/tests/... directories.
 			tmp := t.TempDir()
@@ -471,7 +474,8 @@ func TestGetObjectByteRange(t *testing.T) {
 	require.NotNil(t, b)
 	defer b.Close()
 
-	backend := b.(*Backend)
+	backend, ok := b.(*Backend)
+	require.True(t, ok)
 
 	// Set data directory for nodes
 	dataDir := filepath.Join(tmpDir, "nodes")

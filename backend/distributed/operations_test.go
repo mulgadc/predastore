@@ -28,7 +28,8 @@ func setupTestBackend(t *testing.T) *Backend {
 	require.NoError(t, err)
 	t.Cleanup(func() { b.Close() })
 
-	be := b.(*Backend)
+	be, ok := b.(*Backend)
+	require.True(t, ok)
 
 	tmp := t.TempDir()
 	be.SetDataDir(filepath.Join(tmp, "nodes"))

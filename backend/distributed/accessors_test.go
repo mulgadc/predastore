@@ -96,7 +96,8 @@ func TestBackend_HashRing(t *testing.T) {
 	require.NoError(t, err)
 	defer b.Close()
 
-	backend := b.(*Backend)
+	backend, ok := b.(*Backend)
+	require.True(t, ok)
 	assert.NotNil(t, backend.HashRing())
 }
 

@@ -43,7 +43,8 @@ func setupMultipartTestBackend(t *testing.T) (*Backend, func()) {
 	require.NoError(t, err)
 	require.NotNil(t, b)
 
-	be := b.(*Backend)
+	be, ok := b.(*Backend)
+	require.True(t, ok)
 	dataDir := filepath.Join(tmpDir, "nodes")
 	be.SetDataDir(dataDir)
 
