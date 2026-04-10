@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -62,7 +63,7 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 
 	// Configure Raft
 	raftConfig := raft.DefaultConfig()
-	raftConfig.LocalID = raft.ServerID(fmt.Sprintf("%d", config.NodeID))
+	raftConfig.LocalID = raft.ServerID(strconv.FormatUint(config.NodeID, 10))
 	raftConfig.HeartbeatTimeout = config.HeartbeatTimeout
 	raftConfig.ElectionTimeout = config.ElectionTimeout
 	raftConfig.CommitTimeout = config.CommitTimeout
@@ -143,7 +144,7 @@ func (n *RaftNode) bootstrap() error {
 	servers := make([]raft.Server, 0, len(n.config.Nodes))
 	for _, node := range n.config.Nodes {
 		servers = append(servers, raft.Server{
-			ID:      raft.ServerID(fmt.Sprintf("%d", node.ID)),
+			ID:      raft.ServerID(strconv.FormatUint(node.ID, 10)),
 			Address: raft.ServerAddress(node.RaftAdvertiseAddr()),
 		})
 	}

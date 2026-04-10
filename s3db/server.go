@@ -192,7 +192,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	stats := s.node.Stats()
 
 	s.writeJSON(w, http.StatusOK, StatusResponse{
-		NodeID:     fmt.Sprintf("%d", s.config.ClusterConfig.NodeID),
+		NodeID:     strconv.FormatUint(s.config.ClusterConfig.NodeID, 10),
 		State:      stats["state"],
 		Leader:     s.node.LeaderID(),
 		LeaderAddr: s.node.LeaderAddr(),
