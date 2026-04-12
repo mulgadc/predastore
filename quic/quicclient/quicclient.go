@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/utils"
@@ -35,6 +36,11 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 		HandshakeIdleTimeout: 5 * time.Second,
 		KeepAlivePeriod:      15 * time.Second,
 		MaxIdleTimeout:       60 * time.Second,
+		// See docs/development/bugs/multipart-upload-deadlock.md (Bug C).
+		InitialStreamReceiveWindow:     quicconf.InitialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         quicconf.MaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: quicconf.InitialConnectionReceiveWindow,
+		MaxConnectionReceiveWindow:     quicconf.MaxConnectionReceiveWindow,
 	})
 	if err != nil {
 		return nil, err

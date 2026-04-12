@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/quic-go/quic-go"
 )
 
@@ -38,6 +39,11 @@ func NewPool() *Pool {
 			HandshakeIdleTimeout: 5 * time.Second,
 			KeepAlivePeriod:      15 * time.Second,
 			MaxIdleTimeout:       120 * time.Second, // Longer timeout for pooled connections
+			// See docs/development/bugs/multipart-upload-deadlock.md (Bug C).
+			InitialStreamReceiveWindow:     quicconf.InitialStreamReceiveWindow,
+			MaxStreamReceiveWindow:         quicconf.MaxStreamReceiveWindow,
+			InitialConnectionReceiveWindow: quicconf.InitialConnectionReceiveWindow,
+			MaxConnectionReceiveWindow:     quicconf.MaxConnectionReceiveWindow,
 		},
 	}
 

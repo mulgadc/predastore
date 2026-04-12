@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/s3/wal"
 	"github.com/mulgadc/predastore/s3db"
@@ -149,6 +150,11 @@ func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, erro
 			MaxIdleTimeout:        60 * time.Second,
 			MaxIncomingStreams:    1000, // Allow more concurrent streams
 			MaxIncomingUniStreams: 1000,
+			// See docs/development/bugs/multipart-upload-deadlock.md (Bug C).
+			InitialStreamReceiveWindow:     quicconf.InitialStreamReceiveWindow,
+			MaxStreamReceiveWindow:         quicconf.MaxStreamReceiveWindow,
+			InitialConnectionReceiveWindow: quicconf.InitialConnectionReceiveWindow,
+			MaxConnectionReceiveWindow:     quicconf.MaxConnectionReceiveWindow,
 		})
 		if err == nil {
 			break
