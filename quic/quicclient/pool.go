@@ -188,9 +188,19 @@ func (p *Pool) cleanup() {
 
 	for addr, pc := range p.connections {
 		pc.mu.Lock()
-		// Remove if idle too long or if connection is already closed
-		isIdle := now.Sub(pc.lastUsed) > maxIdle
+		// Remove if idle too long or if connection is already closed.
+		// A connection with in-flight RPC streams is never "idle" even if
+		// lastUsed is stale — handler-side WAL writes can easily exceed
+		// 2 minutes, and reaping them mid-transfer manifests as
+		// "Application error 0x0 (local): done (wrote N of M)" on every
+		// active stream. See docs/development/bugs/multipart-upload-deadlock.md
+		// (Bug A).
 		isClosed := pc.client == nil || pc.client.conn == nil || pc.client.conn.Context().Err() != nil
+		activeStreams := int64(0)
+		if pc.client != nil {
+			activeStreams = pc.client.ActiveStreams()
+		}
+		isIdle := now.Sub(pc.lastUsed) > maxIdle && activeStreams == 0
 		if isIdle || isClosed {
 			if pc.client != nil {
 				if err := pc.client.Close(); err != nil {
