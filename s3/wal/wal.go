@@ -118,23 +118,36 @@ type Shard struct {
 
 // bufferedWALFile wraps an os.File with a bufio.Writer for efficient batched writes.
 // This reduces syscalls by ~10x for typical shard writes (512 fragments per 4MB shard).
+//
+// The embedded *bufio.Writer is not safe for concurrent use. syncWALIfDirty
+// deliberately drops wal.mu.RUnlock() before calling Sync() so fsync does not
+// block writers, which means Sync can race against the next wal.Write holder
+// on the same file. Guard every public method with the per-file mutex.
+// See docs/development/bugs/multipart-upload-deadlock.md (Bug B).
 type bufferedWALFile struct {
+	mu     sync.Mutex
 	file   *os.File
 	writer *bufio.Writer
 }
 
 // Write writes to the buffered writer
 func (b *bufferedWALFile) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.writer.Write(p)
 }
 
 // Flush flushes buffered data to the underlying file
 func (b *bufferedWALFile) Flush() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.writer.Flush()
 }
 
 // Sync flushes the buffer and syncs the underlying file to disk
 func (b *bufferedWALFile) Sync() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if err := b.writer.Flush(); err != nil {
 		return err
 	}
@@ -143,6 +156,8 @@ func (b *bufferedWALFile) Sync() error {
 
 // Stat returns file info (flushes buffer first to get accurate size)
 func (b *bufferedWALFile) Stat() (os.FileInfo, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if err := b.writer.Flush(); err != nil {
 		return nil, err
 	}
@@ -151,6 +166,8 @@ func (b *bufferedWALFile) Stat() (os.FileInfo, error) {
 
 // Close flushes and closes the file
 func (b *bufferedWALFile) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if err := b.writer.Flush(); err != nil {
 		return err
 	}
