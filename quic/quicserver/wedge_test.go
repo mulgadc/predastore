@@ -43,14 +43,12 @@ func newTestQuicServer(t *testing.T) (*quicserver.QuicServer, string) {
 //   - Server-side handlers that hold a global lock (wal.mu) while reading
 //     from the stream.
 //
-// On a wedged server the test hangs until the 60s budget elapses. On a healthy
-// server the writes serialize through wal.mu in well under a second each and
-// total wall time is bounded by loopback bandwidth.
+// On a wedged server the test hangs until the 60s budget elapses. Post-fix
+// (9dcd3dd drains the shard body into a memory buffer before taking wal.mu
+// and 43e20f6 widens QUIC flow-control windows), the writes serialize
+// through wal.mu in well under a second each. This is now a regression
+// gate for those two fixes together.
 func TestQuicServer_ConcurrentShardWrites_NoWedge(t *testing.T) {
-	if os.Getenv("PREDASTORE_BUG_REPRO") != "1" {
-		t.Skip("bug reproducer — set PREDASTORE_BUG_REPRO=1 to run")
-	}
-
 	qs, addr := newTestQuicServer(t)
 	defer qs.Close()
 

@@ -788,16 +788,13 @@ func TestDistributed_MultipartUpload_PartOverwrite(t *testing.T) {
 // Acceptance:
 //   - On `main` today: at least some UploadPart calls hang past their per-
 //     request context deadline and the overall test trips its timeout.
-//   - After fixes land: all 10 concurrent parts complete, the data
-//     reconstructs correctly end-to-end.
+//   - Post-fix (7df9645 + 9dcd3dd + 43e20f6): all 10 concurrent parts
+//     complete and the data reconstructs correctly end-to-end. This is
+//     now the end-to-end regression gate for those fixes.
 //
 // Scope note: the 90 s total-elapsed bound is a deadlock detector, not a
 // performance regression. A per-part benchmark belongs in s3_bench_test.go.
 func TestDistributed_MultipartUpload_ConcurrentParts_Contention(t *testing.T) {
-	if os.Getenv("PREDASTORE_BUG_REPRO") != "1" {
-		t.Skip("bug reproducer — set PREDASTORE_BUG_REPRO=1 to run")
-	}
-
 	be, cleanup := setupMultipartTestBackend(t)
 	defer cleanup()
 

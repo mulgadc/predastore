@@ -1110,16 +1110,10 @@ func TestSyncDoesNotBlockWrites(t *testing.T) {
 // one goroutine holds wal.mu and streams through wal.Write (which repeatedly
 // touches bufferedWALFile.writer); another goroutine, without holding any
 // lock, calls fileToSync.Sync() on the same bufferedWALFile. Under -race,
-// this triggers a DATA RACE on bufio.Writer internals. On a future fix that
-// gives bufferedWALFile its own mutex, -race stays clean.
-//
-// Gated behind PREDASTORE_BUG_REPRO=1 because it currently fails on main —
-// that is the point (validating the bug exists). When Bug B is fixed, remove
-// the gate so this becomes a standard regression test.
+// this triggers a DATA RACE on bufio.Writer internals. Post-fix (7df9645
+// added sync.Mutex on bufferedWALFile), -race stays clean; this test is
+// the regression gate.
 func TestWAL_BufferedWALFile_SyncWriteRace(t *testing.T) {
-	if os.Getenv("PREDASTORE_BUG_REPRO") != "1" {
-		t.Skip("bug reproducer — set PREDASTORE_BUG_REPRO=1 to run")
-	}
 	tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("wal-bufrace-%d", time.Now().UnixNano()))
 	require.NoError(t, os.MkdirAll(tmpDir, 0750))
 	defer os.RemoveAll(tmpDir)
