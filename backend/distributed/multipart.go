@@ -75,7 +75,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.Create
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to create multipart upload", 500)
 	}
 
-	slog.Info("Multipart upload created", "bucket", req.Bucket, "key", req.Key, "uploadID", uploadID)
+	slog.Debug("Multipart upload created", "bucket", req.Bucket, "key", req.Key, "uploadID", uploadID)
 
 	return &backend.CreateMultipartUploadResponse{
 		Bucket:   req.Bucket,
@@ -439,7 +439,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	// Calculate multipart ETag
 	finalETag := multipart.CalculateMultipartETag(partETags, len(req.Parts))
 
-	slog.Info("Multipart upload completed", "bucket", req.Bucket, "key", req.Key, "uploadID", req.UploadID, "parts", len(req.Parts))
+	slog.Debug("Multipart upload completed", "bucket", req.Bucket, "key", req.Key, "uploadID", req.UploadID, "parts", len(req.Parts))
 
 	return &backend.CompleteMultipartUploadResponse{
 		Location: fmt.Sprintf("/%s/%s", req.Bucket, req.Key),
@@ -548,7 +548,7 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadI
 		slog.Warn("Failed to cleanup multipart upload", "uploadID", uploadID, "error", err)
 	}
 
-	slog.Info("Multipart upload aborted", "bucket", bucket, "key", key, "uploadID", uploadID)
+	slog.Debug("Multipart upload aborted", "bucket", bucket, "key", key, "uploadID", uploadID)
 
 	return nil
 }

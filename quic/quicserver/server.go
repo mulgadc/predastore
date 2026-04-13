@@ -286,7 +286,7 @@ func (qs *QuicServer) handleStream(s *quic.Stream) {
 	}()
 
 	if activeCount%100 == 0 || activeCount > 50 {
-		slog.Info("handleStream: active streams high", "count", activeCount, "streamID", streamID)
+		slog.Debug("handleStream: active streams high", "count", activeCount, "streamID", streamID)
 	}
 
 	br := bufio.NewReaderSize(s, 128*1024)
