@@ -118,23 +118,36 @@ type Shard struct {
 
 // bufferedWALFile wraps an os.File with a bufio.Writer for efficient batched writes.
 // This reduces syscalls by ~10x for typical shard writes (512 fragments per 4MB shard).
+//
+// The embedded *bufio.Writer is not safe for concurrent use. syncWALIfDirty
+// deliberately drops wal.mu.RUnlock() before calling Sync() so fsync does not
+// block writers, which means Sync can race against the next wal.Write holder
+// on the same file. Guard every public method with the per-file mutex.
+// See docs/development/bugs/multipart-upload-deadlock.md (Bug B).
 type bufferedWALFile struct {
+	mu     sync.Mutex
 	file   *os.File
 	writer *bufio.Writer
 }
 
 // Write writes to the buffered writer
 func (b *bufferedWALFile) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.writer.Write(p)
 }
 
 // Flush flushes buffered data to the underlying file
 func (b *bufferedWALFile) Flush() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.writer.Flush()
 }
 
 // Sync flushes the buffer and syncs the underlying file to disk
 func (b *bufferedWALFile) Sync() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if err := b.writer.Flush(); err != nil {
 		return err
 	}
@@ -143,6 +156,8 @@ func (b *bufferedWALFile) Sync() error {
 
 // Stat returns file info (flushes buffer first to get accurate size)
 func (b *bufferedWALFile) Stat() (os.FileInfo, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if err := b.writer.Flush(); err != nil {
 		return nil, err
 	}
@@ -151,6 +166,8 @@ func (b *bufferedWALFile) Stat() (os.FileInfo, error) {
 
 // Close flushes and closes the file
 func (b *bufferedWALFile) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if err := b.writer.Flush(); err != nil {
 		return err
 	}
@@ -236,19 +253,13 @@ func New(stateFile, walDir string) (wal *WAL, err error) {
 		return nil, err
 	}
 
-	// Next, check if a WAL already exists
-	walNum := wal.WalNum.Load()
-
-	filename := filepath.Join(walDir, FormatWalFile(walNum))
-
-	_, err = os.Stat(filename)
-
-	if err != nil {
-		err = wal.createWALUnlocked(filename)
-		//wal.CreateWAL(filename)
-		if err != nil {
-			return wal, err
-		}
+	// Open (or create) the active WAL file at WalNum and attach it to
+	// Shard.DB. On a fresh directory this creates the first file; on
+	// restart it reopens the existing one in append mode. If the existing
+	// file is already full, WalNum rotates until an available slot is
+	// found, matching the rotation behaviour used during normal writes.
+	if _, err = wal.openAvailableWALUnlocked(); err != nil {
+		return wal, err
 	}
 
 	// Start background WAL syncer for periodic fsync (200ms default)
@@ -483,29 +494,28 @@ func (wal *WAL) ensureWALFile() (int, error) {
 		}
 	}
 
-	// Need to create a new WAL file
-	// Keep incrementing until we find an empty file or one with space
-	maxAttempts := 100
+	return wal.openAvailableWALUnlocked()
+}
+
+// openAvailableWALUnlocked opens the WAL file at the current WalNum (creating
+// it if absent, reopening it in append mode if present), bumping WalNum until
+// a file with room for at least one fragment is found. On success the opened
+// file is appended to wal.Shard.DB and its index is returned.
+// Caller must hold wal.mu.
+func (wal *WAL) openAvailableWALUnlocked() (int, error) {
+	const maxAttempts = 100
 	for attempt := range maxAttempts {
 		filename := filepath.Join(wal.WalDir, FormatWalFile(wal.WalNum.Load()))
-
 		err := wal.createWALUnlocked(filename)
-		if err != nil {
-			// If file is full, try next number
-			if attempt < maxAttempts-1 {
-				//fmt.Println("Incrementing WalNum")
-				//fmt.Println("wal.WalNum.Load()", wal.WalNum.Load())
-				wal.WalNum.Add(1)
-				//fmt.Println("wal.WalNum.Load()", wal.WalNum.Load())
-
-				continue
-			}
-			return 0, err
+		if err == nil {
+			return len(wal.Shard.DB) - 1, nil
 		}
-
-		return len(wal.Shard.DB) - 1, nil
+		if attempt < maxAttempts-1 {
+			wal.WalNum.Add(1)
+			continue
+		}
+		return 0, err
 	}
-
 	return 0, fmt.Errorf("could not find available WAL file after %d attempts", maxAttempts)
 }
 

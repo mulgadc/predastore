@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/utils"
@@ -22,8 +23,23 @@ const (
 )
 
 type Client struct {
-	conn  *quic.Conn
-	reqID uint64
+	conn          *quic.Conn
+	reqID         uint64
+	activeStreams int64 // atomic: see docs/development/bugs/multipart-upload-deadlock.md (Bug A).
+}
+
+// ActiveStreams reports the number of in-flight RPC streams on this client.
+// Used by Pool.cleanup() to avoid reaping connections with active work.
+func (c *Client) ActiveStreams() int64 {
+	return atomic.LoadInt64(&c.activeStreams)
+}
+
+func (c *Client) incActive() {
+	atomic.AddInt64(&c.activeStreams, 1)
+}
+
+func (c *Client) decActive() {
+	atomic.AddInt64(&c.activeStreams, -1)
 }
 
 func Dial(ctx context.Context, addr string) (*Client, error) {
@@ -35,6 +51,11 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 		HandshakeIdleTimeout: 5 * time.Second,
 		KeepAlivePeriod:      15 * time.Second,
 		MaxIdleTimeout:       60 * time.Second,
+		// See docs/development/bugs/multipart-upload-deadlock.md (Bug C).
+		InitialStreamReceiveWindow:     quicconf.InitialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         quicconf.MaxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: quicconf.InitialConnectionReceiveWindow,
+		MaxConnectionReceiveWindow:     quicconf.MaxConnectionReceiveWindow,
 	})
 	if err != nil {
 		return nil, err
@@ -112,6 +133,8 @@ func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader,
 		slog.Error("doPut: failed to open stream", "error", err)
 		return quicproto.Header{}, nil, err
 	}
+	c.incActive()
+	defer c.decActive()
 	slog.Debug("doPut: stream opened", "streamID", s.StreamID())
 
 	br := bufio.NewReaderSize(s, 128*1024)
@@ -227,6 +250,8 @@ func (c *Client) doDelete(ctx context.Context, requestBytes []byte) (quicproto.H
 	if err != nil {
 		return quicproto.Header{}, nil, err
 	}
+	c.incActive()
+	defer c.decActive()
 
 	br := bufio.NewReaderSize(s, 128*1024)
 	bw := bufio.NewWriterSize(s, 128*1024)
@@ -361,8 +386,10 @@ func (c *Client) GetRange(ctx context.Context, objectRequest quicserver.ObjectRe
 // This is CRITICAL for connection pooling - unclosed streams will accumulate
 // and eventually block OpenStreamSync() when the stream limit is reached.
 type streamReadCloser struct {
-	r      io.Reader
-	stream *quic.Stream
+	r       io.Reader
+	stream  *quic.Stream
+	onClose func() // fires exactly once when Close is first called; may be nil.
+	closed  atomic.Bool
 }
 
 func (s *streamReadCloser) Read(p []byte) (int, error) {
@@ -370,6 +397,12 @@ func (s *streamReadCloser) Read(p []byte) (int, error) {
 }
 
 func (s *streamReadCloser) Close() error {
+	if s.closed.Swap(true) {
+		return nil
+	}
+	if s.onClose != nil {
+		s.onClose()
+	}
 	if s.stream != nil {
 		// Close both sides of the stream to fully release it:
 		// - CancelRead(0): close read side (caller is done reading)
@@ -391,6 +424,15 @@ func (c *Client) do(ctx context.Context, method uint8, objectRequest []byte, bod
 	if err != nil {
 		return quicproto.Header{}, nil, err
 	}
+	c.incActive()
+	// Decrement unless the stream is handed off to a streamReadCloser that
+	// owns the decrement (GET body path). See Bug A in the bug doc.
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			c.decActive()
+		}
+	}()
 
 	br := bufio.NewReaderSize(s, 128*1024)
 	bw := bufio.NewWriterSize(s, 128*1024)
@@ -441,6 +483,8 @@ func (c *Client) do(ctx context.Context, method uint8, objectRequest []byte, bod
 		return respHdr, nil, nil
 	}
 
-	// Return a ReadCloser that will close the stream when the caller is done reading
-	return respHdr, &streamReadCloser{r: br, stream: s}, nil
+	// Return a ReadCloser that will close the stream when the caller is done reading.
+	// Hand off the activeStreams decrement to the stream's Close.
+	handedOff = true
+	return respHdr, &streamReadCloser{r: br, stream: s, onClose: c.decActive}, nil
 }

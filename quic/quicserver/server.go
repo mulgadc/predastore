@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/s3/wal"
 	"github.com/mulgadc/predastore/s3db"
@@ -149,6 +150,11 @@ func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, erro
 			MaxIdleTimeout:        60 * time.Second,
 			MaxIncomingStreams:    1000, // Allow more concurrent streams
 			MaxIncomingUniStreams: 1000,
+			// See docs/development/bugs/multipart-upload-deadlock.md (Bug C).
+			InitialStreamReceiveWindow:     quicconf.InitialStreamReceiveWindow,
+			MaxStreamReceiveWindow:         quicconf.MaxStreamReceiveWindow,
+			InitialConnectionReceiveWindow: quicconf.InitialConnectionReceiveWindow,
+			MaxConnectionReceiveWindow:     quicconf.MaxConnectionReceiveWindow,
 		})
 		if err == nil {
 			break
@@ -280,7 +286,7 @@ func (qs *QuicServer) handleStream(s *quic.Stream) {
 	}()
 
 	if activeCount%100 == 0 || activeCount > 50 {
-		slog.Info("handleStream: active streams high", "count", activeCount, "streamID", streamID)
+		slog.Debug("handleStream: active streams high", "count", activeCount, "streamID", streamID)
 	}
 
 	br := bufio.NewReaderSize(s, 128*1024)
@@ -592,12 +598,23 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		return
 	}
 
-	// Create a limited reader for the shard data
-	shardReader := io.LimitReader(br, int64(bodyLen))
+	// Drain the shard body from the QUIC stream into memory *before*
+	// taking wal.mu, so that the network read path is never coupled to
+	// the WAL's global lock. Without this, concurrent handlers queued on
+	// wal.mu each hold their per-stream receive buffer full of data they
+	// have not read, saturating the connection's shared flow-control
+	// window and starving the active reader of bytes. See
+	// docs/development/bugs/multipart-upload-deadlock.md (Bug C).
+	shardData := make([]byte, bodyLen)
+	if _, err := io.ReadFull(br, shardData); err != nil {
+		slog.Error("handlePUTShard: read body failed", "error", err)
+		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("read body: %v", err))
+		return
+	}
 
 	slog.Debug("handlePUTShard: writing to WAL", "bodyLen", bodyLen)
 	// Write to WAL (WAL has internal mutex for write serialization)
-	writeResult, err := walInstance.Write(shardReader, bodyLen)
+	writeResult, err := walInstance.Write(bytes.NewReader(shardData), bodyLen)
 	if err != nil {
 		slog.Error("handlePUTShard: WAL write failed", "error", err)
 		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("wal write: %v", err))
