@@ -223,7 +223,7 @@ func TestNewWithStateFile(t *testing.T) {
 	wal, err := New(filepath.Join(tmpDir, "state.json"), tmpDir)
 	assert.NoError(t, err, "Should not error since state does not exist")
 	assert.NotNil(t, wal)
-	//assert.Greater(t, len(wal.Shard.DB), 0, "WAL should have at least one file open")
+	assert.Greater(t, len(wal.Shard.DB), 0, "WAL should have at least one file open")
 
 	// Write some test data
 
@@ -242,6 +242,11 @@ func TestNewWithStateFile(t *testing.T) {
 	// Next, open the WAL
 	wal2, err := New(filepath.Join(tmpDir, "state.json"), tmpDir)
 	assert.NoError(t, err, "Should not error since state does not exist")
+
+	// Restarting with a pre-existing WAL file on disk must eagerly attach it
+	// to Shard.DB — otherwise the first Write silently re-opens it via
+	// ensureWALFile and numWALFiles appears to be 0. See mulga-941.
+	assert.Greater(t, len(wal2.Shard.DB), 0, "WAL should reattach existing file on restart")
 
 	// Check expected WAL state
 	assert.Equal(t, wal.WalNum.Load(), wal2.WalNum.Load(), "WalNum should match")
