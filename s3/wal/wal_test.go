@@ -8,10 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // calculateMaxFileSize calculates the max file size (ShardSize + header overhead)
@@ -1092,5 +1094,97 @@ func TestSyncDoesNotBlockWrites(t *testing.T) {
 		// Success - write completed
 	case <-timeout:
 		t.Fatal("DEADLOCK: Write blocked by sync operation for more than 5 seconds")
+	}
+}
+
+// TestWAL_BufferedWALFile_SyncWriteRace is the targeted race repro for Bug B
+// in docs/development/bugs/multipart-upload-deadlock.md. bufferedWALFile has
+// no internal synchronisation around its *bufio.Writer; the syncer calls
+// Sync() (→ writer.Flush()) outside wal.mu while a concurrent Write() holder
+// calls activeWal.Write/Stat/Flush. This test drives the race directly:
+// one goroutine holds wal.mu and streams through wal.Write (which repeatedly
+// touches bufferedWALFile.writer); another goroutine, without holding any
+// lock, calls fileToSync.Sync() on the same bufferedWALFile. Under -race,
+// this triggers a DATA RACE on bufio.Writer internals. On a future fix that
+// gives bufferedWALFile its own mutex, -race stays clean.
+//
+// Gated behind PREDASTORE_BUG_REPRO=1 because it currently fails on main —
+// that is the point (validating the bug exists). When Bug B is fixed, remove
+// the gate so this becomes a standard regression test.
+func TestWAL_BufferedWALFile_SyncWriteRace(t *testing.T) {
+	if os.Getenv("PREDASTORE_BUG_REPRO") != "1" {
+		t.Skip("bug reproducer — set PREDASTORE_BUG_REPRO=1 to run")
+	}
+	tmpDir := filepath.Join(os.TempDir(), fmt.Sprintf("wal-bufrace-%d", time.Now().UnixNano()))
+	require.NoError(t, os.MkdirAll(tmpDir, 0750))
+	defer os.RemoveAll(tmpDir)
+
+	w, err := New("", tmpDir)
+	require.NoError(t, err)
+	// The background syncer is not what we're testing — we drive Sync()
+	// directly to make the race deterministic.
+	w.StopWALSyncer()
+	defer w.Close()
+
+	// Prime: do one write so Shard.DB[0] exists.
+	primer := bytes.Repeat([]byte{0xAA}, 8*1024)
+	_, err = w.Write(bytes.NewReader(primer), len(primer))
+	require.NoError(t, err)
+
+	stop := make(chan struct{})
+	syncerDone := make(chan struct{})
+
+	// Direct racer: bypass syncWALIfDirty entirely and call Sync() on the
+	// bufferedWALFile in a hot loop. Sync() internally does writer.Flush()
+	// and file.Sync() without any lock coordinating with writers.
+	// Capture the bufferedWALFile pointer once so the racer never touches
+	// wal.mu during its hot loop — this removes any accidental HB edge the
+	// RLock/RUnlock pair might create.
+	w.mu.RLock()
+	db := w.Shard.DB[0]
+	w.mu.RUnlock()
+
+	go func() {
+		defer close(syncerDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = db.Sync()
+			}
+		}
+	}()
+
+	// Writers: 4 goroutines × 16 writes × 256 KiB. Each Write() holds wal.mu
+	// and calls activeWal.Write/Stat/Flush 32 times over; plenty of overlap
+	// with the syncer's unsynchronised Sync() calls.
+	const writers = 4
+	const writesPerWriter = 16
+	const payload = 256 * 1024
+
+	var wg sync.WaitGroup
+	errs := make(chan error, writers*writesPerWriter)
+	for i := range writers {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			buf := bytes.Repeat([]byte{byte(id)}, payload)
+			for j := range writesPerWriter {
+				if _, werr := w.Write(bytes.NewReader(buf), payload); werr != nil {
+					errs <- fmt.Errorf("writer %d iter %d: %w", id, j, werr)
+					return
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(stop)
+	<-syncerDone
+	close(errs)
+
+	for e := range errs {
+		t.Errorf("write error: %v", e)
 	}
 }

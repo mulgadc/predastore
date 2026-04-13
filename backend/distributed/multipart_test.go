@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -767,4 +768,157 @@ func TestDistributed_MultipartUpload_PartOverwrite(t *testing.T) {
 	// Check that the data contains 0xBB (V2), not 0xAA (V1)
 	assert.Equal(t, byte(0xBB), readData[0], "Should contain V2 data, not V1")
 	assert.Equal(t, byte(0xBB), readData[multipart.MinPartSize-1], "Should contain V2 data, not V1")
+}
+
+// TestDistributed_MultipartUpload_ConcurrentParts_Contention is the end-to-end
+// reproducer for the AWS-CLI-style access pattern documented in
+// docs/development/bugs/multipart-upload-deadlock.md: one CreateMultipartUpload
+// followed by N UploadPart calls fired concurrently from N goroutines. This
+// is the scenario that wedges against a real spinifex-predastore deployment
+// when `aws s3 cp` (default 10 concurrent threads) is used on any file large
+// enough to split into parts that individually exceed the QUIC connection
+// window.
+//
+// The wedge's necessary conditions — shared pooled QUIC connection per node,
+// many streams per connection, per-part bodies on the order of the connection
+// window (15 MiB default), and server-side handlers that hold wal.mu across
+// the stream read — are all present in this harness because setupMultipart-
+// TestBackend wires up a 5-node QUIC topology with the production code path.
+//
+// Acceptance:
+//   - On `main` today: at least some UploadPart calls hang past their per-
+//     request context deadline and the overall test trips its timeout.
+//   - After fixes land: all 10 concurrent parts complete, the data
+//     reconstructs correctly end-to-end.
+//
+// Scope note: the 90 s total-elapsed bound is a deadlock detector, not a
+// performance regression. A per-part benchmark belongs in s3_bench_test.go.
+func TestDistributed_MultipartUpload_ConcurrentParts_Contention(t *testing.T) {
+	if os.Getenv("PREDASTORE_BUG_REPRO") != "1" {
+		t.Skip("bug reproducer — set PREDASTORE_BUG_REPRO=1 to run")
+	}
+
+	be, cleanup := setupMultipartTestBackend(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	const bucket = "test-bucket"
+	const key = "concurrent-parts.bin"
+	const numParts = 10
+	// Part size above quic-go's default MaxConnectionReceiveWindow (15 MiB).
+	// This is the minimal condition for the head-of-line wedge to form when
+	// multiple streams share one pooled connection.
+	const partSize = 16 * 1024 * 1024
+
+	createResp, err := be.CreateMultipartUpload(ctx, &backend.CreateMultipartUploadRequest{
+		Bucket: bucket,
+		Key:    key,
+	})
+	require.NoError(t, err)
+	uploadID := createResp.UploadID
+
+	type partResult struct {
+		partNumber int
+		etag       string
+		elapsed    time.Duration
+		err        error
+	}
+	results := make(chan partResult, numParts)
+
+	overallStart := time.Now()
+	var wg sync.WaitGroup
+	for p := 1; p <= numParts; p++ {
+		wg.Add(1)
+		go func(pn int) {
+			defer wg.Done()
+
+			// Deterministic per-part payload so the eventual reassembled
+			// object has a known byte pattern.
+			data := make([]byte, partSize)
+			for i := range data {
+				data[i] = byte((pn*31 + i) % 256)
+			}
+
+			partCtx, partCancel := context.WithTimeout(ctx, 2*time.Minute)
+			defer partCancel()
+
+			start := time.Now()
+			resp, perr := be.UploadPart(partCtx, &backend.UploadPartRequest{
+				Bucket:     bucket,
+				Key:        key,
+				UploadID:   uploadID,
+				PartNumber: pn,
+				Body:       bytes.NewReader(data),
+			})
+			elapsed := time.Since(start)
+			if perr != nil {
+				results <- partResult{partNumber: pn, elapsed: elapsed, err: perr}
+				return
+			}
+			results <- partResult{partNumber: pn, etag: resp.ETag, elapsed: elapsed}
+		}(p)
+	}
+
+	wg.Wait()
+	close(results)
+	overallElapsed := time.Since(overallStart)
+
+	completed := make([]backend.CompletedPart, 0, numParts)
+	for r := range results {
+		require.NoError(t, r.err, "part %d failed after %v", r.partNumber, r.elapsed)
+		t.Logf("part %d completed in %v", r.partNumber, r.elapsed)
+		completed = append(completed, backend.CompletedPart{
+			PartNumber: r.partNumber,
+			ETag:       r.etag,
+		})
+	}
+
+	// Deadlock detector. 10 × 16 MiB serialized through five nodes on
+	// loopback should finish well under the bound; the wedge blows through
+	// this via the per-part 2-minute deadline.
+	require.Less(t, overallElapsed, 90*time.Second,
+		"suspected multipart wedge (Bug C): overall elapsed %v exceeded budget", overallElapsed)
+
+	// Sort completed parts by part number before CompleteMultipartUpload —
+	// the results channel delivers out of order.
+	sortPartsByNumber(completed)
+
+	completeResp, err := be.CompleteMultipartUpload(ctx, &backend.CompleteMultipartUploadRequest{
+		Bucket:   bucket,
+		Key:      key,
+		UploadID: uploadID,
+		Parts:    completed,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, completeResp)
+
+	// End-to-end sanity: the reassembled object reads back at the expected
+	// total size. Per-byte verification would double runtime for little
+	// extra signal; the multipart lifecycle tests cover that already.
+	getResp, err := be.GetObject(ctx, &backend.GetObjectRequest{
+		Bucket:     bucket,
+		Key:        key,
+		RangeStart: -1,
+		RangeEnd:   -1,
+	})
+	require.NoError(t, err)
+	defer getResp.Body.Close()
+
+	total, err := io.Copy(io.Discard, getResp.Body)
+	require.NoError(t, err)
+	require.Equal(t, int64(numParts)*int64(partSize), total,
+		"reassembled object size mismatch")
+
+	t.Logf("10 concurrent parts × 16 MiB reassembled in %v", overallElapsed)
+}
+
+// sortPartsByNumber orders CompletedPart entries by PartNumber in place.
+// CompleteMultipartUpload requires parts to be in order.
+func sortPartsByNumber(parts []backend.CompletedPart) {
+	for i := 1; i < len(parts); i++ {
+		for j := i; j > 0 && parts[j-1].PartNumber > parts[j].PartNumber; j-- {
+			parts[j-1], parts[j] = parts[j], parts[j-1]
+		}
+	}
 }
