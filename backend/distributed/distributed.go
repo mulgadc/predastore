@@ -349,11 +349,7 @@ func (b *Backend) putObjectToWAL(bucket string, objectPath string, objectHash [3
 
 	size = instat.Size()
 
-	_, file := filepath.Split(objectPath)
-
-	key := s3db.GenObjectHash(bucket, file)
-
-	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
+	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return nil, nil, 0, err
 	}

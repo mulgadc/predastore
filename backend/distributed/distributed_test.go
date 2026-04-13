@@ -16,7 +16,6 @@ import (
 	s3backend "github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3/wal"
-	s3db "github.com/mulgadc/predastore/s3db"
 	"github.com/stretchr/testify/require"
 )
 
@@ -61,9 +60,7 @@ func TestPutObjectToWAL_RoundTripVerifyJoin(t *testing.T) {
 	require.Len(t, parityRes, backend.RsParityShard())
 
 	// Recompute shard->node mapping (must match putObjectToWAL).
-	_, file := filepath.Split(objPath)
-	key := s3db.GenObjectHash("bucket", file)
-	hashRingShards, err := backend.HashRing().GetClosestN(key[:], backend.RsDataShard()+backend.RsParityShard())
+	hashRingShards, err := backend.HashRing().GetClosestN(objectHash[:], backend.RsDataShard()+backend.RsParityShard())
 	require.NoError(t, err)
 	require.Len(t, hashRingShards, backend.RsDataShard()+backend.RsParityShard())
 
@@ -177,9 +174,7 @@ func TestReadFromWriteResultStream_RoundTripJoin(t *testing.T) {
 	require.Len(t, parityRes, backend.RsParityShard())
 
 	// Recompute shard->node mapping (must match putObjectToWAL).
-	_, file := filepath.Split(objPath)
-	key := s3db.GenObjectHash("bucket", file)
-	hashRingShards, err := backend.HashRing().GetClosestN(key[:], backend.RsDataShard()+backend.RsParityShard())
+	hashRingShards, err := backend.HashRing().GetClosestN(objectHash[:], backend.RsDataShard()+backend.RsParityShard())
 	require.NoError(t, err)
 	require.Len(t, hashRingShards, backend.RsDataShard()+backend.RsParityShard())
 
