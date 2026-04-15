@@ -1,0 +1,11 @@
+; Sequential 1 MiB read — predastore bulk-GET ceiling.
+[global]
+name=seq-read-1m
+ioengine=psync
+rw=read
+bs=1M
+size=1G
+group_reporting=1
+time_based=0
+
+[seq-read-1m]

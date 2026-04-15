@@ -170,6 +170,11 @@ func (s *HTTP2Server) setupRoutes() {
 		r.Use(middleware.Logger)
 	}
 	r.Use(middleware.Recoverer)
+	// AWS S3 accepts bucket-scoped URLs with or without a trailing slash
+	// (e.g. PUT /bucket/ == PUT /bucket for CreateBucket) without redirecting.
+	// StripSlashes only rewrites chi's routing context, not r.URL.Path, so
+	// SigV4 verification still sees the exact URI the client signed.
+	r.Use(middleware.StripSlashes)
 	r.Use(s.sigV4AuthMiddleware)
 
 	// API request throttling (post-auth, per-account + per-action)
@@ -709,6 +714,7 @@ func (s *HTTP2Server) getObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", resp.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(resp.Size, 10))
 	w.Header().Set("ETag", resp.ETag)
+	w.Header().Set("Last-Modified", resp.LastModified.Format("Mon, 02 Jan 2006 15:04:05 GMT"))
 
 	if resp.StatusCode == http.StatusPartialContent {
 		w.Header().Set("Content-Range", resp.ContentRange)
