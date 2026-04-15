@@ -26,3 +26,6 @@ s3/tests/data/distributed/
 s3/tests/data/test-*
 s3/tests/data/predastore/*
 s3/tests/data/local/*
+
+# Bench results
+scripts/bench/results

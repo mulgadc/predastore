@@ -33,11 +33,12 @@ sections, and are passed to warp unchanged.
 
 Raw disk ceiling:
 
-    ./scripts/bench/bench-disk.sh --target /path/on/fs-under-test \
-                                  --out   /path/for/results
+    ./scripts/bench/bench-disk.sh
 
-Each fio job runs twice — buffered and `--direct=1` — and produces a JSON file
-per run under `<out>/disk-<timestamp>/`.
+fio writes to `$BENCH_DIR/disk` (parallel to predastore's `distributed/`
+tree); each job runs twice (buffered and `--direct=1`) and produces a JSON
+file per run under `scripts/bench/results/disk-<timestamp>/`. Override
+`BENCH_DIR` to point at a different filesystem.
 
 Predastore cluster benchmark:
 
