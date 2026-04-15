@@ -1,0 +1,14 @@
+; Random 8 KiB write with fsync — matches predastore WAL WriteAt pattern
+; (see predastore DESIGN.md §6).
+[global]
+name=rand-write-8k
+ioengine=libaio
+rw=randwrite
+bs=8k
+size=256M
+iodepth=32
+fsync=1
+group_reporting=1
+time_based=0
+
+[rand-write-8k]

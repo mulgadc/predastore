@@ -1,0 +1,82 @@
+# Predastore benchmark config template.
+#
+# Rendered by bench-predastore.sh via envsubst with:
+#   NODE1_IP, NODE2_IP, NODE3_IP  — simulated loopback IPs (10.11.12.{1,2,3})
+#   BENCH_DIR                      — base path shared by all three processes
+#   ACCESS_KEY_ID, SECRET_ACCESS_KEY — S3 credentials used by warp
+#
+# The three nodes share BENCH_DIR as base_path; per-node relative paths keep
+# their state in distinct subdirs (distributed/{db,nodes}/node-N/). No [iam]
+# section — predastore falls back to ConfigProvider and never tries to
+# contact NATS.
+
+version = "1.0"
+region = "ap-southeast-2"
+
+host = "0.0.0.0"
+port = 8443
+
+debug = false
+
+base_path = "${BENCH_DIR}"
+
+[rs]
+data = 2
+parity = 1
+
+[[db]]
+id = 1
+host = "${NODE1_IP}"
+port = 6660
+path = "distributed/db/node-1/"
+access_key_id = "${ACCESS_KEY_ID}"
+secret_access_key = "${SECRET_ACCESS_KEY}"
+leader = true
+
+[[db]]
+id = 2
+host = "${NODE2_IP}"
+port = 6661
+path = "distributed/db/node-2/"
+access_key_id = "${ACCESS_KEY_ID}"
+secret_access_key = "${SECRET_ACCESS_KEY}"
+
+[[db]]
+id = 3
+host = "${NODE3_IP}"
+port = 6662
+path = "distributed/db/node-3/"
+access_key_id = "${ACCESS_KEY_ID}"
+secret_access_key = "${SECRET_ACCESS_KEY}"
+
+[[nodes]]
+id = 1
+host = "${NODE1_IP}"
+port = 9991
+path = "distributed/nodes/node-1/"
+
+[[nodes]]
+id = 2
+host = "${NODE2_IP}"
+port = 9992
+path = "distributed/nodes/node-2/"
+
+[[nodes]]
+id = 3
+host = "${NODE3_IP}"
+port = 9993
+path = "distributed/nodes/node-3/"
+
+[[buckets]]
+name = "predastore"
+region = "ap-southeast-2"
+type = "distributed"
+public = false
+encryption = ""
+
+[[auth]]
+access_key_id = "${ACCESS_KEY_ID}"
+secret_access_key = "${SECRET_ACCESS_KEY}"
+policy = [
+  { bucket = "predastore", actions = ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListAllMyBuckets"] },
+]
