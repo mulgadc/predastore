@@ -3,6 +3,8 @@ package s3
 import (
 	"encoding/xml"
 	"time"
+
+	"github.com/mulgadc/predastore/ratelimit"
 )
 
 type ACL struct {
@@ -79,6 +81,9 @@ type Config struct {
 	Debug          bool   `toml:"debug"`
 	BasePath       string `toml:"base_path"`
 	DisableLogging bool   `toml:"disable_logging"`
+
+	// API request throttling
+	RateLimit ratelimit.Config `toml:"ratelimit"`
 
 	// Distributed backend config (deprecated - use DB nodes instead)
 	BadgerDir string `toml:"badger_dir"`

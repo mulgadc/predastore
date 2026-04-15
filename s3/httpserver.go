@@ -30,6 +30,7 @@ import (
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/backend/filesystem"
+	"github.com/mulgadc/predastore/ratelimit"
 	"github.com/mulgadc/predastore/s3/chunked"
 )
 
@@ -39,11 +40,12 @@ const maxClockSkew = 5 * time.Minute
 
 // HTTP2Server is an HTTP/2 compatible S3 server using net/http
 type HTTP2Server struct {
-	config   *Config
-	backend  backend.Backend
-	router   chi.Router
-	server   *http.Server
-	credProv CredentialProvider
+	config    *Config
+	backend   backend.Backend
+	router    chi.Router
+	server    *http.Server
+	credProv  CredentialProvider
+	throttler *ratelimit.Throttler
 }
 
 // NewHTTP2Server creates a new HTTP/2 compatible S3 server
@@ -52,6 +54,10 @@ func NewHTTP2Server(config *Config) *HTTP2Server {
 		config:   config,
 		router:   chi.NewRouter(),
 		credProv: NewConfigProvider(config.Auth),
+	}
+
+	if config.RateLimit.Enabled {
+		s.throttler = ratelimit.New(config.RateLimit)
 	}
 
 	// Create backend based on config
@@ -73,6 +79,11 @@ func NewHTTP2ServerWithBackend(config *Config, be backend.Backend, credProv Cred
 		router:   chi.NewRouter(),
 		credProv: credProv,
 	}
+
+	if config.RateLimit.Enabled {
+		s.throttler = ratelimit.New(config.RateLimit)
+	}
+
 	s.setupRoutes()
 	return s
 }
@@ -160,6 +171,28 @@ func (s *HTTP2Server) setupRoutes() {
 	}
 	r.Use(middleware.Recoverer)
 	r.Use(s.sigV4AuthMiddleware)
+
+	// API request throttling (post-auth, per-account + per-action)
+	if s.throttler != nil {
+		r.Use(s.throttler.Middleware(
+			[]ratelimit.KeyFunc{
+				func(r *http.Request) (string, error) {
+					acct, ok := r.Context().Value(ContextKeyAccountID).(string)
+					if !ok || acct == "" {
+						return "", fmt.Errorf("account-id missing from request context")
+					}
+					return acct, nil
+				},
+				func(r *http.Request) (string, error) {
+					return s3Action(r.Method, r.URL.Path), nil
+				},
+			},
+			func(w http.ResponseWriter, r *http.Request) {
+				s.writeS3Error(w, r, http.StatusServiceUnavailable, "SlowDown",
+					"Please reduce your request rate.")
+			},
+		))
+	}
 
 	// Routes
 	r.Get("/", s.listBuckets)
@@ -892,6 +925,9 @@ func (s *HTTP2Server) ListenAndServeAsync(addr, certFile, keyFile string) error 
 
 // Shutdown gracefully shuts down the server
 func (s *HTTP2Server) Shutdown(ctx context.Context) error {
+	if s.throttler != nil {
+		s.throttler.Stop()
+	}
 	if s.server != nil {
 		return s.server.Shutdown(ctx)
 	}

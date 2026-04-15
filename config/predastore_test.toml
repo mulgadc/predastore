@@ -41,6 +41,12 @@ policy = [
   { bucket = "public-bucket", actions = ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"] },
 ]
 
+# API request throttling (disabled for most tests)
+[ratelimit]
+enabled = false
+rate = 100
+burst = 500
+
 # Secondary valid credentials with limited permissions
 [[auth]]
 access_key_id = "AKIATESTUSERREADONLY"
