@@ -21,13 +21,18 @@ micro-optimisation.
 - `sudo` — required only by `bench-predastore.sh` for `ip addr add` on `lo`.
   The script aliases `10.11.12.{1,2,3}/24` and removes them on exit.
 
-Before running `bench-predastore.sh`:
+Before running `bench-predastore.sh`, either export credentials directly:
 
     export AWS_ACCESS_KEY_ID=...
     export AWS_SECRET_ACCESS_KEY=...
 
-These credentials are baked into the rendered config's `[[db]]` and `[[auth]]`
-sections, and are passed to warp unchanged.
+…or set `AWS_PROFILE` and let the script read them from `~/.aws/credentials`
+(honours `AWS_SHARED_CREDENTIALS_FILE`):
+
+    export AWS_PROFILE=spinifex
+
+The resolved credentials are baked into the rendered config's `[[db]]` and
+`[[auth]]` sections, and are passed to warp unchanged.
 
 ## Usage
 
@@ -81,10 +86,12 @@ Rendered from `predastore.toml.tmpl`:
 - **No `[iam]` section** — predastore falls back to `ConfigProvider` for auth,
   so the harness never tries to contact NATS (see
   `predastore/s3/server.go:initCredentialProvider`).
-- **Shared `base_path = $BENCH_DIR`** — all three processes read the same
-  config and share a data root; per-node relative paths
-  (`distributed/db/node-N/`, `distributed/nodes/node-N/`) keep state cleanly
-  separated.
+- **`-base-path $BENCH_DIR` passed on the CLI** — the distributed backend
+  reads `s.basePath` from the CLI flag, not from the TOML's `base_path`
+  (that only affects filesystem-backend buckets; see
+  `predastore/s3/server.go:337`). Per-node relative paths
+  (`distributed/db/node-N/`, `distributed/nodes/node-N/`) keep each
+  process's state cleanly separated under that root.
 
 ## Deferred
 

@@ -68,8 +68,33 @@ trap cleanup EXIT INT TERM
 # ---------------------------------------------------------------------------
 # Pre-flight.
 # ---------------------------------------------------------------------------
-: "${AWS_ACCESS_KEY_ID:?AWS_ACCESS_KEY_ID must be set}"
-: "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY must be set}"
+
+# Read a key from ~/.aws/credentials under the given profile section.
+# Usage: aws_cred_lookup <profile> <key>
+aws_cred_lookup() {
+    local profile="$1" key="$2" file="${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}"
+    [ -r "$file" ] || return 1
+    awk -v profile="$profile" -v key="$key" '
+        /^[[:space:]]*\[.*\][[:space:]]*$/ {
+            gsub(/^[[:space:]]*\[[[:space:]]*|[[:space:]]*\][[:space:]]*$/, "")
+            section = $0; next
+        }
+        section == profile && $0 ~ "^[[:space:]]*"key"[[:space:]]*=" {
+            sub("^[[:space:]]*"key"[[:space:]]*=[[:space:]]*", "")
+            print; exit
+        }
+    ' "$file"
+}
+
+if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+    : "${AWS_PROFILE:?AWS creds env vars unset and AWS_PROFILE not set — cannot locate credentials}"
+    echo "bench-predastore: AWS env vars unset, loading profile '$AWS_PROFILE' from ~/.aws/credentials"
+    AWS_ACCESS_KEY_ID="$(aws_cred_lookup "$AWS_PROFILE" aws_access_key_id || true)"
+    AWS_SECRET_ACCESS_KEY="$(aws_cred_lookup "$AWS_PROFILE" aws_secret_access_key || true)"
+fi
+[ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "AWS_ACCESS_KEY_ID not set and not found under profile '${AWS_PROFILE:-}' in ~/.aws/credentials" >&2; exit 1; }
+[ -n "${AWS_SECRET_ACCESS_KEY:-}" ] || { echo "AWS_SECRET_ACCESS_KEY not set and not found under profile '${AWS_PROFILE:-}' in ~/.aws/credentials" >&2; exit 1; }
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 export ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID"
 export SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY"
 
@@ -121,13 +146,14 @@ for n in 1 2 3; do
     log="$RESULTS_DIR/logs/node-$n.log"
     echo "bench-predastore: launching node $n on $node_ip:$S3_PORT"
     nohup "$S3D_BIN" \
-        -config   "$RESOLVED_CONFIG" \
-        -tls-cert "$TLS_CERT" \
-        -tls-key  "$TLS_KEY" \
-        -backend  distributed \
-        -node     "$n" \
-        -host     "$node_ip" \
-        -port     "$S3_PORT" \
+        -config    "$RESOLVED_CONFIG" \
+        -tls-cert  "$TLS_CERT" \
+        -tls-key   "$TLS_KEY" \
+        -base-path "$BENCH_DIR" \
+        -backend   distributed \
+        -node      "$n" \
+        -host      "$node_ip" \
+        -port      "$S3_PORT" \
         > "$log" 2>&1 &
     PIDS+=("$!")
 done
@@ -164,6 +190,7 @@ echo "bench-predastore: running warp mixed"
 warp mixed \
     --host="${NODE1_IP}:${S3_PORT},${NODE2_IP}:${S3_PORT},${NODE3_IP}:${S3_PORT}" \
     --tls --insecure \
+    --region=ap-southeast-2 \
     --access-key="$AWS_ACCESS_KEY_ID" \
     --secret-key="$AWS_SECRET_ACCESS_KEY" \
     --bucket=predastore \
