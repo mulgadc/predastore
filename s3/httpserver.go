@@ -177,7 +177,10 @@ func (s *HTTP2Server) setupRoutes() {
 		r.Use(s.throttler.Middleware(
 			[]ratelimit.KeyFunc{
 				func(r *http.Request) (string, error) {
-					acct, _ := r.Context().Value(ContextKeyAccountID).(string)
+					acct, ok := r.Context().Value(ContextKeyAccountID).(string)
+					if !ok || acct == "" {
+						return "", fmt.Errorf("account-id missing from request context")
+					}
 					return acct, nil
 				},
 				func(r *http.Request) (string, error) {

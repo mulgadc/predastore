@@ -6,7 +6,6 @@ package ratelimit
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -154,7 +153,7 @@ func (t *Throttler) Middleware(keyFuncs []KeyFunc, onThrottle ThrottleErrorWrite
 				action = parts[1]
 			}
 
-			key := fmt.Sprintf("%s:%s", parts[0], action)
+			key := parts[0] + ":" + action
 			limiter := t.getOrCreate(key, action)
 
 			reservation := limiter.Reserve()
