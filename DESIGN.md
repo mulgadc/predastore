@@ -23,7 +23,6 @@ Predastore is a distributed, S3-compatible, erasure-coded object store designed 
 15. [Configuration Reference](#15-configuration-reference)
 16. [Developer Reference](#16-developer-reference)
 17. [Tunable Parameters](#17-tunable-parameters)
-18. [Future Work](#18-future-work)
 
 ---
 
@@ -44,17 +43,17 @@ Predastore is a distributed, S3-compatible, erasure-coded object store designed 
 ### Starting a Cluster
 
 ```bash
-# Run full predastore - Simulate 3 multi-node database, and 5 shard instances locally.
-./bin/s3d -backend distributed -config s3/tests/config/cluster.toml
+# Run full predastore - dev mode simulates a 3-node DB cluster and 5 QUIC shard nodes locally.
+./bin/s3d -config s3/tests/config/cluster.toml
 
-# Run full predastore with distributed backend (auto-launches DB and QUIC servers) as node 1
-./bin/s3d -backend distributed -config ./s3/tests/config/cluster.toml -node 1
+# Run as a specific node (auto-launches local DB and QUIC servers for this node).
+./bin/s3d -config ./s3/tests/config/cluster.toml -node 1
 
-# Run only the database server
+# Run only the database server.
 ./bin/s3d -db -config ./s3/tests/config/cluster.toml -db-node 1
 
-# Run specific QUIC shard node
-./bin/s3d -backend distributed -config ./s3/tests/config/cluster.toml -node 2
+# Run a specific QUIC shard node.
+./bin/s3d -config ./s3/tests/config/cluster.toml -node 2
 ```
 
 ### CLI Flags
@@ -62,7 +61,6 @@ Predastore is a distributed, S3-compatible, erasure-coded object store designed 
 | Flag | Environment | Description |
 |------|-------------|-------------|
 | `-config` | `CONFIG` | Path to configuration file (default: config/server.toml) |
-| `-backend` | `BACKEND` | Storage backend: filesystem or distributed |
 | `-node` | `NODE` | QUIC shard node ID to run (-1 = dev mode, runs all locally) |
 | `-db` | `DB_ONLY=true` | Run only the distributed database server |
 | `-db-node` | `DB_NODE` | Database node ID to run (-1 = auto-detect or run all locally) |
@@ -130,24 +128,30 @@ See `s3/tests/config/cluster.toml` for a complete example configuration.
 
 # 4. Logical Data Model
 
-## Objects → Chunks → Shards → Segments → Blocks
+## Objects → Shards → Fragments
 
 ```
-Object
- └── Chunks (logical 32 MB units)
-      └── Shards (per-node RS slices, 32 MB each)
-           └── Segments (compressed 64 KB units, note compression OPTIONAL)
-                └── Blocks (8 KB logical)
+Object (arbitrary size, RS-encoded as a whole)
+ └── Shards (K data + M parity slices, one per node)
+      └── Fragments (fixed 8 KB payload + 32 B header, stored in WAL files)
 ```
+
+An object is Reed-Solomon encoded end-to-end into `K` data shards and `M` parity shards
+without any intermediate chunking. Each shard is streamed to one node, where it is
+stored as a sequence of fixed-size fragments inside one or more WAL files.
 
 ### Size Reference
 
 | Unit | Size | Description |
 |------|------|-------------|
-| Block | 8 KB | Smallest addressable unit |
-| Segment | 64 KB | 8 blocks, independently compressed |
-| Shard | 32 MB | Per-node RS slice (4096 blocks / 512 segments) |
-| Chunk | 32 MB | Logical unit for RS encoding |
+| Fragment payload | 8 KB | Fixed on-disk unit, zero-padded when logical length is shorter |
+| Fragment header | 32 B | Metadata + CRC32 covering header + padded payload |
+| Shard | `⌈object_size / K⌉` | Per-node RS slice, variable size |
+| WAL file | configurable | Container for one or more fragments; may hold fragments from multiple shards |
+
+A WAL file has no fixed relationship to a shard. Small shards pack into a single file
+together with other small shards; large shards span multiple files. Fragments from
+different shards may be interleaved within the same file but never overlap.
 
 ---
 
@@ -394,42 +398,192 @@ The s3db service provides a REST API with AWS Signature V4 authentication:
 
 # 6. Local Shard Storage
 
-Each QUIC shard node stores data locally and maintains its own Badger index.
+Each QUIC shard node stores data locally in append-style WAL files and maintains
+its own Badger index mapping shard identifiers to WAL file locations.
 
 ## Local Badger (Per-QUIC-Node)
 
 | Key Pattern | Value | Purpose |
 |-------------|-------|---------|
-| `<object-hash>` | WAL file + offset | Locate shard data in WAL |
+| `<object-hash>` | `{WALFiles: [{WALNum, Offset, Size}, ...], ShardNum, TotalSize}` | Locate all fragments of a shard |
 
-## Shard File Format
+A shard that spans multiple WAL files produces a `WALFiles` list with one entry per
+file, each recording the starting fragment offset and the number of bytes from this
+shard stored in that file.
+
+**Commit rule**: a Badger entry for a shard exists if and only if all of that shard's
+fragments are fsync-durable on disk. The absence of a Badger entry means the shard is
+unreadable, regardless of what bytes happen to be on disk.
+
+## WAL File On-Disk Layout
 
 ```
-[ Header 8KB ]
-[ Compressed segments ... ]
-[ Footer or .idx index ]
+┌──────────────────────────────────────────────────────────────┐
+│ WAL Header (14 B)                                            │
+│ ┌──────────┬─────────┬────────────┬────────────┐             │
+│ │ Magic(4) │ Ver(2)  │ ShardSize(4)│ChunkSize(4)│             │
+│ └──────────┴─────────┴────────────┴────────────┘             │
+├──────────────────────────────────────────────────────────────┤
+│ Fragment 0 (8224 B = 32 B header + 8192 B payload)           │
+├──────────────────────────────────────────────────────────────┤
+│ Fragment 1 (8224 B)                                          │
+├──────────────────────────────────────────────────────────────┤
+│ ... fragments may belong to different shards ...             │
+├──────────────────────────────────────────────────────────────┤
+│ Fragment N (8224 B)                                          │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Segments
+Every fragment on disk is exactly `FragmentHeaderBytes + ChunkSize = 32 + 8192 = 8224`
+bytes. Fragments whose logical payload is shorter than `ChunkSize` are zero-padded.
+The padding bytes are included in the CRC calculation.
 
-- 64 KB logical
-- Independently LZ4/Snappy compressed (OPTIONAL)
-- Each segment contains:
-  - segmentIndex
-  - logicalLength
-  - compressedLength
-  - crc32
+### Fragment Header (32 B)
 
-### Index
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         SeqNum (8)                              │
+├─────────────────────────────────────────────────────────────────┤
+│                        ShardNum (8)                             │
+├───────────────────────────┬─────────────────────────────────────┤
+│     ShardFragment (4)     │          Length (4)                 │
+├───────────────────────────┼─────────────────────────────────────┤
+│        Flags (4)          │         CRC32 (4)                   │
+└───────────────────────────┴─────────────────────────────────────┘
+```
 
-Maps segmentIndex → fileOffset, compressedLength, logicalLength.
+| Field | Size | Purpose |
+|-------|------|---------|
+| `SeqNum` | 8 B | Global monotonic sequence number (optional; reserved for future replay) |
+| `ShardNum` | 8 B | Identifier of the shard this fragment belongs to |
+| `ShardFragment` | 4 B | Index of this fragment within the shard (0..N-1) |
+| `Length` | 4 B | Logical payload length (≤ 8192); remaining payload bytes are zero-padding |
+| `Flags` | 4 B | Bit flags; `FlagEndOfShard` marks the final fragment of a shard |
+| `CRC32` | 4 B | IEEE CRC32 of the full 32 B header (with CRC field zeroed) + full 8192 B padded payload |
 
-### Local KV Rebuild
+`ShardNum` + `ShardFragment` uniquely identify a fragment's role. The CRC covers both
+header and payload, so a reader can independently verify every 8 KB unit without any
+external metadata.
 
-If local Badger is lost:
-1. Read shard headers
-2. Load footer / `.idx` file
-3. Recreate all local KV entries
+## Fragment Slot Allocation
+
+A shard of size `S` requires `⌈S / ChunkSize⌉` fragments. Fragments for a given shard
+are allocated contiguously within each WAL file they touch but may span multiple files
+when the current file's free slots are exhausted.
+
+**Reservation protocol** (executed under a short `wal.mu` critical section):
+
+1. Compute the fragment count for the incoming shard from the body length on the QUIC
+   request header.
+2. Walk the set of open WAL files, allocating contiguous slot ranges. When a file's
+   free slots are exhausted, create a new WAL file via `os.File.Truncate(maxFileSize)`.
+   Pre-creating full-size files ensures unwritten slots read as zero bytes and makes
+   room for concurrent reservations to begin allocation immediately.
+3. For each file touched, increment that file's in-memory `refCount`.
+4. Assign `SeqNum` values atomically (one per fragment).
+5. Mark a file "full" once its final slot is allocated so no further reservations may
+   claim slots in it.
+6. Return the allocation as a list of `(WALNum, baseFragmentIndex, fragmentCount)`
+   tuples. Release the lock.
+
+The reservation step is the only shared-state critical section on the write path. No
+I/O is performed while holding `wal.mu`.
+
+## Lock-Free Fragment Writes
+
+Once a reservation is issued, the writer goroutine owns a disjoint set of fragment
+slots across one or more WAL files. Slot offsets are deterministic:
+
+```
+fileOffset(walNum, fragmentIndex) = WALHeaderSize + fragmentIndex * 8224
+```
+
+The writer goroutine drains fragment-sized batches from its QUIC stream, assembles
+each fragment (header + payload + zero padding + CRC), and issues
+`(*os.File).WriteAt(fragmentBytes, fileOffset)`. Multiple writer goroutines may issue
+concurrent `WriteAt` calls to the same WAL file as long as their slot allocations are
+disjoint. POSIX `pwrite` guarantees atomicity for non-overlapping regions, and Go's
+`WriteAt` is explicitly safe for concurrent use.
+
+A writer may coalesce up to `N` adjacent fragments into a single `WriteAt` call to
+amortise syscall overhead. `N` is a tunable (see §17) that trades memory for syscall
+count; it has no effect on correctness or the observable state of the WAL.
+
+## Commit Sequence
+
+For each WAL file touched by a reservation, the writer goroutine performs the
+following steps in order:
+
+1. **Write** all owned fragments via `WriteAt` (batched per the tunable above).
+2. **Fsync** the WAL file.
+3. **Commit** by writing the Badger entry (`<object-hash>` → `WALFiles` list).
+4. **Decrement** the file's `refCount` atomically. If the decremented value is zero
+   and the file is marked full, close the file.
+
+Step 3 is the linearisation point for readers: a shard is readable if and only if its
+Badger entry is present. Steps 1-2 may produce fragments on disk that are never
+followed by a commit (aborted writes, crashes); those fragments are dead space
+reclaimable by the compactor.
+
+## Reference Counting & File Lifetime
+
+Each open WAL file carries an atomic `refCount` tracking the number of in-flight
+reservations that hold at least one slot in the file. The counter is:
+
+- Incremented under `wal.mu` during reservation, for every file touched.
+- Decremented after a reservation's commit or abort completes for that file.
+- Checked for zero immediately after the decrement returns (via the return value of
+  `atomic.AddInt32`). A caller that observes zero and the file is marked full is the
+  sole closer.
+
+Marking a file "full" under `wal.mu` before its final `refCount` increment returns
+ensures no late reservation can arrive between a decrement-to-zero and the close.
+
+## Abort Semantics
+
+A reservation is aborted when the server-side writer fails mid-shard (network error,
+client disconnect, disk error). On abort:
+
+- The writer skips step 3 (Badger commit). The shard becomes unreadable.
+- The writer still performs step 4 (refCount decrement) so the file can be closed
+  when no other in-flight reservations remain.
+- Any fragments already written to disk sit as dead space until the compactor
+  reclaims them.
+
+There is no distinct on-disk or in-Badger `failed` state. The absence of a Badger
+entry is the authoritative signal that a shard is unreadable; the read path treats
+"Badger miss" identically to "shard never existed" and falls back to parity.
+
+## Background Compaction & Cold Storage
+
+Committed, fully-written WAL files are candidates for background compaction. The
+compactor:
+
+- Scans closed WAL files for regions not referenced by any live Badger entry (dead
+  fragments from aborted reservations or deleted shards).
+- Rewrites live fragments into a new compacted file, updates Badger entries to point
+  at the new location, and removes the old file.
+- Optionally migrates aged, rarely-accessed shards to long-term cold storage. On a
+  subsequent GET, the shard is rehydrated from cold storage into a local WAL file
+  and served; the rehydration may complete asynchronously with the GET response.
+
+Compaction is not on the critical write path and is not required for correctness of
+PUT or GET operations.
+
+## Local KV Rebuild
+
+If the local Badger index is lost, it can be reconstructed from WAL files:
+
+1. Scan each WAL file from offset `WALHeaderSize` to EOF, one fragment at a time.
+2. Verify each fragment's CRC32. Corrupt fragments are discarded.
+3. Group surviving fragments by `ShardNum`.
+4. A `ShardNum` group is complete when it contains contiguous `ShardFragment` values
+   0 through N-1 and the fragment at index N-1 has `FlagEndOfShard` set.
+5. Insert a Badger entry for each complete shard, pointing at the (WALNum, offset)
+   list where its fragments live.
+
+Incomplete shard groups (missing fragments, missing `FlagEndOfShard`) are discarded.
+They correspond to reservations whose commits never landed.
 
 ---
 
@@ -449,17 +603,23 @@ Defines RS(3,2): 3 data shards, 2 parity shards. Can tolerate loss of any 2 node
 
 ### Encoding Workflow
 
-1. Split 32 MB chunk into 4096 blocks (8 KB)
-2. Pack into 512 segments (64 KB)
-3. RS encode per segment
-4. Compress and store per-node
+1. Read the complete object body into memory on the S3D process.
+2. RS encode the object as a whole into `K` data shards + `M` parity shards using
+   `reedsolomon.NewStream(K, M)` followed by `enc.Split(body, dataWriters, fileSize)`.
+   Each shard is approximately `⌈object_size / K⌉` bytes.
+3. Ship each shard to its assigned node over QUIC (see §9). The node stores the shard
+   as a sequence of 8 KB fragments inside its WAL files (see §6).
+
+No intermediate chunking or segmentation occurs. Compression is not performed on the
+write path; it is optionally applied to closed WAL files by the background compactor.
 
 ### Decoding
 
-- Attempt data shards
-- If missing/corrupt → fetch parity
-- Decompress → RS decode
-- Return chunk bytes
+- Request data shards in parallel from their assigned nodes.
+- If a data shard is missing (Badger miss) or any fragment fails CRC validation, fetch
+  a parity shard instead.
+- Once `K` valid shards have been collected, RS decode to reconstruct the object.
+- Fewer than `K` valid shards → GET fails.
 
 ---
 
@@ -689,7 +849,7 @@ s.Close()        // Close write side (sends FIN)
 │  1. Authenticate request (SigV4)                            │
 │  2. Verify bucket access                                    │
 │  3. Handle chunked transfer encoding (aws-chunked)          │
-│  4. Write body to temp file                                 │
+│  4. Read body into memory                                   │
 │  5. Generate object hash from bucket + key                  │
 │  6. Determine shard nodes via consistent hash ring          │
 └─────────────┬───────────────────────────────────────────────┘
@@ -697,25 +857,26 @@ s.Close()        // Close write side (sends FIN)
               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                  Reed-Solomon Encoding                      │
-│  - Split object into rsDataShard pieces                     │
-│  - Generate rsParityShard parity pieces                     │
-│  - Total shards = data + parity (e.g., 3 + 2 = 5)           │
+│  - RS encode whole object into K data + M parity shards     │
+│  - Shard size ≈ object_size / K                             │
 └─────────────┬───────────────────────────────────────────────┘
               │
-              │  Parallel QUIC requests to all shard nodes
+              │  Parallel QUIC streams, one per shard
               ▼
 ┌─────────────────┐  ┌─────────────────┐       ┌─────────────────┐
-│   QUIC Node 0   │  │   QUIC Node 1   │  ...  │   QUIC Node 4   │
-│   (Data 0)      │  │   (Data 1)      │       │   (Parity 1)    │
-│  ┌───────────┐  │  │  ┌───────────┐  │       │  ┌───────────┐  │
-│  │ WAL Write │  │  │  │ WAL Write │  │       │  │ WAL Write │  │
-│  │  Shard    │  │  │  │  Shard    │  │       │  │  Shard    │  │
-│  └─────┬─────┘  │  │  └─────┬─────┘  │       │  └─────┬─────┘  │
-│        ▼        │  │        ▼        │       │        ▼        │
-│  ┌───────────┐  │  │  ┌───────────┐  │       │  ┌───────────┐  │
-│  │LocalBadger│  │  │  │LocalBadger│  │       │  │LocalBadger│  │
-│  │ hash→WAL  │  │  │  │ hash→WAL  │  │       │  │ hash→WAL  │  │
-│  └───────────┘  │  │  └───────────┘  │       │  └───────────┘  │
+│   QUIC Node 0   │  │   QUIC Node 1   │  ...  │   QUIC Node K+M │
+│   (Data 0)      │  │   (Data 1)      │       │   (Parity M-1)  │
+│                 │  │                 │       │                 │
+│  Per-stream goroutine per shard:                              │
+│  1. Read body length from protocol header                     │
+│  2. Reserve fragment slots under short wal.mu lock            │
+│     - Allocate contiguous slots across 1+ WAL files           │
+│     - Pre-create files via Truncate if needed                 │
+│     - Increment refCount for each file touched                │
+│  3. Lock-free loop: batch N fragments → WriteAt(bytes, offset)│
+│  4. fsync each WAL file                                       │
+│  5. Badger put: object-hash → WALFiles list                   │
+│  6. Atomic refCount decrement; close file if zero and full    │
 └─────────────────┘  └─────────────────┘       └─────────────────┘
               │
               ▼
@@ -728,6 +889,21 @@ s.Close()        // Close write side (sends FIN)
 │  5. Return ETag to client on majority commit                │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+### Write-Path Concurrency Invariants
+
+- `wal.mu` is held only during reservation and is released before any I/O begins. It
+  covers fragment slot allocation, WAL file creation, SeqNum assignment, and refCount
+  bookkeeping.
+- Fragment writes to disk are lock-free. Multiple concurrent writer goroutines may
+  issue `WriteAt` against the same WAL file provided their reserved slots are
+  disjoint.
+- A shard is observable to readers only after its Badger entry has been committed.
+  Fragments fsynced to disk without a corresponding Badger put are invisible to GET
+  and are reclaimable by compaction.
+- File close happens exactly once, driven by the reservation whose refCount
+  decrement returns zero (observed via `atomic.AddInt32`'s return value) after the
+  file has been marked full.
 
 ## GET Object
 
@@ -813,10 +989,39 @@ s.Close()        // Close write side (sends FIN)
 
 # 11. Failure Handling & Repair
 
-- CRC mismatch → fallback to parity shards
-- Node timeout → fallback to parity shards
-- If < DataShards available → GET fails
-- After degraded read → schedule background read-repair
+## Read-Path Failure Modes
+
+A GET fetches shards in parallel from their placement nodes. Each node either returns
+a valid shard or fails; failures degrade to parity fetches until `K` valid shards are
+collected.
+
+| Failure | Detection | Response |
+|---------|-----------|----------|
+| Badger miss | Local lookup returns not-found | Node returns "absent"; S3D fetches parity |
+| Fragment CRC mismatch | Per-fragment CRC32 during read | Node discards corrupt fragment; treated as absent; S3D fetches parity |
+| Node timeout | QUIC request deadline exceeded | S3D fetches parity |
+| Fewer than `K` valid shards | Aggregate check after all fetches | GET returns 500/503 to the client |
+
+A shard that was written to disk but never committed to Badger is indistinguishable
+from one that was never attempted — both surface as "absent." The read path does not
+distinguish between them, and the commit invariant (§6) ensures readers cannot
+observe partial writes.
+
+## Background Repair
+
+A node-local healing process periodically reconciles local state against the hash
+ring:
+
+1. Query s3db for the set of shards the hash ring places on this node.
+2. For each expected shard, look up the local Badger index.
+3. If absent, reconstruct the shard by fetching `K` valid shards from peers and RS
+   decoding, then write the result as a new reservation locally.
+
+The healer uses pull-based reconciliation against the metadata plane, so it repairs
+both shards that failed mid-write and shards that never arrived (e.g. the node was
+offline during the original PUT). A per-node in-memory recent-failures queue may
+optionally drive faster repair for known-bad shards without requiring a full ring
+scan.
 
 ---
 
@@ -864,7 +1069,7 @@ When all nodes have the same host address, s3d runs everything locally:
 
 ```bash
 # Launches embedded DB + all QUIC nodes as goroutines
-./bin/s3d -backend distributed -config ./s3/tests/config/cluster.toml
+./bin/s3d -config ./s3/tests/config/cluster.toml
 ```
 
 ## Production Mode (Multi-Host)
@@ -873,13 +1078,13 @@ For production, run separate processes on each host:
 
 ```bash
 # Host 1: Database leader + QUIC node 0
-./bin/s3d -backend distributed -config cluster.toml -node 0 -db-node 1
+./bin/s3d -config cluster.toml -node 0 -db-node 1
 
 # Host 2: Database follower + QUIC node 1
-./bin/s3d -backend distributed -config cluster.toml -node 1 -db-node 2
+./bin/s3d -config cluster.toml -node 1 -db-node 2
 
 # Host 3: Database follower + QUIC node 2
-./bin/s3d -backend distributed -config cluster.toml -node 2 -db-node 3
+./bin/s3d -config cluster.toml -node 2 -db-node 3
 ```
 
 Or run database nodes separately:
@@ -889,7 +1094,7 @@ Or run database nodes separately:
 ./bin/s3d -db -config cluster.toml -db-node 1
 
 # QUIC-only nodes (connect to DB cluster)
-./bin/s3d -backend distributed -config cluster.toml -node 0
+./bin/s3d -config cluster.toml -node 0
 ```
 
 ## Default Embedded Database
@@ -1052,25 +1257,22 @@ err := state.Scan("objects", []byte("arn:aws:s3:::mybucket/"), func(key, value [
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| Block size | 8 KB | Smallest addressable unit |
-| Segment size | 64 KB | Compression unit |
-| Shard size | 32 MB | Per-node slice |
+| `ChunkSize` | 8 KB | Fragment payload size on disk |
+| `FragmentHeaderBytes` | 32 B | Per-fragment header (SeqNum, ShardNum, ShardFragment, Length, Flags, CRC32) |
+| `ShardSize` | 32 MB | Maximum WAL file payload before rollover (per-file capacity, not per-shard) |
+| Fragment batch size `N` | tunable | Number of fragments coalesced per `WriteAt` by a writer goroutine; memory-vs-syscall tradeoff |
 | RS schemes | RS(2,1) / RS(3,2) | Erasure coding configuration |
 | Hash ring vnodes | 64–256 | Virtual nodes for distribution |
-| QUIC stream limit | 32–256 | Concurrent streams |
-| In-flight chunks | 16–32 | Parallel chunk operations |
+| QUIC concurrent streams | 32–256 | Per-connection stream limit |
+| QUIC flow-control windows | see `quic/quicconf` | Receive window sizes (stream and connection) |
+
+Fragment batch size `N` has no effect on the observable state of the WAL; it tunes
+memory usage and syscall count on the write path. A production node serving many
+concurrent shards per WAL file will typically set `N` higher; a memory-constrained
+node will set it lower.
 
 ---
 
-# 18. Future Work
-
-- **Gossip Protocol**: Replace shared `cluster.toml` with dynamic node discovery
-- **Bucket Operations**: Dynamic bucket creation/deletion stored in s3db
-- **Compaction**: WAL file compaction and garbage collection using DeletedObjectInfo
-- **Rebalancing**: Automatic shard redistribution when nodes join/leave
-- **Read Replicas**: Allow reads from any s3db follower for better read scaling
-- **Background Repair**: Automated healing of degraded objects
-
----
-
-This file is the authoritative reference for Predastore implementation.
+This file covers the engineering rationale and architecture of Predastore. For
+gaps between this design and the current codebase, and for longer-horizon work,
+see [TODO.md](./TODO.md).
