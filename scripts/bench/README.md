@@ -9,7 +9,7 @@ micro-optimisation.
 - `bench-disk.sh` — raw-disk fio ceiling (run independently of predastore).
 - `bench-predastore.sh` — three-node predastore cluster on loopback, driven by
   `warp mixed`.
-- `fio-jobs/` — four fio jobs covering predastore's access patterns.
+- `fio-jobs/` — four fio jobs covering predastore's predicted access patterns.
 - `predastore.toml.tmpl` — config template rendered by `envsubst` at run time.
 
 ## Prerequisites
@@ -55,6 +55,36 @@ and contain:
 The benchmark data root (default `/tmp/predastore-bench`) is wiped on exit by
 the trap. Override with `BENCH_DIR=/some/other/path` if the default filesystem
 is not representative.
+
+## fio Jobs
+
+Each job maps to an access pattern predastore is predicted to exhibit in production.
+Every job runs twice — buffered and `--direct=1` — so cache effects are visible.
+
+| Job               | Pattern               | Reflects                                      |
+|-------------------|-----------------------|-----------------------------------------------|
+| `seq-write-1m`    | `write`, 1M, fsync-on-close | Bulk ingest ceiling (PutObject, AMI writes)   |
+| `rand-write-8k`   | `randwrite`, 8k, `fsync=1`, iodepth 32 | WAL `WriteAt` pattern (DESIGN §6) |
+| `seq-read-1m`     | `read`, 1M            | Bulk GET ceiling                              |
+| `rand-read-8k`    | `randread`, 8k, iodepth 32 | RS reconstruction read fan-out           |
+
+## Predastore Config
+
+Rendered from `predastore.toml.tmpl`:
+
+- **RS(2, 1)** — 2 data shards + 1 parity. Matches the Spinifex default.
+- **3 db nodes** on `10.11.12.{1,2,3}:{6660,6661,6662}` — Raft quorum for
+  metadata, node 1 is the bootstrap leader.
+- **3 QUIC storage nodes** on `10.11.12.{1,2,3}:{9991,9992,9993}` — shard
+  distribution across the three processes.
+- **Single bucket** `predastore` (type `distributed`) — warp targets this.
+- **No `[iam]` section** — predastore falls back to `ConfigProvider` for auth,
+  so the harness never tries to contact NATS (see
+  `predastore/s3/server.go:initCredentialProvider`).
+- **Shared `base_path = $BENCH_DIR`** — all three processes read the same
+  config and share a data root; per-node relative paths
+  (`distributed/db/node-N/`, `distributed/nodes/node-N/`) keep state cleanly
+  separated.
 
 ## Deferred
 
