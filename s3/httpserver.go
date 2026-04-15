@@ -159,6 +159,11 @@ func (s *HTTP2Server) setupRoutes() {
 		r.Use(middleware.Logger)
 	}
 	r.Use(middleware.Recoverer)
+	// AWS S3 accepts bucket-scoped URLs with or without a trailing slash
+	// (e.g. PUT /bucket/ == PUT /bucket for CreateBucket) without redirecting.
+	// StripSlashes only rewrites chi's routing context, not r.URL.Path, so
+	// SigV4 verification still sees the exact URI the client signed.
+	r.Use(middleware.StripSlashes)
 	r.Use(s.sigV4AuthMiddleware)
 
 	// Routes
