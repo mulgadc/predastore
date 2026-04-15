@@ -21,6 +21,7 @@ require (
 	github.com/pelletier/go-toml/v2 v2.3.0
 	github.com/quic-go/quic-go v0.59.0
 	github.com/stretchr/testify v1.11.1
+	golang.org/x/time v0.15.0
 )
 
 require (
