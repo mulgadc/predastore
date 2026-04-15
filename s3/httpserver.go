@@ -681,6 +681,7 @@ func (s *HTTP2Server) getObject(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", resp.ContentType)
 	w.Header().Set("Content-Length", strconv.FormatInt(resp.Size, 10))
 	w.Header().Set("ETag", resp.ETag)
+	w.Header().Set("Last-Modified", resp.LastModified.Format("Mon, 02 Jan 2006 15:04:05 GMT"))
 
 	if resp.StatusCode == http.StatusPartialContent {
 		w.Header().Set("Content-Range", resp.ContentRange)
