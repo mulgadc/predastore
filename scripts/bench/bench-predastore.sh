@@ -23,6 +23,14 @@ export NODE2_IP=10.11.12.2
 export NODE3_IP=10.11.12.3
 S3_PORT=8443
 
+# warp mixed tuning — unset values fall back to warp's built-in defaults
+# (2500 objects × 10MiB, 5m, 20 concurrent). Override for tmpfs-safe local
+# runs or scaled CI/CD runs on dedicated hardware.
+WARP_OBJECTS="${WARP_OBJECTS:-}"
+WARP_OBJ_SIZE="${WARP_OBJ_SIZE:-}"
+WARP_DURATION="${WARP_DURATION:-}"
+WARP_CONCURRENT="${WARP_CONCURRENT:-}"
+
 declare -a PIDS=()
 ADDED_IPS=0
 
@@ -186,6 +194,12 @@ done
 # Run warp. Defaults for duration/object size/concurrency accepted — tuning
 # is a deliberate follow-on (see plan §Scope).
 # ---------------------------------------------------------------------------
+warp_args=()
+[ -n "$WARP_OBJECTS" ]    && warp_args+=(--objects="$WARP_OBJECTS")
+[ -n "$WARP_OBJ_SIZE" ]   && warp_args+=(--obj.size="$WARP_OBJ_SIZE")
+[ -n "$WARP_DURATION" ]   && warp_args+=(--duration="$WARP_DURATION")
+[ -n "$WARP_CONCURRENT" ] && warp_args+=(--concurrent="$WARP_CONCURRENT")
+
 echo "bench-predastore: running warp mixed"
 warp mixed \
     --host="${NODE1_IP}:${S3_PORT},${NODE2_IP}:${S3_PORT},${NODE3_IP}:${S3_PORT}" \
@@ -194,7 +208,8 @@ warp mixed \
     --access-key="$AWS_ACCESS_KEY_ID" \
     --secret-key="$AWS_SECRET_ACCESS_KEY" \
     --bucket=predastore \
-    --benchdata="$RESULTS_DIR/warp-mixed"
+    --benchdata="$RESULTS_DIR/warp-mixed" \
+    "${warp_args[@]}"
 
 # ---------------------------------------------------------------------------
 # Preserve run metadata. The resolved config and per-node logs already live

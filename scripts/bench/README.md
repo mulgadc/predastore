@@ -59,7 +59,29 @@ and contain:
 
 The benchmark data root (default `/tmp/predastore-bench`) is wiped on exit by
 the trap. Override with `BENCH_DIR=/some/other/path` if the default filesystem
-is not representative.
+is not representative — `bench-disk.sh` honours the same variable, so both
+scripts target the same storage when `BENCH_DIR` is set. Note that with RS(2,1)
+the on-disk footprint is ~1.5× the logical object volume, spread across three
+nodes; warp's defaults (2500 × 10 MiB) do not fit a typical dev-host tmpfs.
+
+### Tuning warp mixed
+
+Four env vars forward through to `warp mixed`; leaving any of them unset keeps
+warp's own default:
+
+| Variable          | warp flag      | warp default |
+|-------------------|----------------|--------------|
+| `WARP_OBJECTS`    | `--objects`    | 2500         |
+| `WARP_OBJ_SIZE`   | `--obj.size`   | 10MiB        |
+| `WARP_DURATION`   | `--duration`   | 5m           |
+| `WARP_CONCURRENT` | `--concurrent` | 20           |
+
+For a tmpfs-safe local run (~750 MB on disk):
+
+    WARP_OBJECTS=512 WARP_OBJ_SIZE=1MiB WARP_DURATION=30s WARP_CONCURRENT=10 \
+        ./scripts/bench/bench-predastore.sh
+
+Dedicated-hardware CI runs leave them unset.
 
 ## fio Jobs
 
