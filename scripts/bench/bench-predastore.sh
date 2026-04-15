@@ -164,6 +164,9 @@ for n in 1 2 3; do
         -port      "$S3_PORT" \
         > "$log" 2>&1 &
     PIDS+=("$!")
+    # Remove from bash's job table so cleanup's SIGKILL doesn't emit
+    # "line N: <pid> Killed …" status lines to stderr.
+    disown "$!"
 done
 
 # ---------------------------------------------------------------------------
