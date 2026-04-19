@@ -38,6 +38,10 @@ const (
 
 	// totalSlotSize is the on-disk size of each slot in a segment file.
 	totalSlotSize uint64 = slotHeaderSize + slotPayloadSize
+
+	// slotsPerSegment is the number of slots per segment. Slot payloads
+	// total exactly 1 GiB (131,072 x 8 KiB).
+	slotsPerSegment uint64 = 1 * GiB / slotPayloadSize
 )
 
 // slotFlags is the per-slot feature flag bitmask.
@@ -80,8 +84,11 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 	// Build segment file path.
 	path := filepath.Join(dir, fmt.Sprintf("%016d%s", num, extension))
 
+	seg = &segment{
+		slotsTotal: slotsPerSegment,
+	}
+
 	// Open or create the file.
-	// Removed syscall.O_SYNC - calling fsync explicitly for better performance.
 	seg.file, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
 		slog.Error("failed to open segment file", "error", err)
@@ -104,7 +111,7 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 	}
 
 	switch {
-	// File doesn't has no free slots, return.
+	// File has no free slots, return.
 	case stat.Size()+int64(totalSlotSize) > seg.maxFileSize():
 		return nil, fmt.Errorf("segment %s doesn't have enough space (%d + %d > %d)",
 			path, stat.Size(), totalSlotSize, seg.maxFileSize())
@@ -122,6 +129,20 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 			slog.Error("failed to write segment file header", "error", err)
 			return nil, err
 		}
+		seg.version = v1
+
+	default:
+		header := make([]byte, segmentHeaderSize)
+		if _, err = seg.file.ReadAt(header, 0); err != nil {
+			return nil, fmt.Errorf("failed to read segment header: %w", err)
+		}
+		var fileMagic [4]byte
+		copy(fileMagic[:], header[0:4])
+		if fileMagic != magic {
+			return nil, fmt.Errorf("segment %s: invalid magic %x", path, fileMagic)
+		}
+		seg.version = binary.BigEndian.Uint16(header[4:6])
+		seg.slotsUsed = uint64(stat.Size()-int64(segmentHeaderSize)) / totalSlotSize
 	}
 
 	return seg, nil

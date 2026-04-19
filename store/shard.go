@@ -19,8 +19,8 @@ type Shard struct {
 // SegmentSpan locates a slot-aligned range within a single segment file.
 type SegmentSpan struct {
 	SegmentNum uint64
-	SlotOffset uint64
-	SlotCount  uint64
+	Offset     uint64
+	Len        uint64
 }
 
 // NewReader returns a streaming reader over the shard's full payload.
@@ -30,6 +30,6 @@ func (sh *Shard) NewReader() io.Reader {
 
 // NewRangeReader returns a reader yielding bytes [start, end] of the
 // shard inclusive. Returns an error if the range exceeds TotalSize.
-func (sh *Shard) NewRangeReader(start, end int64) (io.Reader, error) {
+func (sh *Shard) NewRangeReader(offset uint64, len uint64) (io.Reader, error) {
 	panic("store: Shard.NewRangeReader not implemented")
 }

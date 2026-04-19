@@ -77,19 +77,19 @@ func Open(dir string) (store *Store, err error) {
 	// file is already full, segNum rotates until an available slot is
 	// found, matching the rotation behaviour used during normal writes.
 	const maxAttempts = 100
-outer:
 	for attempt := range maxAttempts {
 		store.seg, err = openSegment(dir, store.segNum.Load())
-		switch {
-		case err != nil:
-			break outer
-
-		case attempt < maxAttempts:
-			store.segNum.Add(1)
-
-		default:
-			return nil, fmt.Errorf("could not open segment after %d attempts", maxAttempts)
-
+		if err == nil {
+			break
+		}
+		slog.Debug("segment full or unavailable, rotating",
+			"segNum", store.segNum.Load(),
+			"attempt", attempt,
+			"error", err,
+		)
+		store.segNum.Add(1)
+		if attempt == maxAttempts-1 {
+			return nil, fmt.Errorf("could not open segment after %d attempts: %w", maxAttempts, err)
 		}
 	}
 
@@ -123,11 +123,15 @@ func (store *Store) Close() error {
 	panic("store: Close not implemented")
 }
 
-func (store *Store) loadState() error {
-	path := filepath.Join(store.dir, stateFileName)
+// reserve claims a contiguous range of n slots in the active segment under
+// mu, rotating to a new segment if necessary.
+func (store *Store) reserve(n uint64) (allocation, error) {
+	panic("store: reserve not implemented")
+}
 
+func (store *Store) loadState() error {
 	var state storeState
-	if data, err := os.ReadFile(path); err != nil {
+	if data, err := os.ReadFile(filepath.Join(store.dir, stateFileName)); err != nil {
 		return err
 	} else if err := json.Unmarshal(data, &state); err != nil {
 		return err

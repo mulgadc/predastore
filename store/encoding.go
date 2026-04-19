@@ -6,13 +6,13 @@ import "sync"
 // Buffer length is slotHeaderLen + slotCapacity = 8224 bytes.
 var slotBufferPool = sync.Pool{
 	New: func() any {
-		return make([]byte, int(slotHeaderLen+slotCapacity))
+		return make([]byte, int(slotHeaderSize+slotPayloadSize))
 	},
 }
 
 // zeroPadBuffer is a pre-allocated zero slice used to wipe the padding
 // region of a slot payload before checksumming.
-var zeroPadBuffer = make([]byte, int(slotCapacity))
+var zeroPadBuffer = make([]byte, int(slotPayloadSize))
 
 // encodeShard serialises a Shard for storage in Badger.
 func encodeShard(sh *Shard) ([]byte, error) {
