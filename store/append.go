@@ -7,15 +7,17 @@ import (
 	"io"
 )
 
-// Append writes an object shard to the store and commits its index entry.
-// It reserves slot extents under a short lock, then drains r into those
-// slots lock-free and fsyncs before returning.
+// Append writes an object shard to the store and commits its index entry. It
+// reserves slot extents under a short lock, then drains r into those slots
+// lock-free and fsyncs before returning.
 func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.Reader) (*Shard, error) {
-	// Phase 1: Reserve.
+	// Phase 1: Reserve slots under the lock.
 	store.mu.Lock()
 
+	// Number of slots needed to hold size bytes of payload.
 	fragCount := (size + slotPayloadSize - 1) / slotPayloadSize
 
+	// Snapshot and advance monotonic counters while still under the lock.
 	seqNum := store.seqNum.Load()
 	store.seqNum.Add(uint64(fragCount)) //nolint:gosec // G115: fragCount non-negative
 	shardNum := store.shardNum.Add(1)
@@ -27,13 +29,14 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 		return nil, fmt.Errorf("store: Append: reserve: %w", err)
 	}
 
+	// Release extent refs when done, allowing retired segments to close.
 	defer func() {
 		for _, ext := range exts {
 			ext.Close()
 		}
 	}()
 
-	// Phase 2: Write.
+	// Phase 2: Write slots lock-free.
 	remaining := size
 	fragIndex := 0
 
@@ -42,33 +45,37 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 			bufPtr := slotBufferPool.Get().(*[]byte) //nolint:forcetypeassert,errcheck // Pool.New always returns *[]byte
 			buf := *bufPtr
 
+			// Read up to one slot's worth of payload from the input.
 			toRead := min(remaining, slotPayloadSize)
-			chunkLen := 0
+			payloadLen := 0
 			if toRead > 0 {
-				chunkLen, err = io.ReadFull(r, buf[slotHeaderSize:slotHeaderSize+toRead])
+				payloadLen, err = io.ReadFull(r, buf[slotHeaderSize:slotHeaderSize+toRead])
 				if err != nil {
 					slotBufferPool.Put(bufPtr)
 					return nil, fmt.Errorf("store: Append: read chunk %d: %w", fragIndex, err)
 				}
 			}
 
-			if chunkLen < slotPayloadSize {
-				padStart := slotHeaderSize + chunkLen
-				copy(buf[padStart:slotHeaderSize+slotPayloadSize], zeroPadBuffer[:slotPayloadSize-chunkLen])
+			// Zero-pad the remainder so the CRC covers a full slot.
+			if payloadLen < slotPayloadSize {
+				padStart := slotHeaderSize + payloadLen
+				copy(buf[padStart:slotHeaderSize+slotPayloadSize], zeroPadBuffer[:slotPayloadSize-payloadLen])
 			}
 
-			binary.BigEndian.PutUint64(buf[0:8], seqNum+uint64(fragIndex))
-			binary.BigEndian.PutUint64(buf[8:16], shardNum)
-			binary.BigEndian.PutUint32(buf[16:20], uint32(fragIndex))
-			binary.BigEndian.PutUint32(buf[20:24], uint32(chunkLen)) //nolint:gosec // G115: chunkLen bounded by slotPayloadSize (8 KiB)
+			// Encode the 32-byte slot header.
+			binary.BigEndian.PutUint64(buf[0:8], seqNum+uint64(fragIndex)) // [0:8]   sequence number
+			binary.BigEndian.PutUint64(buf[8:16], shardNum)                // [8:16]  shard number
+			binary.BigEndian.PutUint32(buf[16:20], uint32(fragIndex))      // [16:20] fragment index
+			binary.BigEndian.PutUint32(buf[20:24], uint32(payloadLen))     //nolint:gosec // G115: payloadLen bounded by slotPayloadSize (8 KiB) // [20:24] payload length
 
 			var flags slotFlags
 			if fragIndex == fragCount-1 {
 				flags = flagEndOfShard
 			}
-			binary.BigEndian.PutUint32(buf[24:28], uint32(flags))
-			binary.BigEndian.PutUint32(buf[28:32], 0)
+			binary.BigEndian.PutUint32(buf[24:28], uint32(flags)) // [24:28] flags
+			binary.BigEndian.PutUint32(buf[28:32], 0)             // [28:32] CRC placeholder
 
+			// CRC32-IEEE over header (with CRC field zeroed) + full padded payload.
 			checksum := crc32.ChecksumIEEE(buf[0:slotHeaderSize])
 			checksum = crc32.Update(checksum, crc32.IEEETable, buf[slotHeaderSize:slotHeaderSize+slotPayloadSize])
 			binary.BigEndian.PutUint32(buf[28:32], checksum)
@@ -79,18 +86,19 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 			}
 
 			slotBufferPool.Put(bufPtr)
-			remaining -= chunkLen
+			remaining -= payloadLen
 			fragIndex++
 		}
 	}
 
-	// Phase 3: Commit.
+	// Phase 3: Commit. Fsync all touched segments, then write shard metadata to the index.
 	for _, ext := range exts {
 		if err := ext.seg.file.Sync(); err != nil {
 			return nil, fmt.Errorf("store: Append: fsync segment %d: %w", ext.seg.num, err)
 		}
 	}
 
+	// Build byte-aligned Locations from slot extents.
 	remaining = size
 	locations := make([]Location, len(exts))
 	for i, ext := range exts {

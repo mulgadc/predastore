@@ -39,6 +39,7 @@ type Store struct {
 	epoch    time.Time
 }
 
+// storeState is the JSON-serialised state persisted to state.json between restarts.
 type storeState struct {
 	SegNum   uint64    `json:"SegNum"`
 	SeqNum   uint64    `json:"SeqNum"`
@@ -46,28 +47,24 @@ type storeState struct {
 	Epoch    time.Time `json:"Epoch"`
 }
 
-// Open or create a Store rooted at dir.
+// Open opens or creates a Store rooted at dir.
 func Open(dir string) (store *Store, err error) {
 	store = &Store{
 		dir: dir,
 	}
 
-	// Attempt to load store state from disk.
+	// Load persisted counters. Missing state is expected for fresh directories.
 	if err := store.loadState(); err != nil {
 		slog.Warn("store: Open: load state", "error", err)
 	}
 
-	// Create DB to map (objectHash, shardIndex) keys to segment offsets.
+	// Open the Badger index for shard metadata.
 	store.index, err = s3db.New(filepath.Join(dir, indexFileName))
 	if err != nil {
 		return nil, err
 	}
 
-	// Open (or create) the active segment at segNum and attach it to
-	// the Store. On a fresh directory this creates the first segment; on
-	// restart it reopens the existing one in append mode. If the existing
-	// file is already full, segNum rotates until an available slot is
-	// found, matching the rotation behaviour used during normal writes.
+	// Attach the active segment, rotating past full segments on restart.
 	const maxAttempts = 100
 	for attempt := range maxAttempts {
 		store.seg, err = openSegment(dir, store.segNum.Load())
@@ -92,9 +89,8 @@ func Open(dir string) (store *Store, err error) {
 	return store, err
 }
 
-// Persist Store state and close all underlying files and indexes.
-// Blocks until in-flight writers drain, then closes the active segment
-// and the Badger index.
+// Close persists Store state, blocks until in-flight writers drain,
+// then closes the active segment and the Badger index.
 func (store *Store) Close() error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -106,6 +102,7 @@ func (store *Store) Close() error {
 	}
 
 	if store.seg != nil {
+		// Release the Store's own ref. Spin until in-flight writers release theirs.
 		store.seg.refs.Add(-1)
 		for store.seg.refs.Load() > 0 {
 			runtime.Gosched()
@@ -122,6 +119,7 @@ func (store *Store) Close() error {
 	return errors.Join(errs...)
 }
 
+// loadState reads state.json from the Store directory and restores monotonic counters.
 func (store *Store) loadState() error {
 	var state storeState
 	if data, err := os.ReadFile(filepath.Join(store.dir, stateFileName)); err != nil {
@@ -130,6 +128,7 @@ func (store *Store) loadState() error {
 		return err
 	}
 
+	// +1 ensures counters never reuse a value from a previous run.
 	store.segNum.Store(state.SegNum + 1)
 	store.seqNum.Store(state.SeqNum + 1)
 	store.shardNum.Store(state.ShardNum + 1)
@@ -138,6 +137,7 @@ func (store *Store) loadState() error {
 	return nil
 }
 
+// saveState writes the current monotonic counters to state.json in the Store directory.
 func (store *Store) saveState() error {
 	state := storeState{
 		SegNum:   store.segNum.Load(),

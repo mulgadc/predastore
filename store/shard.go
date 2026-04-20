@@ -4,8 +4,8 @@ import (
 	"encoding/binary"
 )
 
-// Shard is a single object-shard's on-disk footprint. Each
-// Append/Lookup produces one Shard.
+// Shard describes the on-disk footprint of a single object shard.
+// Append and Lookup each return one.
 type Shard struct {
 	ObjectHash [32]byte
 	ShardIndex int
@@ -15,14 +15,14 @@ type Shard struct {
 	store *Store
 }
 
+// Location describes one contiguous byte range of shard payload within a segment file.
 type Location struct {
 	SegmentNum uint64
 	Offset     uint64
 	Size       uint64
 }
 
-// makeShardKey builds the 36-byte composite Badger key for a (objectHash,
-// shardIndex) pair.
+// makeShardKey returns the 36-byte composite Badger key for an (objectHash, shardIndex) pair.
 func makeShardKey(objectHash [32]byte, shardIndex int) []byte {
 	key := make([]byte, 36)
 	copy(key[:32], objectHash[:])
