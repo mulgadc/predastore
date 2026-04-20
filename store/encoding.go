@@ -1,12 +1,18 @@
 package store
 
-import "sync"
+import (
+	"bytes"
+	"encoding/gob"
+	"fmt"
+	"sync"
+)
 
 // slotBufferPool reuses slot-sized write buffers on the Append hot path.
 // Buffer length is slotHeaderLen + slotCapacity = 8224 bytes.
 var slotBufferPool = sync.Pool{
 	New: func() any {
-		return make([]byte, int(slotHeaderSize+slotPayloadSize))
+		b := make([]byte, int(slotHeaderSize+slotPayloadSize))
+		return &b
 	},
 }
 
@@ -16,21 +22,29 @@ var zeroPadBuffer = make([]byte, int(slotPayloadSize))
 
 // encodeShard serialises a Shard for storage in Badger.
 func encodeShard(sh *Shard) ([]byte, error) {
-	panic("store: encodeShard not implemented")
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(sh); err != nil {
+		return nil, fmt.Errorf("store: encodeShard: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // decodeShard deserialises a Shard from Badger storage.
-func decodeShard(data []byte) (*Shard, error) {
-	panic("store: decodeShard not implemented")
+func decodeShard(data []byte) (*Shard, error) { //nolint:unused // used by Lookup (not yet implemented)
+	var sh Shard
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&sh); err != nil {
+		return nil, fmt.Errorf("store: decodeShard: %w", err)
+	}
+	return &sh, nil
 }
 
 // segmentHeader returns the on-disk segment file header bytes. Length is
 // exactly segmentHeaderLen.
-func segmentHeader(magic [4]byte, version uint16) []byte {
+func segmentHeader(magic [4]byte, version uint16) []byte { //nolint:unused // stub for Stage 3
 	panic("store: segmentHeader not implemented")
 }
 
 // parseSegmentHeader decodes a segmentHeaderLen-byte segment header.
-func parseSegmentHeader(data []byte) (magic [4]byte, version uint16, err error) {
+func parseSegmentHeader(data []byte) (magic [4]byte, version uint16, err error) { //nolint:unused // stub for Stage 3
 	panic("store: parseSegmentHeader not implemented")
 }

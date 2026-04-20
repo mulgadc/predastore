@@ -6,10 +6,8 @@
 package store
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -18,20 +16,10 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/s3db"
-	"github.com/mulgadc/predastore/utils"
 )
 
 const stateFileName = "state.json"
 const indexFileName = "db"
-
-// makeShardKey builds the 36-byte composite Badger key for a (objectHash,
-// shardIndex) pair.
-func makeShardKey(objectHash [32]byte, shardIndex int) []byte {
-	key := make([]byte, 36)
-	copy(key[:32], objectHash[:])
-	binary.BigEndian.PutUint32(key[32:], utils.IntToUint32(shardIndex))
-	return key
-}
 
 // Store is a log-structured object store. Writes reserve disjoint slot
 // ranges under a short lock, then perform lock-free WriteAt followed by
@@ -43,15 +31,17 @@ type Store struct {
 	seg *segment
 	mu  sync.Mutex
 
-	segNum atomic.Uint64
-	seqNum atomic.Uint64
-	epoch  time.Time
+	segNum   atomic.Uint64
+	shardNum atomic.Uint64
+	seqNum   atomic.Uint64
+	epoch    time.Time
 }
 
 type storeState struct {
-	SegNum uint64    `json:"segNum"`
-	SeqNum uint64    `json:"seqNum"`
-	Epoch  time.Time `json:"epoch"`
+	SegNum   uint64    `json:"SegNum"`
+	SeqNum   uint64    `json:"SeqNum"`
+	ShardNum uint64    `json:"ShardNum"`
+	Epoch    time.Time `json:"Epoch"`
 }
 
 // Open or create a Store rooted at dir.
@@ -100,33 +90,9 @@ func Open(dir string) (store *Store, err error) {
 	return store, err
 }
 
-// Write an object shard to the store and commits its index entry.
-// It reserves slot ranges under a short lock, then drains r into those
-// slots lock-free and fsyncs before returning.
-func (store *Store) Append(objectHash [32]byte, shardIndex int, totalSize int, r io.Reader) (*Shard, error) {
-	panic("store: Append not implemented")
-}
-
-// Fetch the Shard metadata for (objectHash, shardIndex).
-func (store *Store) Lookup(objectHash [32]byte, shardIndex int) (*Shard, error) {
-	panic("store: Lookup not implemented")
-}
-
-// Delete the index entry for (objectHash, shardIndex).
-// Does not reclaim disk space; that is compaction's job.
-func (store *Store) Delete(objectHash [32]byte, shardIndex int) error {
-	panic("store: Delete not implemented")
-}
-
 // Persist Store state and close all underlying files and indexes.
 func (store *Store) Close() error {
 	panic("store: Close not implemented")
-}
-
-// reserve claims a contiguous range of n slots in the active segment under
-// mu, rotating to a new segment if necessary.
-func (store *Store) reserve(n uint64) (allocation, error) {
-	panic("store: reserve not implemented")
 }
 
 func (store *Store) loadState() error {
@@ -139,6 +105,7 @@ func (store *Store) loadState() error {
 
 	store.segNum.Store(state.SegNum + 1)
 	store.seqNum.Store(state.SeqNum + 1)
+	store.shardNum.Store(state.ShardNum + 1)
 	store.epoch = state.Epoch
 
 	return nil
@@ -146,9 +113,10 @@ func (store *Store) loadState() error {
 
 func (store *Store) saveState() error {
 	state := storeState{
-		SegNum: store.segNum.Load(),
-		SeqNum: store.seqNum.Load(),
-		Epoch:  store.epoch,
+		SegNum:   store.segNum.Load(),
+		SeqNum:   store.seqNum.Load(),
+		ShardNum: store.shardNum.Load(),
+		Epoch:    store.epoch,
 	}
 
 	stateData, err := json.Marshal(state)

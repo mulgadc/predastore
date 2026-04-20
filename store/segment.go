@@ -20,28 +20,17 @@ const (
 )
 
 const (
-	_          = iota
-	KiB uint64 = 1 << (10 * iota)
-	MiB
-	GiB
+	KiB = 1024
+	MiB = 1024 * KiB
+	GiB = 1024 * MiB
 )
 
 const (
-	// segmentHeaderSize is the on-disk segment file header length.
-	segmentHeaderSize uint64 = 14
-
-	// slotHeaderSize is the on-disk slot header length.
-	slotHeaderSize uint64 = 32
-
-	// slotPayloadSize is the payload length of one slot on-disk.
-	slotPayloadSize uint64 = 8 * KiB
-
-	// totalSlotSize is the on-disk size of each slot in a segment file.
-	totalSlotSize uint64 = slotHeaderSize + slotPayloadSize
-
-	// slotsPerSegment is the number of slots per segment. Slot payloads
-	// total exactly 1 GiB (131,072 x 8 KiB).
-	slotsPerSegment uint64 = 1 * GiB / slotPayloadSize
+	segmentHeaderSize = 14
+	slotHeaderSize    = 32
+	slotPayloadSize   = 8 * KiB
+	totalSlotSize     = slotHeaderSize + slotPayloadSize
+	slotsPerSegment   = 1 * GiB / slotPayloadSize
 )
 
 // slotFlags is the per-slot feature flag bitmask.
@@ -63,30 +52,24 @@ const (
 // appended data to disk. It is broken into "slots". Each beginning with
 // 32 bytes of header information.
 type segment struct {
+	num     uint64
 	version uint16
 
-	file     *os.File
-	refCount atomic.Int32
+	file *os.File
+	refs atomic.Int32
 
-	slotsTotal uint64
-	slotsUsed  uint64
-}
-
-// allocation is a contiguous range of slots within a single segment reserved
-// for the contents of a corresponding call to Store.append().
-type allocation struct {
-	seg    *segment
-	offset uint64
-	len    uint64
+	slotsTotal int
+	slotsUsed  int
 }
 
 func openSegment(dir string, num uint64) (seg *segment, err error) {
-	// Build segment file path.
-	path := filepath.Join(dir, fmt.Sprintf("%016d%s", num, extension))
-
 	seg = &segment{
+		num:        num,
 		slotsTotal: slotsPerSegment,
 	}
+
+	// Build segment file path.
+	path := filepath.Join(dir, fmt.Sprintf("%016d%s", num, extension))
 
 	// Open or create the file.
 	seg.file, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
@@ -112,7 +95,7 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 
 	switch {
 	// File has no free slots, return.
-	case stat.Size()+int64(totalSlotSize) > seg.maxFileSize():
+	case stat.Size()+totalSlotSize > seg.maxFileSize():
 		return nil, fmt.Errorf("segment %s doesn't have enough space (%d + %d > %d)",
 			path, stat.Size(), totalSlotSize, seg.maxFileSize())
 
@@ -121,7 +104,7 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 		header := make([]byte, segmentHeaderSize)
 		copy(header[0:4], magic[:])
 		binary.BigEndian.PutUint16(header[4:6], v1)
-		binary.BigEndian.PutUint32(header[6:10], uint32(seg.maxFileSize()))
+		binary.BigEndian.PutUint32(header[6:10], uint32(seg.maxFileSize())) //nolint:gosec // G115: maxFileSize ~1 GiB, fits uint32
 		binary.BigEndian.PutUint32(header[10:14], uint32(slotPayloadSize))
 
 		_, err = seg.file.Write(header)
@@ -142,24 +125,37 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 			return nil, fmt.Errorf("segment %s: invalid magic %x", path, fileMagic)
 		}
 		seg.version = binary.BigEndian.Uint16(header[4:6])
-		seg.slotsUsed = uint64(stat.Size()-int64(segmentHeaderSize)) / totalSlotSize
+		seg.slotsUsed = int((stat.Size() - segmentHeaderSize) / totalSlotSize)
 	}
+
+	seg.refs.Add(1)
 
 	return seg, nil
 }
 
 // Calculate the maxiumum file size in bytes of this segment including all headers.
-func (s *segment) maxFileSize() int64 {
-	return int64(segmentHeaderSize + totalSlotSize*s.slotsTotal)
+func (seg *segment) maxFileSize() int64 {
+	return int64(segmentHeaderSize + totalSlotSize*seg.slotsTotal)
 }
 
-// Get the byte-aligned offset of a slot.
-func (s *segment) byteOffset(slotOffset uint64) uint64 {
-	return segmentHeaderSize + slotOffset*totalSlotSize
+func (seg *segment) freeSlots() int {
+	return seg.slotsTotal - seg.slotsUsed
+}
+
+func (seg *segment) byteOffset(slotOffset int) int64 {
+	return int64(segmentHeaderSize + slotOffset*totalSlotSize)
 }
 
 // Close the underlying file if the segment is full and no writers or
 // readers hold references to it.
-func (s *segment) tryClose() {
-	panic("store: segment.tryClose not implemented")
+func (seg *segment) Close() error {
+	if seg.refs.Load() != 0 {
+		return fmt.Errorf("segment in use")
+	} else if seg.freeSlots() > 0 {
+		return fmt.Errorf("segment has free slots")
+	} else if err := seg.file.Close(); err != nil {
+		return err
+	}
+
+	return nil
 }
