@@ -30,7 +30,7 @@ func encodeShard(sh *Shard) ([]byte, error) {
 }
 
 // decodeShard deserialises a Shard from Badger storage.
-func decodeShard(data []byte) (*Shard, error) { //nolint:unused // used by Lookup (not yet implemented)
+func decodeShard(data []byte) (*Shard, error) {
 	var sh Shard
 	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&sh); err != nil {
 		return nil, fmt.Errorf("store: decodeShard: %w", err)
