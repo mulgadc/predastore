@@ -101,6 +101,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 		ShardIndex: shardIndex,
 		TotalSize:  size,
 		Locations:  locations,
+		store:      store,
 	}
 
 	encoded, err := encodeShard(sh)

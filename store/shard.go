@@ -11,6 +11,8 @@ type Shard struct {
 	ShardIndex int
 	TotalSize  int
 	Locations  []Location
+
+	store *Store
 }
 
 type Location struct {
