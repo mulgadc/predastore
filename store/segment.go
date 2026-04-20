@@ -74,7 +74,7 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 	// Open or create the file.
 	seg.file, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
-		slog.Error("failed to open segment file", "error", err)
+		slog.Error("store: openSegment: open file", "error", err)
 		return nil, err
 	}
 
@@ -82,21 +82,21 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 	defer func() {
 		if err != nil {
 			if closeErr := seg.file.Close(); closeErr != nil {
-				slog.Debug("failed to close segment file", "error", closeErr)
+				slog.Debug("store: openSegment: close file on error", "error", closeErr)
 			}
 		}
 	}()
 
 	stat, err := seg.file.Stat()
 	if err != nil {
-		slog.Error("failed to stat segment file", "error", err)
+		slog.Error("store: openSegment: stat file", "error", err)
 		return nil, err
 	}
 
 	switch {
 	// File has no free slots, return.
 	case stat.Size()+totalSlotSize > seg.maxFileSize():
-		return nil, fmt.Errorf("segment %s doesn't have enough space (%d + %d > %d)",
+		return nil, fmt.Errorf("store: openSegment: segment full %s (%d + %d > %d)",
 			path, stat.Size(), totalSlotSize, seg.maxFileSize())
 
 	// File is empty, write segment header to file.
@@ -109,7 +109,7 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 
 		_, err = seg.file.Write(header)
 		if err != nil {
-			slog.Error("failed to write segment file header", "error", err)
+			slog.Error("store: openSegment: write header", "error", err)
 			return nil, err
 		}
 		seg.version = v1
@@ -117,12 +117,12 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 	default:
 		header := make([]byte, segmentHeaderSize)
 		if _, err = seg.file.ReadAt(header, 0); err != nil {
-			return nil, fmt.Errorf("failed to read segment header: %w", err)
+			return nil, fmt.Errorf("store: openSegment: read header: %w", err)
 		}
 		var fileMagic [4]byte
 		copy(fileMagic[:], header[0:4])
 		if fileMagic != magic {
-			return nil, fmt.Errorf("segment %s: invalid magic %x", path, fileMagic)
+			return nil, fmt.Errorf("store: openSegment: invalid magic %x in %s", fileMagic, path)
 		}
 		seg.version = binary.BigEndian.Uint16(header[4:6])
 		seg.slotsUsed = int((stat.Size() - segmentHeaderSize) / totalSlotSize)
@@ -150,9 +150,9 @@ func (seg *segment) byteOffset(slotOffset int) int64 {
 // readers hold references to it.
 func (seg *segment) Close() error {
 	if seg.refs.Load() != 0 {
-		return fmt.Errorf("segment in use")
+		return fmt.Errorf("store: segment: in use")
 	} else if seg.freeSlots() > 0 {
-		return fmt.Errorf("segment has free slots")
+		return fmt.Errorf("store: segment: has free slots")
 	} else if err := seg.file.Close(); err != nil {
 		return err
 	}

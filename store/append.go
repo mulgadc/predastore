@@ -24,7 +24,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 	store.mu.Unlock()
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to reserve segment space: %w", err)
+		return nil, fmt.Errorf("store: Append: reserve: %w", err)
 	}
 
 	defer func() {
@@ -42,10 +42,14 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 			bufPtr := slotBufferPool.Get().(*[]byte) //nolint:forcetypeassert,errcheck // Pool.New always returns *[]byte
 			buf := *bufPtr
 
-			chunkLen, err := readFull(r, buf[slotHeaderSize:slotHeaderSize+slotPayloadSize], remaining)
-			if err != nil {
-				slotBufferPool.Put(bufPtr)
-				return nil, fmt.Errorf("store: Append: read chunk %d: %w", fragIndex, err)
+			toRead := min(remaining, slotPayloadSize)
+			chunkLen := 0
+			if toRead > 0 {
+				chunkLen, err = io.ReadFull(r, buf[slotHeaderSize:slotHeaderSize+toRead])
+				if err != nil {
+					slotBufferPool.Put(bufPtr)
+					return nil, fmt.Errorf("store: Append: read chunk %d: %w", fragIndex, err)
+				}
 			}
 
 			if chunkLen < slotPayloadSize {
@@ -87,13 +91,16 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 		}
 	}
 
+	remaining = size
 	locations := make([]Location, len(exts))
 	for i, ext := range exts {
+		payloadBytes := min(remaining, ext.size*slotPayloadSize)
 		locations[i] = Location{
 			SegmentNum: ext.seg.num,
-			Offset:     uint64(ext.offset), //nolint:gosec // G115: offset non-negative
-			Size:       uint64(ext.size),   //nolint:gosec // G115: size non-negative
+			Offset:     uint64(ext.seg.byteOffset(ext.offset)), //nolint:gosec // G115: byteOffset non-negative
+			Size:       uint64(payloadBytes),                   //nolint:gosec // G115: payloadBytes non-negative
 		}
+		remaining -= payloadBytes
 	}
 
 	sh := &Shard{
@@ -113,12 +120,4 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 	}
 
 	return sh, nil
-}
-
-func readFull(r io.Reader, buf []byte, remaining int) (int, error) {
-	toRead := min(remaining, len(buf))
-	if toRead == 0 {
-		return 0, nil
-	}
-	return io.ReadFull(r, buf[:toRead])
 }

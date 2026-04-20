@@ -30,12 +30,11 @@ func encodeShard(sh *Shard) ([]byte, error) {
 }
 
 // decodeShard deserialises a Shard from Badger storage.
-func decodeShard(data []byte) (*Shard, error) {
-	var sh Shard
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&sh); err != nil {
+func decodeShard(data []byte) (shard *Shard, err error) {
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&shard); err != nil {
 		return nil, fmt.Errorf("store: decodeShard: %w", err)
 	}
-	return &sh, nil
+	return shard, nil
 }
 
 // segmentHeader returns the on-disk segment file header bytes. Length is

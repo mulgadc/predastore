@@ -54,7 +54,7 @@ func Open(dir string) (store *Store, err error) {
 
 	// Attempt to load store state from disk.
 	if err := store.loadState(); err != nil {
-		slog.Warn("failed to load store state", "error", err)
+		slog.Warn("store: Open: load state", "error", err)
 	}
 
 	// Create DB to map (objectHash, shardIndex) keys to segment offsets.
@@ -74,19 +74,19 @@ func Open(dir string) (store *Store, err error) {
 		if err == nil {
 			break
 		}
-		slog.Debug("segment full or unavailable, rotating",
+		slog.Debug("store: Open: segment full, rotating",
 			"segNum", store.segNum.Load(),
 			"attempt", attempt,
 			"error", err,
 		)
 		store.segNum.Add(1)
 		if attempt == maxAttempts-1 {
-			return nil, fmt.Errorf("could not open segment after %d attempts: %w", maxAttempts, err)
+			return nil, fmt.Errorf("store: Open: open segment after %d attempts: %w", maxAttempts, err)
 		}
 	}
 
 	if err = store.saveState(); err != nil {
-		return nil, fmt.Errorf("failed to save store state: %v", err)
+		return nil, fmt.Errorf("store: Open: save state: %w", err)
 	}
 
 	return store, err
@@ -102,7 +102,7 @@ func (store *Store) Close() error {
 	var errs []error
 
 	if err := store.saveState(); err != nil {
-		errs = append(errs, fmt.Errorf("save state: %w", err))
+		errs = append(errs, fmt.Errorf("store: Close: save state: %w", err))
 	}
 
 	if store.seg != nil {
@@ -111,12 +111,12 @@ func (store *Store) Close() error {
 			runtime.Gosched()
 		}
 		if err := store.seg.file.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close segment %d: %w", store.seg.num, err))
+			errs = append(errs, fmt.Errorf("store: Close: close segment %d: %w", store.seg.num, err))
 		}
 	}
 
 	if err := store.index.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("close index: %w", err))
+		errs = append(errs, fmt.Errorf("store: Close: close index: %w", err))
 	}
 
 	return errors.Join(errs...)
@@ -148,7 +148,7 @@ func (store *Store) saveState() error {
 
 	stateData, err := json.Marshal(state)
 	if err != nil {
-		return fmt.Errorf("failed to marshal state data: %v", err)
+		return fmt.Errorf("store: saveState: marshal: %w", err)
 	}
 
 	return os.WriteFile(filepath.Join(store.dir, stateFileName), stateData, 0600)

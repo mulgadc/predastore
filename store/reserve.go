@@ -29,7 +29,7 @@ func (store *Store) reserve(n int) (exts []*extent, err error) {
 			newSegNum := store.segNum.Load() + 1
 			newSeg, err := openSegment(store.dir, newSegNum)
 			if err != nil {
-				return nil, fmt.Errorf("failed to open segment %d: %w", newSegNum, err)
+				return nil, fmt.Errorf("store: reserve: open segment %d: %w", newSegNum, err)
 			}
 
 			store.segNum.Store(newSegNum)
@@ -51,7 +51,7 @@ func (store *Store) reserve(n int) (exts []*extent, err error) {
 	}
 
 	if err := store.saveState(); err != nil {
-		slog.Warn("store: reserve: failed to save state", "error", err)
+		slog.Warn("store: reserve: save state", "error", err)
 	}
 
 	return exts, nil
