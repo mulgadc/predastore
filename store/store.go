@@ -7,10 +7,12 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -91,8 +93,33 @@ func Open(dir string) (store *Store, err error) {
 }
 
 // Persist Store state and close all underlying files and indexes.
+// Blocks until in-flight writers drain, then closes the active segment
+// and the Badger index.
 func (store *Store) Close() error {
-	panic("store: Close not implemented")
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	var errs []error
+
+	if err := store.saveState(); err != nil {
+		errs = append(errs, fmt.Errorf("save state: %w", err))
+	}
+
+	if store.seg != nil {
+		store.seg.refs.Add(-1)
+		for store.seg.refs.Load() > 0 {
+			runtime.Gosched()
+		}
+		if err := store.seg.file.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close segment %d: %w", store.seg.num, err))
+		}
+	}
+
+	if err := store.index.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close index: %w", err))
+	}
+
+	return errors.Join(errs...)
 }
 
 func (store *Store) loadState() error {
