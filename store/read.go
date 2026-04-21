@@ -48,22 +48,23 @@ func (shard *Shard) ReadAt(p []byte, offset int64) (int, error) {
 		clamped = true
 	}
 
-	// Walk Locations to find the starting location and byte offset within it.
-	var locIndex int
-	var offsetInLoc int64
+	// Walk ByteExtents to find the starting extent and offset within it.
+	var byteExtIndex int
+	var offsetInByteExt int64
 	remaining := offset
-	for i, loc := range shard.Locations {
-		if remaining < int64(loc.Size) {
-			locIndex = i
-			offsetInLoc = remaining
+	for i, byteExt := range shard.ByteExtents {
+		if remaining < int64(byteExt.Size) {
+			byteExtIndex = i
+			offsetInByteExt = remaining
 			break
 		}
-		remaining -= int64(loc.Size)
-		locIndex = len(shard.Locations)
+		remaining -= int64(byteExt.Size)
+		byteExtIndex = len(shard.ByteExtents)
 	}
+
 	// Convert byte offset within the location to a slot index and offset within that slot.
-	slotIndex := int(offsetInLoc / slotPayloadSize)
-	offsetInSlot := int(offsetInLoc % slotPayloadSize)
+	slotIndex := int(offsetInByteExt / slotPayloadSize)
+	offsetInSlot := int(offsetInByteExt % slotPayloadSize)
 
 	bufPtr := slotBufferPool.Get().(*[]byte) //nolint:forcetypeassert,errcheck
 	buf := *bufPtr
@@ -71,25 +72,25 @@ func (shard *Shard) ReadAt(p []byte, offset int64) (int, error) {
 
 	totalCopied := 0
 
-	for locIndex < len(shard.Locations) && totalCopied < len(p) {
-		loc := shard.Locations[locIndex]
-		// Derive slot count from the location's logical byte size.
-		slotsInLoc := (int(loc.Size) + slotPayloadSize - 1) / slotPayloadSize
+	for byteExtIndex < len(shard.ByteExtents) && totalCopied < len(p) {
+		byteExt := shard.ByteExtents[byteExtIndex]
+		// Derive slot count from the ByteExtents's logical byte size.
+		slotsInByteExt := (int(byteExt.Size) + slotPayloadSize - 1) / slotPayloadSize
 
-		f, err := os.Open(filepath.Join(shard.store.dir, fmt.Sprintf("%016d%s", loc.SegmentNum, extension)))
+		f, err := os.Open(filepath.Join(shard.store.dir, fmt.Sprintf("%016d%s", byteExt.SegmentNum, extension)))
 		if err != nil {
-			return totalCopied, fmt.Errorf("store: ReadAt: open segment %d: %w", loc.SegmentNum, err)
+			return totalCopied, fmt.Errorf("store: ReadAt: open segment %d: %w", byteExt.SegmentNum, err)
 		}
 
-		for slotIndex < slotsInLoc && totalCopied < len(p) {
+		for slotIndex < slotsInByteExt && totalCopied < len(p) {
 			// Compute absolute file offset for this slot.
-			diskOffset := int64(loc.Offset) + int64(slotIndex)*int64(totalSlotSize)
+			diskOffset := int64(byteExt.Offset) + int64(slotIndex)*int64(totalSlotSize)
 
 			// Read the full slot (header + padded payload) into the buffer.
 			if _, err := f.ReadAt(buf[:totalSlotSize], diskOffset); err != nil {
 				f.Close()
 				return totalCopied, fmt.Errorf("store: ReadAt: read segment %d offset %d: %w",
-					loc.SegmentNum, diskOffset, err)
+					byteExt.SegmentNum, diskOffset, err)
 			}
 
 			// Validate CRC: zero the stored field, recompute over header + payload.
@@ -101,7 +102,7 @@ func (shard *Shard) ReadAt(p []byte, offset int64) (int, error) {
 			if computed != storedCRC {
 				f.Close()
 				return totalCopied, fmt.Errorf("store: ReadAt: CRC mismatch segment %d offset %d: stored=%08x computed=%08x",
-					loc.SegmentNum, diskOffset, storedCRC, computed)
+					byteExt.SegmentNum, diskOffset, storedCRC, computed)
 			}
 
 			// Extract the logical payload length from the slot header [20:24].
@@ -109,7 +110,7 @@ func (shard *Shard) ReadAt(p []byte, offset int64) (int, error) {
 			if payloadLen > slotPayloadSize {
 				f.Close()
 				return totalCopied, fmt.Errorf("store: ReadAt: invalid payload length %d in segment %d offset %d",
-					payloadLen, loc.SegmentNum, diskOffset)
+					payloadLen, byteExt.SegmentNum, diskOffset)
 			}
 
 			// Copy payload bytes, skipping offsetInSlot on the first slot only.
@@ -123,7 +124,7 @@ func (shard *Shard) ReadAt(p []byte, offset int64) (int, error) {
 
 		f.Close()
 		slotIndex = 0
-		locIndex++
+		byteExtIndex++
 	}
 
 	if clamped {

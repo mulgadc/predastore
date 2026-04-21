@@ -21,7 +21,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 	seqNum := store.seqNum.Load()
 	store.seqNum.Add(uint64(fragCount)) //nolint:gosec // G115: fragCount non-negative
 	shardNum := store.shardNum.Add(1)
-	exts, err := store.reserve(fragCount)
+	slotExts, err := store.reserve(fragCount)
 
 	store.mu.Unlock()
 
@@ -31,7 +31,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 
 	// Release extent refs when done, allowing retired segments to close.
 	defer func() {
-		for _, ext := range exts {
+		for _, ext := range slotExts {
 			ext.Close()
 		}
 	}()
@@ -40,7 +40,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 	remaining := size
 	fragIndex := 0
 
-	for _, ext := range exts {
+	for _, ext := range slotExts {
 		for i := 0; i < ext.size; i++ {
 			bufPtr := slotBufferPool.Get().(*[]byte) //nolint:forcetypeassert,errcheck // Pool.New always returns *[]byte
 			buf := *bufPtr
@@ -92,34 +92,34 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 	}
 
 	// Phase 3: Commit. Fsync all touched segments, then write shard metadata to the index.
-	for _, ext := range exts {
+	for _, ext := range slotExts {
 		if err := ext.seg.file.Sync(); err != nil {
 			return nil, fmt.Errorf("store: Append: fsync segment %d: %w", ext.seg.num, err)
 		}
 	}
 
-	// Build byte-aligned Locations from slot extents.
+	// Build byte extents from slot extents.
 	remaining = size
-	locations := make([]Location, len(exts))
-	for i, ext := range exts {
-		payloadBytes := min(remaining, ext.size*slotPayloadSize)
-		locations[i] = Location{
-			SegmentNum: ext.seg.num,
-			Offset:     uint64(ext.seg.byteOffset(ext.offset)), //nolint:gosec // G115: byteOffset non-negative
-			Size:       uint64(payloadBytes),                   //nolint:gosec // G115: payloadBytes non-negative
+	byteExts := make([]ByteExtent, len(slotExts))
+	for i, slotExt := range slotExts {
+		payloadBytes := min(remaining, slotExt.size*slotPayloadSize)
+		byteExts[i] = ByteExtent{
+			SegmentNum: slotExt.seg.num,
+			Offset:     uint64(slotExt.seg.byteOffset(slotExt.offset)), //nolint:gosec // G115: byteOffset non-negative
+			Size:       uint64(payloadBytes),                           //nolint:gosec // G115: payloadBytes non-negative
 		}
 		remaining -= payloadBytes
 	}
 
-	sh := &Shard{
-		ObjectHash: objectHash,
-		ShardIndex: shardIndex,
-		TotalSize:  size,
-		Locations:  locations,
-		store:      store,
+	shard := &Shard{
+		ObjectHash:  objectHash,
+		ShardIndex:  shardIndex,
+		TotalSize:   size,
+		ByteExtents: byteExts,
+		store:       store,
 	}
 
-	encoded, err := encodeShard(sh)
+	encoded, err := encodeShard(shard)
 	if err != nil {
 		return nil, fmt.Errorf("store: Append: encode shard: %w", err)
 	}
@@ -127,5 +127,5 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 		return nil, fmt.Errorf("store: Append: commit to index: %w", err)
 	}
 
-	return sh, nil
+	return shard, nil
 }

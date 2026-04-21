@@ -7,16 +7,16 @@ import (
 // Shard describes the on-disk footprint of a single object shard.
 // Append and Lookup each return one.
 type Shard struct {
-	ObjectHash [32]byte
-	ShardIndex int
-	TotalSize  int
-	Locations  []Location
+	ObjectHash  [32]byte
+	ShardIndex  int
+	TotalSize   int
+	ByteExtents []ByteExtent
 
 	store *Store
 }
 
-// Location describes one contiguous byte range of shard payload within a segment file.
-type Location struct {
+// ByteExtent describes one contiguous byte range of shard payload within a segment file.
+type ByteExtent struct {
 	SegmentNum uint64
 	Offset     uint64
 	Size       uint64
