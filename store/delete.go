@@ -2,10 +2,10 @@ package store
 
 import "fmt"
 
-// Delete removes the index entry for (objectHash, shardIndex). It does not
+// Delete removes the index entry for the given key. It does not
 // reclaim segment disk space; that is compaction's job.
-func (store *Store) Delete(objectHash [32]byte, shardIndex int) error {
-	if err := store.index.Delete(makeShardKey(objectHash, shardIndex)); err != nil {
+func (store *Store) Delete(key string) error {
+	if err := store.index.Delete([]byte(key)); err != nil {
 		return fmt.Errorf("store: Delete: %w", err)
 	}
 	return nil

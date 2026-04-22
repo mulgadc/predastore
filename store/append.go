@@ -7,19 +7,23 @@ import (
 	"io"
 )
 
-// Append writes an object shard to the store and commits its index entry. It
-// reserves slot extents under a short lock, then drains r into those slots
-// lock-free and fsyncs before returning.
-func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.Reader) (*Shard, error) {
-	// Phase 1: Reserve slots under the lock.
+const writeBufferFragments = 1
+
+var _ ObjectWriter = (*objectWriter)(nil)
+
+// Append reserves slots for an object of the given size and returns an
+// ObjectWriter. The caller writes data via the ObjectWriter and calls
+// Close to fsync and commit. The lock is held only during reservation.
+func (store *Store) Append(key string, size int64) (ObjectWriter, error) {
 	store.mu.Lock()
 
-	// Number of slots needed to hold size bytes of payload.
-	fragCount := (size + slotPayloadSize - 1) / slotPayloadSize
+	fragCount := (int(size) + slotPayloadSize - 1) / slotPayloadSize
+	if fragCount == 0 {
+		fragCount = 1
+	}
 
-	// Snapshot and advance monotonic counters while still under the lock.
 	seqNum := store.seqNum.Load()
-	store.seqNum.Add(uint64(fragCount)) //nolint:gosec // G115: fragCount non-negative
+	store.seqNum.Add(uint64(fragCount))
 	shardNum := store.shardNum.Add(1)
 	slotExts, err := store.reserve(fragCount)
 
@@ -29,103 +33,206 @@ func (store *Store) Append(objectHash [32]byte, shardIndex int, size int, r io.R
 		return nil, fmt.Errorf("store: Append: reserve: %w", err)
 	}
 
-	// Release extent refs when done, allowing retired segments to close.
+	return &objectWriter{
+		store:     store,
+		key:       key,
+		size:      size,
+		exts:      slotExts,
+		seqNum:    seqNum,
+		shardNum:  shardNum,
+		fragCount: fragCount,
+		buf:       make([]byte, writeBufferFragments*slotPayloadSize),
+	}, nil
+}
+
+type objectWriter struct {
+	store     *Store
+	key       string
+	size      int64
+	exts      []*slotExtent
+	seqNum    uint64
+	shardNum  uint64
+	fragCount int
+
+	buf       []byte
+	bufUsed   int
+	fragIndex int
+	written   int64
+	closed    bool
+}
+
+// Write buffers data and flushes full fragments to disk.
+func (ow *objectWriter) Write(p []byte) (int, error) {
+	if ow.closed {
+		return 0, fmt.Errorf("store: objectWriter: write after close")
+	}
+
+	total := 0
+	for len(p) > 0 {
+		space := writeBufferFragments*slotPayloadSize - ow.bufUsed
+		n := copy(ow.buf[ow.bufUsed:ow.bufUsed+space], p)
+		ow.bufUsed += n
+		total += n
+		p = p[n:]
+
+		if ow.bufUsed == writeBufferFragments*slotPayloadSize {
+			if err := ow.flushBuffer(false); err != nil {
+				return total, err
+			}
+		}
+	}
+	return total, nil
+}
+
+// ReadFrom drains r through the same buffering path as Write.
+func (ow *objectWriter) ReadFrom(r io.Reader) (int64, error) {
+	if ow.closed {
+		return 0, fmt.Errorf("store: objectWriter: ReadFrom after close")
+	}
+
+	var total int64
+	for {
+		space := writeBufferFragments*slotPayloadSize - ow.bufUsed
+		n, err := r.Read(ow.buf[ow.bufUsed : ow.bufUsed+space])
+		ow.bufUsed += n
+		total += int64(n)
+
+		if ow.bufUsed == writeBufferFragments*slotPayloadSize {
+			if flushErr := ow.flushBuffer(false); flushErr != nil {
+				return total, flushErr
+			}
+		}
+
+		if err == io.EOF {
+			return total, nil
+		}
+		if err != nil {
+			return total, err
+		}
+	}
+}
+
+// Close flushes any partial fragment, fsyncs all touched segments, commits
+// the object to the index, and releases extent references.
+func (ow *objectWriter) Close() error {
+	if ow.closed {
+		return nil
+	}
+	ow.closed = true
+
 	defer func() {
-		for _, ext := range slotExts {
+		for _, ext := range ow.exts {
 			ext.Close()
 		}
 	}()
 
-	// Phase 2: Write slots lock-free.
-	remaining := size
-	fragIndex := 0
-
-	for _, ext := range slotExts {
-		for i := 0; i < ext.size; i++ {
-			bufPtr := slotBufferPool.Get().(*[]byte) //nolint:forcetypeassert,errcheck // Pool.New always returns *[]byte
-			buf := *bufPtr
-
-			// Read up to one slot's worth of payload from the input.
-			toRead := min(remaining, slotPayloadSize)
-			payloadLen := 0
-			if toRead > 0 {
-				payloadLen, err = io.ReadFull(r, buf[slotHeaderSize:slotHeaderSize+toRead])
-				if err != nil {
-					slotBufferPool.Put(bufPtr)
-					return nil, fmt.Errorf("store: Append: read chunk %d: %w", fragIndex, err)
-				}
-			}
-
-			// Zero-pad the remainder so the CRC covers a full slot.
-			if payloadLen < slotPayloadSize {
-				padStart := slotHeaderSize + payloadLen
-				copy(buf[padStart:slotHeaderSize+slotPayloadSize], zeroPadBuffer[:slotPayloadSize-payloadLen])
-			}
-
-			// Encode the 32-byte slot header.
-			binary.BigEndian.PutUint64(buf[0:8], seqNum+uint64(fragIndex)) // [0:8]   sequence number
-			binary.BigEndian.PutUint64(buf[8:16], shardNum)                // [8:16]  shard number
-			binary.BigEndian.PutUint32(buf[16:20], uint32(fragIndex))      // [16:20] fragment index
-			binary.BigEndian.PutUint32(buf[20:24], uint32(payloadLen))     //nolint:gosec // G115: payloadLen bounded by slotPayloadSize (8 KiB) // [20:24] payload length
-
-			var flags slotFlags
-			if fragIndex == fragCount-1 {
-				flags = flagEndOfShard
-			}
-			binary.BigEndian.PutUint32(buf[24:28], uint32(flags)) // [24:28] flags
-			binary.BigEndian.PutUint32(buf[28:32], 0)             // [28:32] CRC placeholder
-
-			// CRC32-IEEE over header (with CRC field zeroed) + full padded payload.
-			checksum := crc32.ChecksumIEEE(buf[0:slotHeaderSize])
-			checksum = crc32.Update(checksum, crc32.IEEETable, buf[slotHeaderSize:slotHeaderSize+slotPayloadSize])
-			binary.BigEndian.PutUint32(buf[28:32], checksum)
-
-			if _, err := ext.seg.file.WriteAt(buf[:slotHeaderSize+slotPayloadSize], ext.seg.byteOffset(ext.offset+i)); err != nil {
-				slotBufferPool.Put(bufPtr)
-				return nil, fmt.Errorf("store: Append: WriteAt slot %d: %w", fragIndex, err)
-			}
-
-			slotBufferPool.Put(bufPtr)
-			remaining -= payloadLen
-			fragIndex++
+	if ow.bufUsed > 0 {
+		if err := ow.flushBuffer(true); err != nil {
+			return err
 		}
 	}
 
-	// Phase 3: Commit. Fsync all touched segments, then write shard metadata to the index.
-	for _, ext := range slotExts {
+	for _, ext := range ow.exts {
 		if err := ext.seg.file.Sync(); err != nil {
-			return nil, fmt.Errorf("store: Append: fsync segment %d: %w", ext.seg.num, err)
+			return fmt.Errorf("store: objectWriter: fsync segment %d: %w", ext.seg.num, err)
 		}
 	}
 
-	// Build byte extents from slot extents.
-	remaining = size
-	byteExts := make([]ByteExtent, len(slotExts))
-	for i, slotExt := range slotExts {
-		payloadBytes := min(remaining, slotExt.size*slotPayloadSize)
-		byteExts[i] = ByteExtent{
-			SegmentNum: slotExt.seg.num,
-			Offset:     uint64(slotExt.seg.byteOffset(slotExt.offset)), //nolint:gosec // G115: byteOffset non-negative
-			Size:       uint64(payloadBytes),                           //nolint:gosec // G115: payloadBytes non-negative
+	remaining := ow.size
+	byteExts := make([]byteExtent, len(ow.exts))
+	for i, ext := range ow.exts {
+		payloadBytes := min(remaining, int64(ext.size)*int64(slotPayloadSize))
+		byteExts[i] = byteExtent{
+			segmentNum: ext.seg.num,
+			offset:     uint64(ext.seg.byteOffset(ext.offset)), //nolint:gosec // G115: byteOffset non-negative
+			size:       uint64(payloadBytes),                   //nolint:gosec // G115: payloadBytes non-negative
 		}
 		remaining -= payloadBytes
 	}
 
-	shard := &Shard{
-		ObjectHash:  objectHash,
-		ShardIndex:  shardIndex,
-		TotalSize:   size,
-		ByteExtents: byteExts,
-		store:       store,
+	obj := &Object{
+		totalSize:   ow.size,
+		byteExtents: byteExts,
+		store:       ow.store,
 	}
 
-	encoded, err := encodeShard(shard)
+	encoded, err := encodeObject(obj)
 	if err != nil {
-		return nil, fmt.Errorf("store: Append: encode shard: %w", err)
+		return fmt.Errorf("store: objectWriter: encode: %w", err)
 	}
-	if err := store.index.Set(makeShardKey(objectHash, shardIndex), encoded); err != nil {
-		return nil, fmt.Errorf("store: Append: commit to index: %w", err)
+	if err := ow.store.index.Set([]byte(ow.key), encoded); err != nil {
+		return fmt.Errorf("store: objectWriter: commit to index: %w", err)
 	}
 
-	return shard, nil
+	return nil
+}
+
+// flushBuffer writes buffered data as complete slot fragments to disk.
+// If final is true, handles the last (possibly short) fragment.
+func (ow *objectWriter) flushBuffer(final bool) error {
+	offset := 0
+	for offset < ow.bufUsed {
+		payloadLen := min(slotPayloadSize, ow.bufUsed-offset)
+		if !final && payloadLen < slotPayloadSize {
+			break
+		}
+
+		ext, slotInExt := ow.locateSlot(ow.fragIndex)
+		if ext == nil {
+			return fmt.Errorf("store: objectWriter: fragment %d exceeds reserved slots", ow.fragIndex)
+		}
+
+		bufPtr := slotBufferPool.Get().(*[]byte) //nolint:forcetypeassert,errcheck // Pool.New always returns *[]byte
+		slot := *bufPtr
+
+		copy(slot[slotHeaderSize:slotHeaderSize+payloadLen], ow.buf[offset:offset+payloadLen])
+		if payloadLen < slotPayloadSize {
+			copy(slot[slotHeaderSize+payloadLen:slotHeaderSize+slotPayloadSize], zeroPadBuffer[:slotPayloadSize-payloadLen])
+		}
+
+		binary.BigEndian.PutUint64(slot[0:8], ow.seqNum+uint64(ow.fragIndex)) //nolint:gosec // G115: fragIndex non-negative, bounded by fragCount
+		binary.BigEndian.PutUint64(slot[8:16], ow.shardNum)
+		binary.BigEndian.PutUint32(slot[16:20], uint32(ow.fragIndex)) //nolint:gosec // G115: fragIndex non-negative, bounded by fragCount
+		binary.BigEndian.PutUint32(slot[20:24], uint32(payloadLen))   //nolint:gosec // G115: payloadLen bounded by slotPayloadSize (8 KiB)
+		var flags slotFlags
+		if ow.fragIndex == ow.fragCount-1 {
+			flags = flagEndOfShard
+		}
+		binary.BigEndian.PutUint32(slot[24:28], uint32(flags))
+		binary.BigEndian.PutUint32(slot[28:32], 0)
+
+		checksum := crc32.ChecksumIEEE(slot[0:slotHeaderSize])
+		checksum = crc32.Update(checksum, crc32.IEEETable, slot[slotHeaderSize:slotHeaderSize+slotPayloadSize])
+		binary.BigEndian.PutUint32(slot[28:32], checksum)
+
+		diskOffset := ext.seg.byteOffset(ext.offset + slotInExt)
+		if _, err := ext.seg.file.WriteAt(slot[:totalSlotSize], diskOffset); err != nil {
+			slotBufferPool.Put(bufPtr)
+			return fmt.Errorf("store: objectWriter: WriteAt slot %d: %w", ow.fragIndex, err)
+		}
+
+		slotBufferPool.Put(bufPtr)
+		offset += payloadLen
+		ow.written += int64(payloadLen)
+		ow.fragIndex++
+	}
+
+	if offset > 0 {
+		remaining := copy(ow.buf, ow.buf[offset:ow.bufUsed])
+		ow.bufUsed = remaining
+	}
+
+	return nil
+}
+
+// locateSlot maps a fragment index to its extent and slot-within-extent.
+func (ow *objectWriter) locateSlot(fragIndex int) (*slotExtent, int) {
+	idx := fragIndex
+	for _, ext := range ow.exts {
+		if idx < ext.size {
+			return ext, idx
+		}
+		idx -= ext.size
+	}
+	return nil, 0
 }

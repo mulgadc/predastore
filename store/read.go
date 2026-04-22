@@ -9,117 +9,98 @@ import (
 	"path/filepath"
 )
 
-// Lookup fetches the Shard metadata for (objectHash, shardIndex) from the store index.
-func (store *Store) Lookup(objectHash [32]byte, shardIndex int) (*Shard, error) {
-	data, err := store.index.Get(makeShardKey(objectHash, shardIndex))
+const readBufferFragments = 1
+
+// Lookup fetches the Object metadata for key from the store index.
+// Returns (nil, false) if the key does not exist.
+func (store *Store) Lookup(key string) (ObjectReader, bool) {
+	data, err := store.index.Get([]byte(key))
 	if err != nil {
-		return nil, fmt.Errorf("store: Lookup: %w", err)
+		return nil, false
 	}
-	sh, err := decodeShard(data)
+	obj, err := decodeObject(data)
 	if err != nil {
-		return nil, fmt.Errorf("store: Lookup: decode: %w", err)
+		return nil, false
 	}
-	// Attach the Store so the Shard can open segment files for reads.
-	sh.store = store
-	return sh, nil
+	obj.store = store
+	return obj, true
 }
 
-// NewReader returns an io.SectionReader over the full shard.
-func (shard *Shard) NewReader() *io.SectionReader {
-	return io.NewSectionReader(shard, 0, int64(shard.TotalSize))
-}
-
-// NewSectionReader returns an io.SectionReader over [offset, offset+n) bytes of the shard.
-func (shard *Shard) NewSectionReader(offset int64, n int64) *io.SectionReader {
-	return io.NewSectionReader(shard, offset, n)
-}
-
-// ReadAt reads len(p) bytes from the shard starting at byte offset. Stateless and safe for concurrent use.
-func (shard *Shard) ReadAt(p []byte, offset int64) (int, error) {
-	totalSize := int64(shard.TotalSize)
-	if offset >= totalSize {
+// ReadAt reads len(p) bytes from the object starting at byte offset.
+// Stateless and safe for concurrent use. Reads full fragments from disk
+// even for partial requests.
+func (obj *Object) ReadAt(p []byte, offset int64) (int, error) {
+	if offset >= obj.totalSize {
 		return 0, io.EOF
 	}
 
-	// Clamp read to shard bounds; signal EOF after filling.
 	clamped := false
-	if offset+int64(len(p)) > totalSize {
-		p = p[:totalSize-offset]
+	if offset+int64(len(p)) > obj.totalSize {
+		p = p[:obj.totalSize-offset]
 		clamped = true
 	}
 
-	// Walk ByteExtents to find the starting extent and offset within it.
-	var byteExtIndex int
-	var offsetInByteExt int64
-	remaining := offset
-	for i, byteExt := range shard.ByteExtents {
-		if remaining < int64(byteExt.Size) {
-			byteExtIndex = i
-			offsetInByteExt = remaining
-			break
-		}
-		remaining -= int64(byteExt.Size)
-		byteExtIndex = len(shard.ByteExtents)
-	}
+	byteExtIndex, offsetInByteExt := locateByteOffset(obj.byteExtents, offset)
 
-	// Convert byte offset within the location to a slot index and offset within that slot.
 	slotIndex := int(offsetInByteExt / slotPayloadSize)
 	offsetInSlot := int(offsetInByteExt % slotPayloadSize)
 
-	bufPtr := slotBufferPool.Get().(*[]byte) //nolint:forcetypeassert,errcheck
-	buf := *bufPtr
-	defer slotBufferPool.Put(bufPtr)
-
+	fragBuf := make([]byte, readBufferFragments*totalSlotSize)
 	totalCopied := 0
 
-	for byteExtIndex < len(shard.ByteExtents) && totalCopied < len(p) {
-		byteExt := shard.ByteExtents[byteExtIndex]
-		// Derive slot count from the ByteExtents's logical byte size.
-		slotsInByteExt := (int(byteExt.Size) + slotPayloadSize - 1) / slotPayloadSize
+	for byteExtIndex < len(obj.byteExtents) && totalCopied < len(p) {
+		ext := obj.byteExtents[byteExtIndex]
+		slotsInExt := (int(ext.size) + slotPayloadSize - 1) / slotPayloadSize //nolint:gosec // G115: ext.size bounded by segment capacity (~1 GiB)
 
-		f, err := os.Open(filepath.Join(shard.store.dir, fmt.Sprintf("%016d%s", byteExt.SegmentNum, extension)))
+		f, err := os.Open(filepath.Join(obj.store.dir, fmt.Sprintf("%016d%s", ext.segmentNum, extension)))
 		if err != nil {
-			return totalCopied, fmt.Errorf("store: ReadAt: open segment %d: %w", byteExt.SegmentNum, err)
+			return totalCopied, fmt.Errorf("store: ReadAt: open segment %d: %w", ext.segmentNum, err)
 		}
 
-		for slotIndex < slotsInByteExt && totalCopied < len(p) {
-			// Compute absolute file offset for this slot.
-			diskOffset := int64(byteExt.Offset) + int64(slotIndex)*int64(totalSlotSize)
+		for slotIndex < slotsInExt && totalCopied < len(p) {
+			fragsToRead := min(readBufferFragments, slotsInExt-slotIndex)
+			diskOffset := int64(ext.offset) + int64(slotIndex)*int64(totalSlotSize) //nolint:gosec // G115: ext.offset bounded by segment file size
+			readSize := fragsToRead * totalSlotSize
 
-			// Read the full slot (header + padded payload) into the buffer.
-			if _, err := f.ReadAt(buf[:totalSlotSize], diskOffset); err != nil {
+			if _, err := f.ReadAt(fragBuf[:readSize], diskOffset); err != nil {
 				f.Close()
 				return totalCopied, fmt.Errorf("store: ReadAt: read segment %d offset %d: %w",
-					byteExt.SegmentNum, diskOffset, err)
+					ext.segmentNum, diskOffset, err)
 			}
 
-			// Validate CRC: zero the stored field, recompute over header + payload.
-			storedCRC := binary.BigEndian.Uint32(buf[28:32])
-			binary.BigEndian.PutUint32(buf[28:32], 0)
-			computed := crc32.ChecksumIEEE(buf[0:slotHeaderSize])
-			computed = crc32.Update(computed, crc32.IEEETable, buf[slotHeaderSize:slotHeaderSize+slotPayloadSize])
+			for fi := range fragsToRead {
+				if totalCopied >= len(p) {
+					break
+				}
 
-			if computed != storedCRC {
-				f.Close()
-				return totalCopied, fmt.Errorf("store: ReadAt: CRC mismatch segment %d offset %d: stored=%08x computed=%08x",
-					byteExt.SegmentNum, diskOffset, storedCRC, computed)
+				slot := fragBuf[fi*totalSlotSize : (fi+1)*totalSlotSize]
+
+				storedCRC := binary.BigEndian.Uint32(slot[28:32])
+				binary.BigEndian.PutUint32(slot[28:32], 0)
+				computed := crc32.ChecksumIEEE(slot[0:slotHeaderSize])
+				computed = crc32.Update(computed, crc32.IEEETable, slot[slotHeaderSize:slotHeaderSize+slotPayloadSize])
+
+				if computed != storedCRC {
+					f.Close()
+					return totalCopied, fmt.Errorf("store: ReadAt: CRC mismatch segment %d offset %d: stored=%08x computed=%08x",
+						ext.segmentNum, diskOffset+int64(fi)*int64(totalSlotSize), storedCRC, computed)
+				}
+
+				payloadLen := int(binary.BigEndian.Uint32(slot[20:24]))
+				if payloadLen > slotPayloadSize {
+					f.Close()
+					return totalCopied, fmt.Errorf("store: ReadAt: invalid payload length %d in segment %d offset %d",
+						payloadLen, ext.segmentNum, diskOffset+int64(fi)*int64(totalSlotSize))
+				}
+
+				payloadStart := slotHeaderSize + offsetInSlot
+				payloadEnd := slotHeaderSize + payloadLen
+				n := copy(p[totalCopied:], slot[payloadStart:payloadEnd])
+				totalCopied += n
+				offsetInSlot = 0
 			}
 
-			// Extract the logical payload length from the slot header [20:24].
-			payloadLen := int(binary.BigEndian.Uint32(buf[20:24]))
-			if payloadLen > slotPayloadSize {
-				f.Close()
-				return totalCopied, fmt.Errorf("store: ReadAt: invalid payload length %d in segment %d offset %d",
-					payloadLen, byteExt.SegmentNum, diskOffset)
-			}
-
-			// Copy payload bytes, skipping offsetInSlot on the first slot only.
-			payloadStart := slotHeaderSize + offsetInSlot
-			payloadEnd := slotHeaderSize + payloadLen
-			n := copy(p[totalCopied:], buf[payloadStart:payloadEnd])
-			totalCopied += n
-			offsetInSlot = 0
-			slotIndex++
+			slotIndex += fragsToRead
 		}
 
 		f.Close()
@@ -131,4 +112,23 @@ func (shard *Shard) ReadAt(p []byte, offset int64) (int, error) {
 		return totalCopied, io.EOF
 	}
 	return totalCopied, nil
+}
+
+// WriteTo streams the full object to w. Implements io.WriterTo.
+func (obj *Object) WriteTo(w io.Writer) (int64, error) {
+	sr := io.NewSectionReader(obj, 0, obj.totalSize)
+	return io.Copy(w, sr)
+}
+
+// locateByteOffset walks byteExtents to find which extent and offset-within-extent
+// a given global byte offset falls in.
+func locateByteOffset(exts []byteExtent, off int64) (extIndex int, offsetInExt int64) {
+	remaining := off
+	for i, ext := range exts {
+		if remaining < int64(ext.size) { //nolint:gosec // G115: ext.size bounded by segment capacity
+			return i, remaining
+		}
+		remaining -= int64(ext.size) //nolint:gosec // G115: ext.size bounded by segment capacity
+	}
+	return len(exts), 0
 }

@@ -20,6 +20,8 @@ import (
 	"github.com/mulgadc/predastore/s3db"
 )
 
+var _ ObjectStore = (*Store)(nil)
+
 const stateFileName = "state.json"
 const indexFileName = "db"
 
