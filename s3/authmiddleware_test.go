@@ -1,10 +1,12 @@
 package s3
 
 import (
+	"bytes"
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -256,6 +258,53 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			assert.Equal(t, tt.expectStatus, rr.Code)
 		})
 	}
+}
+
+// TestSigV4AuthMiddleware_OversizeSignedBody verifies that a signed request
+// whose body exceeds maxAuthBodySize and does not use UNSIGNED-PAYLOAD or a
+// precomputed hash is rejected with 413 EntityTooLarge, not buffered and
+// OOMed. This is the pre-auth DoS guard.
+func TestSigV4AuthMiddleware_OversizeSignedBody(t *testing.T) {
+	s3Config := &Config{
+		Region: "ap-southeast-2",
+		Buckets: []S3_Buckets{{
+			Name:     "test-bucket01",
+			Region:   "ap-southeast-2",
+			Type:     "fs",
+			Pathname: "tests/data/test-bucket01",
+			Public:   false,
+		}},
+		Auth: []AuthEntry{{
+			AccessKeyID:     "TESTACCESSKEY",
+			SecretAccessKey: "TESTSECRETKEY",
+			Policy: []PolicyRule{{
+				Bucket:  "test-bucket01",
+				Actions: []string{"s3:PutObject"},
+			}},
+		}},
+	}
+
+	server := NewHTTP2Server(s3Config)
+
+	// Body 1 byte over the cap — exercises the MaxBytesReader reject path
+	// without allocating an unreasonable amount of memory in tests.
+	body := strings.Repeat("A", maxAuthBodySize+1)
+	req := httptest.NewRequest(http.MethodPut, "/test-bucket01/big-object", bytes.NewReader([]byte(body)))
+
+	timestamp := time.Now().UTC().Format(auth.TimeFormat)
+	err := auth.GenerateAuthHeaderReq(
+		"TESTACCESSKEY", "TESTSECRETKEY",
+		timestamp, "ap-southeast-2", "s3", req,
+	)
+	assert.NoError(t, err)
+	// Intentionally do not set X-Amz-Content-Sha256 — leaves middleware on
+	// the default (read-body) branch.
+
+	rr := httptest.NewRecorder()
+	server.GetHandler().ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, rr.Code)
+	assert.Contains(t, rr.Body.String(), "EntityTooLarge")
 }
 
 // TestGetSigningKey verifies the key derivation process

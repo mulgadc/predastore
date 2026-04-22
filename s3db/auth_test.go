@@ -1,6 +1,8 @@
 package s3db
 
 import (
+	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -237,4 +239,32 @@ func TestValidateSignatureHTTP_Integration(t *testing.T) {
 func TestDefaultConstants(t *testing.T) {
 	assert.Equal(t, "us-east-1", DefaultRegion)
 	assert.Equal(t, "s3db", DefaultService)
+}
+
+// TestValidateSignatureHTTP_MaxBytesReader verifies that when the caller
+// wraps r.Body with http.MaxBytesReader before invoking signature
+// validation, an oversize body surfaces as an *http.MaxBytesError — this is
+// what authMiddleware relies on to return 413 instead of 500.
+func TestValidateSignatureHTTP_MaxBytesReader(t *testing.T) {
+	credentials := map[string]string{"TESTACCESSKEY": "TESTSECRETKEY"}
+
+	const limit = 1024
+	body := bytes.Repeat([]byte("A"), limit+1)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/put/test-table/test-key", bytes.NewReader(body))
+	req.Host = "localhost:6660"
+
+	timestamp := time.Now().UTC().Format(auth.TimeFormat)
+	err := auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", timestamp, "us-east-1", "s3db", req)
+	assert.NoError(t, err)
+
+	rr := httptest.NewRecorder()
+	req.Body = http.MaxBytesReader(rr, req.Body, limit)
+
+	_, gotErr := ValidateSignatureHTTP(req, credentials, "us-east-1", "s3db")
+	assert.Error(t, gotErr)
+
+	var maxBytesErr *http.MaxBytesError
+	assert.True(t, errors.As(gotErr, &maxBytesErr),
+		"expected *http.MaxBytesError, got %T: %v", gotErr, gotErr)
 }
