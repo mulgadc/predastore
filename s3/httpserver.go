@@ -38,6 +38,14 @@ import (
 // timestamp and the server's current time. Matches spinifex gateway (5 min).
 const maxClockSkew = 5 * time.Minute
 
+// maxAuthBodySize caps the request body read during SigV4 validation when
+// the client did not supply a streaming indicator or precomputed payload
+// hash. Prevents unauthenticated callers from triggering OOM by buffering
+// an unbounded body before signature verification fails. Legitimate large
+// uploads use UNSIGNED-PAYLOAD, STREAMING-UNSIGNED-PAYLOAD-TRAILER, or a
+// precomputed hex SHA-256 and never hit this path.
+const maxAuthBodySize = 10 * 1024 * 1024
+
 // HTTP2Server is an HTTP/2 compatible S3 server using net/http
 type HTTP2Server struct {
 	config    *Config
@@ -342,9 +350,19 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			// the hash, the signature won't match.
 			payloadHash = payloadEncoding
 		default:
-			// Read body for signature verification
+			// Read body for signature verification, capped so an attacker
+			// cannot force unbounded memory use before the signature check.
+			r.Body = http.MaxBytesReader(w, r.Body, maxAuthBodySize)
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
+				var maxBytesErr *http.MaxBytesError
+				if errors.As(err, &maxBytesErr) {
+					slog.Warn("Request body exceeds auth size limit",
+						"limit", maxAuthBodySize, "accessKeyID", accessKey)
+					s.writeS3Error(w, r, http.StatusRequestEntityTooLarge, "EntityTooLarge",
+						"Request body exceeds signature validation size limit")
+					return
+				}
 				s.writeS3Error(w, r, http.StatusInternalServerError, "InternalError", "Failed to read request body")
 				return
 			}
@@ -378,7 +396,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		expectedSig := auth.HmacSHA256Hex(signingKey, stringToSign)
 
 		if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(signature)) != 1 {
-			slog.Debug("Invalid signature", "expected", expectedSig, "actual", signature)
+			slog.Debug("Invalid signature", "accessKeyID", accessKey)
 			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request signature does not match")
 			return
 		}

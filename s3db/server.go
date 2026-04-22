@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -22,6 +23,11 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/mulgadc/predastore/auth"
 )
+
+// maxAuthBodySize bounds the request body read during SigV4 validation to
+// prevent unauthenticated callers from triggering OOM by streaming a large
+// payload before signature verification fails.
+const maxAuthBodySize = 10 * 1024 * 1024
 
 // Server provides HTTP REST API for the distributed database
 type Server struct {
@@ -149,9 +155,22 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			service = DefaultService
 		}
 
+		// Bound the body before signature validation reads it, so a forged
+		// Authorization header cannot force us to buffer a huge payload.
+		r.Body = http.MaxBytesReader(w, r.Body, maxAuthBodySize)
+
 		// Validate the signature
 		accessKey, err := ValidateSignatureHTTP(r, s.config.Credentials, region, service)
 		if err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				slog.Warn("Request body exceeds auth size limit", "limit", maxAuthBodySize)
+				s.writeJSON(w, http.StatusRequestEntityTooLarge, ErrorResponse{
+					Error:   "EntityTooLarge",
+					Message: "Request body exceeds signature validation size limit",
+				})
+				return
+			}
 			slog.Debug("Auth failed", "error", err)
 			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
 				Error:   "AccessDenied",
