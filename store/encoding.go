@@ -34,13 +34,3 @@ func decodeShard(data []byte) (shard *Shard, err error) {
 	}
 	return shard, nil
 }
-
-// segmentHeader returns the on-disk segment file header bytes.
-func segmentHeader(magic [4]byte, version uint16) []byte { //nolint:unused // stub for Stage 3
-	panic("store: segmentHeader not implemented")
-}
-
-// parseSegmentHeader decodes a segment file header.
-func parseSegmentHeader(data []byte) (magic [4]byte, version uint16, err error) { //nolint:unused // stub for Stage 3
-	panic("store: parseSegmentHeader not implemented")
-}
