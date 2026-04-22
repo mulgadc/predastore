@@ -2,6 +2,7 @@ package s3db
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -734,8 +735,8 @@ func ValidateSignatureHTTP(r *http.Request, credentials map[string]string, regio
 	signingKey := auth.GetSigningKey(secretKey, date, reqRegion, reqService)
 	expectedSig := auth.HmacSHA256Hex(signingKey, stringToSign)
 
-	// Compare signatures
-	if expectedSig != signature {
+	// Compare signatures using constant-time comparison to prevent timing attacks
+	if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(signature)) != 1 {
 		return "", fmt.Errorf("signature mismatch")
 	}
 
