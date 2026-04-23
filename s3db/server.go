@@ -29,6 +29,12 @@ import (
 // payload before signature verification fails.
 const maxAuthBodySize = 10 * 1024 * 1024
 
+// maxClockSkew is the maximum allowed difference between the X-Amz-Date
+// request timestamp and the server's current time. Matches the S3 API and
+// spinifex gateway (5 min) to bound replay-attack windows on the Raft-backed
+// IAM state store.
+const maxClockSkew = 5 * time.Minute
+
 // Server provides HTTP REST API for the distributed database
 type Server struct {
 	config *ServerConfig
@@ -681,6 +687,17 @@ func ValidateSignatureHTTP(r *http.Request, credentials map[string]string, regio
 	timestamp := r.Header.Get("X-Amz-Date")
 	if timestamp == "" {
 		return "", fmt.Errorf("missing X-Amz-Date header")
+	}
+
+	// Replay protection: enforce clock skew against X-Amz-Date. s3db gates
+	// Raft-backed IAM state, so a captured Authorization header must not be
+	// replayable indefinitely.
+	parsedTime, err := time.Parse(auth.TimeFormat, timestamp)
+	if err != nil {
+		return "", fmt.Errorf("invalid X-Amz-Date header format: %w", err)
+	}
+	if time.Since(parsedTime).Abs() > maxClockSkew {
+		return "", fmt.Errorf("request timestamp outside allowed skew")
 	}
 
 	// Build canonical URI

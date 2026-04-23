@@ -241,6 +241,62 @@ func TestDefaultConstants(t *testing.T) {
 	assert.Equal(t, "s3db", DefaultService)
 }
 
+// TestValidateSignatureHTTP_ReplayProtection verifies that captured
+// Authorization headers cannot be replayed outside the clock-skew window.
+// s3db gates Raft-backed IAM state, which is why replay protection matters
+// even though region/service are not treated as isolation boundaries.
+func TestValidateSignatureHTTP_ReplayProtection(t *testing.T) {
+	credentials := map[string]string{"TESTACCESSKEY": "TESTSECRETKEY"}
+	const region = "us-east-1"
+	const service = "s3db"
+
+	tests := []struct {
+		name         string
+		setupHeaders func(req *http.Request)
+		wantErrSub   string
+	}{
+		{
+			name: "Stale X-Amz-Date (>5 min) rejected",
+			setupHeaders: func(req *http.Request) {
+				stale := time.Now().UTC().Add(-10 * time.Minute).Format(auth.TimeFormat)
+				assert.NoError(t, auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", stale, region, service, req))
+			},
+			wantErrSub: "outside allowed skew",
+		},
+		{
+			name: "Future X-Amz-Date (>5 min) rejected",
+			setupHeaders: func(req *http.Request) {
+				future := time.Now().UTC().Add(10 * time.Minute).Format(auth.TimeFormat)
+				assert.NoError(t, auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", future, region, service, req))
+			},
+			wantErrSub: "outside allowed skew",
+		},
+		{
+			name: "Malformed X-Amz-Date rejected",
+			setupHeaders: func(req *http.Request) {
+				ts := time.Now().UTC().Format(auth.TimeFormat)
+				assert.NoError(t, auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", ts, region, service, req))
+				req.Header.Set("X-Amz-Date", "not-a-date")
+			},
+			wantErrSub: "invalid X-Amz-Date",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/get/test-table/test-key", nil)
+			req.Host = "localhost:6660"
+			tt.setupHeaders(req)
+
+			_, err := ValidateSignatureHTTP(req, credentials, region, service)
+			assert.Error(t, err)
+			if err != nil {
+				assert.Contains(t, err.Error(), tt.wantErrSub)
+			}
+		})
+	}
+}
+
 // TestValidateSignatureHTTP_MaxBytesReader verifies that when the caller
 // wraps r.Body with http.MaxBytesReader before invoking signature
 // validation, an oversize body surfaces as an *http.MaxBytesError — this is
