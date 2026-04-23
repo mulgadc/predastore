@@ -9,42 +9,6 @@ import (
 
 const writeBufferFragments = 1
 
-var _ ObjectWriter = (*objectWriter)(nil)
-
-// Append reserves slots for an object of the given size and returns an
-// ObjectWriter. The caller writes data via the ObjectWriter and calls
-// Close to fsync and commit. The lock is held only during reservation.
-func (store *Store) Append(key string, size int64) (ObjectWriter, error) {
-	store.mu.Lock()
-
-	fragCount := (int(size) + slotPayloadSize - 1) / slotPayloadSize
-	if fragCount == 0 {
-		fragCount = 1
-	}
-
-	seqNum := store.seqNum.Load()
-	store.seqNum.Add(uint64(fragCount))
-	shardNum := store.shardNum.Add(1)
-	slotExts, err := store.reserve(fragCount)
-
-	store.mu.Unlock()
-
-	if err != nil {
-		return nil, fmt.Errorf("store: Append: reserve: %w", err)
-	}
-
-	return &objectWriter{
-		store:     store,
-		key:       key,
-		size:      size,
-		exts:      slotExts,
-		seqNum:    seqNum,
-		shardNum:  shardNum,
-		fragCount: fragCount,
-		buf:       make([]byte, writeBufferFragments*slotPayloadSize),
-	}, nil
-}
-
 type objectWriter struct {
 	store     *Store
 	key       string
@@ -69,13 +33,13 @@ func (ow *objectWriter) Write(p []byte) (int, error) {
 
 	total := 0
 	for len(p) > 0 {
-		space := writeBufferFragments*slotPayloadSize - ow.bufUsed
+		space := writeBufferFragments*fragSize - ow.bufUsed
 		n := copy(ow.buf[ow.bufUsed:ow.bufUsed+space], p)
 		ow.bufUsed += n
 		total += n
 		p = p[n:]
 
-		if ow.bufUsed == writeBufferFragments*slotPayloadSize {
+		if ow.bufUsed == writeBufferFragments*fragSize {
 			if err := ow.flushBuffer(false); err != nil {
 				return total, err
 			}
@@ -92,12 +56,12 @@ func (ow *objectWriter) ReadFrom(r io.Reader) (int64, error) {
 
 	var total int64
 	for {
-		space := writeBufferFragments*slotPayloadSize - ow.bufUsed
+		space := writeBufferFragments*fragSize - ow.bufUsed
 		n, err := r.Read(ow.buf[ow.bufUsed : ow.bufUsed+space])
 		ow.bufUsed += n
 		total += int64(n)
 
-		if ow.bufUsed == writeBufferFragments*slotPayloadSize {
+		if ow.bufUsed == writeBufferFragments*fragSize {
 			if flushErr := ow.flushBuffer(false); flushErr != nil {
 				return total, flushErr
 			}
@@ -141,7 +105,7 @@ func (ow *objectWriter) Close() error {
 	remaining := ow.size
 	byteExts := make([]byteExtent, len(ow.exts))
 	for i, ext := range ow.exts {
-		payloadBytes := min(remaining, int64(ext.size)*int64(slotPayloadSize))
+		payloadBytes := min(remaining, int64(ext.size)*int64(fragSize))
 		byteExts[i] = byteExtent{
 			segmentNum: ext.seg.num,
 			offset:     uint64(ext.seg.byteOffset(ext.offset)), //nolint:gosec // G115: byteOffset non-negative
@@ -150,7 +114,7 @@ func (ow *objectWriter) Close() error {
 		remaining -= payloadBytes
 	}
 
-	obj := &Object{
+	obj := &objectReader{
 		totalSize:   ow.size,
 		byteExtents: byteExts,
 		store:       ow.store,
@@ -167,13 +131,11 @@ func (ow *objectWriter) Close() error {
 	return nil
 }
 
-// flushBuffer writes buffered data as complete slot fragments to disk.
-// If final is true, handles the last (possibly short) fragment.
 func (ow *objectWriter) flushBuffer(final bool) error {
 	offset := 0
 	for offset < ow.bufUsed {
-		payloadLen := min(slotPayloadSize, ow.bufUsed-offset)
-		if !final && payloadLen < slotPayloadSize {
+		payloadLen := min(fragSize, ow.bufUsed-offset)
+		if !final && payloadLen < fragSize {
 			break
 		}
 
@@ -186,8 +148,8 @@ func (ow *objectWriter) flushBuffer(final bool) error {
 		slot := *bufPtr
 
 		copy(slot[slotHeaderSize:slotHeaderSize+payloadLen], ow.buf[offset:offset+payloadLen])
-		if payloadLen < slotPayloadSize {
-			copy(slot[slotHeaderSize+payloadLen:slotHeaderSize+slotPayloadSize], zeroPadBuffer[:slotPayloadSize-payloadLen])
+		if payloadLen < fragSize {
+			copy(slot[slotHeaderSize+payloadLen:slotHeaderSize+fragSize], zeroPadBuffer[:fragSize-payloadLen])
 		}
 
 		binary.BigEndian.PutUint64(slot[0:8], ow.seqNum+uint64(ow.fragIndex)) //nolint:gosec // G115: fragIndex non-negative, bounded by fragCount
@@ -202,11 +164,11 @@ func (ow *objectWriter) flushBuffer(final bool) error {
 		binary.BigEndian.PutUint32(slot[28:32], 0)
 
 		checksum := crc32.ChecksumIEEE(slot[0:slotHeaderSize])
-		checksum = crc32.Update(checksum, crc32.IEEETable, slot[slotHeaderSize:slotHeaderSize+slotPayloadSize])
+		checksum = crc32.Update(checksum, crc32.IEEETable, slot[slotHeaderSize:slotHeaderSize+fragSize])
 		binary.BigEndian.PutUint32(slot[28:32], checksum)
 
 		diskOffset := ext.seg.byteOffset(ext.offset + slotInExt)
-		if _, err := ext.seg.file.WriteAt(slot[:totalSlotSize], diskOffset); err != nil {
+		if _, err := ext.seg.file.WriteAt(slot[:slotSize], diskOffset); err != nil {
 			slotBufferPool.Put(bufPtr)
 			return fmt.Errorf("store: objectWriter: WriteAt slot %d: %w", ow.fragIndex, err)
 		}
@@ -225,7 +187,6 @@ func (ow *objectWriter) flushBuffer(final bool) error {
 	return nil
 }
 
-// locateSlot maps a fragment index to its extent and slot-within-extent.
 func (ow *objectWriter) locateSlot(fragIndex int) (*slotExtent, int) {
 	idx := fragIndex
 	for _, ext := range ow.exts {

@@ -10,15 +10,15 @@ import (
 // slotBufferPool reuses slot-sized buffers (slotHeaderSize + slotPayloadSize = 8224 bytes).
 var slotBufferPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, int(slotHeaderSize+slotPayloadSize))
+		b := make([]byte, int(slotHeaderSize+fragSize))
 		return &b
 	},
 }
 
 // zeroPadBuffer is a pre-allocated zero slice for clearing the padding region of a slot payload.
-var zeroPadBuffer = make([]byte, int(slotPayloadSize))
+var zeroPadBuffer = make([]byte, int(fragSize))
 
-// objectWire is the gob-serialisable form of Object. All Object fields are private,
+// objectWire is the gob-serialisable form of objectReader. All fields are private,
 // so we need exported fields for gob round-tripping.
 type objectWire struct {
 	TotalSize   int64
@@ -31,7 +31,7 @@ type byteExtentWire struct {
 	Size       uint64
 }
 
-func encodeObject(obj *Object) ([]byte, error) {
+func encodeObject(obj *objectReader) ([]byte, error) {
 	w := objectWire{TotalSize: obj.totalSize}
 	w.ByteExtents = make([]byteExtentWire, len(obj.byteExtents))
 	for i, ext := range obj.byteExtents {
@@ -48,12 +48,12 @@ func encodeObject(obj *Object) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func decodeObject(data []byte) (*Object, error) {
+func decodeObject(data []byte) (*objectReader, error) {
 	var w objectWire
 	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&w); err != nil {
 		return nil, fmt.Errorf("store: decodeObject: %w", err)
 	}
-	obj := &Object{totalSize: w.TotalSize}
+	obj := &objectReader{totalSize: w.TotalSize}
 	obj.byteExtents = make([]byteExtent, len(w.ByteExtents))
 	for i, ext := range w.ByteExtents {
 		obj.byteExtents[i] = byteExtent{

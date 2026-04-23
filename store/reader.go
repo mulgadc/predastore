@@ -11,25 +11,31 @@ import (
 
 const readBufferFragments = 1
 
-// Lookup fetches the Object metadata for key from the store index.
-// Returns (nil, false) if the key does not exist.
-func (store *Store) Lookup(key string) (ObjectReader, bool) {
-	data, err := store.index.Get([]byte(key))
-	if err != nil {
-		return nil, false
-	}
-	obj, err := decodeObject(data)
-	if err != nil {
-		return nil, false
-	}
-	obj.store = store
-	return obj, true
+type objectReader struct {
+	totalSize   int64
+	byteExtents []byteExtent
+
+	store *Store
+}
+
+type byteExtent struct {
+	segmentNum uint64
+	offset     uint64
+	size       uint64
+}
+
+func (obj *objectReader) Size() int64 {
+	return obj.totalSize
+}
+
+func (obj *objectReader) Close() error {
+	return nil
 }
 
 // ReadAt reads len(p) bytes from the object starting at byte offset.
 // Stateless and safe for concurrent use. Reads full fragments from disk
 // even for partial requests.
-func (obj *Object) ReadAt(p []byte, offset int64) (int, error) {
+func (obj *objectReader) ReadAt(p []byte, offset int64) (int, error) {
 	if offset >= obj.totalSize {
 		return 0, io.EOF
 	}
@@ -42,15 +48,15 @@ func (obj *Object) ReadAt(p []byte, offset int64) (int, error) {
 
 	byteExtIndex, offsetInByteExt := locateByteOffset(obj.byteExtents, offset)
 
-	slotIndex := int(offsetInByteExt / slotPayloadSize)
-	offsetInSlot := int(offsetInByteExt % slotPayloadSize)
+	slotIndex := int(offsetInByteExt / fragSize)
+	offsetInSlot := int(offsetInByteExt % fragSize)
 
-	fragBuf := make([]byte, readBufferFragments*totalSlotSize)
+	fragBuf := make([]byte, readBufferFragments*slotSize)
 	totalCopied := 0
 
 	for byteExtIndex < len(obj.byteExtents) && totalCopied < len(p) {
 		ext := obj.byteExtents[byteExtIndex]
-		slotsInExt := (int(ext.size) + slotPayloadSize - 1) / slotPayloadSize //nolint:gosec // G115: ext.size bounded by segment capacity (~1 GiB)
+		slotsInExt := (int(ext.size) + fragSize - 1) / fragSize //nolint:gosec // G115: ext.size bounded by segment capacity (~1 GiB)
 
 		f, err := os.Open(filepath.Join(obj.store.dir, fmt.Sprintf("%016d%s", ext.segmentNum, extension)))
 		if err != nil {
@@ -59,8 +65,8 @@ func (obj *Object) ReadAt(p []byte, offset int64) (int, error) {
 
 		for slotIndex < slotsInExt && totalCopied < len(p) {
 			fragsToRead := min(readBufferFragments, slotsInExt-slotIndex)
-			diskOffset := int64(ext.offset) + int64(slotIndex)*int64(totalSlotSize) //nolint:gosec // G115: ext.offset bounded by segment file size
-			readSize := fragsToRead * totalSlotSize
+			diskOffset := int64(ext.offset) + int64(slotIndex)*int64(slotSize) //nolint:gosec // G115: ext.offset bounded by segment file size
+			readSize := fragsToRead * slotSize
 
 			if _, err := f.ReadAt(fragBuf[:readSize], diskOffset); err != nil {
 				f.Close()
@@ -73,24 +79,24 @@ func (obj *Object) ReadAt(p []byte, offset int64) (int, error) {
 					break
 				}
 
-				slot := fragBuf[fi*totalSlotSize : (fi+1)*totalSlotSize]
+				slot := fragBuf[fi*slotSize : (fi+1)*slotSize]
 
 				storedCRC := binary.BigEndian.Uint32(slot[28:32])
 				binary.BigEndian.PutUint32(slot[28:32], 0)
 				computed := crc32.ChecksumIEEE(slot[0:slotHeaderSize])
-				computed = crc32.Update(computed, crc32.IEEETable, slot[slotHeaderSize:slotHeaderSize+slotPayloadSize])
+				computed = crc32.Update(computed, crc32.IEEETable, slot[slotHeaderSize:slotHeaderSize+fragSize])
 
 				if computed != storedCRC {
 					f.Close()
 					return totalCopied, fmt.Errorf("store: ReadAt: CRC mismatch segment %d offset %d: stored=%08x computed=%08x",
-						ext.segmentNum, diskOffset+int64(fi)*int64(totalSlotSize), storedCRC, computed)
+						ext.segmentNum, diskOffset+int64(fi)*int64(slotSize), storedCRC, computed)
 				}
 
 				payloadLen := int(binary.BigEndian.Uint32(slot[20:24]))
-				if payloadLen > slotPayloadSize {
+				if payloadLen > fragSize {
 					f.Close()
 					return totalCopied, fmt.Errorf("store: ReadAt: invalid payload length %d in segment %d offset %d",
-						payloadLen, ext.segmentNum, diskOffset+int64(fi)*int64(totalSlotSize))
+						payloadLen, ext.segmentNum, diskOffset+int64(fi)*int64(slotSize))
 				}
 
 				payloadStart := slotHeaderSize + offsetInSlot
@@ -115,13 +121,11 @@ func (obj *Object) ReadAt(p []byte, offset int64) (int, error) {
 }
 
 // WriteTo streams the full object to w. Implements io.WriterTo.
-func (obj *Object) WriteTo(w io.Writer) (int64, error) {
+func (obj *objectReader) WriteTo(w io.Writer) (int64, error) {
 	sr := io.NewSectionReader(obj, 0, obj.totalSize)
 	return io.Copy(w, sr)
 }
 
-// locateByteOffset walks byteExtents to find which extent and offset-within-extent
-// a given global byte offset falls in.
 func locateByteOffset(exts []byteExtent, off int64) (extIndex int, offsetInExt int64) {
 	remaining := off
 	for i, ext := range exts {

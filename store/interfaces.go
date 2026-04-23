@@ -5,7 +5,7 @@ import "io"
 type ObjectStore interface {
 	io.Closer
 
-	Lookup(key string) (obj ObjectReader, ok bool)
+	Lookup(key string) (obj ObjectReader, err error)
 	Append(key string, size int64) (obj ObjectWriter, err error)
 	Delete(key string) error
 }
