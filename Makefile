@@ -2,13 +2,16 @@ GO_PROJECT_NAME := s3d
 SHELL := /bin/bash
 
 # Quiet-mode filters (active when QUIET=1, set by preflight via recursive make)
+# Note: grep pipelines use PIPESTATUS[0] so the exit status of `go test`
+# propagates through the filter — otherwise a test failure is swallowed by
+# grep's own (success) exit code and preflight prints "passed" on red.
 ifdef QUIET
   _Q     = @
-  _COVQ  = 2>&1 | grep -Ev '^\s*(ok|PASS|\?|=== RUN|--- PASS:)\s' | grep -v 'coverage: 0\.0%' || true
+  _COVQ  = 2>&1 | { grep -Ev '^\s*(ok|PASS|\?|=== RUN|--- PASS:)\s' | grep -v 'coverage: 0\.0%' || true; }; exit $${PIPESTATUS[0]}
   _RACEQ = 2>&1 | { grep -Ev '^\s*(ok|PASS|\?|=== RUN|--- PASS:)\s' || true; }; exit $${PIPESTATUS[0]}
 else
   _Q     =
-  _COVQ  = || true
+  _COVQ  =
   _RACEQ =
 endif
 
@@ -43,8 +46,6 @@ test:
 	LOG_IGNORE=1 go test -timeout 120s ./...
 
 # Run unit tests with coverage profile
-# Note: go test may exit non-zero due to Go version mismatch in coverage instrumentation
-# for packages without test files. We check actual test results + coverage threshold instead.
 COVERPROFILE ?= coverage.out
 test-cover:
 	@echo -e "\n....Running tests with coverage for $(GO_PROJECT_NAME)...."
