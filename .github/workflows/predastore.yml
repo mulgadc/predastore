@@ -1,4 +1,4 @@
-name: Predastore Build and Test
+name: Build and Test
 
 on:
   push:
@@ -14,7 +14,7 @@ on:
 
 jobs:
   build_and_test:
-    name: Predastore Build and Test
+    name: Build and Test
     runs-on: ubuntu-24.04
 
     steps:
@@ -39,7 +39,7 @@ jobs:
         run: scripts/diff-coverage.sh coverage.out --base HEAD~1
 
   race_detection:
-    name: Predastore Race Detection
+    name: Race Detection
     runs-on: ubuntu-24.04
 
     steps:
@@ -56,7 +56,7 @@ jobs:
         run: make test-race
 
   lint_and_security:
-    name: Predastore Lint and Security
+    name: Lint and Security
     runs-on: ubuntu-24.04
 
     steps:
