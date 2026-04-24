@@ -396,7 +396,23 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		expectedSig := auth.HmacSHA256Hex(signingKey, stringToSign)
 
 		if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(signature)) != 1 {
-			slog.Debug("Invalid signature", "accessKeyID", accessKey)
+			slog.Warn("SigV4 signature mismatch",
+				"accessKeyID", accessKey,
+				"method", method,
+				"path", path,
+				"host", r.Host,
+				"amzDate", amzDate,
+				"signedHeaders", signedHeaders,
+				"payloadHashHeader", payloadEncoding,
+				"contentLength", r.Header.Get("Content-Length"),
+				"userAgent", r.Header.Get("User-Agent"),
+				"proto", r.Proto,
+				"remoteAddr", r.RemoteAddr,
+				"expectedSigPrefix", sigPrefix(expectedSig),
+				"providedSigPrefix", sigPrefix(signature),
+				"canonicalRequest", canonicalRequest,
+				"stringToSign", stringToSign,
+			)
 			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request signature does not match")
 			return
 		}
@@ -966,6 +982,15 @@ func (s *HTTP2Server) GetRouter() chi.Router {
 // GetHandler returns the HTTP handler for testing with httptest
 func (s *HTTP2Server) GetHandler() http.Handler {
 	return s.router
+}
+
+// sigPrefix returns the first 8 chars of a hex signature for diagnostics.
+// Logging the full signature is avoided to limit replay exposure within the SigV4 window.
+func sigPrefix(s string) string {
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8]
 }
 
 // isHexSHA256 returns true if s is exactly 64 lowercase hex characters (a SHA-256 digest).
