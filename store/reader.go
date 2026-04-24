@@ -9,14 +9,7 @@ import (
 	"path/filepath"
 )
 
-const readBufferFragments = 1
-
-type objectReader struct {
-	totalSize   int64
-	byteExtents []byteExtent
-
-	store *Store
-}
+const readBufferSlots = 1
 
 type byteExtent struct {
 	segmentNum uint64

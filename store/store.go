@@ -6,108 +6,82 @@
 package store
 
 import (
-	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
-	"time"
 
 	"github.com/mulgadc/predastore/s3db"
 )
 
-const stateFileName = "state.json"
-const indexFileName = "db"
+const indexFilename = "db"
 
-const extension = ".seg"
+// slotBufferPool reuses slot-sized buffers (slotHeaderSize + slotPayloadSize = 8224 bytes).
+var slotBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, slotSize)
+		return &b
+	},
+}
 
-// magic identifies a file as a store segment.
-var magic = [4]byte{'S', '3', 'S', 'F'}
+// zeroPadBuffer is a pre-allocated zero slice for clearing the padding region of a slot payload.
+var zeroPadBuffer = make([]byte, int(fragSize))
 
-const (
-	_ uint16 = iota
-	v1
-)
+type segNum int64
+type objNum int64
+type slotNum int64
 
-const (
-	KiB = 1024
-	MiB = 1024 * KiB
-	GiB = 1024 * MiB
-)
+type ObjectKey string
 
-const (
-	segHeaderSize  = 14
-	slotHeaderSize = 32
-	fragSize       = 8 * KiB
-	slotSize       = slotHeaderSize + fragSize
-	maxSegSize     = 4 * GiB
-)
-
-// slotFlags is the per-slot feature flag bitmask.
-type slotFlags uint32
-
-const (
-	flagNone         slotFlags = 0
-	flagEndOfShard   slotFlags = 1 << 0
-	flagShardHeader  slotFlags = 1 << 1
-	flagCompressed   slotFlags = 1 << 2
-	flagDeleted      slotFlags = 1 << 3
-	flagPartialWrite slotFlags = 1 << 4
-	flagReserved1    slotFlags = 1 << 5
-	flagReserved2    slotFlags = 1 << 6
-	flagReserved3    slotFlags = 1 << 7
-)
-
-// Store is a log-structured object store. Writes reserve disjoint slot
-// ranges under a short lock, then perform lock-free WriteAt followed by
-// fsync and Badger commit.
 type Store struct {
-	dir string
-
+	dir   string
 	index *s3db.S3DB
-	segs  map[uint64]*os.File
+	segs  map[segNum]*segment
 
-	segNum  uint64
-	objNum  uint64
-	fragNum uint64
+	segNum  segNum
+	objNum  objNum
+	slotNum slotNum
 
-	mu sync.Mutex
+	mu     sync.Mutex
+	closed bool
 }
 
-// storeState is the JSON-serialised state persisted to state.json between restarts.
-type storeState struct {
-	SegNum   uint64    `json:"SegNum"`
-	SeqNum   uint64    `json:"SeqNum"`
-	ShardNum uint64    `json:"ShardNum"`
-	Epoch    time.Time `json:"Epoch"`
-}
-
-type extent struct {
-	segNum  uint64
-	fragNum uint64
-	offset  int64
-	size    int64
-
+type objectReader struct {
+	seg *segment
+	ext extent
 	buf []byte
+	pos int64
+
+	onClose func()
+	closed  bool
+}
+
+type objectWriter struct {
+	key ObjectKey
+	seg *segment
+	ext extent
+	buf []byte
+	pos int64
+
+	onClose func()
+	closed  bool
 }
 
 // Open opens or creates a Store rooted at dir.
-func Open(dir string) (store *Store, err error) {
-	store = &Store{
+func Open(dir string) (st *Store, err error) {
+	st = &Store{
 		dir: dir,
 	}
 
 	// Load persisted counters. Missing state is expected for fresh directories.
-	if err := store.loadState(); err != nil {
+	if err := st.loadState(); err != nil {
 		slog.Warn("store: Open: load state", "error", err)
 	}
 
 	// Open the Badger index for shard metadata.
-	store.index, err = s3db.New(filepath.Join(dir, indexFileName))
+	st.index, err = s3db.New(filepath.Join(dir, indexFilename))
 	if err != nil {
 		return nil, err
 	}
@@ -115,73 +89,162 @@ func Open(dir string) (store *Store, err error) {
 	// Attach the active segment, rotating past full segments on restart.
 	const maxAttempts = 100
 	for attempt := range maxAttempts {
-		store.seg, err = openSegment(dir, store.segNum.Load())
-		if err == nil {
+		seg, err := st.openSegment(st.segNum)
+		if err != nil {
+			return nil, err
+		}
+
+		segFull, err := seg.isFull()
+		if err != nil {
+			slog.Warn("failed to read segment flags",
+				"segNum", st.segNum,
+				"error", err,
+			)
+		} else if !segFull {
 			break
 		}
-		slog.Debug("store: Open: segment full, rotating",
-			"segNum", store.segNum.Load(),
+
+		if attempt == maxAttempts-1 {
+			return nil, fmt.Errorf("failed to open segment after %d attempts: %w", maxAttempts, err)
+		}
+
+		slog.Debug("rotating",
+			"segNum", st.segNum,
 			"attempt", attempt,
 			"error", err,
 		)
-		store.segNum.Add(1)
-		if attempt == maxAttempts-1 {
-			return nil, fmt.Errorf("store: Open: open segment after %d attempts: %w", maxAttempts, err)
-		}
+
+		st.segNum += 1
 	}
 
-	if err = store.saveState(); err != nil {
-		return nil, fmt.Errorf("store: Open: save state: %w", err)
+	if err = st.saveState(); err != nil {
+		return nil, fmt.Errorf("saveState: %w", err)
 	}
 
-	return store, err
+	return st, err
 }
 
 // Lookup fetches the object metadata for key from the store index.
-func (st *Store) Lookup(key string) (ObjectReader, error) {
+func (st *Store) Lookup(key ObjectKey) (or *objectReader, err error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.closed {
+		return nil, fmt.Errorf("store closed")
+	}
+
 	data, err := st.index.Get([]byte(key))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Lookup %s: %w", key, err)
 	}
-	obj, err := decodeObject(data)
+
+	ext, err := decodeExtent(data)
 	if err != nil {
 		return nil, err
 	}
-	obj.store = st
-	return obj, nil
-}
 
-// Append reserves slots for an object of the given size and returns an
-// ObjectWriter. The caller writes data via the ObjectWriter and calls
-// Close to fsync and commit. The lock is held only during reservation.
-func (st *Store) Append(key string, size int64) (ObjectWriter, error) {
-
-	seqNum := st.seqNum.Load()
-	st.seqNum.Add(uint64(fragCount))
-	shardNum := st.shardNum.Add(1)
-	slotExts, err := st.reserve(fragCount)
-
+	seg, err := st.openSegment(ext.segNum)
 	if err != nil {
-		return nil, fmt.Errorf("store: Append: reserve: %w", err)
+		return nil, fmt.Errorf("openSegment: %w", err)
 	}
 
-	return &objectWriter{
-		store:     st,
-		key:       key,
-		size:      size,
-		exts:      slotExts,
-		seqNum:    seqNum,
-		shardNum:  shardNum,
-		fragCount: fragCount,
-		buf:       make([]byte, writeBufferFragments*fragSize),
-	}, nil
+	seg.refs.Add(1)
+
+	or = &objectReader{
+		seg: seg,
+		ext: *ext,
+		buf: make([]byte, readBufferSlots*slotSize),
+		pos: 0,
+
+		onClose: func() {
+			seg.refs.Add(-1)
+		},
+		closed: false,
+	}
+
+	return or, nil
 }
 
-// Delete removes the index entry for the given key. It does not
-// reclaim segment disk space; that is compaction's job.
-func (st *Store) Delete(key string) error {
+func (st *Store) Append(key ObjectKey, size int64) (ow *objectWriter, err error) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.closed {
+		return nil, fmt.Errorf("store closed")
+	}
+
+	slotCount := max(1, (size+fragSize-1)/fragSize)
+
+	var seg *segment
+	var offset int64
+
+	for {
+		seg, err = st.openSegment(st.segNum)
+		if err != nil {
+			return nil, fmt.Errorf("openSegment: %w", err)
+		}
+
+		segSize, err := seg.Size()
+		if err != nil {
+			return nil, err
+		}
+
+		if segSize == segHeaderSize || segSize+slotCount*slotSize <= maxSegSize {
+			offset = segSize
+			break
+		}
+
+		if err := seg.markFull(); err != nil {
+			return nil, err
+		}
+
+		st.segNum += 1
+	}
+
+	if err := seg.fd.Truncate(offset + slotSize*slotCount); err != nil {
+		return nil, fmt.Errorf("truncate seg %d: %w", st.segNum, err)
+	}
+
+	seg.refs.Add(1)
+
+	ow = &objectWriter{
+		key: key,
+		seg: seg,
+		ext: extent{
+			segNum:  st.segNum,
+			objNum:  st.objNum,
+			slotNum: st.slotNum,
+		},
+		buf: make([]byte, writeBufferSlots*slotSize),
+		pos: 0,
+
+		onClose: func() {
+			seg.refs.Add(-1)
+		},
+		closed: false,
+	}
+
+	st.objNum += 1
+	st.slotNum += slotNum(slotCount)
+
+	// Best-effort persist; counters are recoverable from segment files.
+	if err := st.saveState(); err != nil {
+		slog.Warn("Append failed:", "error", err)
+	}
+
+	return ow, nil
+}
+
+func (st *Store) Delete(key ObjectKey) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.closed {
+		return fmt.Errorf("store closed")
+	}
+
 	if err := st.index.Delete([]byte(key)); err != nil {
-		return fmt.Errorf("store: Delete: %w", err)
+		return fmt.Errorf("Delete %s failed: %w", key, err)
 	}
 	return nil
 }
@@ -192,10 +255,16 @@ func (st *Store) Close() error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
+	if st.closed {
+		return fmt.Errorf("store closed")
+	}
+
+	st.closed = true
+
 	var errs []error
 
 	if err := st.saveState(); err != nil {
-		errs = append(errs, fmt.Errorf("store: Close: save state: %w", err))
+		errs = append(errs, fmt.Errorf("saveState: %w", err))
 	}
 
 	if st.seg != nil {
@@ -214,134 +283,4 @@ func (st *Store) Close() error {
 	}
 
 	return errors.Join(errs...)
-}
-
-// loadState reads state.json from the Store directory and restores monotonic counters.
-func (st *Store) loadState() error {
-	var state storeState
-	if data, err := os.ReadFile(filepath.Join(st.dir, stateFileName)); err != nil {
-		return err
-	} else if err := json.Unmarshal(data, &state); err != nil {
-		return err
-	}
-
-	// +1 ensures counters never reuse a value from a previous run.
-	st.segNum.Store(state.SegNum + 1)
-	st.seqNum.Store(state.SeqNum + 1)
-	st.shardNum.Store(state.ShardNum + 1)
-	st.epoch = state.Epoch
-
-	return nil
-}
-
-// saveState writes the current monotonic counters to state.json in the Store directory.
-func (st *Store) saveState() error {
-	state := storeState{
-		SegNum:   st.segNum.Load(),
-		SeqNum:   st.seqNum.Load(),
-		ShardNum: st.shardNum.Load(),
-		Epoch:    st.epoch,
-	}
-
-	stateData, err := json.Marshal(state)
-	if err != nil {
-		return fmt.Errorf("store: saveState: marshal: %w", err)
-	}
-
-	return os.WriteFile(filepath.Join(st.dir, stateFileName), stateData, 0600)
-}
-
-func (st *Store) openFile(num uint64) (file *os.File, err error) {
-	if file, ok := st.segs[num]; ok {
-		return file, nil
-	}
-
-	path := filepath.Join(st.dir, fmt.Sprintf("%016d%s", num, extension))
-
-	file, err = os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
-	if err != nil {
-		return nil, fmt.Errorf("open %v: %w", path, err)
-	}
-
-	st.segs[num] = file
-
-	return file, nil
-}
-
-func (st *Store) alloc(objSize int64) (ext *extent, err error) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
-	fragCount := max(1, (objSize+fragSize-1)/fragSize)
-
-	var seg *os.File
-	var offset int64
-outer:
-	for {
-		seg, err = st.openFile(st.segNum)
-		if err != nil {
-			return nil, fmt.Errorf("alloc: %w", err)
-		}
-
-		stat, err := seg.Stat()
-		if err != nil {
-			return nil, fmt.Errorf("alloc: stat: %w", err)
-		}
-
-		switch {
-		// New file: write the segment header, then break loop.
-		case stat.Size() == 0:
-			header := make([]byte, segHeaderSize)
-			copy(header[0:4], magic[:])                 // [0:4]   magic
-			binary.BigEndian.PutUint16(header[4:6], v1) // [4:6]   version
-			binary.BigEndian.PutUint32(header[6:14], 0) // [6:14]  empty bytes
-
-			if _, err = seg.Write(header); err != nil {
-				return nil, fmt.Errorf("alloc: write seg header: %w", err)
-			}
-
-			offset = 14
-
-			break outer
-
-		// Existing file: validate segment header, then break loop.
-		case stat.Size()+slotSize*fragCount <= maxSegSize:
-			header := make([]byte, segHeaderSize)
-			if _, err = seg.ReadAt(header, 0); err != nil {
-				return nil, fmt.Errorf("alloc: read seg %d header: %w", st.segNum, err)
-			}
-
-			var fileMagic [4]byte
-			copy(fileMagic[:], header[0:4])
-			if fileMagic != magic {
-				return nil, fmt.Errorf("alloc: read seg %d header: invalid magic %x", st.segNum, fileMagic)
-			}
-
-			offset = stat.Size()
-
-			break outer
-
-		// Segment full: open next.
-		default:
-			st.segNum += 1
-			continue
-		}
-	}
-
-	ext = &extent{
-		segNum: st.segNum,
-		offset: offset,
-		size:   slotSize * fragCount,
-	}
-
-	if err := seg.Truncate(offset + slotSize*fragCount); err != nil {
-		return nil, fmt.Errorf("alloc: truncate seg %d: %w", st.segNum, err)
-	}
-
-	// Best-effort persist; counters are recoverable from segment files.
-	if err := st.saveState(); err != nil {
-		slog.Warn("store: alloc: save state", "error", err)
-	}
-
-	return ext, nil
 }

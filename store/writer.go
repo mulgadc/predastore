@@ -7,23 +7,7 @@ import (
 	"io"
 )
 
-const writeBufferFragments = 1
-
-type objectWriter struct {
-	store     *Store
-	key       string
-	size      int64
-	exts      []*slotExtent
-	seqNum    uint64
-	shardNum  uint64
-	fragCount int
-
-	buf       []byte
-	bufUsed   int
-	fragIndex int
-	written   int64
-	closed    bool
-}
+const writeBufferSlots = 1
 
 // Write buffers data and flushes full fragments to disk.
 func (ow *objectWriter) Write(p []byte) (int, error) {
@@ -33,13 +17,13 @@ func (ow *objectWriter) Write(p []byte) (int, error) {
 
 	total := 0
 	for len(p) > 0 {
-		space := writeBufferFragments*fragSize - ow.bufUsed
+		space := writeBufferSlots*fragSize - ow.bufUsed
 		n := copy(ow.buf[ow.bufUsed:ow.bufUsed+space], p)
 		ow.bufUsed += n
 		total += n
 		p = p[n:]
 
-		if ow.bufUsed == writeBufferFragments*fragSize {
+		if ow.bufUsed == writeBufferSlots*fragSize {
 			if err := ow.flushBuffer(false); err != nil {
 				return total, err
 			}
@@ -56,12 +40,12 @@ func (ow *objectWriter) ReadFrom(r io.Reader) (int64, error) {
 
 	var total int64
 	for {
-		space := writeBufferFragments*fragSize - ow.bufUsed
+		space := writeBufferSlots*fragSize - ow.bufUsed
 		n, err := r.Read(ow.buf[ow.bufUsed : ow.bufUsed+space])
 		ow.bufUsed += n
 		total += int64(n)
 
-		if ow.bufUsed == writeBufferFragments*fragSize {
+		if ow.bufUsed == writeBufferSlots*fragSize {
 			if flushErr := ow.flushBuffer(false); flushErr != nil {
 				return total, flushErr
 			}
