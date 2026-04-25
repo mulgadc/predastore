@@ -2,79 +2,109 @@ package store
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 )
 
-const writeBufferSlots = 1
+const writeBufFrags = 1
 
-// Write buffers data and flushes full fragments to disk.
-func (ow *objectWriter) Write(p []byte) (int, error) {
-	if ow.closed {
-		return 0, fmt.Errorf("store: objectWriter: write after close")
-	}
+var ErrWriterFinished = errors.New("object finished writing")
 
-	total := 0
-	for len(p) > 0 {
-		space := writeBufferSlots*fragSize - ow.bufUsed
-		n := copy(ow.buf[ow.bufUsed:ow.bufUsed+space], p)
-		ow.bufUsed += n
-		total += n
-		p = p[n:]
+type objectWriter struct {
+	key    ObjectKey
+	seg    *segment
+	ext    extent
+	extPos int64
+	buf    []byte
+	bufPos int
 
-		if ow.bufUsed == writeBufferSlots*fragSize {
-			if err := ow.flushBuffer(false); err != nil {
-				return total, err
-			}
-		}
-	}
-	return total, nil
+	onClose func()
+	closed  bool
 }
 
-// ReadFrom drains r through the same buffering path as Write.
-func (ow *objectWriter) ReadFrom(r io.Reader) (int64, error) {
+func (ow *objectWriter) Write(dat []byte) (tot int, err error) {
 	if ow.closed {
-		return 0, fmt.Errorf("store: objectWriter: ReadFrom after close")
+		return 0, nil
 	}
 
-	var total int64
-	for {
-		space := writeBufferSlots*fragSize - ow.bufUsed
-		n, err := r.Read(ow.buf[ow.bufUsed : ow.bufUsed+space])
-		ow.bufUsed += n
-		total += int64(n)
+	for len(dat) > 0 {
+		n := copy(ow.buf[ow.bufPos:], dat)
+		ow.extPos += int64(n)
+		ow.bufPos += n
+		tot += n
+		dat = dat[n:]
 
-		if ow.bufUsed == writeBufferSlots*fragSize {
-			if flushErr := ow.flushBuffer(false); flushErr != nil {
-				return total, flushErr
+		if n > 0 {
+			if ow.extPos >= ow.ext.size {
+				if err = ow.flush(true); err != nil {
+					return tot, err
+				}
+
+				if len(dat) > 0 {
+					return tot, ErrWriterFinished
+				}
+
+				return tot, nil
+			}
+
+			if ow.bufPos == writeBufFrags*fragSize {
+				if err := ow.flush(false); err != nil {
+					return tot, err
+				}
 			}
 		}
 
-		if err == io.EOF {
-			return total, nil
-		}
 		if err != nil {
-			return total, err
+			return tot, err
+		}
+	}
+
+	return tot, nil
+}
+
+func (ow *objectWriter) ReadFrom(r io.Reader) (tot int64, err error) {
+	if ow.closed {
+		return 0, nil
+	}
+
+	for {
+		n, err := r.Read(ow.buf[ow.bufPos:])
+		ow.extPos += int64(n)
+		ow.bufPos += n
+		tot += int64(n)
+
+		if n > 0 {
+			if ow.extPos >= ow.ext.size {
+				if err := ow.flush(true); err != nil {
+					return tot, err
+				}
+
+				return tot, io.EOF
+			}
+
+			if ow.bufPos == writeBufFrags*fragSize {
+				if err := ow.flush(false); err != nil {
+					return tot, err
+				}
+			}
+		}
+
+		if err != nil {
+			return tot, err
 		}
 	}
 }
 
-// Close flushes any partial fragment, fsyncs all touched segments, commits
-// the object to the index, and releases extent references.
 func (ow *objectWriter) Close() error {
 	if ow.closed {
-		return nil
+		return fmt.Errorf("objectWriter closed")
 	}
+
 	ow.closed = true
 
-	defer func() {
-		for _, ext := range ow.exts {
-			ext.Close()
-		}
-	}()
-
-	if ow.bufUsed > 0 {
+	if ow.bufPos > 0 {
 		if err := ow.flushBuffer(true); err != nil {
 			return err
 		}
@@ -115,7 +145,7 @@ func (ow *objectWriter) Close() error {
 	return nil
 }
 
-func (ow *objectWriter) flushBuffer(final bool) error {
+func (ow *objectWriter) flush() error {
 	offset := 0
 	for offset < ow.bufUsed {
 		payloadLen := min(fragSize, ow.bufUsed-offset)

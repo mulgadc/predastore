@@ -11,10 +11,14 @@ import (
 
 const readBufferSlots = 1
 
-type byteExtent struct {
-	segmentNum uint64
-	offset     uint64
-	size       uint64
+type objectReader struct {
+	seg *segment
+	ext extent
+	buf []byte
+	pos int64
+
+	onClose func()
+	closed  bool
 }
 
 func (obj *objectReader) Size() int64 {

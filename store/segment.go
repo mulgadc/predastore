@@ -10,7 +10,6 @@ import (
 
 const extension = ".seg"
 
-// magic identifies a file as a store segment.
 var magic = [4]byte{'S', '3', 'S', 'F'}
 
 const (
@@ -57,12 +56,23 @@ type segment struct {
 	closed bool
 }
 
-func (st *Store) openSegment(num segNum) (seg *segment, err error) {
+func (st *Store) getSegment(num segNum) (seg *segment, err error) {
 	if seg, ok := st.segs[num]; ok {
 		return seg, nil
 	}
 
-	path := filepath.Join(st.dir, fmt.Sprintf("%016d%s", num, extension))
+	seg, err = openSegment(st.dir, num)
+	if err != nil {
+		return nil, err
+	}
+
+	st.segs[num] = seg
+
+	return seg, nil
+}
+
+func openSegment(dir string, num segNum) (seg *segment, err error) {
+	path := filepath.Join(dir, fmt.Sprintf("%016d%s", num, extension))
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
 	if err != nil {
@@ -106,8 +116,6 @@ func (st *Store) openSegment(num segNum) (seg *segment, err error) {
 		closed: false,
 	}
 
-	st.segs[num] = seg
-
 	return seg, nil
 }
 
@@ -149,18 +157,4 @@ func (seg *segment) Size() (int64, error) {
 	}
 
 	return info.Size(), nil
-}
-
-func (seg *segment) Close() error {
-	if seg.refs.Load() > 0 {
-		return fmt.Errorf("segment is still referenced")
-	}
-
-	if err := seg.fd.Close(); err != nil {
-		return err
-	}
-
-	seg.closed = true
-
-	return nil
 }
