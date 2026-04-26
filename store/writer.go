@@ -6,208 +6,162 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"sync"
 )
 
-const writeBufFrags = 1
+const writeBufferFrags = 1
 
-var ErrWriterFinished = errors.New("object finished writing")
+var (
+	ErrWriterClosed = errors.New("writer closed")
+	ErrObjectFull   = errors.New("object full")
+)
+
+// slotBufferPool reuses slot-sized buffers (slotHeaderSize + slotPayloadSize = 8224 bytes).
+var slotBufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, slotSize)
+		return &b
+	},
+}
+
+// zeroPadBuffer is a pre-allocated zero slice for clearing the padding region of a slot payload.
+var zeroPadBuffer = make([]byte, int(slotBodySize))
 
 type objectWriter struct {
-	key    ObjectKey
-	seg    *segment
-	ext    extent
-	extPos int64
-	buf    []byte
-	bufPos int
+	seg     *segment
+	extent  extent
+	objNum  uint64
+	slotNum uint64
+	buf     []byte
+	off     int
 
-	onClose func()
+	onClose func() error
 	closed  bool
 }
 
-func (ow *objectWriter) Write(dat []byte) (tot int, err error) {
-	if ow.closed {
-		return 0, nil
+func (writer *objectWriter) Write(p []byte) (total int, err error) {
+	if writer.closed {
+		return 0, ErrWriterClosed
 	}
 
-	for len(dat) > 0 {
-		n := copy(ow.buf[ow.bufPos:], dat)
-		ow.extPos += int64(n)
-		ow.bufPos += n
-		tot += n
-		dat = dat[n:]
+	for len(p) > 0 {
+		if int64(writer.off) >= writer.extent.size {
+			return total, ErrObjectFull
+		}
+
+		n := copy(writer.buf[writer.off%len(writer.buf):], p)
+		writer.off += n
+		total += n
+		p = p[n:]
 
 		if n > 0 {
-			if ow.extPos >= ow.ext.size {
-				if err = ow.flush(true); err != nil {
-					return tot, err
+			switch {
+			case int64(writer.off) >= writer.extent.size:
+				if err := writer.flush(true); err != nil {
+					return total, err
 				}
 
-				if len(dat) > 0 {
-					return tot, ErrWriterFinished
-				}
+				return total, ErrObjectFull
 
-				return tot, nil
-			}
-
-			if ow.bufPos == writeBufFrags*fragSize {
-				if err := ow.flush(false); err != nil {
-					return tot, err
+			case writer.off%len(writer.buf) == 0:
+				if err := writer.flush(false); err != nil {
+					return total, err
 				}
 			}
-		}
-
-		if err != nil {
-			return tot, err
 		}
 	}
 
-	return tot, nil
+	return total, nil
 }
 
-func (ow *objectWriter) ReadFrom(r io.Reader) (tot int64, err error) {
-	if ow.closed {
-		return 0, nil
+func (writer *objectWriter) ReadFrom(r io.Reader) (total int64, err error) {
+	if writer.closed {
+		return 0, ErrWriterClosed
 	}
 
 	for {
-		n, err := r.Read(ow.buf[ow.bufPos:])
-		ow.extPos += int64(n)
-		ow.bufPos += n
-		tot += int64(n)
+		n, err := r.Read(writer.buf[writer.off%len(writer.buf):])
+		writer.off += n
+		total += int64(n)
 
 		if n > 0 {
-			if ow.extPos >= ow.ext.size {
-				if err := ow.flush(true); err != nil {
-					return tot, err
+			switch {
+			case int64(writer.off) >= writer.extent.size:
+				if err := writer.flush(true); err != nil {
+					return total, err
 				}
 
-				return tot, io.EOF
-			}
+				return total, ErrObjectFull
 
-			if ow.bufPos == writeBufFrags*fragSize {
-				if err := ow.flush(false); err != nil {
-					return tot, err
+			case writer.off%len(writer.buf) == 0:
+				if err := writer.flush(false); err != nil {
+					return total, err
 				}
 			}
 		}
 
 		if err != nil {
-			return tot, err
+			return total, err
 		}
 	}
 }
 
-func (ow *objectWriter) Close() error {
-	if ow.closed {
-		return fmt.Errorf("objectWriter closed")
+func (writer *objectWriter) Close() error {
+	if writer.closed {
+		return ErrWriterClosed
 	}
 
-	ow.closed = true
+	writer.closed = true
 
-	if ow.bufPos > 0 {
-		if err := ow.flushBuffer(true); err != nil {
-			return err
-		}
+	if err := writer.seg.file.Sync(); err != nil {
+		return fmt.Errorf("sync segment %d: %w", writer.extent.segNum, err)
 	}
 
-	for _, ext := range ow.exts {
-		if err := ext.seg.file.Sync(); err != nil {
-			return fmt.Errorf("store: objectWriter: fsync segment %d: %w", ext.seg.num, err)
-		}
-	}
-
-	remaining := ow.size
-	byteExts := make([]byteExtent, len(ow.exts))
-	for i, ext := range ow.exts {
-		payloadBytes := min(remaining, int64(ext.size)*int64(fragSize))
-		byteExts[i] = byteExtent{
-			segmentNum: ext.seg.num,
-			offset:     uint64(ext.seg.byteOffset(ext.offset)), //nolint:gosec // G115: byteOffset non-negative
-			size:       uint64(payloadBytes),                   //nolint:gosec // G115: payloadBytes non-negative
-		}
-		remaining -= payloadBytes
-	}
-
-	obj := &objectReader{
-		totalSize:   ow.size,
-		byteExtents: byteExts,
-		store:       ow.store,
-	}
-
-	encoded, err := encodeObject(obj)
-	if err != nil {
-		return fmt.Errorf("store: objectWriter: encode: %w", err)
-	}
-	if err := ow.store.index.Set([]byte(ow.key), encoded); err != nil {
-		return fmt.Errorf("store: objectWriter: commit to index: %w", err)
-	}
-
-	return nil
+	return writer.onClose()
 }
 
-func (ow *objectWriter) flush() error {
-	offset := 0
-	for offset < ow.bufUsed {
-		payloadLen := min(fragSize, ow.bufUsed-offset)
-		if !final && payloadLen < fragSize {
-			break
-		}
-
-		ext, slotInExt := ow.locateSlot(ow.fragIndex)
-		if ext == nil {
-			return fmt.Errorf("store: objectWriter: fragment %d exceeds reserved slots", ow.fragIndex)
-		}
-
-		bufPtr := slotBufferPool.Get().(*[]byte) //nolint:forcetypeassert,errcheck // Pool.New always returns *[]byte
+func (writer *objectWriter) flush(final bool) error {
+	pos := 0
+	for pos < len(writer.buf) {
+		bufPtr := slotBufferPool.Get().(*[]byte)
 		slot := *bufPtr
 
-		copy(slot[slotHeaderSize:slotHeaderSize+payloadLen], ow.buf[offset:offset+payloadLen])
-		if payloadLen < fragSize {
-			copy(slot[slotHeaderSize+payloadLen:slotHeaderSize+fragSize], zeroPadBuffer[:fragSize-payloadLen])
+		fragSize := min(slotBodySize, writer.off-pos)
+
+		// Copy fragment into slot
+		copy(slot[slotHeaderSize:slotHeaderSize+fragSize], writer.buf[pos:pos+fragSize])
+
+		// Pad fragment if short
+		if fragSize < slotBodySize {
+			copy(slot[slotHeaderSize+fragSize:], zeroPadBuffer[:slotBodySize-fragSize])
 		}
 
-		binary.BigEndian.PutUint64(slot[0:8], ow.seqNum+uint64(ow.fragIndex)) //nolint:gosec // G115: fragIndex non-negative, bounded by fragCount
-		binary.BigEndian.PutUint64(slot[8:16], ow.shardNum)
-		binary.BigEndian.PutUint32(slot[16:20], uint32(ow.fragIndex)) //nolint:gosec // G115: fragIndex non-negative, bounded by fragCount
-		binary.BigEndian.PutUint32(slot[20:24], uint32(payloadLen))   //nolint:gosec // G115: payloadLen bounded by slotPayloadSize (8 KiB)
+		// Write slot header
+		binary.BigEndian.PutUint64(slot[0:8], writer.slotNum)
+		binary.BigEndian.PutUint64(slot[8:16], writer.objNum)
+		binary.BigEndian.PutUint32(slot[16:20], 0)
+		binary.BigEndian.PutUint32(slot[20:24], uint32(fragSize))
+
 		var flags slotFlags
-		if ow.fragIndex == ow.fragCount-1 {
-			flags = flagEndOfShard
+		if writer.slotNum == (uint64(writer.extent.size)+slotBodySize-1)/slotBodySize-1 {
+			flags = flagSlotFinal
 		}
 		binary.BigEndian.PutUint32(slot[24:28], uint32(flags))
 		binary.BigEndian.PutUint32(slot[28:32], 0)
 
-		checksum := crc32.ChecksumIEEE(slot[0:slotHeaderSize])
-		checksum = crc32.Update(checksum, crc32.IEEETable, slot[slotHeaderSize:slotHeaderSize+fragSize])
-		binary.BigEndian.PutUint32(slot[28:32], checksum)
+		// Calculate CRC
+		binary.BigEndian.PutUint32(slot[28:32], crc32.ChecksumIEEE(slot[:]))
 
-		diskOffset := ext.seg.byteOffset(ext.offset + slotInExt)
-		if _, err := ext.seg.file.WriteAt(slot[:slotSize], diskOffset); err != nil {
+		off := writer.extent.off + int64(writer.slotNum*slotSize)
+		if _, err := writer.seg.file.WriteAt(slot[:slotSize], off); err != nil {
 			slotBufferPool.Put(bufPtr)
-			return fmt.Errorf("store: objectWriter: WriteAt slot %d: %w", ow.fragIndex, err)
+			return fmt.Errorf("objectWriter: WriteAt offset %d: %w", off, err)
 		}
 
 		slotBufferPool.Put(bufPtr)
-		offset += payloadLen
-		ow.written += int64(payloadLen)
-		ow.fragIndex++
-	}
-
-	if offset > 0 {
-		remaining := copy(ow.buf, ow.buf[offset:ow.bufUsed])
-		ow.bufUsed = remaining
+		pos += fragSize
+		writer.slotNum += 1
 	}
 
 	return nil
-}
-
-func (ow *objectWriter) locateSlot(fragIndex int) (*slotExtent, int) {
-	idx := fragIndex
-	for _, ext := range ow.exts {
-		if idx < ext.size {
-			return ext, idx
-		}
-		idx -= ext.size
-	}
-	return nil, 0
 }

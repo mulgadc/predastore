@@ -9,33 +9,33 @@ import (
 const stateFilename = "state.json"
 
 type state struct {
-	SegNum  segNum  `json:"SegNum"`
-	ObjNum  objNum  `json:"ObjNum"`
-	SlotNum slotNum `json:"SlotNum"`
+	SegNum  uint64 `json:"SegNum"`
+	ObjNum  uint64 `json:"ObjNum"`
+	SlotNum uint64 `json:"SlotNum"`
 }
 
 // loadState reads state.json from the Store directory and restores monotonic counters.
-func (st *Store) loadState() error {
+func (store *Store) loadState() error {
 	var sta state
-	if data, err := os.ReadFile(filepath.Join(st.dir, stateFilename)); err != nil {
+	if data, err := os.ReadFile(filepath.Join(store.dir, stateFilename)); err != nil {
 		return err
 	} else if err := json.Unmarshal(data, &sta); err != nil {
 		return err
 	}
 
-	st.segNum = sta.SegNum
-	st.objNum = sta.ObjNum
-	st.slotNum = sta.SlotNum
+	store.segNum = sta.SegNum
+	store.objNum = sta.ObjNum
+	store.slotNum = sta.SlotNum
 
 	return nil
 }
 
 // saveState writes the current monotonic counters to state.json in the Store directory.
-func (st *Store) saveState() error {
+func (store *Store) saveState() error {
 	sta := state{
-		SegNum:  st.segNum,
-		ObjNum:  st.objNum,
-		SlotNum: st.slotNum,
+		SegNum:  store.segNum,
+		ObjNum:  store.objNum,
+		SlotNum: store.slotNum,
 	}
 
 	data, err := json.Marshal(sta)
@@ -43,5 +43,5 @@ func (st *Store) saveState() error {
 		return err
 	}
 
-	return os.WriteFile(filepath.Join(st.dir, stateFilename), data, 0600)
+	return os.WriteFile(filepath.Join(store.dir, stateFilename), data, 0600)
 }

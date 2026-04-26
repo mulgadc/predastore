@@ -26,8 +26,8 @@ const (
 const (
 	segHeaderSize  = 14
 	slotHeaderSize = 32
-	fragSize       = 8 * KiB
-	slotSize       = slotHeaderSize + fragSize
+	slotBodySize   = 8 * KiB
+	slotSize       = slotHeaderSize + slotBodySize
 	maxSegSize     = 4 * GiB
 )
 
@@ -46,32 +46,32 @@ const (
 type slotFlags uint32
 
 const (
-	flagSlotLast slotFlags = 1 << iota
+	flagSlotFinal slotFlags = 1 << iota
 )
 
 type segment struct {
-	fd   *os.File
-	refs atomic.Int32
+	file *os.File
+	refs int32
 
 	closed bool
 }
 
-func (st *Store) getSegment(num segNum) (seg *segment, err error) {
-	if seg, ok := st.segs[num]; ok {
+func (store *Store) getSegment(num uint64) (seg *segment, err error) {
+	if seg, ok := store.segCache[num]; ok {
 		return seg, nil
 	}
 
-	seg, err = openSegment(st.dir, num)
+	seg, err = openSegment(store.dir, num)
 	if err != nil {
 		return nil, err
 	}
 
-	st.segs[num] = seg
+	store.segCache[num] = seg
 
 	return seg, nil
 }
 
-func openSegment(dir string, num segNum) (seg *segment, err error) {
+func openSegment(dir string, num uint64) (seg *segment, err error) {
 	path := filepath.Join(dir, fmt.Sprintf("%016d%s", num, extension))
 
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
@@ -112,7 +112,7 @@ func openSegment(dir string, num segNum) (seg *segment, err error) {
 	}
 
 	seg = &segment{
-		fd:     file,
+		file:   file,
 		closed: false,
 	}
 
@@ -121,7 +121,7 @@ func openSegment(dir string, num segNum) (seg *segment, err error) {
 
 func (seg *segment) isFull() (bool, error) {
 	buf := make([]byte, 4)
-	if _, err := seg.fd.ReadAt(buf, 6); err != nil {
+	if _, err := seg.file.ReadAt(buf, 6); err != nil {
 		return false, err
 	}
 
@@ -132,14 +132,14 @@ func (seg *segment) isFull() (bool, error) {
 
 func (seg *segment) markFull() error {
 	buf := make([]byte, 4)
-	if _, err := seg.fd.ReadAt(buf, 6); err != nil {
+	if _, err := seg.file.ReadAt(buf, 6); err != nil {
 		return err
 	}
 
 	flags := binary.BigEndian.Uint32(buf[:])
 	binary.BigEndian.PutUint32(buf[:], flags|uint32(flagSegFull)) // [6:10]  Flags
 
-	if _, err := seg.fd.WriteAt(buf, 6); err != nil {
+	if _, err := seg.file.WriteAt(buf, 6); err != nil {
 		return err
 	}
 
@@ -151,7 +151,7 @@ func (seg *segment) Size() (int64, error) {
 		return 0, fmt.Errorf("segment is closed")
 	}
 
-	info, err := seg.fd.Stat()
+	info, err := seg.file.Stat()
 	if err != nil {
 		return 0, err
 	}

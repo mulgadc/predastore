@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,65 +14,48 @@ import (
 
 const indexFilename = "db"
 
-// slotBufferPool reuses slot-sized buffers (slotHeaderSize + slotPayloadSize = 8224 bytes).
-var slotBufferPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, slotSize)
-		return &b
-	},
-}
-
-// zeroPadBuffer is a pre-allocated zero slice for clearing the padding region of a slot payload.
-var zeroPadBuffer = make([]byte, int(fragSize))
-
-type segNum int64
-type objNum int64
-type slotNum int64
-
-type ObjectKey string
-
 type Store struct {
-	dir   string
-	index *s3db.S3DB
-	segs  map[segNum]*segment
+	dir      string
+	index    *s3db.S3DB
+	segCache map[uint64]*segment
+	mutex    sync.Mutex
 
-	segNum  segNum
-	objNum  objNum
-	slotNum slotNum
+	segNum  uint64
+	objNum  uint64
+	slotNum uint64
 
-	mu     sync.Mutex
 	closed bool
 }
 
-func Open(dir string) (st *Store, err error) {
-	st = &Store{
+func Open(dir string) (store *Store, err error) {
+	store = &Store{
 		dir: dir,
 	}
 
-	if err := st.loadState(); err != nil {
+	if err := store.loadState(); err != nil {
 		slog.Warn("store: Open: load state", "error", err)
 	}
 
-	st.index, err = s3db.New(filepath.Join(dir, indexFilename))
+	store.index, err = s3db.New(filepath.Join(dir, indexFilename))
 	if err != nil {
 		return nil, err
 	}
 
 	const maxAttempts = 100
 	for attempt := range maxAttempts {
-		seg, err := openSegment(st.dir, st.segNum)
+		segment, err := openSegment(store.dir, store.segNum)
 		if err != nil {
 			return nil, err
 		}
 
-		segFull, err := seg.isFull()
+		segFull, err := segment.isFull()
 		if err != nil {
 			slog.Warn("failed to read segment flags",
-				"segNum", st.segNum,
+				"segNum", store.segNum,
 				"error", err,
 			)
 		} else if !segFull {
-			st.segs[st.segNum] = seg
+			store.segCache[store.segNum] = segment
 			break
 		}
 
@@ -80,173 +64,211 @@ func Open(dir string) (st *Store, err error) {
 		}
 
 		slog.Debug("rotating",
-			"segNum", st.segNum,
+			"segNum", store.segNum,
 			"attempt", attempt,
 			"error", err,
 		)
 
-		st.segNum += 1
+		store.segNum += 1
 	}
 
-	if err := st.saveState(); err != nil {
+	if err := store.saveState(); err != nil {
 		slog.Warn("saveState:", "error", err)
 	}
 
-	return st, err
+	return store, err
 }
 
-func (st *Store) Lookup(key ObjectKey) (or *objectReader, err error) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
+func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader *objectReader, err error) {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
 
-	if st.closed {
+	if store.closed {
 		return nil, fmt.Errorf("store closed")
 	}
 
-	data, err := st.index.Get([]byte(key))
+	key := makeShardKey(objectHash, shardIndex)
+	data, err := store.index.Get(key)
 	if err != nil {
 		return nil, fmt.Errorf("Lookup %s: %w", key, err)
 	}
 
-	ext, err := decodeExtent(data)
+	extent, err := decodeExtent(data)
 	if err != nil {
 		return nil, err
 	}
 
-	seg, err := st.getSegment(ext.segNum)
+	segment, err := store.getSegment(extent.segNum)
 	if err != nil {
 		return nil, fmt.Errorf("openSegment: %w", err)
 	}
 
-	seg.refs.Add(1)
+	segment.refs += 1
 
-	or = &objectReader{
-		seg: seg,
-		ext: *ext,
+	reader = &objectReader{
+		seg: segment,
+		ext: extent,
 		buf: make([]byte, readBufferSlots*slotSize),
 		pos: 0,
 
 		onClose: func() {
-			seg.refs.Add(-1)
+			store.mutex.Lock()
+			defer store.mutex.Unlock()
+
+			segment.refs -= 1
 		},
 		closed: false,
 	}
 
-	return or, nil
+	return reader, nil
 }
 
-func (st *Store) Append(key ObjectKey, size int64) (ow *objectWriter, err error) {
-	st.mu.Lock()
-	defer st.mu.Unlock()
+func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (writer *objectWriter, err error) {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
 
-	if st.closed {
+	if store.closed {
 		return nil, fmt.Errorf("store closed")
 	}
 
-	slotCount := max(1, (size+fragSize-1)/fragSize)
+	slotCount := max(1, (uint64(size)+slotBodySize-1)/slotBodySize)
 
-	var seg *segment
-	var offset int64
+	var segment *segment
+	var off int64
 
 	for {
-		seg, err = st.getSegment(st.segNum)
+		segment, err = store.getSegment(store.segNum)
 		if err != nil {
 			return nil, fmt.Errorf("openSegment: %w", err)
 		}
 
-		segSize, err := seg.Size()
+		segFull, err := segment.isFull()
 		if err != nil {
 			return nil, err
 		}
 
-		if segSize == segHeaderSize || segSize+slotCount*slotSize <= maxSegSize {
-			offset = segSize
-			break
-		}
-
-		if err := seg.markFull(); err != nil {
+		segSize, err := segment.Size()
+		if err != nil {
 			return nil, err
 		}
 
-		st.segNum += 1
+		if !segFull {
+			// TODO: Check if this cast could be a problem
+			if segSize+int64(slotCount)*slotSize >= maxSegSize {
+				if err := segment.markFull(); err != nil {
+					return nil, err
+				}
+			}
+
+			// TODO: Check if this cast could be a problem
+			if segSize == segHeaderSize || segSize+int64(slotCount)*slotSize <= maxSegSize {
+				off = segSize
+				break
+			}
+		}
+
+		store.segNum += 1
 	}
 
-	if err := seg.fd.Truncate(offset + slotSize*slotCount); err != nil {
-		return nil, fmt.Errorf("truncate seg %d: %w", st.segNum, err)
+	// TODO: Check if this cast could be a problem
+	if err := segment.file.Truncate(off + slotSize*int64(slotCount)); err != nil {
+		return nil, fmt.Errorf("truncate seg %d: %w", store.segNum, err)
 	}
 
-	seg.refs.Add(1)
+	segment.refs += 1
 
-	ow = &objectWriter{
-		key: key,
-		seg: seg,
-		ext: extent{
-			segNum:  st.segNum,
-			objNum:  st.objNum,
-			slotNum: st.slotNum,
+	writer = &objectWriter{
+		seg: segment,
+		extent: extent{
+			segNum: store.segNum,
+			off:    off,
+			size:   size,
 		},
-		buf: make([writeBufFrags * fragSize]byte, writeBufFrags*fragSize),
-		pos: 0,
+		objNum:  store.objNum,
+		slotNum: store.slotNum,
+		buf:     make([]byte, writeBufferFrags*slotBodySize),
+		off:     0,
 
-		onClose: func() {
-			seg.refs.Add(-1)
+		onClose: func() error {
+			store.mutex.Lock()
+			defer store.mutex.Unlock()
+
+			encoded, err := writer.extent.encode()
+			if err != nil {
+				return fmt.Errorf("encode extent: %w", err)
+			}
+
+			if err := store.index.Set(makeShardKey(objectHash, shardIndex), encoded); err != nil {
+				return fmt.Errorf("commit to index: %w", err)
+			}
+
+			segment.refs -= 1
+
+			return nil
 		},
 		closed: false,
 	}
 
-	st.objNum += 1
-	st.slotNum += slotNum(slotCount)
+	store.objNum += 1
+	store.slotNum += slotCount
 
-	if err := st.saveState(); err != nil {
+	if err := store.saveState(); err != nil {
 		slog.Warn("saveState:", "error", err)
 	}
 
-	return ow, nil
+	return writer, nil
 }
 
-func (st *Store) Delete(key ObjectKey) error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
+func (store *Store) Delete(hash []byte, index uint32) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
 
-	if st.closed {
+	if store.closed {
 		return fmt.Errorf("store closed")
 	}
 
-	if err := st.index.Delete([]byte(key)); err != nil {
-		return fmt.Errorf("Delete %s failed: %w", key, err)
+	if err := store.index.Delete(hash); err != nil {
+		return fmt.Errorf("Delete %s failed: %w", hash, err)
 	}
 	return nil
 }
 
-func (st *Store) Close() error {
-	st.mu.Lock()
-	defer st.mu.Unlock()
+func (store *Store) Close() error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
 
-	if st.closed {
+	if store.closed {
 		return fmt.Errorf("store closed")
 	}
 
-	st.closed = true
+	store.closed = true
 
 	var errs []error
 
-	if err := st.saveState(); err != nil {
+	if err := store.saveState(); err != nil {
 		slog.Warn("saveState:", "error", err)
 	}
 
-	for num, seg := range st.segs {
-		for seg.refs.Load() > 0 {
+	for num, seg := range store.segCache {
+		for seg.refs > 0 {
 			runtime.Gosched()
 		}
 
-		if err := seg.fd.Close(); err != nil {
+		if err := seg.file.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close segment %d: %w", num, err))
 		}
 	}
 
-	if err := st.index.Close(); err != nil {
+	if err := store.index.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close index: %w", err))
 	}
 
 	return errors.Join(errs...)
+}
+
+func makeShardKey(objectHash [32]byte, shardIndex uint32) []byte {
+	key := make([]byte, 36)
+	copy(key[:32], objectHash[:])
+	binary.BigEndian.PutUint32(key[32:], shardIndex)
+	return key
 }
