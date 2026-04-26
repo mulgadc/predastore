@@ -647,7 +647,6 @@ func (s *Server) createDistributedBackend() (backend.Backend, error) {
 		PartitionCount:    len(s.config.Nodes),
 		ReplicationFactor: 100,
 		QuicBasePort:      9991,
-		UseQUIC:           true,
 		Nodes:             nodes,
 		Buckets:           buckets,
 		DBClient:          dbClientConfig,

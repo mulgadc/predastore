@@ -170,13 +170,7 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 		slog.Debug("Failed to close temp file", "path", tmpPath, "error", closeErr)
 	}
 
-	// Store via QUIC (or local WAL if QUIC disabled)
-	if b.useQUIC {
-		_, _, _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpPath, objectHash)
-	} else {
-		_, _, _, err = b.putObjectToWAL(req.Bucket, tmpPath, objectHash)
-	}
-	if err != nil {
+	if _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpPath, objectHash); err != nil {
 		slog.Error("Failed to store part", "uploadID", req.UploadID, "part", req.PartNumber, "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store part", 500)
 	}
@@ -376,12 +370,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	// Store the final object using PutObject mechanism
 	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
 
-	if b.useQUIC {
-		_, _, _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
-	} else {
-		_, _, _, err = b.putObjectToWAL(req.Bucket, tmpFile.Name(), objectHash)
-	}
-	if err != nil {
+	if _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash); err != nil {
 		slog.Error("Failed to store final object", "uploadID", req.UploadID, "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store final object", 500)
 	}

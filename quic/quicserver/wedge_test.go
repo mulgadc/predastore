@@ -133,9 +133,9 @@ func TestQuicServer_BasicPut(t *testing.T) {
 		ShardIndex: 0,
 	}, io.NopCloser(bytes.NewReader(body)))
 	require.NoError(t, err)
-	require.Equal(t, len(body), resp.WriteResult.TotalSize)
+	require.Equal(t, int64(len(body)), resp.ShardSize)
 
-	// Sanity: WAL file was created on disk.
-	entries, _ := os.ReadDir(filepath.Join(qs.WalDir))
+	// Sanity: segment file was created on disk.
+	entries, _ := os.ReadDir(qs.WalDir)
 	require.NotEmpty(t, entries)
 }

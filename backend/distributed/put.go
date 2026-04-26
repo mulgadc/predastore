@@ -52,7 +52,7 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 		}
 	}
 
-	// Write object to a temporary file for putObjectToWAL
+	// Write object to a temporary file for RS splitting and QUIC distribution
 	tmpFile, err := os.CreateTemp("", "distributed-put-*")
 	if err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
@@ -78,15 +78,8 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	}
 	slog.Debug("distributed.PutObject: temp file created", "path", tmpFile.Name())
 
-	// Split and write shards (either locally or via QUIC)
 	var size int64
-	if b.useQUIC {
-		slog.Debug("distributed.PutObject: using QUIC for shards")
-		_, _, size, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
-	} else {
-		slog.Debug("distributed.PutObject: using local WAL for shards")
-		_, _, size, err = b.putObjectToWAL(req.Bucket, tmpFile.Name(), objectHash)
-	}
+	size, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
 	if err != nil {
 		slog.Error("distributed.PutObject: shard distribution failed", "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
@@ -167,13 +160,8 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 		}
 	}
 
-	// Split and write shards (either locally or via QUIC)
 	var size int64
-	if b.useQUIC {
-		_, _, size, err = b.putObjectViaQUIC(ctx, bucket, objectPath, objectHash)
-	} else {
-		_, _, size, err = b.putObjectToWAL(bucket, objectPath, objectHash)
-	}
+	size, err = b.putObjectViaQUIC(ctx, bucket, objectPath, objectHash)
 	if err != nil {
 		return err
 	}

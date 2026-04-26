@@ -55,12 +55,9 @@ func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectReq
 		return backend.NewS3Error(backend.ErrInternalError, "corrupt metadata", 500)
 	}
 
-	// Delete shards from nodes via QUIC if enabled
-	if b.useQUIC {
-		if err := b.deleteObjectViaQUIC(ctx, req.Bucket, req.Key, objectHash, objectToShardNodes); err != nil {
-			slog.Error("deleteObjectViaQUIC failed", "error", err)
-			// Continue with local cleanup even if QUIC delete fails
-		}
+	if err := b.deleteObjectViaQUIC(ctx, req.Bucket, req.Key, objectHash, objectToShardNodes); err != nil {
+		slog.Error("deleteObjectViaQUIC failed", "error", err)
+		// Continue with local cleanup even if QUIC delete fails
 	}
 
 	// Track deleted object for future compaction coordination
@@ -96,55 +93,60 @@ func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectReq
 
 // deleteObjectViaQUIC sends DELETE requests to all shard nodes
 func (b *Backend) deleteObjectViaQUIC(ctx context.Context, bucket, key string, objectHash [32]byte, shards ObjectToShardNodes) error {
-	// Collect all node IDs (data + parity)
-	allNodes := make([]uint32, 0, len(shards.DataShardNodes)+len(shards.ParityShardNodes))
-	allNodes = append(allNodes, shards.DataShardNodes...)
-	allNodes = append(allNodes, shards.ParityShardNodes...)
+	// Build (node, shardIndex) pairs so each delete carries the correct shard index.
+	type nodeShard struct {
+		node       uint32
+		shardIndex int
+	}
+	targets := make([]nodeShard, 0, len(shards.DataShardNodes)+len(shards.ParityShardNodes))
+	for i, n := range shards.DataShardNodes {
+		targets = append(targets, nodeShard{node: n, shardIndex: i})
+	}
+	for i, n := range shards.ParityShardNodes {
+		targets = append(targets, nodeShard{node: n, shardIndex: len(shards.DataShardNodes) + i})
+	}
 
-	// Send DELETE to all nodes concurrently
 	var wg sync.WaitGroup
-	errCh := make(chan error, len(allNodes))
+	errCh := make(chan error, len(targets))
 
-	for _, nodeNum := range allNodes {
+	for _, t := range targets {
 		wg.Add(1)
-		go func(node uint32) {
+		go func(ns nodeShard) {
 			defer wg.Done()
 
-			addr := b.getNodeAddr(int(node))
-			// Use pooled connection to avoid TLS handshake overhead
+			addr := b.getNodeAddr(int(ns.node))
 			client, err := quicclient.DialPooled(ctx, addr)
 			if err != nil {
-				slog.Error("deleteObjectViaQUIC: dial failed", "node", node, "addr", addr, "error", err)
+				slog.Error("deleteObjectViaQUIC: dial failed", "node", ns.node, "addr", addr, "error", err)
 				errCh <- err
 				return
 			}
-			// Don't close - connection stays in pool
 
 			delReq := quicserver.DeleteRequest{
 				Bucket:     bucket,
 				Object:     key,
 				ObjectHash: objectHash,
+				ShardIndex: ns.shardIndex,
 			}
 
 			resp, err := client.Delete(ctx, delReq)
 			if err != nil {
-				slog.Error("deleteObjectViaQUIC: delete failed", "node", node, "error", err)
+				slog.Error("deleteObjectViaQUIC: delete failed", "node", ns.node, "error", err)
 				errCh <- err
 				return
 			}
 
 			if !resp.Deleted {
-				slog.Warn("deleteObjectViaQUIC: shard not found on node", "node", node)
+				slog.Warn("deleteObjectViaQUIC: shard not found on node", "node", ns.node, "shardIndex", ns.shardIndex)
 			} else {
-				slog.Info("deleteObjectViaQUIC: deleted shard", "node", node, "bucket", bucket, "key", key)
+				slog.Debug("deleteObjectViaQUIC: deleted shard", "node", ns.node, "shardIndex", ns.shardIndex, "bucket", bucket, "key", key)
 			}
-		}(nodeNum)
+		}(t)
 	}
 
 	wg.Wait()
 	close(errCh)
 
-	// Return first error if any (but all deletes are attempted)
 	for err := range errCh {
 		if err != nil {
 			return err
