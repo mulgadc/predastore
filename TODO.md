@@ -85,9 +85,9 @@ CRC validated as `crc32.ChecksumIEEE(frag[0:totalFragSize])`. Added
 - [ ] 36. **Add deletion tracking to Store** — Store needs a mechanism to record freed extents for future compaction. Currently `store.Delete` just removes the index entry; the on-disk extent becomes dead space.
 - [x] 37. ~~Remove WAL imports~~ — all `wal.*` references removed from `quicserver`, `quicclient`. Handlers split to `get.go`, `put.go`, `delete.go`.
 - [x] 38. ~~Update distributed backend~~ — deleted `putObjectToWAL` (~180 LOC), removed `useQUIC`/`UseQUIC` from `Config`/`Backend`, `putObjectViaQUIC` returns `(size, error)`, `ObjectShardReader` deleted, `shardWriteOutcome` simplified, `deleteObjectViaQUIC` sends per-shard deletes with `ShardIndex`. `s3/wal` import removed from all production code.
-- [ ] 39. **Delete filesystem backend** — remove `backend/filesystem/` and any config/selection logic that references it.
+- [x] 39. ~~Delete filesystem backend~~ — removed `backend/filesystem/` (9 files, ~1,731 LOC), `BackendFilesystem` constant, `-backend` CLI flag, filesystem fallback in `NewHTTP2Server`, `initFilesystemBackend()`, `createFilesystemBackend()`, `ToFilesystemConfig()`. Default backend is now `BackendDistributed`. Tests in `backend_test.go`, `buckethandler_test.go`, `options_test.go`, `crud_test.go`, `handleerror_test.go` updated. README updated.
 
-**Tests not yet updated** — `distributed_test.go`, `bucket_test.go`, `multipart_test.go`, `distributed_putobject_test.go`, `backend_test.go` still reference removed `UseQUIC`/`putObjectToWAL`/`wal.*` types.
+**Tests not yet updated** — `distributed_test.go`, `bucket_test.go`, `multipart_test.go`, `distributed_putobject_test.go` still reference removed `UseQUIC`/`putObjectToWAL`/`wal.*` types. `authmiddleware_test.go`, `delete_test.go`, `get_test.go`, `put_test.go`, `list_test.go`, `s3_integration_test.go`, `s3_bench_test.go` use `NewHTTP2Server` with `server.toml` (no nodes) and need migrating to the distributed backend.
 
 ### Background Compaction & Cold-Storage Tiering
 
