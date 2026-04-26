@@ -2,71 +2,57 @@ package store
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
-	"sync"
 )
 
-const writeBufferFrags = 1
+const writeBufLen = 1
 
-var (
-	ErrWriterClosed = errors.New("writer closed")
-	ErrObjectFull   = errors.New("object full")
-)
-
-// slotBufferPool reuses slot-sized buffers (slotHeaderSize + slotPayloadSize = 8224 bytes).
-var slotBufferPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, slotSize)
-		return &b
-	},
-}
-
-// zeroPadBuffer is a pre-allocated zero slice for clearing the padding region of a slot payload.
-var zeroPadBuffer = make([]byte, int(slotBodySize))
-
-type objectWriter struct {
-	seg     *segment
-	extent  extent
-	objNum  uint64
-	slotNum uint64
-	buf     []byte
-	off     int
+type shardWriter struct {
+	seg      *segment
+	extent   extent
+	shardNum uint64
+	fragNum  uint64
+	dataSize int64
+	buf      []byte
+	off      int64
+	flushed  int64
 
 	onClose func() error
 	closed  bool
 }
 
-func (writer *objectWriter) Write(p []byte) (total int, err error) {
-	if writer.closed {
-		return 0, ErrWriterClosed
+// dataWritten returns the number of logical (non-header) bytes written so far.
+func (w *shardWriter) dataWritten() int64 {
+	return w.off/totalFragSize*fragBodySize + max(0, w.off%totalFragSize-fragHeaderSize)
+}
+
+func (w *shardWriter) Write(p []byte) (total int, err error) {
+	if w.closed {
+		return 0, fmt.Errorf("shard writer closed")
 	}
 
 	for len(p) > 0 {
-		if int64(writer.off) >= writer.extent.size {
-			return total, ErrObjectFull
+		if w.dataWritten() >= w.dataSize {
+			return total, fmt.Errorf("shard full")
 		}
 
-		n := copy(writer.buf[writer.off%len(writer.buf):], p)
-		writer.off += n
+		if w.off%totalFragSize == 0 {
+			w.writeHeader()
+		}
+
+		bufPos := int(w.off - w.flushed)
+		bodyLeft := int(totalFragSize - w.off%totalFragSize)
+		dataLeft := int(w.dataSize - w.dataWritten())
+		n := copy(w.buf[bufPos:bufPos+min(bodyLeft, dataLeft)], p)
+		w.off += int64(n)
 		total += n
 		p = p[n:]
 
-		if n > 0 {
-			switch {
-			case int64(writer.off) >= writer.extent.size:
-				if err := writer.flush(true); err != nil {
-					return total, err
-				}
-
-				return total, ErrObjectFull
-
-			case writer.off%len(writer.buf) == 0:
-				if err := writer.flush(false); err != nil {
-					return total, err
-				}
+		if int(w.off-w.flushed) >= len(w.buf) || w.dataWritten() >= w.dataSize {
+			if err := w.flush(w.dataWritten() >= w.dataSize); err != nil {
+				return total, err
 			}
 		}
 	}
@@ -74,94 +60,100 @@ func (writer *objectWriter) Write(p []byte) (total int, err error) {
 	return total, nil
 }
 
-func (writer *objectWriter) ReadFrom(r io.Reader) (total int64, err error) {
-	if writer.closed {
-		return 0, ErrWriterClosed
+func (w *shardWriter) ReadFrom(r io.Reader) (total int64, err error) {
+	if w.closed {
+		return 0, fmt.Errorf("shard writer closed")
 	}
 
-	for {
-		n, err := r.Read(writer.buf[writer.off%len(writer.buf):])
-		writer.off += n
+	for w.dataWritten() < w.dataSize {
+		if w.off%totalFragSize == 0 {
+			w.writeHeader()
+		}
+
+		bufPos := int(w.off - w.flushed)
+		bodyLeft := int(totalFragSize - w.off%totalFragSize)
+		dataLeft := int(w.dataSize - w.dataWritten())
+
+		n, readErr := r.Read(w.buf[bufPos : bufPos+min(bodyLeft, dataLeft)])
+		w.off += int64(n)
 		total += int64(n)
 
-		if n > 0 {
-			switch {
-			case int64(writer.off) >= writer.extent.size:
-				if err := writer.flush(true); err != nil {
-					return total, err
-				}
-
-				return total, ErrObjectFull
-
-			case writer.off%len(writer.buf) == 0:
-				if err := writer.flush(false); err != nil {
-					return total, err
-				}
+		if int(w.off-w.flushed) >= len(w.buf) || w.dataWritten() >= w.dataSize {
+			if err := w.flush(w.dataWritten() >= w.dataSize); err != nil {
+				return total, err
 			}
 		}
 
-		if err != nil {
-			return total, err
+		if readErr != nil {
+			return total, readErr
 		}
 	}
+
+	return total, nil
 }
 
-func (writer *objectWriter) Close() error {
-	if writer.closed {
-		return ErrWriterClosed
+func (w *shardWriter) Close() error {
+	if w.closed {
+		return fmt.Errorf("shard writer closed")
 	}
 
-	writer.closed = true
+	w.closed = true
 
-	if err := writer.seg.file.Sync(); err != nil {
-		return fmt.Errorf("sync segment %d: %w", writer.extent.segNum, err)
+	if w.off > w.flushed {
+		if err := w.flush(true); err != nil {
+			return err
+		}
 	}
 
-	return writer.onClose()
+	if err := w.seg.file.Sync(); err != nil {
+		return fmt.Errorf("sync segment %d: %w", w.extent.SegNum, err)
+	}
+
+	return w.onClose()
 }
 
-func (writer *objectWriter) flush(final bool) error {
-	pos := 0
-	for pos < len(writer.buf) {
-		bufPtr := slotBufferPool.Get().(*[]byte)
-		slot := *bufPtr
+func (w *shardWriter) writeHeader() {
+	bufPos := int(w.off - w.flushed)
+	binary.BigEndian.PutUint64(w.buf[bufPos:], w.fragNum)
+	binary.BigEndian.PutUint64(w.buf[bufPos+8:], w.shardNum)
+	clear(w.buf[bufPos+16 : bufPos+fragHeaderSize])
+	w.off += fragHeaderSize
+	w.fragNum++
+}
 
-		fragSize := min(slotBodySize, writer.off-pos)
-
-		// Copy fragment into slot
-		copy(slot[slotHeaderSize:slotHeaderSize+fragSize], writer.buf[pos:pos+fragSize])
-
-		// Pad fragment if short
-		if fragSize < slotBodySize {
-			copy(slot[slotHeaderSize+fragSize:], zeroPadBuffer[:slotBodySize-fragSize])
-		}
-
-		// Write slot header
-		binary.BigEndian.PutUint64(slot[0:8], writer.slotNum)
-		binary.BigEndian.PutUint64(slot[8:16], writer.objNum)
-		binary.BigEndian.PutUint32(slot[16:20], 0)
-		binary.BigEndian.PutUint32(slot[20:24], uint32(fragSize))
-
-		var flags slotFlags
-		if writer.slotNum == (uint64(writer.extent.size)+slotBodySize-1)/slotBodySize-1 {
-			flags = flagSlotFinal
-		}
-		binary.BigEndian.PutUint32(slot[24:28], uint32(flags))
-		binary.BigEndian.PutUint32(slot[28:32], 0)
-
-		// Calculate CRC
-		binary.BigEndian.PutUint32(slot[28:32], crc32.ChecksumIEEE(slot[:]))
-
-		off := writer.extent.off + int64(writer.slotNum*slotSize)
-		if _, err := writer.seg.file.WriteAt(slot[:slotSize], off); err != nil {
-			slotBufferPool.Put(bufPtr)
-			return fmt.Errorf("objectWriter: WriteAt offset %d: %w", off, err)
-		}
-
-		slotBufferPool.Put(bufPtr)
-		pos += fragSize
-		writer.slotNum += 1
+func (w *shardWriter) flush(final bool) error {
+	bufUsed := int(w.off - w.flushed)
+	if bufUsed <= 0 {
+		return nil
 	}
 
+	nFrags := (bufUsed + totalFragSize - 1) / totalFragSize
+	writeLen := nFrags * totalFragSize
+
+	for i := range nFrags {
+		pos := i * totalFragSize
+
+		bodySize := fragBodySize
+		if final && i == nFrags-1 {
+			bodySize = bufUsed - pos - fragHeaderSize
+			clear(w.buf[pos+fragHeaderSize+bodySize : pos+totalFragSize])
+		}
+		binary.BigEndian.PutUint32(w.buf[pos+20:pos+24], uint32(bodySize))
+
+		var flags fragFlags
+		if final && i == nFrags-1 {
+			flags = flagEndOfShard
+		}
+		binary.BigEndian.PutUint32(w.buf[pos+24:pos+28], uint32(flags))
+
+		binary.BigEndian.PutUint32(w.buf[pos+28:pos+32], 0)
+		binary.BigEndian.PutUint32(w.buf[pos+28:pos+32], crc32.ChecksumIEEE(w.buf[pos:pos+totalFragSize]))
+	}
+
+	if _, err := w.seg.file.WriteAt(w.buf[:writeLen], w.extent.Off+w.flushed); err != nil {
+		return fmt.Errorf("WriteAt offset %d: %w", w.extent.Off+w.flushed, err)
+	}
+
+	w.flushed = w.off
 	return nil
 }

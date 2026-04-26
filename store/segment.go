@@ -3,12 +3,13 @@ package store
 import (
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 )
 
-const extension = ".seg"
+const segmentFilename = "%016d.seg"
 
 var magic = [4]byte{'S', '3', 'S', 'F'}
 
@@ -25,33 +26,33 @@ const (
 
 const (
 	segHeaderSize  = 14
-	slotHeaderSize = 32
-	slotBodySize   = 8 * KiB
-	slotSize       = slotHeaderSize + slotBodySize
+	fragHeaderSize = 32
+	fragBodySize   = 8 * KiB
+	totalFragSize  = fragHeaderSize + fragBodySize
 	maxSegSize     = 4 * GiB
 )
 
 type segmentFlags uint32
 
 const (
-	flagSegFull slotFlags = 1 << iota
+	flagFull segmentFlags = 1 << iota
 )
 
-type objectFlags uint32
+type shardFlags uint32
 
 const (
-	flagObjDeleted objectFlags = 1 << iota
+	flagDeleted shardFlags = 1 << iota
 )
 
-type slotFlags uint32
+type fragFlags uint32
 
 const (
-	flagSlotFinal slotFlags = 1 << iota
+	flagEndOfShard fragFlags = 1 << iota
 )
 
 type segment struct {
 	file *os.File
-	refs int32
+	refs atomic.Int32
 
 	closed bool
 }
@@ -72,12 +73,23 @@ func (store *Store) getSegment(num uint64) (seg *segment, err error) {
 }
 
 func openSegment(dir string, num uint64) (seg *segment, err error) {
-	path := filepath.Join(dir, fmt.Sprintf("%016d%s", num, extension))
+	path := filepath.Join(dir, fmt.Sprintf(segmentFilename, num))
 
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0600)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, err
 	}
+
+	defer func() {
+		if err != nil {
+			if closeErr := file.Close(); closeErr != nil {
+				slog.Warn("failed to close segment",
+					"segNum", num,
+					"error", closeErr,
+				)
+			}
+		}
+	}()
 
 	info, err := file.Stat()
 	if err != nil {
@@ -93,21 +105,21 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 		binary.BigEndian.PutUint32(header[6:10], uint32(0))     // [6:10]  Flags
 		binary.BigEndian.PutUint32(header[10:segHeaderSize], 0) // [6:14]  Empty
 
-		if _, err = file.Write(header); err != nil {
-			return nil, fmt.Errorf("write seg %d header: %w", num, err)
+		if _, err = file.WriteAt(header, 0); err != nil {
+			return nil, fmt.Errorf("write header: %w", err)
 		}
 
 	// Existing file: validate segment header.
 	default:
 		header := make([]byte, segHeaderSize)
 		if _, err = file.ReadAt(header, 0); err != nil {
-			return nil, fmt.Errorf("read seg %d header: %w", num, err)
+			return nil, fmt.Errorf("read header: %w", err)
 		}
 
 		var fileMagic [4]byte
 		copy(fileMagic[:], header[0:4])
 		if fileMagic != magic {
-			return nil, fmt.Errorf("read seg %d header: invalid magic %x", num, fileMagic)
+			return nil, fmt.Errorf("invalid magic %x", fileMagic)
 		}
 	}
 
@@ -120,24 +132,32 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 }
 
 func (seg *segment) isFull() (bool, error) {
+	if seg.closed {
+		return false, fmt.Errorf("segment closed")
+	}
+
 	buf := make([]byte, 4)
 	if _, err := seg.file.ReadAt(buf, 6); err != nil {
 		return false, err
 	}
 
-	flags := binary.BigEndian.Uint32(buf[:])
+	flags := segmentFlags(binary.BigEndian.Uint32(buf[:]))
 
-	return flags&uint32(flagSegFull) != 0, nil
+	return flags&flagFull != 0, nil
 }
 
 func (seg *segment) markFull() error {
+	if seg.closed {
+		return fmt.Errorf("segment closed")
+	}
+
 	buf := make([]byte, 4)
 	if _, err := seg.file.ReadAt(buf, 6); err != nil {
 		return err
 	}
 
-	flags := binary.BigEndian.Uint32(buf[:])
-	binary.BigEndian.PutUint32(buf[:], flags|uint32(flagSegFull)) // [6:10]  Flags
+	flags := segmentFlags(binary.BigEndian.Uint32(buf[:]))
+	binary.BigEndian.PutUint32(buf[:], uint32(flags|flagFull))
 
 	if _, err := seg.file.WriteAt(buf, 6); err != nil {
 		return err
@@ -148,7 +168,7 @@ func (seg *segment) markFull() error {
 
 func (seg *segment) Size() (int64, error) {
 	if seg.closed {
-		return 0, fmt.Errorf("segment is closed")
+		return 0, fmt.Errorf("segment closed")
 	}
 
 	info, err := seg.file.Stat()

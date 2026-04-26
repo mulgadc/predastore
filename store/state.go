@@ -9,9 +9,9 @@ import (
 const stateFilename = "state.json"
 
 type state struct {
-	SegNum  uint64 `json:"SegNum"`
-	ObjNum  uint64 `json:"ObjNum"`
-	SlotNum uint64 `json:"SlotNum"`
+	SegNum   uint64 `json:"segNum"`
+	ShardNum uint64 `json:"shardNum"`
+	FragNum  uint64 `json:"fragNum"`
 }
 
 // loadState reads state.json from the Store directory and restores monotonic counters.
@@ -24,8 +24,8 @@ func (store *Store) loadState() error {
 	}
 
 	store.segNum = sta.SegNum
-	store.objNum = sta.ObjNum
-	store.slotNum = sta.SlotNum
+	store.shardNum = sta.ShardNum
+	store.fragNum = sta.FragNum
 
 	return nil
 }
@@ -33,9 +33,9 @@ func (store *Store) loadState() error {
 // saveState writes the current monotonic counters to state.json in the Store directory.
 func (store *Store) saveState() error {
 	sta := state{
-		SegNum:  store.segNum,
-		ObjNum:  store.objNum,
-		SlotNum: store.slotNum,
+		SegNum:   store.segNum,
+		ShardNum: store.shardNum,
+		FragNum:  store.fragNum,
 	}
 
 	data, err := json.Marshal(sta)

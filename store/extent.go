@@ -6,9 +6,9 @@ import (
 )
 
 type extent struct {
-	segNum uint64
-	off    int64
-	size   int64
+	SegNum uint64
+	Off    int64
+	Size   int64
 }
 
 func (ext extent) encode() ([]byte, error) {
