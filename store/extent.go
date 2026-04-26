@@ -5,6 +5,9 @@ import (
 	"encoding/gob"
 )
 
+// extent locates a shard's data on disk. Stored gob-encoded in the index.
+//   - PSize: physical (on-disk) size including fragment headers = fragCount * totalFragSize
+//   - LSize: logical (data-only) size as seen by callers of Read/Write
 type extent struct {
 	SegNum uint64
 	Off    int64

@@ -9,6 +9,17 @@ import (
 
 const writeBufLen = 1
 
+// shardWriter writes a single shard as a contiguous sequence of fragments.
+// The internal buffer is sized writeBufLen*totalFragSize and mirrors the on-disk
+// layout exactly (headers interleaved with body data). This allows flush to issue
+// a single WriteAt for the entire buffer without re-packing.
+//
+// Position tracking:
+//   - bufPos: bytes written into the buffer (0 → ext.PSize), includes headers
+//   - extPos: bytes already flushed to disk; buf[0:bufPos-extPos] is unflushed
+//
+// Fragment headers are written inline by writeHeader() whenever bufPos lands on
+// a fragment boundary. Payload length, flags, and CRC are deferred to flush().
 type shardWriter struct {
 	seg *segment
 	ext extent
@@ -24,11 +35,16 @@ type shardWriter struct {
 	closed  bool
 }
 
-// dataWritten returns the number of logical (non-header) bytes written so far.
+// dataWritten derives logical bytes written from bufPos. Each complete fragment
+// contributes fragBodySize logical bytes; a partial fragment contributes
+// (bufPos % totalFragSize - fragHeaderSize) bytes once past the header.
 func (w *shardWriter) dataWritten() int64 {
 	return w.bufPos/totalFragSize*fragBodySize + max(0, w.bufPos%totalFragSize-fragHeaderSize)
 }
 
+// Write copies data into the buffer, inserting fragment headers at each
+// totalFragSize boundary. Flushes to disk when the buffer is full or the
+// shard's logical capacity is reached.
 func (w *shardWriter) Write(p []byte) (total int, err error) {
 	if w.closed {
 		return 0, fmt.Errorf("shard writer closed")
@@ -61,6 +77,9 @@ func (w *shardWriter) Write(p []byte) (total int, err error) {
 	return total, nil
 }
 
+// ReadFrom streams from r into the shard until dataSize is reached or r returns
+// an error. Unlike Write, it returns io.EOF from r without treating it as a
+// fault — partial reads are flushed before the error propagates.
 func (w *shardWriter) ReadFrom(r io.Reader) (total int64, err error) {
 	if w.closed {
 		return 0, fmt.Errorf("shard writer closed")
@@ -93,6 +112,8 @@ func (w *shardWriter) ReadFrom(r io.Reader) (total int64, err error) {
 	return total, nil
 }
 
+// Close flushes any remaining buffered data, syncs the segment file, then
+// commits the extent to the index via onClose. Must be called exactly once.
 func (w *shardWriter) Close() error {
 	if w.closed {
 		return fmt.Errorf("shard writer closed")
@@ -113,6 +134,9 @@ func (w *shardWriter) Close() error {
 	return w.onClose()
 }
 
+// writeHeader writes fragNum and shardNum into the buffer at the current
+// position, zeroes the remaining header fields (payloadLen, flags, crc are
+// filled in by flush), and advances bufPos past the header.
 func (w *shardWriter) writeHeader() {
 	bufPos := int(w.bufPos - w.extPos)
 	binary.BigEndian.PutUint64(w.buf[bufPos:], w.fragNum)
@@ -122,6 +146,10 @@ func (w *shardWriter) writeHeader() {
 	w.fragNum++
 }
 
+// flush writes the buffered fragments to disk in a single WriteAt. Before the
+// write it fills in each fragment's payloadLen, flags, and CRC. If final is
+// true the last fragment gets flagEndOfShard, its body is zero-padded, and
+// payloadLen reflects the actual data (which may be < fragBodySize).
 func (w *shardWriter) flush(final bool) error {
 	bufUsed := int(w.bufPos - w.extPos)
 	if bufUsed <= 0 {
@@ -134,6 +162,7 @@ func (w *shardWriter) flush(final bool) error {
 	for i := range fragCount {
 		pos := i * totalFragSize
 
+		// Determine actual payload length; pad the final fragment's tail with zeros.
 		bodySize := fragBodySize
 		if final && i == fragCount-1 {
 			bodySize = bufUsed - pos - fragHeaderSize
@@ -147,6 +176,7 @@ func (w *shardWriter) flush(final bool) error {
 		}
 		binary.BigEndian.PutUint32(w.buf[pos+24:pos+28], uint32(flags))
 
+		// CRC covers the full fragment with the CRC field itself zeroed.
 		binary.BigEndian.PutUint32(w.buf[pos+28:pos+32], 0)
 		binary.BigEndian.PutUint32(w.buf[pos+28:pos+32], crc32.ChecksumIEEE(w.buf[pos:pos+totalFragSize]))
 	}

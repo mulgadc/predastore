@@ -1,3 +1,6 @@
+// Package store implements segment-based shard storage with CRC-protected
+// fragments. Shards are written as contiguous extents of fixed-size fragments
+// within append-only segment files. Segments roll when they reach maxSegSize.
 package store
 
 import (
@@ -14,12 +17,17 @@ import (
 
 const indexFilename = "db"
 
+// Store manages segment files and an index mapping shard keys to on-disk extents.
+// All public methods are safe for concurrent use. Segment files are pre-allocated
+// via Truncate and written lock-free with WriteAt; the mutex protects only metadata
+// (counters, segment cache, index commits).
 type Store struct {
 	dir      string
 	index    *s3db.S3DB
 	segCache map[uint64]*segment
 	mutex    sync.Mutex
 
+	// Monotonic counters persisted to state.json across restarts.
 	segNum   uint64
 	shardNum uint64
 	fragNum  uint64
@@ -27,6 +35,10 @@ type Store struct {
 	closed bool
 }
 
+// Open recovers or creates a Store in dir. On startup it restores monotonic
+// counters from state.json, opens the index, then finds a non-full segment to
+// write into — rolling forward through segment numbers until one with capacity
+// is found (up to 100 attempts).
 func Open(dir string) (store *Store, err error) {
 	store = &Store{
 		dir:      dir,
@@ -99,6 +111,8 @@ func Open(dir string) (store *Store, err error) {
 	return store, err
 }
 
+// Lookup returns a shardReader for the given shard. The underlying segment is
+// reference-counted: the caller must call reader.Close() to release it.
 func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader *shardReader, err error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
@@ -142,6 +156,12 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader *shar
 	return reader, nil
 }
 
+// Append reserves space for a shard of the given logical size and returns a
+// writer. The segment file is pre-allocated (Truncated) to fit all fragments,
+// so subsequent WriteAt calls from the writer never extend the file. If the
+// current segment can't fit the shard, it is marked full and the store rolls
+// to the next segment number (up to 100 attempts). The index entry is committed
+// only when the writer is closed.
 func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (writer *shardWriter, err error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
@@ -150,6 +170,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		return nil, fmt.Errorf("store closed")
 	}
 
+	// Ceiling division: number of fragments needed to hold size logical bytes.
 	fragCount := max(1, (uint64(size)+fragBodySize-1)/fragBodySize)
 
 	var seg *segment
@@ -209,7 +230,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		store.segNum += 1
 	}
 
-	// TODO: Check if this cast could be a problem
+	// Pre-allocate the extent so writer WriteAt calls never extend the file.
 	if err := seg.file.Truncate(off + totalFragSize*int64(fragCount)); err != nil {
 		return nil, fmt.Errorf("truncate segment %d: %w", store.segNum, err)
 	}
@@ -257,6 +278,8 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 	return writer, nil
 }
 
+// Delete removes the index entry for a shard. The on-disk extent becomes dead
+// space reclaimable by a future compactor.
 func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
@@ -273,6 +296,9 @@ func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) error {
 	return nil
 }
 
+// Close drains all outstanding segment references (spinning with Gosched),
+// closes segment file descriptors and the index. Blocks until all readers and
+// writers have been closed.
 func (store *Store) Close() error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
@@ -306,6 +332,7 @@ func (store *Store) Close() error {
 	return errors.Join(errs...)
 }
 
+// makeShardKey builds a 36-byte index key: 32-byte object hash || 4-byte big-endian shard index.
 func makeShardKey(objectHash [32]byte, shardIndex uint32) []byte {
 	key := make([]byte, 36)
 	copy(key[:32], objectHash[:])

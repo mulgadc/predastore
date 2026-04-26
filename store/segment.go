@@ -24,6 +24,19 @@ const (
 	GiB = 1024 * MiB
 )
 
+// Segment layout:
+//
+//	[0:14]  segment header (magic, version, flags, reserved)
+//	[14:…]  sequence of fixed-size fragments (fragHeaderSize + fragBodySize each)
+//
+// Fragment header layout (32 bytes):
+//
+//	[0:8]   fragNum   — global fragment counter (monotonic across segments)
+//	[8:16]  shardNum  — shard identifier
+//	[16:20] reserved
+//	[20:24] payloadLen — actual data bytes in this fragment's body (≤ fragBodySize)
+//	[24:28] flags     — fragFlags (flagEndOfShard marks the last fragment of a shard)
+//	[28:32] crc32     — IEEE CRC over the entire fragment with this field zeroed
 const (
 	segHeaderSize  = 14
 	fragHeaderSize = 32
@@ -50,6 +63,9 @@ const (
 	flagEndOfShard fragFlags = 1 << iota
 )
 
+// segment is an open segment file handle with a reference count. The refs
+// counter tracks active readers and writers; Store.Close waits for all refs
+// to drain before closing the file descriptor.
 type segment struct {
 	file *os.File
 	refs atomic.Int32
@@ -57,6 +73,8 @@ type segment struct {
 	closed bool
 }
 
+// getSegment returns a cached segment or opens it from disk. Callers must hold
+// store.mutex.
 func (store *Store) getSegment(num uint64) (seg *segment, err error) {
 	if seg, ok := store.segCache[num]; ok {
 		return seg, nil
@@ -72,6 +90,9 @@ func (store *Store) getSegment(num uint64) (seg *segment, err error) {
 	return seg, nil
 }
 
+// openSegment opens or creates a segment file. New files get a header written;
+// existing files have their magic bytes validated. The file is opened O_RDWR
+// (no O_APPEND) so WriteAt works at arbitrary offsets.
 func openSegment(dir string, num uint64) (seg *segment, err error) {
 	path := filepath.Join(dir, fmt.Sprintf(segmentFilename, num))
 
@@ -131,6 +152,7 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 	return seg, nil
 }
 
+// isFull reads the segment header flags and returns whether flagFull is set.
 func (seg *segment) isFull() (bool, error) {
 	if seg.closed {
 		return false, fmt.Errorf("segment closed")
@@ -146,6 +168,8 @@ func (seg *segment) isFull() (bool, error) {
 	return flags&flagFull != 0, nil
 }
 
+// markFull sets flagFull in the segment header. Once set, subsequent calls to
+// isFull return true and the store will roll to the next segment.
 func (seg *segment) markFull() error {
 	if seg.closed {
 		return fmt.Errorf("segment closed")
