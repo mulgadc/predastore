@@ -200,29 +200,16 @@ func New(config any) (backend.Backend, error) {
 	}
 	hashRing := consistent.New(nil, ringCfg)
 
-	// Create node directories and add nodes to ring using config node IDs
+	// Add nodes to hash ring using config node IDs
 	// This ensures hash ring node names match config node IDs (e.g., node-1, node-2, node-3)
+	// Node directories are created by QUIC servers, not by the S3 server.
 	if len(cfg.Nodes) > 0 {
 		for _, node := range cfg.Nodes {
-			nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", node.ID))
-			if err := os.MkdirAll(nodeDir, 0750); err != nil {
-				if closeErr := globalState.Close(); closeErr != nil {
-					slog.Debug("Failed to close global state during cleanup", "error", closeErr)
-				}
-				return nil, fmt.Errorf("failed to create node directory: %w", err)
-			}
 			hashRing.Add(myMember(fmt.Sprintf("node-%d", node.ID)))
 		}
 	} else {
 		// Fallback for tests without config: use 0-indexed nodes
 		for i := 0; i < partitionCount; i++ {
-			nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
-			if err := os.MkdirAll(nodeDir, 0750); err != nil {
-				if closeErr := globalState.Close(); closeErr != nil {
-					slog.Debug("Failed to close global state during cleanup", "error", closeErr)
-				}
-				return nil, fmt.Errorf("failed to create node directory: %w", err)
-			}
 			hashRing.Add(myMember(fmt.Sprintf("node-%d", i)))
 		}
 	}
