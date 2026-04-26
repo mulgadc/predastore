@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"os"
-	"path/filepath"
 )
 
 const readBufLen = 1
@@ -14,122 +12,87 @@ const readBufLen = 1
 type shardReader struct {
 	seg *segment
 	ext extent
-	buf []byte
-	pos int64
 
-	onClose func()
+	buf    []byte
+	bufPos int64
+
+	onClose func() error
 	closed  bool
 }
 
-func (obj *shardReader) Size() int64 {
-	return obj.totalSize
-}
+func (r *shardReader) Read(p []byte) (int, error) {
+	if r.closed {
+		return 0, fmt.Errorf("shard reader closed")
+	}
 
-func (obj *shardReader) Close() error {
-	return nil
-}
-
-// ReadAt reads len(p) bytes from the object starting at byte offset.
-// Stateless and safe for concurrent use. Reads full fragments from disk
-// even for partial requests.
-func (obj *shardReader) ReadAt(p []byte, offset int64) (int, error) {
-	if offset >= obj.totalSize {
+	if r.bufPos >= r.ext.LSize {
 		return 0, io.EOF
 	}
 
-	clamped := false
-	if offset+int64(len(p)) > obj.totalSize {
-		p = p[:obj.totalSize-offset]
-		clamped = true
+	n, err := r.ReadAt(p, r.bufPos)
+	r.bufPos += int64(n)
+	return n, err
+}
+
+// ReadAt reads len(p) bytes from the shard starting at logical byte offset.
+func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
+	if off >= r.ext.LSize {
+		return 0, io.EOF
 	}
 
-	byteExtIndex, offsetInByteExt := locateByteOffset(obj.byteExtents, offset)
+	if off+int64(len(p)) > r.ext.LSize {
+		p = p[:r.ext.LSize-off]
+	}
 
-	slotIndex := int(offsetInByteExt / fragBodySize)
-	offsetInSlot := int(offsetInByteExt % fragBodySize)
-
-	fragBuf := make([]byte, readBufferFragments*totalFragSize)
 	totalCopied := 0
+	for totalCopied < len(p) {
+		logicalPos := off + int64(totalCopied)
+		fragIndex := logicalPos / fragBodySize
+		bodyOffset := int(logicalPos % fragBodySize)
 
-	for byteExtIndex < len(obj.byteExtents) && totalCopied < len(p) {
-		ext := obj.byteExtents[byteExtIndex]
-		slotsInExt := (int(ext.size) + fragBodySize - 1) / fragBodySize //nolint:gosec // G115: ext.size bounded by segment capacity (~1 GiB)
-
-		f, err := os.Open(filepath.Join(obj.store.dir, fmt.Sprintf("%016d%s", ext.segmentNum, extension)))
-		if err != nil {
-			return totalCopied, fmt.Errorf("store: ReadAt: open segment %d: %w", ext.segmentNum, err)
+		diskOff := r.ext.Off + fragIndex*totalFragSize
+		if _, err := r.seg.file.ReadAt(r.buf[:totalFragSize], diskOff); err != nil {
+			return totalCopied, fmt.Errorf("read segment %d at offset %d: %w", r.ext.SegNum, diskOff, err)
 		}
 
-		for slotIndex < slotsInExt && totalCopied < len(p) {
-			fragsToRead := min(readBufferFragments, slotsInExt-slotIndex)
-			diskOffset := int64(ext.offset) + int64(slotIndex)*int64(totalFragSize) //nolint:gosec // G115: ext.offset bounded by segment file size
-			readSize := fragsToRead * totalFragSize
-
-			if _, err := f.ReadAt(fragBuf[:readSize], diskOffset); err != nil {
-				f.Close()
-				return totalCopied, fmt.Errorf("store: ReadAt: read segment %d offset %d: %w",
-					ext.segmentNum, diskOffset, err)
-			}
-
-			for fi := range fragsToRead {
-				if totalCopied >= len(p) {
-					break
-				}
-
-				slot := fragBuf[fi*totalFragSize : (fi+1)*totalFragSize]
-
-				storedCRC := binary.BigEndian.Uint32(slot[28:32])
-				binary.BigEndian.PutUint32(slot[28:32], 0)
-				computed := crc32.ChecksumIEEE(slot[0:fragHeaderSize])
-				computed = crc32.Update(computed, crc32.IEEETable, slot[fragHeaderSize:fragHeaderSize+fragBodySize])
-
-				if computed != storedCRC {
-					f.Close()
-					return totalCopied, fmt.Errorf("store: ReadAt: CRC mismatch segment %d offset %d: stored=%08x computed=%08x",
-						ext.segmentNum, diskOffset+int64(fi)*int64(totalFragSize), storedCRC, computed)
-				}
-
-				payloadLen := int(binary.BigEndian.Uint32(slot[20:24]))
-				if payloadLen > fragBodySize {
-					f.Close()
-					return totalCopied, fmt.Errorf("store: ReadAt: invalid payload length %d in segment %d offset %d",
-						payloadLen, ext.segmentNum, diskOffset+int64(fi)*int64(totalFragSize))
-				}
-
-				payloadStart := fragHeaderSize + offsetInSlot
-				payloadEnd := fragHeaderSize + payloadLen
-				n := copy(p[totalCopied:], slot[payloadStart:payloadEnd])
-				totalCopied += n
-				offsetInSlot = 0
-			}
-
-			slotIndex += fragsToRead
+		// Validate CRC
+		storedCRC := binary.BigEndian.Uint32(r.buf[28:32])
+		binary.BigEndian.PutUint32(r.buf[28:32], 0)
+		if computed := crc32.ChecksumIEEE(r.buf[:totalFragSize]); computed != storedCRC {
+			return totalCopied, fmt.Errorf("ReadAt: CRC mismatch at offset %d: stored=%08x computed=%08x", diskOff, storedCRC, computed)
 		}
 
-		f.Close()
-		slotIndex = 0
-		byteExtIndex++
+		payloadLen := int(binary.BigEndian.Uint32(r.buf[20:24]))
+		if payloadLen > fragBodySize {
+			return totalCopied, fmt.Errorf("ReadAt: invalid payload length %d at offset %d", payloadLen, diskOff)
+		}
+
+		n := copy(p[totalCopied:], r.buf[fragHeaderSize+bodyOffset:fragHeaderSize+payloadLen])
+		totalCopied += n
 	}
 
-	if clamped {
+	if off+int64(totalCopied) >= r.ext.LSize {
 		return totalCopied, io.EOF
 	}
+
 	return totalCopied, nil
 }
 
-// WriteTo streams the full object to w. Implements io.WriterTo.
-func (obj *shardReader) WriteTo(w io.Writer) (int64, error) {
-	sr := io.NewSectionReader(obj, 0, obj.totalSize)
-	return io.Copy(w, sr)
+// WriteTo streams the full shard to w. Implements io.WriterTo.
+func (r *shardReader) WriteTo(w io.Writer) (int64, error) {
+	return io.Copy(w, io.NewSectionReader(r, 0, r.ext.LSize))
 }
 
-func locateByteOffset(exts []byteExtent, off int64) (extIndex int, offsetInExt int64) {
-	remaining := off
-	for i, ext := range exts {
-		if remaining < int64(ext.size) { //nolint:gosec // G115: ext.size bounded by segment capacity
-			return i, remaining
-		}
-		remaining -= int64(ext.size) //nolint:gosec // G115: ext.size bounded by segment capacity
+func (r *shardReader) Size() int64 {
+	return r.ext.LSize
+}
+
+func (r *shardReader) Close() error {
+	if r.closed {
+		return fmt.Errorf("shard reader closed")
 	}
-	return len(exts), 0
+
+	r.closed = true
+
+	return r.onClose()
 }

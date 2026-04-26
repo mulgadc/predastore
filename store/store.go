@@ -126,13 +126,15 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader *shar
 	segment.refs.Add(1)
 
 	reader = &shardReader{
-		seg: segment,
-		ext: extent,
-		buf: make([]byte, readBufLen*totalFragSize),
-		pos: 0,
+		seg:    segment,
+		ext:    extent,
+		buf:    make([]byte, readBufLen*totalFragSize),
+		bufPos: 0,
 
-		onClose: func() {
+		onClose: func() error {
 			segment.refs.Add(-1)
+
+			return nil
 		},
 		closed: false,
 	}
@@ -216,19 +218,19 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 
 	writer = &shardWriter{
 		seg: seg,
-		extent: extent{
+		ext: extent{
 			SegNum: store.segNum,
 			Off:    off,
-			Size:   int64(fragCount) * totalFragSize,
+			PSize:  int64(fragCount) * totalFragSize,
+			LSize:  size,
 		},
 		shardNum: store.shardNum,
 		fragNum:  store.fragNum,
-		dataSize: size,
 		buf:      make([]byte, writeBufLen*totalFragSize),
-		off:      0,
+		bufPos:   0,
 
 		onClose: func() error {
-			encoded, err := writer.extent.encode()
+			encoded, err := writer.ext.encode()
 			if err != nil {
 				return fmt.Errorf("encode extent: %w", err)
 			}
