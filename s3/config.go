@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/backend/filesystem"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -82,13 +80,6 @@ func (s3 *Config) BucketConfig(bucket string) (S3_Buckets, error) {
 	return S3_Buckets{}, errors.New("bucket not found")
 }
 
-// ToFilesystemConfig converts s3.Config to filesystem backend config
-func (s3 *Config) ToFilesystemConfig() any {
-	// Import dynamically to avoid circular imports
-	// The actual conversion happens in the routes setup
-	return s3
-}
-
 // validatePublicBucketPermission checks if the request is allowed for a public bucket
 // Returns nil if the request is allowed, otherwise returns an error
 func (s3 *Config) validatePublicBucketPermission(method, path string) error {
@@ -154,33 +145,4 @@ func findSlash(s string) int {
 		}
 	}
 	return -1
-}
-
-// createFilesystemBackend creates a filesystem backend from the configuration.
-// This is primarily used for testing.
-func (s3 *Config) createFilesystemBackend() backend.Backend {
-	buckets := make([]filesystem.BucketConfig, len(s3.Buckets))
-	for i, b := range s3.Buckets {
-		buckets[i] = filesystem.BucketConfig{
-			Name:     b.Name,
-			Pathname: b.Pathname,
-			Region:   b.Region,
-			Type:     b.Type,
-			Public:   b.Public,
-		}
-	}
-
-	fsConfig := &filesystem.Config{
-		Buckets:   buckets,
-		OwnerID:   "predastore",
-		OwnerName: "predastore",
-	}
-
-	be, err := filesystem.New(fsConfig)
-	if err != nil {
-		slog.Error("Failed to create filesystem backend", "error", err)
-		return nil
-	}
-
-	return be
 }

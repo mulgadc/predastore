@@ -18,7 +18,6 @@ import (
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
-	"github.com/mulgadc/predastore/backend/filesystem"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3db"
 )
@@ -27,8 +26,6 @@ import (
 type BackendType string
 
 const (
-	// BackendFilesystem uses local filesystem storage (simple, single-node)
-	BackendFilesystem BackendType = "filesystem"
 	// BackendDistributed uses distributed storage with erasure coding
 	BackendDistributed BackendType = "distributed"
 )
@@ -70,14 +67,11 @@ type Server struct {
 type Option func(*Server) error
 
 // NewServer creates a new S3 server with the given options.
-// By default, it uses the filesystem backend which is simple and requires no additional setup.
-//
-// For distributed storage with erasure coding, use WithBackend(BackendDistributed).
 func NewServer(opts ...Option) (*Server, error) {
 	s := &Server{
 		host:        "0.0.0.0",
 		port:        8443,
-		backendType: BackendFilesystem,
+		backendType: BackendDistributed,
 		nodeID:      -1, // Dev mode by default
 		shutdown:    make(chan struct{}),
 		dbFailed:    make(chan error, 1),
@@ -141,9 +135,7 @@ func WithDebug(enabled bool) Option {
 }
 
 // WithBackend sets the storage backend type.
-// Use BackendFilesystem for simple single-node storage.
-// Use BackendDistributed for distributed storage with erasure coding.
-// If empty string is passed, the default (BackendFilesystem) is used.
+// If empty string is passed, the default (BackendDistributed) is used.
 func WithBackend(backendType BackendType) Option {
 	return func(s *Server) error {
 		// Only override if a non-empty value is provided
@@ -241,10 +233,6 @@ func (s *Server) init() error {
 
 	// Initialize the appropriate backend
 	switch s.backendType {
-	case BackendFilesystem:
-		if err := s.initFilesystemBackend(); err != nil {
-			return err
-		}
 	case BackendDistributed:
 		if err := s.initDistributedBackend(); err != nil {
 			return err
@@ -265,35 +253,6 @@ func (s *Server) init() error {
 	s.server = NewHTTP2ServerWithBackend(s.config, s.backend, s.credProv)
 	slog.Info("HTTP/2 server initialized - using net/http for connection multiplexing")
 
-	return nil
-}
-
-// initFilesystemBackend initializes the filesystem storage backend
-func (s *Server) initFilesystemBackend() error {
-	buckets := make([]filesystem.BucketConfig, len(s.config.Buckets))
-	for i, b := range s.config.Buckets {
-		buckets[i] = filesystem.BucketConfig{
-			Name:     b.Name,
-			Pathname: b.Pathname,
-			Region:   b.Region,
-			Type:     b.Type,
-			Public:   b.Public,
-		}
-	}
-
-	fsConfig := &filesystem.Config{
-		Buckets:   buckets,
-		OwnerID:   "predastore",
-		OwnerName: "predastore",
-	}
-
-	be, err := filesystem.New(fsConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create filesystem backend: %w", err)
-	}
-
-	s.backend = be
-	slog.Info("Initialized filesystem backend", "buckets", len(buckets))
 	return nil
 }
 

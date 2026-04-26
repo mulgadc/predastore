@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Note: BackendType, BackendFilesystem, and BackendDistributed are defined in server.go
+// Note: BackendType and BackendDistributed are defined in server.go
 
 // TestBackend holds the configuration and server for a specific backend
 type TestBackend struct {
@@ -25,31 +25,6 @@ type TestBackend struct {
 	Backend     backend.Backend
 	QuicServers []*quicserver.QuicServer
 	Cleanup     func()
-}
-
-// setupFilesystemBackend creates a filesystem backend for testing
-func setupFilesystemBackend(t *testing.T) *TestBackend {
-	t.Helper()
-
-	s3 := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := s3.ReadConfig()
-	require.NoError(t, err, "Should read config without error")
-
-	be := s3.createFilesystemBackend()
-	server := NewHTTP2ServerWithBackend(s3, be, NewConfigProvider(s3.Auth))
-
-	return &TestBackend{
-		Type:    BackendFilesystem,
-		Config:  s3,
-		Server:  server,
-		Handler: server.GetHandler(),
-		Backend: be,
-		Cleanup: func() {
-			be.Close()
-		},
-	}
 }
 
 // setupDistributedBackend creates a distributed backend for testing with QUIC servers
@@ -99,7 +74,6 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 		DataShards:     s3.RS.Data,
 		ParityShards:   s3.RS.Parity,
 		PartitionCount: nodeCount,
-		UseQUIC:        true,
 		QuicBasePort:   basePort,
 		Buckets:        buckets,
 	}
@@ -147,8 +121,6 @@ func RunWithBackends(t *testing.T, backends []BackendType, testFn func(t *testin
 		t.Run(string(backendType), func(t *testing.T) {
 			var tb *TestBackend
 			switch backendType {
-			case BackendFilesystem:
-				tb = setupFilesystemBackend(t)
 			case BackendDistributed:
 				tb = setupDistributedBackend(t)
 			default:
@@ -163,12 +135,7 @@ func RunWithBackends(t *testing.T, backends []BackendType, testFn func(t *testin
 
 // AllBackends returns all available backend types for testing
 func AllBackends() []BackendType {
-	return []BackendType{BackendFilesystem, BackendDistributed}
-}
-
-// FilesystemOnly returns only the filesystem backend for testing
-func FilesystemOnly() []BackendType {
-	return []BackendType{BackendFilesystem}
+	return []BackendType{BackendDistributed}
 }
 
 // DistributedOnly returns only the distributed backend for testing

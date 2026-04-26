@@ -50,13 +50,6 @@ func TestWithDebug(t *testing.T) {
 }
 
 func TestWithBackend(t *testing.T) {
-	t.Run("filesystem", func(t *testing.T) {
-		s := &Server{}
-		opt := WithBackend(BackendFilesystem)
-		require.NoError(t, opt(s))
-		assert.Equal(t, BackendFilesystem, s.backendType)
-	})
-
 	t.Run("distributed", func(t *testing.T) {
 		s := &Server{}
 		opt := WithBackend(BackendDistributed)
@@ -65,10 +58,10 @@ func TestWithBackend(t *testing.T) {
 	})
 
 	t.Run("empty string preserves default", func(t *testing.T) {
-		s := &Server{backendType: BackendFilesystem}
+		s := &Server{backendType: BackendDistributed}
 		opt := WithBackend("")
 		require.NoError(t, opt(s))
-		assert.Equal(t, BackendFilesystem, s.backendType)
+		assert.Equal(t, BackendDistributed, s.backendType)
 	})
 }
 

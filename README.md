@@ -2,7 +2,7 @@
 
 Predastore developed by [Mulga Defense Corporation](https://mulgadc.com/) is a distributed, S3-compatible object storage system with Reed-Solomon erasure coding, built for bare-metal, edge, and on-premise deployments. It is the storage backend for [Spinifex](https://github.com/mulgadc/spinifex) — an AWS-compatible infrastructure stack for private clouds.
 
-Predastore can run as a single-node server with local filesystem storage, or scale out to a multi-node cluster with erasure-coded shards, Raft-consensus metadata, and QUIC-based inter-node transport.
+Predastore runs as a distributed cluster with erasure-coded shards, Raft-consensus metadata, and QUIC-based inter-node transport. For development, all nodes run in a single process on loopback.
 
 ## Architecture
 
@@ -61,7 +61,7 @@ make build
 ./bin/s3d
 ```
 
-This starts a single-node server with the filesystem backend on `https://localhost:8443`.
+This starts a development cluster (all nodes on loopback) on `https://localhost:8443`.
 
 ### Configuration
 
@@ -100,24 +100,18 @@ aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 ls s3://my-bucket/
 aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 cp s3://my-bucket/file.txt ./downloaded.txt
 ```
 
-## Storage Backends
+## Storage Backend
 
-### Filesystem (Default)
-
-Local filesystem storage with a flat layout. Production-ready for single-node deployments — no external dependencies.
-
-### Distributed
-
-Multi-node storage with erasure coding, Raft-consensus metadata, and QUIC transport:
+Distributed storage with erasure coding, Raft-consensus metadata, and QUIC transport:
 
 ```bash
-# Development mode — runs all DB and shard nodes in one process
-./bin/s3d -backend distributed -config s3/tests/config/cluster.toml
+# Development mode — runs all DB and shard nodes in one process on loopback
+./bin/s3d -config s3/tests/config/cluster.toml
 
 # Production — separate processes per host
-./bin/s3d -backend distributed -config cluster.toml -node 0 -db-node 1   # Host 1
-./bin/s3d -backend distributed -config cluster.toml -node 1 -db-node 2   # Host 2
-./bin/s3d -backend distributed -config cluster.toml -node 2 -db-node 3   # Host 3
+./bin/s3d -config cluster.toml -node 0   # Host 1
+./bin/s3d -config cluster.toml -node 1   # Host 2
+./bin/s3d -config cluster.toml -node 2   # Host 3
 ```
 
 The distributed backend's data model decomposes objects into chunks, shards, segments, and blocks:

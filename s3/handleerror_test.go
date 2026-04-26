@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/mulgadc/predastore/backend"
@@ -17,12 +16,8 @@ import (
 
 func setupHandleErrorServer(t *testing.T) *HTTP2Server {
 	t.Helper()
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	require.NoError(t, err)
-	return NewHTTP2Server(config)
+	config := &Config{Region: "us-east-1"}
+	return NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(nil))
 }
 
 func TestHandleError_BackendS3Error(t *testing.T) {
@@ -108,16 +103,6 @@ func TestHandleError_GenericError(t *testing.T) {
 	var s3error S3Error
 	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &s3error))
 	assert.Equal(t, "InternalError", s3error.Code)
-}
-
-func TestToFilesystemConfig(t *testing.T) {
-	config := &Config{
-		Buckets: []S3_Buckets{
-			{Name: "test"},
-		},
-	}
-	result := config.ToFilesystemConfig()
-	assert.Equal(t, config, result)
 }
 
 func TestHTTP2Server_Shutdown_NilServer(t *testing.T) {

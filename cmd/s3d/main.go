@@ -19,8 +19,7 @@ func main() {
 	debug := flag.Bool("debug", false, "Enable verbose debug logs")
 	port := flag.Int("port", 443, "Server port")
 	host := flag.String("host", "0.0.0.0", "Server host")
-	backendType := flag.String("backend", "filesystem", "Storage backend type (filesystem, distributed)")
-	nodeID := flag.Int("node", -1, "Node ID to run (distributed mode only, -1 = dev mode runs all nodes)")
+	nodeID := flag.Int("node", -1, "Node ID to run (-1 = dev mode runs all nodes)")
 
 	flag.Parse()
 
@@ -37,17 +36,8 @@ func main() {
 	if os.Getenv("PORT") != "" {
 		*port, _ = strconv.Atoi(os.Getenv("PORT"))
 	}
-	if os.Getenv("BACKEND") != "" {
-		*backendType = os.Getenv("BACKEND")
-	}
 	if os.Getenv("NODE") != "" {
 		*nodeID, _ = strconv.Atoi(os.Getenv("NODE"))
-	}
-
-	// Determine backend type
-	backend := s3.BackendFilesystem
-	if *backendType == "distributed" {
-		backend = s3.BackendDistributed
 	}
 
 	// Create the S3 server with all options
@@ -57,7 +47,6 @@ func main() {
 		s3.WithTLS(*tlsCert, *tlsKey),
 		s3.WithBasePath(*basePath),
 		s3.WithDebug(*debug),
-		s3.WithBackend(backend),
 		s3.WithNodeID(*nodeID),
 	)
 	if err != nil {
