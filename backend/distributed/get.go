@@ -20,6 +20,10 @@ import (
 // GetObject retrieves an object using Reed-Solomon decoding.
 // Supports byte-range requests for efficient partial reads.
 func (b *Backend) GetObject(ctx context.Context, req *backend.GetObjectRequest) (*backend.GetObjectResponse, error) {
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+		return nil, err
+	}
+
 	// Query which nodes have our object shards
 	shards, size, err := b.openInput(req.Bucket, req.Key)
 	if err != nil {
@@ -290,6 +294,10 @@ func (b *Backend) getFullObject(ctx context.Context, req *backend.GetObjectReque
 
 // HeadObject returns object metadata
 func (b *Backend) HeadObject(ctx context.Context, bucket, key string) (*backend.HeadObjectResponse, error) {
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: bucket}); err != nil {
+		return nil, err
+	}
+
 	shards, size, err := b.openInput(bucket, key)
 	if err != nil {
 		return nil, backend.ErrNoSuchKeyError.WithResource(key)

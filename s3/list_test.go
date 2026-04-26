@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"bytes"
 	"encoding/xml"
 	"io"
 	"net/http"
@@ -11,54 +12,9 @@ import (
 
 	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestListBuckets(t *testing.T) {
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
-
-	server := NewHTTP2Server(config)
-
-	// Make a request to list buckets
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-
-	// Add authentication headers using the credentials from server.toml
-	if len(config.Auth) > 0 {
-		authEntry := config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, config.Region, "s3", req)
-		assert.NoError(t, err, "Error generating auth header")
-	}
-
-	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
-
-	assert.Equal(t, 200, rr.Code, "Status code should be 200")
-
-	// Parse the XML response
-	var result ListBuckets
-	err = xml.NewDecoder(rr.Body).Decode(&result)
-	assert.NoError(t, err, "XML parsing should not error")
-
-	// Verify the response contains our test bucket
-	assert.Equal(t, len(result.Buckets), 5, "Should have 5 buckets")
-
-	t.Log("Buckets", result.Buckets)
-
-	if len(result.Buckets) == 5 {
-		assert.Equal(t, result.Buckets[0].Name, "test-bucket01", "Test bucket should be in the list")
-		assert.Equal(t, result.Buckets[1].Name, "private", "Private bucket should be in the list")
-		assert.Equal(t, result.Buckets[2].Name, "secure", "Secure bucket should be in the list")
-		assert.Equal(t, result.Buckets[3].Name, "local", "Local bucket should be in the list")
-		assert.Equal(t, result.Buckets[4].Name, "predastore", "Predastore bucket should be in the list")
-	}
-}
-
-// Test list buckets with no authentication, should fail.
 func TestListBucketsNoAuth(t *testing.T) {
 	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
@@ -66,72 +22,15 @@ func TestListBucketsNoAuth(t *testing.T) {
 	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	server := NewHTTP2Server(config)
+	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
 
-	// Make a request to list buckets
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
-
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 }
 
-func TestListObjectsV2Handler(t *testing.T) {
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
-
-	server := NewHTTP2Server(config)
-
-	// Make a request to list objects in the test bucket
-	req := httptest.NewRequest(http.MethodGet, "/test-bucket01", nil)
-
-	// Add auth for non-public buckets (testbucket is public, but adding auth won't hurt)
-	if len(config.Auth) > 0 {
-		authEntry := config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, config.Region, "s3", req)
-		assert.NoError(t, err, "Error generating auth header")
-	}
-
-	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
-
-	assert.Equal(t, 200, rr.Code, "Status code should be 200")
-
-	// Parse the XML response
-	var result ListObjectsV2
-	err = xml.NewDecoder(rr.Body).Decode(&result)
-	assert.NoError(t, err, "XML parsing should not error")
-
-	// Verify response
-	assert.Equal(t, "test-bucket01", result.Name, "Bucket name should match")
-	assert.NotNil(t, result.Contents, "Contents should not be nil")
-
-	// Check that our test files are in the results
-	foundText := false
-	foundBinary := false
-
-	if result.Contents != nil {
-		for _, item := range *result.Contents {
-			if item.Key == "test.txt" {
-				foundText = true
-			}
-			if item.Key == "binary.dat" {
-				foundBinary = true
-			}
-		}
-	}
-
-	assert.True(t, foundText, "test.txt should be in the bucket")
-	assert.True(t, foundBinary, "binary.dat should be in the bucket")
-}
-
-// Test list objects to a private bucket, with no auth
 func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
 	config := New(&Config{
 		ConfigPath: filepath.Join("tests", "config", "server.toml"),
@@ -139,22 +38,18 @@ func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
 	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	server := NewHTTP2Server(config)
+	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
 
-	// Make a request to list objects in the test bucket
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
-
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 
-	// Parse the XML response
 	var result S3Error
 	err = xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
-
-	assert.Equal(t, result.Code, "AccessDenied", "Error message should indicate access denied")
+	assert.Equal(t, "AccessDenied", result.Code, "Error message should indicate access denied")
 }
 
 func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
@@ -164,14 +59,10 @@ func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 	err := config.ReadConfig()
 	assert.NoError(t, err, "Should read config without error")
 
-	server := NewHTTP2Server(config)
+	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
 
-	// Make a request to list objects in the test bucket
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
-
-	// Use our utility function to generate a valid authorization header
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
-
 	err = auth.GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, config.Region, "s3", req)
 	assert.NoError(t, err, "Error generating auth header")
 
@@ -180,138 +71,101 @@ func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 
-	// Parse the XML response
 	var result S3Error
 	err = xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
-
 	assert.Equal(t, "InvalidAccessKeyId", result.Code, "Error message should indicate invalid access key")
 }
 
-// Test list objects to a public bucket, with no auth
-func TestListObjectsV2HandlerPublicBucketNoAuth(t *testing.T) {
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
-
-	server := NewHTTP2Server(config)
-
-	// Make a request to list objects in the test bucket
-	req := httptest.NewRequest(http.MethodGet, "/test-bucket01", nil)
-
-	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
-
-	assert.Equal(t, 200, rr.Code, "Status code should be 200")
-
-	// Parse the XML response
-	var result ListObjectsV2
-	err = xml.NewDecoder(rr.Body).Decode(&result)
-	assert.NoError(t, err, "XML parsing should not error")
-
-	foundText := false
-
-	if result.Contents != nil {
-		for _, item := range *result.Contents {
-			if item.Key == "test.txt" {
-				foundText = true
-			}
-		}
-	}
-
-	assert.True(t, foundText, "test.txt should be in the bucket")
-}
-
 func TestListObjectsWithPrefix(t *testing.T) {
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
+	tb := setupDistributedBackend(t)
+	defer tb.Cleanup()
 
-	server := NewHTTP2Server(config)
+	bucket := "datastore"
 
-	// Make a request to list objects with prefix
-	req := httptest.NewRequest(http.MethodGet, "/test-bucket01?prefix=test", nil)
-
-	// Add auth for non-public buckets (testbucket is public, but adding auth won't hurt)
-	if len(config.Auth) > 0 {
-		authEntry := config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, config.Region, "s3", req)
-		assert.NoError(t, err, "Error generating auth header")
+	// Upload objects with different prefixes
+	for _, obj := range []struct {
+		key     string
+		content []byte
+	}{
+		{"test-file.txt", []byte("test content")},
+		{"test-other.txt", []byte("other test content")},
+		{"data-file.txt", []byte("data content")},
+	} {
+		req := httptest.NewRequest(http.MethodPut, "/"+bucket+"/"+obj.key, bytes.NewReader(obj.content))
+		if len(tb.Config.Auth) > 0 {
+			authEntry := tb.Config.Auth[0]
+			timestamp := time.Now().UTC().Format("20060102T150405Z")
+			err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+			require.NoError(t, err)
+		}
+		rr := httptest.NewRecorder()
+		tb.Handler.ServeHTTP(rr, req)
+		require.Equal(t, 200, rr.Code, "PUT %s should return 200", obj.key)
 	}
 
+	// List with prefix "test"
+	req := httptest.NewRequest(http.MethodGet, "/"+bucket+"?prefix=test", nil)
+	if len(tb.Config.Auth) > 0 {
+		authEntry := tb.Config.Auth[0]
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		require.NoError(t, err)
+	}
 	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
+	tb.Handler.ServeHTTP(rr, req)
 
 	assert.Equal(t, 200, rr.Code, "Status code should be 200")
 
-	// Parse the XML response
 	var result ListObjectsV2
-	err = xml.NewDecoder(rr.Body).Decode(&result)
+	err := xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
 
-	// Verify only test.txt is in the response
-	assert.Equal(t, "test-bucket01", result.Name, "Bucket name should match")
+	assert.Equal(t, bucket, result.Name, "Bucket name should match")
 	assert.Equal(t, "test", result.Prefix, "Prefix should match")
 
 	if result.Contents != nil {
-		foundText := false
-		foundBinary := false
-
+		foundTest := false
+		foundOther := false
+		foundData := false
 		for _, item := range *result.Contents {
-			if item.Key == "test.txt" {
-				foundText = true
+			if item.Key == "test-file.txt" {
+				foundTest = true
 			}
-			if item.Key == "binary.dat" {
-				foundBinary = true
+			if item.Key == "test-other.txt" {
+				foundOther = true
+			}
+			if item.Key == "data-file.txt" {
+				foundData = true
 			}
 		}
-
-		assert.True(t, foundText, "test.txt should be in the filtered results")
-		assert.False(t, foundBinary, "binary.dat should not be in the filtered results")
+		assert.True(t, foundTest, "test-file.txt should be in filtered results")
+		assert.True(t, foundOther, "test-other.txt should be in filtered results")
+		assert.False(t, foundData, "data-file.txt should NOT be in filtered results")
 	}
 }
 
 func TestListInvalidBucket(t *testing.T) {
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
+	tb := setupDistributedBackend(t)
+	defer tb.Cleanup()
 
-	server := NewHTTP2Server(config)
-
-	// Make a request to list objects in an invalid bucket
 	req := httptest.NewRequest(http.MethodGet, "/invalidbucket", nil)
-
-	// Add authentication headers since routes.go may require it
-	if len(config.Auth) > 0 {
-		authEntry := config.Auth[0]
+	if len(tb.Config.Auth) > 0 {
+		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
-
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, config.Region, "s3", req)
-		assert.NoError(t, err, "Error generating auth header")
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		require.NoError(t, err)
 	}
 
 	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
+	tb.Handler.ServeHTTP(rr, req)
 
 	assert.Equal(t, 404, rr.Code, "Status code should be 404")
 
-	// Read response body
 	body, err := io.ReadAll(rr.Body)
 	assert.NoError(t, err, "Reading body should not error")
 	var s3error S3Error
-
 	err = xml.Unmarshal(body, &s3error)
-
 	assert.NoError(t, err, "XML parsing failed")
-
-	assert.Equal(t, s3error.Code, "NoSuchBucket", "Error message should indicate invalid bucket")
-	assert.Equal(t, s3error.Message, "The specified bucket does not exist")
+	assert.Equal(t, "NoSuchBucket", s3error.Code, "Error message should indicate invalid bucket")
 }

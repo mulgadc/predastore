@@ -28,6 +28,10 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+		return nil, err
+	}
+
 	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
 
 	objectToShardNodes := ObjectToShardNodes{}

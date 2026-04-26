@@ -18,18 +18,19 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/backend/distributed"
+	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const (
-	S3_ENDPOINT     = "https://localhost:6443"
-	S3_BUCKET       = "test-bucket01"
-	TEXT_FILE_SHA   = "8a71e72cef7867d59c08ee233df6d2b7c35369734d0b6dae702857176a1d69f8"
-	BINARY_FILE_SHA = "ce9d16a33fc9a53f592206c0cd23497632e78d3f6219dcd077ec9a11f50e6e4e"
+	S3_ENDPOINT = "https://localhost:6443"
+	S3_BUCKET   = "test-bucket01"
 )
 
-// setupServer starts the S3 server for testing
+// setupServer starts an S3 server backed by a distributed backend for testing.
 func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	t.Helper()
 
@@ -45,25 +46,77 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	wg = &sync.WaitGroup{}
 	wg.Add(1)
 
-	// Create and configure the S3 server
-	s3config := New(&Config{
-		ConfigPath: "./tests/config/server.toml",
-	})
-	err := s3config.ReadConfig()
-	require.NoError(t, err, "Failed to read config file")
+	tmpDir := t.TempDir()
+	nodeDataDir := filepath.Join(tmpDir, "nodes")
+	badgerDir := filepath.Join(tmpDir, "db")
+	require.NoError(t, os.MkdirAll(nodeDataDir, 0750))
+	require.NoError(t, os.MkdirAll(badgerDir, 0750))
 
-	// Setup HTTP/2 server
-	server := NewHTTP2Server(s3config)
+	s3config := loadTestConfig(t)
+	s3config.BadgerDir = badgerDir
+
+	nodeCount := len(s3config.Nodes)
+	if nodeCount == 0 {
+		nodeCount = 5
+	}
+
+	basePort := 10000 + (int(time.Now().UnixNano()/1000000) % 5000)
+
+	be, err := distributed.New(&distributed.Config{
+		BadgerDir:      badgerDir,
+		DataDir:        nodeDataDir,
+		DataShards:     s3config.RS.Data,
+		ParityShards:   s3config.RS.Parity,
+		PartitionCount: nodeCount,
+		QuicBasePort:   basePort,
+	})
+	require.NoError(t, err, "Should create distributed backend")
+
+	quicServers := make([]*quicserver.QuicServer, nodeCount)
+	for i := 0; i < nodeCount; i++ {
+		nodeDir := filepath.Join(nodeDataDir, fmt.Sprintf("node-%d", i))
+		require.NoError(t, os.MkdirAll(nodeDir, 0750))
+		addr := fmt.Sprintf("127.0.0.1:%d", basePort+i)
+		quicServers[i] = quicserver.New(nodeDir, addr)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// Create bucket via API so it appears in globalState (and thus in ListBuckets).
+	// AccountID must match the auth config so ListBuckets filtering works.
+	ownerID := ""
+	accountID := ""
+	if len(s3config.Auth) > 0 {
+		ownerID = s3config.Auth[0].AccessKeyID
+		accountID = s3config.Auth[0].AccountID
+	}
+	_, cbErr := be.CreateBucket(context.Background(), &backend.CreateBucketRequest{
+		Bucket:    S3_BUCKET,
+		Region:    s3config.Region,
+		OwnerID:   ownerID,
+		AccountID: accountID,
+	})
+	require.NoError(t, cbErr, "CreateBucket %q should succeed", S3_BUCKET)
+
+	// Upload fixtures so dev's tests (which previously read these straight from
+	// the filesystem backend) can find them in the distributed backend.
+	for _, f := range []string{"test.txt", "binary.dat"} {
+		data, ferr := os.ReadFile(filepath.Join("tests", "data", "test-bucket01", f))
+		require.NoError(t, ferr, "reading fixture %s", f)
+		_, perr := be.PutObject(context.Background(), &backend.PutObjectRequest{
+			Bucket:        S3_BUCKET,
+			Key:           f,
+			Body:          bytes.NewReader(data),
+			ContentLength: int64(len(data)),
+		})
+		require.NoError(t, perr, "PutObject fixture %s", f)
+	}
+
+	server := NewHTTP2ServerWithBackend(s3config, be, NewConfigProvider(s3config.Auth))
 
 	// Start the server in a goroutine
 	go func() {
 		defer wg.Done()
-
-		// Start the HTTP/2 server with TLS
-		err := server.ListenAndServe(":6443", "../config/server.pem", "../config/server.key")
-
-		// Only report errors other than server closed
-		if err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServe(":6443", "../config/server.pem", "../config/server.key"); err != nil && err != http.ErrServerClosed {
 			t.Logf("Server error: %v", err)
 		}
 	}()
@@ -71,14 +124,17 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	// Setup graceful shutdown
 	go func() {
 		<-ctx.Done()
-		// Give the server up to 5 seconds to shutdown
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer shutdownCancel()
-
-		// Shutdown gracefully
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			fmt.Printf("Error shutting down server: %v\n", err)
 		}
+		for _, qs := range quicServers {
+			if qs != nil {
+				_ = qs.Close()
+			}
+		}
+		be.Close()
 	}()
 
 	// Wait for server to start
@@ -90,7 +146,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 // loadTestConfig reads the shared test config once per test
 func loadTestConfig(t *testing.T) *Config {
 	s3config := New(&Config{
-		ConfigPath: "./tests/config/server.toml",
+		ConfigPath: filepath.Join("tests", "config", "cluster.toml"),
 	})
 	err := s3config.ReadConfig()
 	require.NoError(t, err, "Failed to read config file")

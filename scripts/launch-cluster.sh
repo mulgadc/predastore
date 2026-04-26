@@ -120,7 +120,7 @@ if [ "$KILL_MODE" = true ]; then
     fi
 
     # Also kill any remaining s3d processes
-    pkill -f "s3d.*-backend distributed" 2>/dev/null || true
+    pkill -f "s3d" 2>/dev/null || true
 
     log_info "All s3d processes stopped"
     exit 0
@@ -211,7 +211,6 @@ for node_id in $NODE_IDS; do
     http_port=$((8443 + node_id))
 
     nohup "$S3D_BINARY" \
-        -backend distributed \
         -config "$CONFIG_FILE" \
         -node "$node_id" \
         -port "$http_port" \

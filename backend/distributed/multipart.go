@@ -50,6 +50,10 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.Create
 		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+		return nil, err
+	}
+
 	// Generate unique upload ID
 	uploadID := uuid.New().String()
 
@@ -110,6 +114,10 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 	}
 	if req.Key == "" {
 		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
+	}
+
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+		return nil, err
 	}
 
 	// Validate part number
@@ -271,6 +279,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	}
 	if req.Key == "" {
 		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
+	}
+
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+		return nil, err
 	}
 
 	// Verify upload exists
@@ -503,6 +515,10 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadI
 	}
 	if key == "" {
 		return backend.ErrNoSuchKeyError.WithResource(key)
+	}
+
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: bucket}); err != nil {
+		return err
 	}
 
 	// Verify upload exists

@@ -41,6 +41,10 @@ func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectReq
 		return backend.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+		return err
+	}
+
 	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
 
 	// Check if object exists and get shard node info
