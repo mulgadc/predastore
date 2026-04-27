@@ -7,9 +7,13 @@ micro-optimisation.
 ## Contents
 
 - `bench-disk.sh` — raw-disk fio ceiling (run independently of predastore).
-- `bench-predastore.sh` — three-node predastore cluster on loopback, driven by
-  `warp mixed`.
+- `bench-cluster.sh` — predastore cluster on loopback, driven by `warp mixed`.
 - `fio-jobs/` — four fio jobs covering predastore's predicted access patterns.
+
+All benchmarks can be run via the top-level dispatcher:
+
+    ./scripts/bench.sh disk          # raw-disk fio
+    ./scripts/bench.sh 3node         # cluster warp benchmark
 
 ## Prerequisites
 
@@ -18,7 +22,7 @@ micro-optimisation.
 - `curl`, `ip` (usually present on Linux).
 - `make build` in the predastore repo (produces `bin/s3d`).
 - `make certs` to generate TLS certificates (or `make build`, which does both).
-- `sudo` — required only by `bench-predastore.sh` for `ip addr add` on `lo`.
+- `sudo` — required only by `bench-cluster.sh` for `ip addr add` on `lo`.
   The script aliases `10.11.12.{1,2,3}/24` and removes them on exit.
 
 ## Usage
@@ -34,9 +38,11 @@ file per run under `scripts/bench/results/disk-<timestamp>/`. Override
 
 Predastore cluster benchmark:
 
-    ./scripts/bench/bench-predastore.sh
+    ./scripts/bench.sh 3node
+    # or directly:
+    ./scripts/bench/bench-cluster.sh 3node
 
-Results land under `predastore/scripts/bench/results/predastore-<timestamp>/`
+Results land under `predastore/scripts/bench/results/<clustername>-<timestamp>/`
 and contain:
 
 - `warp-mixed.csv.zst` — warp's raw samples.
@@ -66,7 +72,7 @@ warp's own default:
 For a tmpfs-safe local run (~750 MB on disk):
 
     WARP_OBJECTS=512 WARP_OBJ_SIZE=1MiB WARP_DURATION=30s WARP_CONCURRENT=10 \
-        ./scripts/bench/bench-predastore.sh
+        ./scripts/bench/bench-cluster.sh
 
 Dedicated-hardware CI runs leave them unset.
 
