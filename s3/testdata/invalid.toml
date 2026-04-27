@@ -1,54 +1,53 @@
-# Test configuration file in TOML format.
+# Test configuration with intentionally invalid bucket names.
+# Used by config_test.go to verify bucket name validation.
 version = "1.0"
 region = "ap-southeast-2"
 
-# Optionally configure port and host, or specify via daemon CLI options
-# host = 0.0.0.0
-# port = 443
-
-# Enable verbose debugging
-# debug = false
-
-# Optionally configure base-path if full directory path not defined for "fs" buckets
-# base_path = "/home/predastore/data/"
-
+# Invalid bucket name ([a-z0-9-.])
 [[buckets]]
-name = "test-bucket01"
+name = "INVALIDNAME"
 region = "ap-southeast-2"
-type = "fs"
-pathname = "tests/data/test-bucket01"
-public = true
-encryption = ""
-
-[[buckets]]
-name = "private"
-region = "ap-southeast-2"
-type = "fs"
-pathname = "tests/data/private"
+type = "distributed"
 public = false
 encryption = ""
 
+# Invalid bucket name < 3 chars
 [[buckets]]
-name = "secure"
+name = "hi"
 region = "ap-southeast-2"
-type = "fs"
-pathname = "tests/data/secure"
+type = "distributed"
 public = false
 encryption = ""
 
+# Invalid bucket name > 63 chars
 [[buckets]]
-name = "local"
+name = "1111111111111111111111111111111111111111111111111111111111111111"
 region = "ap-southeast-2"
-type = "fs"
-pathname = "tests/data/local"
+type = "distributed"
 public = false
 encryption = ""
 
+# Invalid bucket name contains _ chars
 [[buckets]]
-name = "predastore"
+name = "invalid_characters"
 region = "ap-southeast-2"
-type = "fs"
-pathname = "tests/data/predastore"
+type = "distributed"
+public = false
+encryption = ""
+
+# Invalid bucket name contains special chars
+[[buckets]]
+name = "bad^bucket;'"
+region = "ap-southeast-2"
+type = "distributed"
+public = false
+encryption = ""
+
+# Invalid bucket must end in a-z0-9
+[[buckets]]
+name = "badbucket-"
+region = "ap-southeast-2"
+type = "distributed"
 public = false
 encryption = ""
 

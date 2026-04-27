@@ -22,10 +22,15 @@ Thumbs.db
 
 # Test reports
 *-report.txt
-s3/tests/data/distributed/
-s3/tests/data/test-*
-s3/tests/data/predastore/*
-s3/tests/data/local/*
+s3/testdata/test-*
+s3/testdata/local/*
+
+# Generated TLS certs
+certs
+
+# Cluster runtime data
+clusters/*/data/
+clusters/*/logs/
 
 # Bench results
 scripts/bench/results

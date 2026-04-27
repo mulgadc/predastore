@@ -2,15 +2,14 @@
 #
 # launch-cluster.sh - Launch a distributed Predastore cluster
 #
-# This script parses a cluster.toml configuration file and launches
-# individual s3d processes for each node, simulating a multi-node
-# distributed system on a single machine.
+# Parses a cluster TOML configuration, sets up loopback IP aliases,
+# and launches individual s3d processes for each node.
 #
 # Usage:
-#   ./scripts/launch-cluster.sh [config_file] [options]
+#   ./scripts/launch-cluster.sh [options]
 #
 # Options:
-#   -c, --config     Path to cluster.toml (default: s3/tests/config/cluster.toml)
+#   -c, --config     Path to cluster.toml (default: clusters/3node/cluster.toml)
 #   -b, --binary     Path to s3d binary (default: ./bin/s3d)
 #   -k, --kill       Kill all running s3d processes
 #   -s, --status     Show status of running s3d processes
@@ -18,19 +17,17 @@
 #
 # Examples:
 #   ./scripts/launch-cluster.sh
-#   ./scripts/launch-cluster.sh -c ./my-cluster.toml
+#   ./scripts/launch-cluster.sh -c clusters/7node/cluster.toml
 #   ./scripts/launch-cluster.sh --kill
 #
 
 set -e
 
 # Default values
-CONFIG_FILE="s3/tests/config/cluster.toml"
+CONFIG_FILE="clusters/3node/cluster.toml"
 S3D_BINARY="./bin/s3d"
-TLS_KEY="config/server.key"
-TLS_CERT="config/server.pem"
-LOG_DIR="logs"
-PID_DIR="pids"
+TLS_KEY="certs/server.key"
+TLS_CERT="certs/server.pem"
 
 # Colors for output
 RED='\033[0;31m'
@@ -49,10 +46,10 @@ usage() {
     echo "  -h, --help           Show this help message"
     echo ""
     echo "Examples:"
-    echo "  $0                           # Launch cluster with defaults"
-    echo "  $0 -c ./my-cluster.toml      # Use custom config"
-    echo "  $0 --kill                    # Stop all nodes"
-    echo "  $0 --status                  # Check node status"
+    echo "  $0                                          # Launch 3-node cluster"
+    echo "  $0 -c clusters/7node/cluster.toml           # Launch 7-node cluster"
+    echo "  $0 --kill                                   # Stop all nodes"
+    echo "  $0 --status                                 # Check node status"
 }
 
 log_info() {
@@ -98,8 +95,54 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Derive cluster directory from config path (e.g., clusters/3node from clusters/3node/cluster.toml)
+CLUSTER_DIR="$(dirname "$CONFIG_FILE")"
+LOG_DIR="$CLUSTER_DIR/logs"
+PID_DIR="$CLUSTER_DIR/pids"
+
 # Create directories
 mkdir -p "$LOG_DIR" "$PID_DIR"
+
+# Parse unique host IPs from the config's [[db]] sections
+parse_host_ips() {
+    grep -E '^\s*host\s*=' "$CONFIG_FILE" | \
+        sed 's/.*=\s*"\(.*\)".*/\1/' | \
+        grep -v '0\.0\.0\.0' | \
+        sort -u
+}
+
+# Parse node IDs from the config's [[db]] sections
+parse_node_ids() {
+    grep -E '^\s*id\s*=' "$CONFIG_FILE" | \
+        awk -F'=' '{gsub(/[[:space:]]/, "", $2); print $2}' | \
+        head -n "$(grep -c '^\[\[db\]\]' "$CONFIG_FILE")"
+}
+
+# Setup loopback IP aliases
+setup_ips() {
+    local ips
+    ips=$(parse_host_ips)
+    if [ -z "$ips" ]; then
+        return
+    fi
+
+    log_info "Adding loopback IP aliases..."
+    for ip in $ips; do
+        if ! ip addr show lo | grep -qw "$ip"; then
+            sudo ip addr add "${ip}/24" dev lo
+            log_info "  Added $ip to lo"
+        fi
+    done
+}
+
+# Remove loopback IP aliases
+teardown_ips() {
+    local ips
+    ips=$(parse_host_ips)
+    for ip in $ips; do
+        sudo ip addr del "${ip}/24" dev lo 2>/dev/null || true
+    done
+}
 
 # Kill mode
 if [ "$KILL_MODE" = true ]; then
@@ -121,6 +164,11 @@ if [ "$KILL_MODE" = true ]; then
 
     # Also kill any remaining s3d processes
     pkill -f "s3d" 2>/dev/null || true
+
+    # Teardown loopback aliases
+    if [ -f "$CONFIG_FILE" ]; then
+        teardown_ips
+    fi
 
     log_info "All s3d processes stopped"
     exit 0
@@ -168,27 +216,26 @@ if [ ! -f "$S3D_BINARY" ]; then
 fi
 
 if [ ! -f "$TLS_KEY" ] || [ ! -f "$TLS_CERT" ]; then
-    log_warn "TLS certificates not found, some features may not work"
+    log_warn "TLS certificates not found, generating..."
+    make certs || {
+        log_error "Failed to generate TLS certificates"
+        exit 1
+    }
 fi
 
-# Parse node IDs from cluster.toml
-# This uses grep/awk to extract node IDs - a simple approach that works for TOML
-parse_node_ids() {
-    grep -E "^\[\[nodes\]\]" -A 10 "$CONFIG_FILE" | \
-        grep -E "^id\s*=" | \
-        awk -F'=' '{gsub(/[[:space:]]/, "", $2); print $2}'
-}
+# Setup loopback IP aliases
+setup_ips
 
-# Get unique node IDs
-NODE_IDS=$(parse_node_ids | sort -u)
+# Get unique DB node IDs (one s3d process per DB node)
+NODE_IDS=$(parse_node_ids | sort -un)
 
 if [ -z "$NODE_IDS" ]; then
-    log_error "No nodes found in $CONFIG_FILE"
+    log_error "No database nodes found in $CONFIG_FILE"
     exit 1
 fi
 
 log_info "Found nodes in config: $(echo $NODE_IDS | tr '\n' ' ')"
-log_info "Launching distributed cluster..."
+log_info "Launching distributed cluster from $CONFIG_FILE..."
 
 # Launch each node
 for node_id in $NODE_IDS; do
@@ -206,14 +253,10 @@ for node_id in $NODE_IDS; do
 
     log_info "Starting node $node_id..."
 
-    # Launch s3d for this node
-    # Using different HTTP ports for each node (8443 + node_id)
-    http_port=$((8443 + node_id))
-
     nohup "$S3D_BINARY" \
         -config "$CONFIG_FILE" \
         -node "$node_id" \
-        -port "$http_port" \
+        -base-path "$CLUSTER_DIR" \
         -tls-key "$TLS_KEY" \
         -tls-cert "$TLS_CERT" \
         > "$log_file" 2>&1 &
@@ -221,7 +264,7 @@ for node_id in $NODE_IDS; do
     pid=$!
     echo "$pid" > "$pid_file"
 
-    log_info "  Node $node_id started (PID: $pid, HTTP: $http_port, Log: $log_file)"
+    log_info "  Node $node_id started (PID: $pid, Log: $log_file)"
 done
 
 # Wait a moment for processes to initialize

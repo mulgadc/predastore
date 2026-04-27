@@ -42,15 +42,15 @@ func (s3 *Config) ReadConfig() (err error) {
 			//return fmt.Errorf("invalid bucket name: %s", err)
 		}
 
-		// Check if the directory is relative
-		if b.Type == "fs" && !filepath.IsAbs(b.Pathname) {
-			s3.Buckets[k].Pathname = filepath.Join(s3.BasePath, b.Pathname)
-		}
-
-		// Check if the directory exists, otherwise create it
-		if _, err := os.Stat(s3.Buckets[k].Pathname); os.IsNotExist(err) {
-			if mkErr := os.MkdirAll(s3.Buckets[k].Pathname, 0750); mkErr != nil {
-				slog.Warn("Failed to create bucket directory", "path", s3.Buckets[k].Pathname, "error", mkErr)
+		// Create bucket directory if a pathname is configured
+		if b.Pathname != "" {
+			if !filepath.IsAbs(b.Pathname) {
+				s3.Buckets[k].Pathname = filepath.Join(s3.BasePath, b.Pathname)
+			}
+			if _, err := os.Stat(s3.Buckets[k].Pathname); os.IsNotExist(err) {
+				if mkErr := os.MkdirAll(s3.Buckets[k].Pathname, 0750); mkErr != nil {
+					slog.Warn("Failed to create bucket directory", "path", s3.Buckets[k].Pathname, "error", mkErr)
+				}
 			}
 		}
 

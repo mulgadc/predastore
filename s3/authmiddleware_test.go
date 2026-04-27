@@ -22,8 +22,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			{
 				Name:     "test-bucket01",
 				Region:   "ap-southeast-2",
-				Type:     "fs",
-				Pathname: "tests/data/test-bucket01",
+				Type:     "distributed",
+				Pathname: "testdata/test-bucket01",
 				Public:   false, // Not public - requires authentication
 			},
 		},

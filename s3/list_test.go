@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -16,11 +15,7 @@ import (
 )
 
 func TestListBucketsNoAuth(t *testing.T) {
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
+	config := newAuthTestConfig()
 
 	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
 
@@ -32,11 +27,7 @@ func TestListBucketsNoAuth(t *testing.T) {
 }
 
 func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
+	config := newAuthTestConfig()
 
 	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
 
@@ -47,23 +38,19 @@ func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 
 	var result S3Error
-	err = xml.NewDecoder(rr.Body).Decode(&result)
+	err := xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
 	assert.Equal(t, "AccessDenied", result.Code, "Error message should indicate access denied")
 }
 
 func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
+	config := newAuthTestConfig()
 
 	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
-	err = auth.GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, config.Region, "s3", req)
+	err := auth.GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, config.Region, "s3", req)
 	assert.NoError(t, err, "Error generating auth header")
 
 	rr := httptest.NewRecorder()
@@ -81,7 +68,7 @@ func TestListObjectsWithPrefix(t *testing.T) {
 	tb := setupDistributedBackend(t)
 	defer tb.Cleanup()
 
-	bucket := "datastore"
+	bucket := testBucket
 
 	// Upload objects with different prefixes
 	for _, obj := range []struct {

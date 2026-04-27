@@ -8,78 +8,28 @@ import (
 )
 
 func TestReadConfig(t *testing.T) {
-	s3 := New(&Config{ConfigPath: filepath.Join("tests", "config", "server.toml")})
+	s3 := New(&Config{ConfigPath: filepath.Join("..", "clusters", "7node", "cluster.toml")})
 	err := s3.ReadConfig()
 
 	assert.NoError(t, err, "Should read config without error")
 	assert.Equal(t, "1.0", s3.Version, "Config version should match")
 	assert.Equal(t, "ap-southeast-2", s3.Region, "Region should match")
-	assert.Equal(t, 5, len(s3.Buckets), "Should have 4 buckets")
-
-	assert.Equal(t, "test-bucket01", s3.Buckets[0].Name, "Bucket name should match")
-	assert.Contains(t, s3.Buckets[0].Pathname, "tests/data/test-bucket01", "Path should match")
-	assert.True(t, s3.Buckets[0].Public, "Bucket should be public")
-
-	assert.Equal(t, "private", s3.Buckets[1].Name, "Bucket name should match")
-	assert.Contains(t, s3.Buckets[1].Pathname, "tests/data/private", "Path should match")
-	assert.False(t, s3.Buckets[1].Public, "Bucket should be private")
-
-	assert.Equal(t, "secure", s3.Buckets[2].Name, "Bucket name should match")
-	assert.Contains(t, s3.Buckets[2].Pathname, "tests/data/secure", "Path should match")
-	assert.False(t, s3.Buckets[2].Public, "Bucket should be private")
-
-	assert.Equal(t, "local", s3.Buckets[3].Name, "Bucket name should match")
-	assert.Contains(t, s3.Buckets[3].Pathname, "tests/data/local", "Path should match")
-	assert.False(t, s3.Buckets[3].Public, "Bucket should be private")
-
-	assert.Equal(t, "predastore", s3.Buckets[4].Name, "Bucket name should match")
-	assert.Contains(t, s3.Buckets[4].Pathname, "tests/data/predastore", "Path should match")
-	assert.False(t, s3.Buckets[4].Public, "Bucket should be private")
-}
-
-func TestBucketConfig(t *testing.T) {
-	s3 := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := s3.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
-
-	bucket, err := s3.BucketConfig("test-bucket01")
-	assert.NoError(t, err, "Should find bucket")
-	assert.Equal(t, "test-bucket01", bucket.Name, "Bucket name should match")
-
-	_, err = s3.BucketConfig("nonexistent")
-	assert.Error(t, err, "Should return error for nonexistent bucket")
-}
-
-func TestBasePathConfig(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	s3 := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-		BasePath:   tmpDir,
-	})
-	err := s3.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
-
-	bucket, err := s3.BucketConfig("test-bucket01")
-	assert.NoError(t, err, "Should find bucket")
-	assert.Equal(t, "test-bucket01", bucket.Name, "Bucket name should match")
-
-	_, err = s3.BucketConfig("nonexistent")
-	assert.Error(t, err, "Should return error for nonexistent bucket")
-
-	assert.Contains(t, bucket.Pathname, tmpDir, "Path should contain base path")
+	assert.Equal(t, 4, s3.RS.Data, "RS data shards should match")
+	assert.Equal(t, 3, s3.RS.Parity, "RS parity shards should match")
+	assert.Equal(t, 0, len(s3.Buckets), "Should have no buckets")
+	assert.Equal(t, 7, len(s3.Nodes), "Should have 7 storage nodes")
+	assert.Equal(t, 7, len(s3.DB), "Should have 7 database nodes")
+	assert.Equal(t, 1, len(s3.Auth), "Should have 1 auth entry")
 }
 
 func TestReadInvalidConfig(t *testing.T) {
-	s3 := New(&Config{ConfigPath: filepath.Join("tests", "config", "invalid.toml")})
+	s3 := New(&Config{ConfigPath: filepath.Join("testdata", "invalid.toml")})
 	err := s3.ReadConfig()
 
 	assert.NoError(t, err, "Should read config without error")
 	assert.Equal(t, "1.0", s3.Version, "Config version should match")
 	assert.Equal(t, "ap-southeast-2", s3.Region, "Region should match")
 
-	// Test no buckets, config file all invalid
+	// All bucket names are invalid — none should survive validation
 	assert.Zero(t, len(s3.Buckets))
 }

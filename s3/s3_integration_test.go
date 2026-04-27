@@ -81,7 +81,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	// Create bucket via API so it appears in globalState (and thus in ListBuckets).
+	// Create test bucket via API so it appears in globalState (and thus in ListBuckets).
 	// AccountID must match the auth config so ListBuckets filtering works.
 	ownerID := ""
 	accountID := ""
@@ -100,7 +100,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	// Upload fixtures so dev's tests (which previously read these straight from
 	// the filesystem backend) can find them in the distributed backend.
 	for _, f := range []string{"test.txt", "binary.dat"} {
-		data, ferr := os.ReadFile(filepath.Join("tests", "data", "test-bucket01", f))
+		data, ferr := os.ReadFile(filepath.Join("testdata", "test-bucket01", f))
 		require.NoError(t, ferr, "reading fixture %s", f)
 		_, perr := be.PutObject(context.Background(), &backend.PutObjectRequest{
 			Bucket:        S3_BUCKET,
@@ -116,7 +116,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	// Start the server in a goroutine
 	go func() {
 		defer wg.Done()
-		if err := server.ListenAndServe(":6443", "../config/server.pem", "../config/server.key"); err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServe(":6443", "../certs/server.pem", "../certs/server.key"); err != nil && err != http.ErrServerClosed {
 			t.Logf("Server error: %v", err)
 		}
 	}()
@@ -146,7 +146,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 // loadTestConfig reads the shared test config once per test
 func loadTestConfig(t *testing.T) *Config {
 	s3config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "cluster.toml"),
+		ConfigPath: filepath.Join("..", "clusters", "7node", "cluster.toml"),
 	})
 	err := s3config.ReadConfig()
 	require.NoError(t, err, "Failed to read config file")
@@ -203,11 +203,11 @@ func runIntegrationSuite(t *testing.T, client *awss3.Client) {
 
 	t.Run("GetObject", func(t *testing.T) {
 		textBytes := getObject(t, client, S3_BUCKET, "test.txt")
-		expectedText := mustReadFile(t, "./tests/data/test-bucket01/test.txt")
+		expectedText := mustReadFile(t, "./testdata/test-bucket01/test.txt")
 		assert.Equal(t, expectedText, textBytes, "Text file content should match")
 
 		binaryBytes := getObject(t, client, S3_BUCKET, "binary.dat")
-		expectedBinary := mustReadFile(t, "./tests/data/test-bucket01/binary.dat")
+		expectedBinary := mustReadFile(t, "./testdata/test-bucket01/binary.dat")
 		assert.Equal(t, expectedBinary, binaryBytes, "Binary file content should match")
 	})
 
@@ -383,7 +383,7 @@ func TestByteRangeRequests(t *testing.T) {
 	client := &http.Client{Transport: tr}
 
 	// Get the full text file content for comparison
-	fullText, err := os.ReadFile("./tests/data/test-bucket01/test.txt")
+	fullText, err := os.ReadFile("./testdata/test-bucket01/test.txt")
 	require.NoError(t, err, "Reading text file should not error")
 
 	// Test range request

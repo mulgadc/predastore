@@ -12,9 +12,9 @@ import (
 )
 
 func main() {
-	config := flag.String("config", "config/server.toml", "S3 server configuration file")
-	tlsKey := flag.String("tls-key", "config/server.key", "Path to TLS key")
-	tlsCert := flag.String("tls-cert", "config/server.pem", "Path to TLS cert")
+	config := flag.String("config", "", "S3 server configuration file (required)")
+	tlsKey := flag.String("tls-key", "certs/server.key", "Path to TLS key")
+	tlsCert := flag.String("tls-cert", "certs/server.pem", "Path to TLS cert")
 	basePath := flag.String("base-path", "", "Base path for the S3 directory when undefined in the config file")
 	debug := flag.Bool("debug", false, "Enable verbose debug logs")
 	port := flag.Int("port", 443, "Server port")
@@ -23,9 +23,14 @@ func main() {
 
 	flag.Parse()
 
-	// Environment variables override CLI options
+	// Environment variable override for config
 	if os.Getenv("CONFIG") != "" {
 		*config = os.Getenv("CONFIG")
+	}
+	if *config == "" {
+		slog.Error("Missing required flag: -config")
+		flag.Usage()
+		os.Exit(1)
 	}
 	if os.Getenv("TLS_KEY") != "" {
 		*tlsKey = os.Getenv("TLS_KEY")

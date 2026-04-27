@@ -65,23 +65,20 @@ This starts a development cluster (all nodes on loopback) on `https://localhost:
 
 ### Configuration
 
-Configure via environment variables or `config.yaml`:
+Cluster configurations live under `clusters/`. Each cluster directory contains a
+`cluster.toml` and co-located `data/` and `logs/` directories:
 
-```yaml
-server:
-  host: "0.0.0.0"
-  port: 8443
-  tls:
-    cert_file: "config/server.pem"
-    key_file: "config/server.key"
+```
+clusters/
+  3node/cluster.toml    # 3 db + 3 storage nodes
+  5node/cluster.toml    # 5 db + 5 storage nodes
+  7node/cluster.toml    # 7 db + 7 storage nodes
+```
 
-storage:
-  backend: "file"            # "file" or "distributed"
-  data_dir: "/var/lib/predastore"
+TLS certificates are generated on first build:
 
-auth:
-  access_key: "your-access-key"
-  secret_key: "your-secret-key"
+```bash
+make certs              # Generate certs/server.{pem,key}
 ```
 
 ### AWS CLI Examples
@@ -105,13 +102,13 @@ aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 cp s3://my-bucket/
 Distributed storage with erasure coding, Raft-consensus metadata, and QUIC transport:
 
 ```bash
-# Development mode — runs all DB and shard nodes in one process on loopback
-./bin/s3d -config s3/tests/config/cluster.toml
+# Launch a 3-node cluster on loopback aliases (requires sudo for IP setup)
+./scripts/launch-cluster.sh
 
-# Production — separate processes per host
-./bin/s3d -config cluster.toml -node 0   # Host 1
-./bin/s3d -config cluster.toml -node 1   # Host 2
-./bin/s3d -config cluster.toml -node 2   # Host 3
+# Or run individual nodes
+./bin/s3d -config clusters/3node/cluster.toml -node 1 -base-path clusters/3node
+./bin/s3d -config clusters/3node/cluster.toml -node 2 -base-path clusters/3node
+./bin/s3d -config clusters/3node/cluster.toml -node 3 -base-path clusters/3node
 ```
 
 The distributed backend's data model decomposes objects into chunks, shards, segments, and blocks:
@@ -138,11 +135,10 @@ Predastore subscribes to NATS topics (`s3.putobject`, `s3.getobject`, `s3.create
 ## Development
 
 ```bash
-make build            # Build s3d binary
+make build            # Build s3d binary (also generates TLS certs)
+make certs            # Generate dev TLS certs
 make test             # Run tests
-make preflight        # Full CI checks (fmt, vet, gosec, staticcheck, govulncheck, tests)
-make bench            # Benchmarks
-make dev              # Hot reload with air
+make preflight        # Full CI checks (lint, govulncheck, tests, race detector)
 make clean            # Clean build artifacts
 ```
 

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -16,17 +15,13 @@ import (
 )
 
 func TestGetObjectNoBucketPermissions(t *testing.T) {
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
+	config := newAuthTestConfig()
 
 	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/private/note.txt", nil)
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
-	err = auth.GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, "us-east-1", "s3", req)
+	err := auth.GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, "us-east-1", "s3", req)
 	assert.NoError(t, err, "Error generating auth header")
 
 	rr := httptest.NewRecorder()
@@ -44,7 +39,7 @@ func TestGetObjectWithRange(t *testing.T) {
 	tb := setupDistributedBackend(t)
 	defer tb.Cleanup()
 
-	bucket := "datastore"
+	bucket := testBucket
 	key := "range-test.txt"
 	content := []byte("Hello, this is test content for range requests!")
 
@@ -81,7 +76,7 @@ func TestGetObjectNonExistent(t *testing.T) {
 	tb := setupDistributedBackend(t)
 	defer tb.Cleanup()
 
-	req := httptest.NewRequest(http.MethodGet, "/datastore/nonexistent.txt", nil)
+	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/nonexistent.txt", nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")
@@ -122,7 +117,7 @@ func TestGetInvalidObjectKey(t *testing.T) {
 	tb := setupDistributedBackend(t)
 	defer tb.Cleanup()
 
-	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/datastore/%s", string([]byte{0x80, 0x80})), nil)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/"+testBucket+"/%s", string([]byte{0x80, 0x80})), nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
 		timestamp := time.Now().UTC().Format("20060102T150405Z")

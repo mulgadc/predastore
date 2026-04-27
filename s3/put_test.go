@@ -5,7 +5,6 @@ import (
 	"encoding/xml"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,11 +14,7 @@ import (
 )
 
 func TestPutObjectPublicBucketNoAuth(t *testing.T) {
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
+	config := newAuthTestConfig()
 
 	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
 
@@ -33,11 +28,7 @@ func TestPutObjectPublicBucketNoAuth(t *testing.T) {
 }
 
 func TestPutObjectPrivateBucketNoAuth(t *testing.T) {
-	config := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := config.ReadConfig()
-	assert.NoError(t, err, "Should read config without error")
+	config := newAuthTestConfig()
 
 	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
 

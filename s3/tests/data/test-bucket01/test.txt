@@ -1,3 +1,0 @@
-This is a sample text file for testing the S3 server.
-It contains multiple lines to test retrieving text files from the S3 server.
-End of file. 
