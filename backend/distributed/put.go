@@ -34,26 +34,10 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 
 	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
 
-	objectToShardNodes := ObjectToShardNodes{}
-
-	// Check if existing
-	data, err := b.globalState.Get(TableObjects, objectHash[:])
-
-	if err != nil {
-		// Key not found or other error - treat as new object
-		objectToShardNodes = ObjectToShardNodes{
-			Object:           objectHash,
-			DataShardNodes:   make([]uint32, b.rsDataShard),
-			ParityShardNodes: make([]uint32, b.rsParityShard),
-		}
-	} else {
-		// Decode existing metadata
-		r := bytes.NewReader(data)
-		dec := gob.NewDecoder(r)
-
-		if err := dec.Decode(&objectToShardNodes); err != nil {
-			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
-		}
+	objectToShardNodes := ObjectToShardNodes{
+		Object:           objectHash,
+		DataShardNodes:   make([]uint32, b.rsDataShard),
+		ParityShardNodes: make([]uint32, b.rsParityShard),
 	}
 
 	// Write object to a temporary file for RS splitting and QUIC distribution
