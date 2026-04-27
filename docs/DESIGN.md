@@ -110,8 +110,9 @@ See `s3/tests/config/cluster.toml` for a complete example configuration.
     │  QUIC Node  │   │  QUIC Node  │   │  QUIC Node  │
     │  (Shard 0)  │   │  (Shard 1)  │   │  (Shard 2)  │
     ├─────────────┤   ├─────────────┤   ├─────────────┤
-    │ Local WAL   │   │ Local WAL   │   │ Local WAL   │
-    │ Local Badger│   │ Local Badger│   │ Local Badger│
+    │ Store       │   │ Store       │   │ Store       │
+    │ (segments + │   │ (segments + │   │ (segments + │
+    │  index)     │   │  index)     │   │  index)     │
     └─────────────┘   └─────────────┘   └─────────────┘
 ```
 
@@ -121,7 +122,7 @@ See `s3/tests/config/cluster.toml` for a complete example configuration.
 |-----------|---------|
 | **S3D (HTTP Server)** | Handles S3 API requests, authentication, routing |
 | **s3db Cluster** | Distributed Raft-based metadata store |
-| **QUIC Shard Nodes** | Store erasure-coded object shards in WAL files |
+| **QUIC Shard Nodes** | Store erasure-coded object shards in append-only segment files |
 | **GlobalState** | Abstraction layer for metadata access (local or distributed) |
 
 ---
@@ -133,12 +134,13 @@ See `s3/tests/config/cluster.toml` for a complete example configuration.
 ```
 Object (arbitrary size, RS-encoded as a whole)
  └── Shards (K data + M parity slices, one per node)
-      └── Fragments (fixed 8 KB payload + 32 B header, stored in WAL files)
+      └── Fragments (fixed 8 KB payload + 32 B header, stored in segment files)
 ```
 
 An object is Reed-Solomon encoded end-to-end into `K` data shards and `M` parity shards
 without any intermediate chunking. Each shard is streamed to one node, where it is
-stored as a sequence of fixed-size fragments inside one or more WAL files.
+stored as a contiguous **extent** of fixed-size fragments inside an append-only
+segment file.
 
 ### Size Reference
 
@@ -146,12 +148,13 @@ stored as a sequence of fixed-size fragments inside one or more WAL files.
 |------|------|-------------|
 | Fragment payload | 8 KB | Fixed on-disk unit, zero-padded when logical length is shorter |
 | Fragment header | 32 B | Metadata + CRC32 covering header + padded payload |
-| Shard | `⌈object_size / K⌉` | Per-node RS slice, variable size |
-| WAL file | configurable | Container for one or more fragments; may hold fragments from multiple shards |
+| Shard | `⌈object_size / K⌉` | Per-node RS slice, variable size; occupies a contiguous extent |
+| Segment file | up to 4 GiB | Append-only container; rolls when full. Holds extents from multiple shards |
 
-A WAL file has no fixed relationship to a shard. Small shards pack into a single file
-together with other small shards; large shards span multiple files. Fragments from
-different shards may be interleaved within the same file but never overlap.
+Each shard is allocated a contiguous extent of fragments within a single segment.
+Multiple shards may share a segment but their extents are disjoint and never
+interleave. When a segment fills, its `flagFull` bit is set in the header and the
+store rolls forward to the next segment number.
 
 ---
 
@@ -398,192 +401,212 @@ The s3db service provides a REST API with AWS Signature V4 authentication:
 
 # 6. Local Shard Storage
 
-Each QUIC shard node stores data locally in append-style WAL files and maintains
-its own Badger index mapping shard identifiers to WAL file locations.
+Each QUIC shard node stores data locally in append-only segment files and maintains
+its own Badger index mapping shard identifiers to the on-disk extent that holds
+the shard's fragments. The implementation lives in the `store/` package.
 
 ## Local Badger (Per-QUIC-Node)
 
 | Key Pattern | Value | Purpose |
 |-------------|-------|---------|
-| `<object-hash>` | `{WALFiles: [{WALNum, Offset, Size}, ...], ShardNum, TotalSize}` | Locate all fragments of a shard |
+| `<32 B object hash \|\| 4 B shard index>` | encoded extent record | Locate a shard's fragments on disk |
 
-A shard that spans multiple WAL files produces a `WALFiles` list with one entry per
-file, each recording the starting fragment offset and the number of bytes from this
-shard stored in that file.
+The extent record is:
 
-**Commit rule**: a Badger entry for a shard exists if and only if all of that shard's
-fragments are fsync-durable on disk. The absence of a Badger entry means the shard is
-unreadable, regardless of what bytes happen to be on disk.
+| Field | Size | Purpose |
+|-------|------|---------|
+| `SegNum` | 8 B | Segment file number containing the shard |
+| `Off` | 8 B | Byte offset of the shard's first fragment within the segment |
+| `PSize` | 8 B | Physical size on disk (fragment-aligned, includes per-fragment headers) |
+| `LSize` | 8 B | Logical (user) size of the shard |
 
-## WAL File On-Disk Layout
+**Commit rule**: a Badger entry for a shard exists if and only if all of that
+shard's fragments are fsync-durable on disk. The absence of a Badger entry means
+the shard is unreadable, regardless of what bytes happen to be on disk.
+
+## Segment File On-Disk Layout
+
+Segments are append-only files containing a 14 B header followed by a sequence of
+fixed-size fragments:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ WAL Header (14 B)                                            │
-│ ┌──────────┬─────────┬────────────┬────────────┐             │
-│ │ Magic(4) │ Ver(2)  │ ShardSize(4)│ChunkSize(4)│             │
-│ └──────────┴─────────┴────────────┴────────────┘             │
+│ Segment Header (14 B)                                        │
+│ ┌──────────┬─────────┬───────────┬──────────────┐            │
+│ │ Magic(4) │ Ver(2)  │ Flags(4)  │ Reserved(4)  │            │
+│ │ "S3SF"   │         │ flagFull  │              │            │
+│ └──────────┴─────────┴───────────┴──────────────┘            │
 ├──────────────────────────────────────────────────────────────┤
 │ Fragment 0 (8224 B = 32 B header + 8192 B payload)           │
 ├──────────────────────────────────────────────────────────────┤
 │ Fragment 1 (8224 B)                                          │
 ├──────────────────────────────────────────────────────────────┤
-│ ... fragments may belong to different shards ...             │
+│ ... fragments belonging to one or more shards ...            │
 ├──────────────────────────────────────────────────────────────┤
 │ Fragment N (8224 B)                                          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Every fragment on disk is exactly `FragmentHeaderBytes + ChunkSize = 32 + 8192 = 8224`
-bytes. Fragments whose logical payload is shorter than `ChunkSize` are zero-padded.
-The padding bytes are included in the CRC calculation.
+Every fragment on disk is exactly `fragHeaderSize + fragBodySize = 32 + 8192 =
+8224` bytes. Fragments whose logical payload is shorter than `fragBodySize` are
+zero-padded; the padding is included in the CRC calculation.
+
+A segment grows up to `maxSegSize` (4 GiB). When full, `flagFull` is set in the
+header and the store rolls forward to a new segment number. Within a segment,
+each shard occupies a contiguous extent of fragments; extents from different
+shards are disjoint.
 
 ### Fragment Header (32 B)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         SeqNum (8)                              │
+│                         FragNum (8)                             │
 ├─────────────────────────────────────────────────────────────────┤
 │                        ShardNum (8)                             │
 ├───────────────────────────┬─────────────────────────────────────┤
-│     ShardFragment (4)     │          Length (4)                 │
+│       Reserved (4)        │       PayloadLen (4)                │
 ├───────────────────────────┼─────────────────────────────────────┤
-│        Flags (4)          │         CRC32 (4)                   │
+│         Flags (4)         │         CRC32 (4)                   │
 └───────────────────────────┴─────────────────────────────────────┘
 ```
 
 | Field | Size | Purpose |
 |-------|------|---------|
-| `SeqNum` | 8 B | Global monotonic sequence number (optional; reserved for future replay) |
+| `FragNum` | 8 B | Global monotonic fragment counter (across segments) |
 | `ShardNum` | 8 B | Identifier of the shard this fragment belongs to |
-| `ShardFragment` | 4 B | Index of this fragment within the shard (0..N-1) |
-| `Length` | 4 B | Logical payload length (≤ 8192); remaining payload bytes are zero-padding |
-| `Flags` | 4 B | Bit flags; `FlagEndOfShard` marks the final fragment of a shard |
-| `CRC32` | 4 B | IEEE CRC32 of the full 32 B header (with CRC field zeroed) + full 8192 B padded payload |
+| `Reserved` | 4 B | Reserved for future use |
+| `PayloadLen` | 4 B | Logical payload length (≤ 8192); remaining body bytes are zero-padding |
+| `Flags` | 4 B | Bit flags; `flagEndOfShard` marks the final fragment of a shard |
+| `CRC32` | 4 B | IEEE CRC32 over the full fragment (header + padded payload) with the CRC field zeroed |
 
-`ShardNum` + `ShardFragment` uniquely identify a fragment's role. The CRC covers both
-header and payload, so a reader can independently verify every 8 KB unit without any
-external metadata.
+The CRC covers both header and payload, so a reader can independently verify
+every fragment without external metadata.
 
-## Fragment Slot Allocation
+## Extent Reservation
 
-A shard of size `S` requires `⌈S / ChunkSize⌉` fragments. Fragments for a given shard
-are allocated contiguously within each WAL file they touch but may span multiple files
-when the current file's free slots are exhausted.
+A shard of logical size `S` requires `⌈S / fragBodySize⌉` fragments occupying a
+contiguous extent of `n × totalFragSize` bytes within a segment.
 
-**Reservation protocol** (executed under a short `wal.mu` critical section):
+**Reservation protocol** (executed under a short `store.mutex` critical section):
 
-1. Compute the fragment count for the incoming shard from the body length on the QUIC
-   request header.
-2. Walk the set of open WAL files, allocating contiguous slot ranges. When a file's
-   free slots are exhausted, create a new WAL file via `os.File.Truncate(maxFileSize)`.
-   Pre-creating full-size files ensures unwritten slots read as zero bytes and makes
-   room for concurrent reservations to begin allocation immediately.
-3. For each file touched, increment that file's in-memory `refCount`.
-4. Assign `SeqNum` values atomically (one per fragment).
-5. Mark a file "full" once its final slot is allocated so no further reservations may
-   claim slots in it.
-6. Return the allocation as a list of `(WALNum, baseFragmentIndex, fragmentCount)`
-   tuples. Release the lock.
+1. Compute the fragment count from the body length on the QUIC request header.
+2. Get the current segment. If full, mark it via `markFull()` and roll to the
+   next segment number (up to 100 attempts).
+3. `Truncate(off + extentSize)` the segment file to reserve the extent up front.
+   Pre-allocating ensures every subsequent `WriteAt` lands within file bounds
+   without extending the file concurrently.
+4. Increment the segment's atomic `refs` counter.
+5. Allocate monotonic `fragNum`/`shardNum` values for the writer.
+6. Build and return a `shardWriter` bound to the reserved extent. Release the
+   lock.
 
-The reservation step is the only shared-state critical section on the write path. No
-I/O is performed while holding `wal.mu`.
+The reservation is the only shared-state critical section on the write path. No
+data I/O happens while holding `store.mutex` — only the `Truncate` syscall, which
+extends the file's size metadata without writing any blocks.
 
 ## Lock-Free Fragment Writes
 
-Once a reservation is issued, the writer goroutine owns a disjoint set of fragment
-slots across one or more WAL files. Slot offsets are deterministic:
+Once a reservation is issued, the writer goroutine owns a disjoint byte range
+within the segment file. Fragment offsets are deterministic:
 
 ```
-fileOffset(walNum, fragmentIndex) = WALHeaderSize + fragmentIndex * 8224
+fileOffset(extent, frag) = extent.Off + frag * totalFragSize
 ```
 
-The writer goroutine drains fragment-sized batches from its QUIC stream, assembles
-each fragment (header + payload + zero padding + CRC), and issues
-`(*os.File).WriteAt(fragmentBytes, fileOffset)`. Multiple writer goroutines may issue
-concurrent `WriteAt` calls to the same WAL file as long as their slot allocations are
-disjoint. POSIX `pwrite` guarantees atomicity for non-overlapping regions, and Go's
-`WriteAt` is explicitly safe for concurrent use.
-
-A writer may coalesce up to `N` adjacent fragments into a single `WriteAt` call to
-amortise syscall overhead. `N` is a tunable (see §17) that trades memory for syscall
-count; it has no effect on correctness or the observable state of the WAL.
+The writer assembles fragments (header + payload + zero padding + CRC) into an
+in-memory buffer and issues `(*os.File).WriteAt(buf, fileOffset)`. Multiple
+writer goroutines may issue concurrent `WriteAt` calls against the same segment
+file because their reserved extents are disjoint. POSIX `pwrite` guarantees
+atomicity for non-overlapping regions, and Go's `WriteAt` is explicitly safe for
+concurrent use.
 
 ## Commit Sequence
 
-For each WAL file touched by a reservation, the writer goroutine performs the
-following steps in order:
+`shardWriter.Close()` performs the following steps in order:
 
-1. **Write** all owned fragments via `WriteAt` (batched per the tunable above).
-2. **Fsync** the WAL file.
-3. **Commit** by writing the Badger entry (`<object-hash>` → `WALFiles` list).
-4. **Decrement** the file's `refCount` atomically. If the decremented value is zero
-   and the file is marked full, close the file.
+1. **Final flush** of any remaining buffered fragments via `WriteAt`.
+2. **Fsync** the segment file.
+3. **Commit** by writing the Badger index entry: `<object hash || shard index>`
+   → encoded extent.
+4. **Decrement** the segment's `refs` counter atomically.
 
-Step 3 is the linearisation point for readers: a shard is readable if and only if its
-Badger entry is present. Steps 1-2 may produce fragments on disk that are never
-followed by a commit (aborted writes, crashes); those fragments are dead space
-reclaimable by the compactor.
+Step 3 is the linearisation point for readers: a shard is readable if and only
+if its Badger entry is present. Steps 1-2 may produce fragments on disk that are
+never followed by a commit (aborted writes, crashes); those fragments are dead
+space reclaimable by the compactor.
 
-## Reference Counting & File Lifetime
+## Reference Counting & Segment Lifetime
 
-Each open WAL file carries an atomic `refCount` tracking the number of in-flight
-reservations that hold at least one slot in the file. The counter is:
+Each cached segment carries an atomic `refs` counter tracking the number of
+in-flight readers and writers that hold the segment open. The counter is:
 
-- Incremented under `wal.mu` during reservation, for every file touched.
-- Decremented after a reservation's commit or abort completes for that file.
-- Checked for zero immediately after the decrement returns (via the return value of
-  `atomic.AddInt32`). A caller that observes zero and the file is marked full is the
-  sole closer.
+- Incremented under `store.mutex` when a reservation succeeds (writers) or when
+  `Lookup` returns a reader.
+- Decremented when the writer closes (after step 3 above) or the reader closes.
 
-Marking a file "full" under `wal.mu` before its final `refCount` increment returns
-ensures no late reservation can arrive between a decrement-to-zero and the close.
+`Store.Close()` waits for all `refs` to drain (spinning with `runtime.Gosched`)
+before closing segment file descriptors and the index.
 
 ## Abort Semantics
 
-A reservation is aborted when the server-side writer fails mid-shard (network error,
-client disconnect, disk error). On abort:
+A reservation is aborted when the server-side writer fails mid-shard (network
+error, client disconnect, disk error). On abort:
 
 - The writer skips step 3 (Badger commit). The shard becomes unreadable.
-- The writer still performs step 4 (refCount decrement) so the file can be closed
-  when no other in-flight reservations remain.
+- The writer still performs step 4 (`refs` decrement) so the segment ref count
+  drains correctly.
 - Any fragments already written to disk sit as dead space until the compactor
   reclaims them.
 
-There is no distinct on-disk or in-Badger `failed` state. The absence of a Badger
-entry is the authoritative signal that a shard is unreadable; the read path treats
-"Badger miss" identically to "shard never existed" and falls back to parity.
+There is no distinct on-disk or in-Badger `failed` state. The absence of a
+Badger entry is the authoritative signal that a shard is unreadable; the read
+path treats "Badger miss" identically to "shard never existed" and falls back to
+parity.
+
+## Persistent State
+
+The Store persists three monotonic counters in `state.json` to survive restarts:
+
+| Counter | Purpose |
+|---------|---------|
+| `segNum` | Current segment number (advances when a segment is marked full) |
+| `shardNum` | Next shard identifier to assign |
+| `fragNum` | Next global fragment counter to assign |
+
+On `Open`, these are restored before opening the active segment. The state file
+is rewritten on every `Append`.
 
 ## Background Compaction & Cold Storage
 
-Committed, fully-written WAL files are candidates for background compaction. The
+Closed, fully-written segments are candidates for background compaction. The
 compactor:
 
-- Scans closed WAL files for regions not referenced by any live Badger entry (dead
-  fragments from aborted reservations or deleted shards).
-- Rewrites live fragments into a new compacted file, updates Badger entries to point
-  at the new location, and removes the old file.
-- Optionally migrates aged, rarely-accessed shards to long-term cold storage. On a
-  subsequent GET, the shard is rehydrated from cold storage into a local WAL file
-  and served; the rehydration may complete asynchronously with the GET response.
+- Scans full segments for extents not referenced by any live Badger entry (dead
+  extents from aborted reservations or deleted shards).
+- Rewrites live extents into a new compacted segment, updates Badger entries to
+  point at the new location, and removes the old segment.
+- Optionally migrates aged, rarely-accessed shards to long-term cold storage. On
+  a subsequent GET, the shard is rehydrated from cold storage into a local
+  segment and served; rehydration may complete asynchronously with the GET
+  response.
 
-Compaction is not on the critical write path and is not required for correctness of
-PUT or GET operations.
+Compaction is not on the critical write path and is not required for
+correctness of PUT or GET operations.
 
 ## Local KV Rebuild
 
-If the local Badger index is lost, it can be reconstructed from WAL files:
+If the local Badger index is lost, it can be reconstructed from segments:
 
-1. Scan each WAL file from offset `WALHeaderSize` to EOF, one fragment at a time.
+1. Scan each segment file from offset `segHeaderSize` to EOF, one fragment at a
+   time.
 2. Verify each fragment's CRC32. Corrupt fragments are discarded.
-3. Group surviving fragments by `ShardNum`.
-4. A `ShardNum` group is complete when it contains contiguous `ShardFragment` values
-   0 through N-1 and the fragment at index N-1 has `FlagEndOfShard` set.
-5. Insert a Badger entry for each complete shard, pointing at the (WALNum, offset)
-   list where its fragments live.
+3. Group surviving fragments by `ShardNum` and contiguous in-segment position.
+4. A shard group is complete when its final fragment has `flagEndOfShard` set.
+5. Compute the extent (segment, offset, sizes) for the group and insert a Badger
+   entry under `<object hash || shard index>`.
 
-Incomplete shard groups (missing fragments, missing `FlagEndOfShard`) are discarded.
-They correspond to reservations whose commits never landed.
+Incomplete shard groups (missing trailing fragments, missing `flagEndOfShard`)
+are discarded. They correspond to reservations whose commits never landed.
 
 ---
 
@@ -608,10 +631,10 @@ Defines RS(3,2): 3 data shards, 2 parity shards. Can tolerate loss of any 2 node
    `reedsolomon.NewStream(K, M)` followed by `enc.Split(body, dataWriters, fileSize)`.
    Each shard is approximately `⌈object_size / K⌉` bytes.
 3. Ship each shard to its assigned node over QUIC (see §9). The node stores the shard
-   as a sequence of 8 KB fragments inside its WAL files (see §6).
+   as a contiguous extent of 8 KB fragments inside a segment file (see §6).
 
 No intermediate chunking or segmentation occurs. Compression is not performed on the
-write path; it is optionally applied to closed WAL files by the background compactor.
+write path; it is optionally applied to closed segments by the background compactor.
 
 ### Decoding
 
@@ -699,7 +722,7 @@ Node-to-node communication uses QUIC for shard storage and retrieval. QUIC was c
 │  go handleStream(stream)                                                │
 │       │                                                                  │
 │       ├─→ Read request header + body                                    │
-│       ├─→ Process (WAL write, read, etc.)                               │
+│       ├─→ Process (store write, read, etc.)                            │
 │       ├─→ Write response                                                │
 │       └─→ Close stream (CancelRead + Close)                             │
 │                                                                          │
@@ -869,14 +892,14 @@ s.Close()        // Close write side (sends FIN)
 │                 │  │                 │       │                 │
 │  Per-stream goroutine per shard:                              │
 │  1. Read body length from protocol header                     │
-│  2. Reserve fragment slots under short wal.mu lock            │
-│     - Allocate contiguous slots across 1+ WAL files           │
-│     - Pre-create files via Truncate if needed                 │
-│     - Increment refCount for each file touched                │
-│  3. Lock-free loop: batch N fragments → WriteAt(bytes, offset)│
-│  4. fsync each WAL file                                       │
-│  5. Badger put: object-hash → WALFiles list                   │
-│  6. Atomic refCount decrement; close file if zero and full    │
+│  2. Reserve a contiguous extent under short store.mutex lock  │
+│     - Roll to next segment if current is full                 │
+│     - Truncate segment to pre-allocate the extent             │
+│     - Increment segment refs                                  │
+│  3. Lock-free WriteAt of fragment buffers within the extent   │
+│  4. fsync the segment file                                    │
+│  5. Badger put: <object-hash || shard-index> → extent record  │
+│  6. Atomic segment refs decrement                             │
 └─────────────────┘  └─────────────────┘       └─────────────────┘
               │
               ▼
@@ -892,18 +915,18 @@ s.Close()        // Close write side (sends FIN)
 
 ### Write-Path Concurrency Invariants
 
-- `wal.mu` is held only during reservation and is released before any I/O begins. It
-  covers fragment slot allocation, WAL file creation, SeqNum assignment, and refCount
-  bookkeeping.
-- Fragment writes to disk are lock-free. Multiple concurrent writer goroutines may
-  issue `WriteAt` against the same WAL file provided their reserved slots are
-  disjoint.
-- A shard is observable to readers only after its Badger entry has been committed.
-  Fragments fsynced to disk without a corresponding Badger put are invisible to GET
-  and are reclaimable by compaction.
-- File close happens exactly once, driven by the reservation whose refCount
-  decrement returns zero (observed via `atomic.AddInt32`'s return value) after the
-  file has been marked full.
+- `store.mutex` is held only during reservation and is released before any data
+  I/O begins. It covers extent allocation, segment rotation, segment-file
+  `Truncate`, `fragNum`/`shardNum` assignment, and `state.json` persistence.
+- Fragment writes to disk are lock-free. Multiple concurrent writer goroutines
+  may issue `WriteAt` against the same segment file provided their reserved
+  extents are disjoint.
+- A shard is observable to readers only after its Badger entry has been
+  committed. Fragments fsynced to disk without a corresponding Badger put are
+  invisible to GET and are reclaimable by compaction.
+- Segment file descriptors are kept open in a per-store cache and are closed
+  only on `Store.Close()`, after waiting for all outstanding writer/reader
+  references to drain.
 
 ## GET Object
 
@@ -928,11 +951,11 @@ s.Close()        // Close write side (sends FIN)
 │   QUIC Node 0   │  │   QUIC Node 1   │  │   QUIC Node 2   │
 │  ┌───────────┐  │  │  ┌───────────┐  │  │  ┌───────────┐  │
 │  │LocalBadger│  │  │  │LocalBadger│  │  │  │LocalBadger│  │
-│  │ hash→WAL  │  │  │  │ hash→WAL  │  │  │  │ hash→WAL  │  │
+│  │key→extent │  │  │  │key→extent │  │  │  │key→extent │  │
 │  └─────┬─────┘  │  │  └─────┬─────┘  │  │  └─────┬─────┘  │
 │        ▼        │  │        ▼        │  │        ▼        │
 │  ┌───────────┐  │  │  ┌───────────┐  │  │  ┌───────────┐  │
-│  │  WAL Read │  │  │  │  WAL Read │  │  │  │  WAL Read │  │
+│  │ Segment   │  │  │  │ Segment   │  │  │  │ Segment   │  │
 │  │  Shard 0  │  │  │  │  Shard 1  │  │  │  │  Shard 2  │  │
 │  └───────────┘  │  │  └───────────┘  │  │  └───────────┘  │
 └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
@@ -1210,11 +1233,20 @@ Requires 5 nodes, providing 3 data, and 2 parity bits for recovery.
 | `s3db/fsm.go` | Finite State Machine, applies commands to BadgerDB |
 | `s3db/server.go` | HTTPS REST API, routes, authentication middleware |
 | `s3db/client.go` | Client for connecting to s3db cluster |
+| `store/store.go` | Store: segment cache, extent reservation, index commits |
+| `store/segment.go` | Segment file format, fragment layout, header flags |
+| `store/writer.go` | Per-shard writer: buffered fragment assembly, lock-free `WriteAt`, fsync, commit |
+| `store/reader.go` | Per-shard reader: extent → fragment iteration with CRC validation |
+| `store/state.go` | Persistent monotonic counters (`state.json`) |
+| `store/extent.go` | Extent record + encoding for the per-node Badger index |
 | `backend/distributed/globalstate.go` | GlobalState interface, LocalState, DistributedState |
 | `backend/distributed/put.go` | PUT object implementation |
 | `backend/distributed/get.go` | GET object implementation |
 | `backend/distributed/list.go` | LIST operations implementation |
 | `backend/distributed/delete.go` | DELETE object implementation |
+| `quic/quicserver/put.go` | QUIC handler for shard PUT (calls `store.Append` + writer) |
+| `quic/quicserver/get.go` | QUIC handler for shard GET (calls `store.Lookup` + reader) |
+| `quic/quicserver/delete.go` | QUIC handler for shard DELETE (calls `store.Delete`) |
 
 ## Raft Tuning Parameters
 
@@ -1257,19 +1289,13 @@ err := state.Scan("objects", []byte("arn:aws:s3:::mybucket/"), func(key, value [
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `ChunkSize` | 8 KB | Fragment payload size on disk |
-| `FragmentHeaderBytes` | 32 B | Per-fragment header (SeqNum, ShardNum, ShardFragment, Length, Flags, CRC32) |
-| `ShardSize` | 32 MB | Maximum WAL file payload before rollover (per-file capacity, not per-shard) |
-| Fragment batch size `N` | tunable | Number of fragments coalesced per `WriteAt` by a writer goroutine; memory-vs-syscall tradeoff |
+| `fragBodySize` | 8 KB | Fragment payload size on disk |
+| `fragHeaderSize` | 32 B | Per-fragment header (FragNum, ShardNum, Reserved, PayloadLen, Flags, CRC32) |
+| `maxSegSize` | 4 GiB | Maximum segment file size before rollover |
 | RS schemes | RS(2,1) / RS(3,2) | Erasure coding configuration |
 | Hash ring vnodes | 64–256 | Virtual nodes for distribution |
 | QUIC concurrent streams | 32–256 | Per-connection stream limit |
 | QUIC flow-control windows | see `quic/quicconf` | Receive window sizes (stream and connection) |
-
-Fragment batch size `N` has no effect on the observable state of the WAL; it tunes
-memory usage and syscall count on the write path. A production node serving many
-concurrent shards per WAL file will typically set `N` higher; a memory-constrained
-node will set it lower.
 
 ---
 

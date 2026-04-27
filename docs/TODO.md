@@ -9,85 +9,96 @@ queue.
 
 ---
 
+## Performance
+
+The lock-free segment write path is sound at 3-node, c=10, 1 MiB warp-mixed:
+PUT ~53 MiB/s, p50 ~83 ms. Per-PUT timing instrumentation (since reverted)
+showed the floor is **two synchronous Raft writes** (`globalState.Set` ×2)
+to the s3db cluster on the critical path of every PUT, ~40 ms median
+combined. The per-shard segment fsync (~9 ms) and per-node store-index
+Badger writes (~60 µs) are not the bottleneck. Items below are ordered by
+expected ROI.
+
+### Raft-side BatchSet for metadata commits
+
+S3 PutObject commits two keys to the s3db cluster after shards land:
+`objectHash → shard metadata` and `arnKey → objectHash`. Today they go as
+two separate `client.Put` calls — two Raft round-trips, two majority
+fsyncs. Add a server-side batch endpoint and route both keys through a
+single Raft proposal.
+
+- Extend `s3db.Client` with a batch Put.
+- Add the matching FSM apply (single `Update` txn writing both keys).
+- Wire `GlobalState.BatchSet` (interface already sketched and reverted)
+  through `DistributedState`.
+- Update `PutObject` and `CompleteMultipartUpload` callers.
+
+Expected savings: ~20 ms median per PUT (one Raft round-trip).
+
+### Eliminate the per-PUT temp file in `distributed.PutObject`
+
+The body is currently spooled to `/tmp/distributed-put-*`, then re-opened
+inside `putObjectViaQUIC` and read back to populate `dataShardBuffers` for
+RS split. On tmpfs this is invisible; on a real disk it's two unnecessary
+disk hops on every PUT. Stream the request body directly into the data
+shard buffers (the RS streaming encoder accepts an `io.Reader`).
+
+- Remove `os.CreateTemp` + `io.Copy(tmpFile, reader)` from `PutObject`.
+- Pass the body reader to a new `putObjectViaQUIC` signature that takes
+  `io.Reader` and `size int64` instead of a path.
+- Make the existing `bytesBufferWriter` path the only path.
+
+### Overlap parity send with data send
+
+In `putObjectViaQUIC`, parity goroutines and `enc.Encode` start only after
+all data shards have fully uploaded, even though the encoder reads the
+already-populated `dataShardBuffers` and the parity sends are independent
+of data sends.
+
+- Spawn parity goroutines + start `enc.Encode` immediately after
+  `enc.Split` returns, in parallel with the data-shard send loop.
+- Wait on both sets at the end.
+
+Expected savings: ~20 ms on `quic_us` median.
+
+### Async metadata commit
+
+Largest single lever. Reply 200 OK to the client after QUIC shards commit;
+write `globalState` metadata in a background goroutine. Removes the full
+~40 ms metadata Raft cost from the critical path.
+
+- Cost: a crash window between shard commit and metadata commit leaves
+  orphaned shards. Needs a startup scrubber that scans the per-node store
+  index, reconciles against the metadata table, and either backfills
+  missing metadata or garbage-collects orphans.
+- Likely the right answer long-term, but bigger surface area than the
+  items above.
+
+### Periodic fsync (deferred)
+
+Originally tracked as Stage 3 of the store rewrite. Bench data shows the
+per-close `seg.file.Sync()` costs ~9 ms median latency but is **not** the
+throughput cap (removing it entirely tied throughput, while p99 latency
+got 4× worse from kernel writeback storms). A 200 ms periodic syncer
+would likely be a Pareto improvement on latency without hurting p99, but
+the throughput payoff is small relative to the Raft items above. Reorder
+once those land.
+
+- Add a 200 ms ticker to `Store` that fsyncs dirty segments.
+- Drop `seg.file.Sync()` from `shardWriter.Close()`.
+- Final sync on `store.Close()`.
+
+### Deletion tracking in Store
+
+`store.Delete` removes the index entry but leaves the on-disk extent as
+dead space. Compaction needs a record of freed extents to reclaim them.
+
+- Persist a freed-extents log (segment-local or store-global).
+- Surface it to the future compactor.
+
+---
+
 ## Design–Implementation Gaps
-
-### Store Rewrite (replaces WAL)
-
-The `store` package (`predastore/store/`) replaces the WAL. The write path
-and `store.go` are drafted; `objectReader` is not done. Fixes, reader
-completion, periodic fsync, and QUIC integration are tracked below.
-
-#### Stage 1: Fix Store Issues
-
-**Critical (won't work without these)**
-
-- [x] 1. ~~Export `extent` fields~~ — fields are now `SegNum`/`Off`/`Size`.
-- [x] 2. ~~Initialize `segCache`~~ — `Open` now uses `make(map[uint64]*segment)`.
-- [x] 3. ~~Separate local frag index from global `fragNum` in flush~~ — writer redesign: `off`/`flushed` track byte position within the extent (headers included). `fragNum` is only used for the header field, incremented in `writeHeader()`. Offset is `extent.Off + flushed`.
-- [x] 4. ~~Fix `flush()` infinite loop~~ — writer redesign: flush writes `buf[0:writeLen]` in a single `WriteAt`. No per-fragment loop, no advancing `pos`.
-- [x] 5. ~~Add final flush before `Close()`~~ — `Close()` now calls `flush(true)` when `off > flushed` before syncing.
-- [x] 6. ~~Fix `Close()` deadlock~~ — `onClose` no longer acquires the store mutex.
-
-**Serious (incorrect behavior)**
-
-- [x] 7. ~~Reader `Close()` must call `onClose`~~ — fixed in Stage 2 rewrite. Sets `closed = true`, calls `onClose()`.
-- [x] 8. ~~Make `refs` atomic~~ — now `atomic.Int32` with `.Add()`/`.Load()`.
-- [x] 9. ~~Fix `Delete` to construct shard key~~ — now uses `makeShardKey(objectHash, shardIndex)` with `[32]byte` signature.
-- [x] 10. ~~Fix `flagEndOfShard` check~~ — writer redesign: `flagEndOfShard` set on the last frag when `final && i == nFrags-1`. No dependence on global `fragNum`.
-
-**Logic errors / consistency**
-
-- [x] 11. ~~Fix `flagSegFull` type~~ — now `flagFull segmentFlags`.
-- [x] 12. ~~Fix `ReadFrom` data loss on EOF~~ — writer redesign: `ReadFrom` flushes whenever `dataWritten() >= dataSize`, so partial-buffer + EOF always triggers a flush before returning.
-- [x] 13. ~~Remove unused `sync/atomic` import~~ — now used by `atomic.Int32`.
-
-**Defensive / minor**
-
-- [x] 14. ~~Add max iteration limit to `Append` rotation loop~~ — now has `maxAttempts = 100`.
-- [x] 15. ~~Fix `Open` error message with nil error~~ — inner closure now returns meaningful errors.
-- [x] 16. ~~Close leaked file descriptors in `Open` error path~~ — defer in inner closure closes on error.
-- [x] 17. ~~Remove `O_APPEND` from `openSegment`~~ — now `O_CREATE|O_RDWR`, header written with `WriteAt`.
-
-**New issues (introduced during Stage 1 work)**
-
-- [x] 18. ~~`fmt.Errorf` format string bugs~~ — all four call sites fixed.
-- [x] 19. ~~`Append` rotation loop missing `store.segNum += 1`~~ — now incremented at end of loop.
-- [x] 20. ~~`Delete` doesn't acquire mutex~~ — now locks/defers `store.mutex`.
-
-#### Stage 2: Finish shardReader
-
-Complete rewrite matching shardWriter. Single-extent model, `pos` tracks
-logical read position, `ReadAt` translates logical offset → disk offset,
-CRC validated as `crc32.ChecksumIEEE(frag[0:totalFragSize])`. Added
-`DataSize` field to extent for logical size; `extent.Size` is on-disk.
-
-- [x] 21. ~~Strip multi-extent scaffolding from `ReadAt`~~ — single-extent: `fragIndex = logicalPos / fragBodySize`, disk read from `ext.Off + fragIndex*totalFragSize`.
-- [x] 22. ~~Fix `Size()`~~ — returns `ext.DataSize` (logical size stored in extent).
-- [x] 23. ~~Fix `Close()`~~ — calls `onClose()`, sets `closed = true`. Also fixes Stage 1 #7.
-- [x] 24. ~~Fix CRC validation to match writer~~ — validates `crc32.ChecksumIEEE(buf[:totalFragSize])` with CRC field zeroed.
-- [x] 25. ~~Fix `WriteTo`~~ — uses `io.NewSectionReader(r, 0, r.ext.DataSize)`.
-- [x] 26. ~~Remove undefined references~~ — `byteExtent`, `locateByteOffset`, `readBufferFragments` all deleted.
-- [x] 27. ~~Validate payload length from frag header~~ — bounds-checked against `fragBodySize` before use.
-
-#### Stage 3: Periodic Fsync
-
-- [ ] 28. **Add a background fsync goroutine to Store** — 200ms ticker matching the WAL's `syncWALIfDirty` pattern. Track dirty segments with an atomic flag.
-- [ ] 29. **Remove per-close `file.Sync()` from `shardWriter.Close()`** — the periodic syncer handles durability.
-- [ ] 30. **Add `StopSyncer()` / final sync to `store.Close()`** — ensure all data is fsynced before shutdown.
-
-#### Stage 4: QUIC Server Integration
-
-- [x] 31. ~~Replace `*wal.WAL` with `*store.Store` in `QuicServer`~~ — `wal`/`walMu` replaced with `store *store.Store`. `NewWithRetry` calls `store.Open`, `Close` calls `store.Close`.
-- [x] 32. ~~Rewrite `handlePUTShard`~~ — `store.Append` reserves under short lock, `writer.ReadFrom(br)` streams directly from QUIC stream lock-free (no pre-buffer), `writer.Close()` commits.
-- [x] 33. ~~Rewrite `handleGET`~~ — ~100 lines of manual fragment walking replaced with `store.Lookup` → `io.NewSectionReader` → `io.Copy`. Range reads use `SectionReader` directly.
-- [x] 34. ~~Rewrite `handleDELETEShard`~~ — replaced direct `walInstance.DB` access with `store.Delete(hash, shardIndex)`. `DeleteRequest` gained `ShardIndex` field. Compaction tracking deferred (see #36).
-- [x] 35. ~~Simplify `PutResponse`~~ — `WriteResult wal.WriteResult` replaced with `ShardSize int64`. `quicclient` updated to match.
-- [ ] 36. **Add deletion tracking to Store** — Store needs a mechanism to record freed extents for future compaction. Currently `store.Delete` just removes the index entry; the on-disk extent becomes dead space.
-- [x] 37. ~~Remove WAL imports~~ — all `wal.*` references removed from `quicserver`, `quicclient`. Handlers split to `get.go`, `put.go`, `delete.go`.
-- [x] 38. ~~Update distributed backend~~ — deleted `putObjectToWAL` (~180 LOC), removed `useQUIC`/`UseQUIC` from `Config`/`Backend`, `putObjectViaQUIC` returns `(size, error)`, `ObjectShardReader` deleted, `shardWriteOutcome` simplified, `deleteObjectViaQUIC` sends per-shard deletes with `ShardIndex`. `s3/wal` import removed from all production code.
-- [x] 39. ~~Delete filesystem backend~~ — removed `backend/filesystem/` (9 files, ~1,731 LOC), `BackendFilesystem` constant, `-backend` CLI flag, filesystem fallback in `NewHTTP2Server`, `initFilesystemBackend()`, `createFilesystemBackend()`, `ToFilesystemConfig()`. Default backend is now `BackendDistributed`. Tests in `backend_test.go`, `buckethandler_test.go`, `options_test.go`, `crud_test.go`, `handleerror_test.go` updated. README updated.
-
-**Tests not yet updated** — `distributed_test.go`, `bucket_test.go`, `multipart_test.go`, `distributed_putobject_test.go` still reference removed `UseQUIC`/`putObjectToWAL`/`wal.*` types. `authmiddleware_test.go`, `delete_test.go`, `get_test.go`, `put_test.go`, `list_test.go`, `s3_integration_test.go`, `s3_bench_test.go` use `NewHTTP2Server` with `server.toml` (no nodes) and need migrating to the distributed backend.
 
 ### Background Compaction & Cold-Storage Tiering
 
@@ -129,6 +140,9 @@ Reference model + stateful PBT against the QUIC server + Store.
 
 ## S3 API
 
+- `POST /{bucket}?delete=` (S3 batch DeleteObjects). Currently returns 405
+  because no route exists; warp's mixed test cleanup hits it. Routing-only
+  change.
 - Unit tests for put/get/list/delete without the correct permission set.
 - Auth header session invalidation after 15 minutes.
 - Checksum support (CRC32, crc64nvme, etc.) for `aws s3 cp` and multipart.

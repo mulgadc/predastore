@@ -22,13 +22,13 @@ Predastore runs as a distributed cluster with erasure-coded shards, Raft-consens
 │  s3db Cluster       │       │  QUIC Shard Nodes                │
 │  (Raft Consensus)   │       │  ┌────────┐┌────────┐┌────────┐  │
 │                     │       │  │ Node 0 ││ Node 1 ││ Node 2 │  │
-│  BoltDB (Raft log)  │       │  │  WAL   ││  WAL   ││  WAL   │  │
-│  BadgerDB (FSM)     │       │  │ Badger ││ Badger ││ Badger │  │
+│  BoltDB (Raft log)  │       │  │ Store  ││ Store  ││ Store  │  │
+│  BadgerDB (FSM)     │       │  │(seg+ix)││(seg+ix)││(seg+ix)│  │
 └─────────────────────┘       │  └────────┘└────────┘└────────┘  │
                               └──────────────────────────────────┘
 ```
 
-**S3D** serves the S3 HTTP API with AWS Signature V4 authentication. The **s3db cluster** provides strongly consistent metadata via Raft (HashiCorp Raft + BoltDB + BadgerDB). **QUIC shard nodes** store erasure-coded object data in write-ahead logs, communicating over persistent QUIC connections with pooled, multiplexed streams — eliminating per-request TLS handshakes.
+**S3D** serves the S3 HTTP API with AWS Signature V4 authentication. The **s3db cluster** provides strongly consistent metadata via Raft (HashiCorp Raft + BoltDB + BadgerDB). **QUIC shard nodes** store erasure-coded object data in append-only segment files, with each shard occupying a contiguous extent indexed by a per-node BadgerDB. Inter-node communication uses persistent QUIC connections with pooled, multiplexed streams — eliminating per-request TLS handshakes.
 
 See [DESIGN.md](DESIGN.md) for the full architecture reference, including the data model, QUIC protocol format, Raft consensus details, hash ring placement, and failure handling.
 
@@ -37,7 +37,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture reference, including the da
 - **Reed-Solomon erasure coding** — objects are split into data + parity shards (configurable, e.g. RS(3,2) tolerates loss of any 2 nodes). No full replication overhead.
 - **Raft consensus for metadata** — bucket and object metadata is strongly consistent across the cluster. Reads can go to any node; writes go through the leader.
 - **QUIC transport** — node-to-node shard I/O uses QUIC over UDP with connection pooling. A single long-lived connection per node pair carries multiplexed streams, so shard writes cost only a stream ID allocation, not a TLS handshake.
-- **Write-ahead logs** — each shard node writes data to a local WAL for durability before acknowledging. WAL entries are indexed in a local BadgerDB for fast lookups.
+- **Append-only segments** — each shard node writes data to large append-only segment files. A shard occupies a contiguous extent within one segment, allocated up-front via `Truncate`; subsequent fragment writes are lock-free `WriteAt` calls. A per-node BadgerDB index maps shard keys to extents.
 - **Consistent hash ring** — shard placement is deterministic via a hash ring with virtual nodes. Adding nodes bumps a ring epoch; old objects stay on the old epoch, new writes use the new one.
 - **Single binary** — `s3d` runs the S3 API server, database nodes, and QUIC shard nodes. In development mode everything runs in one process; in production each component can run separately.
 
@@ -111,14 +111,14 @@ Distributed storage with erasure coding, Raft-consensus metadata, and QUIC trans
 ./bin/s3d -config clusters/3node/cluster.toml -node 3 -base-path clusters/3node
 ```
 
-The distributed backend's data model decomposes objects into chunks, shards, segments, and blocks:
+The distributed backend's data model:
 
 | Unit | Size | Description |
 |------|------|-------------|
-| Block | 8 KB | Smallest addressable unit |
-| Segment | 64 KB | Independently compressible (8 blocks) |
-| Shard | 32 MB | Per-node RS slice (512 segments) |
-| Chunk | 32 MB | Logical unit for RS encoding |
+| Object | arbitrary | RS-encoded end-to-end into K data + M parity shards |
+| Shard | `⌈object_size / K⌉` | Per-node RS slice; occupies a contiguous extent |
+| Fragment | 8 KB payload + 32 B header | On-disk unit; CRC-validated independently |
+| Segment file | up to 4 GiB | Append-only container holding extents from one or more shards |
 
 See [DESIGN.md](DESIGN.md) for full configuration reference, including database node setup, shard node setup, RS tuning, and deployment modes.
 
@@ -168,7 +168,7 @@ sudo sysctl -w net.core.wmem_max=7500000
 - [x] QUIC transport with connection pooling
 - [x] Consistent hash ring placement
 - [ ] Gossip-based node discovery
-- [ ] WAL compaction and garbage collection
+- [ ] Segment compaction and garbage collection
 - [ ] Automatic shard rebalancing
 - [ ] Background read-repair
 - [ ] Bucket versioning
