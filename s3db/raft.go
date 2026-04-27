@@ -37,7 +37,7 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 	}
 
 	// Create data directories
-	dataDir := filepath.Join(config.DataDir, fmt.Sprintf("node-%d", config.NodeID))
+	dataDir := config.DataDir
 	if err := os.MkdirAll(dataDir, 0750); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}

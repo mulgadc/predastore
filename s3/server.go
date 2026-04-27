@@ -523,43 +523,12 @@ func (s *Server) createDistributedBackend() (backend.Backend, error) {
 	// Determine data directories
 	badgerDir := s.config.BadgerDir
 	if badgerDir == "" {
-		if s.nodeID > 0 {
-			for _, n := range s.config.Nodes {
-				if n.ID == s.nodeID && n.DBPath != "" {
-					badgerDir = n.DBPath
-					break
-				}
-			}
-		}
-
-		// Append base-dir if not Absolute Path in config
-		if !filepath.IsAbs(badgerDir) && s.basePath != "" && badgerDir != "" {
-			badgerDir = filepath.Join(s.basePath, badgerDir)
-		} else if badgerDir == "" {
-			badgerDir = filepath.Join(s.basePath, "distributed/db")
-		}
+		badgerDir = filepath.Join(s.basePath, "db")
+	} else if !filepath.IsAbs(badgerDir) && s.basePath != "" {
+		badgerDir = filepath.Join(s.basePath, badgerDir)
 	}
 
-	if err := os.MkdirAll(badgerDir, 0750); err != nil {
-		return nil, fmt.Errorf("failed to create badger directory: %w", err)
-	}
-
-	dataDir := ""
-	if s.nodeID > 0 {
-		for _, n := range s.config.Nodes {
-			if n.ID == s.nodeID {
-				dataDir = filepath.Dir(n.Path)
-				break
-			}
-		}
-	}
-
-	// Append base-dir if not Absolute Path in config
-	if !filepath.IsAbs(dataDir) && s.basePath != "" && dataDir != "" {
-		dataDir = filepath.Join(s.basePath, "distributed/nodes")
-	} else if dataDir == "" {
-		dataDir = filepath.Join(s.basePath, "distributed/nodes")
-	}
+	dataDir := filepath.Join(s.basePath, "store")
 
 	// Build database client configuration
 	var dbClientConfig *distributed.DBClientConfig
