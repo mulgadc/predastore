@@ -31,10 +31,9 @@ Raw disk ceiling:
 
     ./scripts/bench/bench-disk.sh
 
-fio writes to `$BENCH_DIR/disk` (parallel to predastore's `distributed/`
+fio writes to `$PREDA_DIR/disk` (parallel to predastore's `distributed/`
 tree); each job runs twice (buffered and `--direct=1`) and produces a JSON
-file per run under `scripts/bench/results/disk-<timestamp>/`. Override
-`BENCH_DIR` to point at a different filesystem.
+file per run under `scripts/bench/results/disk-<timestamp>/`.
 
 Predastore cluster benchmark:
 
@@ -47,15 +46,19 @@ and contain:
 
 - `warp-mixed.csv.zst` — warp's raw samples.
 - `cluster.toml` — the config used for the run.
-- `logs/node-{1,2,3}.log` — per-node s3d stderr/stdout.
 - `run-info.txt` — commit SHA, warp version, date, hostname.
 
-The benchmark data root (default `/tmp/predastore-bench`) is wiped on exit by
-the trap. Override with `BENCH_DIR=/some/other/path` if the default filesystem
-is not representative — `bench-disk.sh` honours the same variable, so both
-scripts target the same storage when `BENCH_DIR` is set. Note that with RS(2,1)
-the on-disk footprint is ~1.5× the logical object volume, spread across three
-nodes; warp's defaults (2500 × 10 MiB) do not fit a typical dev-host tmpfs.
+### `PREDA_DIR`
+
+All scripts share a single root directory controlled by `PREDA_DIR` (default
+`/tmp/predastore`). Cluster data, warp temp files (`.warp-tmp/`), and fio
+targets all live under this path. Override it to move everything off tmpfs:
+
+    PREDA_DIR=/var/lib/predastore ./scripts/bench.sh 3node
+
+With RS(2,1) the on-disk footprint is ~1.5× the logical object volume, spread
+across three nodes; warp's defaults (2500 × 10 MiB) do not fit a typical
+dev-host tmpfs.
 
 ### Tuning warp mixed
 
@@ -100,8 +103,8 @@ Uses `clusters/3node/cluster.toml` directly (static config, no templating):
 - **No buckets configured** — warp creates its own via `--bucket=predastore`.
 - **Test credentials** — `AKIAIOSFODNN7EXAMPLE` / standard test secret key.
   Self-contained; no AWS profile or credential files needed.
-- **`-base-path $BENCH_DIR` passed on the CLI** — the distributed backend
-  resolves relative data paths from the cluster config against this root.
+- **`-base-path $PREDA_DIR/<cluster>` passed on the CLI** — the distributed
+  backend resolves relative data paths from the cluster config against this root.
 
 ## Deferred
 

@@ -2,7 +2,7 @@
 #
 # stop.sh - Stop all running Predastore clusters
 #
-# Scans /tmp/predastore/*/pids/ and kills any running processes.
+# Scans $PREDA_DIR/*/pids/ and kills any running processes.
 #
 # Usage:
 #   ./scripts/stop.sh
@@ -14,7 +14,7 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 REPO_DIR="$SCRIPT_DIR/.."
 CONFIG_DIR="$REPO_DIR/config"
 
-BASE_DIR="/tmp/predastore"
+BASE_DIR="${PREDA_DIR:-/tmp/predastore}"
 
 # Colors
 RED='\033[0;31m'

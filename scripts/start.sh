@@ -69,7 +69,7 @@ fi
 
 # --- Paths ---
 
-ROOT="/tmp/predastore"
+ROOT="${PREDA_DIR:-/tmp/predastore}"
 BASE="$ROOT/${CLUSTER_NAME}"
 LOGS="$BASE/logs"
 PIDS="$BASE/pids"

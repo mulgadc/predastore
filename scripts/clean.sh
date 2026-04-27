@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# clean.sh - Stop all clusters and remove cluster data (preserves /tmp/predastore and certs)
+# clean.sh - Stop all clusters and remove cluster data (preserves $PREDA_DIR root and certs)
 #
 # Usage:
 #   ./scripts/clean.sh
@@ -19,8 +19,10 @@ log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 # Stop any running processes first
 "$SCRIPT_DIR/stop.sh"
 
+PREDA_DIR="${PREDA_DIR:-/tmp/predastore}"
+
 cleaned=0
-for dir in /tmp/predastore/*/; do
+for dir in "$PREDA_DIR"/*/; do
     [ -d "$dir" ] || continue
     rm -rf "$dir"
     log_info "Removed $dir"

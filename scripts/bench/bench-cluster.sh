@@ -23,6 +23,8 @@ REPO_DIR="$SCRIPT_DIR/../.."
 CONFIG_DIR="$REPO_DIR/config"
 SCRIPTS_DIR="$SCRIPT_DIR/.."
 S3_PORT=8443
+PREDA_DIR="${PREDA_DIR:-/tmp/predastore}"
+export PREDA_DIR
 
 # Colors
 RED='\033[0;31m'
@@ -52,8 +54,7 @@ command -v warp >/dev/null || { log_error "warp not on PATH"; exit 1; }
 # --- Always stop cluster on exit ---
 
 cleanup() {
-    log_info "Stopping cluster..."
-    "$SCRIPTS_DIR/stop.sh"
+    "$SCRIPTS_DIR/clean.sh"
 }
 trap cleanup EXIT INT TERM
 
@@ -87,6 +88,17 @@ STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
 RESULTS_DIR="$SCRIPT_DIR/results/${CLUSTER_NAME}-$STAMP"
 mkdir -p "$RESULTS_DIR"
 cp "$CONFIG_FILE" "$RESULTS_DIR/cluster.toml"
+
+# --- Redirect warp temp dir off tmpfs ---
+#
+# Warp writes multi-MB upload payloads to TMPDIR (distributed-put-* files).
+# On hosts where /tmp is a small tmpfs this competes with the cluster data.
+# Place warp's temp files under PREDA_DIR so they share the same filesystem
+# as the cluster and are cleaned up together.
+
+WARP_TMPDIR="$PREDA_DIR/.warp-tmp"
+mkdir -p "$WARP_TMPDIR"
+export TMPDIR="$WARP_TMPDIR"
 
 # --- Run warp ---
 
