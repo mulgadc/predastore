@@ -68,7 +68,7 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 	require.NoError(t, os.MkdirAll(badgerDir, 0750))
 
 	s3 := New(&Config{
-		ConfigPath: filepath.Join("..", "clusters", "7node", "cluster.toml"),
+		ConfigPath: filepath.Join("..", "config", "7node.toml"),
 	})
 	err := s3.ReadConfig()
 	require.NoError(t, err, "Should read config without error")

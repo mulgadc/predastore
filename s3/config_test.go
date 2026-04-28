@@ -8,7 +8,7 @@ import (
 )
 
 func TestReadConfig(t *testing.T) {
-	s3 := New(&Config{ConfigPath: filepath.Join("..", "clusters", "7node", "cluster.toml")})
+	s3 := New(&Config{ConfigPath: filepath.Join("..", "config", "7node.toml")})
 	err := s3.ReadConfig()
 
 	assert.NoError(t, err, "Should read config without error")

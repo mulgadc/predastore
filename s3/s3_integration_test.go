@@ -146,7 +146,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 // loadTestConfig reads the shared test config once per test
 func loadTestConfig(t *testing.T) *Config {
 	s3config := New(&Config{
-		ConfigPath: filepath.Join("..", "clusters", "7node", "cluster.toml"),
+		ConfigPath: filepath.Join("..", "config", "7node.toml"),
 	})
 	err := s3config.ReadConfig()
 	require.NoError(t, err, "Failed to read config file")
