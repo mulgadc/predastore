@@ -35,6 +35,10 @@ type Store struct {
 	closed bool
 }
 
+var (
+	ErrStoreClosed = errors.New("store closed")
+)
+
 // Open recovers or creates a Store in dir. On startup it restores monotonic
 // counters from state.json, opens the index, then finds a non-full segment to
 // write into — rolling forward through segment numbers until one with capacity
@@ -118,10 +122,10 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader *shar
 	defer store.mutex.Unlock()
 
 	if store.closed {
-		return nil, fmt.Errorf("store closed")
+		return nil, ErrStoreClosed
 	}
 
-	key := makeShardKey(objectHash, shardIndex)
+	key := MakeShardKey(objectHash, shardIndex)
 	data, err := store.index.Get(key)
 	if err != nil {
 		return nil, fmt.Errorf("get: %w", err)
@@ -167,7 +171,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 	defer store.mutex.Unlock()
 
 	if store.closed {
-		return nil, fmt.Errorf("store closed")
+		return nil, ErrStoreClosed
 	}
 
 	// Ceiling division: number of fragments needed to hold size logical bytes.
@@ -256,7 +260,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 				return fmt.Errorf("encode extent: %w", err)
 			}
 
-			key := makeShardKey(objectHash, shardIndex)
+			key := MakeShardKey(objectHash, shardIndex)
 			if err := store.index.Set(key, encoded); err != nil {
 				return fmt.Errorf("commit: %w", err)
 			}
@@ -285,10 +289,10 @@ func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) error {
 	defer store.mutex.Unlock()
 
 	if store.closed {
-		return fmt.Errorf("store closed")
+		return ErrStoreClosed
 	}
 
-	key := makeShardKey(objectHash, shardIndex)
+	key := MakeShardKey(objectHash, shardIndex)
 	if err := store.index.Delete(key); err != nil {
 		return fmt.Errorf("delete: %w", err)
 	}
@@ -304,7 +308,7 @@ func (store *Store) Close() error {
 	defer store.mutex.Unlock()
 
 	if store.closed {
-		return fmt.Errorf("store closed")
+		return ErrStoreClosed
 	}
 
 	store.closed = true
@@ -332,8 +336,8 @@ func (store *Store) Close() error {
 	return errors.Join(errs...)
 }
 
-// makeShardKey builds a 36-byte index key: 32-byte object hash || 4-byte big-endian shard index.
-func makeShardKey(objectHash [32]byte, shardIndex uint32) []byte {
+// MakeShardKey builds a 36-byte index key: 32-byte object hash || 4-byte big-endian shard index.
+func MakeShardKey(objectHash [32]byte, shardIndex uint32) []byte {
 	key := make([]byte, 36)
 	copy(key[:32], objectHash[:])
 	binary.BigEndian.PutUint32(key[32:], shardIndex)

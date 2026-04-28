@@ -62,6 +62,7 @@ func (w *shardWriter) Write(p []byte) (total int, err error) {
 		bufPos := int(w.bufPos - w.extPos)
 		bodyLeft := int(totalFragSize - w.bufPos%totalFragSize)
 		dataLeft := int(w.ext.LSize - w.dataWritten())
+
 		n := copy(w.buf[bufPos:bufPos+min(bodyLeft, dataLeft)], p)
 		w.bufPos += int64(n)
 		total += n
