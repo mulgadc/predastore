@@ -247,14 +247,6 @@ func (b *Backend) Close() error {
 	return nil
 }
 
-// nodeDir returns the directory for a given node
-func (b *Backend) nodeDir(node string) string {
-	if b.dataDir == "" {
-		return filepath.Join("s3", "tests", "data", "distributed", "nodes", node)
-	}
-	return filepath.Join(b.dataDir, node)
-}
-
 // getNodeAddr returns the QUIC address for a node
 // It uses the nodeAddrs map from config if available, otherwise falls back to computed address
 func (b *Backend) getNodeAddr(nodeNum int) string {

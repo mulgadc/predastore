@@ -25,7 +25,6 @@ func setupBucketTest(t *testing.T) (*Backend, func()) {
 		ParityShards:      2,
 		PartitionCount:    5,
 		ReplicationFactor: 100,
-		UseQUIC:           false,
 	}
 
 	be, err := New(config)

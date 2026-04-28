@@ -6,37 +6,64 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// setupTestBackend creates a distributed backend with local WAL (no QUIC) for testing.
+// operationsPortCounter gives each test invocation a unique port range to
+// avoid bind conflicts when the OS hasn't released UDP ports from the prior test.
+var operationsPortCounter atomic.Int32
+
+// setupTestBackend creates a distributed backend with QUIC servers for testing.
 func setupTestBackend(t *testing.T) *Backend {
 	t.Helper()
 	tmpDir := t.TempDir()
 
+	testBasePort := 24991 + int(operationsPortCounter.Add(1)-1)*20
+
 	cfg := &Config{
-		BadgerDir: tmpDir,
+		BadgerDir:      tmpDir,
+		PartitionCount: 5,
+		QuicBasePort:   testBasePort,
 		Buckets: []BucketConfig{
 			{Name: "test-bucket", Region: "us-east-1"},
 		},
 	}
 	b, err := New(cfg)
 	require.NoError(t, err)
-	t.Cleanup(func() { b.Close() })
 
 	be, ok := b.(*Backend)
 	require.True(t, ok)
 
-	tmp := t.TempDir()
-	be.SetDataDir(filepath.Join(tmp, "nodes"))
+	dataDir := filepath.Join(tmpDir, "nodes")
+	be.SetDataDir(dataDir)
 
+	quicServers := make([]*quicserver.QuicServer, 5)
 	for i := range 5 {
-		require.NoError(t, os.MkdirAll(filepath.Join(be.DataDir(), fmt.Sprintf("node-%d", i)), 0750))
+		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
+		require.NoError(t, os.MkdirAll(nodeDir, 0750))
+
+		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5)
+		require.NoError(t, err, "Failed to start QUIC server for node %d", i)
+		quicServers[i] = qs
 	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	t.Cleanup(func() {
+		for _, qs := range quicServers {
+			if qs != nil {
+				_ = qs.Close()
+			}
+		}
+		b.Close()
+	})
 
 	return be
 }
