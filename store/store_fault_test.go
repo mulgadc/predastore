@@ -2,7 +2,9 @@ package store_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/mulgadc/predastore/internal/storetest"
@@ -78,6 +80,42 @@ func (sm *faultSM) FailNextWriteAt(t *rapid.T)  { state.failNextWriteAt = true }
 func (sm *faultSM) FailNextReadAt(t *rapid.T)   { state.failNextReadAt = true }
 func (sm *faultSM) FailNextSync(t *rapid.T)     { state.failNextSync = true }
 func (sm *faultSM) FailNextTruncate(t *rapid.T) { state.failNextTrunc = true }
+
+// CorruptByte flips one bit in a randomly chosen segment file. Subsequent
+// reads must surface the corruption as a CRC error rather than returning
+// silently-wrong bytes.
+func (sm *faultSM) CorruptByte(t *rapid.T) {
+	segNum := rapid.Uint64Range(0, 8).Draw(t, "segNum")
+	path := filepath.Join(sm.Dir, fmt.Sprintf("%016d.seg", segNum))
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return // segment doesn't exist yet — no-op
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return
+	}
+
+	off := rapid.Int64Range(0, info.Size()-1).Draw(t, "off")
+	flip := rapid.Byte().Draw(t, "flip")
+	if flip == 0 {
+		flip = 1
+	}
+
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], off); err != nil {
+		return
+	}
+	b[0] ^= flip
+	if _, err := f.WriteAt(b[:], off); err != nil {
+		return
+	}
+
+	state.triggered = true
+}
 
 // TestStoreFaults runs the same operation alphabet as TestStore but interleaves
 // fault-arming actions that cause the next IO of a chosen kind to fail. Once
