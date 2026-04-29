@@ -142,7 +142,7 @@ func (sm *baseSM) Lookup(t *rapid.T) {
 		t.Fatalf("read body ref: %v", refErr)
 	}
 
-	if sm.Strict() && !bytes.Equal(refBody, realBody) {
+	if !bytes.Equal(refBody, realBody) {
 		t.Fatalf("data corruption: ref=%d bytes, real=%d bytes", len(refBody), len(realBody))
 	}
 }
@@ -245,7 +245,7 @@ func (sm *baseSM) Check(t *rapid.T) {
 			continue
 		}
 
-		if sm.Strict() && refR.Size() != realR.Size() {
+		if refR.Size() != realR.Size() {
 			refR.Close()
 			realR.Close()
 			t.Fatalf("invariant size: ref=%d real=%d", refR.Size(), realR.Size())
@@ -265,7 +265,7 @@ func (sm *baseSM) Check(t *rapid.T) {
 			t.Fatalf("invariant read ref: %v", refErr)
 		}
 
-		if sm.Strict() && !bytes.Equal(refBody, realBody) {
+		if !bytes.Equal(refBody, realBody) {
 			t.Fatalf("invariant corruption: ref=%d bytes, real=%d bytes", len(refBody), len(realBody))
 		}
 	}

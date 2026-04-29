@@ -24,6 +24,7 @@ Thumbs.db
 *-report.txt
 s3/testdata/test-*
 s3/testdata/local/*
+store/testdata/*
 
 # Generated TLS certs
 certs
