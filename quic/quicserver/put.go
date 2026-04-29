@@ -25,7 +25,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 	// Determine how many bytes to read
 	var bodyLen int64
 	if req.BodyLen > 0 {
-		bodyLen = int64(req.BodyLen)
+		bodyLen = utils.Uint64ToInt64(req.BodyLen)
 	} else if putReq.ShardSize > 0 {
 		bodyLen = int64(putReq.ShardSize)
 	} else {

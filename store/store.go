@@ -7,11 +7,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"runtime"
 	"sync"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/mulgadc/predastore/s3db"
 )
 
@@ -32,21 +34,51 @@ type Store struct {
 	shardNum uint64
 	fragNum  uint64
 
+	maxSegSize uint64
+
 	closed bool
 }
 
+type Reader interface {
+	io.ReadCloser
+	io.ReaderAt
+	io.WriterTo
+
+	Size() int64
+}
+
+type Writer interface {
+	io.WriteCloser
+	io.ReaderFrom
+}
+
 var (
-	ErrStoreClosed = errors.New("store closed")
+	ErrClosedStore = errors.New("closed store")
+	ErrKeyNotFound = errors.New("key not found")
 )
+
+// Option configures a Store at Open time.
+type Option func(*Store)
+
+// WithMaxSegSize overrides the segment-roll threshold. Primarily intended for
+// tests that need to exercise rollover without writing 4 GiB of data.
+func WithMaxSegSize(n uint64) Option {
+	return func(s *Store) { s.maxSegSize = n }
+}
 
 // Open recovers or creates a Store in dir. On startup it restores monotonic
 // counters from state.json, opens the index, then finds a non-full segment to
 // write into — rolling forward through segment numbers until one with capacity
 // is found (up to 100 attempts).
-func Open(dir string) (store *Store, err error) {
+func Open(dir string, opts ...Option) (store *Store, err error) {
 	store = &Store{
-		dir:      dir,
-		segCache: make(map[uint64]*segment),
+		dir:        dir,
+		segCache:   make(map[uint64]*segment),
+		maxSegSize: DefaultMaxSegSize,
+	}
+
+	for _, opt := range opts {
+		opt(store)
 	}
 
 	if err := store.loadState(); err != nil {
@@ -115,20 +147,24 @@ func Open(dir string) (store *Store, err error) {
 	return store, err
 }
 
-// Lookup returns a shardReader for the given shard. The underlying segment is
+// Lookup returns a reader for the given shard. The underlying segment is
 // reference-counted: the caller must call reader.Close() to release it.
-func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader *shardReader, err error) {
+func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader Reader, err error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
 	if store.closed {
-		return nil, ErrStoreClosed
+		return nil, ErrClosedStore
 	}
 
 	key := MakeShardKey(objectHash, shardIndex)
 	data, err := store.index.Get(key)
 	if err != nil {
-		return nil, fmt.Errorf("get: %w", err)
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil, ErrKeyNotFound
+		}
+
+		return nil, fmt.Errorf("get extent: %w", err)
 	}
 
 	extent, err := decodeExtent(data)
@@ -148,12 +184,6 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader *shar
 		ext:    extent,
 		buf:    make([]byte, readBufLen*totalFragSize),
 		bufPos: 0,
-
-		onClose: func() error {
-			segment.refs.Add(-1)
-
-			return nil
-		},
 		closed: false,
 	}
 
@@ -166,12 +196,16 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader *shar
 // current segment can't fit the shard, it is marked full and the store rolls
 // to the next segment number (up to 100 attempts). The index entry is committed
 // only when the writer is closed.
-func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (writer *shardWriter, err error) {
+func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (writer Writer, err error) {
+	if size < 0 {
+		return nil, fmt.Errorf("negative size %d", size)
+	}
+
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
 	if store.closed {
-		return nil, ErrStoreClosed
+		return nil, ErrClosedStore
 	}
 
 	// Ceiling division: number of fragments needed to hold size logical bytes.
@@ -199,8 +233,8 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 				return nil, fmt.Errorf("get segment size: %w", err)
 			}
 
-			newSegSize := uint64(segSize) + fragCount*totalFragSize
-			if newSegSize >= maxSegSize {
+			newSegSize := uint64(segSize) + fragCount*totalFragSize //nolint:gosec // segSize from os.File.Stat().Size() is always non-negative.
+			if newSegSize >= store.maxSegSize {
 				if err := seg.markFull(); err != nil {
 					slog.Warn("failed to mark segment full",
 						"num", store.segNum,
@@ -208,10 +242,9 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 						"error", err,
 					)
 				}
-
 			}
 
-			if newSegSize > maxSegSize && segSize != segHeaderSize {
+			if newSegSize > store.maxSegSize && segSize != segHeaderSize {
 				return nil, fmt.Errorf("segment full")
 			}
 
@@ -235,27 +268,29 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 	}
 
 	// Pre-allocate the extent so writer WriteAt calls never extend the file.
-	if err := seg.file.Truncate(off + totalFragSize*int64(fragCount)); err != nil {
+	if err := seg.file.Truncate(off + totalFragSize*int64(fragCount)); err != nil { //nolint:gosec // fragCount bounded by non-negative int64 size.
 		return nil, fmt.Errorf("truncate segment %d: %w", store.segNum, err)
 	}
 
 	seg.refs.Add(1)
 
+	ext := extent{
+		SegNum: store.segNum,
+		Off:    off,
+		PSize:  int64(fragCount) * totalFragSize, //nolint:gosec // fragCount derived from non-negative int64 size.
+		LSize:  size,
+	}
+
 	writer = &shardWriter{
-		seg: seg,
-		ext: extent{
-			SegNum: store.segNum,
-			Off:    off,
-			PSize:  int64(fragCount) * totalFragSize,
-			LSize:  size,
-		},
+		seg:      seg,
+		ext:      ext,
 		shardNum: store.shardNum,
 		fragNum:  store.fragNum,
 		buf:      make([]byte, writeBufLen*totalFragSize),
 		bufPos:   0,
 
 		onClose: func() error {
-			encoded, err := writer.ext.encode()
+			encoded, err := ext.encode()
 			if err != nil {
 				return fmt.Errorf("encode extent: %w", err)
 			}
@@ -264,8 +299,6 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 			if err := store.index.Set(key, encoded); err != nil {
 				return fmt.Errorf("commit: %w", err)
 			}
-
-			seg.refs.Add(-1)
 
 			return nil
 		},
@@ -289,7 +322,7 @@ func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) error {
 	defer store.mutex.Unlock()
 
 	if store.closed {
-		return ErrStoreClosed
+		return ErrClosedStore
 	}
 
 	key := MakeShardKey(objectHash, shardIndex)
@@ -308,7 +341,7 @@ func (store *Store) Close() error {
 	defer store.mutex.Unlock()
 
 	if store.closed {
-		return ErrStoreClosed
+		return ErrClosedStore
 	}
 
 	store.closed = true

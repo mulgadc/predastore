@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -38,11 +39,11 @@ const (
 //	[24:28] flags     — fragFlags (flagEndOfShard marks the last fragment of a shard)
 //	[28:32] crc32     — IEEE CRC over the entire fragment with this field zeroed
 const (
-	segHeaderSize  = 14
-	fragHeaderSize = 32
-	fragBodySize   = 8 * KiB
-	totalFragSize  = fragHeaderSize + fragBodySize
-	maxSegSize     = 4 * GiB
+	segHeaderSize     = 14
+	fragHeaderSize    = 32
+	fragBodySize      = 8 * KiB
+	totalFragSize     = fragHeaderSize + fragBodySize
+	DefaultMaxSegSize = 4 * GiB
 )
 
 type segmentFlags uint32
@@ -51,10 +52,10 @@ const (
 	flagFull segmentFlags = 1 << iota
 )
 
-type shardFlags uint32
+type shardFlags uint32 //nolint:unused // reserved for tombstone support.
 
 const (
-	flagDeleted shardFlags = 1 << iota
+	flagDeleted shardFlags = 1 << iota //nolint:unused // reserved for tombstone support.
 )
 
 type fragFlags uint32
@@ -67,10 +68,28 @@ const (
 // counter tracks active readers and writers; Store.Close waits for all refs
 // to drain before closing the file descriptor.
 type segment struct {
-	file *os.File
+	file segmentFile
 	refs atomic.Int32
 
 	closed bool
+}
+
+// segmentFile is the subset of *os.File that segments depend on. Tests swap
+// openFile to substitute a fault-injecting wrapper.
+type segmentFile interface {
+	io.ReaderAt
+	io.WriterAt
+
+	Truncate(size int64) error
+	Sync() error
+	Stat() (os.FileInfo, error)
+	Close() error
+}
+
+// openFile is the package-level opener used by openSegment. Production code
+// uses os.OpenFile; tests override via export_test.go.
+var openFile = func(path string) (segmentFile, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 }
 
 // getSegment returns a cached segment or opens it from disk. Callers must hold
@@ -96,7 +115,7 @@ func (store *Store) getSegment(num uint64) (seg *segment, err error) {
 func openSegment(dir string, num uint64) (seg *segment, err error) {
 	path := filepath.Join(dir, fmt.Sprintf(segmentFilename, num))
 
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	file, err := openFile(path)
 	if err != nil {
 		return nil, err
 	}

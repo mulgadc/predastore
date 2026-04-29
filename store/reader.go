@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -20,14 +21,15 @@ type shardReader struct {
 	buf    []byte
 	bufPos int64
 
-	onClose func() error
-	closed  bool
+	closed bool
 }
+
+var ErrClosedReader = errors.New("closed reader")
 
 // Read implements io.Reader by delegating to ReadAt at the current position.
 func (r *shardReader) Read(p []byte) (int, error) {
 	if r.closed {
-		return 0, fmt.Errorf("shard reader closed")
+		return 0, ErrClosedReader
 	}
 
 	if r.bufPos >= r.ext.LSize {
@@ -47,6 +49,10 @@ func (r *shardReader) Read(p []byte) (int, error) {
 //
 // Each fragment is CRC-validated before payload extraction.
 func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
+	if r.closed {
+		return 0, ErrClosedReader
+	}
+
 	if off >= r.ext.LSize {
 		return 0, io.EOF
 	}
@@ -91,6 +97,10 @@ func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
 
 // WriteTo streams the full shard to w via io.SectionReader over ReadAt.
 func (r *shardReader) WriteTo(w io.Writer) (int64, error) {
+	if r.closed {
+		return 0, ErrClosedReader
+	}
+
 	return io.Copy(w, io.NewSectionReader(r, 0, r.ext.LSize))
 }
 
@@ -106,6 +116,7 @@ func (r *shardReader) Close() error {
 	}
 
 	r.closed = true
+	r.seg.refs.Add(-1)
 
-	return r.onClose()
+	return nil
 }

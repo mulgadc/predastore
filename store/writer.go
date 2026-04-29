@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -35,6 +36,8 @@ type shardWriter struct {
 	closed  bool
 }
 
+var ErrClosedWriter = errors.New("closed writer")
+
 // dataWritten derives logical bytes written from bufPos. Each complete fragment
 // contributes fragBodySize logical bytes; a partial fragment contributes
 // (bufPos % totalFragSize - fragHeaderSize) bytes once past the header.
@@ -47,7 +50,7 @@ func (w *shardWriter) dataWritten() int64 {
 // shard's logical capacity is reached.
 func (w *shardWriter) Write(p []byte) (total int, err error) {
 	if w.closed {
-		return 0, fmt.Errorf("shard writer closed")
+		return 0, ErrClosedWriter
 	}
 
 	for len(p) > 0 {
@@ -83,7 +86,7 @@ func (w *shardWriter) Write(p []byte) (total int, err error) {
 // fault — partial reads are flushed before the error propagates.
 func (w *shardWriter) ReadFrom(r io.Reader) (total int64, err error) {
 	if w.closed {
-		return 0, fmt.Errorf("shard writer closed")
+		return 0, ErrClosedWriter
 	}
 
 	for w.dataWritten() < w.ext.LSize {
@@ -115,20 +118,23 @@ func (w *shardWriter) ReadFrom(r io.Reader) (total int64, err error) {
 
 // Close flushes any remaining buffered data, syncs the segment file, then
 // commits the extent to the index via onClose. Must be called exactly once.
-func (w *shardWriter) Close() error {
+// The segment ref is always decremented on exit; the index commit only runs
+// when the data is fully durable, preserving rollback on flush/Sync failure.
+func (w *shardWriter) Close() (err error) {
 	if w.closed {
-		return fmt.Errorf("shard writer closed")
+		return ErrClosedWriter
 	}
 
 	w.closed = true
+	defer w.seg.refs.Add(-1)
 
 	if w.bufPos > w.extPos {
-		if err := w.flush(true); err != nil {
+		if err = w.flush(true); err != nil {
 			return err
 		}
 	}
 
-	if err := w.seg.file.Sync(); err != nil {
+	if err = w.seg.file.Sync(); err != nil {
 		return fmt.Errorf("sync segment %d: %w", w.ext.SegNum, err)
 	}
 
@@ -169,7 +175,7 @@ func (w *shardWriter) flush(final bool) error {
 			bodySize = bufUsed - pos - fragHeaderSize
 			clear(w.buf[pos+fragHeaderSize+bodySize : pos+totalFragSize])
 		}
-		binary.BigEndian.PutUint32(w.buf[pos+20:pos+24], uint32(bodySize))
+		binary.BigEndian.PutUint32(w.buf[pos+20:pos+24], uint32(bodySize)) //nolint:gosec // bodySize bounded by fragBodySize (8 KiB).
 
 		var flags fragFlags
 		if final && i == fragCount-1 {
