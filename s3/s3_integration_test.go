@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/quic/quicserver"
@@ -346,6 +347,11 @@ func TestGetObjectHeadIntegration(t *testing.T) {
 	req, err := http.NewRequest(http.MethodHead, S3_ENDPOINT+"/"+S3_BUCKET+"/test.txt", nil)
 	require.NoError(t, err, "Creating HEAD request should not error")
 
+	cfg := loadTestConfig(t)
+	timestamp := time.Now().UTC().Format("20060102T150405Z")
+	err = auth.GenerateAuthHeaderReq(cfg.Auth[0].AccessKeyID, cfg.Auth[0].SecretAccessKey, timestamp, cfg.Region, "s3", req)
+	require.NoError(t, err, "Generating SigV4 auth header should not error")
+
 	// Send request
 	resp, err := client.Do(req)
 	require.NoError(t, err, "HEAD request should not error")
@@ -392,6 +398,11 @@ func TestByteRangeRequests(t *testing.T) {
 
 	// Request first 10 bytes
 	req.Header.Set("Range", "bytes=0-9")
+
+	cfg := loadTestConfig(t)
+	timestamp := time.Now().UTC().Format("20060102T150405Z")
+	err = auth.GenerateAuthHeaderReq(cfg.Auth[0].AccessKeyID, cfg.Auth[0].SecretAccessKey, timestamp, cfg.Region, "s3", req)
+	require.NoError(t, err, "Generating SigV4 auth header should not error")
 
 	// Send request
 	resp, err := client.Do(req)
