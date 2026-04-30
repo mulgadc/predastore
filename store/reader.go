@@ -68,7 +68,7 @@ func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
 		bodyOffset := int(logicalPos % fragBodySize)
 
 		diskOff := r.ext.Off + fragIndex*totalFragSize
-		if _, err := r.seg.file.ReadAt(r.buf[:totalFragSize], diskOff); err != nil {
+		if _, err := r.seg.ReadAt(r.buf[:totalFragSize], diskOff); err != nil {
 			return totalCopied, fmt.Errorf("read segment %d at offset %d: %w", r.ext.SegNum, diskOff, err)
 		}
 

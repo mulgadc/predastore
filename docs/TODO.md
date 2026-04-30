@@ -77,7 +77,7 @@ write `globalState` metadata in a background goroutine. Removes the full
 ### Periodic fsync (deferred)
 
 Originally tracked as Stage 3 of the store rewrite. Bench data shows the
-per-close `seg.file.Sync()` costs ~9 ms median latency but is **not** the
+per-close `seg.Sync()` costs ~9 ms median latency but is **not** the
 throughput cap (removing it entirely tied throughput, while p99 latency
 got 4× worse from kernel writeback storms). A 200 ms periodic syncer
 would likely be a Pareto improvement on latency without hurting p99, but
@@ -85,7 +85,7 @@ the throughput payoff is small relative to the Raft items above. Reorder
 once those land.
 
 - Add a 200 ms ticker to `Store` that fsyncs dirty segments.
-- Drop `seg.file.Sync()` from `shardWriter.Close()`.
+- Drop `seg.Sync()` from `shardWriter.Close()`.
 - Final sync on `store.Close()`.
 
 ### Deletion tracking in Store

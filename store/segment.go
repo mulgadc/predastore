@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,7 +11,7 @@ import (
 	"sync/atomic"
 )
 
-const segmentFilename = "%016d.seg"
+const segFilename = "%016d.seg"
 
 var magic = [4]byte{'S', '3', 'S', 'F'}
 
@@ -64,19 +65,9 @@ const (
 	flagEndOfShard fragFlags = 1 << iota
 )
 
-// segment is an open segment file handle with a reference count. The refs
-// counter tracks active readers and writers; Store.Close waits for all refs
-// to drain before closing the file descriptor.
-type segment struct {
-	file segmentFile
-	refs atomic.Int32
-
-	closed bool
-}
-
-// segmentFile is the subset of *os.File that segments depend on. Tests swap
+// file is the subset of *os.File that segments depend on. Tests swap
 // openFile to substitute a fault-injecting wrapper.
-type segmentFile interface {
+type file interface {
 	io.ReaderAt
 	io.WriterAt
 
@@ -88,18 +79,27 @@ type segmentFile interface {
 
 // openFile is the package-level opener used by openSegment. Production code
 // uses os.OpenFile; tests override via export_test.go.
-var openFile = func(path string) (segmentFile, error) {
+var openFile = func(path string) (file, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+}
+
+// segment is an open segment file handle with a reference count. The refs
+// counter tracks active readers and writers; Store.Close waits for all refs
+// to drain before closing the file descriptor.
+type segment struct {
+	file
+
+	refs atomic.Int32
 }
 
 // getSegment returns a cached segment or opens it from disk. Callers must hold
 // store.mutex.
-func (store *Store) getSegment(num uint64) (seg *segment, err error) {
+func (store *Store) getSegment(num uint64) (*segment, error) {
 	if seg, ok := store.segCache[num]; ok {
 		return seg, nil
 	}
 
-	seg, err = openSegment(store.dir, num)
+	seg, err := openSegment(store.dir, num)
 	if err != nil {
 		return nil, err
 	}
@@ -109,20 +109,57 @@ func (store *Store) getSegment(num uint64) (seg *segment, err error) {
 	return seg, nil
 }
 
-// openSegment opens or creates a segment file. New files get a header written;
-// existing files have their magic bytes validated. The file is opened O_RDWR
-// (no O_APPEND) so WriteAt works at arbitrary offsets.
-func openSegment(dir string, num uint64) (seg *segment, err error) {
-	path := filepath.Join(dir, fmt.Sprintf(segmentFilename, num))
+func (store *Store) openNextSegment(attempts int, guard func(*segment) error) (seg *segment, err error) {
+	for attempt := range attempts {
+		seg, err = openSegment(store.dir, store.segNum)
+		if err == nil {
+			full, err := seg.isFull()
+			if err == nil {
+				if !full {
+					if err = guard(seg); err == nil {
+						return seg, err
+					}
+				}
 
-	file, err := openFile(path)
+				err = errors.New("segment full")
+			}
+
+			if err := seg.Close(); err != nil {
+				slog.Warn("failed to close segment",
+					"segNum", store.segNum,
+					"attempt", attempt,
+					"error", err,
+				)
+			}
+		}
+
+		if attempt == attempts-1 {
+			break
+		}
+
+		slog.Debug("rotating segment",
+			"segNum", store.segNum,
+			"attempt", attempt,
+			"error", err,
+		)
+
+		store.segNum += 1
+	}
+
+	return nil, fmt.Errorf("get segment after %d attempts: %w", attempts, err)
+}
+
+func openSegment(dir string, num uint64) (*segment, error) {
+	path := filepath.Join(dir, fmt.Sprintf(segFilename, num))
+
+	f, err := openFile(path)
 	if err != nil {
 		return nil, err
 	}
 
 	defer func() {
 		if err != nil {
-			if closeErr := file.Close(); closeErr != nil {
+			if closeErr := f.Close(); closeErr != nil {
 				slog.Warn("failed to close segment",
 					"segNum", num,
 					"error", closeErr,
@@ -131,7 +168,7 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 		}
 	}()
 
-	info, err := file.Stat()
+	info, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -145,14 +182,14 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 		binary.BigEndian.PutUint32(header[6:10], uint32(0))     // [6:10]  Flags
 		binary.BigEndian.PutUint32(header[10:segHeaderSize], 0) // [6:14]  Empty
 
-		if _, err = file.WriteAt(header, 0); err != nil {
+		if _, err = f.WriteAt(header, 0); err != nil {
 			return nil, fmt.Errorf("write header: %w", err)
 		}
 
 	// Existing file: validate segment header.
 	default:
 		header := make([]byte, segHeaderSize)
-		if _, err = file.ReadAt(header, 0); err != nil {
+		if _, err = f.ReadAt(header, 0); err != nil {
 			return nil, fmt.Errorf("read header: %w", err)
 		}
 
@@ -163,22 +200,13 @@ func openSegment(dir string, num uint64) (seg *segment, err error) {
 		}
 	}
 
-	seg = &segment{
-		file:   file,
-		closed: false,
-	}
-
-	return seg, nil
+	return &segment{file: f}, nil
 }
 
 // isFull reads the segment header flags and returns whether flagFull is set.
 func (seg *segment) isFull() (bool, error) {
-	if seg.closed {
-		return false, fmt.Errorf("segment closed")
-	}
-
 	buf := make([]byte, 4)
-	if _, err := seg.file.ReadAt(buf, 6); err != nil {
+	if _, err := seg.ReadAt(buf, 6); err != nil {
 		return false, err
 	}
 
@@ -190,34 +218,17 @@ func (seg *segment) isFull() (bool, error) {
 // markFull sets flagFull in the segment header. Once set, subsequent calls to
 // isFull return true and the store will roll to the next segment.
 func (seg *segment) markFull() error {
-	if seg.closed {
-		return fmt.Errorf("segment closed")
-	}
-
 	buf := make([]byte, 4)
-	if _, err := seg.file.ReadAt(buf, 6); err != nil {
+	if _, err := seg.ReadAt(buf, 6); err != nil {
 		return err
 	}
 
 	flags := segmentFlags(binary.BigEndian.Uint32(buf[:]))
 	binary.BigEndian.PutUint32(buf[:], uint32(flags|flagFull))
 
-	if _, err := seg.file.WriteAt(buf, 6); err != nil {
+	if _, err := seg.WriteAt(buf, 6); err != nil {
 		return err
 	}
 
 	return nil
-}
-
-func (seg *segment) Size() (int64, error) {
-	if seg.closed {
-		return 0, fmt.Errorf("segment closed")
-	}
-
-	info, err := seg.file.Stat()
-	if err != nil {
-		return 0, err
-	}
-
-	return info.Size(), nil
 }

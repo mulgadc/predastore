@@ -90,54 +90,8 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("open disk index: %w", err)
 	}
 
-	const maxAttempts = 100
-	for attempt := range maxAttempts {
-		seg, err := func() (*segment, error) {
-			seg, err := openSegment(store.dir, store.segNum)
-			if err != nil {
-				return nil, fmt.Errorf("open segment: %w", err)
-			}
-
-			defer func() {
-				if err != nil {
-					if closeErr := seg.file.Close(); closeErr != nil {
-						slog.Warn("failed to close segment",
-							"num", store.segNum,
-							"attempt", attempt,
-							"error", closeErr,
-						)
-					}
-				}
-			}()
-
-			full, err := seg.isFull()
-			if err != nil {
-				return nil, fmt.Errorf("check segment capacity: %w", err)
-			}
-
-			if full {
-				return nil, fmt.Errorf("segment full")
-			}
-
-			return seg, nil
-		}()
-
-		if err == nil {
-			store.segCache[store.segNum] = seg
-			break
-		}
-
-		if attempt == maxAttempts-1 {
-			return nil, fmt.Errorf("get segment after %d attempts: %w", maxAttempts, err)
-		}
-
-		slog.Debug("rotating segment",
-			"segNum", store.segNum,
-			"attempt", attempt,
-			"error", err,
-		)
-
-		store.segNum += 1
+	if _, err := store.openNextSegment(100, func(*segment) error { return nil }); err != nil {
+		return nil, err
 	}
 
 	if err := store.saveState(); err != nil {
@@ -211,64 +165,37 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 	// Ceiling division: number of fragments needed to hold size logical bytes.
 	fragCount := max(1, (uint64(size)+fragBodySize-1)/fragBodySize)
 
-	var seg *segment
 	var off int64
-
-	const maxAttempts = 100
-	for attempt := range maxAttempts {
-		if seg, err = func() (*segment, error) {
-			seg, err := store.getSegment(store.segNum)
-			if err != nil {
-				return nil, fmt.Errorf("get segment: %w", err)
-			}
-
-			if full, err := seg.isFull(); err != nil {
-				return nil, fmt.Errorf("check segment capacity: %w", err)
-			} else if full {
-				return nil, fmt.Errorf("segment full")
-			}
-
-			segSize, err := seg.Size()
-			if err != nil {
-				return nil, fmt.Errorf("get segment size: %w", err)
-			}
-
-			newSegSize := uint64(segSize) + fragCount*totalFragSize //nolint:gosec // segSize from os.File.Stat().Size() is always non-negative.
-			if newSegSize >= store.maxSegSize {
-				if err := seg.markFull(); err != nil {
-					slog.Warn("failed to mark segment full",
-						"num", store.segNum,
-						"attempt", attempt,
-						"error", err,
-					)
-				}
-			}
-
-			if newSegSize > store.maxSegSize && segSize != segHeaderSize {
-				return nil, fmt.Errorf("segment full")
-			}
-
-			off = segSize
-			return seg, nil
-		}(); err == nil {
-			break
+	seg, err := store.openNextSegment(100, func(seg *segment) error {
+		info, err := seg.Stat()
+		if err != nil {
+			return err
 		}
 
-		if attempt == maxAttempts-1 {
-			return nil, fmt.Errorf("get segment after %d attempts: %w", maxAttempts, err)
+		segSize := info.Size()
+		newSegSize := uint64(segSize) + fragCount*totalFragSize //nolint:gosec // segSize from os.File.Stat().Size() is always non-negative.
+		if newSegSize >= store.maxSegSize {
+			if err := seg.markFull(); err != nil {
+				slog.Warn("failed to mark segment full",
+					"num", store.segNum,
+					"error", err,
+				)
+			}
 		}
 
-		slog.Debug("rotating segment",
-			"segNum", store.segNum,
-			"attempt", attempt,
-			"error", err,
-		)
+		if newSegSize > store.maxSegSize && segSize != segHeaderSize {
+			return fmt.Errorf("segment full")
+		}
 
-		store.segNum += 1
+		off = segSize
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	// Pre-allocate the extent so writer WriteAt calls never extend the file.
-	if err := seg.file.Truncate(off + totalFragSize*int64(fragCount)); err != nil { //nolint:gosec // fragCount bounded by non-negative int64 size.
+	if err := seg.Truncate(off + totalFragSize*int64(fragCount)); err != nil { //nolint:gosec // fragCount bounded by non-negative int64 size.
 		return nil, fmt.Errorf("truncate segment %d: %w", store.segNum, err)
 	}
 
@@ -357,7 +284,7 @@ func (store *Store) Close() error {
 			runtime.Gosched()
 		}
 
-		if err := seg.file.Close(); err != nil {
+		if err := seg.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close segment %d: %w", num, err))
 		}
 	}

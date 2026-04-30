@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -45,40 +46,22 @@ func (w *shardWriter) dataWritten() int64 {
 	return w.bufPos/totalFragSize*fragBodySize + max(0, w.bufPos%totalFragSize-fragHeaderSize)
 }
 
-// Write copies data into the buffer, inserting fragment headers at each
-// totalFragSize boundary. Flushes to disk when the buffer is full or the
-// shard's logical capacity is reached.
-func (w *shardWriter) Write(p []byte) (total int, err error) {
-	if w.closed {
-		return 0, ErrClosedWriter
+// Write copies p into the shard via ReadFrom over a bytes.Reader, sharing the
+// header/flush loop. Returns "shard full" if p doesn't fit in the remaining
+// logical capacity; the trailing io.EOF from a fully-consumed reader is
+// swallowed.
+func (w *shardWriter) Write(p []byte) (int, error) {
+	r := bytes.NewReader(p)
+	n, err := w.ReadFrom(r)
+	if errors.Is(err, io.EOF) {
+		err = nil
 	}
 
-	for len(p) > 0 {
-		if w.dataWritten() >= w.ext.LSize {
-			return total, fmt.Errorf("shard full")
-		}
-
-		if w.bufPos%totalFragSize == 0 {
-			w.writeHeader()
-		}
-
-		bufPos := int(w.bufPos - w.extPos)
-		bodyLeft := int(totalFragSize - w.bufPos%totalFragSize)
-		dataLeft := int(w.ext.LSize - w.dataWritten())
-
-		n := copy(w.buf[bufPos:bufPos+min(bodyLeft, dataLeft)], p)
-		w.bufPos += int64(n)
-		total += n
-		p = p[n:]
-
-		if int(w.bufPos-w.extPos) >= len(w.buf) || w.dataWritten() >= w.ext.LSize {
-			if err := w.flush(w.dataWritten() >= w.ext.LSize); err != nil {
-				return total, err
-			}
-		}
+	if err == nil && r.Len() > 0 {
+		err = fmt.Errorf("shard full")
 	}
 
-	return total, nil
+	return int(n), err
 }
 
 // ReadFrom streams from r into the shard until dataSize is reached or r returns
@@ -134,7 +117,7 @@ func (w *shardWriter) Close() (err error) {
 		}
 	}
 
-	if err = w.seg.file.Sync(); err != nil {
+	if err = w.seg.Sync(); err != nil {
 		return fmt.Errorf("sync segment %d: %w", w.ext.SegNum, err)
 	}
 
@@ -188,7 +171,7 @@ func (w *shardWriter) flush(final bool) error {
 		binary.BigEndian.PutUint32(w.buf[pos+28:pos+32], crc32.ChecksumIEEE(w.buf[pos:pos+totalFragSize]))
 	}
 
-	if _, err := w.seg.file.WriteAt(w.buf[:writeLen], w.ext.Off+w.extPos); err != nil {
+	if _, err := w.seg.WriteAt(w.buf[:writeLen], w.ext.Off+w.extPos); err != nil {
 		return fmt.Errorf("write to segment %d at offset %d: %w", w.ext.SegNum, w.ext.Off+w.extPos, err)
 	}
 

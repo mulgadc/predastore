@@ -123,7 +123,7 @@ func (sm *faultSM) CorruptByte(t *rapid.T) {
 // relaxed: divergent error returns are tolerated, but the strict no-corruption
 // invariant remains — when both stores succeed, sizes and bytes must match.
 func TestStoreFaults(t *testing.T) {
-	defer store.SetOpenFile(func(path string) (store.SegmentFile, error) {
+	defer store.SetOpenFile(func(path string) (store.File, error) {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 		if err != nil {
 			return nil, err
