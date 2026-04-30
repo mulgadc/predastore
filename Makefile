@@ -24,6 +24,10 @@ certs:
 		-addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:10.11.12.1,IP:10.11.12.2,IP:10.11.12.3,IP:10.11.12.4,IP:10.11.12.5,IP:10.11.12.6,IP:10.11.12.7'
 
 build: certs
+	$(MAKE) go_build
+
+# GO commands
+go_build:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
 	go build -ldflags "-s -w" -o ./bin/s3d cmd/s3d/main.go
 
@@ -36,7 +40,7 @@ go_build_docker:
 
 # Preflight — runs the same checks as GitHub Actions (lint + security + tests).
 # Use this before committing to catch CI failures locally.
-preflight: certs
+preflight:
 	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage test-race
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
@@ -94,6 +98,6 @@ fix:
 govulncheck:
 	go tool govulncheck ./...
 
-.PHONY: build certs go_build_docker preflight test test-cover test-race diff-coverage \
+.PHONY: certs build go_build go_build_docker preflight test test-cover test-race diff-coverage \
 	docker_s3d docker_compose_up docker_compose_down docker docker_clean docker_test \
 	clean lint fix govulncheck

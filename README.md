@@ -37,7 +37,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture reference, including the da
 - **Reed-Solomon erasure coding** — objects are split into data + parity shards (configurable, e.g. RS(3,2) tolerates loss of any 2 nodes). No full replication overhead.
 - **Raft consensus for metadata** — bucket and object metadata is strongly consistent across the cluster. Reads can go to any node; writes go through the leader.
 - **QUIC transport** — node-to-node shard I/O uses QUIC over UDP with connection pooling. A single long-lived connection per node pair carries multiplexed streams, so shard writes cost only a stream ID allocation, not a TLS handshake.
-- **Append-only segments** — each shard node writes data to large append-only segment files. A shard occupies a contiguous extent within one segment, allocated up-front via `Truncate`; subsequent fragment writes are lock-free `WriteAt` calls. A per-node BadgerDB index maps shard keys to extents.
+- **Append-only segments** — each shard node writes data to large append-only segment files. A shard occupies a contiguous extent within one segment, pre-allocated to enable lock-free writing to disk. A per-node BadgerDB index maps shard keys to extents.
 - **Consistent hash ring** — shard placement is deterministic via a hash ring with virtual nodes. Adding nodes bumps a ring epoch; old objects stay on the old epoch, new writes use the new one.
 - **Single binary** — `./bin/s3d` runs one cluster node (S3 API server + Raft database + QUIC shard node). A cluster is N `s3d` processes pointed at the same config; `./scripts/start.sh` launches all of them locally on loopback aliases for development.
 
@@ -88,13 +88,13 @@ node in isolation):
 
 ```bash
 ./bin/s3d \
-  -config config/3node.toml \
-  -node 1 \
-  -host 10.11.12.1 \
-  -port 8443 \
-  -base-path /tmp/predastore/3node \
-  -tls-key /tmp/predastore/3node/server.key \
-  -tls-cert /tmp/predastore/3node/server.pem
+  --config config/3node.toml \
+  --node 1 \
+  --host 10.11.12.1 \
+  --port 8443 \
+  --base-path /tmp/predastore/3node \
+  --tls-key /tmp/predastore/3node/server.key \
+  --tls-cert /tmp/predastore/3node/server.pem
 ```
 
 ### Configuration
@@ -121,16 +121,16 @@ make certs              # Generate certs/server.{pem,key}
 
 ```bash
 # Create a bucket
-aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 mb s3://my-bucket
+aws --endpoint-url https://10.11.12.1:8443/ s3 mb s3://my-bucket
 
 # Upload a file
-aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 cp ./file.txt s3://my-bucket/
+aws --endpoint-url https://10.11.12.1:8443/ s3 cp ./file.txt s3://my-bucket/
 
 # List bucket contents
-aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 ls s3://my-bucket/
+aws --endpoint-url https://10.11.12.1:8443/ s3 ls s3://my-bucket/
 
 # Download a file
-aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 cp s3://my-bucket/file.txt ./downloaded.txt
+aws --endpoint-url https://10.11.12.1:8443/ s3 cp s3://my-bucket/file.txt ./downloaded.txt
 ```
 
 ## Storage Backend
