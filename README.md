@@ -39,7 +39,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture reference, including the da
 - **QUIC transport** — node-to-node shard I/O uses QUIC over UDP with connection pooling. A single long-lived connection per node pair carries multiplexed streams, so shard writes cost only a stream ID allocation, not a TLS handshake.
 - **Append-only segments** — each shard node writes data to large append-only segment files. A shard occupies a contiguous extent within one segment, allocated up-front via `Truncate`; subsequent fragment writes are lock-free `WriteAt` calls. A per-node BadgerDB index maps shard keys to extents.
 - **Consistent hash ring** — shard placement is deterministic via a hash ring with virtual nodes. Adding nodes bumps a ring epoch; old objects stay on the old epoch, new writes use the new one.
-- **Single binary** — `s3d` runs the S3 API server, database nodes, and QUIC shard nodes. In development mode everything runs in one process; in production each component can run separately.
+- **Single binary** — `./bin/s3d` runs one cluster node (S3 API server + Raft database + QUIC shard node). A cluster is N `s3d` processes pointed at the same config; `./scripts/start.sh` launches all of them locally on loopback aliases for development.
 
 ## S3 API Compatibility
 
@@ -54,26 +54,62 @@ Predastore implements key S3 operations compatible with AWS CLI, SDKs, and exist
 
 ## Quick Start
 
-### Build and Run
+### Build
 
 ```bash
-make build
-./bin/s3d
+make build              # builds ./bin/s3d (also generates dev TLS certs)
 ```
 
-This starts a development cluster (all nodes on loopback) on `https://localhost:8443`.
+### Run a Dev Cluster
+
+The `./scripts/` directory contains helpers for running a multi-node cluster
+locally on loopback IP aliases — the recommended way to exercise the
+distributed code paths in development:
+
+```bash
+./scripts/start.sh 3node        # launch a 3-node cluster
+./scripts/start.sh -w 5node     # launch a 5-node cluster, wait until ready
+./scripts/stop.sh               # stop all running clusters
+./scripts/clean.sh              # stop and wipe cluster data
+./scripts/bench.sh 3node        # run warp benchmark against a cluster
+./scripts/bench.sh disk         # run raw-disk fio benchmark
+```
+
+Cluster runtime data (logs, PID files, segment files, BadgerDB indexes) lives
+under `$PREDA_DIR` (default `/tmp/predastore/<clustername>/`). The start script
+sets up loopback IP aliases (requires `sudo`) and generates TLS certs on first
+run.
+
+### Run a Single Node
+
+`./bin/s3d` is a single-node process — for running one node of a cluster
+directly (e.g. on a dedicated host in production, or for inspecting one
+node in isolation):
+
+```bash
+./bin/s3d \
+  -config config/3node.toml \
+  -node 1 \
+  -host 10.11.12.1 \
+  -port 8443 \
+  -base-path /tmp/predastore/3node \
+  -tls-key /tmp/predastore/3node/server.key \
+  -tls-cert /tmp/predastore/3node/server.pem
+```
 
 ### Configuration
 
-Cluster configurations live under `clusters/`. Each cluster directory contains a
-`cluster.toml` and co-located `data/` and `logs/` directories:
+Cluster configurations live under `config/` as TOML files, one per topology:
 
 ```
-clusters/
-  3node/cluster.toml    # 3 db + 3 storage nodes
-  5node/cluster.toml    # 5 db + 5 storage nodes
-  7node/cluster.toml    # 7 db + 7 storage nodes
+config/
+  3node.toml    # 3 db + 3 storage nodes
+  5node.toml    # 5 db + 5 storage nodes
+  7node.toml    # 7 db + 7 storage nodes
 ```
+
+Each config defines `[[db]]` and `[[storage]]` sections specifying node IDs,
+hosts, ports, and Reed-Solomon parameters.
 
 TLS certificates are generated on first build:
 
@@ -99,16 +135,11 @@ aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 cp s3://my-bucket/
 
 ## Storage Backend
 
-Distributed storage with erasure coding, Raft-consensus metadata, and QUIC transport:
+Distributed storage with erasure coding, Raft-consensus metadata, and QUIC transport.
+The simplest way to bring up a cluster locally:
 
 ```bash
-# Launch a 3-node cluster on loopback aliases (requires sudo for IP setup)
-./scripts/launch-cluster.sh
-
-# Or run individual nodes
-./bin/s3d -config clusters/3node/cluster.toml -node 1 -base-path clusters/3node
-./bin/s3d -config clusters/3node/cluster.toml -node 2 -base-path clusters/3node
-./bin/s3d -config clusters/3node/cluster.toml -node 3 -base-path clusters/3node
+./scripts/start.sh -w 3node     # 3-node cluster on loopback aliases
 ```
 
 The distributed backend's data model:
