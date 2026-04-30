@@ -22,7 +22,10 @@ Thumbs.db
 
 # Test reports
 *-report.txt
-s3/testdata/test-*
+# Generated at test runtime
+s3/testdata/test-bucket01/multipart_test.bin
+s3/testdata/test-bucket01/new_test_file.txt
+s3/testdata/test-bucket01/sample/
 s3/testdata/local/*
 store/testdata/*
 
