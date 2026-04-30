@@ -249,15 +249,23 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				tt.setupHeaders(req)
 			}
 
-			// Perform request
-			rr := httptest.NewRecorder()
-			server.GetHandler().ServeHTTP(rr, req)
+			// Wrap a stub next handler so we exercise only the auth middleware
+			// and never reach the routed S3 handlers (which need a backend).
+			nextCalled := false
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nextCalled = true
+				w.WriteHeader(http.StatusOK)
+			})
 
-			// Check status code
+			rr := httptest.NewRecorder()
+			server.sigV4AuthMiddleware(next).ServeHTTP(rr, req)
+
 			if tt.expectStatus == -1 {
-				// Sentinel: valid auth should pass through the middleware (not 403)
-				assert.NotEqual(t, http.StatusForbidden, rr.Code, "Valid signature should not be rejected by auth middleware")
+				// Sentinel: valid auth should pass through to next.
+				assert.True(t, nextCalled, "Valid signature should pass through to next handler")
+				assert.Equal(t, http.StatusOK, rr.Code)
 			} else {
+				assert.False(t, nextCalled, "Failing auth must not invoke next handler")
 				assert.Equal(t, tt.expectStatus, rr.Code)
 			}
 		})
