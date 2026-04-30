@@ -8,7 +8,7 @@ import (
 	"io"
 )
 
-const readBufLen = 1
+const readBufLen = 32
 
 // shardReader provides random and sequential access to a single shard's data.
 // It reads one fragment at a time from disk, validates CRC, and copies the

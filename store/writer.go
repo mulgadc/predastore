@@ -9,7 +9,7 @@ import (
 	"io"
 )
 
-const writeBufLen = 1
+const writeBufLen = 32
 
 // shardWriter writes a single shard as a contiguous sequence of fragments.
 // The internal buffer is sized writeBufLen*totalFragSize and mirrors the on-disk
@@ -51,6 +51,10 @@ func (w *shardWriter) dataWritten() int64 {
 // logical capacity; the trailing io.EOF from a fully-consumed reader is
 // swallowed.
 func (w *shardWriter) Write(p []byte) (int, error) {
+	if w.closed {
+		return 0, ErrClosedWriter
+	}
+
 	r := bytes.NewReader(p)
 	n, err := w.ReadFrom(r)
 	if errors.Is(err, io.EOF) {

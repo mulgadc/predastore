@@ -90,7 +90,8 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("open disk index: %w", err)
 	}
 
-	if _, err := store.openNextSegment(100, func(*segment) error { return nil }); err != nil {
+	_, err = store.getNextSegment(100, func(*segment) error { return nil })
+	if err != nil {
 		return nil, err
 	}
 
@@ -166,7 +167,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 	fragCount := max(1, (uint64(size)+fragBodySize-1)/fragBodySize)
 
 	var off int64
-	seg, err := store.openNextSegment(100, func(seg *segment) error {
+	seg, err := store.getNextSegment(100, func(seg *segment) error {
 		info, err := seg.Stat()
 		if err != nil {
 			return err
@@ -217,13 +218,8 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		bufPos:   0,
 
 		onClose: func() error {
-			encoded, err := ext.encode()
-			if err != nil {
-				return fmt.Errorf("encode extent: %w", err)
-			}
-
 			key := MakeShardKey(objectHash, shardIndex)
-			if err := store.index.Set(key, encoded); err != nil {
+			if err := store.index.Set(key, ext.encode()); err != nil {
 				return fmt.Errorf("commit: %w", err)
 			}
 

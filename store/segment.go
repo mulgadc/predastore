@@ -109,41 +109,43 @@ func (store *Store) getSegment(num uint64) (*segment, error) {
 	return seg, nil
 }
 
-func (store *Store) openNextSegment(attempts int, guard func(*segment) error) (seg *segment, err error) {
+func (store *Store) getNextSegment(attempts int, guard func(*segment) error) (seg *segment, err error) {
 	for attempt := range attempts {
-		seg, err = openSegment(store.dir, store.segNum)
-		if err == nil {
+		seg, err = func() (*segment, error) {
+			seg, err := store.getSegment(store.segNum)
+			if err != nil {
+				return nil, err
+			}
+
 			full, err := seg.isFull()
-			if err == nil {
-				if !full {
-					if err = guard(seg); err == nil {
-						return seg, err
-					}
-				}
-
-				err = errors.New("segment full")
+			if err != nil {
+				return nil, err
+			} else if full {
+				return nil, errors.New("segment full")
 			}
 
-			if err := seg.Close(); err != nil {
-				slog.Warn("failed to close segment",
-					"segNum", store.segNum,
-					"attempt", attempt,
-					"error", err,
-				)
+			err = guard(seg)
+			if err != nil {
+				return nil, err
 			}
+
+			return seg, nil
+		}()
+
+		if err == nil {
+			return seg, nil
 		}
 
-		if attempt == attempts-1 {
-			break
+		if attempt < attempts-1 {
+			slog.Debug("rotating segment",
+				"segNum", store.segNum,
+				"attempt", attempt,
+				"error", err,
+			)
+
+			store.segNum += 1
+			continue
 		}
-
-		slog.Debug("rotating segment",
-			"segNum", store.segNum,
-			"attempt", attempt,
-			"error", err,
-		)
-
-		store.segNum += 1
 	}
 
 	return nil, fmt.Errorf("get segment after %d attempts: %w", attempts, err)
