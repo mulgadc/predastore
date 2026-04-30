@@ -17,9 +17,10 @@ const (
 )
 
 // readBody randomizes between io.ReadAll and WriteTo so both reader paths
-// get exercised under property tests.
-func readBody(t *rapid.T, refR, realR store.Reader) (refBody, realBody []byte, refErr, realErr error) {
-	if rapid.Bool().Draw(t, "useWriteTo") {
+// get exercised under property tests. tag is included in the rapid Draw
+// label so failure traces show which call site produced the choice.
+func readBody(t *rapid.T, tag string, refR, realR store.Reader) (refBody, realBody []byte, refErr, realErr error) {
+	if rapid.Bool().Draw(t, tag+"/useWriteTo") {
 		var refBuf, realBuf bytes.Buffer
 		_, refErr = refR.WriteTo(&refBuf)
 		_, realErr = realR.WriteTo(&realBuf)
@@ -57,6 +58,28 @@ func newBaseSM(dir string, refSt *storetest.RefStore, realSt *store.Store, stric
 	}
 }
 
+func (sm *baseSM) drawKey(t *rapid.T, tag string) [36]byte {
+	if sm.Ref.Len() > 0 && rapid.Bool().Draw(t, tag+"/useExisting") {
+		return rapid.SampledFrom(sm.Ref.Keys()).Draw(t, tag+"/existingKey")
+	}
+
+	return [36]byte(store.MakeShardKey(
+		[32]byte(rapid.SliceOfN(rapid.Byte(), 32, 32).Draw(t, tag+"/objectHash")),
+		rapid.Uint32().Draw(t, tag+"/shardIndex"),
+	))
+}
+
+func (sm *baseSM) drawBody(t *rapid.T, tag string) []byte {
+	return rapid.OneOf(
+		rapid.SliceOfN(rapid.Byte(), 0, 0),
+		rapid.SliceOfN(rapid.Byte(), 1, 1),
+		rapid.SliceOfN(rapid.Byte(), pbtFragBodySize, pbtFragBodySize),
+		rapid.SliceOfN(rapid.Byte(), pbtFragBodySize+1, pbtFragBodySize+1),
+		rapid.SliceOfN(rapid.Byte(), 2*pbtFragBodySize, 2*pbtFragBodySize),
+		rapid.SliceOfN(rapid.Byte(), 0, pbtMaxShardSize),
+	).Draw(t, tag+"/body")
+}
+
 func (sm *baseSM) Open(t *rapid.T) {
 	if !sm.Ref.IsClosed() {
 		t.Skip("already open")
@@ -65,8 +88,9 @@ func (sm *baseSM) Open(t *rapid.T) {
 	realSt, err := store.Open(sm.Dir)
 	if err != nil {
 		if sm.Strict() {
-			t.Fatalf("open: %v", err)
+			t.Fatalf("open: real=%v", err)
 		}
+
 		t.Skip("real open failed under fault")
 	}
 
@@ -78,34 +102,96 @@ func (sm *baseSM) Close(t *rapid.T) {
 	refErr := sm.Ref.Close()
 	realErr := sm.Real.Close()
 	if sm.Strict() && !errors.Is(realErr, refErr) {
-		t.Fatalf("close: expected %v, got %v", refErr, realErr)
+		t.Fatalf("close: ref=%v real=%v", refErr, realErr)
 	}
-}
-
-func (sm *baseSM) drawKey(t *rapid.T) [36]byte {
-	if sm.Ref.Len() > 0 && rapid.Bool().Draw(t, "useExisting") {
-		return rapid.SampledFrom(sm.Ref.Keys()).Draw(t, "existingKey")
-	}
-
-	return [36]byte(store.MakeShardKey(
-		[32]byte(rapid.SliceOfN(rapid.Byte(), 32, 32).Draw(t, "objectHash")),
-		rapid.Uint32().Draw(t, "shardIndex"),
-	))
-}
-
-func (sm *baseSM) drawBody(t *rapid.T) []byte {
-	return rapid.OneOf(
-		rapid.SliceOfN(rapid.Byte(), 0, 0),
-		rapid.SliceOfN(rapid.Byte(), 1, 1),
-		rapid.SliceOfN(rapid.Byte(), pbtFragBodySize, pbtFragBodySize),
-		rapid.SliceOfN(rapid.Byte(), pbtFragBodySize+1, pbtFragBodySize+1),
-		rapid.SliceOfN(rapid.Byte(), 2*pbtFragBodySize, 2*pbtFragBodySize),
-		rapid.SliceOfN(rapid.Byte(), 0, pbtMaxShardSize),
-	).Draw(t, "shardBody")
 }
 
 func (sm *baseSM) Lookup(t *rapid.T) {
-	key := sm.drawKey(t)
+	key := sm.drawKey(t, "lookup")
+	sm.checkKey(t, "lookup", key)
+}
+
+func (sm *baseSM) Append(t *rapid.T) {
+	key := sm.drawKey(t, "append")
+	objectHash := [32]byte(key[:32])
+	shardIndex := binary.BigEndian.Uint32(key[32:])
+	body := sm.drawBody(t, "append")
+
+	refW, refErr := sm.Ref.Append(objectHash, shardIndex, int64(len(body)))
+	realW, realErr := sm.Real.Append(objectHash, shardIndex, int64(len(body)))
+	defer func() {
+		if refW != nil {
+			refW.Close()
+		}
+		if realW != nil {
+			realW.Close()
+		}
+	}()
+
+	if refErr != nil || realErr != nil {
+		if sm.Strict() && !errors.Is(realErr, refErr) {
+			t.Fatalf("append: ref=%v real=%v", refErr, realErr)
+		}
+
+		return
+	}
+
+	if rapid.Bool().Draw(t, "append/useReadFrom") {
+		refN, refErr := refW.ReadFrom(bytes.NewReader(body))
+		realN, realErr := realW.ReadFrom(bytes.NewReader(body))
+		if sm.Strict() && !errors.Is(realErr, refErr) {
+			t.Fatalf("append readfrom: ref=%v real=%v", refErr, realErr)
+		}
+		if sm.Strict() && refN != realN {
+			t.Fatalf("append readfrom count: ref=%d real=%d", refN, realN)
+		}
+	} else {
+		refN, refErr := refW.Write(body)
+		realN, realErr := realW.Write(body)
+		if sm.Strict() && !errors.Is(realErr, refErr) {
+			t.Fatalf("append write: ref=%v real=%v", refErr, realErr)
+		}
+		if sm.Strict() && refN != realN {
+			t.Fatalf("append write count: ref=%d real=%d", refN, realN)
+		}
+	}
+
+	// Lookup before commit: writer.Close hasn't run yet, so neither store
+	// should have committed the new extent.
+	sm.checkKey(t, "append/precommit", key)
+
+	refErr = refW.Close()
+	realErr = realW.Close()
+	if sm.Strict() && !errors.Is(realErr, refErr) {
+		t.Fatalf("append writerclose: ref=%v real=%v", refErr, realErr)
+	}
+}
+
+func (sm *baseSM) Delete(t *rapid.T) {
+	key := sm.drawKey(t, "delete")
+	objectHash := [32]byte(key[:32])
+	shardIndex := binary.BigEndian.Uint32(key[32:])
+
+	refErr := sm.Ref.Delete(objectHash, shardIndex)
+	realErr := sm.Real.Delete(objectHash, shardIndex)
+	if sm.Strict() && !errors.Is(realErr, refErr) {
+		t.Fatalf("delete: ref=%v real=%v", refErr, realErr)
+	}
+}
+
+// Check is the invariant: every key present in the reference must read back
+// identical bytes from the real store. Under relaxed mode (post-fault),
+// per-key divergence is tolerated.
+func (sm *baseSM) Check(t *rapid.T) {
+	for _, key := range sm.Ref.Keys() {
+		sm.checkKey(t, "check", key)
+	}
+}
+
+// checkKey verifies one shard's ref/real conformance. tag is included in the
+// failure messages and rapid Draw labels so traces show which call site (the
+// Check invariant scan, or Append's pre-commit lookup) hit the failure.
+func (sm *baseSM) checkKey(t *rapid.T, tag string, key [36]byte) {
 	objectHash := [32]byte(key[:32])
 	shardIndex := binary.BigEndian.Uint32(key[32:])
 
@@ -122,151 +208,26 @@ func (sm *baseSM) Lookup(t *rapid.T) {
 
 	if refErr != nil || realErr != nil {
 		if sm.Strict() && !errors.Is(realErr, refErr) {
-			t.Fatalf("lookup: expected %v, got %v", refErr, realErr)
+			t.Fatalf("%s lookup: ref=%v real=%v", tag, refErr, realErr)
 		}
+
 		return
 	}
 
 	if sm.Strict() && refR.Size() != realR.Size() {
-		t.Fatalf("size mismatch: ref=%d real=%d", refR.Size(), realR.Size())
+		t.Fatalf("%s size: ref=%d real=%d", tag, refR.Size(), realR.Size())
 	}
 
-	refBody, realBody, refErr, realErr := readBody(t, refR, realR)
-	if realErr != nil {
-		if sm.Strict() {
-			t.Fatalf("read body real: %v", realErr)
-		}
-		return
-	}
-	if refErr != nil {
-		t.Fatalf("read body ref: %v", refErr)
-	}
-
-	if !bytes.Equal(refBody, realBody) {
-		t.Fatalf("data corruption: ref=%d bytes, real=%d bytes", len(refBody), len(realBody))
-	}
-}
-
-func (sm *baseSM) Append(t *rapid.T) {
-	key := sm.drawKey(t)
-	objectHash := [32]byte(key[:32])
-	shardIndex := binary.BigEndian.Uint32(key[32:])
-	body := sm.drawBody(t)
-
-	refW, refErr := sm.Ref.Append(objectHash, shardIndex, int64(len(body)))
-	realW, realErr := sm.Real.Append(objectHash, shardIndex, int64(len(body)))
+	refBody, realBody, refErr, realErr := readBody(t, tag, refR, realR)
 	if refErr != nil || realErr != nil {
 		if sm.Strict() && !errors.Is(realErr, refErr) {
-			t.Fatalf("append: expected %v, got %v", refErr, realErr)
+			t.Fatalf("%s read: ref=%v real=%v", tag, refErr, realErr)
 		}
-		if refW != nil {
-			refW.Close()
-		}
-		if realW != nil {
-			realW.Close()
-		}
+
 		return
 	}
 
-	if rapid.Bool().Draw(t, "useReadFrom") {
-		refN, refErr := refW.ReadFrom(bytes.NewReader(body))
-		realN, realErr := realW.ReadFrom(bytes.NewReader(body))
-		if sm.Strict() && !errors.Is(realErr, refErr) {
-			t.Fatalf("read from body: expected %v, got %v", refErr, realErr)
-		}
-		if sm.Strict() && refN != realN {
-			t.Fatalf("read from mismatch: expected %d bytes, got %d bytes", refN, realN)
-		}
-	} else {
-		refN, refErr := refW.Write(body)
-		realN, realErr := realW.Write(body)
-		if sm.Strict() && !errors.Is(realErr, refErr) {
-			t.Fatalf("write body: expected %v, got %v", refErr, realErr)
-		}
-		if sm.Strict() && refN != realN {
-			t.Fatalf("write mismatch: expected %d bytes, got %d bytes", refN, realN)
-		}
-	}
-
-	// Lookup before commit: writer.Close hasn't run yet, so neither store
-	// should have committed the new extent.
-	preR, preRefErr := sm.Ref.Lookup(objectHash, shardIndex)
-	preRealR, preRealErr := sm.Real.Lookup(objectHash, shardIndex)
-	if preR != nil {
-		preR.Close()
-	}
-	if preRealR != nil {
-		preRealR.Close()
-	}
-	if sm.Strict() && !errors.Is(preRealErr, preRefErr) {
-		t.Fatalf("lookup before commit: expected %v, got %v", preRefErr, preRealErr)
-	}
-
-	refErr = refW.Close()
-	realErr = realW.Close()
-	if sm.Strict() && !errors.Is(realErr, refErr) {
-		t.Fatalf("close writer: expected %v, got %v", refErr, realErr)
-	}
-}
-
-func (sm *baseSM) Delete(t *rapid.T) {
-	key := sm.drawKey(t)
-	objectHash := [32]byte(key[:32])
-	shardIndex := binary.BigEndian.Uint32(key[32:])
-
-	refErr := sm.Ref.Delete(objectHash, shardIndex)
-	realErr := sm.Real.Delete(objectHash, shardIndex)
-	if sm.Strict() && !errors.Is(realErr, refErr) {
-		t.Fatalf("delete: expected %v, got %v", refErr, realErr)
-	}
-}
-
-// Check is the invariant: every key present in the reference must read back
-// identical bytes from the real store. Under relaxed mode (post-fault),
-// per-key divergence is tolerated.
-func (sm *baseSM) Check(t *rapid.T) {
-	for _, key := range sm.Ref.Keys() {
-		objectHash := [32]byte(key[:32])
-		shardIndex := binary.BigEndian.Uint32(key[32:])
-
-		refR, refErr := sm.Ref.Lookup(objectHash, shardIndex)
-		realR, realErr := sm.Real.Lookup(objectHash, shardIndex)
-
-		if refErr != nil || realErr != nil {
-			if refR != nil {
-				refR.Close()
-			}
-			if realR != nil {
-				realR.Close()
-			}
-			if sm.Strict() && !errors.Is(realErr, refErr) {
-				t.Fatalf("invariant lookup: expected %v, got %v", refErr, realErr)
-			}
-			continue
-		}
-
-		if refR.Size() != realR.Size() {
-			refR.Close()
-			realR.Close()
-			t.Fatalf("invariant size: ref=%d real=%d", refR.Size(), realR.Size())
-		}
-
-		refBody, realBody, refErr, realErr := readBody(t, refR, realR)
-		refR.Close()
-		realR.Close()
-
-		if realErr != nil {
-			if sm.Strict() {
-				t.Fatalf("invariant read real: %v", realErr)
-			}
-			continue
-		}
-		if refErr != nil {
-			t.Fatalf("invariant read ref: %v", refErr)
-		}
-
-		if !bytes.Equal(refBody, realBody) {
-			t.Fatalf("invariant corruption: ref=%d bytes, real=%d bytes", len(refBody), len(realBody))
-		}
+	if sm.Strict() && !bytes.Equal(refBody, realBody) {
+		t.Fatalf("%s body: ref=%d bytes real=%d bytes", tag, len(refBody), len(realBody))
 	}
 }

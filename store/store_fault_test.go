@@ -21,7 +21,7 @@ type faultState struct {
 	failNextReadAt  bool
 	failNextSync    bool
 	failNextTrunc   bool
-	triggered       bool
+	failed          bool
 }
 
 var state faultState
@@ -31,7 +31,7 @@ type faultFile struct{ *os.File }
 func (f *faultFile) WriteAt(p []byte, off int64) (int, error) {
 	if state.failNextWriteAt {
 		state.failNextWriteAt = false
-		state.triggered = true
+		state.failed = true
 
 		return 0, errInjected
 	}
@@ -42,7 +42,7 @@ func (f *faultFile) WriteAt(p []byte, off int64) (int, error) {
 func (f *faultFile) ReadAt(p []byte, off int64) (int, error) {
 	if state.failNextReadAt {
 		state.failNextReadAt = false
-		state.triggered = true
+		state.failed = true
 
 		return 0, errInjected
 	}
@@ -53,7 +53,7 @@ func (f *faultFile) ReadAt(p []byte, off int64) (int, error) {
 func (f *faultFile) Sync() error {
 	if state.failNextSync {
 		state.failNextSync = false
-		state.triggered = true
+		state.failed = true
 
 		return errInjected
 	}
@@ -64,7 +64,7 @@ func (f *faultFile) Sync() error {
 func (f *faultFile) Truncate(size int64) error {
 	if state.failNextTrunc {
 		state.failNextTrunc = false
-		state.triggered = true
+		state.failed = true
 
 		return errInjected
 	}
@@ -114,7 +114,7 @@ func (sm *faultSM) CorruptByte(t *rapid.T) {
 		return
 	}
 
-	state.triggered = true
+	state.failed = true
 }
 
 // TestStoreFaults runs the same operation alphabet as TestStore but interleaves
@@ -150,7 +150,7 @@ func TestStoreFaults(t *testing.T) {
 		}
 
 		sm := &faultSM{
-			baseSM: newBaseSM(dir, refSt, realSt, func() bool { return !state.triggered }),
+			baseSM: newBaseSM(dir, refSt, realSt, func() bool { return !state.failed }),
 		}
 
 		defer func() {
