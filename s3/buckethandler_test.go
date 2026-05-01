@@ -3,94 +3,93 @@ package s3
 import (
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func setupBucketHandlerServer(t *testing.T) *TestBackend {
-	t.Helper()
-	s3 := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := s3.ReadConfig()
-	require.NoError(t, err)
-
-	be := s3.createFilesystemBackend()
-	server := NewHTTP2ServerWithBackend(s3, be, NewConfigProvider(s3.Auth))
-	return &TestBackend{
-		Config:  s3,
-		Server:  server,
-		Handler: server.GetHandler(),
-		Backend: be,
-		Cleanup: func() { be.Close() },
-	}
-}
-
 func TestCreateBucket_Handler(t *testing.T) {
-	tb := setupBucketHandlerServer(t)
+	tb := setupDistributedBackend(t)
 	defer tb.Cleanup()
 
-	// Filesystem backend doesn't support creating buckets, should return error
 	req := httptest.NewRequest(http.MethodPut, "/new-test-bucket", nil)
-	rr := httptest.NewRecorder()
-	tb.Handler.ServeHTTP(rr, req)
-
-	// Should get an error (AccessDenied for filesystem backend)
-	assert.NotEqual(t, http.StatusOK, rr.Code)
-}
-
-func TestHeadBucket_Handler(t *testing.T) {
-	tb := setupBucketHandlerServer(t)
-	defer tb.Cleanup()
-
-	// Head an existing bucket
-	req := httptest.NewRequest(http.MethodHead, "/test-bucket01", nil)
+	if len(tb.Config.Auth) > 0 {
+		authEntry := tb.Config.Auth[0]
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		require.NoError(t, err)
+	}
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
 
 	assert.Equal(t, http.StatusOK, rr.Code)
-	assert.NotEmpty(t, rr.Header().Get("X-Amz-Bucket-Region"))
 }
 
 func TestHeadBucket_NotFound(t *testing.T) {
-	tb := setupBucketHandlerServer(t)
+	tb := setupDistributedBackend(t)
 	defer tb.Cleanup()
 
 	req := httptest.NewRequest(http.MethodHead, "/nonexistent-bucket-xyz", nil)
+	if len(tb.Config.Auth) > 0 {
+		authEntry := tb.Config.Auth[0]
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		require.NoError(t, err)
+	}
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
 
-	// Filesystem backend returns 403 for unknown buckets (not configured)
-	assert.True(t, rr.Code == http.StatusNotFound || rr.Code == http.StatusForbidden)
+	assert.Equal(t, http.StatusNotFound, rr.Code)
 }
 
 func TestDeleteBucket_Handler(t *testing.T) {
-	tb := setupBucketHandlerServer(t)
+	tb := setupDistributedBackend(t)
 	defer tb.Cleanup()
 
-	// Filesystem backend doesn't support deleting buckets
-	req := httptest.NewRequest(http.MethodDelete, "/test-bucket01", nil)
+	// Create a bucket first, then delete it
+	createReq := httptest.NewRequest(http.MethodPut, "/delete-test-bucket", nil)
+	if len(tb.Config.Auth) > 0 {
+		authEntry := tb.Config.Auth[0]
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", createReq)
+		require.NoError(t, err)
+	}
 	rr := httptest.NewRecorder()
+	tb.Handler.ServeHTTP(rr, createReq)
+	require.Equal(t, http.StatusOK, rr.Code)
+
+	req := httptest.NewRequest(http.MethodDelete, "/delete-test-bucket", nil)
+	if len(tb.Config.Auth) > 0 {
+		authEntry := tb.Config.Auth[0]
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		require.NoError(t, err)
+	}
+	rr = httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
 
-	// Should get an error (AccessDenied for filesystem backend)
-	assert.NotEqual(t, http.StatusNoContent, rr.Code)
+	assert.Equal(t, http.StatusNoContent, rr.Code)
 }
 
 func TestCreateBucket_WithLocationConstraint(t *testing.T) {
-	tb := setupBucketHandlerServer(t)
+	tb := setupDistributedBackend(t)
 	defer tb.Cleanup()
 
 	body := `<CreateBucketConfiguration><LocationConstraint>eu-west-1</LocationConstraint></CreateBucketConfiguration>`
 	req := httptest.NewRequest(http.MethodPut, "/new-bucket-region", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/xml")
+	if len(tb.Config.Auth) > 0 {
+		authEntry := tb.Config.Auth[0]
+		timestamp := time.Now().UTC().Format("20060102T150405Z")
+		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
+		require.NoError(t, err)
+	}
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
 
-	// Filesystem backend rejects, but the XML parsing path should be exercised
-	assert.NotEqual(t, http.StatusOK, rr.Code)
+	assert.Equal(t, http.StatusOK, rr.Code)
 }

@@ -37,8 +37,10 @@ func setupMultipartTestBackend(t *testing.T) (*Backend, func()) {
 	cfg := &Config{
 		BadgerDir:      tmpDir,
 		PartitionCount: 5,
-		UseQUIC:        true,
 		QuicBasePort:   testBasePort,
+		Buckets: []BucketConfig{
+			{Name: "test-bucket", Region: "us-east-1"},
+		},
 	}
 	b, err := New(cfg)
 	require.NoError(t, err)

@@ -2,7 +2,7 @@
 
 Predastore developed by [Mulga Defense Corporation](https://mulgadc.com/) is a distributed, S3-compatible object storage system with Reed-Solomon erasure coding, built for bare-metal, edge, and on-premise deployments. It is the storage backend for [Spinifex](https://github.com/mulgadc/spinifex) — an AWS-compatible infrastructure stack for private clouds.
 
-Predastore can run as a single-node server with local filesystem storage, or scale out to a multi-node cluster with erasure-coded shards, Raft-consensus metadata, and QUIC-based inter-node transport.
+Predastore runs as a distributed cluster with erasure-coded shards, Raft-consensus metadata, and QUIC-based inter-node transport. For development, all nodes run in a single process on loopback.
 
 ## Architecture
 
@@ -22,13 +22,13 @@ Predastore can run as a single-node server with local filesystem storage, or sca
 │  s3db Cluster       │       │  QUIC Shard Nodes                │
 │  (Raft Consensus)   │       │  ┌────────┐┌────────┐┌────────┐  │
 │                     │       │  │ Node 0 ││ Node 1 ││ Node 2 │  │
-│  BoltDB (Raft log)  │       │  │  WAL   ││  WAL   ││  WAL   │  │
-│  BadgerDB (FSM)     │       │  │ Badger ││ Badger ││ Badger │  │
+│  BoltDB (Raft log)  │       │  │ Store  ││ Store  ││ Store  │  │
+│  BadgerDB (FSM)     │       │  │(seg+ix)││(seg+ix)││(seg+ix)│  │
 └─────────────────────┘       │  └────────┘└────────┘└────────┘  │
                               └──────────────────────────────────┘
 ```
 
-**S3D** serves the S3 HTTP API with AWS Signature V4 authentication. The **s3db cluster** provides strongly consistent metadata via Raft (HashiCorp Raft + BoltDB + BadgerDB). **QUIC shard nodes** store erasure-coded object data in write-ahead logs, communicating over persistent QUIC connections with pooled, multiplexed streams — eliminating per-request TLS handshakes.
+**S3D** serves the S3 HTTP API with AWS Signature V4 authentication. The **s3db cluster** provides strongly consistent metadata via Raft (HashiCorp Raft + BoltDB + BadgerDB). **QUIC shard nodes** store erasure-coded object data in append-only segment files, with each shard occupying a contiguous extent indexed by a per-node BadgerDB. Inter-node communication uses persistent QUIC connections with pooled, multiplexed streams — eliminating per-request TLS handshakes.
 
 See [DESIGN.md](DESIGN.md) for the full architecture reference, including the data model, QUIC protocol format, Raft consensus details, hash ring placement, and failure handling.
 
@@ -37,9 +37,9 @@ See [DESIGN.md](DESIGN.md) for the full architecture reference, including the da
 - **Reed-Solomon erasure coding** — objects are split into data + parity shards (configurable, e.g. RS(3,2) tolerates loss of any 2 nodes). No full replication overhead.
 - **Raft consensus for metadata** — bucket and object metadata is strongly consistent across the cluster. Reads can go to any node; writes go through the leader.
 - **QUIC transport** — node-to-node shard I/O uses QUIC over UDP with connection pooling. A single long-lived connection per node pair carries multiplexed streams, so shard writes cost only a stream ID allocation, not a TLS handshake.
-- **Write-ahead logs** — each shard node writes data to a local WAL for durability before acknowledging. WAL entries are indexed in a local BadgerDB for fast lookups.
+- **Append-only segments** — each shard node writes data to large append-only segment files. A shard occupies a contiguous extent within one segment, pre-allocated to enable lock-free writing to disk. A per-node BadgerDB index maps shard keys to extents.
 - **Consistent hash ring** — shard placement is deterministic via a hash ring with virtual nodes. Adding nodes bumps a ring epoch; old objects stay on the old epoch, new writes use the new one.
-- **Single binary** — `s3d` runs the S3 API server, database nodes, and QUIC shard nodes. In development mode everything runs in one process; in production each component can run separately.
+- **Single binary** — `./bin/s3d` runs one cluster node (S3 API server + Raft database + QUIC shard node). A cluster is N `s3d` processes pointed at the same config; `./scripts/start.sh` launches all of them locally on loopback aliases for development.
 
 ## S3 API Compatibility
 
@@ -54,80 +54,102 @@ Predastore implements key S3 operations compatible with AWS CLI, SDKs, and exist
 
 ## Quick Start
 
-### Build and Run
+### Build
 
 ```bash
-make build
-./bin/s3d
+make build              # builds ./bin/s3d (also generates dev TLS certs)
 ```
 
-This starts a single-node server with the filesystem backend on `https://localhost:8443`.
+### Run a Dev Cluster
+
+The `./scripts/` directory contains helpers for running a multi-node cluster
+locally on loopback IP aliases — the recommended way to exercise the
+distributed code paths in development:
+
+```bash
+./scripts/start.sh 3node        # launch a 3-node cluster
+./scripts/start.sh -w 5node     # launch a 5-node cluster, wait until ready
+./scripts/stop.sh               # stop all running clusters
+./scripts/clean.sh              # stop and wipe cluster data
+./scripts/bench.sh 3node        # run warp benchmark against a cluster
+./scripts/bench.sh disk         # run raw-disk fio benchmark
+```
+
+Cluster runtime data (logs, PID files, segment files, BadgerDB indexes) lives
+under `$PREDA_DIR` (default `/tmp/predastore/<clustername>/`). The start script
+sets up loopback IP aliases (requires `sudo`) and generates TLS certs on first
+run.
+
+### Run a Single Node
+
+`./bin/s3d` is a single-node process — for running one node of a cluster
+directly (e.g. on a dedicated host in production, or for inspecting one
+node in isolation):
+
+```bash
+./bin/s3d \
+  --config config/3node.toml \
+  --node 1 \
+  --host 10.11.12.1 \
+  --port 8443 \
+  --base-path /tmp/predastore/3node \
+  --tls-key /tmp/predastore/3node/server.key \
+  --tls-cert /tmp/predastore/3node/server.pem
+```
 
 ### Configuration
 
-Configure via environment variables or `config.yaml`:
+Cluster configurations live under `config/` as TOML files, one per topology:
 
-```yaml
-server:
-  host: "0.0.0.0"
-  port: 8443
-  tls:
-    cert_file: "config/server.pem"
-    key_file: "config/server.key"
+```
+config/
+  3node.toml    # 3 db + 3 storage nodes
+  5node.toml    # 5 db + 5 storage nodes
+  7node.toml    # 7 db + 7 storage nodes
+```
 
-storage:
-  backend: "file"            # "file" or "distributed"
-  data_dir: "/var/lib/predastore"
+Each config defines `[[db]]` and `[[storage]]` sections specifying node IDs,
+hosts, ports, and Reed-Solomon parameters.
 
-auth:
-  access_key: "your-access-key"
-  secret_key: "your-secret-key"
+TLS certificates are generated on first build:
+
+```bash
+make certs              # Generate certs/server.{pem,key}
 ```
 
 ### AWS CLI Examples
 
 ```bash
 # Create a bucket
-aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 mb s3://my-bucket
+aws --endpoint-url https://10.11.12.1:8443/ s3 mb s3://my-bucket
 
 # Upload a file
-aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 cp ./file.txt s3://my-bucket/
+aws --endpoint-url https://10.11.12.1:8443/ s3 cp ./file.txt s3://my-bucket/
 
 # List bucket contents
-aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 ls s3://my-bucket/
+aws --endpoint-url https://10.11.12.1:8443/ s3 ls s3://my-bucket/
 
 # Download a file
-aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 cp s3://my-bucket/file.txt ./downloaded.txt
+aws --endpoint-url https://10.11.12.1:8443/ s3 cp s3://my-bucket/file.txt ./downloaded.txt
 ```
 
-## Storage Backends
+## Storage Backend
 
-### Filesystem (Default)
-
-Local filesystem storage with a flat layout. Production-ready for single-node deployments — no external dependencies.
-
-### Distributed
-
-Multi-node storage with erasure coding, Raft-consensus metadata, and QUIC transport:
+Distributed storage with erasure coding, Raft-consensus metadata, and QUIC transport.
+The simplest way to bring up a cluster locally:
 
 ```bash
-# Development mode — runs all DB and shard nodes in one process
-./bin/s3d -backend distributed -config s3/tests/config/cluster.toml
-
-# Production — separate processes per host
-./bin/s3d -backend distributed -config cluster.toml -node 0 -db-node 1   # Host 1
-./bin/s3d -backend distributed -config cluster.toml -node 1 -db-node 2   # Host 2
-./bin/s3d -backend distributed -config cluster.toml -node 2 -db-node 3   # Host 3
+./scripts/start.sh -w 3node     # 3-node cluster on loopback aliases
 ```
 
-The distributed backend's data model decomposes objects into chunks, shards, segments, and blocks:
+The distributed backend's data model:
 
 | Unit | Size | Description |
 |------|------|-------------|
-| Block | 8 KB | Smallest addressable unit |
-| Segment | 64 KB | Independently compressible (8 blocks) |
-| Shard | 32 MB | Per-node RS slice (512 segments) |
-| Chunk | 32 MB | Logical unit for RS encoding |
+| Object | arbitrary | RS-encoded end-to-end into K data + M parity shards |
+| Shard | `⌈object_size / K⌉` | Per-node RS slice; occupies a contiguous extent |
+| Fragment | 8 KB payload + 32 B header | On-disk unit; CRC-validated independently |
+| Segment file | up to 4 GiB | Append-only container holding extents from one or more shards |
 
 See [DESIGN.md](DESIGN.md) for full configuration reference, including database node setup, shard node setup, RS tuning, and deployment modes.
 
@@ -144,11 +166,10 @@ Predastore subscribes to NATS topics (`s3.putobject`, `s3.getobject`, `s3.create
 ## Development
 
 ```bash
-make build            # Build s3d binary
+make build            # Build s3d binary (also generates TLS certs)
+make certs            # Generate dev TLS certs
 make test             # Run tests
-make preflight        # Full CI checks (fmt, vet, gosec, staticcheck, govulncheck, tests)
-make bench            # Benchmarks
-make dev              # Hot reload with air
+make preflight        # Full CI checks (lint, govulncheck, tests, race detector)
 make clean            # Clean build artifacts
 ```
 
@@ -178,7 +199,7 @@ sudo sysctl -w net.core.wmem_max=7500000
 - [x] QUIC transport with connection pooling
 - [x] Consistent hash ring placement
 - [ ] Gossip-based node discovery
-- [ ] WAL compaction and garbage collection
+- [ ] Segment compaction and garbage collection
 - [ ] Automatic shard rebalancing
 - [ ] Background read-repair
 - [ ] Bucket versioning

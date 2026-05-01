@@ -50,6 +50,10 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.Create
 		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+		return nil, err
+	}
+
 	// Generate unique upload ID
 	uploadID := uuid.New().String()
 
@@ -112,6 +116,10 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+		return nil, err
+	}
+
 	// Validate part number
 	if err := multipart.ValidatePartNumber(req.PartNumber); err != nil {
 		return nil, err
@@ -170,13 +178,7 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 		slog.Debug("Failed to close temp file", "path", tmpPath, "error", closeErr)
 	}
 
-	// Store via QUIC (or local WAL if QUIC disabled)
-	if b.useQUIC {
-		_, _, _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpPath, objectHash)
-	} else {
-		_, _, _, err = b.putObjectToWAL(req.Bucket, tmpPath, objectHash)
-	}
-	if err != nil {
+	if _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpPath, objectHash); err != nil {
 		slog.Error("Failed to store part", "uploadID", req.UploadID, "part", req.PartNumber, "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store part", 500)
 	}
@@ -279,6 +281,10 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+		return nil, err
+	}
+
 	// Verify upload exists
 	uploadMetadata, err := b.getUploadMetadata(req.UploadID)
 	if err != nil {
@@ -376,12 +382,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	// Store the final object using PutObject mechanism
 	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
 
-	if b.useQUIC {
-		_, _, _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
-	} else {
-		_, _, _, err = b.putObjectToWAL(req.Bucket, tmpFile.Name(), objectHash)
-	}
-	if err != nil {
+	if _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash); err != nil {
 		slog.Error("Failed to store final object", "uploadID", req.UploadID, "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store final object", 500)
 	}
@@ -514,6 +515,10 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadI
 	}
 	if key == "" {
 		return backend.ErrNoSuchKeyError.WithResource(key)
+	}
+
+	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: bucket}); err != nil {
+		return err
 	}
 
 	// Verify upload exists

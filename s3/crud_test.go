@@ -171,16 +171,9 @@ func TestListObjectsAllBackends(t *testing.T) {
 	})
 }
 
-// getBucketForBackend returns the appropriate test bucket for the backend type
-func getBucketForBackend(backendType BackendType) string {
-	switch backendType {
-	case BackendFilesystem:
-		return "local"
-	case BackendDistributed:
-		return "datastore"
-	default:
-		return "local"
-	}
+// getBucketForBackend returns the shared test bucket name.
+func getBucketForBackend(_ BackendType) string {
+	return testBucket
 }
 
 // TestPutOverwrite tests that PUT overwrites existing objects correctly with all backends

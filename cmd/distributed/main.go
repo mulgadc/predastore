@@ -14,7 +14,7 @@ import (
 
 func main() {
 	cfg := &distributed.Config{
-		BadgerDir: "s3/tests/data/distributed/badger",
+		BadgerDir: "distributed/badger",
 	}
 
 	b, err := distributed.New(cfg)

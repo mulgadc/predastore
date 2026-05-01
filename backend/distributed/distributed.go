@@ -21,7 +21,6 @@ import (
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
-	"github.com/mulgadc/predastore/s3/wal"
 	s3db "github.com/mulgadc/predastore/s3db"
 	"github.com/mulgadc/predastore/utils"
 )
@@ -66,9 +65,6 @@ type Config struct {
 	// QUIC server base port (each node uses BasePort + nodeNum)
 	QuicBasePort int
 
-	// UseQUIC enables QUIC-based shard distribution (requires QUIC servers to be running)
-	UseQUIC bool
-
 	// Nodes configuration (from cluster.toml)
 	Nodes []NodeConfig
 
@@ -92,7 +88,6 @@ type Backend struct {
 	quicBasePort  int
 	nodeAddrs     map[int]string // node ID -> "host:port"
 	buckets       []BucketConfig // bucket configurations
-	useQUIC       bool           // when true, use QUIC for shard distribution
 }
 
 // ObjectToShardNodes maps an object to its shard locations
@@ -101,12 +96,6 @@ type ObjectToShardNodes struct {
 	Size             int64
 	DataShardNodes   []uint32
 	ParityShardNodes []uint32
-}
-
-// ObjectShardReader provides access to a shard stored in WAL
-type ObjectShardReader struct {
-	File        *os.File
-	WALFileInfo wal.WALFileInfo
 }
 
 // hasher implements consistent.Hasher using xxhash
@@ -123,10 +112,10 @@ func (m myMember) String() string {
 	return string(m)
 }
 
-// shardWriteOutcome captures the result of writing a shard to WAL
+// shardWriteOutcome captures the result of writing a shard via QUIC
 type shardWriteOutcome struct {
 	shardIndex int
-	result     *wal.WriteResult
+	shardSize  int64
 	err        error
 }
 
@@ -211,29 +200,16 @@ func New(config any) (backend.Backend, error) {
 	}
 	hashRing := consistent.New(nil, ringCfg)
 
-	// Create node directories and add nodes to ring using config node IDs
+	// Add nodes to hash ring using config node IDs
 	// This ensures hash ring node names match config node IDs (e.g., node-1, node-2, node-3)
+	// Node directories are created by QUIC servers, not by the S3 server.
 	if len(cfg.Nodes) > 0 {
 		for _, node := range cfg.Nodes {
-			nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", node.ID))
-			if err := os.MkdirAll(nodeDir, 0750); err != nil {
-				if closeErr := globalState.Close(); closeErr != nil {
-					slog.Debug("Failed to close global state during cleanup", "error", closeErr)
-				}
-				return nil, fmt.Errorf("failed to create node directory: %w", err)
-			}
 			hashRing.Add(myMember(fmt.Sprintf("node-%d", node.ID)))
 		}
 	} else {
 		// Fallback for tests without config: use 0-indexed nodes
 		for i := 0; i < partitionCount; i++ {
-			nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
-			if err := os.MkdirAll(nodeDir, 0750); err != nil {
-				if closeErr := globalState.Close(); closeErr != nil {
-					slog.Debug("Failed to close global state during cleanup", "error", closeErr)
-				}
-				return nil, fmt.Errorf("failed to create node directory: %w", err)
-			}
 			hashRing.Add(myMember(fmt.Sprintf("node-%d", i)))
 		}
 	}
@@ -255,7 +231,6 @@ func New(config any) (backend.Backend, error) {
 		quicBasePort:  quicBasePort,
 		nodeAddrs:     nodeAddrs,
 		buckets:       cfg.Buckets,
-		useQUIC:       cfg.UseQUIC,
 	}, nil
 }
 
@@ -270,14 +245,6 @@ func (b *Backend) Close() error {
 		return b.globalState.Close()
 	}
 	return nil
-}
-
-// nodeDir returns the directory for a given node
-func (b *Backend) nodeDir(node string) string {
-	if b.dataDir == "" {
-		return filepath.Join("s3", "tests", "data", "distributed", "nodes", node)
-	}
-	return filepath.Join(b.dataDir, node)
 }
 
 // getNodeAddr returns the QUIC address for a node
@@ -329,202 +296,24 @@ func (b *Backend) GlobalState() GlobalState {
 	return b.globalState
 }
 
-// putObjectToWAL splits a file into RS shards and writes each to the appropriate node's WAL
-func (b *Backend) putObjectToWAL(bucket string, objectPath string, objectHash [32]byte) (dataResults []*wal.WriteResult, parityResults []*wal.WriteResult, size int64, err error) {
-	enc, err := reedsolomon.NewStream(b.rsDataShard, b.rsParityShard)
-	if err != nil {
-		return nil, nil, 0, err
-	}
-
-	f, err := os.Open(objectPath)
-	if err != nil {
-		return nil, nil, 0, err
-	}
-	defer f.Close()
-
-	instat, err := f.Stat()
-	if err != nil {
-		return nil, nil, 0, err
-	}
-
-	size = instat.Size()
-
-	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
-	if err != nil {
-		return nil, nil, 0, err
-	}
-
-	// TODO: Implement PUT using QUIC client <> server communication.
-
-	totalShards := b.rsDataShard + b.rsParityShard
-	walFiles := make([]*wal.WAL, totalShards)
-	for i := range walFiles {
-		walDir := b.nodeDir(hashRingShards[i].String())
-		if mkErr := os.MkdirAll(walDir, 0750); mkErr != nil {
-			return nil, nil, 0, mkErr
-		}
-		walFiles[i], err = wal.New(filepath.Join(walDir, "state.json"), walDir)
-		if err != nil {
-			return nil, nil, 0, err
-		}
-	}
-	defer func() {
-		for i := range walFiles {
-			if walFiles[i] != nil {
-				_ = walFiles[i].Close()
-				_ = walFiles[i].DB.Close()
-			}
-		}
-	}()
-
-	// Calculate shard size
-	fileSize := instat.Size()
-	ds := int64(b.rsDataShard)
-	shardSize := int((fileSize + ds - 1) / ds)
-
-	// Split input -> data shard writers
-	dataWriters := make([]io.Writer, b.rsDataShard)
-	dataPipeWriters := make([]*io.PipeWriter, b.rsDataShard)
-	dataResults = make([]*wal.WriteResult, b.rsDataShard)
-	dataCh := make(chan shardWriteOutcome, b.rsDataShard)
-	var dataWG sync.WaitGroup
-
-	for i := 0; i < b.rsDataShard; i++ {
-		pr, pw := io.Pipe()
-		dataPipeWriters[i] = pw
-		dataWriters[i] = pw
-
-		dataWG.Add(1)
-		go func(idx int, r *io.PipeReader) {
-			defer dataWG.Done()
-			res, werr := walFiles[idx].Write(r, shardSize)
-
-			if werr == nil {
-				if updateErr := walFiles[idx].UpdateObjectToWAL(objectHash, res); updateErr != nil {
-					slog.Warn("Failed to update object in WAL", "shard", idx, "error", updateErr)
-				}
-			}
-
-			dataCh <- shardWriteOutcome{shardIndex: idx, result: res, err: werr}
-		}(i, pr)
-	}
-
-	splitErr := enc.Split(f, dataWriters, fileSize)
-
-	for i := 0; i < b.rsDataShard; i++ {
-		if splitErr != nil {
-			_ = dataPipeWriters[i].CloseWithError(splitErr)
-		} else {
-			_ = dataPipeWriters[i].Close()
-		}
-	}
-
-	go func() {
-		dataWG.Wait()
-		close(dataCh)
-	}()
-
-	var firstErr error
-	for outcome := range dataCh {
-		if outcome.err != nil && firstErr == nil {
-			firstErr = outcome.err
-		}
-		dataResults[outcome.shardIndex] = outcome.result
-	}
-	if splitErr != nil && firstErr == nil {
-		firstErr = splitErr
-	}
-	if firstErr != nil {
-		return nil, nil, 0, firstErr
-	}
-
-	// Encode parity shards
-	dataReaders := make([]io.Reader, b.rsDataShard)
-	for i := 0; i < b.rsDataShard; i++ {
-		bdata, rerr := walFiles[i].ReadFromWriteResult(dataResults[i])
-		if rerr != nil {
-			return nil, nil, 0, rerr
-		}
-		slog.Debug("parity encoding: data shard read", "shard", i, "len", len(bdata), "md5", fmt.Sprintf("%x", md5.Sum(bdata)))
-		dataReaders[i] = bytes.NewReader(bdata)
-	}
-
-	parityWriters := make([]io.Writer, b.rsParityShard)
-	parityPipeWriters := make([]*io.PipeWriter, b.rsParityShard)
-	parityResults = make([]*wal.WriteResult, b.rsParityShard)
-	parityCh := make(chan shardWriteOutcome, b.rsParityShard)
-	var parityWG sync.WaitGroup
-
-	for i := 0; i < b.rsParityShard; i++ {
-		pr, pw := io.Pipe()
-		parityPipeWriters[i] = pw
-		parityWriters[i] = pw
-
-		walIdx := b.rsDataShard + i
-		parityWG.Add(1)
-		go func(localParityIdx int, walIndex int, r *io.PipeReader) {
-			defer parityWG.Done()
-			res, werr := walFiles[walIndex].Write(r, shardSize)
-			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: res, err: werr}
-
-			if werr == nil {
-				if updateErr := walFiles[walIndex].UpdateObjectToWAL(objectHash, res); updateErr != nil {
-					slog.Warn("Failed to update parity object in WAL", "walIndex", walIndex, "error", updateErr)
-				}
-			}
-		}(i, walIdx, pr)
-	}
-
-	encodeErr := enc.Encode(dataReaders, parityWriters)
-
-	for i := 0; i < b.rsParityShard; i++ {
-		if encodeErr != nil {
-			_ = parityPipeWriters[i].CloseWithError(encodeErr)
-		} else {
-			_ = parityPipeWriters[i].Close()
-		}
-	}
-
-	go func() {
-		parityWG.Wait()
-		close(parityCh)
-	}()
-
-	firstErr = nil
-	for outcome := range parityCh {
-		if outcome.err != nil && firstErr == nil {
-			firstErr = outcome.err
-		}
-		parityResults[outcome.shardIndex] = outcome.result
-	}
-	if encodeErr != nil && firstErr == nil {
-		firstErr = encodeErr
-	}
-	if firstErr != nil {
-		return nil, nil, 0, firstErr
-	}
-
-	return dataResults, parityResults, size, nil
-}
-
-// putObjectViaQUIC splits a file into RS shards and sends each to the appropriate node via QUIC
-func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPath string, objectHash [32]byte) (dataResults []*wal.WriteResult, parityResults []*wal.WriteResult, size int64, err error) {
+// putObjectViaQUIC splits a file into RS shards and sends each to the appropriate node via QUIC.
+func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPath string, objectHash [32]byte) (size int64, err error) {
 	slog.Debug("putObjectViaQUIC: starting", "bucket", bucket, "objectPath", objectPath)
 
 	enc, err := reedsolomon.NewStream(b.rsDataShard, b.rsParityShard)
 	if err != nil {
-		return nil, nil, 0, err
+		return 0, err
 	}
 
 	f, err := os.Open(objectPath)
 	if err != nil {
-		return nil, nil, 0, err
+		return 0, err
 	}
 	defer f.Close()
 
 	instat, err := f.Stat()
 	if err != nil {
-		return nil, nil, 0, err
+		return 0, err
 	}
 
 	size = instat.Size()
@@ -533,7 +322,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	// Use objectHash for hash ring placement for consistency with storage and retrieval
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
-		return nil, nil, 0, err
+		return 0, err
 	}
 
 	// Calculate shard size
@@ -550,13 +339,11 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 		dataWriters[i] = &bytesBufferWriter{buf: &dataShardBuffers[i]}
 	}
 
-	splitErr := enc.Split(f, dataWriters, fileSize)
-	if splitErr != nil {
-		return nil, nil, 0, splitErr
+	if splitErr := enc.Split(f, dataWriters, fileSize); splitErr != nil {
+		return 0, splitErr
 	}
 
 	// Step 2: Send data shards to nodes via QUIC
-	dataResults = make([]*wal.WriteResult, b.rsDataShard)
 	dataCh := make(chan shardWriteOutcome, b.rsDataShard)
 	var dataWG sync.WaitGroup
 
@@ -567,19 +354,17 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 
 			nodeNum, nodeErr := NodeToUint32(hashRingShards[idx].String())
 			if nodeErr != nil {
-				dataCh <- shardWriteOutcome{shardIndex: idx, result: nil, err: nodeErr}
+				dataCh <- shardWriteOutcome{shardIndex: idx, err: nodeErr}
 				return
 			}
 
 			addr := b.getNodeAddr(int(nodeNum))
-			// Use pooled connection to avoid TLS handshake overhead
 			client, dialErr := quicclient.DialPooled(ctx, addr)
 			if dialErr != nil {
 				slog.Error("putObjectViaQUIC: dial failed", "node", nodeNum, "addr", addr, "error", dialErr)
-				dataCh <- shardWriteOutcome{shardIndex: idx, result: nil, err: dialErr}
+				dataCh <- shardWriteOutcome{shardIndex: idx, err: dialErr}
 				return
 			}
-			// Don't close - connection stays in pool
 
 			putReq := quicserver.PutRequest{
 				Bucket:     bucket,
@@ -592,11 +377,11 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 			resp, putErr := client.Put(ctx, putReq, bytes.NewReader(shardData))
 			if putErr != nil {
 				slog.Error("putObjectViaQUIC: put failed", "node", nodeNum, "error", putErr)
-				dataCh <- shardWriteOutcome{shardIndex: idx, result: nil, err: putErr}
+				dataCh <- shardWriteOutcome{shardIndex: idx, err: putErr}
 				return
 			}
 
-			dataCh <- shardWriteOutcome{shardIndex: idx, result: &resp.WriteResult, err: nil}
+			dataCh <- shardWriteOutcome{shardIndex: idx, shardSize: resp.ShardSize}
 		}(i, dataShardBuffers[i])
 	}
 
@@ -606,32 +391,24 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	}()
 
 	var firstErr error
-	completedDataShards := 0
 	for outcome := range dataCh {
-		completedDataShards++
 		if outcome.err != nil && firstErr == nil {
 			firstErr = outcome.err
 		}
-		dataResults[outcome.shardIndex] = outcome.result
 	}
-	slog.Debug("putObjectViaQUIC: all data shards completed", "count", completedDataShards)
 	if firstErr != nil {
-		slog.Error("putObjectViaQUIC: data shard failed", "error", firstErr)
-		return nil, nil, 0, firstErr
+		return 0, firstErr
 	}
 
 	// Step 3: Encode parity shards using the buffered data shards
-	// (no need to read back from QUIC - we already have them in memory)
 	dataReaders := make([]io.Reader, b.rsDataShard)
 	for i := 0; i < b.rsDataShard; i++ {
 		slog.Debug("parity encoding: data shard", "shard", i, "len", len(dataShardBuffers[i]), "md5", fmt.Sprintf("%x", md5.Sum(dataShardBuffers[i])))
 		dataReaders[i] = bytes.NewReader(dataShardBuffers[i])
 	}
 
-	// Encode parity shards via pipes
 	parityWriters := make([]io.Writer, b.rsParityShard)
 	parityPipeWriters := make([]*io.PipeWriter, b.rsParityShard)
-	parityResults = make([]*wal.WriteResult, b.rsParityShard)
 	parityCh := make(chan shardWriteOutcome, b.rsParityShard)
 	var parityWG sync.WaitGroup
 
@@ -647,38 +424,36 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 
 			nodeNum, nodeErr := NodeToUint32(hashRingShards[hashRingIdx].String())
 			if nodeErr != nil {
-				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: nil, err: nodeErr}
+				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, err: nodeErr}
 				_, _ = io.Copy(io.Discard, r)
 				return
 			}
 
 			addr := b.getNodeAddr(int(nodeNum))
-			// Use pooled connection to avoid TLS handshake overhead
 			client, dialErr := quicclient.DialPooled(ctx, addr)
 			if dialErr != nil {
 				slog.Error("putObjectViaQUIC: dial failed for parity", "node", nodeNum, "addr", addr, "error", dialErr)
-				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: nil, err: dialErr}
+				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, err: dialErr}
 				_, _ = io.Copy(io.Discard, r)
 				return
 			}
-			// Don't close - connection stays in pool
 
 			putReq := quicserver.PutRequest{
 				Bucket:     bucket,
 				Object:     objectPath,
 				ObjectHash: objectHash,
 				ShardSize:  shardSize,
-				ShardIndex: hashRingIdx, // Use hash ring index as the shard index
+				ShardIndex: hashRingIdx,
 			}
 
 			resp, putErr := client.Put(ctx, putReq, r)
 			if putErr != nil {
 				slog.Error("putObjectViaQUIC: put parity failed", "node", nodeNum, "error", putErr)
-				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: nil, err: putErr}
+				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, err: putErr}
 				return
 			}
 
-			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, result: &resp.WriteResult, err: nil}
+			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, shardSize: resp.ShardSize}
 		}(i, parityIdx, pr)
 	}
 
@@ -698,25 +473,20 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	}()
 
 	firstErr = nil
-	completedParityShards := 0
 	for outcome := range parityCh {
-		completedParityShards++
 		if outcome.err != nil && firstErr == nil {
 			firstErr = outcome.err
 		}
-		parityResults[outcome.shardIndex] = outcome.result
 	}
-	slog.Debug("putObjectViaQUIC: all parity shards completed", "count", completedParityShards)
 	if encodeErr != nil && firstErr == nil {
 		firstErr = encodeErr
 	}
 	if firstErr != nil {
-		slog.Error("putObjectViaQUIC: parity shard failed", "error", firstErr)
-		return nil, nil, 0, firstErr
+		return 0, firstErr
 	}
 
 	slog.Debug("putObjectViaQUIC: completed successfully", "size", size)
-	return dataResults, parityResults, size, nil
+	return size, nil
 }
 
 // openInput retrieves shard location metadata for an object

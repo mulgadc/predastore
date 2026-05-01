@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/backend/filesystem"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -44,15 +42,15 @@ func (s3 *Config) ReadConfig() (err error) {
 			//return fmt.Errorf("invalid bucket name: %s", err)
 		}
 
-		// Check if the directory is relative
-		if b.Type == "fs" && !filepath.IsAbs(b.Pathname) {
-			s3.Buckets[k].Pathname = filepath.Join(s3.BasePath, b.Pathname)
-		}
-
-		// Check if the directory exists, otherwise create it
-		if _, err := os.Stat(s3.Buckets[k].Pathname); os.IsNotExist(err) {
-			if mkErr := os.MkdirAll(s3.Buckets[k].Pathname, 0750); mkErr != nil {
-				slog.Warn("Failed to create bucket directory", "path", s3.Buckets[k].Pathname, "error", mkErr)
+		// Create bucket directory if a pathname is configured
+		if b.Pathname != "" {
+			if !filepath.IsAbs(b.Pathname) {
+				s3.Buckets[k].Pathname = filepath.Join(s3.BasePath, b.Pathname)
+			}
+			if _, err := os.Stat(s3.Buckets[k].Pathname); os.IsNotExist(err) {
+				if mkErr := os.MkdirAll(s3.Buckets[k].Pathname, 0750); mkErr != nil {
+					slog.Warn("Failed to create bucket directory", "path", s3.Buckets[k].Pathname, "error", mkErr)
+				}
 			}
 		}
 
@@ -80,13 +78,6 @@ func (s3 *Config) BucketConfig(bucket string) (S3_Buckets, error) {
 	}
 
 	return S3_Buckets{}, errors.New("bucket not found")
-}
-
-// ToFilesystemConfig converts s3.Config to filesystem backend config
-func (s3 *Config) ToFilesystemConfig() any {
-	// Import dynamically to avoid circular imports
-	// The actual conversion happens in the routes setup
-	return s3
 }
 
 // validatePublicBucketPermission checks if the request is allowed for a public bucket
@@ -154,33 +145,4 @@ func findSlash(s string) int {
 		}
 	}
 	return -1
-}
-
-// createFilesystemBackend creates a filesystem backend from the configuration.
-// This is primarily used for testing.
-func (s3 *Config) createFilesystemBackend() backend.Backend {
-	buckets := make([]filesystem.BucketConfig, len(s3.Buckets))
-	for i, b := range s3.Buckets {
-		buckets[i] = filesystem.BucketConfig{
-			Name:     b.Name,
-			Pathname: b.Pathname,
-			Region:   b.Region,
-			Type:     b.Type,
-			Public:   b.Public,
-		}
-	}
-
-	fsConfig := &filesystem.Config{
-		Buckets:   buckets,
-		OwnerID:   "predastore",
-		OwnerName: "predastore",
-	}
-
-	be, err := filesystem.New(fsConfig)
-	if err != nil {
-		slog.Error("Failed to create filesystem backend", "error", err)
-		return nil
-	}
-
-	return be
 }

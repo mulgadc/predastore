@@ -119,7 +119,7 @@ func (c *Client) Put(ctx context.Context, putReq quicserver.PutRequest, shardDat
 	slog.Debug("QUIC Put completed successfully",
 		"bucket", putReq.Bucket,
 		"shardIndex", putReq.ShardIndex,
-		"shardNum", response.WriteResult.ShardNum,
+		"shardSize", response.ShardSize,
 	)
 
 	return &response, nil

@@ -149,7 +149,7 @@ func TestThreeNodeCluster(t *testing.T) {
 	for i, nodeConfig := range nodes {
 		config := DefaultClusterConfig()
 		config.NodeID = nodeConfig.ID
-		config.DataDir = tmpDir
+		config.DataDir = nodeConfig.Path
 		config.Bootstrap = (i == 0) // Only first node bootstraps
 		config.Nodes = nodes
 
@@ -216,7 +216,7 @@ func TestLeaderFailover(t *testing.T) {
 	for i, nodeConfig := range nodes {
 		config := DefaultClusterConfig()
 		config.NodeID = nodeConfig.ID
-		config.DataDir = tmpDir
+		config.DataDir = nodeConfig.Path
 		config.Bootstrap = (i == 0)
 		config.Nodes = nodes
 		// Faster timeouts for testing

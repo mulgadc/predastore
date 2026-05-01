@@ -15,6 +15,14 @@ else
   _RACEQ =
 endif
 
+# Generate self-signed dev TLS certs (no-op if they already exist)
+certs:
+	@mkdir -p certs
+	@test -f certs/server.pem || openssl req -x509 -newkey rsa:2048 -nodes \
+		-keyout certs/server.key -out certs/server.pem \
+		-days 3650 -subj '/CN=localhost' \
+		-addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:10.11.12.1,IP:10.11.12.2,IP:10.11.12.3,IP:10.11.12.4,IP:10.11.12.5,IP:10.11.12.6,IP:10.11.12.7'
+
 build:
 	$(MAKE) go_build
 
@@ -30,10 +38,6 @@ go_build_docker:
 
 	GOOS=darwin GOARCH=$(GOARCH) go build -ldflags "-s -w" -o ./bin/darwin/s3d cmd/s3d/main.go
 
-go_run:
-	@echo -e "\n....Running $(GO_PROJECT_NAME)...."
-	$(GOPATH)/bin/$(GO_PROJECT_NAME)
-
 # Preflight — runs the same checks as GitHub Actions (lint + security + tests).
 # Use this before committing to catch CI failures locally.
 preflight:
@@ -47,7 +51,7 @@ test:
 
 # Run unit tests with coverage profile
 COVERPROFILE ?= coverage.out
-test-cover:
+test-cover: certs
 	@echo -e "\n....Running tests with coverage for $(GO_PROJECT_NAME)...."
 	$(_Q)LOG_IGNORE=1 go test -timeout 120s -coverprofile=$(COVERPROFILE) -covermode=atomic ./... $(_COVQ)
 	@scripts/check-coverage.sh $(COVERPROFILE) $(QUIET)
@@ -60,13 +64,6 @@ test-race:
 # Check that new/changed code meets coverage threshold (runs tests first)
 diff-coverage: test-cover
 	@QUIET=$(QUIET) scripts/diff-coverage.sh $(COVERPROFILE)
-
-bench:
-	@echo -e "\n....Running benchmarks for $(GO_PROJECT_NAME)...."
-	LOG_IGNORE=1 go test -benchmem -run=. -bench=. ./...
-
-dev:
-	air go run cmd/s3d/main.go
 
 # Docker builds
 docker_s3d:
@@ -89,10 +86,6 @@ docker_clean:
 
 docker_test: docker docker_compose_up test docker_compose_down docker_clean
 
-run:
-	$(MAKE) go_build
-	$(MAKE) go_run
-
 clean:
 	rm -f ./bin/s3d
 
@@ -105,6 +98,6 @@ fix:
 govulncheck:
 	go tool govulncheck ./...
 
-.PHONY: build go_build go_build_docker go_run preflight test test-cover test-race diff-coverage bench dev \
+.PHONY: certs build go_build go_build_docker preflight test test-cover test-race diff-coverage \
 	docker_s3d docker_compose_up docker_compose_down docker docker_clean docker_test \
-	run clean lint fix govulncheck
+	clean lint fix govulncheck

@@ -273,6 +273,6 @@ func TestDefaultServerConfig(t *testing.T) {
 	assert.Equal(t, 30*time.Second, cfg.ReadTimeout)
 	assert.Equal(t, 30*time.Second, cfg.WriteTimeout)
 	assert.Equal(t, 120*time.Second, cfg.IdleTimeout)
-	assert.Equal(t, "config/server.pem", cfg.TLSCert)
-	assert.Equal(t, "config/server.key", cfg.TLSKey)
+	assert.Equal(t, "certs/server.pem", cfg.TLSCert)
+	assert.Equal(t, "certs/server.key", cfg.TLSKey)
 }
