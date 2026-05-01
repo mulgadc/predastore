@@ -51,7 +51,7 @@ test:
 
 # Run unit tests with coverage profile
 COVERPROFILE ?= coverage.out
-test-cover: certs
+test-cover:
 	@echo -e "\n....Running tests with coverage for $(GO_PROJECT_NAME)...."
 	$(_Q)LOG_IGNORE=1 go test -timeout 120s -coverprofile=$(COVERPROFILE) -covermode=atomic ./... $(_COVQ)
 	@scripts/check-coverage.sh $(COVERPROFILE) $(QUIET)
