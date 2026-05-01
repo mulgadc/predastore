@@ -23,7 +23,7 @@ certs:
 		-days 3650 -subj '/CN=localhost' \
 		-addext 'subjectAltName=DNS:localhost,IP:127.0.0.1,IP:10.11.12.1,IP:10.11.12.2,IP:10.11.12.3,IP:10.11.12.4,IP:10.11.12.5,IP:10.11.12.6,IP:10.11.12.7'
 
-build: certs
+build:
 	$(MAKE) go_build
 
 # GO commands
@@ -45,7 +45,7 @@ preflight:
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
 # Run unit tests
-test: certs
+test:
 	@echo -e "\n....Running tests for $(GO_PROJECT_NAME)...."
 	LOG_IGNORE=1 go test -timeout 120s ./...
 
@@ -57,7 +57,7 @@ test-cover: certs
 	@scripts/check-coverage.sh $(COVERPROFILE) $(QUIET)
 
 # Run unit tests with race detector
-test-race: certs
+test-race:
 	@echo -e "\n....Running tests with race detector for $(GO_PROJECT_NAME)...."
 	$(_Q)LOG_IGNORE=1 go test -race -timeout 300s ./... $(_RACEQ)
 
