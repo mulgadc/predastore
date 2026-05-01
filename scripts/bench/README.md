@@ -7,32 +7,23 @@ micro-optimisation.
 ## Contents
 
 - `bench-disk.sh` — raw-disk fio ceiling (run independently of predastore).
-- `bench-predastore.sh` — three-node predastore cluster on loopback, driven by
-  `warp mixed`.
+- `bench-cluster.sh` — predastore cluster on loopback, driven by `warp mixed`.
 - `fio-jobs/` — four fio jobs covering predastore's predicted access patterns.
-- `predastore.toml.tmpl` — config template rendered by `envsubst` at run time.
+
+All benchmarks can be run via the top-level dispatcher:
+
+    ./scripts/bench.sh disk          # raw-disk fio
+    ./scripts/bench.sh 3node         # cluster warp benchmark
 
 ## Prerequisites
 
 - `fio` (`apt install fio`).
 - `warp` (`go install github.com/minio/warp@latest`).
-- `envsubst`, `curl`, `ip` (usually present on Linux).
+- `curl`, `ip` (usually present on Linux).
 - `make build` in the predastore repo (produces `bin/s3d`).
-- `sudo` — required only by `bench-predastore.sh` for `ip addr add` on `lo`.
+- `make certs` to generate TLS certificates (or `make build`, which does both).
+- `sudo` — required only by `bench-cluster.sh` for `ip addr add` on `lo`.
   The script aliases `10.11.12.{1,2,3}/24` and removes them on exit.
-
-Before running `bench-predastore.sh`, either export credentials directly:
-
-    export AWS_ACCESS_KEY_ID=...
-    export AWS_SECRET_ACCESS_KEY=...
-
-…or set `AWS_PROFILE` and let the script read them from `~/.aws/credentials`
-(honours `AWS_SHARED_CREDENTIALS_FILE`):
-
-    export AWS_PROFILE=spinifex
-
-The resolved credentials are baked into the rendered config's `[[db]]` and
-`[[auth]]` sections, and are passed to warp unchanged.
 
 ## Usage
 
@@ -40,29 +31,34 @@ Raw disk ceiling:
 
     ./scripts/bench/bench-disk.sh
 
-fio writes to `$BENCH_DIR/disk` (parallel to predastore's `distributed/`
+fio writes to `$PREDA_DIR/disk` (parallel to predastore's `distributed/`
 tree); each job runs twice (buffered and `--direct=1`) and produces a JSON
-file per run under `scripts/bench/results/disk-<timestamp>/`. Override
-`BENCH_DIR` to point at a different filesystem.
+file per run under `scripts/bench/results/disk-<timestamp>/`.
 
 Predastore cluster benchmark:
 
-    ./scripts/bench/bench-predastore.sh
+    ./scripts/bench.sh 3node
+    # or directly:
+    ./scripts/bench/bench-cluster.sh 3node
 
-Results land under `predastore/scripts/bench/results/predastore-<timestamp>/`
+Results land under `predastore/scripts/bench/results/<clustername>-<timestamp>/`
 and contain:
 
 - `warp-mixed.csv.zst` — warp's raw samples.
-- `predastore.toml` — the rendered config used for the run.
-- `logs/node-{1,2,3}.log` — per-node s3d stderr/stdout.
+- `cluster.toml` — the config used for the run.
 - `run-info.txt` — commit SHA, warp version, date, hostname.
 
-The benchmark data root (default `/tmp/predastore-bench`) is wiped on exit by
-the trap. Override with `BENCH_DIR=/some/other/path` if the default filesystem
-is not representative — `bench-disk.sh` honours the same variable, so both
-scripts target the same storage when `BENCH_DIR` is set. Note that with RS(2,1)
-the on-disk footprint is ~1.5× the logical object volume, spread across three
-nodes; warp's defaults (2500 × 10 MiB) do not fit a typical dev-host tmpfs.
+### `PREDA_DIR`
+
+All scripts share a single root directory controlled by `PREDA_DIR` (default
+`/tmp/predastore`). Cluster data, warp temp files (`.warp-tmp/`), and fio
+targets all live under this path. Override it to move everything off tmpfs:
+
+    PREDA_DIR=/var/lib/predastore ./scripts/bench.sh 3node
+
+With RS(2,1) the on-disk footprint is ~1.5× the logical object volume, spread
+across three nodes; warp's defaults (2500 × 10 MiB) do not fit a typical
+dev-host tmpfs.
 
 ### Tuning warp mixed
 
@@ -79,7 +75,7 @@ warp's own default:
 For a tmpfs-safe local run (~750 MB on disk):
 
     WARP_OBJECTS=512 WARP_OBJ_SIZE=1MiB WARP_DURATION=30s WARP_CONCURRENT=10 \
-        ./scripts/bench/bench-predastore.sh
+        ./scripts/bench/bench-cluster.sh
 
 Dedicated-hardware CI runs leave them unset.
 
@@ -91,29 +87,24 @@ Every job runs twice — buffered and `--direct=1` — so cache effects are visi
 | Job               | Pattern               | Reflects                                      |
 |-------------------|-----------------------|-----------------------------------------------|
 | `seq-write-1m`    | `write`, 1M, fsync-on-close | Bulk ingest ceiling (PutObject, AMI writes)   |
-| `rand-write-8k`   | `randwrite`, 8k, `fsync=1`, iodepth 32 | WAL `WriteAt` pattern (DESIGN §6) |
+| `rand-write-8k`   | `randwrite`, 8k, `fsync=1`, iodepth 32 | WAL `WriteAt` pattern |
 | `seq-read-1m`     | `read`, 1M            | Bulk GET ceiling                              |
 | `rand-read-8k`    | `randread`, 8k, iodepth 32 | RS reconstruction read fan-out           |
 
 ## Predastore Config
 
-Rendered from `predastore.toml.tmpl`:
+Uses `clusters/3node/cluster.toml` directly (static config, no templating):
 
-- **RS(2, 1)** — 2 data shards + 1 parity. Matches the Spinifex default.
-- **3 db nodes** on `10.11.12.{1,2,3}:{6660,6661,6662}` — Raft quorum for
-  metadata, node 1 is the bootstrap leader.
-- **3 QUIC storage nodes** on `10.11.12.{1,2,3}:{9991,9992,9993}` — shard
-  distribution across the three processes.
-- **Single bucket** `predastore` (type `distributed`) — warp targets this.
-- **No `[iam]` section** — predastore falls back to `ConfigProvider` for auth,
-  so the harness never tries to contact NATS (see
-  `predastore/s3/server.go:initCredentialProvider`).
-- **`-base-path $BENCH_DIR` passed on the CLI** — the distributed backend
-  reads `s.basePath` from the CLI flag, not from the TOML's `base_path`
-  (that only affects filesystem-backend buckets; see
-  `predastore/s3/server.go:337`). Per-node relative paths
-  (`distributed/db/node-N/`, `distributed/nodes/node-N/`) keep each
-  process's state cleanly separated under that root.
+- **RS(2, 1)** — 2 data shards + 1 parity.
+- **3 db nodes** on `10.11.12.{1,2,3}:6660` — Raft quorum for metadata,
+  node 1 is the bootstrap leader.
+- **3 QUIC storage nodes** on `10.11.12.{1,2,3}:9991` — shard distribution
+  across the three processes.
+- **No buckets configured** — warp creates its own via `--bucket=predastore`.
+- **Test credentials** — `AKIAIOSFODNN7EXAMPLE` / standard test secret key.
+  Self-contained; no AWS profile or credential files needed.
+- **`-base-path $PREDA_DIR/<cluster>` passed on the CLI** — the distributed
+  backend resolves relative data paths from the cluster config against this root.
 
 ## Deferred
 

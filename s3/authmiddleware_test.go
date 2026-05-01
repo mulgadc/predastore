@@ -22,8 +22,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			{
 				Name:     "test-bucket01",
 				Region:   "ap-southeast-2",
-				Type:     "fs",
-				Pathname: "tests/data/test-bucket01",
+				Type:     "distributed",
+				Pathname: "testdata/test-bucket01",
 				Public:   false, // Not public - requires authentication
 			},
 		},
@@ -85,8 +85,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 					assert.Fail(t, "Error generating auth header: %v", err)
 				}
 			},
-			expectStatus:   http.StatusOK,
-			expectResponse: "", // Response is XML ListBucketResult, just check status
+			expectStatus:   -1, // sentinel: assert NOT 403 (auth passed, backend is nil so handler may 500)
+			expectResponse: "",
 		},
 
 		{
@@ -239,23 +239,35 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 		},
 	}
 
+	server := NewHTTP2ServerWithBackend(s3Config, nil, NewConfigProvider(s3Config.Auth))
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create an HTTP/2 server for testing
-			server := NewHTTP2Server(s3Config)
-
 			// Create request
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			if tt.setupHeaders != nil {
 				tt.setupHeaders(req)
 			}
 
-			// Perform request
-			rr := httptest.NewRecorder()
-			server.GetHandler().ServeHTTP(rr, req)
+			// Wrap a stub next handler so we exercise only the auth middleware
+			// and never reach the routed S3 handlers (which need a backend).
+			nextCalled := false
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nextCalled = true
+				w.WriteHeader(http.StatusOK)
+			})
 
-			// Check status code
-			assert.Equal(t, tt.expectStatus, rr.Code)
+			rr := httptest.NewRecorder()
+			server.sigV4AuthMiddleware(next).ServeHTTP(rr, req)
+
+			if tt.expectStatus == -1 {
+				// Sentinel: valid auth should pass through to next.
+				assert.True(t, nextCalled, "Valid signature should pass through to next handler")
+				assert.Equal(t, http.StatusOK, rr.Code)
+			} else {
+				assert.False(t, nextCalled, "Failing auth must not invoke next handler")
+				assert.Equal(t, tt.expectStatus, rr.Code)
+			}
 		})
 	}
 }

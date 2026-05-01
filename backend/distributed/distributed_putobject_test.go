@@ -31,8 +31,10 @@ func TestPutObjectWithTempFile(t *testing.T) {
 	cfg := &Config{
 		BadgerDir:      tmpDir,
 		PartitionCount: 5,
-		UseQUIC:        true,
 		QuicBasePort:   testBasePort,
+		Buckets: []BucketConfig{
+			{Name: bucket, Region: "us-east-1"},
+		},
 	}
 	b, err := New(cfg)
 	require.NoError(t, err)

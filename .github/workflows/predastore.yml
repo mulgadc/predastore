@@ -30,6 +30,9 @@ jobs:
           cache-dependency-path: "go.sum"
           go-version-file: "go.mod"
 
+      - name: Generate Certificates
+        run: make certs
+
       - name: Build Predastore
         run: make build
 
@@ -52,6 +55,9 @@ jobs:
         with:
           cache-dependency-path: "go.sum"
           go-version-file: "go.mod"
+
+      - name: Generate Certificates
+        run: make certs
 
       - name: Run Tests with Race Detector
         run: make test-race

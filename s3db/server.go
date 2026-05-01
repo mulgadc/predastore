@@ -75,8 +75,8 @@ func DefaultServerConfig() *ServerConfig {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
-		TLSCert:      "config/server.pem",
-		TLSKey:       "config/server.key",
+		TLSCert:      "certs/server.pem",
+		TLSKey:       "certs/server.key",
 	}
 }
 

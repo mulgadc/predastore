@@ -29,7 +29,6 @@ import (
 	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
-	"github.com/mulgadc/predastore/backend/filesystem"
 	"github.com/mulgadc/predastore/ratelimit"
 	"github.com/mulgadc/predastore/s3/chunked"
 )
@@ -72,7 +71,7 @@ func NewHTTP2Server(config *Config) *HTTP2Server {
 	if len(config.Nodes) > 0 {
 		s.backend = s.createDistributedBackend()
 	} else {
-		s.backend = s.createFilesystemBackend()
+		slog.Warn("No [[nodes]] configured, starting without storage backend")
 	}
 
 	s.setupRoutes()
@@ -94,26 +93,6 @@ func NewHTTP2ServerWithBackend(config *Config, be backend.Backend, credProv Cred
 
 	s.setupRoutes()
 	return s
-}
-
-func (s *HTTP2Server) createFilesystemBackend() backend.Backend {
-	buckets := make([]filesystem.BucketConfig, 0, len(s.config.Buckets))
-	for _, b := range s.config.Buckets {
-		buckets = append(buckets, filesystem.BucketConfig{
-			Name:     b.Name,
-			Pathname: b.Pathname,
-			Region:   b.Region,
-			Type:     b.Type,
-			Public:   b.Public,
-		})
-	}
-
-	config := &filesystem.Config{Buckets: buckets}
-	be, err := filesystem.New(config)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to create filesystem backend: %v", err))
-	}
-	return be
 }
 
 func (s *HTTP2Server) createDistributedBackend() backend.Backend {

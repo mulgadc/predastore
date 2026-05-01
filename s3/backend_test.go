@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -14,7 +15,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Note: BackendType, BackendFilesystem, and BackendDistributed are defined in server.go
+// testBucket is the bucket name used by all unit and integration tests.
+const testBucket = "test"
+
+// Note: BackendType and BackendDistributed are defined in server.go
+
+// newAuthTestConfig returns an inline Config for tests that only exercise
+// auth middleware (no real backend needed). Avoids reading any TOML file.
+func newAuthTestConfig() *Config {
+	return &Config{
+		Version: "1.0",
+		Region:  "ap-southeast-2",
+		Buckets: []S3_Buckets{
+			{Name: "test-bucket01", Region: "ap-southeast-2", Type: "distributed", Public: true},
+			{Name: "private", Region: "ap-southeast-2", Type: "distributed", Public: false},
+			{Name: "local", Region: "ap-southeast-2", Type: "distributed", Public: false},
+		},
+		Auth: []AuthEntry{
+			{
+				AccessKeyID:     "AKIAIOSFODNN7EXAMPLE",
+				SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+				Policy: []PolicyRule{
+					{Bucket: "private", Actions: []string{"s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListAllMyBuckets"}},
+					{Bucket: "local", Actions: []string{"s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListAllMyBuckets"}},
+				},
+			},
+		},
+	}
+}
 
 // TestBackend holds the configuration and server for a specific backend
 type TestBackend struct {
@@ -25,31 +53,6 @@ type TestBackend struct {
 	Backend     backend.Backend
 	QuicServers []*quicserver.QuicServer
 	Cleanup     func()
-}
-
-// setupFilesystemBackend creates a filesystem backend for testing
-func setupFilesystemBackend(t *testing.T) *TestBackend {
-	t.Helper()
-
-	s3 := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "server.toml"),
-	})
-	err := s3.ReadConfig()
-	require.NoError(t, err, "Should read config without error")
-
-	be := s3.createFilesystemBackend()
-	server := NewHTTP2ServerWithBackend(s3, be, NewConfigProvider(s3.Auth))
-
-	return &TestBackend{
-		Type:    BackendFilesystem,
-		Config:  s3,
-		Server:  server,
-		Handler: server.GetHandler(),
-		Backend: be,
-		Cleanup: func() {
-			be.Close()
-		},
-	}
 }
 
 // setupDistributedBackend creates a distributed backend for testing with QUIC servers
@@ -65,7 +68,7 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 	require.NoError(t, os.MkdirAll(badgerDir, 0750))
 
 	s3 := New(&Config{
-		ConfigPath: filepath.Join("tests", "config", "cluster.toml"),
+		ConfigPath: filepath.Join("..", "config", "7node.toml"),
 	})
 	err := s3.ReadConfig()
 	require.NoError(t, err, "Should read config without error")
@@ -99,7 +102,6 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 		DataShards:     s3.RS.Data,
 		ParityShards:   s3.RS.Parity,
 		PartitionCount: nodeCount,
-		UseQUIC:        true,
 		QuicBasePort:   basePort,
 		Buckets:        buckets,
 	}
@@ -119,6 +121,15 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 
 	// Allow QUIC servers time to start
 	time.Sleep(100 * time.Millisecond)
+
+	// Create the shared test bucket so tests don't have to.
+	_, err = be.CreateBucket(context.Background(), &backend.CreateBucketRequest{
+		Bucket:    testBucket,
+		Region:    s3.Region,
+		OwnerID:   s3.Auth[0].AccessKeyID,
+		AccountID: s3.Auth[0].AccountID,
+	})
+	require.NoError(t, err, "CreateBucket %q should succeed", testBucket)
 
 	server := NewHTTP2ServerWithBackend(s3, be, NewConfigProvider(s3.Auth))
 
@@ -147,8 +158,6 @@ func RunWithBackends(t *testing.T, backends []BackendType, testFn func(t *testin
 		t.Run(string(backendType), func(t *testing.T) {
 			var tb *TestBackend
 			switch backendType {
-			case BackendFilesystem:
-				tb = setupFilesystemBackend(t)
 			case BackendDistributed:
 				tb = setupDistributedBackend(t)
 			default:
@@ -163,12 +172,7 @@ func RunWithBackends(t *testing.T, backends []BackendType, testFn func(t *testin
 
 // AllBackends returns all available backend types for testing
 func AllBackends() []BackendType {
-	return []BackendType{BackendFilesystem, BackendDistributed}
-}
-
-// FilesystemOnly returns only the filesystem backend for testing
-func FilesystemOnly() []BackendType {
-	return []BackendType{BackendFilesystem}
+	return []BackendType{BackendDistributed}
 }
 
 // DistributedOnly returns only the distributed backend for testing
