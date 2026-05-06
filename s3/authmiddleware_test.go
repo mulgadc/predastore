@@ -272,6 +272,71 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 	}
 }
 
+// TestSigV4AuthMiddleware_RequireSignedHeaders verifies that requests whose
+// SigV4 SignedHeaders list omits "host" or "x-amz-date" are rejected with
+// AuthorizationHeaderMalformed. AWS SDKs always sign both; omitting either
+// would let a captured Authorization header replay against a different vhost
+// or outside the X-Amz-Date skew window.
+func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
+	s3Config := &Config{
+		Region: "ap-southeast-2",
+		Buckets: []S3_Buckets{{
+			Name:     "test-bucket01",
+			Region:   "ap-southeast-2",
+			Type:     "distributed",
+			Pathname: "testdata/test-bucket01",
+			Public:   false,
+		}},
+		Auth: []AuthEntry{{
+			AccessKeyID:     "TESTACCESSKEY",
+			SecretAccessKey: "TESTSECRETKEY",
+			Policy: []PolicyRule{{
+				Bucket:  "test-bucket01",
+				Actions: []string{"s3:GetObject", "s3:ListBucket"},
+			}},
+		}},
+	}
+	server := NewHTTP2ServerWithBackend(s3Config, nil, NewConfigProvider(s3Config.Auth))
+
+	rewriteSignedHeaders := func(req *http.Request, list string) {
+		ah := req.Header.Get("Authorization")
+		parts := strings.Split(ah, ", ")
+		if len(parts) != 3 {
+			t.Fatalf("expected 3-part auth header, got %d", len(parts))
+		}
+		parts[1] = "SignedHeaders=" + list
+		req.Header.Set("Authorization", strings.Join(parts, ", "))
+	}
+
+	tests := []struct {
+		name       string
+		signedList string
+	}{
+		{"missing host", "x-amz-date"},
+		{"missing x-amz-date", "host"},
+		{"neither present", "content-type"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/test-bucket01", nil)
+			ts := time.Now().UTC().Format(auth.TimeFormat)
+			err := auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", ts, "ap-southeast-2", "s3", req)
+			assert.NoError(t, err)
+			rewriteSignedHeaders(req, tt.signedList)
+
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Fatal("next handler must not be invoked when SignedHeaders guard fires")
+			})
+			rr := httptest.NewRecorder()
+			server.sigV4AuthMiddleware(next).ServeHTTP(rr, req)
+
+			assert.Equal(t, http.StatusForbidden, rr.Code)
+			assert.Contains(t, rr.Body.String(), "AuthorizationHeaderMalformed")
+		})
+	}
+}
+
 // TestSigV4AuthMiddleware_OversizeSignedBody verifies that a signed request
 // whose body exceeds maxAuthBodySize and does not use UNSIGNED-PAYLOAD or a
 // precomputed hash is rejected with 413 EntityTooLarge, not buffered and

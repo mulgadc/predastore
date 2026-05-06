@@ -301,6 +301,10 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		// Canonical headers
 		// Note: Go's net/http moves Host header from r.Header to r.Host
 		headers := strings.Split(signedHeaders, ";")
+		if err := auth.RequireSignedHeaders(headers); err != nil {
+			s.writeS3Error(w, r, http.StatusForbidden, "AuthorizationHeaderMalformed", err.Error())
+			return
+		}
 		sort.Strings(headers)
 
 		canonicalHeaders := ""

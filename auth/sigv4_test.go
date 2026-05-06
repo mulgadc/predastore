@@ -277,6 +277,67 @@ func TestGenerateAuthHeaderReq(t *testing.T) {
 	})
 }
 
+func TestRequireSignedHeaders(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers []string
+		wantErr string
+	}{
+		{
+			name:    "host and x-amz-date present",
+			headers: []string{"host", "x-amz-date"},
+			wantErr: "",
+		},
+		{
+			name:    "host, x-amz-date, content-type present",
+			headers: []string{"content-type", "host", "x-amz-date"},
+			wantErr: "",
+		},
+		{
+			name:    "case-insensitive Host accepted",
+			headers: []string{"Host", "X-Amz-Date"},
+			wantErr: "",
+		},
+		{
+			name:    "leading/trailing whitespace tolerated",
+			headers: []string{" host ", "\tx-amz-date\t"},
+			wantErr: "",
+		},
+		{
+			name:    "missing host",
+			headers: []string{"x-amz-date"},
+			wantErr: "host",
+		},
+		{
+			name:    "missing x-amz-date",
+			headers: []string{"host"},
+			wantErr: "x-amz-date",
+		},
+		{
+			name:    "both missing",
+			headers: []string{"content-type"},
+			wantErr: "host",
+		},
+		{
+			name:    "empty list",
+			headers: []string{},
+			wantErr: "host",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := RequireSignedHeaders(tt.headers)
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
 func TestTimeFormatConstants(t *testing.T) {
 	assert.Equal(t, "20060102T150405Z", TimeFormat)
 	assert.Equal(t, "20060102", ShortTimeFormat)

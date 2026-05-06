@@ -5,12 +5,14 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSignRequest(t *testing.T) {
@@ -293,6 +295,61 @@ func TestValidateSignatureHTTP_ReplayProtection(t *testing.T) {
 			if err != nil {
 				assert.Contains(t, err.Error(), tt.wantErrSub)
 			}
+		})
+	}
+}
+
+// TestValidateSignatureHTTP_RequireSignedHeaders verifies that requests
+// whose SigV4 SignedHeaders list omits "host" or "x-amz-date" are rejected
+// before signature comparison. AWS SDKs always sign both; omitting either
+// would let a captured Authorization header replay against a different vhost
+// or outside the X-Amz-Date skew window.
+func TestValidateSignatureHTTP_RequireSignedHeaders(t *testing.T) {
+	credentials := map[string]string{"TESTACCESSKEY": "TESTSECRETKEY"}
+	const region = "us-east-1"
+	const service = "s3db"
+
+	rewriteSignedHeaders := func(req *http.Request, newList string) {
+		ah := req.Header.Get("Authorization")
+		parts := strings.Split(ah, ", ")
+		require.Len(t, parts, 3)
+		parts[1] = "SignedHeaders=" + newList
+		req.Header.Set("Authorization", strings.Join(parts, ", "))
+	}
+
+	tests := []struct {
+		name       string
+		signedList string
+		wantErrSub string
+	}{
+		{
+			name:       "missing host rejected",
+			signedList: "x-amz-date",
+			wantErrSub: "host",
+		},
+		{
+			name:       "missing x-amz-date rejected",
+			signedList: "host",
+			wantErrSub: "x-amz-date",
+		},
+		{
+			name:       "neither present rejected",
+			signedList: "content-type",
+			wantErrSub: "host",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v1/get/test-table/test-key", nil)
+			req.Host = "localhost:6660"
+			ts := time.Now().UTC().Format(auth.TimeFormat)
+			require.NoError(t, auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", ts, region, service, req))
+			rewriteSignedHeaders(req, tt.signedList)
+
+			_, err := ValidateSignatureHTTP(req, credentials, region, service)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErrSub)
 		})
 	}
 }

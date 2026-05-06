@@ -28,6 +28,29 @@ func HashSHA256(s string) string {
 	return hex.EncodeToString(hash[:])
 }
 
+// RequireSignedHeaders enforces that SigV4 SignedHeaders includes both
+// "host" and "x-amz-date". Omitting either lets a captured Authorization
+// header be replayed against a different vhost or outside the clock-skew
+// window. AWS SDKs always sign both; rejecting requests that don't is safe.
+func RequireSignedHeaders(headers []string) error {
+	var hasHost, hasDate bool
+	for _, h := range headers {
+		switch strings.ToLower(strings.TrimSpace(h)) {
+		case "host":
+			hasHost = true
+		case "x-amz-date":
+			hasDate = true
+		}
+	}
+	if !hasHost {
+		return fmt.Errorf("SignedHeaders must include host")
+	}
+	if !hasDate {
+		return fmt.Errorf("SignedHeaders must include x-amz-date")
+	}
+	return nil
+}
+
 // HmacSHA256 returns the HMAC-SHA256 of data using the given key
 func HmacSHA256(key []byte, data string) []byte {
 	h := hmac.New(sha256.New, key)
