@@ -320,6 +320,11 @@ func (s *Server) launchDBServers() []*s3db.Server {
 		}
 	}
 
+	if len(credentials) == 0 {
+		slog.Error("No s3db credentials configured; refusing to launch database servers (set credentials on [[db]] or [[auth]])")
+		return nil
+	}
+
 	// Determine which nodes to launch
 	var nodesToLaunch []s3db.DBNodeConfig
 	if s.nodeID > 0 {
