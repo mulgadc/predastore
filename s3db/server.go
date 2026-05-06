@@ -717,6 +717,9 @@ func ValidateSignatureHTTP(r *http.Request, credentials map[string]string, regio
 	// Build canonical headers
 	// Note: Go's net/http moves Host header to r.Host, not r.Header
 	headers := strings.Split(signedHeaders, ";")
+	if err := auth.RequireSignedHeaders(headers); err != nil {
+		return "", err
+	}
 	sort.Strings(headers)
 
 	canonicalHeaders := ""
