@@ -86,6 +86,12 @@ func NewServer(config *ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("cluster config is required")
 	}
 
+	// Fail closed: an empty credentials map would otherwise grant unauthenticated
+	// access to the Raft-backed IAM mutation endpoints under /v1/*.
+	if len(config.Credentials) == 0 {
+		return nil, fmt.Errorf("s3db: no credentials configured; refusing to start (set credentials on [[db]] or [[auth]])")
+	}
+
 	// Initialize Raft node
 	node, err := NewRaftNode(config.ClusterConfig)
 	if err != nil {
@@ -141,12 +147,6 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip auth for health and status endpoints
 		if r.URL.Path == "/health" || r.URL.Path == "/status" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Skip auth if no credentials configured
-		if len(s.config.Credentials) == 0 {
 			next.ServeHTTP(w, r)
 			return
 		}
