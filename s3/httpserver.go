@@ -428,7 +428,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		// Runs after IAM evaluation so explicit IAM denies still short-circuit.
 		// Skipped for ListAllMyBuckets (no bucket component, already account-scoped)
 		// and CreateBucket (no existing owner to compare against).
-		if bucket := bucketFromPath(path); bucket != "" && !(method == http.MethodPut && !pathHasObjectKey(path)) {
+		if bucket := bucketFromPath(path); bucket != "" && (method != http.MethodPut || pathHasObjectKey(path)) {
 			meta, err := s.resolveBucketMetadata(bucket)
 			if err != nil {
 				slog.Error("Failed to resolve bucket metadata for ownership check",
@@ -1012,8 +1012,8 @@ func bucketFromPath(path string) string {
 	if cleanPath == "" {
 		return ""
 	}
-	if idx := strings.IndexByte(cleanPath, '/'); idx >= 0 {
-		return cleanPath[:idx]
+	if before, _, ok := strings.Cut(cleanPath, "/"); ok {
+		return before
 	}
 	return cleanPath
 }
