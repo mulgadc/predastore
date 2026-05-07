@@ -33,3 +33,19 @@ func TestReadInvalidConfig(t *testing.T) {
 	// All bucket names are invalid — none should survive validation
 	assert.Zero(t, len(s3.Buckets))
 }
+
+func TestReadConfig_AuthMissingAccountIDIsHardError(t *testing.T) {
+	s3 := New(&Config{ConfigPath: filepath.Join("testdata", "missing_auth_account_id.toml")})
+	err := s3.ReadConfig()
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "missing account_id")
+}
+
+func TestReadConfig_BucketMissingAccountIDIsHardError(t *testing.T) {
+	s3 := New(&Config{ConfigPath: filepath.Join("testdata", "missing_bucket_account_id.toml")})
+	err := s3.ReadConfig()
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "missing account_id")
+}

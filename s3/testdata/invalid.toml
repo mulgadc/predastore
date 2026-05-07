@@ -10,6 +10,7 @@ region = "ap-southeast-2"
 type = "distributed"
 public = false
 encryption = ""
+account_id = "123456789012"
 
 # Invalid bucket name < 3 chars
 [[buckets]]
@@ -18,6 +19,7 @@ region = "ap-southeast-2"
 type = "distributed"
 public = false
 encryption = ""
+account_id = "123456789012"
 
 # Invalid bucket name > 63 chars
 [[buckets]]
@@ -26,6 +28,7 @@ region = "ap-southeast-2"
 type = "distributed"
 public = false
 encryption = ""
+account_id = "123456789012"
 
 # Invalid bucket name contains _ chars
 [[buckets]]
@@ -34,6 +37,7 @@ region = "ap-southeast-2"
 type = "distributed"
 public = false
 encryption = ""
+account_id = "123456789012"
 
 # Invalid bucket name contains special chars
 [[buckets]]
@@ -42,6 +46,7 @@ region = "ap-southeast-2"
 type = "distributed"
 public = false
 encryption = ""
+account_id = "123456789012"
 
 # Invalid bucket must end in a-z0-9
 [[buckets]]
@@ -50,6 +55,7 @@ region = "ap-southeast-2"
 type = "distributed"
 public = false
 encryption = ""
+account_id = "123456789012"
 
 [[auth]]
 access_key_id = "AKIAIOSFODNN7EXAMPLE"

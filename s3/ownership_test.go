@@ -27,25 +27,33 @@ func TestBucketAccessAllowed(t *testing.T) {
 
 	tests := []struct {
 		name            string
+		method          string
 		caller          string
 		meta            *backend.BucketMetadata
 		skipPolicyCheck bool
 		want            bool
 	}{
-		{"same account", "000000000001", owned, false, true},
-		{"cross account", "000000000002", owned, false, false},
-		{"cross account against config bucket", "000000000002", configBucket, false, false},
-		{"public bucket cross-account read", "000000000002", publicBucket, false, true},
-		{"public bucket anonymous", "", publicBucket, false, true},
-		{"skip policy check service account", "", owned, true, true},
-		{"skip policy check on config bucket", "", configBucket, true, true},
-		{"nil metadata fails closed", "000000000001", nil, false, false},
-		{"empty owner account never matches", "", &backend.BucketMetadata{AccountID: ""}, false, false},
+		{"same account read", http.MethodGet, "000000000001", owned, false, true},
+		{"same account write", http.MethodPut, "000000000001", owned, false, true},
+		{"cross account read", http.MethodGet, "000000000002", owned, false, false},
+		{"cross account write", http.MethodPut, "000000000002", owned, false, false},
+		{"cross account against config bucket", http.MethodGet, "000000000002", configBucket, false, false},
+		{"public bucket cross-account GET", http.MethodGet, "000000000002", publicBucket, false, true},
+		{"public bucket cross-account HEAD", http.MethodHead, "000000000002", publicBucket, false, true},
+		{"public bucket cross-account PUT denied", http.MethodPut, "000000000002", publicBucket, false, false},
+		{"public bucket cross-account DELETE denied", http.MethodDelete, "000000000002", publicBucket, false, false},
+		{"public bucket cross-account POST denied", http.MethodPost, "000000000002", publicBucket, false, false},
+		{"public bucket anonymous GET", http.MethodGet, "", publicBucket, false, true},
+		{"public bucket anonymous PUT denied", http.MethodPut, "", publicBucket, false, false},
+		{"skip policy check service account", http.MethodPut, "", owned, true, true},
+		{"skip policy check on config bucket", http.MethodDelete, "", configBucket, true, true},
+		{"nil metadata fails closed", http.MethodGet, "000000000001", nil, false, false},
+		{"empty owner account never matches", http.MethodGet, "", &backend.BucketMetadata{AccountID: ""}, false, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := bucketAccessAllowed(tt.caller, tt.meta, tt.skipPolicyCheck)
+			got := bucketAccessAllowed(tt.method, tt.caller, tt.meta, tt.skipPolicyCheck)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -69,12 +77,18 @@ func (p *stubCredProvider) Close() {}
 
 // stubBackend implements backend.Backend with only GetBucketMetadata exercised.
 // Other methods return ErrInternalError so any unexpected route invocation is
-// obvious in test failures.
+// obvious in test failures. metadataErr, when non-nil, makes GetBucketMetadata
+// return that error verbatim (used to exercise the infra-error branch of
+// resolveBucketMetadata).
 type stubBackend struct {
-	buckets map[string]*backend.BucketMetadata
+	buckets     map[string]*backend.BucketMetadata
+	metadataErr error
 }
 
 func (b *stubBackend) GetBucketMetadata(bucket string) (*backend.BucketMetadata, error) {
+	if b.metadataErr != nil {
+		return nil, b.metadataErr
+	}
 	if m, ok := b.buckets[bucket]; ok {
 		return m, nil
 	}
@@ -259,7 +273,9 @@ func TestOwnership_OwnerWithoutIAMPolicyDenied(t *testing.T) {
 }
 
 // CreateBucket (PUT /{bucket}) skips the ownership check because there is no
-// existing owner to compare against.
+// existing owner to compare against. Paired with object-PUT below to prove the
+// skip is genuinely scoped to bare-bucket PUTs and not a blanket
+// "all PUTs bypass ownership".
 func TestOwnership_CreateBucketSkipsOwnershipCheck(t *testing.T) {
 	server := ownershipServer(t)
 	// "fresh-bucket" does not exist in stubBackend or config — without the skip,
@@ -269,6 +285,94 @@ func TestOwnership_CreateBucketSkipsOwnershipCheck(t *testing.T) {
 	status, nextCalled, _ := runMiddleware(t, server, req)
 	assert.True(t, nextCalled)
 	assert.Equal(t, http.StatusOK, status)
+
+	// Object-PUT against the same caller's foreign bucket must still be
+	// rejected — the skip applies to CreateBucket only.
+	req = signedReq(t, http.MethodPut, "/owner-bucket/some-key", keyOther)
+	status, nextCalled, body := runMiddleware(t, server, req)
+	assert.False(t, nextCalled, "cross-account object PUT must not bypass ownership")
+	assert.Equal(t, http.StatusForbidden, status)
+	assert.Contains(t, body, "AccessDenied")
+}
+
+// Cross-account access on every object verb must be denied. Without these
+// cases a regression in the CreateBucket skip would silently allow
+// cross-account object reads and writes.
+func TestOwnership_CrossAccountDeniedOnObjectVerbs(t *testing.T) {
+	server := ownershipServer(t)
+	verbs := []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete}
+	for _, m := range verbs {
+		t.Run(m, func(t *testing.T) {
+			req := signedReq(t, m, "/owner-bucket/some-key", keyOther)
+			status, nextCalled, body := runMiddleware(t, server, req)
+			assert.False(t, nextCalled)
+			assert.Equal(t, http.StatusForbidden, status)
+			assert.Contains(t, body, "AccessDenied")
+		})
+	}
+}
+
+// Multipart upload entry points are object-keyed and must be subject to the
+// cross-account check on every step (initiate, upload-part, complete).
+func TestOwnership_CrossAccountDeniedOnMultipart(t *testing.T) {
+	server := ownershipServer(t)
+	cases := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{"CreateMultipartUpload", http.MethodPost, "/owner-bucket/some-key?uploads"},
+		{"UploadPart", http.MethodPut, "/owner-bucket/some-key?partNumber=1&uploadId=abc"},
+		{"CompleteMultipartUpload", http.MethodPost, "/owner-bucket/some-key?uploadId=abc"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := signedReq(t, tc.method, tc.path, keyOther)
+			status, nextCalled, body := runMiddleware(t, server, req)
+			assert.False(t, nextCalled)
+			assert.Equal(t, http.StatusForbidden, status)
+			assert.Contains(t, body, "AccessDenied")
+		})
+	}
+}
+
+// Sub-resource PUTs on an existing bucket (?policy, ?acl, ?versioning, ...)
+// must not be treated as CreateBucket — they would otherwise let a
+// cross-account caller write resource-level configuration.
+func TestOwnership_CrossAccountDeniedOnBucketSubresources(t *testing.T) {
+	server := ownershipServer(t)
+	subresources := []string{"acl", "policy", "versioning", "lifecycle", "cors", "tagging"}
+	for _, sub := range subresources {
+		t.Run(sub, func(t *testing.T) {
+			req := signedReq(t, http.MethodPut, "/owner-bucket?"+sub, keyOther)
+			status, nextCalled, body := runMiddleware(t, server, req)
+			assert.False(t, nextCalled, "sub-resource PUT must not bypass ownership")
+			assert.Equal(t, http.StatusForbidden, status)
+			assert.Contains(t, body, "AccessDenied")
+		})
+	}
+}
+
+// A non-NoSuchBucket backend error must surface as 500 InternalError without
+// invoking the route handler — a regression that swallowed the error and
+// returned (nil, nil) would silently allow cross-account access via the
+// "unknown bucket — let the handler return NoSuchBucket" branch.
+func TestOwnership_BackendErrorReturnsInternalError(t *testing.T) {
+	cfg := &Config{Region: "ap-southeast-2"} // no config buckets — force backend lookup
+	be := &stubBackend{
+		buckets:     map[string]*backend.BucketMetadata{},
+		metadataErr: errors.New("backend infrastructure failure"),
+	}
+	credProv := &stubCredProvider{creds: map[string]*CredentialResult{
+		keyOther: {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iamPolicyDocument{allowAllPolicy}},
+	}}
+	server := NewHTTP2ServerWithBackend(cfg, be, credProv)
+
+	req := signedReq(t, http.MethodGet, "/some-bucket", keyOther)
+	status, nextCalled, body := runMiddleware(t, server, req)
+	assert.False(t, nextCalled, "handler must not run when metadata lookup errors")
+	assert.Equal(t, http.StatusInternalServerError, status)
+	assert.Contains(t, body, "InternalError")
 }
 
 // ListAllMyBuckets has no bucket component so the ownership check is a no-op,

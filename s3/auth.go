@@ -356,6 +356,15 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 		return nil, fmt.Errorf("access key %s is inactive (status: %s)", accessKeyID, ak.Status)
 	}
 
+	// Reject malformed credentials at the boundary — an empty AccountID would
+	// silently propagate into the bucket-ownership check and fail closed for
+	// every authenticated request without any clear diagnostic.
+	if ak.AccountID == "" {
+		slog.Error("Access key has empty account_id — refusing to authenticate",
+			"accessKeyID", accessKeyID, "userName", ak.UserName)
+		return nil, fmt.Errorf("access key %s has empty account_id", accessKeyID)
+	}
+
 	// Decrypt the secret
 	secret, err := p.decrypt(ak.SecretAccessKey)
 	if err != nil {

@@ -43,18 +43,19 @@ func (s3 *Config) ReadConfig() (err error) {
 
 	// Loop through the buckets, if a directory is relative, add the base path
 	for k, b := range s3.Buckets {
+		// account_id is a hard requirement (bucket-ownership check has nothing
+		// to compare against without it) — validated before bucket-name checks
+		// so a malformed name cannot mask a missing owner.
+		if b.AccountID == "" {
+			return fmt.Errorf("bucket %q missing account_id", b.Name)
+		}
+
 		// Check if the bucket name is valid
 		err := IsValidBucketName(b.Name)
 		if err != nil {
 			slog.Warn("Invalid bucket name", "bucket", b.Name, "error", err)
 			continue
 			//return fmt.Errorf("invalid bucket name: %s", err)
-		}
-
-		// Every config-defined bucket needs an account_id so the ownership
-		// check has something to compare a non-owner caller against.
-		if b.AccountID == "" {
-			return fmt.Errorf("bucket %q missing account_id", b.Name)
 		}
 
 		// Create bucket directory if a pathname is configured

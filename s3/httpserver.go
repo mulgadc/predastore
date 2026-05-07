@@ -427,8 +427,12 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		// Bucket-ownership check (default-deny on cross-account access).
 		// Runs after IAM evaluation so explicit IAM denies still short-circuit.
 		// Skipped for ListAllMyBuckets (no bucket component, already account-scoped)
-		// and CreateBucket (no existing owner to compare against).
-		if bucket := bucketFromPath(path); bucket != "" && (method != http.MethodPut || pathHasObjectKey(path)) {
+		// and CreateBucket (no existing owner). A sub-resource query on a bare
+		// bucket (?policy, ?acl, ?versioning, ...) is NOT CreateBucket and must
+		// stay subject to the cross-account check.
+		bucket, key := parseS3Path(path)
+		isCreateBucket := method == http.MethodPut && bucket != "" && key == "" && r.URL.RawQuery == ""
+		if bucket != "" && !isCreateBucket {
 			meta, err := s.resolveBucketMetadata(bucket)
 			if err != nil {
 				slog.Error("Failed to resolve bucket metadata for ownership check",
@@ -439,7 +443,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			}
 			// Unknown bucket — let the route handler return NoSuchBucket so
 			// existence is reported consistently with non-authenticated paths.
-			if meta != nil && !bucketAccessAllowed(credResult.AccountID, meta, credResult.SkipPolicyCheck) {
+			if meta != nil && !bucketAccessAllowed(method, credResult.AccountID, meta, credResult.SkipPolicyCheck) {
 				slog.Warn("Cross-account bucket access denied",
 					"accessKeyID", accessKey,
 					"callerAccountID", credResult.AccountID,
@@ -1005,52 +1009,31 @@ func sigPrefix(s string) string {
 	return s[:8]
 }
 
-// bucketFromPath extracts the bucket name from a request URL path. Returns
-// "" for the root path (ListAllMyBuckets).
-func bucketFromPath(path string) string {
-	cleanPath := strings.TrimPrefix(path, "/")
-	if cleanPath == "" {
-		return ""
-	}
-	if before, _, ok := strings.Cut(cleanPath, "/"); ok {
-		return before
-	}
-	return cleanPath
-}
-
-// pathHasObjectKey reports whether a request URL path includes an object key
-// after the bucket component.
-func pathHasObjectKey(path string) bool {
-	cleanPath := strings.TrimPrefix(path, "/")
-	idx := strings.IndexByte(cleanPath, '/')
-	return idx >= 0 && idx < len(cleanPath)-1
-}
-
-// resolveBucketMetadata returns metadata for the named bucket, falling back to
-// config-defined buckets when no s3db record exists. Returns nil with no error
-// when the bucket is unknown — the route handler is responsible for returning
-// NoSuchBucket so existence is reported consistently.
+// resolveBucketMetadata returns metadata for the named bucket. Config-defined
+// buckets (static, known at startup) are checked first to avoid a synchronous
+// backend round-trip on every authenticated request. Returns nil with no error
+// when the bucket is unknown anywhere — the route handler is responsible for
+// returning NoSuchBucket so existence is reported consistently.
 func (s *HTTP2Server) resolveBucketMetadata(bucket string) (*backend.BucketMetadata, error) {
-	if s.backend != nil {
-		meta, err := s.backend.GetBucketMetadata(bucket)
-		if err == nil {
-			return meta, nil
-		}
-		if backendErr, ok := backend.IsS3Error(err); !ok || backendErr.Code != backend.ErrNoSuchBucket {
-			return nil, err
-		}
+	if b, err := s.config.BucketConfig(bucket); err == nil {
+		return &backend.BucketMetadata{
+			Name:      b.Name,
+			Region:    b.Region,
+			AccountID: b.AccountID,
+			Public:    b.Public,
+		}, nil
 	}
-	for _, b := range s.config.Buckets {
-		if b.Name == bucket {
-			return &backend.BucketMetadata{
-				Name:      b.Name,
-				Region:    b.Region,
-				AccountID: b.AccountID,
-				Public:    b.Public,
-			}, nil
-		}
+	if s.backend == nil {
+		return nil, nil
 	}
-	return nil, nil
+	meta, err := s.backend.GetBucketMetadata(bucket)
+	if err == nil {
+		return meta, nil
+	}
+	if backendErr, ok := backend.IsS3Error(err); ok && backendErr.Code == backend.ErrNoSuchBucket {
+		return nil, nil
+	}
+	return nil, err
 }
 
 // isHexSHA256 returns true if s is exactly 64 lowercase hex characters (a SHA-256 digest).

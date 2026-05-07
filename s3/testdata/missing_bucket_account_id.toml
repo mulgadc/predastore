@@ -1,0 +1,17 @@
+# Test fixture: a [[buckets]] entry without account_id must hard-fail config
+# load even when the bucket name itself is valid.
+version = "1.0"
+region = "ap-southeast-2"
+
+[[auth]]
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+account_id = "123456789012"
+policy = []
+
+[[buckets]]
+name = "valid-bucket-name"
+region = "ap-southeast-2"
+type = "distributed"
+public = false
+encryption = ""

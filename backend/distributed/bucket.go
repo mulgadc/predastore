@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"errors"
 	"strings"
 	"time"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/s3db"
 )
 
 // Compile-time check that *Backend satisfies backend.Backend.
@@ -212,7 +215,11 @@ func (b *Backend) removeBucketFromCache(name string) {
 func (b *Backend) GetBucketMetadata(bucket string) (*backend.BucketMetadata, error) {
 	data, err := b.globalState.Get(TableBuckets, []byte(bucket))
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "KeyNotFound") {
+		// Typed sentinels rather than substring matching — a transient backend
+		// error whose message coincidentally contained "not found" would
+		// otherwise be silently converted into NoSuchBucket and short-circuit
+		// the bucket-ownership check via the config fallback.
+		if errors.Is(err, badger.ErrKeyNotFound) || errors.Is(err, s3db.ErrKeyNotFound) {
 			return nil, backend.ErrNoSuchBucketError.WithResource(bucket)
 		}
 		return nil, err
