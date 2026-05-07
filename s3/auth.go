@@ -24,7 +24,11 @@ type CredentialResult struct {
 	SecretAccessKey string
 	AccountID       string
 	UserName        string
-	SkipPolicyCheck bool                // true for config-based entries (implicit full access)
+	// SkipPolicyCheck marks the caller as a trusted config-based service
+	// account. It bypasses both the IAM policy check AND the bucket-ownership
+	// check, granting unrestricted access to every bucket regardless of owner.
+	// Adding an [[auth]] entry to predastore.toml therefore grants god-mode.
+	SkipPolicyCheck bool
 	PolicyDocuments []iamPolicyDocument // resolved policies (only for NATS-sourced credentials)
 }
 

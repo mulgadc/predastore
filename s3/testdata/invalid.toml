@@ -54,6 +54,7 @@ encryption = ""
 [[auth]]
 access_key_id = "AKIAIOSFODNN7EXAMPLE"
 secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+account_id = "123456789012"
 policy = [
   { bucket = "private", actions = ["s3:ListBucket",  "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListAllMyBuckets"] },
   { bucket = "secure", actions = ["s3:ListBucket", "s3:ListAllMyBuckets", "s3:GetObject"] },

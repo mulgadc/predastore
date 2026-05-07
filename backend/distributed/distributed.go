@@ -40,10 +40,11 @@ type NodeConfig struct {
 
 // BucketConfig holds configuration for a bucket
 type BucketConfig struct {
-	Name   string
-	Region string
-	Type   string
-	Public bool
+	Name      string
+	Region    string
+	Type      string
+	Public    bool
+	AccountID string
 }
 
 // Config holds distributed backend configuration

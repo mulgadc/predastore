@@ -30,6 +30,15 @@ func (s3 *Config) ReadConfig() (err error) {
 
 	err = toml.Unmarshal(config, &s3)
 
+	// Every config-defined service account must have an account_id so that
+	// buckets it creates land with a real owner ID — otherwise the ownership
+	// check would compare callerAccountID against "".
+	for i, a := range s3.Auth {
+		if a.AccountID == "" {
+			return fmt.Errorf("auth entry %d (access_key_id=%q) missing account_id", i, a.AccessKeyID)
+		}
+	}
+
 	var validBuckets = []S3_Buckets{}
 
 	// Loop through the buckets, if a directory is relative, add the base path
@@ -40,6 +49,12 @@ func (s3 *Config) ReadConfig() (err error) {
 			slog.Warn("Invalid bucket name", "bucket", b.Name, "error", err)
 			continue
 			//return fmt.Errorf("invalid bucket name: %s", err)
+		}
+
+		// Every config-defined bucket needs an account_id so the ownership
+		// check has something to compare a non-owner caller against.
+		if b.AccountID == "" {
+			return fmt.Errorf("bucket %q missing account_id", b.Name)
 		}
 
 		// Create bucket directory if a pathname is configured

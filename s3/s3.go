@@ -21,6 +21,7 @@ type S3_Buckets struct {
 	Pathname   string `toml:"pathname"`
 	Public     bool   `toml:"public"`
 	Encryption string `toml:"encryption"`
+	AccountID  string `toml:"account_id"`
 }
 
 type RS struct {

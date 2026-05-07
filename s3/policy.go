@@ -3,7 +3,31 @@ package s3
 import (
 	"net/http"
 	"strings"
+
+	"github.com/mulgadc/predastore/backend"
 )
+
+// bucketAccessAllowed enforces the S3 default-deny ownership invariant on top
+// of an already-allowed IAM policy decision. Same-account callers pass; the
+// public flag opens anonymous read; SkipPolicyCheck callers (config-defined
+// service accounts) bypass entirely. Cross-account access requires a
+// resource-based grant (bucket policy / ACL) which is not yet wired up here.
+func bucketAccessAllowed(callerAccountID string, meta *backend.BucketMetadata, skipPolicyCheck bool) bool {
+	if skipPolicyCheck {
+		return true
+	}
+	if meta == nil {
+		return false
+	}
+	if meta.AccountID != "" && callerAccountID == meta.AccountID {
+		return true
+	}
+	if meta.Public {
+		return true
+	}
+	// TODO: bucket-policy / ACL evaluation for cross-account grants.
+	return false
+}
 
 // s3Action maps HTTP method + path to the corresponding IAM S3 action.
 func s3Action(method, path string) string {

@@ -10,6 +10,9 @@ import (
 	"github.com/mulgadc/predastore/backend"
 )
 
+// Compile-time check that *Backend satisfies backend.Backend.
+var _ backend.Backend = (*Backend)(nil)
+
 // CreateBucket creates a new bucket in the distributed store
 func (b *Backend) CreateBucket(ctx context.Context, req *backend.CreateBucketRequest) (*backend.CreateBucketResponse, error) {
 	// Validate bucket name

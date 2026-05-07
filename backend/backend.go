@@ -20,6 +20,7 @@ type Backend interface {
 	HeadBucket(ctx context.Context, req *HeadBucketRequest) (*HeadBucketResponse, error)
 	ListBuckets(ctx context.Context, accountID string) (*ListBucketsResponse, error)
 	ListObjects(ctx context.Context, req *ListObjectsRequest) (*ListObjectsResponse, error)
+	GetBucketMetadata(bucket string) (*BucketMetadata, error)
 
 	// Multipart upload operations
 	CreateMultipartUpload(ctx context.Context, req *CreateMultipartUploadRequest) (*CreateMultipartUploadResponse, error)

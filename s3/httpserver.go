@@ -114,10 +114,11 @@ func (s *HTTP2Server) createDistributedBackend() backend.Backend {
 	buckets := make([]distributed.BucketConfig, 0, len(s.config.Buckets))
 	for _, b := range s.config.Buckets {
 		buckets = append(buckets, distributed.BucketConfig{
-			Name:   b.Name,
-			Region: b.Region,
-			Type:   b.Type,
-			Public: b.Public,
+			Name:      b.Name,
+			Region:    b.Region,
+			Type:      b.Type,
+			Public:    b.Public,
+			AccountID: b.AccountID,
 		})
 	}
 
@@ -418,6 +419,34 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 				slog.Debug("S3 access denied by policy",
 					"action", action, "resource", resource,
 					"accessKeyID", accessKey, "policyCount", len(credResult.PolicyDocuments))
+				s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
+				return
+			}
+		}
+
+		// Bucket-ownership check (default-deny on cross-account access).
+		// Runs after IAM evaluation so explicit IAM denies still short-circuit.
+		// Skipped for ListAllMyBuckets (no bucket component, already account-scoped)
+		// and CreateBucket (no existing owner to compare against).
+		if bucket := bucketFromPath(path); bucket != "" && !(method == http.MethodPut && !pathHasObjectKey(path)) {
+			meta, err := s.resolveBucketMetadata(bucket)
+			if err != nil {
+				slog.Error("Failed to resolve bucket metadata for ownership check",
+					"bucket", bucket, "error", err, "accessKeyID", accessKey)
+				s.writeS3Error(w, r, http.StatusInternalServerError, "InternalError",
+					"An internal error occurred")
+				return
+			}
+			// Unknown bucket — let the route handler return NoSuchBucket so
+			// existence is reported consistently with non-authenticated paths.
+			if meta != nil && !bucketAccessAllowed(credResult.AccountID, meta, credResult.SkipPolicyCheck) {
+				slog.Warn("Cross-account bucket access denied",
+					"accessKeyID", accessKey,
+					"callerAccountID", credResult.AccountID,
+					"bucketAccountID", meta.AccountID,
+					"bucket", bucket,
+					"action", s3Action(method, path),
+					"resource", s3Resource(path))
 				s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 				return
 			}
@@ -974,6 +1003,54 @@ func sigPrefix(s string) string {
 		return s
 	}
 	return s[:8]
+}
+
+// bucketFromPath extracts the bucket name from a request URL path. Returns
+// "" for the root path (ListAllMyBuckets).
+func bucketFromPath(path string) string {
+	cleanPath := strings.TrimPrefix(path, "/")
+	if cleanPath == "" {
+		return ""
+	}
+	if idx := strings.IndexByte(cleanPath, '/'); idx >= 0 {
+		return cleanPath[:idx]
+	}
+	return cleanPath
+}
+
+// pathHasObjectKey reports whether a request URL path includes an object key
+// after the bucket component.
+func pathHasObjectKey(path string) bool {
+	cleanPath := strings.TrimPrefix(path, "/")
+	idx := strings.IndexByte(cleanPath, '/')
+	return idx >= 0 && idx < len(cleanPath)-1
+}
+
+// resolveBucketMetadata returns metadata for the named bucket, falling back to
+// config-defined buckets when no s3db record exists. Returns nil with no error
+// when the bucket is unknown — the route handler is responsible for returning
+// NoSuchBucket so existence is reported consistently.
+func (s *HTTP2Server) resolveBucketMetadata(bucket string) (*backend.BucketMetadata, error) {
+	if s.backend != nil {
+		meta, err := s.backend.GetBucketMetadata(bucket)
+		if err == nil {
+			return meta, nil
+		}
+		if backendErr, ok := backend.IsS3Error(err); !ok || backendErr.Code != backend.ErrNoSuchBucket {
+			return nil, err
+		}
+	}
+	for _, b := range s.config.Buckets {
+		if b.Name == bucket {
+			return &backend.BucketMetadata{
+				Name:      b.Name,
+				Region:    b.Region,
+				AccountID: b.AccountID,
+				Public:    b.Public,
+			}, nil
+		}
+	}
+	return nil, nil
 }
 
 // isHexSHA256 returns true if s is exactly 64 lowercase hex characters (a SHA-256 digest).

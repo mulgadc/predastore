@@ -518,10 +518,11 @@ func (s *Server) createDistributedBackend() (backend.Backend, error) {
 	buckets := make([]distributed.BucketConfig, len(s.config.Buckets))
 	for i, b := range s.config.Buckets {
 		buckets[i] = distributed.BucketConfig{
-			Name:   b.Name,
-			Region: b.Region,
-			Type:   b.Type,
-			Public: b.Public,
+			Name:      b.Name,
+			Region:    b.Region,
+			Type:      b.Type,
+			Public:    b.Public,
+			AccountID: b.AccountID,
 		}
 	}
 
