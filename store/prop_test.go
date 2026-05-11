@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -43,9 +44,10 @@ type baseSM struct {
 	Real   *store.Store
 	Strict func() bool
 	Dir    string
+	AEAD   cipher.AEAD
 }
 
-func newBaseSM(dir string, refSt *storetest.RefStore, realSt *store.Store, strict func() bool) *baseSM {
+func newBaseSM(dir string, refSt *storetest.RefStore, realSt *store.Store, aead cipher.AEAD, strict func() bool) *baseSM {
 	if strict == nil {
 		strict = func() bool { return true }
 	}
@@ -55,6 +57,7 @@ func newBaseSM(dir string, refSt *storetest.RefStore, realSt *store.Store, stric
 		Real:   realSt,
 		Strict: strict,
 		Dir:    dir,
+		AEAD:   aead,
 	}
 }
 
@@ -85,7 +88,7 @@ func (sm *baseSM) Open(t *rapid.T) {
 		t.Skip("already open")
 	}
 
-	realSt, err := store.Open(sm.Dir, store.WithAEAD(storetest.TestAEAD()))
+	realSt, err := store.Open(sm.Dir, store.WithAEAD(sm.AEAD))
 	if err != nil {
 		if sm.Strict() {
 			t.Fatalf("open: real=%v", err)

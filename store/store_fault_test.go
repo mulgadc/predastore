@@ -132,6 +132,7 @@ func TestStoreFaults(t *testing.T) {
 		return &faultFile{File: f}, nil
 	})()
 
+	aead := storetest.TestAEAD()
 	rapid.Check(t, func(rt *rapid.T) {
 		state = faultState{}
 
@@ -144,14 +145,14 @@ func TestStoreFaults(t *testing.T) {
 		realSt, err := store.Open(
 			dir,
 			store.WithMaxSegSize(rapid.Uint64Range(16*store.KiB, 1*store.MiB).Draw(rt, "maxSegSize")),
-			store.WithAEAD(storetest.TestAEAD()),
+			store.WithAEAD(aead),
 		)
 		if err != nil {
 			rt.Fatalf("open: %v", err)
 		}
 
 		sm := &faultSM{
-			baseSM: newBaseSM(dir, refSt, realSt, func() bool { return !state.failed }),
+			baseSM: newBaseSM(dir, refSt, realSt, aead, func() bool { return !state.failed }),
 		}
 
 		defer func() {
