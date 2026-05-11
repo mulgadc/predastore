@@ -2,65 +2,55 @@ package store
 
 import (
 	"bytes"
-	"crypto/cipher"
 	"errors"
 	"fmt"
 	"io"
 )
 
-const writeBufLen = 32
+var ErrClosedWriter = errors.New("closed writer")
 
-// shardWriter buffers a single shard's fragments and seals each body in place
+// writer buffers a single shard's fragments and seals each body in place
 // before flushing. The internal buffer mirrors the on-disk layout (headers,
 // body slots, and tag slots interleaved) so flush can issue one WriteAt for
-// the whole window. bufPos advances past each fragment's tag slot when the
+// the whole window. cursor advances past each fragment's tag slot when the
 // body fills, so the next iteration starts cleanly on a fragment boundary.
-type shardWriter struct {
+type writer struct {
+	store      *Store
 	objectHash [32]byte
 	shardIndex uint32
 	storeID    uint32
-	aead       cipher.AEAD // shared cipher.AEAD built once at Store.Open; safe for concurrent use.
 
-	seg *segment // nil for 0-byte shards (no segment reservation).
+	seg *segment
 	ext extent
 
 	shardNum uint64
 	fragNum  uint64
 
-	buf    []byte
-	bufPos int64
-	extPos int64
+	// buf holds the unflushed fragment window. cursor is the offset into the
+	// shard's extent where the next byte will go; flushedTo is the same kind
+	// of offset, fixed to the last successful WriteAt. cursor - flushedTo is
+	// the live buffer-fill in bytes. dataLen tracks logical bytes written so
+	// we don't recompute it from cursor on every iteration.
+	buf       []byte
+	cursor    int64
+	flushedTo int64
+	dataLen   int64
 
-	onClose func() error
-	closed  bool
-}
-
-var ErrClosedWriter = errors.New("closed writer")
-
-// dataWritten derives logical bytes written from bufPos. Each complete fragment
-// contributes fragBodySize logical bytes; a partial fragment contributes
-// (bufPos % totalFragSize - fragHeaderSize) bytes once past the header.
-func (w *shardWriter) dataWritten() int64 {
-	return w.bufPos/totalFragSize*fragBodySize + max(0, w.bufPos%totalFragSize-fragHeaderSize)
+	closed bool
 }
 
 // Write copies p into the shard via ReadFrom over a bytes.Reader, sharing the
-// header/flush loop. Returns "shard full" if p doesn't fit in the remaining
-// logical capacity; the trailing io.EOF from a fully-consumed reader is
-// swallowed.
-func (w *shardWriter) Write(p []byte) (int, error) {
+// header/flush loop. Returns ErrShardFull if p doesn't fit in the remaining
+// logical capacity.
+func (w *writer) Write(p []byte) (int, error) {
 	if w.closed {
 		return 0, ErrClosedWriter
 	}
 
 	r := bytes.NewReader(p)
 	n, err := w.ReadFrom(r)
-	if errors.Is(err, io.EOF) {
-		err = nil
-	}
-
 	if err == nil && r.Len() > 0 {
-		err = fmt.Errorf("shard full")
+		err = ErrShardFull
 	}
 
 	return int(n), err
@@ -70,36 +60,42 @@ func (w *shardWriter) Write(p []byte) (int, error) {
 // io.ReadFull fills the body, capped at the remaining shard bytes so the
 // final partial fragment doesn't try to over-read. Flush triggers when the
 // buffer window fills or the shard is done.
-func (w *shardWriter) ReadFrom(r io.Reader) (total int64, err error) {
+//
+// If r is exhausted before the shard is filled (underfill), returns the
+// bytes consumed and io.EOF — the writer's Close will still flush whatever
+// partial bytes were buffered, but the index entry's LSize will exceed the
+// actual data; ReadAt of the unfilled tail will surface ErrIntegrity.
+func (w *writer) ReadFrom(r io.Reader) (total int64, err error) {
 	if w.closed {
 		return 0, ErrClosedWriter
 	}
 
-	for w.dataWritten() < w.ext.LSize {
-		bufPos := int(w.bufPos - w.extPos)
+	for w.dataLen < w.ext.LSize {
+		bufPos := int(w.cursor - w.flushedTo)
 		frag := (*fragment)(w.buf[bufPos : bufPos+totalFragSize])
 		frag.stampHeader(w.fragNum, w.shardNum)
 		w.fragNum++
-		w.bufPos += fragHeaderSize
+		w.cursor += fragHeaderSize
 
-		dataLeft := w.ext.LSize - w.dataWritten()
+		dataLeft := w.ext.LSize - w.dataLen
 		want := int(min(int64(fragBodySize), dataLeft))
 		n, readErr := io.ReadFull(r, frag.body()[:want])
 		if errors.Is(readErr, io.ErrUnexpectedEOF) {
 			readErr = io.EOF
 		}
-		w.bufPos += int64(n)
+		w.cursor += int64(n)
+		w.dataLen += int64(n)
 		total += int64(n)
 
 		// Skip the tag slot when the body filled, so the next iteration
 		// starts at a fragment boundary. The tag bytes themselves are
 		// written in place by flush()'s Seal.
 		if n == fragBodySize {
-			w.bufPos += fragTagSize
+			w.cursor += fragTagSize
 		}
 
-		if int(w.bufPos-w.extPos) >= len(w.buf) || w.dataWritten() >= w.ext.LSize {
-			if err := w.flush(w.dataWritten() >= w.ext.LSize); err != nil {
+		if int(w.cursor-w.flushedTo) >= len(w.buf) || w.dataLen >= w.ext.LSize {
+			if err := w.flush(w.dataLen >= w.ext.LSize); err != nil {
 				return total, err
 			}
 		}
@@ -113,41 +109,35 @@ func (w *shardWriter) ReadFrom(r io.Reader) (total int64, err error) {
 }
 
 // Close flushes any remaining buffered data, syncs the segment file, then
-// commits the extent to the index via onClose. Must be called exactly once.
-// The segment ref is always decremented on exit; the index commit only runs
-// when the data is fully durable, preserving rollback on flush/Sync failure.
-//
-// 0-byte shards have no segment — Close skips flush/Sync and just runs the
-// index commit.
-func (w *shardWriter) Close() (err error) {
+// commits the extent to the index. Must be called exactly once. The segment
+// ref is always decremented on exit; the index commit only runs when the
+// data is fully durable, preserving rollback on flush/Sync failure.
+func (w *writer) Close() (err error) {
 	if w.closed {
 		return ErrClosedWriter
 	}
 
 	w.closed = true
+	defer w.seg.releaseRef()
 
-	if w.seg != nil {
-		defer w.seg.refs.Add(-1)
-
-		if w.bufPos > w.extPos {
-			if err = w.flush(true); err != nil {
-				return err
-			}
-		}
-
-		if err = w.seg.Sync(); err != nil {
-			return fmt.Errorf("sync segment %d: %w", w.ext.SegNum, err)
+	if w.cursor > w.flushedTo {
+		if err = w.flush(true); err != nil {
+			return err
 		}
 	}
 
-	return w.onClose()
+	if err = w.seg.Sync(); err != nil {
+		return fmt.Errorf("sync segment %d: %w", w.ext.SegNum, err)
+	}
+
+	return w.store.commitExtent(w.objectHash, w.shardIndex, w.ext)
 }
 
 // flush seals each buffered fragment in place under aead, then writes the
 // whole window in one WriteAt. If final, the last fragment is sealed with the
 // flagEndOfShard flag and its size set to the actual data byte count.
-func (w *shardWriter) flush(final bool) error {
-	bufUsed := int(w.bufPos - w.extPos)
+func (w *writer) flush(final bool) error {
+	bufUsed := int(w.cursor - w.flushedTo)
 	if bufUsed <= 0 {
 		return nil
 	}
@@ -170,13 +160,13 @@ func (w *shardWriter) flush(final bool) error {
 			flags = flagEndOfShard
 		}
 
-		frag.seal(w.aead, w.objectHash, w.shardIndex, w.storeID, size, flags)
+		frag.seal(w.store.aead, w.objectHash, w.shardIndex, w.storeID, size, flags)
 	}
 
-	if _, err := w.seg.WriteAt(w.buf[:writeLen], w.ext.Off+w.extPos); err != nil {
-		return fmt.Errorf("write to segment %d at offset %d: %w", w.ext.SegNum, w.ext.Off+w.extPos, err)
+	if _, err := w.seg.WriteAt(w.buf[:writeLen], w.ext.Off+w.flushedTo); err != nil {
+		return fmt.Errorf("write to segment %d at offset %d: %w", w.ext.SegNum, w.ext.Off+w.flushedTo, err)
 	}
 
-	w.extPos = w.bufPos
+	w.flushedTo = w.cursor
 	return nil
 }

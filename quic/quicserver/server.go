@@ -3,6 +3,8 @@ package quicserver
 import (
 	"bufio"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -17,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/keyfile"
 	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/store"
@@ -35,7 +38,8 @@ type QuicServer struct {
 	Addr   string
 	WalDir string
 
-	masterKey []byte
+	aead           cipher.AEAD
+	keyFingerprint string
 
 	store *store.Store
 
@@ -60,9 +64,24 @@ type Option func(*QuicServer) error
 
 // WithMasterKey provides the 32-byte AES-256 master key used to seal/open
 // shard fragments. Required — NewWithRetry fails if no key is supplied.
+// The AEAD is built here once and handed down to the store; the raw key is
+// fingerprinted for logging and then dropped so it isn't retained on the
+// QuicServer.
 func WithMasterKey(key []byte) Option {
 	return func(qs *QuicServer) error {
-		qs.masterKey = key
+		if len(key) != keyfile.MasterKeySize {
+			return fmt.Errorf("master key must be %d bytes, got %d", keyfile.MasterKeySize, len(key))
+		}
+		block, err := aes.NewCipher(key)
+		if err != nil {
+			return fmt.Errorf("create AES cipher: %w", err)
+		}
+		aead, err := cipher.NewGCM(block)
+		if err != nil {
+			return fmt.Errorf("create GCM: %w", err)
+		}
+		qs.aead = aead
+		qs.keyFingerprint = keyfile.Fingerprint(key)
 		return nil
 	}
 }
@@ -129,12 +148,12 @@ func NewWithRetry(walDir string, addr string, maxRetries int, opts ...Option) (*
 		}
 	}
 
-	if qs.masterKey == nil {
+	if qs.aead == nil {
 		cancel()
 		return nil, fmt.Errorf("quicserver: master key is required (use WithMasterKey)")
 	}
 
-	s, err := store.Open(walDir, store.WithMasterKey(qs.masterKey))
+	s, err := store.Open(walDir, store.WithAEAD(qs.aead))
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("open store in %s: %w", walDir, err)
@@ -177,7 +196,12 @@ func NewWithRetry(walDir string, addr string, maxRetries int, opts ...Option) (*
 	}
 
 	qs.listener = l
-	slog.Info("QUIC RPC server listening", "addr", addr, "alpn", alpn, "walDir", walDir)
+	slog.Info("QUIC RPC server listening",
+		"addr", addr,
+		"alpn", alpn,
+		"walDir", walDir,
+		"keyFingerprint", qs.keyFingerprint,
+	)
 
 	// Start accept loop in goroutine
 	go qs.acceptLoop()

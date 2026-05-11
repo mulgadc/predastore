@@ -26,6 +26,12 @@ const (
 	fragBodySize   = 8 * KiB
 	fragTagSize    = 16
 	totalFragSize  = fragHeaderSize + fragBodySize + fragTagSize
+
+	// bufLen is the per-shard fragment window: shardWriter buffers this many
+	// fragments before issuing one WriteAt, and shardReader fills the same
+	// window per seg.ReadAt. Trades RAM (≈ bufLen * 8 KiB per reader/writer)
+	// for syscall amortization. Cap at shard's fragment count when smaller.
+	bufLen = 32
 )
 
 // AAD layout (52 bytes, big-endian):

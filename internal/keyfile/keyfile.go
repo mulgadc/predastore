@@ -1,8 +1,12 @@
-// Package crypto loads and identifies the cluster master key used to seal and
-// open shard fragments at rest. The key is held as a raw 32-byte slice — the
-// same on-disk format as the IAM master key — and never logged in raw form;
-// callers identify it via Fingerprint instead.
-package crypto
+// Package keyfile loads and identifies the cluster master key used to seal
+// and open shard fragments at rest. The key is held as a raw 32-byte slice —
+// the same on-disk format as the IAM master key — and never logged in raw
+// form; callers identify it via Fingerprint instead.
+//
+// This package lives at the operator-facing layer (S3 server, quicd, quicserver).
+// The store package never touches raw key bytes; it consumes a cipher.AEAD
+// constructed elsewhere.
+package keyfile
 
 import (
 	"crypto/sha256"
@@ -14,12 +18,12 @@ import (
 // MasterKeySize is the required length of an AES-256 master key in bytes.
 const MasterKeySize = 32
 
-// LoadMasterKey reads a 32-byte AES-256 master key from disk. It is fail-closed
-// on loose permissions: any group/other-readable mode (mode & 0077 != 0) is
-// rejected outright with no override. The master key gates plaintext access to
-// every object cluster-wide; warn-and-allow would put us one ignored log line
-// from a permanent breach.
-func LoadMasterKey(path string) ([]byte, error) {
+// Load reads a 32-byte AES-256 master key from disk. It is fail-closed on
+// loose permissions: any group/other-readable mode (mode & 0077 != 0) is
+// rejected outright with no override. The master key gates plaintext access
+// to every object cluster-wide; warn-and-allow would put us one ignored log
+// line from a permanent breach.
+func Load(path string) ([]byte, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat master key %s: %w", path, err)
