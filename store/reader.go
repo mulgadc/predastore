@@ -73,6 +73,11 @@ func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	totalCopied := 0
+	// Only the very first fragment we touch can start mid-body; all
+	// subsequent fragments (within or across batches) begin at body offset 0
+	// because each non-final copy consumes exactly fragBodySize logical bytes.
+	bodyOffset := int(off % fragBodySize)
+
 	for totalCopied < len(p) {
 		logicalPos := off + int64(totalCopied)
 		startFragIdx := logicalPos / fragBodySize
@@ -99,7 +104,7 @@ func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
 			ciphertext := r.buf[pos+fragHeaderSize : pos+totalFragSize]
 			plaintext, err := openFragment(r.aead, ciphertext, aad[:], nonce[:])
 			if err != nil {
-				return totalCopied, fmt.Errorf("segment %d offset %d: %w: %v", r.ext.SegNum, fragDiskOff, ErrIntegrity, err)
+				return totalCopied, fmt.Errorf("segment %d offset %d: %w: %w", r.ext.SegNum, fragDiskOff, ErrIntegrity, err)
 			}
 
 			payloadLen := int(binary.BigEndian.Uint32(r.buf[pos+20 : pos+24]))
@@ -107,9 +112,9 @@ func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
 				return totalCopied, fmt.Errorf("invalid payload length %d in segment %d at offset %d", payloadLen, r.ext.SegNum, fragDiskOff)
 			}
 
-			bodyOffset := int((off + int64(totalCopied)) % fragBodySize)
 			n := copy(p[totalCopied:], plaintext[bodyOffset:payloadLen])
 			totalCopied += n
+			bodyOffset = 0
 		}
 	}
 
