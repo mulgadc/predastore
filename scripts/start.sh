@@ -124,6 +124,20 @@ if [ ! -f "$TLS_CERT" ]; then
     log_info "Certificates written to $ROOT/"
 fi
 
+# --- Generate master encryption key ---
+#
+# s3d's keyfile loader is fail-closed on group/other-readable modes, so the
+# key file must be 0600. Create it under a tightened umask to avoid a
+# briefly world-readable window between open and chmod.
+
+MASTER_KEY="$ROOT/master.key"
+
+if [ ! -f "$MASTER_KEY" ]; then
+    log_info "Generating AES-256 master key..."
+    ( umask 0177 && openssl rand -out "$MASTER_KEY" 32 )
+    log_info "Master key written to $MASTER_KEY"
+fi
+
 # --- Build s3d if needed ---
 
 if [ ! -f "$S3D_BINARY" ]; then
@@ -175,6 +189,7 @@ echo "$DB_NODES" | while read -r node_id node_host; do
         -base-path "$BASE" \
         -tls-key "$TLS_KEY" \
         -tls-cert "$TLS_CERT" \
+        -encryption-key-file "$MASTER_KEY" \
         > "$log_file" 2>&1 &
 
     pid=$!
