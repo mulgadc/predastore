@@ -29,9 +29,10 @@ func makeNonce(fragNum uint64, storeID uint32) [12]byte {
 
 // makeAAD binds each fragment to its logical position. A tampered fragment
 // header or a fragment spliced into a different shard / object / position
-// produces a different AAD at read time, and GCM Open fails.
-func makeAAD(objectHash [32]byte, shardIndex uint32, shardNum, fragNum uint64) []byte {
-	aad := make([]byte, aadSize)
+// produces a different AAD at read time, and GCM Open fails. Returned by
+// value so it stays on the stack on the per-fragment hot path.
+func makeAAD(objectHash [32]byte, shardIndex uint32, shardNum, fragNum uint64) [aadSize]byte {
+	var aad [aadSize]byte
 	copy(aad[0:32], objectHash[:])
 	binary.BigEndian.PutUint32(aad[32:36], shardIndex)
 	binary.BigEndian.PutUint64(aad[36:44], shardNum)

@@ -13,10 +13,9 @@ import (
 
 const segFilename = "%016d.seg"
 
-// magic identifies segments written by the encryption-at-rest format. The bump
-// from the pre-encryption 'S','3','S','F' fails openSegment fast on any
-// pre-encryption data dir — there is no in-place migration path, the operator
-// must start fresh.
+// magic identifies the encryption-at-rest segment format. There is no in-place
+// migration from older formats — openSegment rejects them so the operator is
+// forced to start with a fresh data dir.
 var magic = [4]byte{'S', '3', 'S', 'E'}
 
 const (
@@ -48,7 +47,7 @@ const (
 //	[16:20] reserved
 //	[20:24] payloadLen — actual data bytes in this fragment's body (≤ fragBodySize)
 //	[24:28] flags      — fragFlags (flagEndOfShard marks the last fragment of a shard)
-//	[28:32] reserved   — was CRC32 pre-encryption; GCM is now the integrity authority
+//	[28:32] reserved
 const (
 	segHeaderSize     = 14
 	fragHeaderSize    = 32
@@ -214,7 +213,7 @@ func openSegment(dir string, num uint64) (*segment, error) {
 		var fileMagic [4]byte
 		copy(fileMagic[:], header[0:4])
 		if fileMagic != magic {
-			return nil, fmt.Errorf("segment %s: invalid magic %x (encryption-at-rest format change — a fresh data dir is required, pre-encryption data cannot be migrated in place)", path, fileMagic)
+			return nil, fmt.Errorf("segment %s: invalid magic %x: encryption-at-rest format requires a fresh data dir", path, fileMagic)
 		}
 	}
 
