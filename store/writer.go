@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"crypto/cipher"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -15,7 +14,7 @@ const writeBufLen = 32
 // before flushing. The internal buffer mirrors the on-disk layout (headers,
 // body slots, and tag slots interleaved) so flush can issue one WriteAt for
 // the whole window. bufPos advances past each fragment's tag slot when the
-// body fills, so writeHeader fires cleanly on the next iteration.
+// body fills, so the next iteration starts cleanly on a fragment boundary.
 type shardWriter struct {
 	objectHash [32]byte
 	shardIndex uint32
@@ -67,31 +66,35 @@ func (w *shardWriter) Write(p []byte) (int, error) {
 	return int(n), err
 }
 
-// ReadFrom streams from r into the shard until dataSize is reached or r returns
-// an error. Unlike Write, it returns io.EOF from r without treating it as a
-// fault — partial reads are flushed before the error propagates.
+// ReadFrom streams from r into the shard, one fragment per iteration.
+// io.ReadFull fills the body, capped at the remaining shard bytes so the
+// final partial fragment doesn't try to over-read. Flush triggers when the
+// buffer window fills or the shard is done.
 func (w *shardWriter) ReadFrom(r io.Reader) (total int64, err error) {
 	if w.closed {
 		return 0, ErrClosedWriter
 	}
 
 	for w.dataWritten() < w.ext.LSize {
-		if w.bufPos%totalFragSize == 0 {
-			w.writeHeader()
-		}
-
 		bufPos := int(w.bufPos - w.extPos)
-		bodyLeft := fragHeaderSize + fragBodySize - int(w.bufPos%totalFragSize)
-		dataLeft := int(w.ext.LSize - w.dataWritten())
+		frag := (*fragment)(w.buf[bufPos : bufPos+totalFragSize])
+		frag.stampHeader(w.fragNum, w.shardNum)
+		w.fragNum++
+		w.bufPos += fragHeaderSize
 
-		n, readErr := r.Read(w.buf[bufPos : bufPos+min(bodyLeft, dataLeft)])
+		dataLeft := w.ext.LSize - w.dataWritten()
+		want := int(min(int64(fragBodySize), dataLeft))
+		n, readErr := io.ReadFull(r, frag.body()[:want])
+		if errors.Is(readErr, io.ErrUnexpectedEOF) {
+			readErr = io.EOF
+		}
 		w.bufPos += int64(n)
 		total += int64(n)
 
-		// Jump over the tag slot at the end of each fragment so the next
-		// iteration's bufPos%totalFragSize == 0 triggers writeHeader cleanly.
-		// The tag bytes themselves are written in place by flush()'s Seal.
-		if int(w.bufPos%totalFragSize) == fragHeaderSize+fragBodySize {
+		// Skip the tag slot when the body filled, so the next iteration
+		// starts at a fragment boundary. The tag bytes themselves are
+		// written in place by flush()'s Seal.
+		if n == fragBodySize {
 			w.bufPos += fragTagSize
 		}
 
@@ -140,22 +143,9 @@ func (w *shardWriter) Close() (err error) {
 	return w.onClose()
 }
 
-// writeHeader writes fragNum and shardNum and zeroes the rest of the header.
-// flush fills in payloadLen and flags; bytes [28:32] stay zero.
-func (w *shardWriter) writeHeader() {
-	bufPos := int(w.bufPos - w.extPos)
-	binary.BigEndian.PutUint64(w.buf[bufPos:], w.fragNum)
-	binary.BigEndian.PutUint64(w.buf[bufPos+8:], w.shardNum)
-	clear(w.buf[bufPos+16 : bufPos+fragHeaderSize])
-	w.bufPos += fragHeaderSize
-	w.fragNum++
-}
-
-// flush fills in each buffered fragment's payloadLen and flags, seals the
-// body in place under aead, then writes the whole window in one WriteAt. If
-// final, the last fragment is zero-padded to fragBodySize before the seal
-// (the ciphertext is fixed-length regardless of payload) and gets
-// flagEndOfShard; payloadLen carries the actual data byte count.
+// flush seals each buffered fragment in place under aead, then writes the
+// whole window in one WriteAt. If final, the last fragment is sealed with the
+// flagEndOfShard flag and its size set to the actual data byte count.
 func (w *shardWriter) flush(final bool) error {
 	bufUsed := int(w.bufPos - w.extPos)
 	if bufUsed <= 0 {
@@ -165,42 +155,22 @@ func (w *shardWriter) flush(final bool) error {
 	fragCount := (bufUsed + totalFragSize - 1) / totalFragSize
 	writeLen := fragCount * totalFragSize
 
-	// writeHeader has already advanced w.fragNum past every fragment in this
-	// window; recover the starting fragNum so each iteration uses the value
-	// that landed in the on-disk header.
-	firstFragNum := w.fragNum - uint64(fragCount)
-
 	for i := range fragCount {
 		pos := i * totalFragSize
+		frag := (*fragment)(w.buf[pos : pos+totalFragSize])
 		isLast := final && i == fragCount-1
-		fragNum := firstFragNum + uint64(i)
 
-		// The final fragment may be partial (body not yet full → bodySize is
-		// the data byte count) or fully filled and already tag-skipped
-		// (bufUsed - pos - fragHeaderSize would overshoot fragBodySize by
-		// fragTagSize, so cap with min).
-		bodySize := fragBodySize
-		if isLast {
-			bodySize = min(bufUsed-pos-fragHeaderSize, fragBodySize)
-			if bodySize < fragBodySize {
-				clear(w.buf[pos+fragHeaderSize+bodySize : pos+fragHeaderSize+fragBodySize])
-			}
-		}
-		binary.BigEndian.PutUint32(w.buf[pos+20:pos+24], uint32(bodySize)) //nolint:gosec // bodySize bounded by fragBodySize (8 KiB).
-
+		// The final fragment may be partial (size = data byte count) or
+		// fully filled and already tag-skipped (bufUsed - pos - fragHeaderSize
+		// would overshoot fragBodySize by fragTagSize, so cap with min).
+		size := uint32(fragBodySize)
 		var flags fragFlags
 		if isLast {
+			size = uint32(min(bufUsed-pos-fragHeaderSize, fragBodySize)) //nolint:gosec // bounded by fragBodySize (8 KiB).
 			flags = flagEndOfShard
 		}
-		binary.BigEndian.PutUint32(w.buf[pos+24:pos+28], uint32(flags))
 
-		aad := makeAAD(w.objectHash, w.shardIndex, w.shardNum, fragNum)
-		nonce := makeNonce(fragNum, w.storeID)
-
-		// body slice has cap reaching exactly the tag slot so Seal's append
-		// lands ciphertext + tag in buf[pos+32 : pos+totalFragSize] in place.
-		body := w.buf[pos+fragHeaderSize : pos+fragHeaderSize+fragBodySize : pos+totalFragSize]
-		_ = sealFragment(w.aead, body, aad[:], nonce[:])
+		frag.seal(w.aead, w.objectHash, w.shardIndex, w.storeID, size, flags)
 	}
 
 	if _, err := w.seg.WriteAt(w.buf[:writeLen], w.ext.Off+w.extPos); err != nil {

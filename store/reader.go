@@ -2,7 +2,6 @@ package store
 
 import (
 	"crypto/cipher"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -11,9 +10,10 @@ import (
 const readBufLen = 32
 
 // shardReader provides random and sequential access to a single shard's data.
-// It reads one fragment at a time from disk, opens it under AES-256-GCM, and
-// copies the plaintext into the caller's buffer. bufPos tracks the logical
-// read position for sequential Read() calls; ReadAt is stateless.
+// It reads fragments from disk in batches of up to readBufLen, opens each
+// under AES-256-GCM, and copies the plaintext into the caller's buffer.
+// bufPos tracks the logical read position for sequential Read() calls; ReadAt
+// is stateless.
 type shardReader struct {
 	objectHash [32]byte
 	shardIndex uint32
@@ -57,8 +57,8 @@ func (r *shardReader) Read(p []byte) (int, error) {
 // mirrors the writer's one-WriteAt-per-window pattern so readBufLen acts as a
 // tunable syscall-batch knob symmetric with writeBufLen.
 //
-// Each fragment's body+tag is opened under AES-256-GCM. A failed Open wraps
-// ErrIntegrity — disk corruption, tamper, and wrong master key share one path.
+// A failed Open wraps ErrIntegrity — disk corruption, tamper, and wrong
+// master key share one path.
 func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
 	if r.closed {
 		return 0, ErrClosedReader
@@ -91,28 +91,14 @@ func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
 
 		for i := 0; i < batchFragCount && totalCopied < len(p); i++ {
 			pos := i * totalFragSize
-			fragDiskOff := batchDiskOff + int64(pos)
+			frag := (*fragment)(r.buf[pos : pos+totalFragSize])
 
-			// Reconstruct AAD/nonce from the on-disk header. Header tamper
-			// shifts AAD or nonce — Open then fails to authenticate.
-			fragNum := binary.BigEndian.Uint64(r.buf[pos : pos+8])
-			shardNum := binary.BigEndian.Uint64(r.buf[pos+8 : pos+16])
-			aad := makeAAD(r.objectHash, r.shardIndex, shardNum, fragNum)
-			nonce := makeNonce(fragNum, r.storeID)
-
-			// plaintext aliases r.buf[pos+fragHeaderSize : pos+fragHeaderSize+fragBodySize].
-			ciphertext := r.buf[pos+fragHeaderSize : pos+totalFragSize]
-			plaintext, err := openFragment(r.aead, ciphertext, aad[:], nonce[:])
+			plaintext, err := frag.open(r.aead, r.objectHash, r.shardIndex, r.storeID)
 			if err != nil {
-				return totalCopied, fmt.Errorf("segment %d offset %d: %w: %w", r.ext.SegNum, fragDiskOff, ErrIntegrity, err)
+				return totalCopied, fmt.Errorf("segment %d offset %d: %w", r.ext.SegNum, batchDiskOff+int64(pos), err)
 			}
 
-			payloadLen := int(binary.BigEndian.Uint32(r.buf[pos+20 : pos+24]))
-			if payloadLen > fragBodySize {
-				return totalCopied, fmt.Errorf("invalid payload length %d in segment %d at offset %d", payloadLen, r.ext.SegNum, fragDiskOff)
-			}
-
-			n := copy(p[totalCopied:], plaintext[bodyOffset:payloadLen])
+			n := copy(p[totalCopied:], plaintext[bodyOffset:])
 			totalCopied += n
 			bodyOffset = 0
 		}
