@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,11 @@ import (
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/require"
 )
+
+// s3BackendPortCounter gives each setupDistributedBackend invocation a unique
+// port range so concurrent or rapidly-sequenced test setups don't collide on
+// QUIC (UDP) ports the OS hasn't released yet.
+var s3BackendPortCounter atomic.Int32
 
 // testBucket is the bucket name used by all unit and integration tests.
 const testBucket = "test"
@@ -94,8 +100,7 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 		})
 	}
 
-	// Use a unique port range based on test timestamp to avoid conflicts
-	basePort := 10000 + (int(time.Now().UnixNano()/1000000) % 5000)
+	basePort := 14001 + int(s3BackendPortCounter.Add(1)-1)*20
 
 	config := &distributed.Config{
 		BadgerDir:      badgerDir,

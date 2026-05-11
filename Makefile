@@ -41,7 +41,7 @@ go_build_docker:
 # Preflight — runs the same checks as GitHub Actions (lint + security + tests).
 # Use this before committing to catch CI failures locally.
 preflight:
-	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage test-race
+	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage test-race test-integration
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
 # Run unit tests
@@ -60,6 +60,12 @@ test-cover:
 test-race:
 	@echo -e "\n....Running tests with race detector for $(GO_PROJECT_NAME)...."
 	$(_Q)LOG_IGNORE=1 go test -race -timeout 300s ./... $(_RACEQ)
+
+# Run integration tests (gated behind the 'integration' build tag — these
+# bind real network ports and are excluded from default/test-race runs).
+test-integration:
+	@echo -e "\n....Running integration tests for $(GO_PROJECT_NAME)...."
+	$(_Q)LOG_IGNORE=1 go test -tags=integration -timeout 300s ./... $(_RACEQ)
 
 # Check that new/changed code meets coverage threshold (runs tests first)
 diff-coverage: test-cover
@@ -98,6 +104,6 @@ fix:
 govulncheck:
 	go tool govulncheck ./...
 
-.PHONY: certs build go_build go_build_docker preflight test test-cover test-race diff-coverage \
+.PHONY: certs build go_build go_build_docker preflight test test-cover test-race test-integration diff-coverage \
 	docker_s3d docker_compose_up docker_compose_down docker docker_clean docker_test \
 	clean lint fix govulncheck
