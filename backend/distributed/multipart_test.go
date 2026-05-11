@@ -15,6 +15,7 @@ import (
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/multipart"
+	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -57,7 +58,7 @@ func setupMultipartTestBackend(t *testing.T) (*Backend, func()) {
 		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 
-		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5)
+		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5, quicserver.WithMasterKey(storetest.TestMasterKey))
 		require.NoError(t, err, "Failed to start QUIC server for node %d", i)
 		quicServers[i] = qs
 	}

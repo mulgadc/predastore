@@ -21,6 +21,7 @@ import (
 	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
+	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -78,7 +79,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 		nodeDir := filepath.Join(nodeDataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 		addr := fmt.Sprintf("127.0.0.1:%d", basePort+i)
-		quicServers[i] = quicserver.New(nodeDir, addr)
+		quicServers[i] = quicserver.New(nodeDir, addr, quicserver.WithMasterKey(storetest.TestMasterKey))
 	}
 	time.Sleep(100 * time.Millisecond)
 

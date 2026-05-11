@@ -11,6 +11,7 @@ import (
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
+	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/require"
 )
@@ -116,7 +117,7 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 
 		addr := fmt.Sprintf("127.0.0.1:%d", basePort+i)
-		quicServers[i] = quicserver.New(nodeDir, addr)
+		quicServers[i] = quicserver.New(nodeDir, addr, quicserver.WithMasterKey(storetest.TestMasterKey))
 	}
 
 	// Allow QUIC servers time to start

@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/mulgadc/predastore/internal/storetest"
 )
 
 // TestNewWithRetryBindsListener exercises the server-side quic.Config
@@ -16,7 +18,7 @@ func TestNewWithRetryBindsListener(t *testing.T) {
 		t.Fatalf("mkdir walDir: %v", err)
 	}
 
-	qs, err := NewWithRetry(walDir, "127.0.0.1:0", 1)
+	qs, err := NewWithRetry(walDir, "127.0.0.1:0", 1, WithMasterKey(storetest.TestMasterKey))
 	if err != nil {
 		t.Fatalf("NewWithRetry: %v", err)
 	}

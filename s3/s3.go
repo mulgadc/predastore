@@ -15,13 +15,12 @@ type ACL struct {
 }
 
 type S3_Buckets struct {
-	Name       string `toml:"name"`
-	Region     string `toml:"region"`
-	Type       string `toml:"type"`
-	Pathname   string `toml:"pathname"`
-	Public     bool   `toml:"public"`
-	Encryption string `toml:"encryption"`
-	AccountID  string `toml:"account_id"`
+	Name      string `toml:"name"`
+	Region    string `toml:"region"`
+	Type      string `toml:"type"`
+	Pathname  string `toml:"pathname"`
+	Public    bool   `toml:"public"`
+	AccountID string `toml:"account_id"`
 }
 
 type RS struct {
