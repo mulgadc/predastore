@@ -119,11 +119,18 @@ DESIGN §11 describes pull-based repair; not implemented.
   the result as a new reservation.
 - Optional in-memory recent-failures queue for faster repair.
 
-### Index Rebuild from Segments
+### Envelope Encryption (Master Key Rotation)
 
-DESIGN §6 promises this path. Walk all segments, parse slot headers, rebuild
-the index from committed objects (those with `flagSlotFinal` set). Discard
-incomplete writes.
+The current encryption-at-rest implementation uses a single cluster-wide
+master key with no rotation. Rotating the master would require re-encrypting
+every fragment, which is not viable.
+
+- Introduce a per-data-dir derived key wrapped by a true cluster master held
+  in NATS KV; rotating the master re-wraps the derived keys without
+  re-encrypting any ciphertext.
+- Per-bucket / per-tenant keys ride the same envelope layer.
+- Collapses the cluster-wide `storeID` collision domain (each data dir gets
+  its own per-key collision space).
 
 ### Formal Verification Harness
 

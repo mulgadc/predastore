@@ -2,7 +2,7 @@
 // at-rest encryption. Shards are written as contiguous extents of fixed-size
 // fragments within append-only segment files. Segments roll when they reach
 // maxSegSize. Each fragment is sealed under AES-256-GCM (master key per
-// cluster, storeID per data dir) — see docs/development/feature/aes-256-encryption-at-rest.md.
+// cluster, storeID per data dir) — see docs/DESIGN.md §6.
 package store
 
 import (

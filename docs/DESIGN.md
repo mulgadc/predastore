@@ -67,8 +67,14 @@ Predastore is a distributed, S3-compatible, erasure-coded object store designed 
 | `-port` | `PORT` | S3 API server port (default: 443) |
 | `-tls-cert` | - | Path to TLS certificate |
 | `-tls-key` | - | Path to TLS private key |
+| `-encryption-key-file` | `ENCRYPTION_KEY_FILE` | Path to 32-byte AES-256 master key (required, mode `0600`) |
 
 See `s3/tests/config/cluster.toml` for a complete example configuration.
+
+`quicd` (the standalone shard-node binary) accepts the same
+`-encryption-key-file` / `ENCRYPTION_KEY_FILE` and refuses to start without
+it. Every node in a cluster MUST be given the same master key file —
+fragments sealed under one master cannot be opened under another.
 
 ---
 
@@ -146,8 +152,10 @@ segment file.
 
 | Unit | Size | Description |
 |------|------|-------------|
-| Fragment payload | 8 KB | Fixed on-disk unit, zero-padded when logical length is shorter |
-| Fragment header | 32 B | Metadata + CRC32 covering header + padded payload |
+| Fragment body | 8 KiB | AES-256-GCM ciphertext, zero-padded when logical length is shorter |
+| Fragment header | 32 B | `fragNum`, `shardNum`, `size`, `flags`, two reserved slots |
+| Fragment tag | 16 B | GCM authentication tag; binds ciphertext + AAD |
+| Fragment total | 8240 B | header + body + tag, fixed on-disk unit |
 | Shard | `⌈object_size / K⌉` | Per-node RS slice, variable size; occupies a contiguous extent |
 | Segment file | up to 4 GiB | Append-only container; rolls when full. Holds extents from multiple shards |
 
@@ -434,22 +442,28 @@ fixed-size fragments:
 │ Segment Header (14 B)                                        │
 │ ┌──────────┬─────────┬───────────┬──────────────┐            │
 │ │ Magic(4) │ Ver(2)  │ Flags(4)  │ Reserved(4)  │            │
-│ │ "S3SF"   │         │ flagFull  │              │            │
+│ │ "S3SE"   │   1     │ flagFull  │              │            │
 │ └──────────┴─────────┴───────────┴──────────────┘            │
 ├──────────────────────────────────────────────────────────────┤
-│ Fragment 0 (8224 B = 32 B header + 8192 B payload)           │
+│ Fragment 0 (8240 B = 32 B header + 8192 B body + 16 B tag)   │
 ├──────────────────────────────────────────────────────────────┤
-│ Fragment 1 (8224 B)                                          │
+│ Fragment 1 (8240 B)                                          │
 ├──────────────────────────────────────────────────────────────┤
 │ ... fragments belonging to one or more shards ...            │
 ├──────────────────────────────────────────────────────────────┤
-│ Fragment N (8224 B)                                          │
+│ Fragment N (8240 B)                                          │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Every fragment on disk is exactly `fragHeaderSize + fragBodySize = 32 + 8192 =
-8224` bytes. Fragments whose logical payload is shorter than `fragBodySize` are
-zero-padded; the padding is included in the CRC calculation.
+Every fragment on disk is exactly `fragHeaderSize + fragBodySize + fragTagSize
+= 32 + 8192 + 16 = 8240` bytes. Bodies are zero-padded to `fragBodySize`
+before encryption; GCM is a stream cipher so the ciphertext is the same length
+as the plaintext (8192 B), and the authentication tag follows.
+
+The magic `'S','3','S','E'` (segment version `1`) identifies the
+encryption-at-rest format. The previous pre-encryption magic (`'S','3','S','F'`)
+is rejected outright by `openSegment` — there is no in-place migration, the
+operator must start with a fresh data dir.
 
 A segment grows up to `maxSegSize` (4 GiB). When full, `flagFull` is set in the
 header and the store rolls forward to a new segment number. Within a segment,
@@ -464,23 +478,65 @@ shards are disjoint.
 ├─────────────────────────────────────────────────────────────────┤
 │                        ShardNum (8)                             │
 ├───────────────────────────┬─────────────────────────────────────┤
-│       Reserved (4)        │       PayloadLen (4)                │
+│       Reserved (4)        │          Size (4)                   │
 ├───────────────────────────┼─────────────────────────────────────┤
-│         Flags (4)         │         CRC32 (4)                   │
+│         Flags (4)         │         Reserved (4)                │
 └───────────────────────────┴─────────────────────────────────────┘
 ```
 
 | Field | Size | Purpose |
 |-------|------|---------|
-| `FragNum` | 8 B | Global monotonic fragment counter (across segments) |
-| `ShardNum` | 8 B | Identifier of the shard this fragment belongs to |
+| `FragNum` | 8 B | Global monotonic fragment counter (across segments). Feeds the GCM nonce, so it must be unique for the lifetime of the master key (see Persistent State below). |
+| `ShardNum` | 8 B | Identifier of the shard this fragment belongs to. Bound into AAD. |
 | `Reserved` | 4 B | Reserved for future use |
-| `PayloadLen` | 4 B | Logical payload length (≤ 8192); remaining body bytes are zero-padding |
+| `Size` | 4 B | Logical payload length (≤ 8192); the body bytes past `Size` are zero-padding inside the ciphertext |
 | `Flags` | 4 B | Bit flags; `flagEndOfShard` marks the final fragment of a shard |
-| `CRC32` | 4 B | IEEE CRC32 over the full fragment (header + padded payload) with the CRC field zeroed |
+| `Reserved` | 4 B | Formerly CRC32 — see "Encryption-at-Rest" below; not reclaimed for a different field while the current segment magic is in use |
 
-The CRC covers both header and payload, so a reader can independently verify
-every fragment without external metadata.
+The fragment header is plaintext on disk — readers need `FragNum` and
+`ShardNum` *before* decryption to reconstruct the AAD and nonce. The header
+fields are protected by GCM authentication, not by encryption: any tamper
+that changes `FragNum`, `ShardNum`, or `Size` makes the reconstructed AAD
+differ from what was bound at seal time and the tag check fails.
+
+### Encryption-at-Rest
+
+Every fragment is sealed independently under AES-256-GCM. The 12-byte GCM
+nonce and 52-byte AAD are deterministic and reconstructable at read time
+from the on-disk header + per-data-dir state:
+
+```
+nonce[0:8]   = BE(fragNum)    // from fragment header
+nonce[8:12]  = BE(storeID)    // from state.json (4 random bytes, per data dir)
+
+aad[0:32]    = objectHash     // SHA-256, already part of the shard index key
+aad[32:36]   = BE(shardIndex) // already part of the shard index key
+aad[36:44]   = BE(shardNum)   // from fragment header
+aad[44:52]   = BE(fragNum)    // from fragment header
+```
+
+Properties:
+
+- **Confidentiality.** Disk-level access yields only ciphertext + tag;
+  plaintext is never written to disk.
+- **Authenticated integrity.** GCM is the sole integrity authority — there is
+  no separate CRC. A failed tag check returns `ErrIntegrity`; "disk
+  corruption", "tamper", and "wrong master key" all surface as one error.
+- **Position binding.** AAD binds each fragment to its
+  `(objectHash, shardIndex, shardNum, fragNum)` slot, so swapping fragments
+  between shards or rewriting the on-disk header to claim a different slot
+  fails the tag.
+- **Cross-data-dir defence.** `storeID` enters the nonce, not the AAD —
+  splicing a fragment from data dir A into data dir B's segment yields a
+  different nonce at read time and the tag fails.
+- **Mandatory.** `store.Open` errors without `WithAEAD`; the operator-layer
+  daemons (`s3d`, `quicd`) refuse to start without `-encryption-key-file`.
+  There is no unencrypted code path.
+
+The master key is loaded once at daemon startup by the `internal/keyfile`
+package (raw 32 bytes, mode `0600` — group/other-readable rejected outright),
+turned into a `cipher.AEAD`, and handed to `store.Open` via `WithAEAD`. The
+store never sees the raw key bytes.
 
 ## Extent Reservation
 
@@ -513,12 +569,15 @@ within the segment file. Fragment offsets are deterministic:
 fileOffset(extent, frag) = extent.Off + frag * totalFragSize
 ```
 
-The writer assembles fragments (header + payload + zero padding + CRC) into an
-in-memory buffer and issues `(*os.File).WriteAt(buf, fileOffset)`. Multiple
-writer goroutines may issue concurrent `WriteAt` calls against the same segment
-file because their reserved extents are disjoint. POSIX `pwrite` guarantees
-atomicity for non-overlapping regions, and Go's `WriteAt` is explicitly safe for
-concurrent use.
+The writer assembles fragments (header + zero-padded body + GCM tag) into an
+in-memory window buffer, seals each body in place under the shared
+`cipher.AEAD`, and issues `(*os.File).WriteAt(buf, fileOffset)` for the whole
+window in one syscall. Multiple writer goroutines may issue concurrent
+`WriteAt` calls against the same segment file because their reserved extents
+are disjoint. POSIX `pwrite` guarantees atomicity for non-overlapping regions,
+and Go's `WriteAt` is explicitly safe for concurrent use. The AEAD itself is
+constructed once at `Store.Open` and shared — the stdlib's GCM is safe for
+concurrent `Seal` / `Open`.
 
 ## Commit Sequence
 
@@ -565,16 +624,33 @@ parity.
 
 ## Persistent State
 
-The Store persists three monotonic counters in `state.json` to survive restarts:
+The Store persists monotonic counters and the per-data-dir crypto identity
+in `state.json`:
 
-| Counter | Purpose |
-|---------|---------|
+| Field | Purpose |
+|-------|---------|
 | `segNum` | Current segment number (advances when a segment is marked full) |
 | `shardNum` | Next shard identifier to assign |
-| `fragNum` | Next global fragment counter to assign |
+| `fragNum` | Next global fragment counter to assign (bound into the GCM nonce) |
+| `fragNumHighWater` | Durably-reserved upper bound on `fragNum`; `Append` extends it (and fsyncs) only when an allocation would cross it |
+| `storeID` | 4 random bytes generated on first `Open` and held for the lifetime of the data dir; bound into the GCM nonce |
 
-On `Open`, these are restored before opening the active segment. The state file
-is rewritten on every `Append`.
+`state.json` is written atomically and durably: write `state.json.tmp`,
+fsync the file, rename to `state.json`, fsync the parent directory. The
+first save (after `storeID` generation, before any fragment can be sealed)
+MUST complete before `Open` returns — otherwise a crash + restart could
+generate a different `storeID` and orphan data written under the old one.
+
+`fragNum` uniqueness across crashes is preserved by **batched high-water
+reservation**, the standard pattern for crash-safe monotonic-counter
+allocators. On `Open`, the store advances `fragNumHighWater` by
+`fragNumReservation` (= 1 048 576) and fsyncs `state.json`. `Append` then
+hands out `fragNum` values freely below the high-water without touching
+disk; only an allocation that would cross the high-water triggers another
+fsync. On crash recovery, `Open` resumes `fragNum = fragNumHighWater` —
+the unflushed reservation window from before the crash is sacrificed to
+guarantee nonce uniqueness. At most `fragNumReservation` fragNums are
+"wasted" per crash; against the 2⁶⁴ budget this is negligible.
 
 ## Background Compaction & Cold Storage
 
@@ -595,18 +671,23 @@ correctness of PUT or GET operations.
 
 ## Local KV Rebuild
 
-If the local Badger index is lost, it can be reconstructed from segments:
+If the local Badger index is lost, fragments alone are **not** sufficient to
+rebuild it. The AAD that authenticates each fragment is keyed on
+`(objectHash, shardIndex)` — both of which live only in the lost Badger
+key, not on disk. A scan-and-decrypt rebuild would need an exhaustive search
+over every known shard-key candidate per fragment, which is intractable.
 
-1. Scan each segment file from offset `segHeaderSize` to EOF, one fragment at a
-   time.
-2. Verify each fragment's CRC32. Corrupt fragments are discarded.
-3. Group surviving fragments by `ShardNum` and contiguous in-segment position.
-4. A shard group is complete when its final fragment has `flagEndOfShard` set.
-5. Compute the extent (segment, offset, sizes) for the group and insert a Badger
-   entry under `<object hash || shard index>`.
+The supported recovery path for a lost local index is **read-repair from
+peers**: the hash ring identifies which shards this node should hold;
+missing shards are reconstructed by fetching `K` valid shards from peers
+and RS-decoding (see §11). The on-disk fragments from the lost index
+become dead space reclaimable by compaction.
 
-Incomplete shard groups (missing trailing fragments, missing `flagEndOfShard`)
-are discarded. They correspond to reservations whose commits never landed.
+This is a deliberate trade-off introduced with the encryption-at-rest
+format: the per-fragment AAD binding that defends against fragment
+shuffling also makes "rebuild from segments alone" infeasible without
+storing the shard key in plaintext on disk, which would weaken the
+position-binding guarantee.
 
 ---
 
@@ -631,7 +712,8 @@ Defines RS(3,2): 3 data shards, 2 parity shards. Can tolerate loss of any 2 node
    `reedsolomon.NewStream(K, M)` followed by `enc.Split(body, dataWriters, fileSize)`.
    Each shard is approximately `⌈object_size / K⌉` bytes.
 3. Ship each shard to its assigned node over QUIC (see §9). The node stores the shard
-   as a contiguous extent of 8 KB fragments inside a segment file (see §6).
+   as a contiguous extent of 8 KiB fragments inside a segment file, sealing each
+   fragment under AES-256-GCM (see §6).
 
 No intermediate chunking or segmentation occurs. Compression is not performed on the
 write path; it is optionally applied to closed segments by the background compactor.
@@ -639,8 +721,8 @@ write path; it is optionally applied to closed segments by the background compac
 ### Decoding
 
 - Request data shards in parallel from their assigned nodes.
-- If a data shard is missing (Badger miss) or any fragment fails CRC validation, fetch
-  a parity shard instead.
+- If a data shard is missing (Badger miss) or any fragment fails GCM
+  authentication (`ErrIntegrity`), fetch a parity shard instead.
 - Once `K` valid shards have been collected, RS decode to reconstruct the object.
 - Fewer than `K` valid shards → GET fails.
 
@@ -1021,7 +1103,7 @@ collected.
 | Failure | Detection | Response |
 |---------|-----------|----------|
 | Badger miss | Local lookup returns not-found | Node returns "absent"; S3D fetches parity |
-| Fragment CRC mismatch | Per-fragment CRC32 during read | Node discards corrupt fragment; treated as absent; S3D fetches parity |
+| Fragment integrity failure | GCM tag check fails during read (returns `ErrIntegrity`) | Node treats the shard as unreadable; S3D fetches parity. Covers disk corruption, tamper, fragment swap, and wrong master key indistinguishably. |
 | Node timeout | QUIC request deadline exceeded | S3D fetches parity |
 | Fewer than `K` valid shards | Aggregate check after all fetches | GET returns 500/503 to the client |
 
@@ -1081,6 +1163,32 @@ All communication uses TLS:
 - s3db uses AWS Signature V4 authentication
 - Credentials defined in `[[db]]` or `[[auth]]` sections
 - All database operations require valid signatures
+
+## Encryption at Rest
+
+Every shard fragment is sealed under AES-256-GCM before it touches disk —
+see §6 ("Encryption-at-Rest") for the on-disk format, AAD, and nonce
+construction. Operationally:
+
+- **Master key.** One 32-byte AES-256 key per cluster, loaded from a file
+  path supplied via `-encryption-key-file` / `ENCRYPTION_KEY_FILE`. The
+  loader is fail-closed on permissions: any group/other-readable mode
+  (`mode & 0077 != 0`) is rejected with no override — `chmod 600` is
+  mandatory. The same key MUST be configured on every node; rotation is
+  out of scope for the current implementation.
+- **No plaintext on disk.** Both `s3d` and `quicd` refuse to start without
+  a key path; `store.Open` errors without `WithAEAD`. There is no
+  unencrypted code path to fall back to.
+- **Logging.** The raw key is never logged. Operators identify a key by
+  its fingerprint (`hex(sha256(key)[:8])`, 16 hex chars), logged once at
+  `Server.init` and at QUIC server startup.
+- **In scope.** Confidentiality and integrity against an attacker reading
+  or modifying segment files; detection of fragment shuffling within or
+  across shards / data dirs on the same master key.
+- **Out of scope.** Compromise of a node host with the live master key in
+  memory; per-bucket / per-tenant keys; KMS integration; key rotation;
+  migration of existing unencrypted data (clusters must start fresh against
+  the new segment magic); encryption of the s3db (BadgerDB) index.
 
 ---
 
@@ -1233,12 +1341,14 @@ Requires 5 nodes, providing 3 data, and 2 parity bits for recovery.
 | `s3db/fsm.go` | Finite State Machine, applies commands to BadgerDB |
 | `s3db/server.go` | HTTPS REST API, routes, authentication middleware |
 | `s3db/client.go` | Client for connecting to s3db cluster |
-| `store/store.go` | Store: segment cache, extent reservation, index commits |
-| `store/segment.go` | Segment file format, fragment layout, header flags |
-| `store/writer.go` | Per-shard writer: buffered fragment assembly, lock-free `WriteAt`, fsync, commit |
-| `store/reader.go` | Per-shard reader: extent → fragment iteration with CRC validation |
-| `store/state.go` | Persistent monotonic counters (`state.json`) |
+| `store/store.go` | Store: segment cache, extent reservation, fragNum high-water reservation, index commits, `WithAEAD` option |
+| `store/segment.go` | Segment file format, header (magic `S3SE`), `flagFull` rollover |
+| `store/fragment.go` | Per-fragment layout, AES-256-GCM `seal` / `open`, AAD + nonce construction |
+| `store/writer.go` | Per-shard writer: buffered fragment assembly, in-place seal, lock-free `WriteAt`, fsync, commit |
+| `store/reader.go` | Per-shard reader: extent → batched seg.ReadAt → in-place GCM Open, `ErrIntegrity` on tag failure |
+| `store/state.go` | Persistent counters + `storeID` (`state.json`, atomic + fsync'd) |
 | `store/extent.go` | Extent record + encoding for the per-node Badger index |
+| `internal/keyfile/keyfile.go` | Master-key loader (32-byte, fail-closed on loose perms) + `Fingerprint` for log-safe key identification |
 | `backend/distributed/globalstate.go` | GlobalState interface, LocalState, DistributedState |
 | `backend/distributed/put.go` | PUT object implementation |
 | `backend/distributed/get.go` | GET object implementation |
@@ -1289,9 +1399,13 @@ err := state.Scan("objects", []byte("arn:aws:s3:::mybucket/"), func(key, value [
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `fragBodySize` | 8 KB | Fragment payload size on disk |
-| `fragHeaderSize` | 32 B | Per-fragment header (FragNum, ShardNum, Reserved, PayloadLen, Flags, CRC32) |
+| `fragBodySize` | 8 KiB | Fragment body size on disk (GCM ciphertext, same length as plaintext) |
+| `fragHeaderSize` | 32 B | Per-fragment header (`FragNum`, `ShardNum`, two reserved slots, `Size`, `Flags`) |
+| `fragTagSize` | 16 B | AES-256-GCM authentication tag per fragment |
+| `totalFragSize` | 8240 B | header + body + tag, fixed on-disk fragment unit |
 | `maxSegSize` | 4 GiB | Maximum segment file size before rollover |
+| `fragNumReservation` | 1 048 576 | fragNum batch durably reserved in `state.json` per fsync; bounds wasted nonce space per crash |
+| `bufLen` | 32 fragments | Per-shard writer/reader window: amortises `WriteAt` / `ReadAt` syscalls (≈ 256 KiB RAM per active stream) |
 | RS schemes | RS(2,1) / RS(3,2) | Erasure coding configuration |
 | Hash ring vnodes | 64–256 | Virtual nodes for distribution |
 | QUIC concurrent streams | 32–256 | Per-connection stream limit |
