@@ -51,6 +51,6 @@ func sealFragment(aead cipher.AEAD, plaintext, aad, nonce []byte) []byte {
 // GCM tag against aad. Callers pass ciphertext sized to body + tag; the open
 // is in-place. On tag mismatch, the underlying cipher error is returned —
 // the reader wraps it with ErrIntegrity for callers to inspect via errors.Is.
-func openFragment(aead cipher.AEAD, ciphertext, aad, nonce []byte) ([]byte, error) { //nolint:unused // consumed by shardReader in Stage 3.
+func openFragment(aead cipher.AEAD, ciphertext, aad, nonce []byte) ([]byte, error) {
 	return aead.Open(ciphertext[:0], nonce, ciphertext, aad)
 }

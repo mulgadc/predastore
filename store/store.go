@@ -206,6 +206,7 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader Reade
 			objectHash: objectHash,
 			shardIndex: shardIndex,
 			storeID:    store.storeID,
+			aead:       store.aead,
 			ext:        extent,
 		}, nil
 	}
@@ -221,6 +222,7 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader Reade
 		objectHash: objectHash,
 		shardIndex: shardIndex,
 		storeID:    store.storeID,
+		aead:       store.aead,
 		seg:        segment,
 		ext:        extent,
 		buf:        make([]byte, readBufLen*totalFragSize),
