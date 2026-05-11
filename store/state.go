@@ -80,23 +80,26 @@ func (store *Store) saveState() (retErr error) {
 	if err != nil {
 		return err
 	}
+	closed := false
 	defer func() {
+		if !closed {
+			_ = f.Close()
+		}
 		if retErr != nil {
 			_ = os.Remove(tmpPath)
 		}
 	}()
 
 	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
 		return err
 	}
 	if err := f.Sync(); err != nil {
-		_ = f.Close()
 		return err
 	}
 	if err := f.Close(); err != nil {
 		return err
 	}
+	closed = true
 
 	if err := os.Rename(tmpPath, finalPath); err != nil {
 		return err

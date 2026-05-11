@@ -105,7 +105,7 @@ func TestPutObject_ShardPlacementAndReconstruction(t *testing.T) {
 		nodeNum, err := NodeToUint32(node)
 		require.NoError(t, err)
 
-		s, err := store.Open(nodeDirs[nodeNum], store.WithMasterKey(storetest.TestMasterKey))
+		s, err := store.Open(nodeDirs[nodeNum], store.WithAEAD(storetest.TestAEAD()))
 		require.NoError(t, err, "open store for node %s (shard %d)", node, i)
 		stores[i] = s
 

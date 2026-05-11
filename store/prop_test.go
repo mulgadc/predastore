@@ -85,7 +85,7 @@ func (sm *baseSM) Open(t *rapid.T) {
 		t.Skip("already open")
 	}
 
-	realSt, err := store.Open(sm.Dir, store.WithMasterKey(storetest.TestMasterKey))
+	realSt, err := store.Open(sm.Dir, store.WithAEAD(storetest.TestAEAD()))
 	if err != nil {
 		if sm.Strict() {
 			t.Fatalf("open: real=%v", err)

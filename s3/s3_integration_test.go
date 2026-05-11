@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -33,7 +34,9 @@ const (
 )
 
 // setupServer starts an S3 server backed by a distributed backend for testing.
-func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
+// Returns the per-node data directory so callers can scan segment files on
+// disk for ciphertext assertions.
+func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup, nodeDataDir string) {
 	t.Helper()
 
 	// These are integration tests that spin up a TLS server on a fixed port.
@@ -49,7 +52,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	wg.Add(1)
 
 	tmpDir := t.TempDir()
-	nodeDataDir := filepath.Join(tmpDir, "nodes")
+	nodeDataDir = filepath.Join(tmpDir, "nodes")
 	badgerDir := filepath.Join(tmpDir, "db")
 	require.NoError(t, os.MkdirAll(nodeDataDir, 0750))
 	require.NoError(t, os.MkdirAll(badgerDir, 0750))
@@ -142,7 +145,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup) {
 	// Wait for server to start
 	time.Sleep(2 * time.Second)
 
-	return cancel, wg
+	return cancel, wg, nodeDataDir
 }
 
 // loadTestConfig reads the shared test config once per test
@@ -174,7 +177,7 @@ func createS3Client(t *testing.T) *awss3.Client {
 	})
 }
 
-func runIntegrationSuite(t *testing.T, client *awss3.Client) {
+func runIntegrationSuite(t *testing.T, client *awss3.Client, nodeDataDir string) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -282,6 +285,73 @@ func runIntegrationSuite(t *testing.T, client *awss3.Client) {
 		downloaded := getObject(t, client, S3_BUCKET, key)
 		assert.Equal(t, data, downloaded, "Multipart uploaded content should match original data")
 	})
+
+	t.Run("CiphertextOnDisk", func(t *testing.T) {
+		// Distinctive 16-byte marker repeated to fill 256 bytes — large enough
+		// to survive Reed-Solomon sharding boundaries and land contiguously in
+		// at least one data shard's fragment body. If encryption is broken, the
+		// marker bytes will appear verbatim on disk.
+		marker := []byte("MULGA-CIPHERTEXT")
+		payload := bytes.Repeat(marker, 16)
+
+		const key = "ciphertext_check.bin"
+		_, err := client.PutObject(ctx, &awss3.PutObjectInput{
+			Bucket: aws.String(S3_BUCKET),
+			Key:    aws.String(key),
+			Body:   bytes.NewReader(payload),
+		})
+		require.NoError(t, err, "PutObject for ciphertext check should not error")
+
+		// Round-trip first to confirm the object is actually retrievable —
+		// the on-disk scan only proves a negative, so the GET protects against
+		// false-positives from objects that never reached the store.
+		got := getObject(t, client, S3_BUCKET, key)
+		assert.Equal(t, payload, got, "round-trip plaintext must match")
+
+		var segFiles []string
+		err = filepath.WalkDir(nodeDataDir, func(path string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if !d.IsDir() && strings.HasSuffix(path, ".seg") {
+				segFiles = append(segFiles, path)
+			}
+			return nil
+		})
+		require.NoError(t, err, "walking node data dir for segment files should not error")
+		require.NotEmpty(t, segFiles, "expected at least one segment file after a PUT — test cannot prove encryption otherwise")
+
+		for _, path := range segFiles {
+			data, err := os.ReadFile(path)
+			require.NoError(t, err, "reading segment file %s", path)
+			assert.NotContains(t, string(data), string(marker),
+				"plaintext marker leaked into segment file %s — encryption is not sealing fragment bodies", path)
+		}
+	})
+
+	t.Run("ZeroByteRoundTrip", func(t *testing.T) {
+		// The store-level 0-byte short-circuit (Stage 1) is correct, but the
+		// distributed backend's Reed-Solomon sharding rejects empty bodies
+		// before reaching the store. Tracked by mulga-bm-13; un-skip when fixed.
+		t.Skip("blocked on mulga-bm-13: distributed PutObject rejects 0-byte bodies")
+
+		const key = "empty.bin"
+
+		_, err := client.PutObject(ctx, &awss3.PutObjectInput{
+			Bucket: aws.String(S3_BUCKET),
+			Key:    aws.String(key),
+			Body:   bytes.NewReader(nil),
+		})
+		require.NoError(t, err, "PutObject with empty body should not error")
+
+		result, err := client.GetObject(ctx, &awss3.GetObjectInput{
+			Bucket: aws.String(S3_BUCKET),
+			Key:    aws.String(key),
+		})
+		require.NoError(t, err, "GetObject for 0-byte object should not error")
+		body := readBody(t, result.Body)
+		assert.Empty(t, body, "0-byte round-trip must yield 0 bytes")
+	})
 }
 
 func getObject(t *testing.T, client *awss3.Client, bucket, key string) []byte {
@@ -316,13 +386,13 @@ func TestS3Integration(t *testing.T) {
 	}
 
 	// Start the server
-	cancel, wg := setupServer(t)
+	cancel, wg, nodeDataDir := setupServer(t)
 	defer func() {
 		cancel()
 		wg.Wait()
 	}()
 
-	runIntegrationSuite(t, createS3Client(t))
+	runIntegrationSuite(t, createS3Client(t), nodeDataDir)
 }
 
 // TestGetObjectHead tests the HEAD request for an object
@@ -332,7 +402,7 @@ func TestGetObjectHeadIntegration(t *testing.T) {
 	}
 
 	// Start the server
-	cancel, wg := setupServer(t)
+	cancel, wg, _ := setupServer(t)
 	defer func() {
 		cancel()
 		wg.Wait()
@@ -377,7 +447,7 @@ func TestByteRangeRequests(t *testing.T) {
 	}
 
 	// Start the server
-	cancel, wg := setupServer(t)
+	cancel, wg, _ := setupServer(t)
 	defer func() {
 		cancel()
 		wg.Wait()

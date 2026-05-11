@@ -6,7 +6,6 @@
 package store
 
 import (
-	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
@@ -14,12 +13,10 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
-	"runtime"
 	"sync"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/mulgadc/predastore/s3db"
-	"github.com/mulgadc/predastore/store/crypto"
 )
 
 const indexFilename = "db"
@@ -35,19 +32,23 @@ const fragNumReservation = 1 << 20 // 1 048 576
 // All public methods are safe for concurrent use. Segment files are pre-allocated
 // via Truncate and written lock-free with WriteAt; the mutex protects only metadata
 // (counters, segment cache, index commits).
+//
+// segCache is unbounded — entries accumulate as the store touches old
+// segments. Fine for the current single-data-dir scale; a long-lived store
+// reading from thousands of distinct segments will need an LRU.
 type Store struct {
 	dir      string
 	index    *s3db.S3DB
 	segCache map[uint64]*segment
 	mutex    sync.Mutex
 
-	// At-rest encryption: masterKey/aead are built once at Open from
-	// WithMasterKey and shared (concurrency-safe per stdlib contract) across
-	// every shardWriter and shardReader. storeID is intrinsic per data dir,
-	// generated on first Open and bound into every nonce.
-	masterKey []byte
-	aead      cipher.AEAD
-	storeID   uint32
+	// At-rest encryption: aead is supplied by the caller via WithAEAD and
+	// shared (concurrency-safe per stdlib contract) across every shardWriter
+	// and shardReader. The store never sees raw key bytes — cipher construction
+	// lives at the layer that loads the key file. storeID is intrinsic per
+	// data dir, generated on first Open and bound into every nonce.
+	aead    cipher.AEAD
+	storeID uint32
 
 	// Monotonic counters persisted to state.json across restarts.
 	// fragNumHighWater is the durably-reserved upper bound on fragNum; Append
@@ -78,6 +79,7 @@ type Writer interface {
 var (
 	ErrClosedStore = errors.New("closed store")
 	ErrKeyNotFound = errors.New("key not found")
+	ErrShardFull   = errors.New("shard full")
 )
 
 // Option configures a Store at Open time. Options may fail (e.g. invalid key
@@ -93,24 +95,21 @@ func WithMaxSegSize(n uint64) Option {
 	}
 }
 
-// WithMasterKey configures the AES-256 master key used to seal/open every
-// fragment. The key must be exactly 32 bytes. The cipher.AEAD built here is
-// shared across all writers and readers; the stdlib guarantees concurrent
-// Seal/Open are safe.
-func WithMasterKey(key []byte) Option {
+// WithAEAD configures the cipher.AEAD used to seal/open every fragment. The
+// AEAD is shared across all writers and readers; the stdlib's GCM guarantees
+// concurrent Seal/Open are safe. The store builds 12-byte nonces as
+// BE(fragNum) || BE(storeID), so the AEAD must report NonceSize() == 12.
+//
+// Cipher construction (and the raw key it consumes) live at the operator
+// layer — the store deliberately never sees key bytes.
+func WithAEAD(aead cipher.AEAD) Option {
 	return func(s *Store) error {
-		if len(key) != crypto.MasterKeySize {
-			return fmt.Errorf("master key must be %d bytes, got %d", crypto.MasterKeySize, len(key))
+		if aead == nil {
+			return errors.New("aead must not be nil")
 		}
-		block, err := aes.NewCipher(key)
-		if err != nil {
-			return fmt.Errorf("create AES cipher: %w", err)
+		if aead.NonceSize() != 12 {
+			return fmt.Errorf("aead nonce size must be 12, got %d", aead.NonceSize())
 		}
-		aead, err := cipher.NewGCM(block)
-		if err != nil {
-			return fmt.Errorf("create GCM: %w", err)
-		}
-		s.masterKey = key
 		s.aead = aead
 		return nil
 	}
@@ -119,9 +118,10 @@ func WithMasterKey(key []byte) Option {
 // Open recovers or creates a Store in dir. On startup it restores monotonic
 // counters from state.json (or generates a fresh storeID for a new data dir),
 // advances and durably persists the fragNum high-water reservation, opens the
-// index, then finds a non-full segment to write into.
+// index, then advances segNum past any full segments left over from a prior
+// crash so the first Append sees a writable segment.
 //
-// WithMasterKey is mandatory — Open errors if no key was supplied.
+// WithAEAD is mandatory — Open errors if no cipher was supplied.
 func Open(dir string, opts ...Option) (store *Store, err error) {
 	store = &Store{
 		dir:        dir,
@@ -136,7 +136,7 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 	}
 
 	if store.aead == nil {
-		return nil, errors.New("store: master key is required (use WithMasterKey)")
+		return nil, errors.New("store: aead is required (use WithAEAD)")
 	}
 
 	if err := store.loadState(); err != nil {
@@ -157,15 +157,13 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("open disk index: %w", err)
 	}
 
-	_, err = store.getNextSegment(100, func(*segment) error { return nil })
-	if err != nil {
+	if _, err := store.nextAvailableSegment(); err != nil {
 		return nil, err
 	}
 
 	slog.Info("store opened",
 		"dir", dir,
 		"storeID", fmt.Sprintf("%08x", store.storeID),
-		"keyFingerprint", crypto.Fingerprint(store.masterKey),
 		"fragNumHighWater", store.fragNumHighWater,
 	)
 
@@ -174,11 +172,7 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 
 // Lookup returns a reader for the given shard. The underlying segment is
 // reference-counted: the caller must call reader.Close() to release it.
-//
-// 0-byte shards short-circuit: the recorded extent has LSize==0 and no
-// segment fragment was reserved, so we return a reader that yields zero
-// bytes without touching any segment file.
-func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader Reader, err error) {
+func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (Reader, error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
@@ -196,54 +190,36 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (reader Reade
 		return nil, fmt.Errorf("get extent: %w", err)
 	}
 
-	extent, err := decodeExtent(data)
+	ext, err := decodeExtent(data)
 	if err != nil {
 		return nil, fmt.Errorf("decode extent: %w", err)
 	}
 
-	if extent.LSize == 0 {
-		return &shardReader{
-			objectHash: objectHash,
-			shardIndex: shardIndex,
-			storeID:    store.storeID,
-			aead:       store.aead,
-			ext:        extent,
-		}, nil
-	}
-
-	segment, err := store.getSegment(extent.SegNum)
+	seg, err := store.getSegment(ext.SegNum)
 	if err != nil {
-		return nil, fmt.Errorf("get segment %d: %w", extent.SegNum, err)
+		return nil, fmt.Errorf("get segment %d: %w", ext.SegNum, err)
 	}
 
-	segment.refs.Add(1)
+	seg.addRef()
 
-	reader = &shardReader{
+	return &reader{
 		objectHash: objectHash,
 		shardIndex: shardIndex,
 		storeID:    store.storeID,
 		aead:       store.aead,
-		seg:        segment,
-		ext:        extent,
-		buf:        make([]byte, readBufLen*totalFragSize),
-		bufPos:     0,
-		closed:     false,
-	}
-
-	return reader, nil
+		seg:        seg,
+		ext:        ext,
+		buf:        make([]byte, min(int64(bufLen), ext.PSize/totalFragSize)*totalFragSize),
+	}, nil
 }
 
 // Append reserves space for a shard of the given logical size and returns a
 // writer. The segment file is pre-allocated (Truncated) to fit all fragments,
 // so subsequent WriteAt calls from the writer never extend the file. If the
 // current segment can't fit the shard, it is marked full and the store rolls
-// to the next segment number (up to 100 attempts). The index entry is committed
-// only when the writer is closed.
-//
-// size == 0 short-circuits: no segment reservation, no fragNum allocation, no
-// fragment written. The writer's Close just commits an empty-extent index
-// entry. This avoids wasting an 8 KiB fragment per 0-byte shard.
-func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (writer Writer, err error) {
+// to the next segment. The index entry is committed only when the writer is
+// closed.
+func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (Writer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("negative size %d", size)
 	}
@@ -255,25 +231,9 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		return nil, ErrClosedStore
 	}
 
-	if size == 0 {
-		ext := extent{}
-		return &shardWriter{
-			objectHash: objectHash,
-			shardIndex: shardIndex,
-			storeID:    store.storeID,
-			aead:       store.aead,
-			ext:        ext,
-			onClose: func() error {
-				key := MakeShardKey(objectHash, shardIndex)
-				if err := store.index.Set(key, ext.encode()); err != nil {
-					return fmt.Errorf("commit: %w", err)
-				}
-				return nil
-			},
-		}, nil
-	}
-
 	// Ceiling division: number of fragments needed to hold size logical bytes.
+	// size == 0 yields fragCount == 0; the writer's ReadFrom loop never runs
+	// and Close commits an empty-extent index entry.
 	fragCount := (uint64(size) + fragBodySize - 1) / fragBodySize
 
 	// Reserve fragNums durably before handing them out. We must fsync before
@@ -289,41 +249,12 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		}
 	}
 
-	var off int64
-	seg, err := store.getNextSegment(100, func(seg *segment) error {
-		info, err := seg.Stat()
-		if err != nil {
-			return err
-		}
-
-		segSize := info.Size()
-		newSegSize := uint64(segSize) + fragCount*totalFragSize //nolint:gosec // segSize from os.File.Stat().Size() is always non-negative.
-		if newSegSize >= store.maxSegSize {
-			if err := seg.markFull(); err != nil {
-				slog.Warn("failed to mark segment full",
-					"num", store.segNum,
-					"error", err,
-				)
-			}
-		}
-
-		if newSegSize > store.maxSegSize && segSize != segHeaderSize {
-			return fmt.Errorf("segment full")
-		}
-
-		off = segSize
-		return nil
-	})
+	seg, off, err := store.reserveExtent(fragCount)
 	if err != nil {
 		return nil, err
 	}
 
-	// Pre-allocate the extent so writer WriteAt calls never extend the file.
-	if err := seg.Truncate(off + totalFragSize*int64(fragCount)); err != nil { //nolint:gosec // fragCount bounded by non-negative int64 size.
-		return nil, fmt.Errorf("truncate segment %d: %w", store.segNum, err)
-	}
-
-	seg.refs.Add(1)
+	seg.addRef()
 
 	ext := extent{
 		SegNum: store.segNum,
@@ -332,33 +263,86 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		LSize:  size,
 	}
 
-	writer = &shardWriter{
+	w := &writer{
+		store:      store,
 		objectHash: objectHash,
 		shardIndex: shardIndex,
 		storeID:    store.storeID,
-		aead:       store.aead,
 		seg:        seg,
 		ext:        ext,
 		shardNum:   store.shardNum,
 		fragNum:    store.fragNum,
-		buf:        make([]byte, writeBufLen*totalFragSize),
-		bufPos:     0,
-
-		onClose: func() error {
-			key := MakeShardKey(objectHash, shardIndex)
-			if err := store.index.Set(key, ext.encode()); err != nil {
-				return fmt.Errorf("commit: %w", err)
-			}
-
-			return nil
-		},
-		closed: false,
+		buf:        make([]byte, min(uint64(bufLen), fragCount)*totalFragSize),
 	}
 
 	store.shardNum += 1
 	store.fragNum += fragCount
 
-	return writer, nil
+	return w, nil
+}
+
+// reserveExtent locates a segment with capacity for fragCount fragments,
+// pre-allocates the extent via Truncate, and returns the segment and the
+// in-segment offset where the writer should start writing. Callers must hold
+// store.mutex.
+func (store *Store) reserveExtent(fragCount uint64) (*segment, int64, error) {
+	seg, err := store.nextAvailableSegment()
+	if err != nil {
+		return nil, 0, err
+	}
+
+	info, err := seg.Stat()
+	if err != nil {
+		return nil, 0, fmt.Errorf("stat segment %d: %w", store.segNum, err)
+	}
+	segSize := info.Size()
+
+	newSegSize := uint64(segSize) + fragCount*totalFragSize //nolint:gosec // segSize from os.File.Stat().Size() is always non-negative.
+
+	if newSegSize >= store.maxSegSize {
+		// Mark full once we've decided this is the last shard for this segment.
+		// markFull failure is non-fatal: next Append re-reads the on-disk flag
+		// (cache stays as-is here too), so we'll retry the mark naturally.
+		if err := seg.markFull(); err != nil {
+			slog.Warn("failed to mark segment full",
+				"segNum", store.segNum,
+				"error", err,
+			)
+		}
+	}
+
+	// Roll if this shard would overflow the segment, unless the segment is
+	// fresh (header-only) — then we let one oversized shard through so a
+	// pathological size still makes forward progress.
+	if newSegSize > store.maxSegSize && segSize != segHeaderSize {
+		seg, err = store.rollSegment()
+		if err != nil {
+			return nil, 0, fmt.Errorf("roll to next segment: %w", err)
+		}
+		info, err = seg.Stat()
+		if err != nil {
+			return nil, 0, fmt.Errorf("stat segment %d: %w", store.segNum, err)
+		}
+		segSize = info.Size()
+	}
+
+	off := segSize
+	if err := seg.Truncate(off + totalFragSize*int64(fragCount)); err != nil { //nolint:gosec // fragCount bounded by non-negative int64 size.
+		return nil, 0, fmt.Errorf("truncate segment %d: %w", store.segNum, err)
+	}
+
+	return seg, off, nil
+}
+
+// commitExtent persists a shard's extent to the index. Called by writers from
+// Close once the data is durable. Concurrency-safe via badger; no Store-level
+// lock needed.
+func (store *Store) commitExtent(objectHash [32]byte, shardIndex uint32, ext extent) error {
+	key := MakeShardKey(objectHash, shardIndex)
+	if err := store.index.Set(key, ext.encode()); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
 }
 
 // Delete removes the index entry for a shard. The on-disk extent becomes dead
@@ -379,9 +363,8 @@ func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) error {
 	return nil
 }
 
-// Close drains all outstanding segment references (spinning with Gosched),
-// closes segment file descriptors and the index. Blocks until all readers and
-// writers have been closed.
+// Close blocks until all outstanding segment references drain, then closes
+// segment file descriptors and the index. Must be called exactly once.
 func (store *Store) Close() error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
@@ -395,13 +378,11 @@ func (store *Store) Close() error {
 	var errs []error
 
 	if err := store.saveState(); err != nil {
-		slog.Warn("failed save store state:", "error", err)
+		errs = append(errs, fmt.Errorf("save state: %w", err))
 	}
 
 	for num, seg := range store.segCache {
-		for seg.refs.Load() > 0 {
-			runtime.Gosched()
-		}
+		seg.waitForRefs()
 
 		if err := seg.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close segment %d: %w", num, err))

@@ -7,42 +7,39 @@ import (
 	"io"
 )
 
-const readBufLen = 32
+var ErrClosedReader = errors.New("closed reader")
 
-// shardReader provides random and sequential access to a single shard's data.
-// It reads fragments from disk in batches of up to readBufLen, opens each
-// under AES-256-GCM, and copies the plaintext into the caller's buffer.
-// bufPos tracks the logical read position for sequential Read() calls; ReadAt
-// is stateless.
-type shardReader struct {
+// reader provides random and sequential access to a single shard's data.
+// It reads fragments from disk in batches of up to bufLen, opens each under
+// AES-256-GCM, and copies the plaintext into the caller's buffer. readPos
+// tracks the logical position for sequential Read() calls; ReadAt is stateless.
+type reader struct {
 	objectHash [32]byte
 	shardIndex uint32
 	storeID    uint32
 	aead       cipher.AEAD // shared cipher.AEAD built once at Store.Open; safe for concurrent use.
 
-	seg *segment // nil for 0-byte shards (no segment to read from).
+	seg *segment
 	ext extent
 
-	buf    []byte
-	bufPos int64
+	buf     []byte
+	readPos int64
 
 	closed bool
 }
 
-var ErrClosedReader = errors.New("closed reader")
-
 // Read implements io.Reader by delegating to ReadAt at the current position.
-func (r *shardReader) Read(p []byte) (int, error) {
+func (r *reader) Read(p []byte) (int, error) {
 	if r.closed {
 		return 0, ErrClosedReader
 	}
 
-	if r.bufPos >= r.ext.LSize {
+	if r.readPos >= r.ext.LSize {
 		return 0, io.EOF
 	}
 
-	n, err := r.ReadAt(p, r.bufPos)
-	r.bufPos += int64(n)
+	n, err := r.ReadAt(p, r.readPos)
+	r.readPos += int64(n)
 	return n, err
 }
 
@@ -52,14 +49,14 @@ func (r *shardReader) Read(p []byte) (int, error) {
 //	fragIndex = logicalPos / fragBodySize
 //	diskOff   = ext.Off + fragIndex * totalFragSize
 //
-// Fragments are read in batches of up to readBufLen at a time — one
-// seg.ReadAt fills the buffer, then each fragment is opened in place. This
-// mirrors the writer's one-WriteAt-per-window pattern so readBufLen acts as a
-// tunable syscall-batch knob symmetric with writeBufLen.
+// Fragments are read in batches of up to bufLen at a time — one seg.ReadAt
+// fills the buffer, then each fragment is opened in place. This mirrors the
+// writer's one-WriteAt-per-window pattern so bufLen acts as a tunable
+// syscall-batch knob symmetric on both sides.
 //
 // A failed Open wraps ErrIntegrity — disk corruption, tamper, and wrong
 // master key share one path.
-func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
+func (r *reader) ReadAt(p []byte, off int64) (int, error) {
 	if r.closed {
 		return 0, ErrClosedReader
 	}
@@ -78,11 +75,13 @@ func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
 	// because each non-final copy consumes exactly fragBodySize logical bytes.
 	bodyOffset := int(off % fragBodySize)
 
+	batchCap := len(r.buf) / totalFragSize
+
 	for totalCopied < len(p) {
 		logicalPos := off + int64(totalCopied)
 		startFragIdx := logicalPos / fragBodySize
 		endFragIdx := (logicalPos + int64(len(p)-totalCopied) - 1) / fragBodySize
-		batchFragCount := min(int(endFragIdx-startFragIdx+1), readBufLen)
+		batchFragCount := min(int(endFragIdx-startFragIdx+1), batchCap)
 		batchDiskOff := r.ext.Off + startFragIdx*totalFragSize
 
 		if _, err := r.seg.ReadAt(r.buf[:batchFragCount*totalFragSize], batchDiskOff); err != nil {
@@ -112,7 +111,7 @@ func (r *shardReader) ReadAt(p []byte, off int64) (int, error) {
 }
 
 // WriteTo streams the full shard to w via io.SectionReader over ReadAt.
-func (r *shardReader) WriteTo(w io.Writer) (int64, error) {
+func (r *reader) WriteTo(w io.Writer) (int64, error) {
 	if r.closed {
 		return 0, ErrClosedReader
 	}
@@ -121,22 +120,17 @@ func (r *shardReader) WriteTo(w io.Writer) (int64, error) {
 }
 
 // Size returns the logical (data-only) size of the shard, excluding fragment headers.
-func (r *shardReader) Size() int64 {
+func (r *reader) Size() int64 {
 	return r.ext.LSize
 }
 
 // Close releases the segment reference. Must be called exactly once.
-// 0-byte readers carry no segment reference, so Close is a no-op beyond
-// flipping the closed flag.
-func (r *shardReader) Close() error {
+func (r *reader) Close() error {
 	if r.closed {
 		return fmt.Errorf("shard reader closed")
 	}
 
 	r.closed = true
-	if r.seg != nil {
-		r.seg.refs.Add(-1)
-	}
-
+	r.seg.releaseRef()
 	return nil
 }

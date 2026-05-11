@@ -18,9 +18,9 @@ import (
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
+	"github.com/mulgadc/predastore/internal/keyfile"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3db"
-	storecrypto "github.com/mulgadc/predastore/store/crypto"
 )
 
 // BackendType specifies the storage backend type
@@ -232,12 +232,12 @@ func (s *Server) init() error {
 	if s.encryptionKeyPath == "" {
 		return fmt.Errorf("encryption key file is required (use -encryption-key-file or ENCRYPTION_KEY_FILE)")
 	}
-	key, err := storecrypto.LoadMasterKey(s.encryptionKeyPath)
+	key, err := keyfile.Load(s.encryptionKeyPath)
 	if err != nil {
 		return fmt.Errorf("load master key: %w", err)
 	}
 	s.masterKey = key
-	slog.Info("master key loaded", "fingerprint", storecrypto.Fingerprint(key))
+	slog.Info("master key loaded", "fingerprint", keyfile.Fingerprint(key))
 
 	// Set log level early so debug logs during backend initialization are visible
 	var logLevel slog.Level

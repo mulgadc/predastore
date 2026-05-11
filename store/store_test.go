@@ -20,7 +20,7 @@ func TestStore(t *testing.T) {
 		realSt, err := store.Open(
 			dir,
 			store.WithMaxSegSize(rapid.Uint64Range(16*store.KiB, 1*store.MiB).Draw(rt, "maxSegSize")),
-			store.WithMasterKey(storetest.TestMasterKey),
+			store.WithAEAD(storetest.TestAEAD()),
 		)
 		if err != nil {
 			rt.Fatalf("open: %v", err)
