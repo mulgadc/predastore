@@ -38,6 +38,7 @@ See [DESIGN.md](DESIGN.md) for the full architecture reference, including the da
 - **Raft consensus for metadata** — bucket and object metadata is strongly consistent across the cluster. Reads can go to any node; writes go through the leader.
 - **QUIC transport** — node-to-node shard I/O uses QUIC over UDP with connection pooling. A single long-lived connection per node pair carries multiplexed streams, so shard writes cost only a stream ID allocation, not a TLS handshake.
 - **Append-only segments** — each shard node writes data to large append-only segment files. A shard occupies a contiguous extent within one segment, pre-allocated to enable lock-free writing to disk. A per-node BadgerDB index maps shard keys to extents.
+- **AES-256-GCM encryption at rest** — every 8 KiB fragment is sealed under a per-fragment GCM nonce with AAD binding it to its `(objectHash, shardIndex, shardNum, fragNum)` position, so tamper, replay, and cross-shard splice attempts fail to authenticate. GCM is the sole on-disk integrity authority (no separate CRC). A 32-byte cluster master key is loaded from a `0600` file path supplied via `-encryption-key-file` / `ENCRYPTION_KEY_FILE`.
 - **Consistent hash ring** — shard placement is deterministic via a hash ring with virtual nodes. Adding nodes bumps a ring epoch; old objects stay on the old epoch, new writes use the new one.
 - **Single binary** — `./bin/s3d` runs one cluster node (S3 API server + Raft database + QUIC shard node). A cluster is N `s3d` processes pointed at the same config; `./scripts/start.sh` launches all of them locally on loopback aliases for development.
 
@@ -94,8 +95,15 @@ node in isolation):
   --port 8443 \
   --base-path /tmp/predastore/3node \
   --tls-key /tmp/predastore/3node/server.key \
-  --tls-cert /tmp/predastore/3node/server.pem
+  --tls-cert /tmp/predastore/3node/server.pem \
+  --encryption-key-file /tmp/predastore/3node/master.key
 ```
+
+The encryption key file must be exactly 32 raw bytes (no base64, no header)
+with mode `0600` — group/other-readable keys are rejected outright. Generate
+one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key
+must be supplied to every node in a cluster; rotating it is not supported
+(see Roadmap → envelope encryption).
 
 ### Configuration
 
@@ -148,7 +156,7 @@ The distributed backend's data model:
 |------|------|-------------|
 | Object | arbitrary | RS-encoded end-to-end into K data + M parity shards |
 | Shard | `⌈object_size / K⌉` | Per-node RS slice; occupies a contiguous extent |
-| Fragment | 8 KB payload + 32 B header | On-disk unit; CRC-validated independently |
+| Fragment | 32 B header + 8 KiB body + 16 B GCM tag = 8240 B | On-disk unit; AES-256-GCM seals body with AAD bound to `(objectHash, shardIndex, shardNum, fragNum)` |
 | Segment file | up to 4 GiB | Append-only container holding extents from one or more shards |
 
 See [DESIGN.md](DESIGN.md) for full configuration reference, including database node setup, shard node setup, RS tuning, and deployment modes.
@@ -198,6 +206,8 @@ sudo sysctl -w net.core.wmem_max=7500000
 - [x] Raft-consensus metadata (s3db)
 - [x] QUIC transport with connection pooling
 - [x] Consistent hash ring placement
+- [x] AES-256-GCM encryption at rest (single cluster-wide master key)
+- [ ] Envelope encryption (master key rotation, per-bucket / per-tenant keys)
 - [ ] Gossip-based node discovery
 - [ ] Segment compaction and garbage collection
 - [ ] Automatic shard rebalancing
