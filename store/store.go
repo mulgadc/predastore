@@ -259,6 +259,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 			objectHash: objectHash,
 			shardIndex: shardIndex,
 			storeID:    store.storeID,
+			aead:       store.aead,
 			ext:        ext,
 			onClose: func() error {
 				key := MakeShardKey(objectHash, shardIndex)
@@ -333,6 +334,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		objectHash: objectHash,
 		shardIndex: shardIndex,
 		storeID:    store.storeID,
+		aead:       store.aead,
 		seg:        seg,
 		ext:        ext,
 		shardNum:   store.shardNum,

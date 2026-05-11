@@ -13,7 +13,11 @@ import (
 
 const segFilename = "%016d.seg"
 
-var magic = [4]byte{'S', '3', 'S', 'F'}
+// magic identifies segments written by the encryption-at-rest format. The bump
+// from the pre-encryption 'S','3','S','F' fails openSegment fast on any
+// pre-encryption data dir — there is no in-place migration path, the operator
+// must start fresh.
+var magic = [4]byte{'S', '3', 'S', 'E'}
 
 const (
 	_ uint16 = iota
@@ -29,23 +33,35 @@ const (
 // Segment layout:
 //
 //	[0:14]  segment header (magic, version, flags, reserved)
-//	[14:…]  sequence of fixed-size fragments (fragHeaderSize + fragBodySize each)
+//	[14:…]  sequence of fixed-size fragments (fragHeaderSize + fragBodySize + fragTagSize each)
+//
+// Fragment layout (8240 bytes):
+//
+//	[0:32]      header (see Fragment header layout)
+//	[32:8224]   body — AES-256-GCM ciphertext (same length as plaintext under GCM/CTR)
+//	[8224:8240] tag  — 16-byte GCM authentication tag binding ciphertext + AAD
 //
 // Fragment header layout (32 bytes):
 //
-//	[0:8]   fragNum   — global fragment counter (monotonic across segments)
-//	[8:16]  shardNum  — shard identifier
+//	[0:8]   fragNum    — global fragment counter (monotonic across segments)
+//	[8:16]  shardNum   — shard identifier
 //	[16:20] reserved
 //	[20:24] payloadLen — actual data bytes in this fragment's body (≤ fragBodySize)
-//	[24:28] flags     — fragFlags (flagEndOfShard marks the last fragment of a shard)
-//	[28:32] crc32     — IEEE CRC over the entire fragment with this field zeroed
+//	[24:28] flags      — fragFlags (flagEndOfShard marks the last fragment of a shard)
+//	[28:32] reserved   — was CRC32 pre-encryption; GCM is now the integrity authority
 const (
 	segHeaderSize     = 14
 	fragHeaderSize    = 32
 	fragBodySize      = 8 * KiB
-	totalFragSize     = fragHeaderSize + fragBodySize
+	fragTagSize       = 16
+	totalFragSize     = fragHeaderSize + fragBodySize + fragTagSize
 	DefaultMaxSegSize = 4 * GiB
 )
+
+// ErrIntegrity is returned when a fragment's GCM tag fails to authenticate —
+// either the ciphertext, the on-disk header bytes that feed AAD reconstruction,
+// or the master key / storeID do not match what was bound at seal time.
+var ErrIntegrity = errors.New("fragment integrity check failed")
 
 type segmentFlags uint32
 
@@ -198,7 +214,7 @@ func openSegment(dir string, num uint64) (*segment, error) {
 		var fileMagic [4]byte
 		copy(fileMagic[:], header[0:4])
 		if fileMagic != magic {
-			return nil, fmt.Errorf("invalid magic %x", fileMagic)
+			return nil, fmt.Errorf("segment %s: invalid magic %x (encryption-at-rest format change — a fresh data dir is required, pre-encryption data cannot be migrated in place)", path, fileMagic)
 		}
 	}
 
