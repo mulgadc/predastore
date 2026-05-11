@@ -20,6 +20,7 @@ import (
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3db"
+	storecrypto "github.com/mulgadc/predastore/store/crypto"
 )
 
 // BackendType specifies the storage backend type
@@ -33,15 +34,17 @@ const (
 // Server encapsulates the S3-compatible server with all its components
 type Server struct {
 	// Configuration
-	configPath  string
-	host        string
-	port        int
-	tlsCert     string
-	tlsKey      string
-	basePath    string
-	debug       bool
-	backendType BackendType
-	nodeID      int // For distributed mode: specific node to run (-1 = dev mode)
+	configPath        string
+	host              string
+	port              int
+	tlsCert           string
+	tlsKey            string
+	basePath          string
+	debug             bool
+	backendType       BackendType
+	nodeID            int    // For distributed mode: specific node to run (-1 = dev mode)
+	encryptionKeyPath string // Path to the 32-byte AES-256 master key file.
+	masterKey         []byte // Loaded 32-byte AES-256 master key.
 
 	// Runtime state
 	config    *Config
@@ -156,6 +159,16 @@ func WithNodeID(nodeID int) Option {
 	}
 }
 
+// WithEncryptionKeyFile sets the path to the 32-byte AES-256 master key file
+// used to seal/open shard fragments at rest. Required — the server refuses
+// to start if no key path is configured.
+func WithEncryptionKeyFile(path string) Option {
+	return func(s *Server) error {
+		s.encryptionKeyPath = path
+		return nil
+	}
+}
+
 // WithPprof enables CPU profiling.
 // The profile is written to a temp file during operation and saved to outputPath on shutdown.
 // If outputPath is empty, it defaults to /tmp/predastore-cpu.prof
@@ -212,6 +225,19 @@ func (s *Server) init() error {
 	if s.debug {
 		s.config.Debug = true
 	}
+
+	// Master key is mandatory. The key path itself is delivered via CLI/env
+	// only (not TOML) to avoid plaintext-secret-in-config and to keep s3d's
+	// config surface decoupled from quicd's. See encryption-at-rest plan.
+	if s.encryptionKeyPath == "" {
+		return fmt.Errorf("encryption key file is required (use -encryption-key-file or ENCRYPTION_KEY_FILE)")
+	}
+	key, err := storecrypto.LoadMasterKey(s.encryptionKeyPath)
+	if err != nil {
+		return fmt.Errorf("load master key: %w", err)
+	}
+	s.masterKey = key
+	slog.Info("master key loaded", "fingerprint", storecrypto.Fingerprint(key))
 
 	// Set log level early so debug logs during backend initialization are visible
 	var logLevel slog.Level
@@ -624,7 +650,7 @@ func (s *Server) launchQUICServers() {
 					return
 				}
 
-				quicserver.New(nodePath, quicAddr)
+				quicserver.New(nodePath, quicAddr, quicserver.WithMasterKey(s.masterKey))
 				return
 			}
 		}

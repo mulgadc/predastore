@@ -22,8 +22,16 @@ const writeBufLen = 32
 //
 // Fragment headers are written inline by writeHeader() whenever bufPos lands on
 // a fragment boundary. Payload length, flags, and CRC are deferred to flush().
+//
+// objectHash, shardIndex, and storeID are carried separately from extent to
+// avoid changing the on-disk extent encoding for data already in the index;
+// they are inputs to AEAD nonce / AAD construction consumed in Stage 2.
 type shardWriter struct {
-	seg *segment
+	objectHash [32]byte
+	shardIndex uint32
+	storeID    uint32
+
+	seg *segment // nil for 0-byte shards (no segment reservation).
 	ext extent
 
 	shardNum uint64
@@ -107,22 +115,28 @@ func (w *shardWriter) ReadFrom(r io.Reader) (total int64, err error) {
 // commits the extent to the index via onClose. Must be called exactly once.
 // The segment ref is always decremented on exit; the index commit only runs
 // when the data is fully durable, preserving rollback on flush/Sync failure.
+//
+// 0-byte shards have no segment — Close skips flush/Sync and just runs the
+// index commit.
 func (w *shardWriter) Close() (err error) {
 	if w.closed {
 		return ErrClosedWriter
 	}
 
 	w.closed = true
-	defer w.seg.refs.Add(-1)
 
-	if w.bufPos > w.extPos {
-		if err = w.flush(true); err != nil {
-			return err
+	if w.seg != nil {
+		defer w.seg.refs.Add(-1)
+
+		if w.bufPos > w.extPos {
+			if err = w.flush(true); err != nil {
+				return err
+			}
 		}
-	}
 
-	if err = w.seg.Sync(); err != nil {
-		return fmt.Errorf("sync segment %d: %w", w.ext.SegNum, err)
+		if err = w.seg.Sync(); err != nil {
+			return fmt.Errorf("sync segment %d: %w", w.ext.SegNum, err)
+		}
 	}
 
 	return w.onClose()

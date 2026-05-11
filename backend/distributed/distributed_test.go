@@ -12,6 +12,7 @@ import (
 
 	"github.com/klauspost/reedsolomon"
 	s3backend "github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3db"
 	"github.com/mulgadc/predastore/store"
@@ -55,7 +56,7 @@ func TestPutObject_ShardPlacementAndReconstruction(t *testing.T) {
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 		nodeDirs[i] = nodeDir
 
-		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5)
+		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5, quicserver.WithMasterKey(storetest.TestMasterKey))
 		require.NoError(t, err, "Failed to start QUIC server for node %d", i)
 		quicServers[i] = qs
 	}
@@ -104,7 +105,7 @@ func TestPutObject_ShardPlacementAndReconstruction(t *testing.T) {
 		nodeNum, err := NodeToUint32(node)
 		require.NoError(t, err)
 
-		s, err := store.Open(nodeDirs[nodeNum])
+		s, err := store.Open(nodeDirs[nodeNum], store.WithMasterKey(storetest.TestMasterKey))
 		require.NoError(t, err, "open store for node %s (shard %d)", node, i)
 		stores[i] = s
 
@@ -159,7 +160,7 @@ func TestPutGetRoundTrip(t *testing.T) {
 		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 
-		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5)
+		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5, quicserver.WithMasterKey(storetest.TestMasterKey))
 		require.NoError(t, err, "Failed to start QUIC server for node %d", i)
 		quicServers[i] = qs
 	}
@@ -349,7 +350,7 @@ func TestGetObjectByteRange(t *testing.T) {
 		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 
-		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5)
+		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5, quicserver.WithMasterKey(storetest.TestMasterKey))
 		require.NoError(t, err, "Failed to start QUIC server for node %d", i)
 		quicServers[i] = qs
 	}

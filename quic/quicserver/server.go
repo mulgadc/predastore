@@ -35,6 +35,8 @@ type QuicServer struct {
 	Addr   string
 	WalDir string
 
+	masterKey []byte
+
 	store *store.Store
 
 	// Listener for graceful shutdown
@@ -51,6 +53,18 @@ type QuicServer struct {
 
 	// Active stream counter for debugging
 	activeStreams int64
+}
+
+// Option configures a QuicServer at construction time.
+type Option func(*QuicServer) error
+
+// WithMasterKey provides the 32-byte AES-256 master key used to seal/open
+// shard fragments. Required — NewWithRetry fails if no key is supplied.
+func WithMasterKey(key []byte) Option {
+	return func(qs *QuicServer) error {
+		qs.masterKey = key
+		return nil
+	}
 }
 
 type ObjectRequest struct {
@@ -91,32 +105,46 @@ type DeleteResponse struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// NewWithRetry creates and starts a new QUIC server with retry logic for port binding
-// Returns the server instance and any error encountered
-func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, error) {
+// NewWithRetry creates and starts a new QUIC server with retry logic for port binding.
+// The master key (WithMasterKey) is mandatory; the store is opened with it.
+func NewWithRetry(walDir string, addr string, maxRetries int, opts ...Option) (*QuicServer, error) {
 	// Ensure storage directory exists
 	if err := os.MkdirAll(walDir, 0750); err != nil {
 		return nil, fmt.Errorf("create storage directory %s: %w", walDir, err)
-	}
-
-	s, err := store.Open(walDir)
-	if err != nil {
-		return nil, fmt.Errorf("open store in %s: %w", walDir, err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	qs := &QuicServer{
 		WalDir:     walDir,
 		Addr:       addr,
-		store:      s,
 		ctx:        ctx,
 		cancel:     cancel,
 		shutdownCh: make(chan struct{}),
 	}
 
+	for _, opt := range opts {
+		if err := opt(qs); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+
+	if qs.masterKey == nil {
+		cancel()
+		return nil, fmt.Errorf("quicserver: master key is required (use WithMasterKey)")
+	}
+
+	s, err := store.Open(walDir, store.WithMasterKey(qs.masterKey))
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("open store in %s: %w", walDir, err)
+	}
+	qs.store = s
+
 	tlsConf, err := makeServerTLSConfig()
 	if err != nil {
 		_ = s.Close()
+		cancel()
 		return nil, fmt.Errorf("tls config: %w", err)
 	}
 	tlsConf.NextProtos = []string{alpn}
@@ -144,6 +172,7 @@ func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, erro
 	}
 	if err != nil {
 		_ = s.Close()
+		cancel()
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}
 
@@ -160,8 +189,8 @@ func NewWithRetry(walDir string, addr string, maxRetries int) (*QuicServer, erro
 // The WAL is opened once and shared across all request handlers
 // Returns the server instance for graceful shutdown control
 // Panics on error - use NewWithRetry for error handling
-func New(walDir string, addr string) *QuicServer {
-	qs, err := NewWithRetry(walDir, addr, 10)
+func New(walDir string, addr string, opts ...Option) *QuicServer {
+	qs, err := NewWithRetry(walDir, addr, 10, opts...)
 	if err != nil {
 		slog.Error("failed to start QUIC server", "error", err)
 		os.Exit(1)

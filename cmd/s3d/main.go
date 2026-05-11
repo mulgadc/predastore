@@ -20,6 +20,7 @@ func main() {
 	port := flag.Int("port", 443, "Server port")
 	host := flag.String("host", "0.0.0.0", "Server host")
 	nodeID := flag.Int("node", -1, "Node ID to run (-1 = dev mode runs all nodes)")
+	encryptionKeyFile := flag.String("encryption-key-file", "", "Path to 32-byte AES-256 master key for encryption at rest (required)")
 
 	flag.Parse()
 
@@ -44,6 +45,14 @@ func main() {
 	if os.Getenv("NODE") != "" {
 		*nodeID, _ = strconv.Atoi(os.Getenv("NODE"))
 	}
+	if os.Getenv("ENCRYPTION_KEY_FILE") != "" {
+		*encryptionKeyFile = os.Getenv("ENCRYPTION_KEY_FILE")
+	}
+	if *encryptionKeyFile == "" {
+		slog.Error("Missing required flag: -encryption-key-file (or ENCRYPTION_KEY_FILE)")
+		flag.Usage()
+		os.Exit(1)
+	}
 
 	// Create the S3 server with all options
 	server, err := s3.NewServer(
@@ -53,6 +62,7 @@ func main() {
 		s3.WithBasePath(*basePath),
 		s3.WithDebug(*debug),
 		s3.WithNodeID(*nodeID),
+		s3.WithEncryptionKeyFile(*encryptionKeyFile),
 	)
 	if err != nil {
 		slog.Error("Failed to create server", "error", err)

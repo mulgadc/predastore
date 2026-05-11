@@ -14,8 +14,16 @@ const readBufLen = 32
 // It reads one fragment at a time from disk, validates CRC, and copies the
 // payload into the caller's buffer. bufPos tracks the logical read position
 // for sequential Read() calls; ReadAt is stateless.
+//
+// objectHash, shardIndex, and storeID are carried separately from extent to
+// avoid changing the on-disk extent encoding for data already in the index;
+// they are inputs to AEAD nonce / AAD reconstruction consumed in Stage 3.
 type shardReader struct {
-	seg *segment
+	objectHash [32]byte
+	shardIndex uint32
+	storeID    uint32
+
+	seg *segment // nil for 0-byte shards (no segment to read from).
 	ext extent
 
 	buf    []byte
@@ -110,13 +118,17 @@ func (r *shardReader) Size() int64 {
 }
 
 // Close releases the segment reference. Must be called exactly once.
+// 0-byte readers carry no segment reference, so Close is a no-op beyond
+// flipping the closed flag.
 func (r *shardReader) Close() error {
 	if r.closed {
 		return fmt.Errorf("shard reader closed")
 	}
 
 	r.closed = true
-	r.seg.refs.Add(-1)
+	if r.seg != nil {
+		r.seg.refs.Add(-1)
+	}
 
 	return nil
 }
