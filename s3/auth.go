@@ -172,8 +172,11 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 		return nil, fmt.Errorf("iam.master_key_path is required")
 	}
 
-	// Load and validate master key
-	key, err := masterkey.Load(cfg.MasterKeyPath)
+	// Load and validate master key. The IAM master key is shared across
+	// services on the host via group ownership (e.g. /etc/spinifex/master.key
+	// at root:spinifex 0640), so use the shared loader rather than the strict
+	// 0600 loader used for the per-node fragment encryption key.
+	key, err := masterkey.LoadShared(cfg.MasterKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("load master key: %w", err)
 	}

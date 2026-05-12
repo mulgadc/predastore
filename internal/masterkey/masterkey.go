@@ -35,13 +35,26 @@ type Key struct {
 // to every object cluster-wide; warn-and-allow would put us one ignored log
 // line from a permanent breach.
 func Load(path string) (*Key, error) {
+	return load(path, 0o077, "0600")
+}
+
+// LoadShared reads a 32-byte AES-256 master key from disk that is shared
+// across services on the same host via group ownership (e.g. the IAM master
+// key at /etc/spinifex/master.key, root:spinifex 0640). Group-read is
+// permitted; any "other" access bit (mode & 0007 != 0) is rejected. Use Load
+// instead for keys that must remain owner-only.
+func LoadShared(path string) (*Key, error) {
+	return load(path, 0o007, "0640")
+}
+
+func load(path string, denyMask os.FileMode, wantMode string) (*Key, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat master key %s: %w", path, err)
 	}
 
-	if perm := info.Mode().Perm(); perm&0o077 != 0 {
-		return nil, fmt.Errorf("master key %s has permissions %#o: must be 0600 (group/other access disallowed)", path, perm)
+	if perm := info.Mode().Perm(); perm&denyMask != 0 {
+		return nil, fmt.Errorf("master key %s has permissions %#o: must be %s or stricter", path, perm, wantMode)
 	}
 
 	raw, err := os.ReadFile(path)

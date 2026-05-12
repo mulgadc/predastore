@@ -77,6 +77,49 @@ func TestLoad_LoosePermissions(t *testing.T) {
 	}
 }
 
+func TestLoadShared_AcceptsGroupRead(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission semantics not enforced on Windows")
+	}
+
+	raw := make([]byte, masterkey.MasterKeySize)
+	_, err := rand.Read(raw)
+	require.NoError(t, err)
+
+	// LoadShared exists for cluster-shared keys (e.g. the IAM master key at
+	// root:spinifex 0640). Owner-only modes must keep working too.
+	for _, mode := range []os.FileMode{0o600, 0o640, 0o400, 0o440} {
+		t.Run(fmt.Sprintf("mode_%#o", mode), func(t *testing.T) {
+			path := writeKeyFile(t, "key", raw, mode)
+			k, err := masterkey.LoadShared(path)
+			require.NoError(t, err, "mode %#o has no other-access bits; should be accepted", mode)
+			require.NotNil(t, k)
+			assert.NotNil(t, k.AEAD)
+			assert.Equal(t, masterkey.Fingerprint(raw), k.Fingerprint)
+		})
+	}
+}
+
+func TestLoadShared_RejectsOtherAccess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission semantics not enforced on Windows")
+	}
+
+	raw := make([]byte, masterkey.MasterKeySize)
+
+	// LoadShared still rejects any "other" access bit — group sharing is
+	// fine, world-readable is not.
+	for _, mode := range []os.FileMode{0o644, 0o604, 0o601, 0o606, 0o646, 0o666, 0o777} {
+		t.Run(fmt.Sprintf("mode_%#o", mode), func(t *testing.T) {
+			path := writeKeyFile(t, "key", raw, mode)
+			_, err := masterkey.LoadShared(path)
+			require.Error(t, err, "mode %#o exposes other access; LoadShared must reject", mode)
+			assert.Contains(t, err.Error(), "permissions",
+				"error should explain the perm failure to the operator")
+		})
+	}
+}
+
 func TestLoad_WrongLength(t *testing.T) {
 	for _, n := range []int{0, 1, 16, 24, 31, 33, 64, 128} {
 		t.Run(fmt.Sprintf("len_%d", n), func(t *testing.T) {
