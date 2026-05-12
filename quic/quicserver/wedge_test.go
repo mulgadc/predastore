@@ -28,7 +28,7 @@ func newTestQuicServer(t *testing.T) (*quicserver.QuicServer, string) {
 	dir := t.TempDir()
 	port := 46000 + int(quicServerTestPortCounter.Add(1))
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	qs, err := quicserver.NewWithRetry(filepath.Join(dir, "wal"), addr, 5, quicserver.WithMasterKey(storetest.TestMasterKey))
+	qs, err := quicserver.NewWithRetry(filepath.Join(dir, "wal"), addr, 5, quicserver.WithMasterKey(storetest.TestKey()))
 	require.NoError(t, err)
 	return qs, addr
 }

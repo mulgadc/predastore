@@ -1,18 +1,17 @@
 package s3
 
 import (
-	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/masterkey"
 	"github.com/nats-io/nats.go"
 )
 
@@ -174,19 +173,11 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	}
 
 	// Load and validate master key
-	masterKey, err := loadMasterKey(cfg.MasterKeyPath)
+	key, err := masterkey.Load(cfg.MasterKeyPath)
 	if err != nil {
 		return nil, fmt.Errorf("load master key: %w", err)
 	}
-
-	block, err := aes.NewCipher(masterKey)
-	if err != nil {
-		return nil, fmt.Errorf("create AES cipher: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("create GCM: %w", err)
-	}
+	gcm := key.AEAD
 
 	// Connect to NATS
 	opts := []nats.Option{nats.Name("predastore-iam")}
@@ -532,17 +523,4 @@ func (p *ChainProvider) LookupCredentials(accessKeyID string) (*CredentialResult
 func (p *ChainProvider) Close() {
 	p.iam.Close()
 	p.config.Close()
-}
-
-// --- Helpers ---
-
-func loadMasterKey(path string) ([]byte, error) {
-	key, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read master key: %w", err)
-	}
-	if len(key) != 32 {
-		return nil, fmt.Errorf("master key must be 32 bytes, got %d", len(key))
-	}
-	return key, nil
 }

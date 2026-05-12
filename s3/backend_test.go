@@ -122,7 +122,7 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 
 		addr := fmt.Sprintf("127.0.0.1:%d", basePort+i)
-		quicServers[i] = quicserver.New(nodeDir, addr, quicserver.WithMasterKey(storetest.TestMasterKey))
+		quicServers[i] = quicserver.New(nodeDir, addr, quicserver.WithMasterKey(storetest.TestKey()))
 	}
 
 	// Allow QUIC servers time to start

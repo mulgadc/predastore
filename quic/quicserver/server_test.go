@@ -18,7 +18,7 @@ func TestNewWithRetryBindsListener(t *testing.T) {
 		t.Fatalf("mkdir walDir: %v", err)
 	}
 
-	qs, err := NewWithRetry(walDir, "127.0.0.1:0", 1, WithMasterKey(storetest.TestMasterKey))
+	qs, err := NewWithRetry(walDir, "127.0.0.1:0", 1, WithMasterKey(storetest.TestKey()))
 	if err != nil {
 		t.Fatalf("NewWithRetry: %v", err)
 	}

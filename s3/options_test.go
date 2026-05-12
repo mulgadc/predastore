@@ -66,14 +66,28 @@ func TestWithBackend(t *testing.T) {
 }
 
 func TestWithNodeID(t *testing.T) {
-	s := &Server{}
-	opt := WithNodeID(3)
-	require.NoError(t, opt(s))
-	assert.Equal(t, 3, s.nodeID)
+	t.Run("accepts production ID", func(t *testing.T) {
+		s := &Server{}
+		require.NoError(t, WithNodeID(3)(s))
+		assert.Equal(t, 3, s.nodeID)
+	})
 
-	opt = WithNodeID(-1)
-	require.NoError(t, opt(s))
-	assert.Equal(t, -1, s.nodeID)
+	t.Run("accepts dev sentinel", func(t *testing.T) {
+		s := &Server{}
+		require.NoError(t, WithNodeID(-1)(s))
+		assert.Equal(t, -1, s.nodeID)
+	})
+
+	t.Run("rejects garbage values", func(t *testing.T) {
+		// 0 is the dangerous one: strconv.Atoi of a non-numeric env var
+		// silently returns 0. Anything < -1 is malformed by construction.
+		for _, n := range []int{0, -2, -100} {
+			s := &Server{}
+			err := WithNodeID(n)(s)
+			require.Error(t, err, "node ID %d must be rejected", n)
+			assert.Contains(t, err.Error(), "invalid node ID")
+		}
+	})
 }
 
 func TestWithPprof(t *testing.T) {

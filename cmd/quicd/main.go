@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/mulgadc/predastore/internal/keyfile"
+	"github.com/mulgadc/predastore/internal/masterkey"
 	"github.com/mulgadc/predastore/quic/quicserver"
 )
 
@@ -24,7 +24,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	key, err := keyfile.Load(*encryptionKeyFile)
+	key, err := masterkey.Load(*encryptionKeyFile)
 	if err != nil {
 		slog.Error("Failed to load master key", "path", *encryptionKeyFile, "error", err)
 		os.Exit(1)

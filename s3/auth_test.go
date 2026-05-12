@@ -8,8 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -132,41 +130,6 @@ func TestExtractPolicyName(t *testing.T) {
 		got := extractPolicyName(tt.arn)
 		assert.Equal(t, tt.want, got, "extractPolicyName(%q)", tt.arn)
 	}
-}
-
-// --- loadMasterKey tests ---
-
-func TestLoadMasterKey_Valid(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "master.key")
-
-	key := make([]byte, 32)
-	_, err := rand.Read(key)
-	require.NoError(t, err)
-
-	err = os.WriteFile(path, key, 0600)
-	require.NoError(t, err)
-
-	loaded, err := loadMasterKey(path)
-	require.NoError(t, err)
-	assert.Equal(t, key, loaded)
-}
-
-func TestLoadMasterKey_WrongSize(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "master.key")
-
-	err := os.WriteFile(path, []byte("too-short"), 0600)
-	require.NoError(t, err)
-
-	_, err = loadMasterKey(path)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "32 bytes")
-}
-
-func TestLoadMasterKey_Missing(t *testing.T) {
-	_, err := loadMasterKey("/nonexistent/master.key")
-	assert.Error(t, err)
 }
 
 // --- decrypt tests ---

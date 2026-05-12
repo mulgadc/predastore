@@ -90,7 +90,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup, n
 		nodeDir := filepath.Join(nodeDataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 		addr := fmt.Sprintf("127.0.0.1:%d", basePort+i)
-		quicServers[i] = quicserver.New(nodeDir, addr, quicserver.WithMasterKey(storetest.TestMasterKey))
+		quicServers[i] = quicserver.New(nodeDir, addr, quicserver.WithMasterKey(storetest.TestKey()))
 	}
 	time.Sleep(100 * time.Millisecond)
 
