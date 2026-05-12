@@ -3,7 +3,6 @@ package quicserver
 import (
 	"bufio"
 	"context"
-	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/rsa"
@@ -19,7 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mulgadc/predastore/internal/keyfile"
+	"github.com/mulgadc/predastore/internal/masterkey"
 	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/store"
@@ -62,26 +61,16 @@ type QuicServer struct {
 // Option configures a QuicServer at construction time.
 type Option func(*QuicServer) error
 
-// WithMasterKey provides the 32-byte AES-256 master key used to seal/open
-// shard fragments. Required — NewWithRetry fails if no key is supplied.
-// The AEAD is built here once and handed down to the store; the raw key is
-// fingerprinted for logging and then dropped so it isn't retained on the
-// QuicServer.
-func WithMasterKey(key []byte) Option {
+// WithMasterKey supplies the loaded master key used to seal/open shard
+// fragments. Required — NewWithRetry fails if no key is supplied. The AEAD
+// is taken directly from k; raw key bytes never reach this layer.
+func WithMasterKey(k *masterkey.Key) Option {
 	return func(qs *QuicServer) error {
-		if len(key) != keyfile.MasterKeySize {
-			return fmt.Errorf("master key must be %d bytes, got %d", keyfile.MasterKeySize, len(key))
+		if k == nil || k.AEAD == nil {
+			return fmt.Errorf("quicserver: master key is required")
 		}
-		block, err := aes.NewCipher(key)
-		if err != nil {
-			return fmt.Errorf("create AES cipher: %w", err)
-		}
-		aead, err := cipher.NewGCM(block)
-		if err != nil {
-			return fmt.Errorf("create GCM: %w", err)
-		}
-		qs.aead = aead
-		qs.keyFingerprint = keyfile.Fingerprint(key)
+		qs.aead = k.AEAD
+		qs.keyFingerprint = k.Fingerprint
 		return nil
 	}
 }

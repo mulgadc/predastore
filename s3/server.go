@@ -18,7 +18,7 @@ import (
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
-	"github.com/mulgadc/predastore/internal/keyfile"
+	"github.com/mulgadc/predastore/internal/masterkey"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3db"
 )
@@ -42,9 +42,9 @@ type Server struct {
 	basePath          string
 	debug             bool
 	backendType       BackendType
-	nodeID            int    // For distributed mode: specific node to run (-1 = dev mode)
-	encryptionKeyPath string // Path to the 32-byte AES-256 master key file.
-	masterKey         []byte // Loaded 32-byte AES-256 master key.
+	nodeID            int            // For distributed mode: specific node to run (-1 = dev mode)
+	encryptionKeyPath string         // Path to the 32-byte AES-256 master key file.
+	masterKey         *masterkey.Key // Loaded master key handle (AEAD + fingerprint, no raw bytes).
 
 	// Runtime state
 	config    *Config
@@ -151,9 +151,14 @@ func WithBackend(backendType BackendType) Option {
 
 // WithNodeID sets the node ID for distributed mode.
 // Use -1 (default) for dev mode which runs all nodes locally.
-// Use a specific ID to run only that node (for production deployments).
+// Use a specific ID >= 1 to run only that node (for production deployments).
+// Node IDs are 1-indexed; any other value is rejected so a typo in the caller
+// (e.g. NODE=garbage parsed to 0) does not silently downgrade to dev mode.
 func WithNodeID(nodeID int) Option {
 	return func(s *Server) error {
+		if nodeID != -1 && nodeID < 1 {
+			return fmt.Errorf("invalid node ID %d: must be -1 (dev mode) or >= 1 (production)", nodeID)
+		}
 		s.nodeID = nodeID
 		return nil
 	}
@@ -232,12 +237,12 @@ func (s *Server) init() error {
 	if s.encryptionKeyPath == "" {
 		return fmt.Errorf("encryption key file is required (use -encryption-key-file or ENCRYPTION_KEY_FILE)")
 	}
-	key, err := keyfile.Load(s.encryptionKeyPath)
+	key, err := masterkey.Load(s.encryptionKeyPath)
 	if err != nil {
 		return fmt.Errorf("load master key: %w", err)
 	}
 	s.masterKey = key
-	slog.Info("master key loaded", "fingerprint", keyfile.Fingerprint(key))
+	slog.Info("master key loaded", "fingerprint", key.Fingerprint)
 
 	// Set log level early so debug logs during backend initialization are visible
 	var logLevel slog.Level
@@ -673,7 +678,7 @@ func (s *Server) launchQUICServers() {
 				continue
 			}
 
-			quicserver.New(nodePath, quicAddr)
+			quicserver.New(nodePath, quicAddr, quicserver.WithMasterKey(s.masterKey))
 		}
 	} else {
 		slog.Error("Distributed mode requires -node flag when nodes have different hosts")
