@@ -29,14 +29,14 @@ build:
 # GO commands
 go_build:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
-	go build -ldflags "-s -w" -o ./bin/s3d cmd/s3d/main.go
+	GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/s3d cmd/s3d/main.go
 
 # Build multi-arch for docker, TODO add ARM
 go_build_docker:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
-	GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" --ldflags '-extldflags "-static"' -o ./bin/linux/s3d cmd/s3d/main.go
+	GOOS=linux GOARCH=amd64 GOFIPS140=v1.0.0 go build -ldflags "-s -w" --ldflags '-extldflags "-static"' -o ./bin/linux/s3d cmd/s3d/main.go
 
-	GOOS=darwin GOARCH=$(GOARCH) go build -ldflags "-s -w" -o ./bin/darwin/s3d cmd/s3d/main.go
+	GOOS=darwin GOARCH=$(GOARCH) GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/darwin/s3d cmd/s3d/main.go
 
 # Preflight — runs the same checks as GitHub Actions (lint + security + tests).
 # Use this before committing to catch CI failures locally.
