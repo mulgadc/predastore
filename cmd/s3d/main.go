@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/s3"
+
+	_ "github.com/mulgadc/predastore/internal/fipsboot"
 )
 
 func main() {
