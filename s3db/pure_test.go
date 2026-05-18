@@ -2,7 +2,6 @@ package s3db
 
 import (
 	"crypto/sha256"
-	"net/url"
 	"testing"
 	"time"
 
@@ -166,49 +165,6 @@ func TestGenObjectHash(t *testing.T) {
 		expected := sha256.Sum256([]byte("b/k"))
 		assert.Equal(t, expected, GenObjectHash("b", "k"))
 	})
-}
-
-func TestServerUriEncode(t *testing.T) {
-	tests := []struct {
-		name        string
-		input       string
-		encodeSlash bool
-		want        string
-	}{
-		{"unreserved chars", "ABCabc012-._~", true, "ABCabc012-._~"},
-		{"slash not encoded", "/path/to", false, "/path/to"},
-		{"slash encoded", "/path/to", true, "%2Fpath%2Fto"},
-		{"space encoded", "hello world", true, "hello%20world"},
-		{"empty", "", true, ""},
-		{"equals and ampersand", "a=b&c", true, "a%3Db%26c"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, UriEncode(tt.input, tt.encodeSlash))
-		})
-	}
-}
-
-func TestServerCanonicalQueryString(t *testing.T) {
-	tests := []struct {
-		name   string
-		params url.Values
-		want   string
-	}{
-		{"empty", url.Values{}, ""},
-		{"single param", url.Values{"key": {"value"}}, "key=value"},
-		{"sorted keys", url.Values{"z": {"1"}, "a": {"2"}}, "a=2&z=1"},
-		{"sorted values", url.Values{"k": {"c", "a", "b"}}, "k=a&k=b&k=c"},
-		{"special chars encoded", url.Values{"a b": {"c=d"}}, "a%20b=c%3Dd"},
-		{"nil", nil, ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, CanonicalQueryString(tt.params))
-		})
-	}
 }
 
 func TestClusterConfig_GetNode(t *testing.T) {

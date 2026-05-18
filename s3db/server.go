@@ -2,7 +2,6 @@ package s3db
 
 import (
 	"context"
-	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -12,10 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
-	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -24,17 +20,6 @@ import (
 	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
 )
-
-// maxAuthBodySize bounds the request body read during SigV4 validation to
-// prevent unauthenticated callers from triggering OOM by streaming a large
-// payload before signature verification fails.
-const maxAuthBodySize = 10 * 1024 * 1024
-
-// maxClockSkew is the maximum allowed difference between the X-Amz-Date
-// request timestamp and the server's current time. Matches the S3 API and
-// spinifex gateway (5 min) to bound replay-attack windows on the Raft-backed
-// IAM state store.
-const maxClockSkew = 5 * time.Minute
 
 // Server provides HTTP REST API for the distributed database
 type Server struct {
@@ -148,16 +133,14 @@ func (s *Server) setupRoutes() {
 	})
 }
 
-// authMiddleware validates AWS Signature V4 authentication
+// authMiddleware validates AWS Signature V4 authentication.
 func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip auth for health and status endpoints
 		if r.URL.Path == "/health" || r.URL.Path == "/status" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		// Get region and service, with defaults
 		region := s.config.Region
 		if region == "" {
 			region = DefaultRegion
@@ -167,16 +150,18 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			service = DefaultService
 		}
 
-		// Bound the body before signature validation reads it, so a forged
-		// Authorization header cannot force us to buffer a huge payload.
-		r.Body = http.MaxBytesReader(w, r.Body, maxAuthBodySize)
+		lookup := func(id string) (string, error) {
+			secret, ok := s.config.Credentials[id]
+			if !ok {
+				return "", fmt.Errorf("invalid access key: %s", id)
+			}
+			return secret, nil
+		}
 
-		// Validate the signature
-		accessKey, err := ValidateSignatureHTTP(r, s.config.Credentials, region, service)
+		accessKey, err := auth.VerifySigV4Request(r, region, service, lookup)
 		if err != nil {
-			var maxBytesErr *http.MaxBytesError
-			if errors.As(err, &maxBytesErr) {
-				slog.Warn("Request body exceeds auth size limit", "limit", maxAuthBodySize)
+			if errors.Is(err, auth.ErrBodyTooLarge) {
+				slog.Warn("Request body exceeds auth size limit")
 				s.writeJSON(w, http.StatusRequestEntityTooLarge, ErrorResponse{
 					Error:   "EntityTooLarge",
 					Message: "Request body exceeds signature validation size limit",
@@ -191,7 +176,6 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Store authenticated access key in context
 		ctx := context.WithValue(r.Context(), contextKeyAccessKey, accessKey)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -644,185 +628,4 @@ type ScanResponse struct {
 type JoinRequest struct {
 	NodeID string `json:"node_id"`
 	Addr   string `json:"addr"`
-}
-
-// ValidateSignatureHTTP validates an AWS Signature V4 authorization header for net/http
-// Returns the access key if valid, or an error if invalid
-func ValidateSignatureHTTP(r *http.Request, credentials map[string]string, region, service string) (string, error) {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		return "", fmt.Errorf("missing Authorization header")
-	}
-
-	// Parse authorization header
-	// Format: AWS4-HMAC-SHA256 Credential=ACCESS/DATE/REGION/SERVICE/aws4_request, SignedHeaders=..., Signature=...
-	parts := strings.Split(authHeader, ", ")
-	if len(parts) != 3 {
-		return "", fmt.Errorf("invalid Authorization header format")
-	}
-
-	// Parse credential
-	credPart := strings.TrimPrefix(parts[0], "AWS4-HMAC-SHA256 Credential=")
-	creds := strings.Split(credPart, "/")
-	if len(creds) != 5 {
-		return "", fmt.Errorf("invalid credential scope")
-	}
-	accessKey, date, reqRegion, reqService := creds[0], creds[1], creds[2], creds[3]
-
-	// Lookup secret key
-	secretKey, ok := credentials[accessKey]
-	if !ok {
-		return "", fmt.Errorf("invalid access key")
-	}
-
-	// Parse signed headers and signature
-	signedHeaders := strings.TrimPrefix(parts[1], "SignedHeaders=")
-	signature := strings.TrimPrefix(parts[2], "Signature=")
-
-	// Get timestamp
-	timestamp := r.Header.Get("X-Amz-Date")
-	if timestamp == "" {
-		return "", fmt.Errorf("missing X-Amz-Date header")
-	}
-
-	// Replay protection: enforce clock skew against X-Amz-Date. s3db gates
-	// Raft-backed IAM state, so a captured Authorization header must not be
-	// replayable indefinitely.
-	parsedTime, err := time.Parse(auth.TimeFormat, timestamp)
-	if err != nil {
-		return "", fmt.Errorf("invalid X-Amz-Date header format: %w", err)
-	}
-	if time.Since(parsedTime).Abs() > maxClockSkew {
-		return "", fmt.Errorf("request timestamp outside allowed skew")
-	}
-
-	// Build canonical URI
-	canonicalURI := r.URL.Path
-	if canonicalURI == "" {
-		canonicalURI = "/"
-	}
-	canonicalURI = auth.UriEncode(canonicalURI, false)
-
-	// Build canonical query string
-	queryUrl := r.URL.Query()
-	for key := range queryUrl {
-		sort.Strings(queryUrl[key])
-	}
-	canonicalQueryString := strings.ReplaceAll(queryUrl.Encode(), "+", "%20")
-
-	// Build canonical headers
-	// Note: Go's net/http moves Host header to r.Host, not r.Header
-	headers := strings.Split(signedHeaders, ";")
-	if err := auth.RequireSignedHeaders(headers); err != nil {
-		return "", err
-	}
-	sort.Strings(headers)
-
-	canonicalHeaders := ""
-	for _, header := range headers {
-		var value string
-		if header == "host" {
-			// Host header is in r.Host, not r.Header in net/http
-			value = r.Host
-		} else {
-			value = r.Header.Get(header)
-		}
-		canonicalHeaders += fmt.Sprintf("%s:%s\n", header, strings.TrimSpace(value))
-	}
-
-	// Calculate payload hash
-	var body []byte
-	if r.Body != nil {
-		var err error
-		body, err = io.ReadAll(r.Body)
-		if err != nil {
-			return "", fmt.Errorf("failed to read request body: %w", err)
-		}
-		// Put body back for handlers
-		r.Body = io.NopCloser(strings.NewReader(string(body)))
-	}
-	payloadHash := auth.HashSHA256(string(body))
-
-	// Build canonical request
-	canonicalRequest := fmt.Sprintf(
-		"%s\n%s\n%s\n%s\n%s\n%s",
-		r.Method,
-		canonicalURI,
-		canonicalQueryString,
-		canonicalHeaders,
-		signedHeaders,
-		payloadHash,
-	)
-
-	// Hash canonical request
-	hashedCanonicalRequest := auth.HashSHA256(canonicalRequest)
-
-	// Create string to sign - use the region from the request for validation
-	scope := fmt.Sprintf("%s/%s/%s/aws4_request", date, reqRegion, reqService)
-	stringToSign := fmt.Sprintf(
-		"AWS4-HMAC-SHA256\n%s\n%s\n%s",
-		timestamp,
-		scope,
-		hashedCanonicalRequest,
-	)
-
-	// Derive signing key and calculate expected signature
-	signingKey := auth.GetSigningKey(secretKey, date, reqRegion, reqService)
-	expectedSig := auth.HmacSHA256Hex(signingKey, stringToSign)
-
-	// Compare signatures using constant-time comparison to prevent timing attacks
-	if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(signature)) != 1 {
-		return "", fmt.Errorf("signature mismatch")
-	}
-
-	return accessKey, nil
-}
-
-// UriEncode follows AWS's specific requirements for canonical URI encoding
-func UriEncode(input string, encodeSlash bool) string {
-	var builder strings.Builder
-	builder.Grow(len(input) * 3) // Pre-allocate space for worst case
-
-	for _, b := range []byte(input) {
-		// AWS's unreserved characters
-		if (b >= 'A' && b <= 'Z') ||
-			(b >= 'a' && b <= 'z') ||
-			(b >= '0' && b <= '9') ||
-			b == '-' || b == '.' || b == '_' || b == '~' {
-			builder.WriteByte(b)
-		} else if b == '/' && !encodeSlash {
-			builder.WriteByte(b)
-		} else {
-			// URI encode everything else
-			fmt.Fprintf(&builder, "%%%02X", b)
-		}
-	}
-
-	return builder.String()
-}
-
-// CanonicalQueryString creates the canonical query string according to AWS specs
-func CanonicalQueryString(queryParams url.Values) string {
-	// 1. Sort parameter names in ascending order
-	keys := make([]string, 0, len(queryParams))
-	for k := range queryParams {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	// 2. Build canonical query string
-	var pairs []string
-	for _, key := range keys {
-		values := queryParams[key]
-		sort.Strings(values) // Sort values for each key
-
-		// URI encode both key and values
-		encodedKey := UriEncode(key, true)
-		for _, v := range values {
-			encodedValue := UriEncode(v, true)
-			pairs = append(pairs, fmt.Sprintf("%s=%s", encodedKey, encodedValue))
-		}
-	}
-
-	return strings.Join(pairs, "&")
 }

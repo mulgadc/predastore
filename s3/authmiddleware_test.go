@@ -2,7 +2,6 @@ package s3
 
 import (
 	"bytes"
-	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -338,10 +337,11 @@ func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
 }
 
 // TestSigV4AuthMiddleware_OversizeSignedBody verifies that a signed request
-// whose body exceeds maxAuthBodySize and does not use UNSIGNED-PAYLOAD or a
-// precomputed hash is rejected with 413 EntityTooLarge, not buffered and
-// OOMed. This is the pre-auth DoS guard.
+// whose body exceeds the auth-package's 10 MiB cap and does not use
+// UNSIGNED-PAYLOAD or a precomputed hash is rejected with 413 EntityTooLarge,
+// not buffered and OOMed. This is the pre-auth DoS guard.
 func TestSigV4AuthMiddleware_OversizeSignedBody(t *testing.T) {
+	const oversize = 10*1024*1024 + 1
 	s3Config := &Config{
 		Region: "ap-southeast-2",
 		Buckets: []S3_Buckets{{
@@ -363,9 +363,9 @@ func TestSigV4AuthMiddleware_OversizeSignedBody(t *testing.T) {
 
 	server := NewHTTP2Server(s3Config)
 
-	// Body 1 byte over the cap — exercises the MaxBytesReader reject path
-	// without allocating an unreasonable amount of memory in tests.
-	body := strings.Repeat("A", maxAuthBodySize+1)
+	// Body 1 byte over the cap — exercises the auth.ErrBodyTooLarge reject
+	// path without allocating an unreasonable amount of memory in tests.
+	body := strings.Repeat("A", oversize)
 	req := httptest.NewRequest(http.MethodPut, "/test-bucket01/big-object", bytes.NewReader([]byte(body)))
 
 	timestamp := time.Now().UTC().Format(auth.TimeFormat)
@@ -382,54 +382,4 @@ func TestSigV4AuthMiddleware_OversizeSignedBody(t *testing.T) {
 
 	assert.Equal(t, http.StatusRequestEntityTooLarge, rr.Code)
 	assert.Contains(t, rr.Body.String(), "EntityTooLarge")
-}
-
-// TestGetSigningKey verifies the key derivation process
-func TestGetSigningKey(t *testing.T) {
-	// Test values from AWS documentation
-	secret := "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
-	date := "20150830"
-	region := "us-east-1"
-	service := "iam"
-
-	// Expected signing key (hex-encoded)
-	// This value is from the AWS Signature V4 documentation example
-	expectedKey := "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
-
-	// Generate the signing key
-	signingKey := auth.GetSigningKey(secret, date, region, service)
-	actualKey := hex.EncodeToString(signingKey)
-
-	// Verify the key matches the expected value
-	assert.Equal(t, expectedKey, actualKey)
-}
-
-// TestHmacSHA256 tests the HMAC-SHA256 function
-func TestHmacSHA256(t *testing.T) {
-	key := []byte("key")
-	data := "The quick brown fox jumps over the lazy dog"
-
-	// Expected HMAC-SHA256 (hex-encoded)
-	expectedHmac := "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
-
-	// Calculate HMAC-SHA256
-	hmac := auth.HmacSHA256(key, data)
-	actualHmac := hex.EncodeToString(hmac)
-
-	// Verify the HMAC matches the expected value
-	assert.Equal(t, expectedHmac, actualHmac)
-}
-
-// TestHashSHA256 tests the SHA256 hash function
-func TestHashSHA256(t *testing.T) {
-	data := "The quick brown fox jumps over the lazy dog"
-
-	// Expected SHA256 (hex-encoded)
-	expectedHash := "d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592"
-
-	// Calculate SHA256
-	actualHash := auth.HashSHA256(data)
-
-	// Verify the hash matches the expected value
-	assert.Equal(t, expectedHash, actualHash)
 }
