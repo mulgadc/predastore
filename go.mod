@@ -17,7 +17,7 @@ require (
 	github.com/minio/crc64nvme v1.1.1
 	github.com/nats-io/nats.go v1.52.0
 	github.com/pelletier/go-toml/v2 v2.3.1
-	github.com/quic-go/quic-go v0.59.0
+	github.com/quic-go/quic-go v0.59.1
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/time v0.15.0
 	pgregory.net/rapid v1.3.0
