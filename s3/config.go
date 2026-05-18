@@ -55,7 +55,6 @@ func (s3 *Config) ReadConfig() (err error) {
 		if err != nil {
 			slog.Warn("Invalid bucket name", "bucket", b.Name, "error", err)
 			continue
-			//return fmt.Errorf("invalid bucket name: %s", err)
 		}
 
 		// Create bucket directory if a pathname is configured
