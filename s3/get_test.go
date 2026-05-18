@@ -21,7 +21,7 @@ func TestGetObjectNoBucketPermissions(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/private/note.txt", nil)
 	timestamp := time.Now().UTC().Format("20060102T150405Z")
-	err := auth.GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, "us-east-1", "s3", req)
+	err := auth.GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, config.Region, "s3", req)
 	assert.NoError(t, err, "Error generating auth header")
 
 	rr := httptest.NewRecorder()

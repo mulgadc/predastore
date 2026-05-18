@@ -5,11 +5,8 @@
 package s3
 
 import (
-	"bytes"
 	"context"
-	"crypto/subtle"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -18,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -33,18 +29,6 @@ import (
 	"github.com/mulgadc/predastore/ratelimit"
 	"github.com/mulgadc/predastore/s3/chunked"
 )
-
-// maxClockSkew is the maximum allowed difference between the request
-// timestamp and the server's current time. Matches spinifex gateway (5 min).
-const maxClockSkew = 5 * time.Minute
-
-// maxAuthBodySize caps the request body read during SigV4 validation when
-// the client did not supply a streaming indicator or precomputed payload
-// hash. Prevents unauthenticated callers from triggering OOM by buffering
-// an unbounded body before signature verification fails. Legitimate large
-// uploads use UNSIGNED-PAYLOAD, STREAMING-UNSIGNED-PAYLOAD-TRAILER, or a
-// precomputed hex SHA-256 and never hit this path.
-const maxAuthBodySize = 10 * 1024 * 1024
 
 // HTTP2Server is an HTTP/2 compatible S3 server using net/http
 type HTTP2Server struct {
@@ -205,204 +189,53 @@ func (s *HTTP2Server) setupRoutes() {
 	r.Delete("/{bucket}/*", s.deleteObject)
 }
 
-// sigV4AuthMiddleware validates AWS Signature V4 authentication
+// sigV4AuthMiddleware authenticates and authorizes incoming S3 requests.
+// Stages: public-bucket short-circuit → SigV4 verification → IAM policy
+// evaluation → cross-account bucket-ownership check → handler dispatch
+// with the authenticated principal stored on the request context.
 func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		method := r.Method
-		authHeader := r.Header.Get("Authorization")
 
-		// Check if resource is public
+		// Public buckets short-circuit auth when no Authorization header
+		// is presented. A presented header always goes through the verifier
+		// so signature failures still produce an explicit error.
 		publicBucketAccess := s.config.validatePublicBucketPermission(method, path)
-
-		// Allow public bucket access if no auth header
-		if publicBucketAccess == nil && authHeader == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// If not public and no auth header, deny access
-		if authHeader == "" {
+		if r.Header.Get("Authorization") == "" {
+			if publicBucketAccess == nil {
+				next.ServeHTTP(w, r)
+				return
+			}
 			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 			return
 		}
 
-		// Parse authorization header
-		parts := strings.Split(authHeader, ", ")
-		if len(parts) != 3 {
-			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid Authorization header format")
-			return
-		}
-
-		creds := strings.Split(strings.TrimPrefix(parts[0], "AWS4-HMAC-SHA256 Credential="), "/")
-		if len(creds) != 5 {
-			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid credential scope")
-			return
-		}
-
-		accessKey, date, region, svc := creds[0], creds[1], creds[2], creds[3]
-
-		// Validate X-Amz-Date timestamp to prevent replay attacks
-		amzDate := r.Header.Get("X-Amz-Date")
-		if amzDate == "" {
-			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing required header: X-Amz-Date")
-			return
-		}
-		parsedTime, err := time.Parse(auth.TimeFormat, amzDate)
-		if err != nil {
-			slog.Debug("Invalid X-Amz-Date format", "timestamp", amzDate)
-			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid X-Amz-Date header format")
-			return
-		}
-		if time.Since(parsedTime).Abs() > maxClockSkew {
-			slog.Debug("Request timestamp outside allowed skew",
-				"timestamp", amzDate, "skew", time.Since(parsedTime))
-			s.writeS3Error(w, r, http.StatusForbidden, "RequestTimeTooSkewed",
-				"The difference between the request time and the current time is too large")
-			return
-		}
-
-		credResult, err := s.credProv.LookupCredentials(accessKey)
-		if err != nil {
-			if errors.Is(err, ErrKeyNotFound) {
-				slog.Warn("Unknown access key",
-					"accessKeyID", accessKey,
-					"remoteAddr", r.RemoteAddr)
-				s.writeS3Error(w, r, http.StatusForbidden, "InvalidAccessKeyId",
-					"The AWS Access Key Id you provided does not exist in our records")
-			} else {
-				// Infrastructure error (NATS down, etc.) — return 500 so AWS SDKs retry.
-				slog.Error("Credential lookup infrastructure error",
-					"accessKeyID", accessKey,
-					"error", err,
-					"remoteAddr", r.RemoteAddr)
-				s.writeS3Error(w, r, http.StatusInternalServerError, "InternalError",
-					"An internal error occurred while validating credentials")
-			}
-			return
-		}
-		secretKey := credResult.SecretAccessKey
-
-		signedHeaders := strings.TrimPrefix(parts[1], "SignedHeaders=")
-		signature := strings.TrimPrefix(parts[2], "Signature=")
-
-		// Build canonical request
-		canonicalURI := r.URL.Path
-		if canonicalURI == "" {
-			canonicalURI = "/"
-		}
-		canonicalURI = auth.UriEncode(canonicalURI, false)
-
-		// Canonical query string
-		queryUrl := r.URL.Query()
-		for key := range queryUrl {
-			sort.Strings(queryUrl[key])
-		}
-		canonicalQueryString := strings.ReplaceAll(queryUrl.Encode(), "+", "%20")
-
-		// Canonical headers
-		// Note: Go's net/http moves Host header from r.Header to r.Host
-		headers := strings.Split(signedHeaders, ";")
-		if err := auth.RequireSignedHeaders(headers); err != nil {
-			s.writeS3Error(w, r, http.StatusForbidden, "AuthorizationHeaderMalformed", err.Error())
-			return
-		}
-		sort.Strings(headers)
-
-		canonicalHeaders := ""
-		for _, header := range headers {
-			var value string
-			if header == "host" {
-				// Host header is in r.Host, not r.Header in net/http
-				value = r.Host
-			} else {
-				value = r.Header.Get(header)
-			}
-			canonicalHeaders += fmt.Sprintf("%s:%s\n", header, strings.TrimSpace(value))
-		}
-
-		// Payload hash — use the client-provided hash from X-Amz-Content-SHA256 when
-		// it contains a precomputed hex digest. This avoids buffering the entire
-		// request body into memory (critical for large object uploads).
-		var payloadHash string
-		payloadEncoding := r.Header.Get("X-Amz-Content-Sha256")
-		switch {
-		case payloadEncoding == "STREAMING-UNSIGNED-PAYLOAD-TRAILER" || payloadEncoding == "UNSIGNED-PAYLOAD":
-			payloadHash = payloadEncoding
-		case isHexSHA256(payloadEncoding):
-			// Client sent the precomputed hash — use it directly. The signature
-			// verification below guarantees integrity: if the client lied about
-			// the hash, the signature won't match.
-			payloadHash = payloadEncoding
-		default:
-			// Read body for signature verification, capped so an attacker
-			// cannot force unbounded memory use before the signature check.
-			r.Body = http.MaxBytesReader(w, r.Body, maxAuthBodySize)
-			body, err := io.ReadAll(r.Body)
+		// Closure-captured: the SecretLookup callback runs inside
+		// VerifySigV4Request and is the only point credResult is in scope
+		// before the request continues. We stash it here so the IAM and
+		// ownership stages downstream can consume it without re-fetching.
+		var (
+			credResult *CredentialResult
+			lookupErr  error
+		)
+		lookup := func(id string) (string, error) {
+			cr, err := s.credProv.LookupCredentials(id)
 			if err != nil {
-				var maxBytesErr *http.MaxBytesError
-				if errors.As(err, &maxBytesErr) {
-					slog.Warn("Request body exceeds auth size limit",
-						"limit", maxAuthBodySize, "accessKeyID", accessKey)
-					s.writeS3Error(w, r, http.StatusRequestEntityTooLarge, "EntityTooLarge",
-						"Request body exceeds signature validation size limit")
-					return
-				}
-				s.writeS3Error(w, r, http.StatusInternalServerError, "InternalError", "Failed to read request body")
-				return
+				lookupErr = err
+				return "", err
 			}
-			// Put body back for handlers using bytes.NewReader (preserves binary data)
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			payloadHash = auth.HashSHA256(string(body))
+			credResult = cr
+			return cr.SecretAccessKey, nil
 		}
 
-		canonicalRequest := fmt.Sprintf(
-			"%s\n%s\n%s\n%s\n%s\n%s",
-			method,
-			canonicalURI,
-			canonicalQueryString,
-			canonicalHeaders,
-			signedHeaders,
-			payloadHash,
-		)
-
-		hashedCanonicalRequest := auth.HashSHA256(canonicalRequest)
-
-		scope := fmt.Sprintf("%s/%s/%s/aws4_request", date, s.config.Region, svc)
-
-		stringToSign := fmt.Sprintf(
-			"AWS4-HMAC-SHA256\n%s\n%s\n%s",
-			amzDate,
-			scope,
-			hashedCanonicalRequest,
-		)
-
-		signingKey := auth.GetSigningKey(secretKey, date, region, svc)
-		expectedSig := auth.HmacSHA256Hex(signingKey, stringToSign)
-
-		if subtle.ConstantTimeCompare([]byte(expectedSig), []byte(signature)) != 1 {
-			slog.Warn("SigV4 signature mismatch",
-				"accessKeyID", accessKey,
-				"method", method,
-				"path", path,
-				"host", r.Host,
-				"amzDate", amzDate,
-				"signedHeaders", signedHeaders,
-				"payloadHashHeader", payloadEncoding,
-				"contentLength", r.Header.Get("Content-Length"),
-				"userAgent", r.Header.Get("User-Agent"),
-				"proto", r.Proto,
-				"remoteAddr", r.RemoteAddr,
-				"expectedSigPrefix", sigPrefix(expectedSig),
-				"providedSigPrefix", sigPrefix(signature),
-				"canonicalRequest", canonicalRequest,
-				"stringToSign", stringToSign,
-			)
-			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request signature does not match")
+		accessKey, err := auth.VerifySigV4Request(r, s.config.Region, "s3", lookup)
+		if err != nil {
+			s.respondSigV4Error(w, r, accessKey, err, lookupErr)
 			return
 		}
 
-		// Check IAM policy authorization for NATS-sourced credentials
+		// IAM policy evaluation (NATS-sourced credentials only).
 		if !credResult.SkipPolicyCheck {
 			action := s3Action(method, path)
 			if action == "" {
@@ -457,12 +290,86 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		// Store authenticated user info in context
 		ctx := context.WithValue(r.Context(), ContextKeyAccessKeyID, accessKey)
 		ctx = context.WithValue(ctx, ContextKeyAccountID, credResult.AccountID)
-
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// respondSigV4Error maps an auth-package sentinel (or a SecretLookup
+// failure that propagated out via lookupErr) to the appropriate S3 error
+// response. *SigMismatchError is unwrapped via errors.As to surface
+// canonical-request + string-to-sign in the warn log for SDK debugging.
+func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string, err, lookupErr error) {
+	// SecretLookup errors are returned verbatim from VerifySigV4Request;
+	// route them via the original lookup error so callers see ErrKeyNotFound
+	// distinct from the auth-package sentinels below.
+	if lookupErr != nil {
+		if errors.Is(lookupErr, ErrKeyNotFound) {
+			slog.Warn("Unknown access key", "accessKeyID", claimedKey, "remoteAddr", r.RemoteAddr)
+			s.writeS3Error(w, r, http.StatusForbidden, "InvalidAccessKeyId",
+				"The AWS Access Key Id you provided does not exist in our records")
+			return
+		}
+		slog.Error("Credential lookup infrastructure error",
+			"accessKeyID", claimedKey, "error", lookupErr, "remoteAddr", r.RemoteAddr)
+		s.writeS3Error(w, r, http.StatusInternalServerError, "InternalError",
+			"An internal error occurred while validating credentials")
+		return
+	}
+
+	switch {
+	case errors.Is(err, auth.ErrMissingAuth):
+		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing Authorization header")
+	case errors.Is(err, auth.ErrInvalidAuthFormat):
+		// RequireSignedHeaders failures wrap ErrInvalidAuthFormat with a
+		// message that names the offending header. Map those to
+		// AuthorizationHeaderMalformed so SDKs see the same code AWS uses.
+		if strings.Contains(err.Error(), "SignedHeaders") {
+			s.writeS3Error(w, r, http.StatusForbidden, "AuthorizationHeaderMalformed", err.Error())
+			return
+		}
+		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid Authorization header format")
+	case errors.Is(err, auth.ErrInvalidCredScope):
+		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid credential scope")
+	case errors.Is(err, auth.ErrMissingDate):
+		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing required header: X-Amz-Date")
+	case errors.Is(err, auth.ErrInvalidDateFormat):
+		slog.Debug("Invalid X-Amz-Date format", "timestamp", r.Header.Get("X-Amz-Date"))
+		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid X-Amz-Date header format")
+	case errors.Is(err, auth.ErrClockSkew):
+		slog.Debug("Request timestamp outside allowed skew", "timestamp", r.Header.Get("X-Amz-Date"))
+		s.writeS3Error(w, r, http.StatusForbidden, "RequestTimeTooSkewed",
+			"The difference between the request time and the current time is too large")
+	case errors.Is(err, auth.ErrBodyTooLarge):
+		slog.Warn("Request body exceeds auth size limit", "accessKeyID", claimedKey)
+		s.writeS3Error(w, r, http.StatusRequestEntityTooLarge, "EntityTooLarge",
+			"Request body exceeds signature validation size limit")
+	case errors.Is(err, auth.ErrSignatureMismatch):
+		var smErr *auth.SigMismatchError
+		if errors.As(err, &smErr) {
+			slog.Warn("SigV4 signature mismatch",
+				"accessKeyID", smErr.AccessKeyID,
+				"method", r.Method,
+				"path", r.URL.Path,
+				"host", r.Host,
+				"amzDate", r.Header.Get("X-Amz-Date"),
+				"payloadHashHeader", r.Header.Get("X-Amz-Content-Sha256"),
+				"contentLength", r.Header.Get("Content-Length"),
+				"userAgent", r.Header.Get("User-Agent"),
+				"proto", r.Proto,
+				"remoteAddr", r.RemoteAddr,
+				"expectedSigPrefix", smErr.ExpectedSigPrefix,
+				"providedSigPrefix", smErr.ProvidedSigPrefix,
+				"canonicalRequest", smErr.CanonicalRequest,
+				"stringToSign", smErr.StringToSign,
+			)
+		}
+		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request signature does not match")
+	default:
+		slog.Warn("Unexpected SigV4 verification error", "error", err, "accessKeyID", claimedKey)
+		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", err.Error())
+	}
 }
 
 // writeS3Error writes an S3 error response
@@ -991,15 +898,6 @@ func (s *HTTP2Server) GetHandler() http.Handler {
 	return s.router
 }
 
-// sigPrefix returns the first 8 chars of a hex signature for diagnostics.
-// Logging the full signature is avoided to limit replay exposure within the SigV4 window.
-func sigPrefix(s string) string {
-	if len(s) <= 8 {
-		return s
-	}
-	return s[:8]
-}
-
 // resolveBucketMetadata returns metadata for the named bucket. Config-defined
 // buckets (static, known at startup) are checked first to avoid a synchronous
 // backend round-trip on every authenticated request. Returns nil with no error
@@ -1025,18 +923,4 @@ func (s *HTTP2Server) resolveBucketMetadata(bucket string) (*backend.BucketMetad
 		return nil, nil
 	}
 	return nil, err
-}
-
-// isHexSHA256 returns true if s is exactly 64 lowercase hex characters (a SHA-256 digest).
-func isHexSHA256(s string) bool {
-	if len(s) != hex.EncodedLen(32) {
-		return false
-	}
-	for i := range len(s) {
-		c := s[i]
-		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-			return false
-		}
-	}
-	return true
 }

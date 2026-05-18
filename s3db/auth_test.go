@@ -1,18 +1,15 @@
 package s3db
 
 import (
-	"bytes"
-	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestSignRequest(t *testing.T) {
@@ -71,139 +68,33 @@ func TestSignRequest(t *testing.T) {
 	}
 }
 
-func TestValidateSignatureHTTP(t *testing.T) {
-	credentials := map[string]string{
-		"TESTACCESSKEY": "TESTSECRETKEY",
-	}
-	region := "us-east-1"
-	service := "s3db"
+// TestVerifySigV4Request_Integration drives auth.VerifySigV4Request through
+// a chi router middleware — proving the verifier behaves correctly when
+// composed into the same request pipeline the production authMiddleware
+// uses. Verifier-specific unit cases live in predastore/auth.
+func TestVerifySigV4Request_Integration(t *testing.T) {
+	credentials := map[string]string{"TESTACCESSKEY": "TESTSECRETKEY"}
+	const region = "us-east-1"
+	const service = "s3db"
 
-	tests := []struct {
-		name          string
-		method        string
-		path          string
-		setupHeaders  func(req *http.Request)
-		wantAccessKey string
-		wantErr       bool
-	}{
-		{
-			name:   "Missing Authorization header",
-			method: "GET",
-			path:   "/v1/get/test-table/test-key",
-			setupHeaders: func(req *http.Request) {
-				// No auth header
-			},
-			wantAccessKey: "",
-			wantErr:       true,
-		},
-		{
-			name:   "Valid signature",
-			method: "GET",
-			path:   "/v1/get/test-table/test-key",
-			setupHeaders: func(req *http.Request) {
-				timestamp := time.Now().UTC().Format(auth.TimeFormat)
-				err := auth.GenerateAuthHeaderReq(
-					"TESTACCESSKEY",
-					"TESTSECRETKEY",
-					timestamp,
-					region,
-					service,
-					req,
-				)
-				if err != nil {
-					t.Fatalf("Error generating auth header: %v", err)
-				}
-			},
-			wantAccessKey: "TESTACCESSKEY",
-			wantErr:       false,
-		},
-		{
-			name:   "Invalid access key",
-			method: "GET",
-			path:   "/v1/get/test-table/test-key",
-			setupHeaders: func(req *http.Request) {
-				timestamp := time.Now().UTC().Format(auth.TimeFormat)
-				err := auth.GenerateAuthHeaderReq(
-					"INVALIDACCESSKEY",
-					"TESTSECRETKEY",
-					timestamp,
-					region,
-					service,
-					req,
-				)
-				if err != nil {
-					t.Fatalf("Error generating auth header: %v", err)
-				}
-			},
-			wantAccessKey: "",
-			wantErr:       true,
-		},
-		{
-			name:   "Invalid signature (wrong secret)",
-			method: "GET",
-			path:   "/v1/get/test-table/test-key",
-			setupHeaders: func(req *http.Request) {
-				timestamp := time.Now().UTC().Format(auth.TimeFormat)
-				err := auth.GenerateAuthHeaderReq(
-					"TESTACCESSKEY",
-					"WRONGSECRETKEY",
-					timestamp,
-					region,
-					service,
-					req,
-				)
-				if err != nil {
-					t.Fatalf("Error generating auth header: %v", err)
-				}
-			},
-			wantAccessKey: "",
-			wantErr:       true,
-		},
+	lookup := func(id string) (string, error) {
+		secret, ok := credentials[id]
+		if !ok {
+			return "", fmt.Errorf("invalid access key: %s", id)
+		}
+		return secret, nil
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create request
-			req := httptest.NewRequest(tt.method, tt.path, nil)
-			req.Host = "localhost:6660"
-			if tt.setupHeaders != nil {
-				tt.setupHeaders(req)
-			}
-
-			// Validate signature
-			gotAccessKey, gotErr := ValidateSignatureHTTP(req, credentials, region, service)
-
-			if tt.wantErr {
-				assert.Error(t, gotErr)
-			} else {
-				assert.NoError(t, gotErr)
-				assert.Equal(t, tt.wantAccessKey, gotAccessKey)
-			}
-		})
-	}
-}
-
-func TestValidateSignatureHTTP_Integration(t *testing.T) {
-	// Test full round-trip: sign request on client side, validate on server side
-	credentials := map[string]string{
-		"TESTACCESSKEY": "TESTSECRETKEY",
-	}
-	region := "us-east-1"
-	service := "s3db"
-
-	// Create chi router with auth middleware
 	r := chi.NewRouter()
-
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			accessKey, err := ValidateSignatureHTTP(r, credentials, region, service)
+			accessKey, err := auth.VerifySigV4Request(r, region, service, lookup)
 			if err != nil {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
-				w.Write([]byte(`{"error":"AccessDenied","message":"` + err.Error() + `"}`))
+				_, _ = w.Write([]byte(`{"error":"AccessDenied","message":"` + err.Error() + `"}`))
 				return
 			}
-			// Store access key in header (context not needed for this test)
 			w.Header().Set("X-Access-Key", accessKey)
 			next.ServeHTTP(w, r)
 		})
@@ -212,10 +103,9 @@ func TestValidateSignatureHTTP_Integration(t *testing.T) {
 	r.Get("/v1/get/{table}/{key}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"success"}`))
+		_, _ = w.Write([]byte(`{"status":"success"}`))
 	})
 
-	// Create a signed request
 	req := httptest.NewRequest(http.MethodGet, "/v1/get/test-table/test-key", nil)
 	req.Host = "localhost:6660"
 
@@ -230,7 +120,6 @@ func TestValidateSignatureHTTP_Integration(t *testing.T) {
 	)
 	assert.NoError(t, err)
 
-	// Perform request
 	rr := httptest.NewRecorder()
 	r.ServeHTTP(rr, req)
 
@@ -241,143 +130,4 @@ func TestValidateSignatureHTTP_Integration(t *testing.T) {
 func TestDefaultConstants(t *testing.T) {
 	assert.Equal(t, "us-east-1", DefaultRegion)
 	assert.Equal(t, "s3db", DefaultService)
-}
-
-// TestValidateSignatureHTTP_ReplayProtection verifies that captured
-// Authorization headers cannot be replayed outside the clock-skew window.
-// s3db gates Raft-backed IAM state, which is why replay protection matters
-// even though region/service are not treated as isolation boundaries.
-func TestValidateSignatureHTTP_ReplayProtection(t *testing.T) {
-	credentials := map[string]string{"TESTACCESSKEY": "TESTSECRETKEY"}
-	const region = "us-east-1"
-	const service = "s3db"
-
-	tests := []struct {
-		name         string
-		setupHeaders func(req *http.Request)
-		wantErrSub   string
-	}{
-		{
-			name: "Stale X-Amz-Date (>5 min) rejected",
-			setupHeaders: func(req *http.Request) {
-				stale := time.Now().UTC().Add(-10 * time.Minute).Format(auth.TimeFormat)
-				assert.NoError(t, auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", stale, region, service, req))
-			},
-			wantErrSub: "outside allowed skew",
-		},
-		{
-			name: "Future X-Amz-Date (>5 min) rejected",
-			setupHeaders: func(req *http.Request) {
-				future := time.Now().UTC().Add(10 * time.Minute).Format(auth.TimeFormat)
-				assert.NoError(t, auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", future, region, service, req))
-			},
-			wantErrSub: "outside allowed skew",
-		},
-		{
-			name: "Malformed X-Amz-Date rejected",
-			setupHeaders: func(req *http.Request) {
-				ts := time.Now().UTC().Format(auth.TimeFormat)
-				assert.NoError(t, auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", ts, region, service, req))
-				req.Header.Set("X-Amz-Date", "not-a-date")
-			},
-			wantErrSub: "invalid X-Amz-Date",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/v1/get/test-table/test-key", nil)
-			req.Host = "localhost:6660"
-			tt.setupHeaders(req)
-
-			_, err := ValidateSignatureHTTP(req, credentials, region, service)
-			assert.Error(t, err)
-			if err != nil {
-				assert.Contains(t, err.Error(), tt.wantErrSub)
-			}
-		})
-	}
-}
-
-// TestValidateSignatureHTTP_RequireSignedHeaders verifies that requests
-// whose SigV4 SignedHeaders list omits "host" or "x-amz-date" are rejected
-// before signature comparison. AWS SDKs always sign both; omitting either
-// would let a captured Authorization header replay against a different vhost
-// or outside the X-Amz-Date skew window.
-func TestValidateSignatureHTTP_RequireSignedHeaders(t *testing.T) {
-	credentials := map[string]string{"TESTACCESSKEY": "TESTSECRETKEY"}
-	const region = "us-east-1"
-	const service = "s3db"
-
-	rewriteSignedHeaders := func(req *http.Request, newList string) {
-		ah := req.Header.Get("Authorization")
-		parts := strings.Split(ah, ", ")
-		require.Len(t, parts, 3)
-		parts[1] = "SignedHeaders=" + newList
-		req.Header.Set("Authorization", strings.Join(parts, ", "))
-	}
-
-	tests := []struct {
-		name       string
-		signedList string
-		wantErrSub string
-	}{
-		{
-			name:       "missing host rejected",
-			signedList: "x-amz-date",
-			wantErrSub: "host",
-		},
-		{
-			name:       "missing x-amz-date rejected",
-			signedList: "host",
-			wantErrSub: "x-amz-date",
-		},
-		{
-			name:       "neither present rejected",
-			signedList: "content-type",
-			wantErrSub: "host",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/v1/get/test-table/test-key", nil)
-			req.Host = "localhost:6660"
-			ts := time.Now().UTC().Format(auth.TimeFormat)
-			require.NoError(t, auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", ts, region, service, req))
-			rewriteSignedHeaders(req, tt.signedList)
-
-			_, err := ValidateSignatureHTTP(req, credentials, region, service)
-			require.Error(t, err)
-			assert.Contains(t, err.Error(), tt.wantErrSub)
-		})
-	}
-}
-
-// TestValidateSignatureHTTP_MaxBytesReader verifies that when the caller
-// wraps r.Body with http.MaxBytesReader before invoking signature
-// validation, an oversize body surfaces as an *http.MaxBytesError — this is
-// what authMiddleware relies on to return 413 instead of 500.
-func TestValidateSignatureHTTP_MaxBytesReader(t *testing.T) {
-	credentials := map[string]string{"TESTACCESSKEY": "TESTSECRETKEY"}
-
-	const limit = 1024
-	body := bytes.Repeat([]byte("A"), limit+1)
-
-	req := httptest.NewRequest(http.MethodPost, "/v1/put/test-table/test-key", bytes.NewReader(body))
-	req.Host = "localhost:6660"
-
-	timestamp := time.Now().UTC().Format(auth.TimeFormat)
-	err := auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", timestamp, "us-east-1", "s3db", req)
-	assert.NoError(t, err)
-
-	rr := httptest.NewRecorder()
-	req.Body = http.MaxBytesReader(rr, req.Body, limit)
-
-	_, gotErr := ValidateSignatureHTTP(req, credentials, "us-east-1", "s3db")
-	assert.Error(t, gotErr)
-
-	var maxBytesErr *http.MaxBytesError
-	assert.True(t, errors.As(gotErr, &maxBytesErr),
-		"expected *http.MaxBytesError, got %T: %v", gotErr, gotErr)
 }
