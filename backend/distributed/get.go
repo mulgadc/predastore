@@ -298,12 +298,10 @@ func (b *Backend) HeadObject(ctx context.Context, bucket, key string) (*backend.
 		return nil, err
 	}
 
-	shards, size, err := b.openInput(bucket, key)
+	_, size, err := b.openInput(bucket, key)
 	if err != nil {
 		return nil, backend.ErrNoSuchKeyError.WithResource(key)
 	}
-
-	_ = shards // Used for validation
 
 	return &backend.HeadObjectResponse{
 		ContentType:   "application/octet-stream",

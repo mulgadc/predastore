@@ -52,7 +52,6 @@ type Server struct {
 	backend   backend.Backend
 	credProv  CredentialProvider
 	dbServers []*s3db.Server
-	// quicCancel context.CancelFunc
 
 	// Profiling
 	pprofEnabled    bool
