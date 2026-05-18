@@ -18,7 +18,6 @@ import (
 	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/store"
-	"github.com/mulgadc/predastore/utils"
 	quic "github.com/quic-go/quic-go"
 )
 
@@ -97,7 +96,7 @@ type ObjectRequest struct {
 	Owner      string `json:"owner,omitempty"`
 	RangeStart int64  `json:"range_start"` // -1 means from start (unset), >= 0 is actual offset
 	RangeEnd   int64  `json:"range_end"`   // -1 means to end (unset), >= 0 is actual offset
-	ShardIndex int    `json:"shard_index"` // Index of shard being requested (for multi-shard objects)
+	ShardIndex uint32 `json:"shard_index"` // Index of shard being requested (for multi-shard objects)
 }
 
 // PutRequest contains metadata for storing a shard via QUIC PUT
@@ -106,7 +105,7 @@ type PutRequest struct {
 	Object     string   `json:"object"`
 	ObjectHash [32]byte `json:"object_hash"` // SHA256 of bucket/object for metadata
 	ShardSize  int      `json:"shard_size"`  // Expected size of the shard data
-	ShardIndex int      `json:"shard_index"` // Index of this shard (0-based, for multi-shard objects)
+	ShardIndex uint32   `json:"shard_index"` // Index of this shard (0-based, for multi-shard objects)
 }
 
 // PutResponse contains the result of a QUIC PUT operation
@@ -120,7 +119,7 @@ type DeleteRequest struct {
 	Bucket     string   `json:"bucket"`
 	Object     string   `json:"object"`
 	ObjectHash [32]byte `json:"object_hash"` // SHA256 of bucket/object for metadata lookup
-	ShardIndex int      `json:"shard_index"` // Index of shard to delete
+	ShardIndex uint32   `json:"shard_index"` // Index of shard to delete
 }
 
 // DeleteResponse contains the result of a QUIC DELETE operation
@@ -387,7 +386,7 @@ func (qs *QuicServer) handleSTATUS(bw *bufio.Writer, req quicproto.Header) {
 		Status:  quicproto.StatusOK,
 		ReqID:   req.ReqID,
 		KeyLen:  0,
-		MetaLen: utils.IntToUint32(len(b)),
+		MetaLen: uint32(len(b)), //nolint:gosec // G115: status JSON is bounded (hundreds of bytes).
 		BodyLen: 0,
 	}
 	_ = quicproto.WriteHeader(bw, rh)
@@ -402,7 +401,7 @@ func writeErr(bw *bufio.Writer, req quicproto.Header, code uint16, msg string) {
 		Method:  req.Method,
 		Status:  code,
 		ReqID:   req.ReqID,
-		MetaLen: utils.IntToUint32(len(meta)),
+		MetaLen: uint32(len(meta)), //nolint:gosec // G115: error meta JSON is bounded (under maxMetaLen = 64 KiB).
 		BodyLen: 0,
 	}
 	_ = quicproto.WriteHeader(bw, rh)

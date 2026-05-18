@@ -98,7 +98,7 @@ func TestQuicServer_ConcurrentShardWrites_NoWedge(t *testing.T) {
 				Object:     fmt.Sprintf("obj-%d", idx),
 				ObjectHash: hash,
 				ShardSize:  shardSize,
-				ShardIndex: idx,
+				ShardIndex: uint32(idx),
 			}, bytes.NewReader(body))
 			errCh <- perr
 		}(i)

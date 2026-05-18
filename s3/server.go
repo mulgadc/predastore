@@ -14,8 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mulgadc/predastore/utils"
-
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/internal/masterkey"
@@ -326,7 +324,7 @@ func (s *Server) launchDBServers() []*s3db.Server {
 		nodePath := checkBaseDir(s.basePath, n.Path)
 
 		dbNodes[i] = s3db.DBNodeConfig{
-			ID:              utils.IntToUint64(n.ID),
+			ID:              n.ID,
 			Host:            n.Host,
 			Port:            n.Port,
 			RaftPort:        n.RaftPort,
@@ -359,7 +357,7 @@ func (s *Server) launchDBServers() []*s3db.Server {
 	var nodesToLaunch []s3db.DBNodeConfig
 	if s.nodeID > 0 {
 		for _, n := range dbNodes {
-			if n.ID == utils.IntToUint64(s.nodeID) {
+			if n.ID == uint64(s.nodeID) {
 				nodesToLaunch = append(nodesToLaunch, n)
 				break
 			}

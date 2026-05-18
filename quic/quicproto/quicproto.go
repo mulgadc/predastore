@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math"
 )
 
 const (
@@ -25,7 +26,8 @@ const (
 )
 
 var (
-	ErrBadVersion = errors.New("bad protocol version")
+	ErrBadVersion      = errors.New("bad protocol version")
+	ErrBodyLenOverflow = errors.New("body length exceeds int64 max")
 )
 
 type Header struct {
@@ -78,6 +80,9 @@ func ReadHeader(r io.Reader) (Header, error) {
 	}
 	if h.Version != Version1 {
 		return Header{}, ErrBadVersion
+	}
+	if h.BodyLen > math.MaxInt64 {
+		return Header{}, ErrBodyLenOverflow
 	}
 	return h, nil
 }

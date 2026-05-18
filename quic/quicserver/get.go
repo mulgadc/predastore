@@ -7,13 +7,12 @@ import (
 
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/s3db"
-	"github.com/mulgadc/predastore/utils"
 )
 
 func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRequest ObjectRequest) {
 	objectHash := s3db.GenObjectHash(objectRequest.Bucket, objectRequest.Object)
 
-	reader, err := qs.store.Lookup(objectHash, utils.IntToUint32(objectRequest.ShardIndex))
+	reader, err := qs.store.Lookup(objectHash, objectRequest.ShardIndex)
 	if err != nil {
 		slog.Debug("handleGET: shard not found", "bucket", objectRequest.Bucket, "object", objectRequest.Object, "shardIndex", objectRequest.ShardIndex, "error", err)
 		writeErr(bw, req, quicproto.StatusNotFound, "shard not found")
@@ -53,7 +52,7 @@ func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRe
 		ReqID:   req.ReqID,
 		KeyLen:  0,
 		MetaLen: 0,
-		BodyLen: utils.Int64ToUint64(responseSize),
+		BodyLen: uint64(responseSize), //nolint:gosec // G115: responseSize = rangeEnd - rangeStart + 1, guaranteed >= 1 by range validation above.
 	}
 	if err := quicproto.WriteHeader(bw, rh); err != nil {
 		slog.Error("handleGET: write header failed", "error", err)

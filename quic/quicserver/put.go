@@ -8,7 +8,6 @@ import (
 	"log/slog"
 
 	"github.com/mulgadc/predastore/quic/quicproto"
-	"github.com/mulgadc/predastore/utils"
 )
 
 // handlePUTShard receives shard data via QUIC and writes it to the local store.
@@ -25,7 +24,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 	// Determine how many bytes to read
 	var bodyLen int64
 	if req.BodyLen > 0 {
-		bodyLen = utils.Uint64ToInt64(req.BodyLen)
+		bodyLen = int64(req.BodyLen) //nolint:gosec // G115: quicproto.ReadHeader rejects BodyLen > MaxInt64 with ErrBodyLenOverflow.
 	} else if putReq.ShardSize > 0 {
 		bodyLen = int64(putReq.ShardSize)
 	} else {
@@ -33,7 +32,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		return
 	}
 
-	writer, err := qs.store.Append(putReq.ObjectHash, utils.IntToUint32(putReq.ShardIndex), bodyLen)
+	writer, err := qs.store.Append(putReq.ObjectHash, putReq.ShardIndex, bodyLen)
 	if err != nil {
 		slog.Error("handlePUTShard: append failed", "error", err)
 		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("append: %v", err))
@@ -72,7 +71,7 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		Status:  quicproto.StatusOK,
 		ReqID:   req.ReqID,
 		KeyLen:  0,
-		MetaLen: utils.IntToUint32(len(respBytes)),
+		MetaLen: uint32(len(respBytes)), //nolint:gosec // G115: PutResponse JSON is bounded (tens of bytes).
 		BodyLen: 0,
 	}
 	if err := quicproto.WriteHeader(bw, rh); err != nil {
