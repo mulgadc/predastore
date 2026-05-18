@@ -130,7 +130,7 @@ func (b *Backend) deleteObjectViaQUIC(ctx context.Context, bucket, key string, o
 				Bucket:     bucket,
 				Object:     key,
 				ObjectHash: objectHash,
-				ShardIndex: ns.shardIndex,
+				ShardIndex: uint32(ns.shardIndex), //nolint:gosec // G115: shardIndex bounded by rsDataShard + rsParityShard (small uint).
 			}
 
 			resp, err := client.Delete(ctx, delReq)

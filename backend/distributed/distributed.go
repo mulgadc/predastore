@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,7 +23,6 @@ import (
 	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	s3db "github.com/mulgadc/predastore/s3db"
-	"github.com/mulgadc/predastore/utils"
 )
 
 // NodeConfig holds configuration for a single node
@@ -372,7 +372,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				Object:     objectPath,
 				ObjectHash: objectHash,
 				ShardSize:  len(shardData),
-				ShardIndex: idx,
+				ShardIndex: uint32(idx), //nolint:gosec // G115: idx bounded by rsDataShard (small uint).
 			}
 
 			resp, putErr := client.Put(ctx, putReq, bytes.NewReader(shardData))
@@ -444,7 +444,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				Object:     objectPath,
 				ObjectHash: objectHash,
 				ShardSize:  shardSize,
-				ShardIndex: hashRingIdx,
+				ShardIndex: uint32(hashRingIdx), //nolint:gosec // G115: hashRingIdx bounded by rsDataShard + rsParityShard (small uint).
 			}
 
 			resp, putErr := client.Put(ctx, putReq, r)
@@ -549,7 +549,7 @@ func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShar
 			Object:     object,
 			RangeStart: -1, // -1 means full shard (no range)
 			RangeEnd:   -1,
-			ShardIndex: i, // Include shard index for unique lookup
+			ShardIndex: uint32(i), // Include shard index for unique lookup
 		}
 
 		reader, err := c.Get(context.Background(), objectRequest)
@@ -577,12 +577,16 @@ func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShar
 	return shardReaders, nil
 }
 
-// NodeToUint32 converts a node name to uint32
+// NodeToUint32 converts a node name to uint32. Returns an error if the
+// numeric component is negative or exceeds math.MaxUint32.
 func NodeToUint32(value string) (uint32, error) {
 	s := strings.Replace(value, "node-", "", 1)
 	vint, err := strconv.Atoi(s)
 	if err != nil {
 		return 0, err
 	}
-	return utils.IntToUint32(vint), nil
+	if vint < 0 || vint > math.MaxUint32 {
+		return 0, fmt.Errorf("node id %d out of uint32 range", vint)
+	}
+	return uint32(vint), nil
 }

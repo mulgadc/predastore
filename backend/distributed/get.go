@@ -163,7 +163,7 @@ func (b *Backend) readRangeFromSingleShard(ctx context.Context, bucket, key stri
 	objectRequest := quicserver.ObjectRequest{
 		Bucket:     bucket,
 		Object:     key,
-		ShardIndex: shardIdx,
+		ShardIndex: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by rsDataShard (small uint).
 		RangeStart: offsetInShard,
 		RangeEnd:   endInShard,
 	}

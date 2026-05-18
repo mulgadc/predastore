@@ -42,7 +42,7 @@ type Nodes struct {
 
 // DBNode represents a distributed database node configuration
 type DBNode struct {
-	ID              int    `toml:"id"`
+	ID              uint64 `toml:"id"`
 	Host            string `toml:"host"`
 	Port            int    `toml:"port"`
 	RaftPort        int    `toml:"raft_port"` // Port for Raft consensus (default: Port + 1000)
