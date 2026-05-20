@@ -47,7 +47,7 @@ type Throttler struct {
 
 // New creates a Throttler from config and starts the GC goroutine.
 func New(cfg Config) *Throttler {
-	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // G118: cancel is called in Stop()
+	ctx, cancel := context.WithCancel(context.Background())
 	t := &Throttler{
 		cfg:     cfg,
 		entries: make(map[string]*entry),

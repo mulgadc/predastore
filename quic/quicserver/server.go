@@ -55,7 +55,7 @@ type QuicServer struct {
 	closed     bool
 
 	// Active stream counter for debugging
-	activeStreams int64
+	activeStreams atomic.Int64
 }
 
 // Option configures a QuicServer at construction time.
@@ -285,7 +285,7 @@ func (qs *QuicServer) serveConn(conn *quic.Conn) {
 }
 
 func (qs *QuicServer) handleStream(s *quic.Stream) {
-	activeCount := atomic.AddInt64(&qs.activeStreams, 1)
+	activeCount := qs.activeStreams.Add(1)
 	streamID := s.StreamID()
 	slog.Debug("handleStream: started", "streamID", streamID, "activeStreams", activeCount)
 
@@ -299,7 +299,7 @@ func (qs *QuicServer) handleStream(s *quic.Stream) {
 		if err := s.Close(); err != nil {
 			slog.Debug("handleStream: close error", "streamID", streamID, "error", err)
 		}
-		finalCount := atomic.AddInt64(&qs.activeStreams, -1)
+		finalCount := qs.activeStreams.Add(-1)
 		slog.Debug("handleStream: closed", "streamID", streamID, "activeStreams", finalCount)
 	}()
 

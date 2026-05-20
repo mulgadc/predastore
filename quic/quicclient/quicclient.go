@@ -24,22 +24,22 @@ const (
 
 type Client struct {
 	conn          *quic.Conn
-	reqID         uint64
-	activeStreams int64 // atomic: see docs/development/bugs/multipart-upload-deadlock.md (Bug A).
+	reqID         atomic.Uint64
+	activeStreams atomic.Int64 // atomic: see docs/development/bugs/multipart-upload-deadlock.md (Bug A).
 }
 
 // ActiveStreams reports the number of in-flight RPC streams on this client.
 // Used by Pool.cleanup() to avoid reaping connections with active work.
 func (c *Client) ActiveStreams() int64 {
-	return atomic.LoadInt64(&c.activeStreams)
+	return c.activeStreams.Load()
 }
 
 func (c *Client) incActive() {
-	atomic.AddInt64(&c.activeStreams, 1)
+	c.activeStreams.Add(1)
 }
 
 func (c *Client) decActive() {
-	atomic.AddInt64(&c.activeStreams, -1)
+	c.activeStreams.Add(-1)
 }
 
 func Dial(ctx context.Context, addr string) (*Client, error) {
@@ -71,7 +71,7 @@ func (c *Client) Close() error {
 }
 
 func (c *Client) nextID() uint64 {
-	return atomic.AddUint64(&c.reqID, 1)
+	return c.reqID.Add(1)
 }
 
 // Put sends a shard to the QUIC server and returns the WriteResult
