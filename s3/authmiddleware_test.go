@@ -1,7 +1,6 @@
 package s3
 
 import (
-	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -45,7 +44,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 		name           string
 		method         string
 		path           string
-		setupHeaders   func(req *http.Request)
+		setupHeaders   func(t *testing.T, req *http.Request)
 		query          url.Values
 		expectStatus   int
 		expectResponse string
@@ -54,7 +53,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			name:   "No Auth Header",
 			method: "GET",
 			path:   "/test-bucket01",
-			setupHeaders: func(req *http.Request) {
+			setupHeaders: func(t *testing.T, req *http.Request) {
 				// No auth header
 			},
 			expectStatus:   http.StatusForbidden,
@@ -66,23 +65,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			name:   "Valid Signature",
 			method: "GET",
 			path:   "/test-bucket01",
-			setupHeaders: func(req *http.Request) {
-				// Use our utility function to generate a valid authorization header
-				timestamp := time.Now().UTC().Format("20060102T150405Z")
-
-				// Generate valid auth header
-				err := auth.GenerateAuthHeaderReq(
-					"TESTACCESSKEY",
-					"TESTSECRETKEY",
-					timestamp,
-					"ap-southeast-2",
-					"s3",
-					req,
-				)
-
-				if err != nil {
-					assert.Fail(t, "Error generating auth header: %v", err)
-				}
+			setupHeaders: func(t *testing.T, req *http.Request) {
+				signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3")
 			},
 			expectStatus:   -1, // sentinel: assert NOT 403 (auth passed, backend is nil so handler may 500)
 			expectResponse: "",
@@ -92,23 +76,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			name:   "Valid Signature Wrong Region",
 			method: "GET",
 			path:   "/test-bucket01",
-			setupHeaders: func(req *http.Request) {
-				// Use our utility function to generate a valid authorization header
-				timestamp := time.Now().UTC().Format("20060102T150405Z")
-
-				// Generate valid auth header
-				err := auth.GenerateAuthHeaderReq(
-					"TESTACCESSKEY",
-					"TESTSECRETKEY",
-					timestamp,
-					"ap-southeast-1",
-					"s3",
-					req,
-				)
-
-				if err != nil {
-					assert.Fail(t, "Error generating auth header: %v", err)
-				}
+			setupHeaders: func(t *testing.T, req *http.Request) {
+				signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-1", "s3")
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "Request authenticated",
@@ -118,22 +87,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			name:   "Invalid Access Key",
 			method: "GET",
 			path:   "/test-bucket01",
-			setupHeaders: func(req *http.Request) {
-				timestamp := time.Now().UTC().Format("20060102T150405Z")
-
-				// Generate auth header with invalid access key
-				err := auth.GenerateAuthHeaderReq(
-					"INVALIDACCESSKEY",
-					"TESTSECRETKEY",
-					timestamp,
-					"ap-southeast-2",
-					"s3",
-					req,
-				)
-
-				if err != nil {
-					assert.Fail(t, "Error generating auth header: %v", err)
-				}
+			setupHeaders: func(t *testing.T, req *http.Request) {
+				signTestReq(t, req, nil, "INVALIDACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3")
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "Invalid access key",
@@ -142,22 +97,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			name:   "Invalid Signature",
 			method: "GET",
 			path:   "/test-bucket01",
-			setupHeaders: func(req *http.Request) {
-				timestamp := time.Now().UTC().Format("20060102T150405Z")
-
-				// Generate valid header first
-				err := auth.GenerateAuthHeaderReq(
-					"TESTACCESSKEY",
-					"WRONGSECRETKEY", // Wrong secret key
-					timestamp,
-					"ap-southeast-2",
-					"s3",
-					req,
-				)
-
-				if err != nil {
-					assert.Fail(t, "Error generating auth header: %v", err)
-				}
+			setupHeaders: func(t *testing.T, req *http.Request) {
+				signTestReq(t, req, nil, "TESTACCESSKEY", "WRONGSECRETKEY", "ap-southeast-2", "s3")
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "Invalid signature",
@@ -166,16 +107,10 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			name:   "Expired Timestamp - Too Old",
 			method: "GET",
 			path:   "/test-bucket01",
-			setupHeaders: func(req *http.Request) {
+			setupHeaders: func(t *testing.T, req *http.Request) {
 				// 6 minutes in the past — exceeds the 5-minute maxClockSkew
-				timestamp := time.Now().UTC().Add(-6 * time.Minute).Format(auth.TimeFormat)
-				err := auth.GenerateAuthHeaderReq(
-					"TESTACCESSKEY", "TESTSECRETKEY",
-					timestamp, "ap-southeast-2", "s3", req,
-				)
-				if err != nil {
-					assert.Fail(t, "Error generating auth header: %v", err)
-				}
+				signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3",
+					auth.WithTime(time.Now().UTC().Add(-6*time.Minute)))
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "RequestTimeTooSkewed",
@@ -184,16 +119,10 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			name:   "Expired Timestamp - Too Far In Future",
 			method: "GET",
 			path:   "/test-bucket01",
-			setupHeaders: func(req *http.Request) {
+			setupHeaders: func(t *testing.T, req *http.Request) {
 				// 6 minutes in the future
-				timestamp := time.Now().UTC().Add(6 * time.Minute).Format(auth.TimeFormat)
-				err := auth.GenerateAuthHeaderReq(
-					"TESTACCESSKEY", "TESTSECRETKEY",
-					timestamp, "ap-southeast-2", "s3", req,
-				)
-				if err != nil {
-					assert.Fail(t, "Error generating auth header: %v", err)
-				}
+				signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3",
+					auth.WithTime(time.Now().UTC().Add(6*time.Minute)))
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "RequestTimeTooSkewed",
@@ -202,15 +131,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			name:   "Missing X-Amz-Date Header",
 			method: "GET",
 			path:   "/test-bucket01",
-			setupHeaders: func(req *http.Request) {
-				timestamp := time.Now().UTC().Format(auth.TimeFormat)
-				err := auth.GenerateAuthHeaderReq(
-					"TESTACCESSKEY", "TESTSECRETKEY",
-					timestamp, "ap-southeast-2", "s3", req,
-				)
-				if err != nil {
-					assert.Fail(t, "Error generating auth header: %v", err)
-				}
+			setupHeaders: func(t *testing.T, req *http.Request) {
+				signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3")
 				// Remove the date header after signing
 				req.Header.Del("X-Amz-Date")
 			},
@@ -221,15 +143,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			name:   "Invalid X-Amz-Date Format",
 			method: "GET",
 			path:   "/test-bucket01",
-			setupHeaders: func(req *http.Request) {
-				timestamp := time.Now().UTC().Format(auth.TimeFormat)
-				err := auth.GenerateAuthHeaderReq(
-					"TESTACCESSKEY", "TESTSECRETKEY",
-					timestamp, "ap-southeast-2", "s3", req,
-				)
-				if err != nil {
-					assert.Fail(t, "Error generating auth header: %v", err)
-				}
+			setupHeaders: func(t *testing.T, req *http.Request) {
+				signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3")
 				// Replace with malformed date
 				req.Header.Set("X-Amz-Date", "not-a-valid-date")
 			},
@@ -245,7 +160,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			// Create request
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			if tt.setupHeaders != nil {
-				tt.setupHeaders(req)
+				tt.setupHeaders(t, req)
 			}
 
 			// Wrap a stub next handler so we exercise only the auth middleware
@@ -271,11 +186,9 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 	}
 }
 
-// TestSigV4AuthMiddleware_RequireSignedHeaders verifies that requests whose
-// SigV4 SignedHeaders list omits "host" or "x-amz-date" are rejected with
-// AuthorizationHeaderMalformed. AWS SDKs always sign both; omitting either
-// would let a captured Authorization header replay against a different vhost
-// or outside the X-Amz-Date skew window.
+// TestSigV4AuthMiddleware_RequireSignedHeaders asserts that requests
+// missing "host" or "x-amz-date" from SignedHeaders are rejected with
+// AuthorizationHeaderMalformed.
 func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
 	s3Config := &Config{
 		Region: "ap-southeast-2",
@@ -319,9 +232,7 @@ func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/test-bucket01", nil)
-			ts := time.Now().UTC().Format(auth.TimeFormat)
-			err := auth.GenerateAuthHeaderReq("TESTACCESSKEY", "TESTSECRETKEY", ts, "ap-southeast-2", "s3", req)
-			assert.NoError(t, err)
+			signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3")
 			rewriteSignedHeaders(req, tt.signedList)
 
 			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -334,52 +245,4 @@ func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
 			assert.Contains(t, rr.Body.String(), "AuthorizationHeaderMalformed")
 		})
 	}
-}
-
-// TestSigV4AuthMiddleware_OversizeSignedBody verifies that a signed request
-// whose body exceeds the auth-package's 10 MiB cap and does not use
-// UNSIGNED-PAYLOAD or a precomputed hash is rejected with 413 EntityTooLarge,
-// not buffered and OOMed. This is the pre-auth DoS guard.
-func TestSigV4AuthMiddleware_OversizeSignedBody(t *testing.T) {
-	const oversize = 10*1024*1024 + 1
-	s3Config := &Config{
-		Region: "ap-southeast-2",
-		Buckets: []S3_Buckets{{
-			Name:     "test-bucket01",
-			Region:   "ap-southeast-2",
-			Type:     "fs",
-			Pathname: "tests/data/test-bucket01",
-			Public:   false,
-		}},
-		Auth: []AuthEntry{{
-			AccessKeyID:     "TESTACCESSKEY",
-			SecretAccessKey: "TESTSECRETKEY",
-			Policy: []PolicyRule{{
-				Bucket:  "test-bucket01",
-				Actions: []string{"s3:PutObject"},
-			}},
-		}},
-	}
-
-	server := NewHTTP2Server(s3Config)
-
-	// Body 1 byte over the cap — exercises the auth.ErrBodyTooLarge reject
-	// path without allocating an unreasonable amount of memory in tests.
-	body := strings.Repeat("A", oversize)
-	req := httptest.NewRequest(http.MethodPut, "/test-bucket01/big-object", bytes.NewReader([]byte(body)))
-
-	timestamp := time.Now().UTC().Format(auth.TimeFormat)
-	err := auth.GenerateAuthHeaderReq(
-		"TESTACCESSKEY", "TESTSECRETKEY",
-		timestamp, "ap-southeast-2", "s3", req,
-	)
-	assert.NoError(t, err)
-	// Intentionally do not set X-Amz-Content-Sha256 — leaves middleware on
-	// the default (read-body) branch.
-
-	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
-
-	assert.Equal(t, http.StatusRequestEntityTooLarge, rr.Code)
-	assert.Contains(t, rr.Body.String(), "EntityTooLarge")
 }

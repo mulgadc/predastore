@@ -7,9 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -20,9 +18,7 @@ func TestGetObjectNoBucketPermissions(t *testing.T) {
 	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/private/note.txt", nil)
-	timestamp := time.Now().UTC().Format("20060102T150405Z")
-	err := auth.GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, config.Region, "s3", req)
-	assert.NoError(t, err, "Error generating auth header")
+	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")
 
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
@@ -30,7 +26,7 @@ func TestGetObjectNoBucketPermissions(t *testing.T) {
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 
 	var s3error S3Error
-	err = xml.Unmarshal(rr.Body.Bytes(), &s3error)
+	err := xml.Unmarshal(rr.Body.Bytes(), &s3error)
 	assert.NoError(t, err, "XML parsing failed")
 	assert.Equal(t, "InvalidAccessKeyId", s3error.Code, "Error message should indicate invalid access key")
 }
@@ -47,9 +43,7 @@ func TestGetObjectWithRange(t *testing.T) {
 	putReq := httptest.NewRequest(http.MethodPut, "/"+bucket+"/"+key, bytes.NewReader(content))
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", putReq)
-		require.NoError(t, err)
+		signTestReq(t, putReq, content, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, putReq)
@@ -60,9 +54,7 @@ func TestGetObjectWithRange(t *testing.T) {
 	getReq.Header.Set("Range", "bytes=0-9")
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", getReq)
-		require.NoError(t, err)
+		signTestReq(t, getReq, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 	rr = httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, getReq)
@@ -79,9 +71,7 @@ func TestGetObjectNonExistent(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/"+testBucket+"/nonexistent.txt", nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err)
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	rr := httptest.NewRecorder()
@@ -97,9 +87,7 @@ func TestGetInvalidBucket(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/invalidbucket/file.txt", nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err)
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	rr := httptest.NewRecorder()
@@ -120,9 +108,7 @@ func TestGetInvalidObjectKey(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/"+testBucket+"/%s", string([]byte{0x80, 0x80})), nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err)
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	rr := httptest.NewRecorder()

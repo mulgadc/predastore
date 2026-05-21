@@ -189,18 +189,16 @@ func (s *HTTP2Server) setupRoutes() {
 	r.Delete("/{bucket}/*", s.deleteObject)
 }
 
-// sigV4AuthMiddleware authenticates and authorizes incoming S3 requests.
-// Stages: public-bucket short-circuit → SigV4 verification → IAM policy
-// evaluation → cross-account bucket-ownership check → handler dispatch
-// with the authenticated principal stored on the request context.
+// sigV4AuthMiddleware authenticates and authorizes incoming S3 requests:
+// public-bucket short-circuit, SigV4 verify, IAM policy eval, and
+// cross-account bucket-ownership check.
 func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		method := r.Method
 
-		// Public buckets short-circuit auth when no Authorization header
-		// is presented. A presented header always goes through the verifier
-		// so signature failures still produce an explicit error.
+		// Skip auth only when no Authorization header is present; a
+		// presented header always goes through the verifier.
 		publicBucketAccess := s.config.validatePublicBucketPermission(method, path)
 		if r.Header.Get("Authorization") == "" {
 			if publicBucketAccess == nil {
@@ -211,29 +209,23 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Closure-captured: the SecretLookup callback runs inside
-		// VerifySigV4Request and is the only point credResult is in scope
-		// before the request continues. We stash it here so the IAM and
-		// ownership stages downstream can consume it without re-fetching.
-		var (
-			credResult *CredentialResult
-			lookupErr  error
-		)
-		lookup := func(id string) (string, error) {
-			cr, err := s.credProv.LookupCredentials(id)
-			if err != nil {
-				lookupErr = err
-				return "", err
-			}
-			credResult = cr
-			return cr.SecretAccessKey, nil
-		}
-
-		accessKey, err := auth.VerifySigV4Request(r, s.config.Region, "s3", lookup)
+		sig, err := auth.ParseReq(r)
 		if err != nil {
-			s.respondSigV4Error(w, r, accessKey, err, lookupErr)
+			s.respondSigV4Error(w, r, "", err, nil)
 			return
 		}
+
+		credResult, err := s.credProv.LookupCredentials(sig.AccessKeyID)
+		if err != nil {
+			s.respondSigV4Error(w, r, sig.AccessKeyID, nil, err)
+			return
+		}
+
+		if err := sig.Verify(credResult.SecretAccessKey, "s3", s.config.Region); err != nil {
+			s.respondSigV4Error(w, r, sig.AccessKeyID, err, nil)
+			return
+		}
+		accessKey := sig.AccessKeyID
 
 		// IAM policy evaluation (NATS-sourced credentials only).
 		if !credResult.SkipPolicyCheck {
@@ -296,14 +288,9 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// respondSigV4Error maps an auth-package sentinel (or a SecretLookup
-// failure that propagated out via lookupErr) to the appropriate S3 error
-// response. *SigMismatchError is unwrapped via errors.As to surface
-// canonical-request + string-to-sign in the warn log for SDK debugging.
+// respondSigV4Error maps a parse/verify sentinel or a credential lookup
+// error to the matching S3 error response.
 func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string, err, lookupErr error) {
-	// SecretLookup errors are returned verbatim from VerifySigV4Request;
-	// route them via the original lookup error so callers see ErrKeyNotFound
-	// distinct from the auth-package sentinels below.
 	if lookupErr != nil {
 		if errors.Is(lookupErr, ErrKeyNotFound) {
 			slog.Warn("Unknown access key", "accessKeyID", claimedKey, "remoteAddr", r.RemoteAddr)
@@ -321,30 +308,18 @@ func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, 
 	switch {
 	case errors.Is(err, auth.ErrMissingAuth):
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing Authorization header")
+	case errors.Is(err, auth.ErrMissingSignedHeader):
+		s.writeS3Error(w, r, http.StatusForbidden, "AuthorizationHeaderMalformed", err.Error())
 	case errors.Is(err, auth.ErrInvalidAuthFormat):
-		// RequireSignedHeaders failures wrap ErrInvalidAuthFormat with a
-		// message that names the offending header. Map those to
-		// AuthorizationHeaderMalformed so SDKs see the same code AWS uses.
-		if strings.Contains(err.Error(), "SignedHeaders") {
-			s.writeS3Error(w, r, http.StatusForbidden, "AuthorizationHeaderMalformed", err.Error())
-			return
-		}
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid Authorization header format")
-	case errors.Is(err, auth.ErrInvalidCredScope):
-		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid credential scope")
 	case errors.Is(err, auth.ErrMissingDate):
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing required header: X-Amz-Date")
-	case errors.Is(err, auth.ErrInvalidDateFormat):
-		slog.Debug("Invalid X-Amz-Date format", "timestamp", r.Header.Get("X-Amz-Date"))
-		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid X-Amz-Date header format")
+	case errors.Is(err, auth.ErrMissingContentSHA):
+		s.writeS3Error(w, r, http.StatusBadRequest, "InvalidRequest", "Missing required header: X-Amz-Content-Sha256")
 	case errors.Is(err, auth.ErrClockSkew):
 		slog.Debug("Request timestamp outside allowed skew", "timestamp", r.Header.Get("X-Amz-Date"))
 		s.writeS3Error(w, r, http.StatusForbidden, "RequestTimeTooSkewed",
 			"The difference between the request time and the current time is too large")
-	case errors.Is(err, auth.ErrBodyTooLarge):
-		slog.Warn("Request body exceeds auth size limit", "accessKeyID", claimedKey)
-		s.writeS3Error(w, r, http.StatusRequestEntityTooLarge, "EntityTooLarge",
-			"Request body exceeds signature validation size limit")
 	case errors.Is(err, auth.ErrSignatureMismatch):
 		var smErr *auth.SigMismatchError
 		if errors.As(err, &smErr) {
@@ -359,10 +334,8 @@ func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, 
 				"userAgent", r.Header.Get("User-Agent"),
 				"proto", r.Proto,
 				"remoteAddr", r.RemoteAddr,
-				"expectedSigPrefix", smErr.ExpectedSigPrefix,
-				"providedSigPrefix", smErr.ProvidedSigPrefix,
-				"canonicalRequest", smErr.CanonicalRequest,
-				"stringToSign", smErr.StringToSign,
+				"expectedAuthHdr", smErr.ExpectedAuthHdr,
+				"providedAuthHdr", smErr.ProvidedAuthHdr,
 			)
 		}
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request signature does not match")

@@ -2,6 +2,8 @@ package s3
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/internal/storetest"
@@ -18,6 +21,18 @@ import (
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/require"
 )
+
+// signTestReq signs req with the given credentials and body payload hash.
+// body may be nil for body-less requests (sha256.Sum256(nil) is the empty
+// SHA-256 the server expects). Fails the test on signer error.
+func signTestReq(t *testing.T, req *http.Request, body []byte,
+	accessKey, secret, region, service string, opts ...func(*auth.Options)) {
+	t.Helper()
+	sum := sha256.Sum256(body)
+	payloadHash := hex.EncodeToString(sum[:])
+	require.NoError(t,
+		auth.SignReq(req, accessKey, secret, payloadHash, service, region, opts...))
+}
 
 // s3BackendPortCounter gives each setupDistributedBackend invocation a unique
 // port range so concurrent or rapidly-sequenced test setups don't collide on
