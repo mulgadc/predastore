@@ -2,6 +2,7 @@ package s3db
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
@@ -15,8 +16,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
 )
+
+// emptyPayloadSHA256 is sha256("") in hex — the payload hash for any
+// request without a body.
+const emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 // Client provides access to the distributed database cluster
 type Client struct {
@@ -232,7 +238,7 @@ func (c *Client) doRead(path string) ([]byte, error) {
 
 			// Sign the request if credentials are configured
 			if c.accessKeyID != "" && c.secretAccessKey != "" {
-				if err := SignRequest(req, c.accessKeyID, c.secretAccessKey, c.region, c.service); err != nil {
+				if err := auth.SignReq(req, c.accessKeyID, c.secretAccessKey, emptyPayloadSHA256, c.service, c.region); err != nil {
 					lastErr = fmt.Errorf("failed to sign request: %w", err)
 					continue
 				}
@@ -352,9 +358,12 @@ func (c *Client) tryWrite(method, node, path string, body []byte) ([]byte, strin
 
 	req.Header.Set("Content-Type", "application/octet-stream")
 
-	// Sign the request if credentials are configured
+	// Sign the request if credentials are configured. sha256.Sum256 is
+	// nil-safe; bodyless writes naturally hash to the empty-string digest.
 	if c.accessKeyID != "" && c.secretAccessKey != "" {
-		if err := SignRequest(req, c.accessKeyID, c.secretAccessKey, c.region, c.service); err != nil {
+		sum := sha256.Sum256(body)
+		payloadHash := hex.EncodeToString(sum[:])
+		if err := auth.SignReq(req, c.accessKeyID, c.secretAccessKey, payloadHash, c.service, c.region); err != nil {
 			return nil, "", fmt.Errorf("failed to sign request: %w", err)
 		}
 	}

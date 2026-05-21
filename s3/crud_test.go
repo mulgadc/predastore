@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -45,9 +44,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	// Add authentication
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, testContent, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp := doRequest(t, tb, req)
@@ -58,9 +55,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp = doRequest(t, tb, req)
@@ -76,9 +71,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp = doRequest(t, tb, req)
@@ -90,9 +83,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp = doRequest(t, tb, req)
@@ -103,9 +94,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp = doRequest(t, tb, req)
@@ -120,9 +109,7 @@ func TestListBucketsAllBackends(t *testing.T) {
 			createReq := httptest.NewRequest(http.MethodPut, "/list-test-bucket", nil)
 			if len(tb.Config.Auth) > 0 {
 				authEntry := tb.Config.Auth[0]
-				timestamp := time.Now().UTC().Format("20060102T150405Z")
-				err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", createReq)
-				require.NoError(t, err, "Error generating auth header for CreateBucket")
+				signTestReq(t, createReq, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 			}
 			createResp := doRequest(t, tb, createReq)
 			require.Equal(t, 200, createResp.StatusCode, "CreateBucket should return 200")
@@ -132,9 +119,7 @@ func TestListBucketsAllBackends(t *testing.T) {
 
 		if len(tb.Config.Auth) > 0 {
 			authEntry := tb.Config.Auth[0]
-			timestamp := time.Now().UTC().Format("20060102T150405Z")
-			err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-			require.NoError(t, err, "Error generating auth header")
+			signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 		}
 
 		resp := doRequest(t, tb, req)
@@ -156,9 +141,7 @@ func TestListObjectsAllBackends(t *testing.T) {
 
 		if len(tb.Config.Auth) > 0 {
 			authEntry := tb.Config.Auth[0]
-			timestamp := time.Now().UTC().Format("20060102T150405Z")
-			err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-			require.NoError(t, err, "Error generating auth header")
+			signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 		}
 
 		resp := doRequest(t, tb, req)
@@ -207,9 +190,7 @@ func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
 	req := httptest.NewRequest(http.MethodPut, "/"+bucketName+"/"+objectKey, bytes.NewReader(testContent))
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, testContent, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp := doRequest(t, tb, req)
@@ -219,9 +200,7 @@ func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
 	req = httptest.NewRequest(http.MethodGet, "/"+bucketName+"?list-type=2&prefix=size-test-", nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp = doRequest(t, tb, req)
@@ -249,9 +228,7 @@ func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
 	req = httptest.NewRequest(http.MethodDelete, "/"+bucketName+"/"+objectKey, nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp = doRequest(t, tb, req)
@@ -273,9 +250,7 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	req := httptest.NewRequest(http.MethodPut, "/"+bucketName+"/"+objectKey, bytes.NewReader(initialContent))
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, initialContent, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp := doRequest(t, tb, req)
@@ -285,9 +260,7 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	req = httptest.NewRequest(http.MethodGet, "/"+bucketName+"/"+objectKey, nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp = doRequest(t, tb, req)
@@ -316,9 +289,7 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	req = httptest.NewRequest(http.MethodPut, "/"+bucketName+"/"+objectKey, bytes.NewReader(modifiedContent))
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, modifiedContent, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp = doRequest(t, tb, req)
@@ -328,9 +299,7 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	req = httptest.NewRequest(http.MethodGet, "/"+bucketName+"/"+objectKey, nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp = doRequest(t, tb, req)
@@ -349,9 +318,7 @@ func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	req = httptest.NewRequest(http.MethodDelete, "/"+bucketName+"/"+objectKey, nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err, "Error generating auth header")
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	resp = doRequest(t, tb, req)

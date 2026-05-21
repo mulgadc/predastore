@@ -5,9 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,9 +17,7 @@ func TestCreateBucket_Handler(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/new-test-bucket", nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err)
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
@@ -36,9 +32,7 @@ func TestHeadBucket_NotFound(t *testing.T) {
 	req := httptest.NewRequest(http.MethodHead, "/nonexistent-bucket-xyz", nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err)
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
@@ -54,9 +48,7 @@ func TestDeleteBucket_Handler(t *testing.T) {
 	createReq := httptest.NewRequest(http.MethodPut, "/delete-test-bucket", nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", createReq)
-		require.NoError(t, err)
+		signTestReq(t, createReq, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, createReq)
@@ -65,9 +57,7 @@ func TestDeleteBucket_Handler(t *testing.T) {
 	req := httptest.NewRequest(http.MethodDelete, "/delete-test-bucket", nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err)
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 	rr = httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
@@ -84,9 +74,7 @@ func TestCreateBucket_WithLocationConstraint(t *testing.T) {
 	req.Header.Set("Content-Type", "application/xml")
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err)
+		signTestReq(t, req, []byte(body), authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)

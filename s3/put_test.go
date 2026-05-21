@@ -6,11 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestPutObjectPublicBucketNoAuth(t *testing.T) {
@@ -50,9 +47,7 @@ func TestPutObjectInvalidBucket(t *testing.T) {
 
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err)
+		signTestReq(t, req, testContent, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	rr := httptest.NewRecorder()

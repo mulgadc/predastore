@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -150,25 +149,9 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			service = DefaultService
 		}
 
-		lookup := func(id string) (string, error) {
-			secret, ok := s.config.Credentials[id]
-			if !ok {
-				return "", fmt.Errorf("invalid access key: %s", id)
-			}
-			return secret, nil
-		}
-
-		accessKey, err := auth.VerifySigV4Request(r, region, service, lookup)
+		sig, err := auth.ParseReq(r)
 		if err != nil {
-			if errors.Is(err, auth.ErrBodyTooLarge) {
-				slog.Warn("Request body exceeds auth size limit")
-				s.writeJSON(w, http.StatusRequestEntityTooLarge, ErrorResponse{
-					Error:   "EntityTooLarge",
-					Message: "Request body exceeds signature validation size limit",
-				})
-				return
-			}
-			slog.Debug("Auth failed", "error", err)
+			slog.Debug("Auth parse failed", "error", err)
 			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
 				Error:   "AccessDenied",
 				Message: err.Error(),
@@ -176,7 +159,26 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), contextKeyAccessKey, accessKey)
+		secret, ok := s.config.Credentials[sig.AccessKeyID]
+		if !ok {
+			slog.Debug("Unknown access key", "accessKey", sig.AccessKeyID)
+			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
+				Error:   "AccessDenied",
+				Message: fmt.Sprintf("invalid access key: %s", sig.AccessKeyID),
+			})
+			return
+		}
+
+		if err := sig.Verify(secret, service, region); err != nil {
+			slog.Debug("Auth verify failed", "error", err)
+			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
+				Error:   "AccessDenied",
+				Message: err.Error(),
+			})
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), contextKeyAccessKey, sig.AccessKeyID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

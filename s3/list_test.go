@@ -7,9 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -49,9 +47,7 @@ func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
-	timestamp := time.Now().UTC().Format("20060102T150405Z")
-	err := auth.GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, config.Region, "s3", req)
-	assert.NoError(t, err, "Error generating auth header")
+	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")
 
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)
@@ -59,7 +55,7 @@ func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 
 	var result S3Error
-	err = xml.NewDecoder(rr.Body).Decode(&result)
+	err := xml.NewDecoder(rr.Body).Decode(&result)
 	assert.NoError(t, err, "XML parsing should not error")
 	assert.Equal(t, "InvalidAccessKeyId", result.Code, "Error message should indicate invalid access key")
 }
@@ -82,9 +78,7 @@ func TestListObjectsWithPrefix(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPut, "/"+bucket+"/"+obj.key, bytes.NewReader(obj.content))
 		if len(tb.Config.Auth) > 0 {
 			authEntry := tb.Config.Auth[0]
-			timestamp := time.Now().UTC().Format("20060102T150405Z")
-			err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-			require.NoError(t, err)
+			signTestReq(t, req, obj.content, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 		}
 		rr := httptest.NewRecorder()
 		tb.Handler.ServeHTTP(rr, req)
@@ -95,9 +89,7 @@ func TestListObjectsWithPrefix(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/"+bucket+"?prefix=test", nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err)
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 	rr := httptest.NewRecorder()
 	tb.Handler.ServeHTTP(rr, req)
@@ -139,9 +131,7 @@ func TestListInvalidBucket(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/invalidbucket", nil)
 	if len(tb.Config.Auth) > 0 {
 		authEntry := tb.Config.Auth[0]
-		timestamp := time.Now().UTC().Format("20060102T150405Z")
-		err := auth.GenerateAuthHeaderReq(authEntry.AccessKeyID, authEntry.SecretAccessKey, timestamp, tb.Config.Region, "s3", req)
-		require.NoError(t, err)
+		signTestReq(t, req, nil, authEntry.AccessKeyID, authEntry.SecretAccessKey, tb.Config.Region, "s3")
 	}
 
 	rr := httptest.NewRecorder()

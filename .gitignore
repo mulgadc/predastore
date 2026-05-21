@@ -27,7 +27,7 @@ s3/testdata/test-bucket01/multipart_test.bin
 s3/testdata/test-bucket01/new_test_file.txt
 s3/testdata/test-bucket01/sample/
 s3/testdata/local/*
-store/testdata/*
+*/testdata/*
 
 # Generated TLS certs
 certs

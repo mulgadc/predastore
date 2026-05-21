@@ -4,9 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -32,11 +30,8 @@ func TestDeleteObjectBadAuth(t *testing.T) {
 	// Send a delete request
 	req := httptest.NewRequest(http.MethodDelete, "/local/unknownfile.txt", nil)
 
-	// Use our utility function to generate a valid authorization header
-	timestamp := time.Now().UTC().Format("20060102T150405Z")
-
-	err := auth.GenerateAuthHeaderReq("BADACCESSKEY", "BADSECRETKEY", timestamp, config.Region, "s3", req)
-	assert.NoError(t, err, "Error generating auth header")
+	// Sign with bad credentials to exercise the InvalidAccessKeyId path.
+	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")
 
 	rr := httptest.NewRecorder()
 	server.GetHandler().ServeHTTP(rr, req)

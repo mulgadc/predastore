@@ -11,9 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
-	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/stretchr/testify/assert"
 )
@@ -196,10 +194,7 @@ func ownershipServer(t *testing.T) *HTTP2Server {
 func signedReq(t *testing.T, method, path, accessKey string) *http.Request {
 	t.Helper()
 	req := httptest.NewRequest(method, path, nil)
-	timestamp := time.Now().UTC().Format(auth.TimeFormat)
-	if err := auth.GenerateAuthHeaderReq(accessKey, secret, timestamp, "ap-southeast-2", "s3", req); err != nil {
-		t.Fatalf("sign request: %v", err)
-	}
+	signTestReq(t, req, nil, accessKey, secret, "ap-southeast-2", "s3")
 	return req
 }
 
