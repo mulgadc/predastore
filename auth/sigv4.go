@@ -222,7 +222,7 @@ func (req *Request) Verify(
 	}
 
 	// The SDK signer derives SignedHeaders from whatever's on the request,
-	// so any transport-added headers (Accept-Encoding, Content-Length, ...)
+	// so any transport-added headers (Accept-Encoding, User-Agent, ...)
 	// would make the re-signed Authorization diverge from the wire one.
 	// Stash them, sign, restore — Host is read from req.Host, not the
 	// header map; Authorization is always deleted+restored separately.
@@ -238,6 +238,19 @@ func (req *Request) Verify(
 		}
 	}
 
+	// content-length is special: the SDK signer auto-adds it to
+	// SignedHeaders from req.ContentLength (not req.Header), so
+	// stashing the header doesn't suppress it. Zero ContentLength
+	// across the re-sign when the client didn't sign it; restore
+	// after. boto3/aws-cli don't sign content-length, only the Go SDK.
+	var stashedContentLength int64
+	contentLengthStashed := false
+	if _, ok := req.signedHeaders["content-length"]; !ok && req.ContentLength > 0 {
+		stashedContentLength = req.ContentLength
+		req.ContentLength = 0
+		contentLengthStashed = true
+	}
+
 	req.Header.Del(authHeaderKey)
 	signErr := v4.NewSigner().SignHTTP(
 		context.Background(),
@@ -247,6 +260,9 @@ func (req *Request) Verify(
 	expected := req.Header.Get(authHeaderKey)
 	req.Header.Set(authHeaderKey, req.authHeader)
 	maps.Copy(req.Header, stash)
+	if contentLengthStashed {
+		req.ContentLength = stashedContentLength
+	}
 	if signErr != nil {
 		return fmt.Errorf("re-sign for verify: %w", signErr)
 	}

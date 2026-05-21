@@ -395,10 +395,13 @@ func TestVerify_MissingContentSHAFallback(t *testing.T) {
 
 // TestVerify_TransportAddedHeaders pins the contract that headers
 // added after signing by the HTTP transport (Accept-Encoding,
-// Content-Length, ...) must not cause re-signing to over-include
-// them in SignedHeaders. boto3/aws-cli sign content-type;host;
-// x-amz-date but the wire request gains Accept-Encoding etc. before
-// the server reads it.
+// User-Agent, ...) must not cause re-signing to over-include them
+// in SignedHeaders. boto3/aws-cli sign content-type;host;x-amz-date
+// but the wire request gains Accept-Encoding etc. before the server
+// reads it. Content-Length is a separate auto-add path (sourced
+// from req.ContentLength, not req.Header) — exercised here by
+// signing with ContentLength=0 to mirror boto3 semantics, then
+// restoring the body length to mirror the wire state.
 func TestVerify_TransportAddedHeaders(t *testing.T) {
 	body := []byte("Action=DescribeInstances")
 	sum := sha256.Sum256(body)
@@ -407,15 +410,16 @@ func TestVerify_TransportAddedHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
 	req.Host = "ec2.amazonaws.com"
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.ContentLength = 0 // suppress SDK's auto-content-length to match boto3
 	require.NoError(t, v4.NewSigner().SignHTTP(
 		context.Background(),
 		aws.Credentials{AccessKeyID: exAccessKeyID, SecretAccessKey: exSecret},
 		req, bodyHashHex, "ec2", exRegion, exTime,
 	))
 
-	// Simulate transport-added headers post-signing.
+	// Wire state: body length is back, transport added unsigned headers.
+	req.ContentLength = int64(len(body))
 	req.Header.Set("Accept-Encoding", "identity")
-	req.Header.Set("Content-Length", "23")
 	req.Header.Set("User-Agent", "aws-cli/2.0")
 
 	sig, err := auth.ParseReq(req)
@@ -424,8 +428,8 @@ func TestVerify_TransportAddedHeaders(t *testing.T) {
 		auth.WithTime(exTime),
 		auth.WithBodyHash(bodyHashHex)))
 
-	// Transport-added headers must still be on the request after Verify.
+	// Wire state must survive Verify untouched.
 	require.Equal(t, "identity", req.Header.Get("Accept-Encoding"))
-	require.Equal(t, "23", req.Header.Get("Content-Length"))
 	require.Equal(t, "aws-cli/2.0", req.Header.Get("User-Agent"))
+	require.Equal(t, int64(len(body)), req.ContentLength)
 }
