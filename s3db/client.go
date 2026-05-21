@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/mulgadc/predastore/internal/tlsconfig"
 )
 
 // Client provides access to the distributed database cluster
@@ -72,6 +74,8 @@ func NewClient(config *ClientConfig) *Client {
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: config.InsecureSkipVerify,
 			NextProtos:         []string{"h2", "http/1.1"},
+			MinVersion:         tls.VersionTLS13,
+			CurvePreferences:   tlsconfig.Curves,
 		},
 		ForceAttemptHTTP2: true,
 	}

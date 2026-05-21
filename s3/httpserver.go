@@ -29,6 +29,7 @@ import (
 	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
+	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/ratelimit"
 	"github.com/mulgadc/predastore/s3/chunked"
 )
@@ -930,19 +931,9 @@ func (s *HTTP2Server) ListenAndServe(addr, certFile, keyFile string) error {
 		Certificates: []tls.Certificate{cert},
 		// NextProtos enables ALPN for HTTP/2 negotiation
 		// "h2" = HTTP/2, "http/1.1" = HTTP/1.1 fallback
-		NextProtos: []string{"h2", "http/1.1"},
-		MinVersion: tls.VersionTLS12,
-		// Optimized cipher suites for performance
-		CipherSuites: []uint16{
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-		},
-		// Session resumption for faster reconnects
-		SessionTicketsDisabled: false,
+		NextProtos:       []string{"h2", "http/1.1"},
+		MinVersion:       tls.VersionTLS13,
+		CurvePreferences: tlsconfig.Curves,
 	}
 
 	s.server = &http.Server{

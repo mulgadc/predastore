@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/quic/quicserver"
@@ -46,6 +47,8 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true, // demo only. Use mTLS with your CA in prod.
 		NextProtos:         []string{alpn},
+		MinVersion:         tls.VersionTLS13,
+		CurvePreferences:   tlsconfig.Curves,
 	}
 	conn, err := quic.DialAddr(ctx, addr, tlsConf, &quic.Config{
 		HandshakeIdleTimeout: 5 * time.Second,

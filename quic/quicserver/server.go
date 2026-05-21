@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/internal/masterkey"
+	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/store"
@@ -425,5 +426,9 @@ func makeServerTLSConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
+	return &tls.Config{
+		Certificates:     []tls.Certificate{cert},
+		MinVersion:       tls.VersionTLS13,
+		CurvePreferences: tlsconfig.Curves,
+	}, nil
 }
