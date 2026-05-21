@@ -36,6 +36,12 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 		return nil, fmt.Errorf("node ID %d not found in cluster config", config.NodeID)
 	}
 
+	// Fail closed: the Raft transport carries committed log entries (object
+	// metadata, IAM state). There is no plaintext fallback. Mirrors quicd.
+	if config.TLSCert == "" || config.TLSKey == "" {
+		return nil, fmt.Errorf("s3db raft: TLS cert and key are required; refusing to start without transport encryption")
+	}
+
 	// Create data directories
 	dataDir := config.DataDir
 	if err := os.MkdirAll(dataDir, 0750); err != nil {
@@ -87,13 +93,24 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 	}
 
 	slog.Info("Setting up Raft transport", "bindAddr", bindAddr, "advertiseAddr", advertiseAddr)
-	node.transport, err = raft.NewTCPTransport(bindAddr, tcpAddr, 3, 10*time.Second, os.Stderr)
+	rawListener, err := net.Listen("tcp", bindAddr)
 	if err != nil {
 		if cerr := node.badgerDB.Close(); cerr != nil {
 			slog.Debug("Failed to close badger during cleanup", "error", cerr)
 		}
-		return nil, fmt.Errorf("failed to create transport: %w", err)
+		return nil, fmt.Errorf("failed to listen on raft bind %s: %w", bindAddr, err)
 	}
+	streamLayer, err := newTLSStreamLayer(rawListener, tcpAddr, config.TLSCert, config.TLSKey)
+	if err != nil {
+		if cerr := rawListener.Close(); cerr != nil {
+			slog.Debug("Failed to close raft listener during cleanup", "error", cerr)
+		}
+		if cerr := node.badgerDB.Close(); cerr != nil {
+			slog.Debug("Failed to close badger during cleanup", "error", cerr)
+		}
+		return nil, fmt.Errorf("failed to create raft TLS stream layer: %w", err)
+	}
+	node.transport = raft.NewNetworkTransport(streamLayer, 3, 10*time.Second, os.Stderr)
 
 	// Setup log store and stable store (BoltDB)
 	boltDBPath := filepath.Join(dataDir, "raft.db")

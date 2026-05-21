@@ -1154,7 +1154,10 @@ scan.
 
 All communication uses TLS:
 - s3db server uses HTTPS with configurable certificates
-- Client connections skip certificate verification for self-signed certs (configurable)
+- The Raft transport (`raft_port`) is TLS-wrapped using the same cert/key
+  pair; peers verify the server cert against the OS trust store
+- The QUIC RPC transport between s3d and shard nodes verifies the server
+  cert against the OS trust store (no `InsecureSkipVerify`)
 - Certificate paths: `-tls-cert` and `-tls-key` flags
 
 ## Authentication
@@ -1278,7 +1281,14 @@ Each database node uses two ports:
 | Port | Purpose | Default |
 |------|---------|---------|
 | `port` | HTTPS REST API for client requests | 6660 |
-| `raft_port` | TCP for Raft consensus (leader election, log replication) | `port + 1000` (e.g., 7660) |
+| `raft_port` | TLS-wrapped TCP for Raft consensus (leader election, log replication) | `port + 1000` (e.g., 7660) |
+
+The Raft transport is TLS-protected using the same `-tls-cert` / `-tls-key`
+pair as the HTTPS S3 API and s3db REST listener. Peers verify the server
+cert against the OS trust store (cluster CA installed via
+`update-ca-certificates`); s3db refuses to start without a cert/key pair —
+there is no plaintext fallback. Mutual TLS (peer client-cert auth) is
+deferred to a follow-up bead.
 
 ### Bind vs Advertise Address
 

@@ -25,6 +25,12 @@ type ClusterConfig struct {
 	DataDir   string         // Base data directory
 	Bootstrap bool           // Whether to bootstrap a new cluster
 
+	// TLS material for the Raft transport. Populated programmatically by
+	// s3db.NewServer from ServerConfig.TLS{Cert,Key} — not from cluster.toml.
+	// NewRaftNode refuses to start if either is empty.
+	TLSCert string
+	TLSKey  string
+
 	// Raft tuning
 	HeartbeatTimeout   time.Duration
 	ElectionTimeout    time.Duration
