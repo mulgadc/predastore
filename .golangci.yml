@@ -141,7 +141,5 @@ linters:
         linters: [gosec] # file path from variable — necessary for config/data loading
       - text: "G401"
         linters: [gosec] # use of weak crypto (MD5) — used for S3 Content-MD5 compatibility
-      - text: "G402"
-        linters: [gosec] # TLS config — we handle TLS ourselves
       - text: "G501"
         linters: [gosec] # import of crypto/md5 — required for S3 Content-MD5
