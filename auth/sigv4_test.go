@@ -2,6 +2,7 @@ package auth_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -10,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
@@ -340,4 +343,53 @@ func TestVerify_WithBodyHash(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestVerify_MissingContentSHAFallback exercises the non-S3 SDK path:
+// EC2/IAM/ELBv2 clients sign with a payload hash in the canonical
+// request but omit X-Amz-Content-Sha256 from the wire. Verify must
+// accept these when WithBodyHash supplies the same hash, and still
+// reject when no bodyHash is provided.
+func TestVerify_MissingContentSHAFallback(t *testing.T) {
+	body := []byte("Action=DescribeInstances&Version=2016-11-15")
+	sum := sha256.Sum256(body)
+	bodyHashHex := hex.EncodeToString(sum[:])
+
+	// Sign without setting X-Amz-Content-Sha256 to mirror non-S3 SDK
+	// clients (EC2 etc.): the SDK passes payloadHash into the canonical
+	// request but does not emit it as a wire header.
+	signNoHeader := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+		req.Host = "ec2.amazonaws.com"
+		require.NoError(t, v4.NewSigner().SignHTTP(
+			context.Background(),
+			aws.Credentials{AccessKeyID: exAccessKeyID, SecretAccessKey: exSecret},
+			req, bodyHashHex, "ec2", exRegion, exTime,
+		))
+		require.Empty(t, req.Header.Get("X-Amz-Content-Sha256"))
+		return req
+	}
+
+	t.Run("accepts when WithBodyHash supplies the hash", func(t *testing.T) {
+		sig, err := auth.ParseReq(signNoHeader())
+		require.NoError(t, err)
+		require.NoError(t, sig.Verify(exSecret, "ec2", exRegion,
+			auth.WithTime(exTime), auth.WithBodyHash(bodyHashHex)))
+	})
+
+	t.Run("rejects when no bodyHash is supplied", func(t *testing.T) {
+		sig, err := auth.ParseReq(signNoHeader())
+		require.NoError(t, err)
+		err = sig.Verify(exSecret, "ec2", exRegion, auth.WithTime(exTime))
+		require.ErrorIs(t, err, auth.ErrMissingContentSHA)
+	})
+
+	t.Run("rejects when bodyHash diverges from what client signed", func(t *testing.T) {
+		sig, err := auth.ParseReq(signNoHeader())
+		require.NoError(t, err)
+		err = sig.Verify(exSecret, "ec2", exRegion,
+			auth.WithTime(exTime),
+			auth.WithBodyHash(strings.Repeat("0", 64)))
+		require.ErrorIs(t, err, auth.ErrSignatureMismatch)
+	})
 }

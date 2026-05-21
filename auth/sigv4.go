@@ -76,11 +76,14 @@ func WithTime(t time.Time) func(*Options) {
 // is constant-time-compared against the wire X-Amz-Content-Sha256
 // header. SigV4 payload sentinels in the header (UNSIGNED-PAYLOAD and
 // the STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER] family) skip the
-// check — the header is not a hash in those modes.
+// check — the header is not a hash in those modes. When the header is
+// absent (non-S3 SDK clients omit it), the supplied hash is used as the
+// payload hash for re-signing instead — body integrity is then enforced
+// implicitly via the signature comparison.
 //
-// Opt-in. Verify without WithBodyHash trusts the header verbatim,
-// matching default SignHTTP semantics where the payload hash is the
-// caller's responsibility.
+// Opt-in. Verify without WithBodyHash trusts the header verbatim and
+// requires it to be present, matching default SignHTTP semantics where
+// the payload hash is the caller's responsibility.
 func WithBodyHash(hex string) func(*Options) {
 	return func(o *Options) { o.bodyHash = hex }
 }
@@ -199,7 +202,13 @@ func (req *Request) Verify(
 
 	payloadHash := req.Header.Get("X-Amz-Content-Sha256")
 	if payloadHash == "" {
-		return ErrMissingContentSHA
+		// Only S3 SDK clients emit X-Amz-Content-Sha256; EC2/IAM/ELBv2/etc.
+		// put the payload hash in the canonical request without a header.
+		// Fall back to the caller's server-computed hash when supplied.
+		if o.bodyHash == "" {
+			return ErrMissingContentSHA
+		}
+		payloadHash = o.bodyHash
 	}
 
 	// Opt-in body-hash gate. Runs before the SDK re-sign so a body-swap
