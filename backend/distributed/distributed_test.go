@@ -13,6 +13,8 @@ import (
 	"github.com/klauspost/reedsolomon"
 	s3backend "github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/internal/storetest"
+	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3db"
 	"github.com/mulgadc/predastore/store"
@@ -49,6 +51,10 @@ func TestPutObject_ShardPlacementAndReconstruction(t *testing.T) {
 	dataDir := filepath.Join(tmpDir, "nodes")
 	backend.SetDataDir(dataDir)
 
+	certPath, keyPath, pool := testcerts.Generate(t)
+	quicclient.SetDefaultRootCAs(pool)
+	t.Cleanup(func() { quicclient.SetDefaultRootCAs(nil) })
+
 	nodeDirs := make([]string, partitionCount)
 	quicServers := make([]*quicserver.QuicServer, partitionCount)
 	for i := range partitionCount {
@@ -56,7 +62,10 @@ func TestPutObject_ShardPlacementAndReconstruction(t *testing.T) {
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 		nodeDirs[i] = nodeDir
 
-		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5, quicserver.WithMasterKey(storetest.TestKey()))
+		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5,
+			quicserver.WithMasterKey(storetest.TestKey()),
+			quicserver.WithTLSCertFiles(certPath, keyPath),
+		)
 		require.NoError(t, err, "Failed to start QUIC server for node %d", i)
 		quicServers[i] = qs
 	}
@@ -155,12 +164,19 @@ func TestPutGetRoundTrip(t *testing.T) {
 	dataDir := filepath.Join(tmpDir, "nodes")
 	backend.SetDataDir(dataDir)
 
+	certPath, keyPath, pool := testcerts.Generate(t)
+	quicclient.SetDefaultRootCAs(pool)
+	t.Cleanup(func() { quicclient.SetDefaultRootCAs(nil) })
+
 	quicServers := make([]*quicserver.QuicServer, partitionCount)
 	for i := range partitionCount {
 		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 
-		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5, quicserver.WithMasterKey(storetest.TestKey()))
+		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5,
+			quicserver.WithMasterKey(storetest.TestKey()),
+			quicserver.WithTLSCertFiles(certPath, keyPath),
+		)
 		require.NoError(t, err, "Failed to start QUIC server for node %d", i)
 		quicServers[i] = qs
 	}
@@ -345,12 +361,19 @@ func TestGetObjectByteRange(t *testing.T) {
 	dataDir := filepath.Join(tmpDir, "nodes")
 	backend.SetDataDir(dataDir)
 
+	certPath, keyPath, pool := testcerts.Generate(t)
+	quicclient.SetDefaultRootCAs(pool)
+	t.Cleanup(func() { quicclient.SetDefaultRootCAs(nil) })
+
 	quicServers := make([]*quicserver.QuicServer, 5)
 	for i := range 5 {
 		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 
-		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5, quicserver.WithMasterKey(storetest.TestKey()))
+		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5,
+			quicserver.WithMasterKey(storetest.TestKey()),
+			quicserver.WithTLSCertFiles(certPath, keyPath),
+		)
 		require.NoError(t, err, "Failed to start QUIC server for node %d", i)
 		quicServers[i] = qs
 	}

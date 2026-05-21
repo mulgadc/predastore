@@ -2,17 +2,13 @@ package quicclient
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
-	"encoding/pem"
 	"fmt"
-	"math/big"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/testcerts"
 	quic "github.com/quic-go/quic-go"
 	"github.com/stretchr/testify/require"
 )
@@ -27,8 +23,17 @@ var poolTestPortCounter atomic.Int32
 func startMinimalQUICListener(t *testing.T) (string, func()) {
 	t.Helper()
 
-	tlsConf := generateTestTLSConfig(t)
-	tlsConf.NextProtos = []string{alpn}
+	certPath, keyPath, pool := testcerts.Generate(t)
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	require.NoError(t, err)
+	tlsConf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{alpn},
+	}
+
+	SetDefaultRootCAs(pool)
+	t.Cleanup(func() { SetDefaultRootCAs(nil) })
 
 	port := 47000 + int(poolTestPortCounter.Add(1))
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
@@ -140,33 +145,4 @@ func TestQuicClientPool_ReapSkipsActiveRPCStreams(t *testing.T) {
 
 	// Keep the deferred decActive balanced (we did one extra inc above).
 	client.incActive()
-}
-
-// generateTestTLSConfig mirrors quicserver's makeServerTLSConfig but lives
-// in this package to avoid importing quicserver (which would create a cycle).
-func generateTestTLSConfig(t *testing.T) *tls.Config {
-	t.Helper()
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-
-	tmpl := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:     []string{"localhost"},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
-	require.NoError(t, err)
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	require.NoError(t, err)
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS13,
-	}
 }

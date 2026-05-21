@@ -125,6 +125,29 @@ TLS certificates are generated on first build:
 make certs              # Generate certs/server.{pem,key}
 ```
 
+### Standalone TLS Trust
+
+The QUIC inter-node transport and the s3db REST client now verify the server
+certificate — `InsecureSkipVerify` is gone from both the production code path
+and the test fixtures (tests inject an ephemeral CA via
+`quicclient.SetDefaultRootCAs`). Standalone operators must install the cluster
+CA into the host trust store before launching `s3d`, otherwise nodes cannot
+dial each other:
+
+```bash
+# Debian / Ubuntu
+sudo cp cluster-ca.pem /usr/local/share/ca-certificates/predastore-cluster-ca.crt
+sudo update-ca-certificates
+
+# RHEL / Fedora / Amazon Linux
+sudo cp cluster-ca.pem /etc/pki/ca-trust/source/anchors/predastore-cluster-ca.pem
+sudo update-ca-trust
+```
+
+When predastore is deployed by Spinifex, the cluster CA is installed into the
+host trust store automatically as part of node bootstrap — no manual action is
+required.
+
 ### AWS CLI Examples
 
 ```bash

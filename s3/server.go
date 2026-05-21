@@ -655,7 +655,10 @@ func (s *Server) launchQUICServers() {
 					return
 				}
 
-				quicserver.New(nodePath, quicAddr, quicserver.WithMasterKey(s.masterKey))
+				quicserver.New(nodePath, quicAddr,
+					quicserver.WithMasterKey(s.masterKey),
+					quicserver.WithTLSCertFiles(s.tlsCert, s.tlsKey),
+				)
 				return
 			}
 		}
@@ -678,7 +681,10 @@ func (s *Server) launchQUICServers() {
 				continue
 			}
 
-			quicserver.New(nodePath, quicAddr, quicserver.WithMasterKey(s.masterKey))
+			quicserver.New(nodePath, quicAddr,
+				quicserver.WithMasterKey(s.masterKey),
+				quicserver.WithTLSCertFiles(s.tlsCert, s.tlsKey),
+			)
 		}
 	} else {
 		slog.Error("Distributed mode requires -node flag when nodes have different hosts")

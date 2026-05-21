@@ -26,6 +26,8 @@ import (
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/internal/storetest"
+	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -85,12 +87,19 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup, n
 	})
 	require.NoError(t, err, "Should create distributed backend")
 
+	certPath, keyPath, pool := testcerts.Generate(t)
+	quicclient.SetDefaultRootCAs(pool)
+	t.Cleanup(func() { quicclient.SetDefaultRootCAs(nil) })
+
 	quicServers := make([]*quicserver.QuicServer, nodeCount)
 	for i := 0; i < nodeCount; i++ {
 		nodeDir := filepath.Join(nodeDataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 		addr := fmt.Sprintf("127.0.0.1:%d", basePort+i)
-		quicServers[i] = quicserver.New(nodeDir, addr, quicserver.WithMasterKey(storetest.TestKey()))
+		quicServers[i] = quicserver.New(nodeDir, addr,
+			quicserver.WithMasterKey(storetest.TestKey()),
+			quicserver.WithTLSCertFiles(certPath, keyPath),
+		)
 	}
 	time.Sleep(100 * time.Millisecond)
 

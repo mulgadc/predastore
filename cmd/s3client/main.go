@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -17,17 +16,16 @@ import (
 
 // Options for the client
 type ClientOptions struct {
-	Endpoint     string
-	Region       string
-	Bucket       string
-	Method       string
-	Path         string
-	Body         string
-	BodyFile     string
-	AccessKey    string
-	SecretKey    string
-	OutputFile   string
-	SkipTLSCheck bool
+	Endpoint   string
+	Region     string
+	Bucket     string
+	Method     string
+	Path       string
+	Body       string
+	BodyFile   string
+	AccessKey  string
+	SecretKey  string
+	OutputFile string
 }
 
 func main() {
@@ -65,14 +63,7 @@ func main() {
 		}
 	}
 
-	// Create HTTP client (skip TLS verification if requested)
 	client := &http.Client{}
-	if opts.SkipTLSCheck {
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
-		client = &http.Client{Transport: tr}
-	}
 
 	// Create request
 	req, err := http.NewRequest(opts.Method, url, bytes.NewReader([]byte(body)))
@@ -158,7 +149,6 @@ func parseFlags() ClientOptions {
 	flag.StringVar(&opts.AccessKey, "access-key", "", "AWS access key")
 	flag.StringVar(&opts.SecretKey, "secret-key", "", "AWS secret key")
 	flag.StringVar(&opts.OutputFile, "output", "", "File to write response to")
-	flag.BoolVar(&opts.SkipTLSCheck, "skip-tls-check", false, "Skip TLS certificate verification")
 
 	flag.Parse()
 

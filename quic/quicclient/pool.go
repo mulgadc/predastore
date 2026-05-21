@@ -3,20 +3,48 @@ package quicclient
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/quic-go/quic-go"
 )
+
+// rootCAs is the package-level root CA pool consulted at dial time. Nil ⇒ OS
+// trust store, which is the production path (cluster CA installed via
+// update-ca-certificates / update-ca-trust). Tests inject an ephemeral CA via
+// SetDefaultRootCAs before any dial happens.
+var rootCAs atomic.Pointer[x509.CertPool]
+
+// SetDefaultRootCAs replaces the root CA pool consulted by Dial and the
+// default Pool. Pass nil to restore the OS trust store. Production code
+// should never call this — it exists so tests that exercise the strict-verify
+// code path can trust an ephemeral CA.
+func SetDefaultRootCAs(pool *x509.CertPool) {
+	rootCAs.Store(pool)
+}
+
+// tlsConfigForDial builds a fresh strict-verify *tls.Config. RootCAs comes
+// from the package-level default (nil ⇒ OS trust store).
+func tlsConfigForDial() *tls.Config {
+	return &tls.Config{
+		RootCAs:          rootCAs.Load(),
+		NextProtos:       []string{alpn},
+		MinVersion:       tls.VersionTLS13,
+		CurvePreferences: tlsconfig.Curves,
+	}
+}
 
 // Pool manages a pool of QUIC connections to multiple nodes.
 // Connections are reused to avoid TLS handshake overhead.
 type Pool struct {
 	mu          sync.RWMutex
 	connections map[string]*pooledConn
-	tlsConf     *tls.Config
 	quicConf    *quic.Config
 }
 
@@ -31,10 +59,6 @@ type pooledConn struct {
 func NewPool() *Pool {
 	p := &Pool{
 		connections: make(map[string]*pooledConn),
-		tlsConf: &tls.Config{
-			InsecureSkipVerify: true, // demo only. Use mTLS with your CA in prod.
-			NextProtos:         []string{alpn},
-		},
 		quicConf: &quic.Config{
 			HandshakeIdleTimeout: 5 * time.Second,
 			KeepAlivePeriod:      15 * time.Second,
@@ -105,10 +129,13 @@ func (p *Pool) createConnection(ctx context.Context, addr string) (*Client, erro
 		pc.mu.Unlock()
 	}
 
-	// Create new QUIC connection
-	conn, err := quic.DialAddr(ctx, addr, p.tlsConf, p.quicConf)
+	// Create new QUIC connection. Rebuild TLS config per dial so the pool
+	// picks up SetDefaultRootCAs updates (DefaultPool is constructed at
+	// package init, before any test can inject a CA).
+	conn, err := quic.DialAddr(ctx, addr, tlsConfigForDial(), p.quicConf)
 	if err != nil {
-		return nil, err
+		slog.Warn("quic dial failed", "addr", addr, "error", err)
+		return nil, fmt.Errorf("quic dial %s: %w", addr, err)
 	}
 
 	client := &Client{conn: conn}
