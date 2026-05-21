@@ -11,6 +11,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"regexp"
 	"strings"
@@ -76,11 +77,14 @@ func WithTime(t time.Time) func(*Options) {
 // is constant-time-compared against the wire X-Amz-Content-Sha256
 // header. SigV4 payload sentinels in the header (UNSIGNED-PAYLOAD and
 // the STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER] family) skip the
-// check — the header is not a hash in those modes.
+// check — the header is not a hash in those modes. When the header is
+// absent (non-S3 SDK clients omit it), the supplied hash is used as the
+// payload hash for re-signing instead — body integrity is then enforced
+// implicitly via the signature comparison.
 //
-// Opt-in. Verify without WithBodyHash trusts the header verbatim,
-// matching default SignHTTP semantics where the payload hash is the
-// caller's responsibility.
+// Opt-in. Verify without WithBodyHash trusts the header verbatim and
+// requires it to be present, matching default SignHTTP semantics where
+// the payload hash is the caller's responsibility.
 func WithBodyHash(hex string) func(*Options) {
 	return func(o *Options) { o.bodyHash = hex }
 }
@@ -104,7 +108,8 @@ type Request struct {
 	Region      string
 	Service     string
 
-	authHeader string // verbatim Authorization header, for verify-side compare
+	authHeader    string              // verbatim Authorization header, for verify-side compare
+	signedHeaders map[string]struct{} // lowercase header names from the Authorization SignedHeaders field
 }
 
 // SignReq signs r in place per the SigV4 header scheme via
@@ -144,22 +149,19 @@ func ParseReq(r *http.Request) (*Request, error) {
 		return nil, ErrInvalidAuthFormat
 	}
 
-	// Required SignedHeaders entries per SigV4 spec; surfacing these as
-	// ErrMissingSignedHeader preserves S3's AuthorizationHeaderMalformed
-	// error code instead of falling through to a signature mismatch.
-	hasHost, hasDate := false, false
+	// Build the signed-headers set. Required entries per SigV4 spec
+	// (host, x-amz-date) surface as ErrMissingSignedHeader to preserve
+	// S3's AuthorizationHeaderMalformed error code instead of falling
+	// through to a signature mismatch. The set is also consulted in
+	// Verify to strip transport-added headers before re-signing.
+	signedHeaders := make(map[string]struct{})
 	for h := range strings.SplitSeq(m[5], ";") {
-		switch strings.ToLower(strings.TrimSpace(h)) {
-		case "host":
-			hasHost = true
-		case "x-amz-date":
-			hasDate = true
-		}
+		signedHeaders[strings.ToLower(h)] = struct{}{}
 	}
-	if !hasHost {
+	if _, ok := signedHeaders["host"]; !ok {
 		return nil, fmt.Errorf("%w: host", ErrMissingSignedHeader)
 	}
-	if !hasDate {
+	if _, ok := signedHeaders["x-amz-date"]; !ok {
 		return nil, fmt.Errorf("%w: x-amz-date", ErrMissingSignedHeader)
 	}
 
@@ -173,12 +175,13 @@ func ParseReq(r *http.Request) (*Request, error) {
 	}
 
 	return &Request{
-		Request:     r,
-		AccessKeyID: m[1],
-		SignedTime:  time,
-		Region:      m[3],
-		Service:     m[4],
-		authHeader:  hdr,
+		Request:       r,
+		AccessKeyID:   m[1],
+		SignedTime:    time,
+		Region:        m[3],
+		Service:       m[4],
+		authHeader:    hdr,
+		signedHeaders: signedHeaders,
 	}, nil
 }
 
@@ -199,7 +202,13 @@ func (req *Request) Verify(
 
 	payloadHash := req.Header.Get("X-Amz-Content-Sha256")
 	if payloadHash == "" {
-		return ErrMissingContentSHA
+		// Only S3 SDK clients emit X-Amz-Content-Sha256; EC2/IAM/ELBv2/etc.
+		// put the payload hash in the canonical request without a header.
+		// Fall back to the caller's server-computed hash when supplied.
+		if o.bodyHash == "" {
+			return ErrMissingContentSHA
+		}
+		payloadHash = o.bodyHash
 	}
 
 	// Opt-in body-hash gate. Runs before the SDK re-sign so a body-swap
@@ -212,10 +221,36 @@ func (req *Request) Verify(
 		}
 	}
 
-	// The SDK signs in place. Strip the wire Authorization so the SDK
-	// doesn't see it, capture the freshly produced header, then restore
-	// the wire value so downstream middleware observes the request
-	// unchanged. signErr is captured first so the restore always runs.
+	// The SDK signer derives SignedHeaders from whatever's on the request,
+	// so any transport-added headers (Accept-Encoding, User-Agent, ...)
+	// would make the re-signed Authorization diverge from the wire one.
+	// Stash them, sign, restore — Host is read from req.Host, not the
+	// header map; Authorization is always deleted+restored separately.
+	stash := make(http.Header)
+	for name, values := range req.Header {
+		lc := strings.ToLower(name)
+		if lc == "authorization" || lc == "host" {
+			continue
+		}
+		if _, ok := req.signedHeaders[lc]; !ok {
+			stash[name] = values
+			req.Header.Del(name)
+		}
+	}
+
+	// content-length is special: the SDK signer auto-adds it to
+	// SignedHeaders from req.ContentLength (not req.Header), so
+	// stashing the header doesn't suppress it. Zero ContentLength
+	// across the re-sign when the client didn't sign it; restore
+	// after. boto3/aws-cli don't sign content-length, only the Go SDK.
+	var stashedContentLength int64
+	contentLengthStashed := false
+	if _, ok := req.signedHeaders["content-length"]; !ok && req.ContentLength > 0 {
+		stashedContentLength = req.ContentLength
+		req.ContentLength = 0
+		contentLengthStashed = true
+	}
+
 	req.Header.Del(authHeaderKey)
 	signErr := v4.NewSigner().SignHTTP(
 		context.Background(),
@@ -224,6 +259,10 @@ func (req *Request) Verify(
 	)
 	expected := req.Header.Get(authHeaderKey)
 	req.Header.Set(authHeaderKey, req.authHeader)
+	maps.Copy(req.Header, stash)
+	if contentLengthStashed {
+		req.ContentLength = stashedContentLength
+	}
 	if signErr != nil {
 		return fmt.Errorf("re-sign for verify: %w", signErr)
 	}

@@ -2,6 +2,7 @@ package auth_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
@@ -10,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
@@ -162,6 +165,9 @@ func TestProp_TamperingFailsVerification(t *testing.T) {
 			auth.WithTime(signTime),
 		))
 
+		// Headers added post-signing (Accept-Encoding, Content-Length, ...)
+		// are tolerated by Verify per TestVerify_TransportAddedHeaders, so
+		// "add-header" is not a tampering mutation.
 		mutation := rapid.SampledFrom([]string{
 			"flip-signature",
 			"change-method",
@@ -169,7 +175,6 @@ func TestProp_TamperingFailsVerification(t *testing.T) {
 			"tamper-query",
 			"tamper-host",
 			"tamper-content-sha",
-			"add-header",
 			"drop-host-from-signed-headers",
 		}).Draw(t, "mutation")
 
@@ -203,9 +208,6 @@ func TestProp_TamperingFailsVerification(t *testing.T) {
 			// All-zero hash will never match a real body hash (2^-256 collision).
 			req.Header.Set("X-Amz-Content-Sha256",
 				"0000000000000000000000000000000000000000000000000000000000000000")
-		case "add-header":
-			// Header name was filtered out of random gen, so this is always new.
-			req.Header.Set("X-Tamper-Probe", "1")
 		case "drop-host-from-signed-headers":
 			// Remove the "host" entry from the wire Authorization's
 			// SignedHeaders list. Hits ErrMissingSignedHeader via ParseReq.
@@ -340,4 +342,94 @@ func TestVerify_WithBodyHash(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestVerify_MissingContentSHAFallback exercises the non-S3 SDK path:
+// EC2/IAM/ELBv2 clients sign with a payload hash in the canonical
+// request but omit X-Amz-Content-Sha256 from the wire. Verify must
+// accept these when WithBodyHash supplies the same hash, and still
+// reject when no bodyHash is provided.
+func TestVerify_MissingContentSHAFallback(t *testing.T) {
+	body := []byte("Action=DescribeInstances&Version=2016-11-15")
+	sum := sha256.Sum256(body)
+	bodyHashHex := hex.EncodeToString(sum[:])
+
+	// Sign without setting X-Amz-Content-Sha256 to mirror non-S3 SDK
+	// clients (EC2 etc.): the SDK passes payloadHash into the canonical
+	// request but does not emit it as a wire header.
+	signNoHeader := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+		req.Host = "ec2.amazonaws.com"
+		require.NoError(t, v4.NewSigner().SignHTTP(
+			context.Background(),
+			aws.Credentials{AccessKeyID: exAccessKeyID, SecretAccessKey: exSecret},
+			req, bodyHashHex, "ec2", exRegion, exTime,
+		))
+		require.Empty(t, req.Header.Get("X-Amz-Content-Sha256"))
+		return req
+	}
+
+	t.Run("accepts when WithBodyHash supplies the hash", func(t *testing.T) {
+		sig, err := auth.ParseReq(signNoHeader())
+		require.NoError(t, err)
+		require.NoError(t, sig.Verify(exSecret, "ec2", exRegion,
+			auth.WithTime(exTime), auth.WithBodyHash(bodyHashHex)))
+	})
+
+	t.Run("rejects when no bodyHash is supplied", func(t *testing.T) {
+		sig, err := auth.ParseReq(signNoHeader())
+		require.NoError(t, err)
+		err = sig.Verify(exSecret, "ec2", exRegion, auth.WithTime(exTime))
+		require.ErrorIs(t, err, auth.ErrMissingContentSHA)
+	})
+
+	t.Run("rejects when bodyHash diverges from what client signed", func(t *testing.T) {
+		sig, err := auth.ParseReq(signNoHeader())
+		require.NoError(t, err)
+		err = sig.Verify(exSecret, "ec2", exRegion,
+			auth.WithTime(exTime),
+			auth.WithBodyHash(strings.Repeat("0", 64)))
+		require.ErrorIs(t, err, auth.ErrSignatureMismatch)
+	})
+}
+
+// TestVerify_TransportAddedHeaders pins the contract that headers
+// added after signing by the HTTP transport (Accept-Encoding,
+// User-Agent, ...) must not cause re-signing to over-include them
+// in SignedHeaders. boto3/aws-cli sign content-type;host;x-amz-date
+// but the wire request gains Accept-Encoding etc. before the server
+// reads it. Content-Length is a separate auto-add path (sourced
+// from req.ContentLength, not req.Header) — exercised here by
+// signing with ContentLength=0 to mirror boto3 semantics, then
+// restoring the body length to mirror the wire state.
+func TestVerify_TransportAddedHeaders(t *testing.T) {
+	body := []byte("Action=DescribeInstances")
+	sum := sha256.Sum256(body)
+	bodyHashHex := hex.EncodeToString(sum[:])
+
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	req.Host = "ec2.amazonaws.com"
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.ContentLength = 0 // suppress SDK's auto-content-length to match boto3
+	require.NoError(t, v4.NewSigner().SignHTTP(
+		context.Background(),
+		aws.Credentials{AccessKeyID: exAccessKeyID, SecretAccessKey: exSecret},
+		req, bodyHashHex, "ec2", exRegion, exTime,
+	))
+
+	// Wire state: body length is back, transport added unsigned headers.
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("User-Agent", "aws-cli/2.0")
+
+	sig, err := auth.ParseReq(req)
+	require.NoError(t, err)
+	require.NoError(t, sig.Verify(exSecret, "ec2", exRegion,
+		auth.WithTime(exTime),
+		auth.WithBodyHash(bodyHashHex)))
+
+	// Wire state must survive Verify untouched.
+	require.Equal(t, "identity", req.Header.Get("Accept-Encoding"))
+	require.Equal(t, "aws-cli/2.0", req.Header.Get("User-Agent"))
+	require.Equal(t, int64(len(body)), req.ContentLength)
 }
