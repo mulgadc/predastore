@@ -11,6 +11,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"regexp"
 	"strings"
@@ -107,7 +108,8 @@ type Request struct {
 	Region      string
 	Service     string
 
-	authHeader string // verbatim Authorization header, for verify-side compare
+	authHeader    string              // verbatim Authorization header, for verify-side compare
+	signedHeaders map[string]struct{} // lowercase header names from the Authorization SignedHeaders field
 }
 
 // SignReq signs r in place per the SigV4 header scheme via
@@ -147,22 +149,19 @@ func ParseReq(r *http.Request) (*Request, error) {
 		return nil, ErrInvalidAuthFormat
 	}
 
-	// Required SignedHeaders entries per SigV4 spec; surfacing these as
-	// ErrMissingSignedHeader preserves S3's AuthorizationHeaderMalformed
-	// error code instead of falling through to a signature mismatch.
-	hasHost, hasDate := false, false
+	// Build the signed-headers set. Required entries per SigV4 spec
+	// (host, x-amz-date) surface as ErrMissingSignedHeader to preserve
+	// S3's AuthorizationHeaderMalformed error code instead of falling
+	// through to a signature mismatch. The set is also consulted in
+	// Verify to strip transport-added headers before re-signing.
+	signedHeaders := make(map[string]struct{})
 	for h := range strings.SplitSeq(m[5], ";") {
-		switch strings.ToLower(strings.TrimSpace(h)) {
-		case "host":
-			hasHost = true
-		case "x-amz-date":
-			hasDate = true
-		}
+		signedHeaders[strings.ToLower(h)] = struct{}{}
 	}
-	if !hasHost {
+	if _, ok := signedHeaders["host"]; !ok {
 		return nil, fmt.Errorf("%w: host", ErrMissingSignedHeader)
 	}
-	if !hasDate {
+	if _, ok := signedHeaders["x-amz-date"]; !ok {
 		return nil, fmt.Errorf("%w: x-amz-date", ErrMissingSignedHeader)
 	}
 
@@ -176,12 +175,13 @@ func ParseReq(r *http.Request) (*Request, error) {
 	}
 
 	return &Request{
-		Request:     r,
-		AccessKeyID: m[1],
-		SignedTime:  time,
-		Region:      m[3],
-		Service:     m[4],
-		authHeader:  hdr,
+		Request:       r,
+		AccessKeyID:   m[1],
+		SignedTime:    time,
+		Region:        m[3],
+		Service:       m[4],
+		authHeader:    hdr,
+		signedHeaders: signedHeaders,
 	}, nil
 }
 
@@ -221,10 +221,23 @@ func (req *Request) Verify(
 		}
 	}
 
-	// The SDK signs in place. Strip the wire Authorization so the SDK
-	// doesn't see it, capture the freshly produced header, then restore
-	// the wire value so downstream middleware observes the request
-	// unchanged. signErr is captured first so the restore always runs.
+	// The SDK signer derives SignedHeaders from whatever's on the request,
+	// so any transport-added headers (Accept-Encoding, Content-Length, ...)
+	// would make the re-signed Authorization diverge from the wire one.
+	// Stash them, sign, restore — Host is read from req.Host, not the
+	// header map; Authorization is always deleted+restored separately.
+	stash := make(http.Header)
+	for name, values := range req.Header {
+		lc := strings.ToLower(name)
+		if lc == "authorization" || lc == "host" {
+			continue
+		}
+		if _, ok := req.signedHeaders[lc]; !ok {
+			stash[name] = values
+			req.Header.Del(name)
+		}
+	}
+
 	req.Header.Del(authHeaderKey)
 	signErr := v4.NewSigner().SignHTTP(
 		context.Background(),
@@ -233,6 +246,7 @@ func (req *Request) Verify(
 	)
 	expected := req.Header.Get(authHeaderKey)
 	req.Header.Set(authHeaderKey, req.authHeader)
+	maps.Copy(req.Header, stash)
 	if signErr != nil {
 		return fmt.Errorf("re-sign for verify: %w", signErr)
 	}

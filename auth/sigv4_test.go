@@ -165,6 +165,9 @@ func TestProp_TamperingFailsVerification(t *testing.T) {
 			auth.WithTime(signTime),
 		))
 
+		// Headers added post-signing (Accept-Encoding, Content-Length, ...)
+		// are tolerated by Verify per TestVerify_TransportAddedHeaders, so
+		// "add-header" is not a tampering mutation.
 		mutation := rapid.SampledFrom([]string{
 			"flip-signature",
 			"change-method",
@@ -172,7 +175,6 @@ func TestProp_TamperingFailsVerification(t *testing.T) {
 			"tamper-query",
 			"tamper-host",
 			"tamper-content-sha",
-			"add-header",
 			"drop-host-from-signed-headers",
 		}).Draw(t, "mutation")
 
@@ -206,9 +208,6 @@ func TestProp_TamperingFailsVerification(t *testing.T) {
 			// All-zero hash will never match a real body hash (2^-256 collision).
 			req.Header.Set("X-Amz-Content-Sha256",
 				"0000000000000000000000000000000000000000000000000000000000000000")
-		case "add-header":
-			// Header name was filtered out of random gen, so this is always new.
-			req.Header.Set("X-Tamper-Probe", "1")
 		case "drop-host-from-signed-headers":
 			// Remove the "host" entry from the wire Authorization's
 			// SignedHeaders list. Hits ErrMissingSignedHeader via ParseReq.
@@ -392,4 +391,41 @@ func TestVerify_MissingContentSHAFallback(t *testing.T) {
 			auth.WithBodyHash(strings.Repeat("0", 64)))
 		require.ErrorIs(t, err, auth.ErrSignatureMismatch)
 	})
+}
+
+// TestVerify_TransportAddedHeaders pins the contract that headers
+// added after signing by the HTTP transport (Accept-Encoding,
+// Content-Length, ...) must not cause re-signing to over-include
+// them in SignedHeaders. boto3/aws-cli sign content-type;host;
+// x-amz-date but the wire request gains Accept-Encoding etc. before
+// the server reads it.
+func TestVerify_TransportAddedHeaders(t *testing.T) {
+	body := []byte("Action=DescribeInstances")
+	sum := sha256.Sum256(body)
+	bodyHashHex := hex.EncodeToString(sum[:])
+
+	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	req.Host = "ec2.amazonaws.com"
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	require.NoError(t, v4.NewSigner().SignHTTP(
+		context.Background(),
+		aws.Credentials{AccessKeyID: exAccessKeyID, SecretAccessKey: exSecret},
+		req, bodyHashHex, "ec2", exRegion, exTime,
+	))
+
+	// Simulate transport-added headers post-signing.
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("Content-Length", "23")
+	req.Header.Set("User-Agent", "aws-cli/2.0")
+
+	sig, err := auth.ParseReq(req)
+	require.NoError(t, err)
+	require.NoError(t, sig.Verify(exSecret, "ec2", exRegion,
+		auth.WithTime(exTime),
+		auth.WithBodyHash(bodyHashHex)))
+
+	// Transport-added headers must still be on the request after Verify.
+	require.Equal(t, "identity", req.Header.Get("Accept-Encoding"))
+	require.Equal(t, "23", req.Header.Get("Content-Length"))
+	require.Equal(t, "aws-cli/2.0", req.Header.Get("User-Agent"))
 }
