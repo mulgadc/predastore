@@ -94,7 +94,9 @@ func TestProp_SignParseVerifyRoundtrip(t *testing.T) {
 		sig, err := auth.ParseReq(req)
 		require.NoError(t, err, "Parse")
 		require.NoError(t,
-			sig.Verify(secret, service, region, auth.WithTime(signTime)),
+			sig.Verify(secret, service, region,
+				auth.WithTime(signTime),
+				auth.WithBodyHash(payloadHash)),
 			"Verify",
 		)
 		require.Equal(t, authHdr, req.Header.Get("Authorization"),
@@ -225,7 +227,9 @@ func TestProp_TamperingFailsVerification(t *testing.T) {
 		if perr != nil {
 			return // Parse rejection is a valid rejection.
 		}
-		verr := sig.Verify(secret, service, region, auth.WithTime(signTime))
+		verr := sig.Verify(secret, service, region,
+			auth.WithTime(signTime),
+			auth.WithBodyHash(payloadHash))
 		require.Error(t, verr, "mutation %q should be rejected", mutation)
 	})
 }
@@ -287,6 +291,53 @@ func TestStreamingSentinels(t *testing.T) {
 			require.NoError(t, err)
 			require.NoError(t, sig.Verify(exSecret, exService, exRegion,
 				auth.WithTime(exTime)))
+		})
+	}
+}
+
+// TestVerify_WithBodyHash pins WithBodyHash's three contracts:
+//  1. matching hex hash accepts;
+//  2. mismatching hex hash returns ErrBodyHashMismatch;
+//  3. sentinel payload headers (UNSIGNED-PAYLOAD, STREAMING-*) skip
+//     the check regardless of what WithBodyHash carries.
+func TestVerify_WithBodyHash(t *testing.T) {
+	body := []byte("hello world")
+	sum := sha256.Sum256(body)
+	bodyHashHex := hex.EncodeToString(sum[:])
+	wrongHashHex := strings.Repeat("0", 64)
+
+	tests := []struct {
+		name        string
+		payloadHash string // header value at sign time
+		verifyOpt   string // WithBodyHash arg
+		wantErrIs   error  // nil = accept
+	}{
+		{"matching hash accepts", bodyHashHex, bodyHashHex, nil},
+		{"wrong hash rejects", bodyHashHex, wrongHashHex, auth.ErrBodyHashMismatch},
+		{"UNSIGNED-PAYLOAD skips check", "UNSIGNED-PAYLOAD", wrongHashHex, nil},
+		{"STREAMING-PAYLOAD skips check", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", wrongHashHex, nil},
+		{"STREAMING-PAYLOAD-TRAILER skips check", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER", wrongHashHex, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/bucket/key", bytes.NewReader(body))
+			req.Host = "s3.amazonaws.com"
+			require.NoError(t, auth.SignReq(req,
+				exAccessKeyID, exSecret, tt.payloadHash, exService, exRegion,
+				auth.WithTime(exTime)))
+
+			sig, err := auth.ParseReq(req)
+			require.NoError(t, err)
+
+			err = sig.Verify(exSecret, exService, exRegion,
+				auth.WithTime(exTime),
+				auth.WithBodyHash(tt.verifyOpt))
+
+			if tt.wantErrIs == nil {
+				require.NoError(t, err)
+			} else {
+				require.ErrorIs(t, err, tt.wantErrIs)
+			}
 		})
 	}
 }

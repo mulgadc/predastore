@@ -44,6 +44,7 @@ var (
 	ErrMissingContentSHA   = errors.New("auth: missing X-Amz-Content-Sha256 header")
 	ErrClockSkew           = errors.New("auth: request timestamp outside allowed skew")
 	ErrSignatureMismatch   = errors.New("auth: signature mismatch")
+	ErrBodyHashMismatch    = errors.New("auth: body hash does not match X-Amz-Content-Sha256")
 )
 
 // SigMismatchError carries the wire Authorization header alongside the
@@ -60,13 +61,28 @@ func (e *SigMismatchError) Is(target error) bool { return target == ErrSignature
 
 // Options tunes Sign and Verify.
 type Options struct {
-	Time func() time.Time // defaults to time.Now
+	Time     func() time.Time // defaults to time.Now
+	bodyHash string           // set via WithBodyHash; consumed by Verify
 }
 
 // WithTime pins the time used by Sign (X-Amz-Date generation +
 // credential scope) and Verify (skew comparison). Defaults to time.Now().
 func WithTime(t time.Time) func(*Options) {
 	return func(o *Options) { o.Time = func() time.Time { return t } }
+}
+
+// WithBodyHash enables Verify's payload-integrity check. The caller-
+// supplied hex SHA-256 (typically computed from the capped request body)
+// is constant-time-compared against the wire X-Amz-Content-Sha256
+// header. SigV4 payload sentinels in the header (UNSIGNED-PAYLOAD and
+// the STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER] family) skip the
+// check — the header is not a hash in those modes.
+//
+// Opt-in. Verify without WithBodyHash trusts the header verbatim,
+// matching default SignHTTP semantics where the payload hash is the
+// caller's responsibility.
+func WithBodyHash(hex string) func(*Options) {
+	return func(o *Options) { o.bodyHash = hex }
 }
 
 func resolveOpts(optFns []func(*Options)) Options {
@@ -186,6 +202,16 @@ func (req *Request) Verify(
 		return ErrMissingContentSHA
 	}
 
+	// Opt-in body-hash gate. Runs before the SDK re-sign so a body-swap
+	// (header tampered to match a substituted payload) short-circuits
+	// before the expensive crypto. Sentinel payloads (UNSIGNED-PAYLOAD,
+	// STREAMING-*) carry no hash to check against.
+	if o.bodyHash != "" && !isPayloadSentinel(payloadHash) {
+		if subtle.ConstantTimeCompare([]byte(o.bodyHash), []byte(payloadHash)) != 1 {
+			return ErrBodyHashMismatch
+		}
+	}
+
 	// The SDK signs in place. Strip the wire Authorization so the SDK
 	// doesn't see it, capture the freshly produced header, then restore
 	// the wire value so downstream middleware observes the request
@@ -210,4 +236,18 @@ func (req *Request) Verify(
 		}
 	}
 	return nil
+}
+
+// isPayloadSentinel reports whether s is one of the SigV4 payload-hash
+// sentinel strings that callers send in X-Amz-Content-Sha256 instead of
+// a hex SHA-256. Defined by the AWS S3 docs:
+// https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+func isPayloadSentinel(s string) bool {
+	switch s {
+	case "UNSIGNED-PAYLOAD",
+		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+		"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER":
+		return true
+	}
+	return false
 }
