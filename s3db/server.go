@@ -93,6 +93,11 @@ func NewServer(config *ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("s3db: no credentials configured; refusing to start (set credentials on [[db]] or [[auth]])")
 	}
 
+	// Plumb the same cert/key used by the s3db HTTPS REST listener into the
+	// Raft transport. NewRaftNode fails closed if either is empty.
+	config.ClusterConfig.TLSCert = config.TLSCert
+	config.ClusterConfig.TLSKey = config.TLSKey
+
 	// Initialize Raft node
 	node, err := NewRaftNode(config.ClusterConfig)
 	if err != nil {

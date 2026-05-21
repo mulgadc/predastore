@@ -2,23 +2,40 @@ package s3db
 
 import (
 	"fmt"
+	"net"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/testcerts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+// installTestTLS wires the unexported Raft TLS test hooks: generates an
+// ephemeral self-signed cert (with `localhost` + `127.0.0.1` SANs) and
+// installs the matching root CA as the package-level dialer trust pool.
+// Returns the cert + key paths that callers wire into ClusterConfig.
+func installTestTLS(t *testing.T) (certPath, keyPath string) {
+	t.Helper()
+	certPath, keyPath, pool := testcerts.Generate(t)
+	setStreamLayerRootCAs(pool)
+	t.Cleanup(func() { setStreamLayerRootCAs(nil) })
+	return certPath, keyPath
+}
+
 // TestSingleNodeRaft tests basic operations on a single Raft node
 func TestSingleNodeRaft(t *testing.T) {
 	tmpDir := t.TempDir()
+	certPath, keyPath := installTestTLS(t)
 
 	config := DefaultClusterConfig()
 	config.NodeID = 1
 	config.DataDir = tmpDir
 	config.Bootstrap = true
+	config.TLSCert = certPath
+	config.TLSKey = keyPath
 	config.Nodes = []DBNodeConfig{
 		{ID: 1, Host: "127.0.0.1", Port: 16661, RaftPort: 17661, Path: filepath.Join(tmpDir, "node-1")},
 	}
@@ -84,11 +101,14 @@ func TestSingleNodeRaft(t *testing.T) {
 // TestMultipleTablesIsolation tests that tables are isolated from each other
 func TestMultipleTablesIsolation(t *testing.T) {
 	tmpDir := t.TempDir()
+	certPath, keyPath := installTestTLS(t)
 
 	config := DefaultClusterConfig()
 	config.NodeID = 1
 	config.DataDir = tmpDir
 	config.Bootstrap = true
+	config.TLSCert = certPath
+	config.TLSKey = keyPath
 	config.Nodes = []DBNodeConfig{
 		{ID: 1, Host: "127.0.0.1", Port: 16662, RaftPort: 17662, Path: filepath.Join(tmpDir, "node-1")},
 	}
@@ -135,6 +155,7 @@ func TestThreeNodeCluster(t *testing.T) {
 	}
 
 	tmpDir := t.TempDir()
+	certPath, keyPath := installTestTLS(t)
 
 	// Create 3-node cluster config
 	nodes := []DBNodeConfig{
@@ -151,6 +172,8 @@ func TestThreeNodeCluster(t *testing.T) {
 		config.NodeID = nodeConfig.ID
 		config.DataDir = nodeConfig.Path
 		config.Bootstrap = (i == 0) // Only first node bootstraps
+		config.TLSCert = certPath
+		config.TLSKey = keyPath
 		config.Nodes = nodes
 
 		node, err := NewRaftNode(config)
@@ -201,6 +224,7 @@ func TestLeaderFailover(t *testing.T) {
 	}
 
 	tmpDir := t.TempDir()
+	certPath, keyPath := installTestTLS(t)
 
 	// Create 3-node cluster config
 	nodes := []DBNodeConfig{
@@ -218,6 +242,8 @@ func TestLeaderFailover(t *testing.T) {
 		config.NodeID = nodeConfig.ID
 		config.DataDir = nodeConfig.Path
 		config.Bootstrap = (i == 0)
+		config.TLSCert = certPath
+		config.TLSKey = keyPath
 		config.Nodes = nodes
 		// Faster timeouts for testing
 		config.HeartbeatTimeout = 200 * time.Millisecond
@@ -300,11 +326,14 @@ func TestLeaderFailover(t *testing.T) {
 // TestConcurrentWrites tests concurrent writes to the cluster
 func TestConcurrentWrites(t *testing.T) {
 	tmpDir := t.TempDir()
+	certPath, keyPath := installTestTLS(t)
 
 	config := DefaultClusterConfig()
 	config.NodeID = 1
 	config.DataDir = tmpDir
 	config.Bootstrap = true
+	config.TLSCert = certPath
+	config.TLSKey = keyPath
 	config.Nodes = []DBNodeConfig{
 		{ID: 1, Host: "127.0.0.1", Port: 16691, RaftPort: 17691, Path: filepath.Join(tmpDir, "node-1")},
 	}
@@ -361,11 +390,14 @@ func TestConcurrentWrites(t *testing.T) {
 // TestLargeValues tests storing large values
 func TestLargeValues(t *testing.T) {
 	tmpDir := t.TempDir()
+	certPath, keyPath := installTestTLS(t)
 
 	config := DefaultClusterConfig()
 	config.NodeID = 1
 	config.DataDir = tmpDir
 	config.Bootstrap = true
+	config.TLSCert = certPath
+	config.TLSKey = keyPath
 	config.Nodes = []DBNodeConfig{
 		{ID: 1, Host: "127.0.0.1", Port: 16692, RaftPort: 17692, Path: filepath.Join(tmpDir, "node-1")},
 	}
@@ -397,4 +429,55 @@ func TestLargeValues(t *testing.T) {
 			assert.Equal(t, data, value)
 		})
 	}
+}
+
+// TestNewRaftNode_RequiresTLS verifies the transport refuses to start without
+// a cert/key pair, mirroring quicd's fail-closed posture.
+func TestNewRaftNode_RequiresTLS(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cases := []struct {
+		name string
+		cert string
+		key  string
+	}{
+		{"both empty", "", ""},
+		{"cert only", "cert.pem", ""},
+		{"key only", "", "key.pem"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := DefaultClusterConfig()
+			config.NodeID = 1
+			config.DataDir = filepath.Join(tmpDir, tc.name)
+			config.Bootstrap = true
+			config.TLSCert = tc.cert
+			config.TLSKey = tc.key
+			config.Nodes = []DBNodeConfig{
+				{ID: 1, Host: "127.0.0.1", Port: 16693, RaftPort: 17693, Path: config.DataDir},
+			}
+
+			node, err := NewRaftNode(config)
+			require.Error(t, err)
+			assert.Nil(t, node)
+			assert.Contains(t, err.Error(), "TLS cert and key are required")
+		})
+	}
+}
+
+// TestNewTLSStreamLayer_BadCertPath verifies the stream layer surfaces a
+// load error instead of silently falling back to plaintext.
+func TestNewTLSStreamLayer_BadCertPath(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	advertise, err := net.ResolveTCPAddr("tcp", ln.Addr().String())
+	require.NoError(t, err)
+
+	layer, err := newTLSStreamLayer(ln, advertise, "/nonexistent/cert.pem", "/nonexistent/key.pem")
+	require.Error(t, err)
+	assert.Nil(t, layer)
+	assert.Contains(t, err.Error(), "load raft tls cert/key")
 }
