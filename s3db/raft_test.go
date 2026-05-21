@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/hashicorp/raft"
 	"github.com/mulgadc/predastore/internal/testcerts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -464,6 +466,45 @@ func TestNewRaftNode_RequiresTLS(t *testing.T) {
 			assert.Contains(t, err.Error(), "TLS cert and key are required")
 		})
 	}
+}
+
+// TestRaftTLSStreamLayer_RejectsUnknownCA pins the verify-on TLS posture: the
+// dialer must reject a peer whose cert is not signed by a trusted CA. Without
+// this, a future regression that adds InsecureSkipVerify=true or widens
+// RootCAs would pass every other test in this file silently.
+func TestRaftTLSStreamLayer_RejectsUnknownCA(t *testing.T) {
+	// Server presents serverCert; dialer trusts only otherPool (which does
+	// not contain serverCert). Two independent testcerts.Generate calls
+	// yield two unrelated self-signed CAs.
+	serverCert, serverKey, _ := testcerts.Generate(t)
+	_, _, otherPool := testcerts.Generate(t)
+	setStreamLayerRootCAs(otherPool)
+	t.Cleanup(func() { setStreamLayerRootCAs(nil) })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	advertise, err := net.ResolveTCPAddr("tcp", ln.Addr().String())
+	require.NoError(t, err)
+
+	layer, err := newTLSStreamLayer(ln, advertise, serverCert, serverKey)
+	require.NoError(t, err)
+	defer layer.Close()
+
+	// Drive the server-side accept so the handshake actually runs and the
+	// dial returns rather than hanging on connect.
+	go func() {
+		conn, aerr := layer.Accept()
+		if aerr != nil {
+			return
+		}
+		_, _ = conn.Read(make([]byte, 1))
+		_ = conn.Close()
+	}()
+
+	_, derr := layer.Dial(raft.ServerAddress(ln.Addr().String()), 2*time.Second)
+	require.Error(t, derr)
+	assert.Contains(t, strings.ToLower(derr.Error()), "certificate",
+		"dial error should mention cert verification, got: %v", derr)
 }
 
 // TestNewTLSStreamLayer_BadCertPath verifies the stream layer surfaces a

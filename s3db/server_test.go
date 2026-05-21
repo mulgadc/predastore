@@ -60,3 +60,47 @@ func TestNewServer_RejectsMissingClusterConfig(t *testing.T) {
 	assert.Nil(t, server)
 	assert.Contains(t, err.Error(), "cluster config is required")
 }
+
+// TestNewServer_RejectsEmptyTLS pins the Raft transport's cert plumb-through
+// in NewServer. The empty-string check itself lives one layer down in
+// NewRaftNode, but exercising it through NewServer guards against a future
+// refactor that drops the plumb-through and silently bypasses transport
+// encryption on the Raft port.
+func TestNewServer_RejectsEmptyTLS(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	cases := []struct {
+		name string
+		cert string
+		key  string
+	}{
+		{"both empty", "", ""},
+		{"cert only", "/nonexistent/cert.pem", ""},
+		{"key only", "", "/nonexistent/key.pem"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clusterCfg := DefaultClusterConfig()
+			clusterCfg.NodeID = 1
+			clusterCfg.DataDir = filepath.Join(tmpDir, tc.name)
+			clusterCfg.Bootstrap = true
+			clusterCfg.Nodes = []DBNodeConfig{
+				{ID: 1, Host: "127.0.0.1", Port: 16694, RaftPort: 17694, Path: clusterCfg.DataDir},
+			}
+
+			cfg := &ServerConfig{
+				Addr:          "127.0.0.1:0",
+				Credentials:   map[string]string{"key": "secret"},
+				ClusterConfig: clusterCfg,
+				TLSCert:       tc.cert,
+				TLSKey:        tc.key,
+			}
+
+			server, err := NewServer(cfg)
+			require.Error(t, err)
+			assert.Nil(t, server)
+			assert.Contains(t, err.Error(), "TLS cert and key are required")
+		})
+	}
+}
