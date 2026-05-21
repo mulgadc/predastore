@@ -141,13 +141,12 @@ func NewDistributedState(cfg *DBClientConfig) (*DistributedState, error) {
 	}
 
 	client := s3db.NewClient(&s3db.ClientConfig{
-		Nodes:              cfg.Nodes,
-		AccessKeyID:        cfg.AccessKeyID,
-		SecretAccessKey:    cfg.SecretAccessKey,
-		Region:             region,
-		Service:            "s3db",
-		InsecureSkipVerify: true, // For self-signed certs
-		MaxRetries:         3,    // Required - 0 would skip the retry loop entirely
+		Nodes:           cfg.Nodes,
+		AccessKeyID:     cfg.AccessKeyID,
+		SecretAccessKey: cfg.SecretAccessKey,
+		Region:          region,
+		Service:         "s3db",
+		MaxRetries:      3, // Required - 0 would skip the retry loop entirely
 	})
 
 	return &DistributedState{client: client}, nil

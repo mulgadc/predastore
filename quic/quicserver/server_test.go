@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/mulgadc/predastore/internal/storetest"
+	"github.com/mulgadc/predastore/internal/testcerts"
 )
 
 // TestNewWithRetryBindsListener exercises the server-side quic.Config
@@ -18,7 +19,12 @@ func TestNewWithRetryBindsListener(t *testing.T) {
 		t.Fatalf("mkdir walDir: %v", err)
 	}
 
-	qs, err := NewWithRetry(walDir, "127.0.0.1:0", 1, WithMasterKey(storetest.TestKey()))
+	certPath, keyPath, _ := testcerts.Generate(t)
+
+	qs, err := NewWithRetry(walDir, "127.0.0.1:0", 1,
+		WithMasterKey(storetest.TestKey()),
+		WithTLSCertFiles(certPath, keyPath),
+	)
 	if err != nil {
 		t.Fatalf("NewWithRetry: %v", err)
 	}

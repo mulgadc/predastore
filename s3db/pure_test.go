@@ -141,7 +141,7 @@ func TestDefaultClientConfig(t *testing.T) {
 	assert.Equal(t, "s3db", cfg.Service)
 	assert.Equal(t, 10*time.Second, cfg.Timeout)
 	assert.Equal(t, 3, cfg.MaxRetries)
-	assert.True(t, cfg.InsecureSkipVerify)
+	assert.Nil(t, cfg.RootCAs)
 }
 
 func TestGenObjectHash(t *testing.T) {

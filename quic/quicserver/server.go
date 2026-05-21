@@ -4,15 +4,10 @@ import (
 	"bufio"
 	"context"
 	"crypto/cipher"
-	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -40,6 +35,9 @@ type QuicServer struct {
 
 	aead           cipher.AEAD
 	keyFingerprint string
+
+	tlsCert string
+	tlsKey  string
 
 	store *store.Store
 
@@ -72,6 +70,23 @@ func WithMasterKey(k *masterkey.Key) Option {
 		}
 		qs.aead = k.AEAD
 		qs.keyFingerprint = k.Fingerprint
+		return nil
+	}
+}
+
+// WithTLSCertFiles supplies the on-disk paths to the PEM-encoded server cert
+// and key. Both are required — NewWithRetry fails if either is empty. The
+// cert must be signed by a CA the QUIC clients trust (cluster CA installed
+// in the OS trust store, or injected via quicclient.SetDefaultRootCAs in
+// tests). The QUIC listener no longer generates an ephemeral self-signed
+// cert at start.
+func WithTLSCertFiles(certPath, keyPath string) Option {
+	return func(qs *QuicServer) error {
+		if certPath == "" || keyPath == "" {
+			return fmt.Errorf("quicserver: tls cert and key paths are required")
+		}
+		qs.tlsCert = certPath
+		qs.tlsKey = keyPath
 		return nil
 	}
 }
@@ -142,6 +157,10 @@ func NewWithRetry(walDir string, addr string, maxRetries int, opts ...Option) (*
 		cancel()
 		return nil, fmt.Errorf("quicserver: master key is required (use WithMasterKey)")
 	}
+	if qs.tlsCert == "" || qs.tlsKey == "" {
+		cancel()
+		return nil, fmt.Errorf("quicserver: tls cert and key are required (use WithTLSCertFiles)")
+	}
 
 	s, err := store.Open(walDir, store.WithAEAD(qs.aead))
 	if err != nil {
@@ -150,13 +169,12 @@ func NewWithRetry(walDir string, addr string, maxRetries int, opts ...Option) (*
 	}
 	qs.store = s
 
-	tlsConf, err := makeServerTLSConfig()
+	tlsConf, err := loadServerTLSConfig(qs.tlsCert, qs.tlsKey)
 	if err != nil {
 		_ = s.Close()
 		cancel()
 		return nil, fmt.Errorf("tls config: %w", err)
 	}
-	tlsConf.NextProtos = []string{alpn}
 
 	// Retry port binding with exponential backoff
 	var l *quic.Listener
@@ -397,38 +415,15 @@ func hostname() string {
 	return h
 }
 
-func makeServerTLSConfig() (*tls.Config, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+func loadServerTLSConfig(certPath, keyPath string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil, err
-	}
-
-	tmpl := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		NotBefore:    time.Now().Add(-1 * time.Hour),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
-
-		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-
-		DNSNames: []string{"localhost"},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
-	if err != nil {
-		return nil, err
-	}
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load x509 key pair from %s/%s: %w", certPath, keyPath, err)
 	}
 	return &tls.Config{
 		Certificates:     []tls.Certificate{cert},
 		MinVersion:       tls.VersionTLS13,
 		CurvePreferences: tlsconfig.Curves,
+		NextProtos:       []string{alpn},
 	}, nil
 }

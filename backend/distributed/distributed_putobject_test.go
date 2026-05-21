@@ -12,6 +12,8 @@ import (
 
 	s3backend "github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/internal/storetest"
+	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/require"
 )
@@ -49,13 +51,20 @@ func TestPutObjectWithTempFile(t *testing.T) {
 	dataDir := filepath.Join(tmpDir, "nodes")
 	backend.SetDataDir(dataDir)
 
+	certPath, keyPath, pool := testcerts.Generate(t)
+	quicclient.SetDefaultRootCAs(pool)
+	t.Cleanup(func() { quicclient.SetDefaultRootCAs(nil) })
+
 	// Start QUIC servers for nodes 0-4 on test ports
 	quicServers := make([]*quicserver.QuicServer, 5)
 	for i := range 5 {
 		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))
 		require.NoError(t, os.MkdirAll(nodeDir, 0750))
 
-		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5, quicserver.WithMasterKey(storetest.TestKey()))
+		qs, err := quicserver.NewWithRetry(nodeDir, fmt.Sprintf("127.0.0.1:%d", testBasePort+i), 5,
+			quicserver.WithMasterKey(storetest.TestKey()),
+			quicserver.WithTLSCertFiles(certPath, keyPath),
+		)
 		require.NoError(t, err, "Failed to start QUIC server for node %d", i)
 		quicServers[i] = qs
 	}

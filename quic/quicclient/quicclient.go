@@ -3,7 +3,6 @@ package quicclient
 import (
 	"bufio"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/quic/quicserver"
@@ -44,13 +42,7 @@ func (c *Client) decActive() {
 }
 
 func Dial(ctx context.Context, addr string) (*Client, error) {
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true, // demo only. Use mTLS with your CA in prod.
-		NextProtos:         []string{alpn},
-		MinVersion:         tls.VersionTLS13,
-		CurvePreferences:   tlsconfig.Curves,
-	}
-	conn, err := quic.DialAddr(ctx, addr, tlsConf, &quic.Config{
+	conn, err := quic.DialAddr(ctx, addr, tlsConfigForDial(), &quic.Config{
 		HandshakeIdleTimeout: 5 * time.Second,
 		KeepAlivePeriod:      15 * time.Second,
 		MaxIdleTimeout:       60 * time.Second,

@@ -3,6 +3,7 @@ package s3db
 import (
 	"bytes"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -32,24 +33,27 @@ type Client struct {
 
 // ClientConfig holds client configuration
 type ClientConfig struct {
-	Nodes              []string      // Initial list of node addresses
-	AccessKeyID        string        // AWS-style access key ID
-	SecretAccessKey    string        // AWS-style secret access key
-	Region             string        // Region for signing (default: us-east-1)
-	Service            string        // Service name for signing (default: s3db)
-	Timeout            time.Duration // HTTP request timeout
-	MaxRetries         int           // Max retries on failure
-	InsecureSkipVerify bool          // Skip TLS certificate verification (for self-signed certs)
+	Nodes           []string      // Initial list of node addresses
+	AccessKeyID     string        // AWS-style access key ID
+	SecretAccessKey string        // AWS-style secret access key
+	Region          string        // Region for signing (default: us-east-1)
+	Service         string        // Service name for signing (default: s3db)
+	Timeout         time.Duration // HTTP request timeout
+	MaxRetries      int           // Max retries on failure
+	// RootCAs overrides the OS trust store for verifying the server
+	// certificate. Nil ⇒ OS trust store, which is the production path
+	// (cluster CA installed via update-ca-certificates). Tests inject an
+	// ephemeral CA here.
+	RootCAs *x509.CertPool
 }
 
 // DefaultClientConfig returns sensible defaults
 func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{
-		Region:             DefaultRegion,
-		Service:            DefaultService,
-		Timeout:            10 * time.Second,
-		MaxRetries:         3,
-		InsecureSkipVerify: true, // Default to true for self-signed certs
+		Region:     DefaultRegion,
+		Service:    DefaultService,
+		Timeout:    10 * time.Second,
+		MaxRetries: 3,
 	}
 }
 
@@ -69,13 +73,12 @@ func NewClient(config *ClientConfig) *Client {
 		service = DefaultService
 	}
 
-	// Configure TLS transport with optional certificate verification skip
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: config.InsecureSkipVerify,
-			NextProtos:         []string{"h2", "http/1.1"},
-			MinVersion:         tls.VersionTLS13,
-			CurvePreferences:   tlsconfig.Curves,
+			RootCAs:          config.RootCAs,
+			NextProtos:       []string{"h2", "http/1.1"},
+			MinVersion:       tls.VersionTLS13,
+			CurvePreferences: tlsconfig.Curves,
 		},
 		ForceAttemptHTTP2: true,
 	}
