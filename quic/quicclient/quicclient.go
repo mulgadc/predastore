@@ -53,7 +53,8 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 		MaxConnectionReceiveWindow:     quicconf.MaxConnectionReceiveWindow,
 	})
 	if err != nil {
-		return nil, err
+		slog.Warn("quic dial failed", "addr", addr, "error", err)
+		return nil, fmt.Errorf("quic dial %s: %w", addr, err)
 	}
 	return &Client{conn: conn}, nil
 }

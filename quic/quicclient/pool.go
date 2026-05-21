@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -133,7 +134,8 @@ func (p *Pool) createConnection(ctx context.Context, addr string) (*Client, erro
 	// package init, before any test can inject a CA).
 	conn, err := quic.DialAddr(ctx, addr, tlsConfigForDial(), p.quicConf)
 	if err != nil {
-		return nil, err
+		slog.Warn("quic dial failed", "addr", addr, "error", err)
+		return nil, fmt.Errorf("quic dial %s: %w", addr, err)
 	}
 
 	client := &Client{conn: conn}
