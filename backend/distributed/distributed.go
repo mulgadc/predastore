@@ -3,8 +3,9 @@ package distributed
 import (
 	"bytes"
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"encoding/gob"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -404,7 +405,8 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	// Step 3: Encode parity shards using the buffered data shards
 	dataReaders := make([]io.Reader, b.rsDataShard)
 	for i := 0; i < b.rsDataShard; i++ {
-		slog.Debug("parity encoding: data shard", "shard", i, "len", len(dataShardBuffers[i]), "md5", fmt.Sprintf("%x", md5.Sum(dataShardBuffers[i])))
+		shardHash := sha256.Sum256(dataShardBuffers[i])
+		slog.Debug("parity encoding: data shard", "shard", i, "len", len(dataShardBuffers[i]), "sha256", hex.EncodeToString(shardHash[:4]))
 		dataReaders[i] = bytes.NewReader(dataShardBuffers[i])
 	}
 
