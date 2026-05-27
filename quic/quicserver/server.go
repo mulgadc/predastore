@@ -13,8 +13,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mulgadc/predastore/internal/masterkey"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
+	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/mulgadc/predastore/quic/quicproto"
 	"github.com/mulgadc/predastore/store"

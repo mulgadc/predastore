@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mulgadc/predastore/internal/masterkey"
+	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/nats-io/nats.go"
 )
 
