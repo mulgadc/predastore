@@ -30,7 +30,7 @@ Predastore runs as a distributed cluster with erasure-coded shards, Raft-consens
 
 **S3D** serves the S3 HTTP API with AWS Signature V4 authentication. The **s3db cluster** provides strongly consistent metadata via Raft (HashiCorp Raft + BoltDB + BadgerDB). **QUIC shard nodes** store erasure-coded object data in append-only segment files, with each shard occupying a contiguous extent indexed by a per-node BadgerDB. Inter-node communication uses persistent QUIC connections with pooled, multiplexed streams — eliminating per-request TLS handshakes.
 
-See [DESIGN.md](DESIGN.md) for the full architecture reference, including the data model, QUIC protocol format, Raft consensus details, hash ring placement, and failure handling.
+See [DESIGN.md](docs/DESIGN.md) for the full architecture reference, including the data model, QUIC protocol format, Raft consensus details, hash ring placement, and failure handling.
 
 ## Key Design Decisions
 
@@ -182,7 +182,7 @@ The distributed backend's data model:
 | Fragment | 32 B header + 8 KiB body + 16 B GCM tag = 8240 B | On-disk unit; AES-256-GCM seals body with AAD bound to `(objectHash, shardIndex, shardNum, fragNum)` |
 | Segment file | up to 4 GiB | Append-only container holding extents from one or more shards |
 
-See [DESIGN.md](DESIGN.md) for full configuration reference, including database node setup, shard node setup, RS tuning, and deployment modes.
+See [DESIGN.md](docs/DESIGN.md) for full configuration reference, including database node setup, shard node setup, RS tuning, and deployment modes.
 
 ## Spinifex Integration
 
