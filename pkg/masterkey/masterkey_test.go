@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mulgadc/predastore/internal/masterkey"
+	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

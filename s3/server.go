@@ -16,7 +16,7 @@ import (
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
-	"github.com/mulgadc/predastore/internal/masterkey"
+	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3db"
 )

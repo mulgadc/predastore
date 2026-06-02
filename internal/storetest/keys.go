@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"crypto/cipher"
 
-	"github.com/mulgadc/predastore/internal/masterkey"
+	"github.com/mulgadc/predastore/pkg/masterkey"
 )
 
 // TestMasterKey is a deterministic 32-byte AES-256 key for use in tests that
 // need raw key bytes (e.g. property tests that exercise the loader). Production
-// code MUST load the key via internal/masterkey.Load instead.
+// code MUST load the key via pkg/masterkey.Load instead.
 var TestMasterKey = bytes.Repeat([]byte{0x42}, 32)
 
 // TestAEAD returns the cipher.AEAD derived from TestMasterKey. Use this in
