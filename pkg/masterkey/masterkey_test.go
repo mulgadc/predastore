@@ -1,10 +1,7 @@
 package masterkey_test
 
 import (
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -17,64 +14,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// spinifexTokenHMAC reproduces spinifex handlers_sts.computeTokenHMAC:
-// base64(HMAC-SHA256(masterKey, token)). VerifyTokenHMAC must agree with it
-// byte-for-byte or gateway-minted session tokens would fail to verify here.
-func spinifexTokenHMAC(key []byte, token string) string {
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(token))
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
-}
-
-// loadRandomKey writes a fresh random master key, loads it, and returns the
-// Key alongside the raw bytes (so the test can compute the expected HMAC).
-func loadRandomKey(t *testing.T) (*masterkey.Key, []byte) {
-	t.Helper()
-	raw := make([]byte, masterkey.MasterKeySize)
-	_, err := rand.Read(raw)
-	require.NoError(t, err)
-	path := writeKeyFile(t, "key", raw, 0o600)
-	k, err := masterkey.Load(path)
-	require.NoError(t, err)
-	return k, raw
-}
-
-func TestVerifyTokenHMAC_MatchesSpinifex(t *testing.T) {
-	k, raw := loadRandomKey(t)
-
-	for _, token := range []string{"", "short", "a-realistic-base64-session-token=="} {
-		t.Run(fmt.Sprintf("token_%q", token), func(t *testing.T) {
-			expected := spinifexTokenHMAC(raw, token)
-			assert.True(t, k.VerifyTokenHMAC(token, expected),
-				"VerifyTokenHMAC must accept an HMAC computed the spinifex way")
-		})
-	}
-}
-
-func TestVerifyTokenHMAC_WrongToken(t *testing.T) {
-	k, raw := loadRandomKey(t)
-	expected := spinifexTokenHMAC(raw, "the-real-token")
-	assert.False(t, k.VerifyTokenHMAC("a-different-token", expected),
-		"a token whose HMAC differs must be rejected")
-}
-
-func TestVerifyTokenHMAC_WrongKey(t *testing.T) {
-	k, _ := loadRandomKey(t)
-
-	otherKey := make([]byte, masterkey.MasterKeySize)
-	_, err := rand.Read(otherKey)
-	require.NoError(t, err)
-	// HMAC computed under a different master key must not verify.
-	expected := spinifexTokenHMAC(otherKey, "token")
-	assert.False(t, k.VerifyTokenHMAC("token", expected))
-}
-
-func TestVerifyTokenHMAC_MalformedBase64(t *testing.T) {
-	k, _ := loadRandomKey(t)
-	assert.False(t, k.VerifyTokenHMAC("token", "not-valid-base64!!!"),
-		"a malformed stored HMAC must be rejected, not error")
-}
 
 // writeKeyFile writes contents to a fresh path under t.TempDir() and explicitly
 // chmods to mode so the test result is independent of the process umask.

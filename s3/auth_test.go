@@ -22,7 +22,7 @@ func TestConfigProvider_Found(t *testing.T) {
 		{AccessKeyID: "AK2", SecretAccessKey: "SK2", AccountID: "acct-2"},
 	})
 
-	result, err := p.LookupCredentials("AK2", "")
+	result, err := p.LookupCredentials("AK2")
 	require.NoError(t, err)
 	assert.Equal(t, "SK2", result.SecretAccessKey)
 	assert.Equal(t, "acct-2", result.AccountID)
@@ -34,13 +34,13 @@ func TestConfigProvider_NotFound(t *testing.T) {
 		{AccessKeyID: "AK1", SecretAccessKey: "SK1"},
 	})
 
-	_, err := p.LookupCredentials("AK_MISSING", "")
+	_, err := p.LookupCredentials("AK_MISSING")
 	assert.Error(t, err)
 }
 
 func TestConfigProvider_Empty(t *testing.T) {
 	p := NewConfigProvider(nil)
-	_, err := p.LookupCredentials("AK1", "")
+	_, err := p.LookupCredentials("AK1")
 	assert.Error(t, err)
 }
 
@@ -51,7 +51,7 @@ type mockProvider struct {
 	err    error
 }
 
-func (m *mockProvider) LookupCredentials(_, _ string) (*CredentialResult, error) {
+func (m *mockProvider) LookupCredentials(_ string) (*CredentialResult, error) {
 	return m.result, m.err
 }
 
@@ -63,7 +63,7 @@ func TestChainProvider_ConfigWins(t *testing.T) {
 	config := &mockProvider{result: &CredentialResult{SecretAccessKey: "from-config", AccountID: "acct-1", SkipPolicyCheck: true}}
 
 	chain := NewChainProvider(iam, config)
-	result, err := chain.LookupCredentials("AK1", "")
+	result, err := chain.LookupCredentials("AK1")
 	require.NoError(t, err)
 	assert.Equal(t, "from-config", result.SecretAccessKey)
 	assert.True(t, result.SkipPolicyCheck, "config entries should skip policy check")
@@ -75,7 +75,7 @@ func TestChainProvider_IAMFallback(t *testing.T) {
 	config := &mockProvider{err: ErrKeyNotFound}
 
 	chain := NewChainProvider(iam, config)
-	result, err := chain.LookupCredentials("AK1", "")
+	result, err := chain.LookupCredentials("AK1")
 	require.NoError(t, err)
 	assert.Equal(t, "from-iam", result.SecretAccessKey)
 }
@@ -86,7 +86,7 @@ func TestChainProvider_IAMInfraError(t *testing.T) {
 	config := &mockProvider{err: ErrKeyNotFound}
 
 	chain := NewChainProvider(iam, config)
-	_, err := chain.LookupCredentials("AK1", "")
+	_, err := chain.LookupCredentials("AK1")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "NATS connection timeout")
 }
@@ -97,7 +97,7 @@ func TestChainProvider_IAMInactiveKey(t *testing.T) {
 	config := &mockProvider{err: ErrKeyNotFound}
 
 	chain := NewChainProvider(iam, config)
-	_, err := chain.LookupCredentials("AK1", "")
+	_, err := chain.LookupCredentials("AK1")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "inactive")
 }
@@ -107,7 +107,7 @@ func TestChainProvider_BothNotFound(t *testing.T) {
 	config := &mockProvider{err: ErrKeyNotFound}
 
 	chain := NewChainProvider(iam, config)
-	_, err := chain.LookupCredentials("AK1", "")
+	_, err := chain.LookupCredentials("AK1")
 	assert.Error(t, err)
 	assert.ErrorIs(t, err, ErrKeyNotFound)
 }
@@ -250,7 +250,7 @@ func TestNATSIAMProvider_LazyBucketsNotReady_InfraError(t *testing.T) {
 		done:         make(chan struct{}),
 	}
 
-	_, err = p.LookupCredentials("AKIAEXAMPLE", "")
+	_, err = p.LookupCredentials("AKIAEXAMPLE")
 	assert.Error(t, err)
 	assert.False(t, errors.Is(err, ErrKeyNotFound),
 		"infrastructure errors should NOT be mapped to ErrKeyNotFound")

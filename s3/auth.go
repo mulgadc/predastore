@@ -31,11 +31,9 @@ type CredentialResult struct {
 	PolicyDocuments []iamPolicyDocument // resolved policies (only for NATS-sourced credentials)
 }
 
-// CredentialProvider looks up credentials by access key ID. securityToken is
-// the request's X-Amz-Security-Token header (empty for long-lived AKIA creds);
-// the NATS provider HMAC-verifies it on the ASIA session path.
+// CredentialProvider looks up credentials by access key ID.
 type CredentialProvider interface {
-	LookupCredentials(accessKeyID, securityToken string) (*CredentialResult, error)
+	LookupCredentials(accessKeyID string) (*CredentialResult, error)
 	Close()
 }
 
@@ -53,16 +51,15 @@ type iamAccessKey struct {
 
 // sessionCredential mirrors the spinifex STS SessionCredential stored in the
 // spinifex-iam-session-credentials KV bucket. Records are write-once at mint
-// and expire within hours. Only the fields predastore needs to verify and
-// resolve a session are replicated.
+// and expire within hours. Only the fields predastore needs to resolve a
+// session are replicated.
 type sessionCredential struct {
-	AccessKeyID      string    `json:"access_key_id"`
-	SecretEncrypted  string    `json:"secret_encrypted"`   // AES-256-GCM, base64 (handlers_iam.EncryptSecret format)
-	SessionTokenHMAC string    `json:"session_token_hmac"` // base64(HMAC-SHA256(masterKey, token))
-	AccountID        string    `json:"account_id"`
-	PrincipalType    string    `json:"principal_type"` // "user" | "assumed-role" | ""
-	SessionName      string    `json:"session_name"`
-	ExpiresAt        time.Time `json:"expires_at"`
+	AccessKeyID     string    `json:"access_key_id"`
+	SecretEncrypted string    `json:"secret_encrypted"` // AES-256-GCM, base64 (handlers_iam.EncryptSecret format)
+	AccountID       string    `json:"account_id"`
+	PrincipalType   string    `json:"principal_type"` // "user" | "assumed-role" | ""
+	SessionName     string    `json:"session_name"`
+	ExpiresAt       time.Time `json:"expires_at"`
 }
 
 // iamUser mirrors the spinifex IAM User stored in NATS KV.
@@ -127,10 +124,7 @@ func NewConfigProvider(entries []AuthEntry) *ConfigProvider {
 	return &ConfigProvider{entries: entries}
 }
 
-// LookupCredentials resolves a static config service account. The security
-// token is ignored: config accounts are always long-lived AKIA keys, never STS
-// sessions.
-func (p *ConfigProvider) LookupCredentials(accessKeyID, _ string) (*CredentialResult, error) {
+func (p *ConfigProvider) LookupCredentials(accessKeyID string) (*CredentialResult, error) {
 	for _, auth := range p.entries {
 		if auth.AccessKeyID == accessKeyID {
 			return &CredentialResult{
@@ -180,7 +174,6 @@ type cachedCredential struct {
 type NATSIAMProvider struct {
 	conn       *nats.Conn
 	js         nats.JetStreamContext
-	key        *masterkey.Key // retained for the session path's VerifyTokenHMAC
 	gcm        cipher.AEAD
 	bucketName string // access keys bucket name
 
@@ -251,7 +244,6 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	p := &NATSIAMProvider{
 		conn:       conn,
 		js:         js,
-		key:        key,
 		gcm:        gcm,
 		bucketName: bucketName,
 		cache:      make(map[string]*cachedCredential),
@@ -340,19 +332,12 @@ func (p *NATSIAMProvider) ensureSessionsBucket() error {
 	return nil
 }
 
-// lookupSessionCredentials resolves an ASIA STS session credential, mirroring
-// the spinifex gateway's ASIA verifier: require the security token, fetch the
-// record, check expiry, HMAC-verify the token, decrypt the secret, and resolve
-// the caller's policies. Session lookups are never cached — the per-request
-// expiry and HMAC checks must run on every call.
-func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID, securityToken string) (*CredentialResult, error) {
-	// The AWS SDK always sends X-Amz-Security-Token with session creds, and the
-	// HMAC check cannot run without it. A missing token is treated as an unknown
-	// key (→ 403 InvalidAccessKeyId), matching the gateway's fail-closed posture.
-	if securityToken == "" {
-		return nil, fmt.Errorf("%w: %s (missing security token)", ErrKeyNotFound, accessKeyID)
-	}
-
+// lookupSessionCredentials resolves an ASIA STS session credential: fetch the
+// record, check expiry, decrypt the secret, and resolve the caller's policies.
+// The request's SigV4 signature (over the decrypted secret) is what
+// authenticates the caller — identical to the AKIA path, plus an expiry check.
+// Session lookups are never cached so expiry is re-checked on every request.
+func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID string) (*CredentialResult, error) {
 	// Lazily open the session bucket. A not-yet-created bucket is the bootstrap
 	// case — surface it as key-not-found (403) so AKIA auth is unaffected; any
 	// other infra error propagates so the caller returns 500, not a misleading 403.
@@ -389,15 +374,6 @@ func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID, securityToken st
 		slog.Warn("Authentication attempt with expired session credential",
 			"accessKeyID", accessKeyID, "accountID", cred.AccountID, "expiresAt", cred.ExpiresAt)
 		return nil, fmt.Errorf("%w: %s (session expired)", ErrKeyNotFound, accessKeyID)
-	}
-
-	// Defence-in-depth on top of SigV4: only the token's HMAC is stored, never
-	// the raw token, so this fails closed even against an attacker holding the
-	// master key plus KV read.
-	if !p.key.VerifyTokenHMAC(securityToken, cred.SessionTokenHMAC) {
-		slog.Warn("Session token HMAC mismatch",
-			"accessKeyID", accessKeyID, "accountID", cred.AccountID)
-		return nil, fmt.Errorf("%w: %s (token mismatch)", ErrKeyNotFound, accessKeyID)
 	}
 
 	// An empty AccountID would silently fail the bucket-ownership check for every
@@ -487,12 +463,12 @@ func (p *NATSIAMProvider) watchChanges() {
 	}
 }
 
-func (p *NATSIAMProvider) LookupCredentials(accessKeyID, securityToken string) (*CredentialResult, error) {
+func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResult, error) {
 	// STS session credentials live in a separate bucket and follow a distinct
-	// verification path (expiry + token HMAC, no caching). Dispatch on the AWS
-	// access-key prefix before the AKIA cache check.
+	// resolution path (expiry check, no caching). Dispatch on the AWS access-key
+	// prefix before the AKIA cache check.
 	if strings.HasPrefix(accessKeyID, sessionAccessKeyIDPrefix) {
-		return p.lookupSessionCredentials(accessKeyID, securityToken)
+		return p.lookupSessionCredentials(accessKeyID)
 	}
 
 	// Check cache
@@ -694,9 +670,9 @@ func NewChainProvider(iam, config CredentialProvider) *ChainProvider {
 	return &ChainProvider{config: config, iam: iam}
 }
 
-func (p *ChainProvider) LookupCredentials(accessKeyID, securityToken string) (*CredentialResult, error) {
+func (p *ChainProvider) LookupCredentials(accessKeyID string) (*CredentialResult, error) {
 	// Config entries are trusted service accounts — check first.
-	result, err := p.config.LookupCredentials(accessKeyID, securityToken)
+	result, err := p.config.LookupCredentials(accessKeyID)
 	if err == nil {
 		return result, nil
 	}
@@ -706,7 +682,7 @@ func (p *ChainProvider) LookupCredentials(accessKeyID, securityToken string) (*C
 	}
 
 	// Not in config — try NATS IAM for user / session credentials.
-	result, err = p.iam.LookupCredentials(accessKeyID, securityToken)
+	result, err = p.iam.LookupCredentials(accessKeyID)
 	if err == nil {
 		return result, nil
 	}
