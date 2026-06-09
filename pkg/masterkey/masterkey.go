@@ -2,15 +2,19 @@
 // an AES-256-GCM cipher.AEAD used to seal and open shard fragments at rest.
 //
 // Load is the only path that touches the raw 32-byte key on disk. It returns
-// a *Key whose AEAD field is the only handle production code holds — the
-// underlying key bytes are not retained on the Key. Callers identify a key
-// via Key.Fingerprint instead of logging raw bytes.
+// a *Key whose AEAD field is the only cipher handle production code holds. The
+// raw key bytes are retained in a private field solely so VerifyTokenHMAC can
+// recompute STS session-token HMACs; they are never returned to callers, who
+// identify a key via Key.Fingerprint instead of logging raw bytes.
 package masterkey
 
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -21,15 +25,19 @@ const MasterKeySize = 32
 
 // Key is the runtime handle for a loaded master key. AEAD is safe for
 // concurrent use per the crypto/cipher contract; Fingerprint is a short,
-// log-safe identifier (16 hex chars) derived from the key bytes.
+// log-safe identifier (16 hex chars) derived from the key bytes. The raw key
+// is held privately for VerifyTokenHMAC and is never exposed to callers.
 type Key struct {
 	AEAD        cipher.AEAD
 	Fingerprint string
+	raw         []byte
 }
 
 // Load reads a 32-byte AES-256 master key from disk, builds the AEAD, and
-// returns a *Key. The raw key bytes are not retained on the returned value —
-// only the AEAD and its fingerprint survive past this call. It is fail-closed
+// returns a *Key. The raw key bytes are retained privately on the returned
+// value so VerifyTokenHMAC can recompute session-token HMACs; they are never
+// returned to callers. Only the AEAD, fingerprint, and HMAC verification
+// survive past this call as exported behaviour. It is fail-closed
 // on loose permissions: any group/other-readable mode (mode & 0077 != 0) is
 // rejected outright with no override. The master key gates plaintext access
 // to every object cluster-wide; warn-and-allow would put us one ignored log
@@ -70,7 +78,22 @@ func load(path string, denyMask os.FileMode, wantMode string) (*Key, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Key{AEAD: aead, Fingerprint: Fingerprint(raw)}, nil
+	return &Key{AEAD: aead, Fingerprint: Fingerprint(raw), raw: raw}, nil
+}
+
+// VerifyTokenHMAC reports whether base64(HMAC-SHA256(masterKey, token)) equals
+// expectedB64, compared in constant time. It mirrors spinifex's
+// handlers_sts.computeTokenHMAC so an STS session token minted by the gateway
+// verifies identically here. The raw key never leaves the package: only the
+// boolean verdict is returned.
+func (k *Key) VerifyTokenHMAC(token, expectedB64 string) bool {
+	expected, err := base64.StdEncoding.DecodeString(expectedB64)
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, k.raw)
+	mac.Write([]byte(token))
+	return subtle.ConstantTimeCompare(mac.Sum(nil), expected) == 1
 }
 
 // NewAEAD builds an AES-256-GCM AEAD from a 32-byte master key. Exposed for

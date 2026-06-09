@@ -215,7 +215,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		credResult, err := s.credProv.LookupCredentials(sig.AccessKeyID)
+		credResult, err := s.credProv.LookupCredentials(sig.AccessKeyID, r.Header.Get("X-Amz-Security-Token"))
 		if err != nil {
 			s.respondSigV4Error(w, r, sig.AccessKeyID, nil, err)
 			return

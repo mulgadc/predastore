@@ -64,7 +64,7 @@ type stubCredProvider struct {
 	creds map[string]*CredentialResult
 }
 
-func (p *stubCredProvider) LookupCredentials(accessKeyID string) (*CredentialResult, error) {
+func (p *stubCredProvider) LookupCredentials(accessKeyID, _ string) (*CredentialResult, error) {
 	if r, ok := p.creds[accessKeyID]; ok {
 		return r, nil
 	}

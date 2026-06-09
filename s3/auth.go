@@ -31,9 +31,11 @@ type CredentialResult struct {
 	PolicyDocuments []iamPolicyDocument // resolved policies (only for NATS-sourced credentials)
 }
 
-// CredentialProvider looks up credentials by access key ID.
+// CredentialProvider looks up credentials by access key ID. securityToken is
+// the request's X-Amz-Security-Token header (empty for long-lived AKIA creds);
+// the NATS provider HMAC-verifies it on the ASIA session path.
 type CredentialProvider interface {
-	LookupCredentials(accessKeyID string) (*CredentialResult, error)
+	LookupCredentials(accessKeyID, securityToken string) (*CredentialResult, error)
 	Close()
 }
 
@@ -47,6 +49,20 @@ type iamAccessKey struct {
 	AccountID       string `json:"account_id"`
 	Status          string `json:"status"`
 	CreatedAt       string `json:"created_at"`
+}
+
+// sessionCredential mirrors the spinifex STS SessionCredential stored in the
+// spinifex-iam-session-credentials KV bucket. Records are write-once at mint
+// and expire within hours. Only the fields predastore needs to verify and
+// resolve a session are replicated.
+type sessionCredential struct {
+	AccessKeyID      string    `json:"access_key_id"`
+	SecretEncrypted  string    `json:"secret_encrypted"`   // AES-256-GCM, base64 (handlers_iam.EncryptSecret format)
+	SessionTokenHMAC string    `json:"session_token_hmac"` // base64(HMAC-SHA256(masterKey, token))
+	AccountID        string    `json:"account_id"`
+	PrincipalType    string    `json:"principal_type"` // "user" | "assumed-role" | ""
+	SessionName      string    `json:"session_name"`
+	ExpiresAt        time.Time `json:"expires_at"`
 }
 
 // iamUser mirrors the spinifex IAM User stored in NATS KV.
@@ -109,7 +125,10 @@ func NewConfigProvider(entries []AuthEntry) *ConfigProvider {
 	return &ConfigProvider{entries: entries}
 }
 
-func (p *ConfigProvider) LookupCredentials(accessKeyID string) (*CredentialResult, error) {
+// LookupCredentials resolves a static config service account. The security
+// token is ignored: config accounts are always long-lived AKIA keys, never STS
+// sessions.
+func (p *ConfigProvider) LookupCredentials(accessKeyID, _ string) (*CredentialResult, error) {
 	for _, auth := range p.entries {
 		if auth.AccessKeyID == accessKeyID {
 			return &CredentialResult{
@@ -130,6 +149,21 @@ const (
 	kvBucketUsers    = "spinifex-iam-users"
 	kvBucketPolicies = "spinifex-iam-policies"
 
+	// kvBucketSessionCredentials holds STS-minted ASIA session records. It is a
+	// separate bucket from the AKIA access keys and is opened lazily on its own
+	// readiness flag so a missing session bucket never disables AKIA auth.
+	//nolint:gosec // G101: bucket name, not a credential value
+	kvBucketSessionCredentials = "spinifex-iam-session-credentials"
+
+	// sessionAccessKeyIDPrefix is the AWS prefix for STS temporary credentials.
+	// Long-lived IAM keys use "AKIA"; the two namespaces live in disjoint
+	// buckets so a prefix-first dispatch cannot be confused.
+	sessionAccessKeyIDPrefix = "ASIA"
+
+	// principalTypeUser marks a session minted by GetSessionToken for an IAM
+	// user (SessionName == user name), as opposed to an assumed-role session.
+	principalTypeUser = "user"
+
 	cacheTTL = 60 * time.Second
 )
 
@@ -144,6 +178,7 @@ type cachedCredential struct {
 type NATSIAMProvider struct {
 	conn       *nats.Conn
 	js         nats.JetStreamContext
+	key        *masterkey.Key // retained for the session path's VerifyTokenHMAC
 	gcm        cipher.AEAD
 	bucketName string // access keys bucket name
 
@@ -155,6 +190,11 @@ type NATSIAMProvider struct {
 	usersBucket      nats.KeyValue
 	policiesBucket   nats.KeyValue
 	bucketsReady     bool
+
+	// Session-credentials bucket has its own readiness flag: it is opened
+	// independently of the AKIA buckets so either path can come up alone.
+	sessionsBucket nats.KeyValue
+	sessionsReady  bool
 
 	watcher   nats.KeyWatcher
 	done      chan struct{}
@@ -207,6 +247,7 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	p := &NATSIAMProvider{
 		conn:       conn,
 		js:         js,
+		key:        key,
 		gcm:        gcm,
 		bucketName: bucketName,
 		cache:      make(map[string]*cachedCredential),
@@ -272,6 +313,128 @@ func (p *NATSIAMProvider) ensureBuckets() error {
 	return nil
 }
 
+// ensureSessionsBucket lazily opens the session-credentials KV bucket. It is
+// deliberately decoupled from ensureBuckets: a missing session bucket must not
+// disable AKIA auth, and an unbootstrapped AKIA path must not block sessions.
+// The caller must hold p.mu.
+func (p *NATSIAMProvider) ensureSessionsBucket() error {
+	if p.sessionsReady {
+		return nil
+	}
+	if p.js == nil {
+		return fmt.Errorf("JetStream context not available")
+	}
+
+	bucket, err := p.js.KeyValue(kvBucketSessionCredentials)
+	if err != nil {
+		return fmt.Errorf("open session credentials bucket: %w", err)
+	}
+
+	p.sessionsBucket = bucket
+	p.sessionsReady = true
+	slog.Info("STS session-credentials bucket now available — ASIA session auth is active")
+	return nil
+}
+
+// lookupSessionCredentials resolves an ASIA STS session credential, mirroring
+// the spinifex gateway's ASIA verifier: require the security token, fetch the
+// record, check expiry, HMAC-verify the token, decrypt the secret, and resolve
+// the caller's policies. Session lookups are never cached — the per-request
+// expiry and HMAC checks must run on every call (see plan Decision 2).
+func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID, securityToken string) (*CredentialResult, error) {
+	// The AWS SDK always sends X-Amz-Security-Token with session creds, and the
+	// HMAC check cannot run without it. A missing token is treated as an unknown
+	// key (→ 403 InvalidAccessKeyId), matching the gateway's fail-closed posture.
+	if securityToken == "" {
+		return nil, fmt.Errorf("%w: %s (missing security token)", ErrKeyNotFound, accessKeyID)
+	}
+
+	// Lazily open the session bucket. A not-yet-created bucket is the bootstrap
+	// case — surface it as key-not-found (403) so AKIA auth is unaffected; any
+	// other infra error propagates so the caller returns 500, not a misleading 403.
+	p.mu.Lock()
+	if !p.sessionsReady {
+		if err := p.ensureSessionsBucket(); err != nil {
+			p.mu.Unlock()
+			if errors.Is(err, nats.ErrBucketNotFound) || errors.Is(err, nats.ErrStreamNotFound) {
+				return nil, fmt.Errorf("%w: %s (session bucket not yet created)", ErrKeyNotFound, accessKeyID)
+			}
+			return nil, fmt.Errorf("session credential lookup unavailable: %w", err)
+		}
+	}
+	bucket := p.sessionsBucket
+	p.mu.Unlock()
+
+	entry, err := bucket.Get(accessKeyID)
+	if err != nil {
+		if errors.Is(err, nats.ErrKeyNotFound) {
+			return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, accessKeyID)
+		}
+		return nil, fmt.Errorf("NATS KV lookup failed for session key %s: %w", accessKeyID, err)
+	}
+
+	var cred sessionCredential
+	if err := json.Unmarshal(entry.Value(), &cred); err != nil {
+		return nil, fmt.Errorf("unmarshal session credential: %w", err)
+	}
+
+	// Expired records are still readable until the STS janitor reaps them; reject
+	// them here. Mapped to key-not-found (403 InvalidAccessKeyId) so the console
+	// classifies it as a stale credential and logs out cleanly.
+	if time.Now().UTC().After(cred.ExpiresAt) {
+		slog.Warn("Authentication attempt with expired session credential",
+			"accessKeyID", accessKeyID, "accountID", cred.AccountID, "expiresAt", cred.ExpiresAt)
+		return nil, fmt.Errorf("%w: %s (session expired)", ErrKeyNotFound, accessKeyID)
+	}
+
+	// Defence-in-depth on top of SigV4: only the token's HMAC is stored, never
+	// the raw token, so this fails closed even against an attacker holding the
+	// master key plus KV read.
+	if !p.key.VerifyTokenHMAC(securityToken, cred.SessionTokenHMAC) {
+		slog.Warn("Session token HMAC mismatch",
+			"accessKeyID", accessKeyID, "accountID", cred.AccountID)
+		return nil, fmt.Errorf("%w: %s (token mismatch)", ErrKeyNotFound, accessKeyID)
+	}
+
+	// An empty AccountID would silently fail the bucket-ownership check for every
+	// request; reject at the boundary with a clear diagnostic (parity with AKIA).
+	if cred.AccountID == "" {
+		slog.Error("Session credential has empty account_id — refusing to authenticate",
+			"accessKeyID", accessKeyID, "sessionName", cred.SessionName)
+		return nil, fmt.Errorf("session credential %s has empty account_id", accessKeyID)
+	}
+
+	secret, err := p.decrypt(cred.SecretEncrypted)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt session secret: %w", err)
+	}
+
+	// GetSessionToken user-sessions resolve straight back to the IAM user
+	// (SessionName == user name), so the existing per-user policy resolver
+	// applies. Assumed-role sessions have no policy resolver in predastore —
+	// fail closed with no policy documents (implicit deny → 403 AccessDenied).
+	var policies []iamPolicyDocument
+	if cred.PrincipalType == principalTypeUser {
+		policies, err = p.resolveUserPolicies(cred.AccountID, cred.SessionName)
+		if err != nil {
+			return nil, fmt.Errorf("resolve session policies: %w", err)
+		}
+	} else {
+		slog.Warn("Assumed-role session presented to predastore S3 — no role-policy "+
+			"resolver, failing closed (implicit deny)",
+			"accessKeyID", accessKeyID, "principalType", cred.PrincipalType,
+			"accountID", cred.AccountID, "sessionName", cred.SessionName)
+	}
+
+	return &CredentialResult{
+		SecretAccessKey: secret,
+		AccountID:       cred.AccountID,
+		UserName:        cred.SessionName,
+		SkipPolicyCheck: false,
+		PolicyDocuments: policies,
+	}, nil
+}
+
 func (p *NATSIAMProvider) watchChanges() {
 	for {
 		select {
@@ -298,7 +461,14 @@ func (p *NATSIAMProvider) watchChanges() {
 	}
 }
 
-func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResult, error) {
+func (p *NATSIAMProvider) LookupCredentials(accessKeyID, securityToken string) (*CredentialResult, error) {
+	// STS session credentials live in a separate bucket and follow a distinct
+	// verification path (expiry + token HMAC, no caching). Dispatch on the AWS
+	// access-key prefix before the AKIA cache check.
+	if strings.HasPrefix(accessKeyID, sessionAccessKeyIDPrefix) {
+		return p.lookupSessionCredentials(accessKeyID, securityToken)
+	}
+
 	// Check cache
 	p.mu.RLock()
 	if cached, ok := p.cache[accessKeyID]; ok && time.Now().Before(cached.expiresAt) {
@@ -496,9 +666,9 @@ func NewChainProvider(iam, config CredentialProvider) *ChainProvider {
 	return &ChainProvider{config: config, iam: iam}
 }
 
-func (p *ChainProvider) LookupCredentials(accessKeyID string) (*CredentialResult, error) {
+func (p *ChainProvider) LookupCredentials(accessKeyID, securityToken string) (*CredentialResult, error) {
 	// Config entries are trusted service accounts — check first.
-	result, err := p.config.LookupCredentials(accessKeyID)
+	result, err := p.config.LookupCredentials(accessKeyID, securityToken)
 	if err == nil {
 		return result, nil
 	}
@@ -507,8 +677,8 @@ func (p *ChainProvider) LookupCredentials(accessKeyID string) (*CredentialResult
 		return nil, err
 	}
 
-	// Not in config — try NATS IAM for user credentials.
-	result, err = p.iam.LookupCredentials(accessKeyID)
+	// Not in config — try NATS IAM for user / session credentials.
+	result, err = p.iam.LookupCredentials(accessKeyID, securityToken)
 	if err == nil {
 		return result, nil
 	}
