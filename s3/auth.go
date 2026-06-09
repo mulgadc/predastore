@@ -120,6 +120,8 @@ type ConfigProvider struct {
 	entries []AuthEntry
 }
 
+var _ CredentialProvider = (*ConfigProvider)(nil)
+
 // NewConfigProvider creates a provider backed by static config entries.
 func NewConfigProvider(entries []AuthEntry) *ConfigProvider {
 	return &ConfigProvider{entries: entries}
@@ -200,6 +202,8 @@ type NATSIAMProvider struct {
 	done      chan struct{}
 	closeOnce sync.Once
 }
+
+var _ CredentialProvider = (*NATSIAMProvider)(nil)
 
 // NewNATSIAMProvider creates a provider that looks up IAM credentials from NATS KV.
 // The provider connects to NATS eagerly but opens KV buckets lazily — this allows
@@ -340,7 +344,7 @@ func (p *NATSIAMProvider) ensureSessionsBucket() error {
 // the spinifex gateway's ASIA verifier: require the security token, fetch the
 // record, check expiry, HMAC-verify the token, decrypt the secret, and resolve
 // the caller's policies. Session lookups are never cached — the per-request
-// expiry and HMAC checks must run on every call (see plan Decision 2).
+// expiry and HMAC checks must run on every call.
 func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID, securityToken string) (*CredentialResult, error) {
 	// The AWS SDK always sends X-Amz-Security-Token with session creds, and the
 	// HMAC check cannot run without it. A missing token is treated as an unknown
@@ -415,8 +419,30 @@ func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID, securityToken st
 	// fail closed with no policy documents (implicit deny → 403 AccessDenied).
 	var policies []iamPolicyDocument
 	if cred.PrincipalType == principalTypeUser {
+		// resolveUserPolicies reads the IAM users/policies buckets, which the
+		// session path does not open itself. Ensure they are ready first
+		// (bootstrap-safe, mirroring the AKIA path) — otherwise a session that
+		// arrives before any AKIA request would dereference a nil bucket.
+		p.mu.Lock()
+		if !p.bucketsReady {
+			if err := p.ensureBuckets(); err != nil {
+				p.mu.Unlock()
+				if errors.Is(err, nats.ErrBucketNotFound) || errors.Is(err, nats.ErrStreamNotFound) {
+					return nil, fmt.Errorf("%w: %s (IAM buckets not yet created)", ErrKeyNotFound, accessKeyID)
+				}
+				return nil, fmt.Errorf("session credential lookup unavailable: %w", err)
+			}
+		}
+		p.mu.Unlock()
+
 		policies, err = p.resolveUserPolicies(cred.AccountID, cred.SessionName)
 		if err != nil {
+			// A deleted IAM user or detached policy surfaces as a not-found from
+			// KV: that is a stale-principal authentication failure (403), not a
+			// server fault. Other errors propagate as infrastructure errors (500).
+			if errors.Is(err, nats.ErrKeyNotFound) {
+				return nil, fmt.Errorf("%w: %s (session principal no longer exists)", ErrKeyNotFound, accessKeyID)
+			}
 			return nil, fmt.Errorf("resolve session policies: %w", err)
 		}
 	} else {
@@ -660,6 +686,8 @@ type ChainProvider struct {
 	config CredentialProvider
 	iam    CredentialProvider
 }
+
+var _ CredentialProvider = (*ChainProvider)(nil)
 
 // NewChainProvider creates a provider that tries config first, then NATS IAM.
 func NewChainProvider(iam, config CredentialProvider) *ChainProvider {
