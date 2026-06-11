@@ -446,7 +446,8 @@ func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID string) (*Credent
 				"sessionName", cred.SessionName, "underlyingRoleARN", cred.UnderlyingRoleARN)
 		case arnAccount != "" && arnAccount != cred.AccountID:
 			// Spinifex rejects cross-account assume at mint, so a mismatch here
-			// means a corrupt/misfiled record — fail closed (D2, defence-in-depth).
+			// means a corrupt/misfiled record — fail closed (defence-in-depth
+			// against resolving a same-named role in the session's own account).
 			slog.Error("Assumed-role session ARN account disagrees with session account — failing closed",
 				"accessKeyID", accessKeyID, "sessionAccountID", cred.AccountID,
 				"arnAccountID", arnAccount, "underlyingRoleARN", cred.UnderlyingRoleARN)
@@ -709,8 +710,10 @@ func extractPolicyName(arn string) string {
 // parseRoleNameFromARN extracts the account ID and role name from an IAM role
 // ARN of the form arn:aws:iam::<accountID>:role/<path>/<name> (path optional),
 // mirroring spinifex's parseRoleARN. The name is the segment after the final
-// "/", so nested paths (role/some/path/Name → Name) are handled. Any malformed
-// ARN returns empty strings so the caller fails closed (implicit deny).
+// "/", so nested paths (role/some/path/Name → Name) are handled. A real IAM role
+// ARN always carries a non-empty account, so an empty account is treated as
+// malformed. Any malformed ARN returns empty strings so the caller fails closed
+// (implicit deny).
 func parseRoleNameFromARN(arn string) (accountID, name string) {
 	parts := strings.SplitN(arn, ":", 6)
 	if len(parts) != 6 || parts[0] != "arn" || parts[1] != "aws" || parts[2] != "iam" || parts[3] != "" {
@@ -727,7 +730,7 @@ func parseRoleNameFromARN(arn string) (accountID, name string) {
 	} else {
 		name = pathAndName
 	}
-	if name == "" {
+	if name == "" || parts[4] == "" {
 		return "", ""
 	}
 	return parts[4], name

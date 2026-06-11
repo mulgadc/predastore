@@ -276,9 +276,9 @@ func TestLookupSession_AssumedRoleNoAttachedPolicies(t *testing.T) {
 	assert.False(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments))
 }
 
-// TestLookupSession_AssumedRoleAccountMismatch covers D2: an ARN whose embedded
-// account disagrees with the session's account_id must fail closed rather than
-// resolve a same-named role in the session's account.
+// TestLookupSession_AssumedRoleAccountMismatch: an ARN whose embedded account
+// disagrees with the session's account_id must fail closed rather than resolve a
+// same-named role in the session's account.
 func TestLookupSession_AssumedRoleAccountMismatch(t *testing.T) {
 	k := loadTestKey(t)
 	// The roles/policies exist in the session's account, but the ARN names a
@@ -290,7 +290,24 @@ func TestLookupSession_AssumedRoleAccountMismatch(t *testing.T) {
 
 	res, err := p.LookupCredentials(testSessionAKID)
 	require.NoError(t, err)
-	assert.Empty(t, res.PolicyDocuments, "ARN account ≠ session account must fail closed (D2), never resolve")
+	assert.Empty(t, res.PolicyDocuments, "ARN account ≠ session account must fail closed, never resolve")
+}
+
+// TestLookupSession_AssumedRoleEmptyAccountARN: an ARN with a blank account field
+// (arn:aws:iam:::role/Name) is malformed — a real role ARN always carries an
+// account — so it must fail closed rather than resolve the named role in the
+// session's own account, even though the account does not visibly "disagree".
+func TestLookupSession_AssumedRoleEmptyAccountARN(t *testing.T) {
+	k := loadTestKey(t)
+	// The role+policy exist in the session's account; only the ARN is corrupt.
+	roles, policies := roleWithPolicy(t, "S3FullAccess", allowAllS3Policy)
+	accountlessARN := "arn:aws:iam:::role/" + testSessionRole
+	sessions := assumedRoleSession(t, k, "secret", accountlessARN, time.Now().UTC().Add(time.Hour))
+	p := newSessionProvider(k, sessions, nil, roles, policies)
+
+	res, err := p.LookupCredentials(testSessionAKID)
+	require.NoError(t, err)
+	assert.Empty(t, res.PolicyDocuments, "an account-less role ARN must fail closed, never resolve")
 }
 
 // TestLookupSession_AssumedRoleDeletedRole: a session referencing a role that no
@@ -318,6 +335,67 @@ func TestLookupSession_AssumedRoleKVError(t *testing.T) {
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, ErrKeyNotFound), "infra faults must not be mapped to ErrKeyNotFound")
 	assert.Contains(t, err.Error(), "resolve session policies")
+}
+
+// TestLookupSession_AssumedRoleMissingPolicy: the role record exists and attaches
+// a policy, but that managed policy has been detached/deleted — a stale principal
+// → 403 (ErrKeyNotFound), not a 500.
+func TestLookupSession_AssumedRoleMissingPolicy(t *testing.T) {
+	k := loadTestKey(t)
+	roles, _ := roleWithPolicy(t, "S3FullAccess", allowAllS3Policy)
+	sessions := assumedRoleSession(t, k, "secret", testSessionRoleARN, time.Now().UTC().Add(time.Hour))
+	// Empty (non-nil) policies bucket → the attached policy Get returns ErrKeyNotFound.
+	p := newSessionProvider(k, sessions, nil, roles, map[string][]byte{})
+
+	_, err := p.LookupCredentials(testSessionAKID)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrKeyNotFound, "a detached/deleted managed policy maps to 403, not 500")
+}
+
+// TestLookupSession_AssumedRolePolicyKVError: a non-NotFound fault on the policy
+// lookup (role resolved fine) is infrastructure (→ 500), never a misleading
+// ErrKeyNotFound (→ 403).
+func TestLookupSession_AssumedRolePolicyKVError(t *testing.T) {
+	k := loadTestKey(t)
+	roles, _ := roleWithPolicy(t, "S3FullAccess", allowAllS3Policy)
+	sessions := assumedRoleSession(t, k, "secret", testSessionRoleARN, time.Now().UTC().Add(time.Hour))
+	p := newSessionProvider(k, sessions, nil, roles, map[string][]byte{})
+	p.policiesBucket = &fakeKV{getErr: errors.New("nats: connection closed")}
+
+	_, err := p.LookupCredentials(testSessionAKID)
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, ErrKeyNotFound), "infra faults must not be mapped to ErrKeyNotFound")
+	assert.Contains(t, err.Error(), "resolve session policies")
+}
+
+// TestLookupSession_AssumedRoleSkipsUnparseablePolicyARN: an unparseable entry in
+// the role's attached policies is skipped (logged), not treated as an error — the
+// remaining valid policies still resolve.
+func TestLookupSession_AssumedRoleSkipsUnparseablePolicyARN(t *testing.T) {
+	k := loadTestKey(t)
+	roles := map[string][]byte{
+		testSessionAccount + "." + testSessionRole: mustMarshal(t, iamRole{
+			RoleName:  testSessionRole,
+			AccountID: testSessionAccount,
+			AttachedPolicies: []string{
+				"not-an-arn",
+				"arn:aws:iam::" + testSessionAccount + ":policy/S3FullAccess",
+			},
+		}),
+	}
+	policies := map[string][]byte{
+		testSessionAccount + ".S3FullAccess": mustMarshal(t, iamPolicy{
+			PolicyName:     "S3FullAccess",
+			PolicyDocument: allowAllS3Policy,
+		}),
+	}
+	sessions := assumedRoleSession(t, k, "secret", testSessionRoleARN, time.Now().UTC().Add(time.Hour))
+	p := newSessionProvider(k, sessions, nil, roles, policies)
+
+	res, err := p.LookupCredentials(testSessionAKID)
+	require.NoError(t, err, "an unparseable ARN must be skipped, not error the whole lookup")
+	require.Len(t, res.PolicyDocuments, 1, "only the one valid attached policy resolves")
+	assert.True(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments))
 }
 
 // TestLookupSession_UnrecognisedPrincipalType: a principal_type that is neither
@@ -373,6 +451,7 @@ func TestParseRoleNameFromARN(t *testing.T) {
 		{"nested path", "arn:aws:iam::000000000001:role/some/path/MyRole", "000000000001", "MyRole"},
 		{"role prefix only", "arn:aws:iam::000000000001:role/", "", ""},
 		{"trailing slash, empty name", "arn:aws:iam::000000000001:role/path/", "", ""},
+		{"empty account", "arn:aws:iam:::role/MyRole", "", ""},
 		{"not a role resource", "arn:aws:iam::000000000001:user/Bob", "", ""},
 		{"wrong service", "arn:aws:s3:::000000000001:role/MyRole", "", ""},
 		{"too few fields", "arn:aws:iam::000000000001", "", ""},
