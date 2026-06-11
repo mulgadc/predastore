@@ -418,7 +418,7 @@ func TestLookupSession_UnrecognisedPrincipalType(t *testing.T) {
 	assert.Empty(t, res.PolicyDocuments, "an unrecognised principal_type must fail closed (implicit deny)")
 }
 
-// --- unit tests: iamRole / parseRoleNameFromARN ---
+// --- unit tests: iamRole ---
 
 func TestIamRole_UnmarshalsSpinifexJSON(t *testing.T) {
 	// A representative spinifex Role record. Extra fields (trust policy, ARN,
@@ -438,32 +438,6 @@ func TestIamRole_UnmarshalsSpinifexJSON(t *testing.T) {
 	assert.Equal(t, "InstanceRole", role.RoleName)
 	assert.Equal(t, "000000000001", role.AccountID)
 	assert.Equal(t, []string{"arn:aws:iam::000000000001:policy/S3FullAccess"}, role.AttachedPolicies)
-}
-
-func TestParseRoleNameFromARN(t *testing.T) {
-	tests := []struct {
-		name        string
-		arn         string
-		wantAccount string
-		wantName    string
-	}{
-		{"simple", "arn:aws:iam::000000000001:role/MyRole", "000000000001", "MyRole"},
-		{"nested path", "arn:aws:iam::000000000001:role/some/path/MyRole", "000000000001", "MyRole"},
-		{"role prefix only", "arn:aws:iam::000000000001:role/", "", ""},
-		{"trailing slash, empty name", "arn:aws:iam::000000000001:role/path/", "", ""},
-		{"empty account", "arn:aws:iam:::role/MyRole", "", ""},
-		{"not a role resource", "arn:aws:iam::000000000001:user/Bob", "", ""},
-		{"wrong service", "arn:aws:s3:::000000000001:role/MyRole", "", ""},
-		{"too few fields", "arn:aws:iam::000000000001", "", ""},
-		{"empty", "", "", ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			account, name := parseRoleNameFromARN(tt.arn)
-			assert.Equal(t, tt.wantAccount, account, "account")
-			assert.Equal(t, tt.wantName, name, "name")
-		})
-	}
 }
 
 func TestLookupSession_Expired(t *testing.T) {

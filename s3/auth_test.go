@@ -112,26 +112,6 @@ func TestChainProvider_BothNotFound(t *testing.T) {
 	assert.ErrorIs(t, err, ErrKeyNotFound)
 }
 
-// --- extractPolicyName tests ---
-
-func TestExtractPolicyName(t *testing.T) {
-	tests := []struct {
-		arn  string
-		want string
-	}{
-		{"arn:aws:iam::000000000001:policy/AdministratorAccess", "AdministratorAccess"},
-		{"arn:aws:iam::000000000001:policy/path/to/MyPolicy", "MyPolicy"},
-		{"arn:aws:iam::000000000001:policy/", ""},
-		{"invalid-arn", ""},
-		{"", ""},
-	}
-
-	for _, tt := range tests {
-		got := extractPolicyName(tt.arn)
-		assert.Equal(t, tt.want, got, "extractPolicyName(%q)", tt.arn)
-	}
-}
-
 // --- decrypt tests ---
 
 func TestDecrypt_Roundtrip(t *testing.T) {

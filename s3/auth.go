@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/nats-io/nats.go"
 )
@@ -435,16 +436,16 @@ func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID string) (*Credent
 			return nil, mapSessionPrincipalError(accessKeyID, err)
 		}
 	case principalTypeAssumedRole, "":
-		arnAccount, roleName := parseRoleNameFromARN(cred.UnderlyingRoleARN)
+		arnAccount, roleName, arnErr := auth.ParseRoleARN(cred.UnderlyingRoleARN)
 		switch {
-		case roleName == "":
+		case arnErr != nil:
 			// A malformed or absent underlying_role_arn (e.g. a legacy record
 			// predating the field) cannot identify a role — fail closed
 			// (implicit deny), today's safe behaviour, never a server error.
 			slog.Warn("Assumed-role session has no resolvable role ARN — failing closed (implicit deny)",
 				"accessKeyID", accessKeyID, "accountID", cred.AccountID,
-				"sessionName", cred.SessionName, "underlyingRoleARN", cred.UnderlyingRoleARN)
-		case arnAccount != "" && arnAccount != cred.AccountID:
+				"sessionName", cred.SessionName, "underlyingRoleARN", cred.UnderlyingRoleARN, "err", arnErr)
+		case arnAccount != cred.AccountID:
 			// Spinifex rejects cross-account assume at mint, so a mismatch here
 			// means a corrupt/misfiled record — fail closed (defence-in-depth
 			// against resolving a same-named role in the session's own account).
@@ -669,7 +670,7 @@ func (p *NATSIAMProvider) resolveRolePolicies(accountID, roleName string) ([]iam
 func (p *NATSIAMProvider) resolveManagedPolicies(accountID string, arns []string) ([]iamPolicyDocument, error) {
 	var docs []iamPolicyDocument
 	for _, arn := range arns {
-		policyName := extractPolicyName(arn)
+		policyName := auth.ExtractPolicyName(arn)
 		if policyName == "" {
 			slog.Warn("Skipping unparseable policy ARN", "arn", arn, "accountID", accountID)
 			continue
@@ -694,46 +695,6 @@ func (p *NATSIAMProvider) resolveManagedPolicies(accountID string, arns []string
 	}
 
 	return docs, nil
-}
-
-// extractPolicyName extracts the policy name from an ARN like
-// "arn:aws:iam::000000000001:policy/AdministratorAccess"
-func extractPolicyName(arn string) string {
-	parts := strings.SplitN(arn, ":policy", 2)
-	if len(parts) != 2 || parts[1] == "" {
-		return ""
-	}
-	segments := strings.Split(parts[1], "/")
-	return segments[len(segments)-1]
-}
-
-// parseRoleNameFromARN extracts the account ID and role name from an IAM role
-// ARN of the form arn:aws:iam::<accountID>:role/<path>/<name> (path optional),
-// mirroring spinifex's parseRoleARN. The name is the segment after the final
-// "/", so nested paths (role/some/path/Name → Name) are handled. A real IAM role
-// ARN always carries a non-empty account, so an empty account is treated as
-// malformed. Any malformed ARN returns empty strings so the caller fails closed
-// (implicit deny).
-func parseRoleNameFromARN(arn string) (accountID, name string) {
-	parts := strings.SplitN(arn, ":", 6)
-	if len(parts) != 6 || parts[0] != "arn" || parts[1] != "aws" || parts[2] != "iam" || parts[3] != "" {
-		return "", ""
-	}
-	const prefix = "role/"
-	resource := parts[5]
-	if !strings.HasPrefix(resource, prefix) {
-		return "", ""
-	}
-	pathAndName := resource[len(prefix):]
-	if slash := strings.LastIndex(pathAndName, "/"); slash >= 0 {
-		name = pathAndName[slash+1:]
-	} else {
-		name = pathAndName
-	}
-	if name == "" || parts[4] == "" {
-		return "", ""
-	}
-	return parts[4], name
 }
 
 func (p *NATSIAMProvider) decrypt(ciphertext string) (string, error) {
