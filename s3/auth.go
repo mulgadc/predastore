@@ -54,12 +54,16 @@ type iamAccessKey struct {
 // and expire within hours. Only the fields predastore needs to resolve a
 // session are replicated.
 type sessionCredential struct {
-	AccessKeyID     string    `json:"access_key_id"`
-	SecretEncrypted string    `json:"secret_encrypted"` // AES-256-GCM, base64 (handlers_iam.EncryptSecret format)
-	AccountID       string    `json:"account_id"`
-	PrincipalType   string    `json:"principal_type"` // "user" | "assumed-role" | ""
-	SessionName     string    `json:"session_name"`
-	ExpiresAt       time.Time `json:"expires_at"`
+	AccessKeyID     string `json:"access_key_id"`
+	SecretEncrypted string `json:"secret_encrypted"` // AES-256-GCM, base64 (handlers_iam.EncryptSecret format)
+	AccountID       string `json:"account_id"`
+	PrincipalType   string `json:"principal_type"` // "user" | "assumed-role" | ""
+	SessionName     string `json:"session_name"`
+	// UnderlyingRoleARN identifies the assumed role for "assumed-role" sessions;
+	// SessionName carries the instance ID, not the role, so the role name is
+	// parsed from this ARN. Empty for "user" sessions.
+	UnderlyingRoleARN string    `json:"underlying_role_arn"`
+	ExpiresAt         time.Time `json:"expires_at"`
 }
 
 // iamUser mirrors the spinifex IAM User stored in NATS KV.
@@ -67,6 +71,17 @@ type iamUser struct {
 	UserName         string   `json:"user_name"`
 	AccountID        string   `json:"account_id"`
 	AttachedPolicies []string `json:"attached_policies"` // policy ARNs
+}
+
+// iamRole mirrors the spinifex IAM Role stored in NATS KV (spinifex-iam-roles).
+// Only the fields predastore needs to resolve an assumed-role session's
+// permissions are replicated. The role's assume_role_policy_document is the
+// trust policy (who may assume the role), not a permission policy, so it is
+// deliberately omitted here.
+type iamRole struct {
+	RoleName         string   `json:"role_name"`
+	AccountID        string   `json:"account_id"`
+	AttachedPolicies []string `json:"attached_policies"` // managed policy ARNs
 }
 
 // iamPolicy mirrors the spinifex IAM Policy stored in NATS KV.
@@ -143,6 +158,7 @@ func (p *ConfigProvider) Close() {}
 
 const (
 	kvBucketUsers    = "spinifex-iam-users"
+	kvBucketRoles    = "spinifex-iam-roles"
 	kvBucketPolicies = "spinifex-iam-policies"
 
 	// kvBucketSessionCredentials holds STS-minted ASIA session records. It is a
@@ -159,6 +175,12 @@ const (
 	// principalTypeUser marks a session minted by GetSessionToken for an IAM
 	// user (SessionName == user name), as opposed to an assumed-role session.
 	principalTypeUser = "user"
+
+	// principalTypeAssumedRole marks a session minted by AssumeRole /
+	// AssumeRoleForInstance; the caller's permissions come from the underlying
+	// role's attached managed policies (resolved via underlying_role_arn). An
+	// empty principal_type is treated as assumed-role for backward compatibility.
+	principalTypeAssumedRole = "assumed-role"
 
 	cacheTTL = 60 * time.Second
 )
@@ -183,6 +205,7 @@ type NATSIAMProvider struct {
 	// Lazy-initialized KV buckets — nil until spinifex daemon creates them.
 	accessKeysBucket nats.KeyValue
 	usersBucket      nats.KeyValue
+	rolesBucket      nats.KeyValue
 	policiesBucket   nats.KeyValue
 	bucketsReady     bool
 
@@ -263,7 +286,7 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	return p, nil
 }
 
-// ensureBuckets attempts to open the three IAM KV buckets and start the watcher.
+// ensureBuckets attempts to open the four IAM KV buckets and start the watcher.
 // Returns nil if all buckets are ready, or an error describing what's missing.
 // Safe to call multiple times — no-ops once buckets are ready.
 func (p *NATSIAMProvider) ensureBuckets() error {
@@ -284,6 +307,11 @@ func (p *NATSIAMProvider) ensureBuckets() error {
 		return fmt.Errorf("open users bucket: %w", err)
 	}
 
+	rolesBucket, err := p.js.KeyValue(kvBucketRoles)
+	if err != nil {
+		return fmt.Errorf("open roles bucket: %w", err)
+	}
+
 	policiesBucket, err := p.js.KeyValue(kvBucketPolicies)
 	if err != nil {
 		return fmt.Errorf("open policies bucket: %w", err)
@@ -291,6 +319,7 @@ func (p *NATSIAMProvider) ensureBuckets() error {
 
 	p.accessKeysBucket = akBucket
 	p.usersBucket = usersBucket
+	p.rolesBucket = rolesBucket
 	p.policiesBucket = policiesBucket
 	p.bucketsReady = true
 
@@ -389,41 +418,50 @@ func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID string) (*Credent
 		return nil, fmt.Errorf("decrypt session secret: %w", err)
 	}
 
-	// GetSessionToken user-sessions resolve straight back to the IAM user
-	// (SessionName == user name), so the existing per-user policy resolver
-	// applies. Assumed-role sessions have no policy resolver in predastore —
-	// fail closed with no policy documents (implicit deny → 403 AccessDenied).
+	// User sessions (GetSessionToken) resolve straight back to the IAM user
+	// (SessionName == user name); assumed-role sessions (AssumeRole /
+	// AssumeRoleForInstance) resolve the underlying role's attached managed
+	// policies. Both feed the same policy + ownership evaluation downstream. An
+	// empty principal_type is treated as assumed-role for backward compat; any
+	// other value fails closed (no policies → implicit deny → 403 AccessDenied).
 	var policies []iamPolicyDocument
-	if cred.PrincipalType == principalTypeUser {
-		// resolveUserPolicies reads the IAM users/policies buckets, which the
-		// session path does not open itself. Ensure they are ready first
-		// (bootstrap-safe, mirroring the AKIA path) — otherwise a session that
-		// arrives before any AKIA request would dereference a nil bucket.
-		p.mu.Lock()
-		if !p.bucketsReady {
-			if err := p.ensureBuckets(); err != nil {
-				p.mu.Unlock()
-				if errors.Is(err, nats.ErrBucketNotFound) || errors.Is(err, nats.ErrStreamNotFound) {
-					return nil, fmt.Errorf("%w: %s (IAM buckets not yet created)", ErrKeyNotFound, accessKeyID)
-				}
-				return nil, fmt.Errorf("session credential lookup unavailable: %w", err)
-			}
+	switch cred.PrincipalType {
+	case principalTypeUser:
+		if err := p.ensureIAMBucketsForSession(accessKeyID); err != nil {
+			return nil, err
 		}
-		p.mu.Unlock()
-
 		policies, err = p.resolveUserPolicies(cred.AccountID, cred.SessionName)
 		if err != nil {
-			// A deleted IAM user or detached policy surfaces as a not-found from
-			// KV: that is a stale-principal authentication failure (403), not a
-			// server fault. Other errors propagate as infrastructure errors (500).
-			if errors.Is(err, nats.ErrKeyNotFound) {
-				return nil, fmt.Errorf("%w: %s (session principal no longer exists)", ErrKeyNotFound, accessKeyID)
-			}
-			return nil, fmt.Errorf("resolve session policies: %w", err)
+			return nil, mapSessionPrincipalError(accessKeyID, err)
 		}
-	} else {
-		slog.Warn("Assumed-role session presented to predastore S3 — no role-policy "+
-			"resolver, failing closed (implicit deny)",
+	case principalTypeAssumedRole, "":
+		arnAccount, roleName := parseRoleNameFromARN(cred.UnderlyingRoleARN)
+		switch {
+		case roleName == "":
+			// A malformed or absent underlying_role_arn (e.g. a legacy record
+			// predating the field) cannot identify a role — fail closed
+			// (implicit deny), today's safe behaviour, never a server error.
+			slog.Warn("Assumed-role session has no resolvable role ARN — failing closed (implicit deny)",
+				"accessKeyID", accessKeyID, "accountID", cred.AccountID,
+				"sessionName", cred.SessionName, "underlyingRoleARN", cred.UnderlyingRoleARN)
+		case arnAccount != "" && arnAccount != cred.AccountID:
+			// Spinifex rejects cross-account assume at mint, so a mismatch here
+			// means a corrupt/misfiled record — fail closed (defence-in-depth
+			// against resolving a same-named role in the session's own account).
+			slog.Error("Assumed-role session ARN account disagrees with session account — failing closed",
+				"accessKeyID", accessKeyID, "sessionAccountID", cred.AccountID,
+				"arnAccountID", arnAccount, "underlyingRoleARN", cred.UnderlyingRoleARN)
+		default:
+			if err := p.ensureIAMBucketsForSession(accessKeyID); err != nil {
+				return nil, err
+			}
+			policies, err = p.resolveRolePolicies(cred.AccountID, roleName)
+			if err != nil {
+				return nil, mapSessionPrincipalError(accessKeyID, err)
+			}
+		}
+	default:
+		slog.Warn("Unrecognised session principal_type — failing closed (implicit deny)",
 			"accessKeyID", accessKeyID, "principalType", cred.PrincipalType,
 			"accountID", cred.AccountID, "sessionName", cred.SessionName)
 	}
@@ -562,8 +600,36 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 	return result, nil
 }
 
+// ensureIAMBucketsForSession opens the users/roles/policies buckets needed to
+// resolve a session principal's permissions. Bootstrap-safe (mirroring the AKIA
+// path): a not-yet-created bucket surfaces as ErrKeyNotFound (403) so a session
+// arriving before any AKIA request never dereferences a nil bucket; any other
+// infra error propagates so the caller returns 500, not a misleading 403.
+func (p *NATSIAMProvider) ensureIAMBucketsForSession(accessKeyID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.ensureBuckets(); err != nil {
+		if errors.Is(err, nats.ErrBucketNotFound) || errors.Is(err, nats.ErrStreamNotFound) {
+			return fmt.Errorf("%w: %s (IAM buckets not yet created)", ErrKeyNotFound, accessKeyID)
+		}
+		return fmt.Errorf("session credential lookup unavailable: %w", err)
+	}
+	return nil
+}
+
+// mapSessionPrincipalError classifies a policy-resolution failure for a session
+// principal. A deleted IAM user/role or detached policy surfaces as a KV
+// not-found: a stale-principal authentication failure (403), not a server
+// fault. Any other error is an infrastructure fault (500). Shared by the user
+// and assumed-role arms so both report identical semantics.
+func mapSessionPrincipalError(accessKeyID string, err error) error {
+	if errors.Is(err, nats.ErrKeyNotFound) {
+		return fmt.Errorf("%w: %s (session principal no longer exists)", ErrKeyNotFound, accessKeyID)
+	}
+	return fmt.Errorf("resolve session policies: %w", err)
+}
+
 func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iamPolicyDocument, error) {
-	// Look up user
 	kvKey := accountID + "." + userName
 	entry, err := p.usersBucket.Get(kvKey)
 	if err != nil {
@@ -575,15 +641,37 @@ func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iam
 		return nil, fmt.Errorf("unmarshal user: %w", err)
 	}
 
-	// Resolve each attached policy
+	return p.resolveManagedPolicies(accountID, user.AttachedPolicies)
+}
+
+// resolveRolePolicies resolves an assumed-role session's permissions: load the
+// role record from rolesBucket and resolve its attached managed policies. It
+// mirrors resolveUserPolicies — spinifex roles only ever carry managed policies
+// (no inline role policies exist), so the per-policy resolution is identical.
+func (p *NATSIAMProvider) resolveRolePolicies(accountID, roleName string) ([]iamPolicyDocument, error) {
+	kvKey := accountID + "." + roleName
+	entry, err := p.rolesBucket.Get(kvKey)
+	if err != nil {
+		return nil, fmt.Errorf("lookup role %s: %w", kvKey, err)
+	}
+
+	var role iamRole
+	if err := json.Unmarshal(entry.Value(), &role); err != nil {
+		return nil, fmt.Errorf("unmarshal role: %w", err)
+	}
+
+	return p.resolveManagedPolicies(accountID, role.AttachedPolicies)
+}
+
+// resolveManagedPolicies resolves a list of managed-policy ARNs into parsed
+// policy documents from policiesBucket. Shared by the user and role resolvers:
+// both attach only managed policies, so the per-ARN resolution is identical.
+func (p *NATSIAMProvider) resolveManagedPolicies(accountID string, arns []string) ([]iamPolicyDocument, error) {
 	var docs []iamPolicyDocument
-	for _, arn := range user.AttachedPolicies {
+	for _, arn := range arns {
 		policyName := extractPolicyName(arn)
 		if policyName == "" {
-			slog.Warn("Skipping unparseable policy ARN",
-				"arn", arn,
-				"accountID", accountID,
-				"userName", userName)
+			slog.Warn("Skipping unparseable policy ARN", "arn", arn, "accountID", accountID)
 			continue
 		}
 
@@ -617,6 +705,35 @@ func extractPolicyName(arn string) string {
 	}
 	segments := strings.Split(parts[1], "/")
 	return segments[len(segments)-1]
+}
+
+// parseRoleNameFromARN extracts the account ID and role name from an IAM role
+// ARN of the form arn:aws:iam::<accountID>:role/<path>/<name> (path optional),
+// mirroring spinifex's parseRoleARN. The name is the segment after the final
+// "/", so nested paths (role/some/path/Name → Name) are handled. A real IAM role
+// ARN always carries a non-empty account, so an empty account is treated as
+// malformed. Any malformed ARN returns empty strings so the caller fails closed
+// (implicit deny).
+func parseRoleNameFromARN(arn string) (accountID, name string) {
+	parts := strings.SplitN(arn, ":", 6)
+	if len(parts) != 6 || parts[0] != "arn" || parts[1] != "aws" || parts[2] != "iam" || parts[3] != "" {
+		return "", ""
+	}
+	const prefix = "role/"
+	resource := parts[5]
+	if !strings.HasPrefix(resource, prefix) {
+		return "", ""
+	}
+	pathAndName := resource[len(prefix):]
+	if slash := strings.LastIndex(pathAndName, "/"); slash >= 0 {
+		name = pathAndName[slash+1:]
+	} else {
+		name = pathAndName
+	}
+	if name == "" || parts[4] == "" {
+		return "", ""
+	}
+	return parts[4], name
 }
 
 func (p *NATSIAMProvider) decrypt(ciphertext string) (string, error) {
