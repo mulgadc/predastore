@@ -236,7 +236,7 @@ go test ./backend/distributed/... -run TestDistributed_Multipart -v -count=1
 
 ```bash
 # Stop dev environment first (CRITICAL before running unit tests)
-cd ~/Development/mulga/spinifex && ./scripts/stop-dev.sh
+sudo systemctl stop spinifex.target
 
 # Then run tests
 cd ~/Development/mulga/predastore-rewrite && go test ./... -count=1
@@ -244,7 +244,7 @@ cd ~/Development/mulga/predastore-rewrite && go test ./... -count=1
 
 ```bash
 # Start dev environment for E2E testing
-cd ~/Development/mulga/spinifex && ./scripts/start-dev.sh
+sudo systemctl start spinifex.target
 
 # Upload large file (use extended timeout for CompleteMultipartUpload)
 aws --no-verify-ssl --cli-read-timeout 600 --endpoint-url https://localhost:8443/ \
@@ -259,7 +259,7 @@ md5sum large-file.img /tmp/downloaded.img
 aws --no-verify-ssl --endpoint-url https://localhost:8443/ s3 ls s3://predastore/
 
 # Stop dev environment when done (required before running unit tests again)
-./scripts/stop-dev.sh
+sudo systemctl stop spinifex.target
 ```
 
 ---
@@ -901,7 +901,7 @@ To trace the issue, detailed logging was added throughout the PUT lifecycle:
 **To Test:**
 ```bash
 # Rebuild and restart
-cd ~/Development/mulga/spinifex && ./scripts/start-dev.sh
+sudo systemctl start spinifex.target
 
 # Run import with DEBUG logging
 LOG_LEVEL=debug ./bi./spx admin images import --arch x86_64 --distro ubuntu \
@@ -925,7 +925,7 @@ tail -f ~/Development/mulga/spinifex/data/logs/predastore.log | grep -E "(PUT|st
 
 ```bash
 # Stop all services (CRITICAL before running unit tests)
-cd ~/Development/mulga/spinifex && ./scripts/stop-dev.sh
+sudo systemctl stop spinifex.target
 
 # Verify ports are free
 lsof -i :9991  # Should return nothing
@@ -934,14 +934,14 @@ lsof -i :9991  # Should return nothing
 cd ~/Development/mulga/predastore-rewrite && go test ./... -count=1
 
 # Start dev environment for E2E testing
-cd ~/Development/mulga/spinifex && ./scripts/start-dev.sh
+sudo systemctl start spinifex.target
 
 # Test image import
 ./bi./spx admin images import --arch x86_64 --distro ubuntu \
     --file ~/isos/noble-server-cloudimg-amd64.img --version 24.04
 
 # Stop when done
-./scripts/stop-dev.sh
+sudo systemctl stop spinifex.target
 ```
 
 ---
@@ -1296,7 +1296,7 @@ No changes needed to the connection/stream model. The 5.99% TLS overhead is from
 
 ### Issue: Raft Election Loop on Shutdown
 
-**Symptom:** When stopping predastore (via `stop-dev.sh` or SIGTERM), Raft nodes get stuck in an infinite election loop:
+**Symptom:** When stopping predastore (via `systemctl stop spinifex.target` or SIGTERM), Raft nodes get stuck in an infinite election loop:
 
 ```
 raft: heartbeat timeout reached, starting election
