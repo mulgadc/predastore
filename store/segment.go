@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,7 +12,78 @@ import (
 	"sync/atomic"
 )
 
-const segFilename = "%016d.seg"
+const (
+	segFilename    = "%016d.seg"
+	idxSegFilename = "%016d.idx"
+)
+
+// idxEntry is one row of a segment's reverse sidecar (.idx): the in-segment
+// offset of an allocated extent, the shard key it holds, and its physical size.
+// Append-only; one row written per allocation so compaction can enumerate a
+// segment's extents without a full index scan.
+const idxEntrySize = 52 // Off(8) ‖ Key(36) ‖ PSize(8)
+
+type idxEntry struct {
+	Off   int64
+	Key   [36]byte
+	PSize int64
+}
+
+func (e idxEntry) encode() []byte {
+	buf := make([]byte, idxEntrySize)
+	binary.BigEndian.PutUint64(buf[0:8], uint64(e.Off)) //nolint:gosec // round-trips bit-for-bit via int64 cast on decode.
+	copy(buf[8:44], e.Key[:])
+	binary.BigEndian.PutUint64(buf[44:52], uint64(e.PSize)) //nolint:gosec // round-trips bit-for-bit via int64 cast on decode.
+	return buf
+}
+
+func decodeIdxEntry(b []byte) (e idxEntry, err error) {
+	if len(b) != idxEntrySize {
+		return e, fmt.Errorf("idxEntry: invalid length %d, want %d", len(b), idxEntrySize)
+	}
+	e.Off = int64(binary.BigEndian.Uint64(b[0:8])) //nolint:gosec // round-trips bit-for-bit from encode.
+	copy(e.Key[:], b[8:44])
+	e.PSize = int64(binary.BigEndian.Uint64(b[44:52])) //nolint:gosec // round-trips bit-for-bit from encode.
+	return e, nil
+}
+
+// scanIdx sequentially reads a segment's whole .idx sidecar into memory. Used
+// by compaction to enumerate every extent ever allocated in the segment; the
+// returned rows are selection hints back-checked against the index authority.
+func scanIdx(dir string, segNum uint64) ([]idxEntry, error) {
+	f, err := openFile(filepath.Join(dir, fmt.Sprintf(idxSegFilename, segNum)))
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			slog.Warn("failed to close idx", "segNum", segNum, "error", closeErr)
+		}
+	}()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	// A torn trailing record is a crash mid-append: since .idx is fsynced before
+	// the index commit, that extent never went live, so dropping the partial row
+	// is safe. Enumerate only whole records.
+	count := info.Size() / idxEntrySize
+	entries := make([]idxEntry, 0, count)
+	buf := make([]byte, idxEntrySize)
+	for i := range count {
+		if _, err := f.ReadAt(buf, i*idxEntrySize); err != nil {
+			return nil, err
+		}
+		e, err := decodeIdxEntry(buf)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
 
 // magic identifies the encryption-at-rest segment format. There is no in-place
 // migration from older formats — openSegment rejects them so the operator is
@@ -75,7 +147,11 @@ var openFile = func(path string) (file, error) {
 // race with Wait. full caches the on-disk full flag so the hot Append path
 // avoids a ReadAt per call.
 type segment struct {
-	file
+	file // .seg
+
+	idx     file   // .idx sidecar
+	idxSize int64  // .idx append cursor, guarded by store.mutex
+	num     uint64 // for unlink paths on drop
 
 	refs sync.WaitGroup
 	full atomic.Bool
@@ -84,6 +160,45 @@ type segment struct {
 func (seg *segment) addRef()      { seg.refs.Add(1) }
 func (seg *segment) releaseRef()  { seg.refs.Done() }
 func (seg *segment) waitForRefs() { seg.refs.Wait() }
+
+// appendIdx writes one row at the .idx append cursor and advances it. Caller
+// holds store.mutex.
+func (seg *segment) appendIdx(e idxEntry) error {
+	if _, err := seg.idx.WriteAt(e.encode(), seg.idxSize); err != nil {
+		return err
+	}
+	seg.idxSize += idxEntrySize
+	return nil
+}
+
+func (seg *segment) syncIdx() error { return seg.idx.Sync() }
+
+// dropSegment removes a fully-drained segment: evict from segCache, drain refs,
+// close both fds, and unlink .seg + .idx. Caller holds store.mutex. Safe only
+// after every live extent the segment held has been CAS-committed elsewhere.
+func (store *Store) dropSegment(num uint64) error {
+	seg, ok := store.segCache[num]
+	if !ok {
+		return nil
+	}
+	delete(store.segCache, num)
+	seg.waitForRefs()
+
+	var errs []error
+	if err := seg.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close segment %d: %w", num, err))
+	}
+	if err := seg.idx.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close idx %d: %w", num, err))
+	}
+	if err := os.Remove(filepath.Join(store.dir, fmt.Sprintf(segFilename, num))); err != nil {
+		errs = append(errs, fmt.Errorf("unlink segment %d: %w", num, err))
+	}
+	if err := os.Remove(filepath.Join(store.dir, fmt.Sprintf(idxSegFilename, num))); err != nil {
+		errs = append(errs, fmt.Errorf("unlink idx %d: %w", num, err))
+	}
+	return errors.Join(errs...)
+}
 
 // getSegment returns a cached segment or opens it from disk. Callers must hold
 // store.mutex.
@@ -139,23 +254,35 @@ func openSegment(dir string, num uint64) (*segment, error) {
 		return nil, err
 	}
 
+	idxFile, err := openFile(filepath.Join(dir, fmt.Sprintf(idxSegFilename, num)))
+	if err != nil {
+		if closeErr := f.Close(); closeErr != nil {
+			slog.Warn("failed to close segment", "segNum", num, "error", closeErr)
+		}
+		return nil, err
+	}
+
 	defer func() {
 		if err != nil {
-			if closeErr := f.Close(); closeErr != nil {
-				slog.Warn("failed to close segment",
-					"segNum", num,
-					"error", closeErr,
-				)
+			for name, c := range map[string]file{"segment": f, "idx": idxFile} {
+				if closeErr := c.Close(); closeErr != nil {
+					slog.Warn("failed to close "+name, "segNum", num, "error", closeErr)
+				}
 			}
 		}
 	}()
+
+	idxInfo, err := idxFile.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat idx %d: %w", num, err)
+	}
 
 	info, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
 
-	seg := &segment{file: f}
+	seg := &segment{file: f, idx: idxFile, idxSize: idxInfo.Size(), num: num}
 
 	switch {
 	// New file: write the segment header.

@@ -6,6 +6,7 @@
 package store
 
 import (
+	"bytes"
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
@@ -60,6 +61,9 @@ type Store struct {
 
 	maxSegSize uint64
 
+	compactionEnabled bool
+	compactor         *compactor
+
 	closed bool
 }
 
@@ -91,6 +95,15 @@ type Option func(*Store) error
 func WithMaxSegSize(n uint64) Option {
 	return func(s *Store) error {
 		s.maxSegSize = n
+		return nil
+	}
+}
+
+// WithCompaction starts a background compactor that reclaims dead space on an
+// interval. Without it, no compaction goroutine runs.
+func WithCompaction() Option {
+	return func(s *Store) error {
+		s.compactionEnabled = true
 		return nil
 	}
 }
@@ -159,6 +172,10 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 
 	if _, err := store.nextAvailableSegment(); err != nil {
 		return nil, err
+	}
+
+	if store.compactionEnabled {
+		store.startCompactor()
 	}
 
 	slog.Info("store opened",
@@ -263,6 +280,12 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		LSize:  size,
 	}
 
+	key := MakeShardKey(objectHash, shardIndex)
+	if err := seg.appendIdx(idxEntry{Off: off, Key: [36]byte(key), PSize: ext.PSize}); err != nil {
+		seg.releaseRef()
+		return nil, fmt.Errorf("append idx: %w", err)
+	}
+
 	w := &writer{
 		store:      store,
 		objectHash: objectHash,
@@ -345,8 +368,48 @@ func (store *Store) commitExtent(objectHash [32]byte, shardIndex uint32, ext ext
 	return nil
 }
 
-// Delete removes the index entry for a shard. The on-disk extent becomes dead
-// space reclaimable by a future compactor.
+// errStaleSlot signals that a compare-and-swap found the key no longer pointing
+// at the expected extent — a concurrent overwrite or delete won the race.
+var errStaleSlot = errors.New("extent slot moved")
+
+// casExtent commits new only if key still encodes old, in a single index
+// transaction; it retries on badger write conflicts. committed is false (with a
+// nil error) when the slot moved out from under us or the key was deleted — the
+// caller treats the just-copied bytes as harmless dead space.
+func (store *Store) casExtent(key []byte, old, next extent) (committed bool, err error) {
+	for {
+		err = store.index.Badger.Update(func(txn *badger.Txn) error {
+			item, err := txn.Get(key)
+			if err != nil {
+				return err
+			}
+			cur, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			if !bytes.Equal(cur, old.encode()) {
+				return errStaleSlot
+			}
+			return txn.Set(key, next.encode())
+		})
+
+		switch {
+		case errors.Is(err, badger.ErrConflict):
+			continue
+		case errors.Is(err, errStaleSlot), errors.Is(err, badger.ErrKeyNotFound):
+			return false, nil
+		case err != nil:
+			return false, err
+		}
+		return true, nil
+	}
+}
+
+// Delete removes the index entry for a shard in a single index transaction:
+// read the current extent, write a slot-keyed tombstone for compaction's
+// selector, then delete the live key. Tombstone and deletion commit together,
+// so the dead-space hint can never outlive or precede the deletion it records.
+// The on-disk extent becomes dead space reclaimable by the compactor.
 func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
@@ -356,24 +419,52 @@ func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) error {
 	}
 
 	key := MakeShardKey(objectHash, shardIndex)
-	if err := store.index.Delete(key); err != nil {
-		return fmt.Errorf("delete: %w", err)
-	}
+	return store.index.Badger.Update(func(txn *badger.Txn) error {
+		item, err := txn.Get(key)
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("delete: read extent: %w", err)
+		}
 
-	return nil
+		raw, err := item.ValueCopy(nil)
+		if err != nil {
+			return fmt.Errorf("delete: copy extent: %w", err)
+		}
+		ext, err := decodeExtent(raw)
+		if err != nil {
+			return fmt.Errorf("delete: decode extent: %w", err)
+		}
+
+		if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
+			return fmt.Errorf("delete: put tombstone: %w", err)
+		}
+		return txn.Delete(key)
+	})
 }
 
 // Close blocks until all outstanding segment references drain, then closes
 // segment file descriptors and the index. Must be called exactly once.
 func (store *Store) Close() error {
 	store.mutex.Lock()
-	defer store.mutex.Unlock()
-
 	if store.closed {
+		store.mutex.Unlock()
 		return ErrClosedStore
 	}
-
 	store.closed = true
+	c := store.compactor
+	store.mutex.Unlock()
+
+	// Stop the compactor without holding the mutex: an in-flight cycle takes
+	// store.mutex, so joining under the lock would deadlock. closed is already
+	// set, so no new public mutation slips in behind the join.
+	if c != nil {
+		c.stop()
+	}
+
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
 
 	var errs []error
 
@@ -394,6 +485,33 @@ func (store *Store) Close() error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// Slot-keyed tombstones live in the index under the tombstonePrefix namespace:
+// Delete writes d ‖ BE(segNum) ‖ BE(off) → BE(PSize) for the extent it removes.
+// They are a candidate-selection accelerator for compaction only — never
+// consulted for correctness. Keyed by physical slot so the same object key
+// dying more than once stays unique.
+const tombstonePrefix = 'd'
+
+const tombstoneKeySize = 17 // prefix(1) ‖ segNum(8) ‖ off(8)
+
+func tombstoneKey(segNum uint64, off int64) []byte {
+	key := make([]byte, tombstoneKeySize)
+	key[0] = tombstonePrefix
+	binary.BigEndian.PutUint64(key[1:9], segNum)
+	binary.BigEndian.PutUint64(key[9:17], uint64(off)) //nolint:gosec // round-trips bit-for-bit via int64 cast on decode.
+	return key
+}
+
+func tombstoneSegNum(key []byte) uint64 {
+	return binary.BigEndian.Uint64(key[1:9])
+}
+
+func tombstoneValue(psize int64) []byte {
+	v := make([]byte, 8)
+	binary.BigEndian.PutUint64(v, uint64(psize)) //nolint:gosec // PSize is a non-negative on-disk byte count.
+	return v
 }
 
 // MakeShardKey builds a 36-byte index key: 32-byte object hash || 4-byte big-endian shard index.

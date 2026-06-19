@@ -11,3 +11,7 @@ func SetOpenFile(f func(path string) (File, error)) (restore func()) {
 	openFile = f
 	return func() { openFile = prev }
 }
+
+// CompactOnce runs a single compaction cycle synchronously. The background
+// compactor is wired separately; tests drive cycles deterministically here.
+func (store *Store) CompactOnce() error { return store.compactOnce() }
