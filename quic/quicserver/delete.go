@@ -8,20 +8,23 @@ import (
 	"github.com/mulgadc/predastore/quic/quicproto"
 )
 
-// handleDELETEShard removes shard metadata from the store index. The on-disk
-// extent becomes dead space reclaimable by a future compactor.
+// handleDELETEShard marks shard metadata in the store index as deleted so that it may be reclaimed by compaction.
 func (qs *QuicServer) handleDELETEShard(bw *bufio.Writer, req quicproto.Header, delReq DeleteRequest) {
-	if err := qs.store.Delete(delReq.ObjectHash, delReq.ShardIndex); err != nil {
-		slog.Debug("handleDELETEShard: delete failed", "bucket", delReq.Bucket, "object", delReq.Object, "shardIndex", delReq.ShardIndex, "error", err)
+	deleted, err := qs.store.Delete(delReq.ObjectHash, delReq.ShardIndex)
+	if err != nil {
+		slog.Error("handleDELETEShard: delete failed", "bucket", delReq.Bucket, "object", delReq.Object, "shardIndex", delReq.ShardIndex, "error", err)
+		qs.sendDeleteResponse(bw, req, false, err.Error())
+		return
 	}
 
 	slog.Debug("handleDELETEShard: deleted shard",
 		"bucket", delReq.Bucket,
 		"object", delReq.Object,
 		"shardIndex", delReq.ShardIndex,
+		"deleted", deleted,
 	)
 
-	qs.sendDeleteResponse(bw, req, true, "")
+	qs.sendDeleteResponse(bw, req, deleted, "")
 }
 
 func (qs *QuicServer) sendDeleteResponse(bw *bufio.Writer, req quicproto.Header, deleted bool, errMsg string) {

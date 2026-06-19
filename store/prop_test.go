@@ -175,10 +175,13 @@ func (sm *baseSM) Delete(t *rapid.T) {
 	objectHash := [32]byte(key[:32])
 	shardIndex := binary.BigEndian.Uint32(key[32:])
 
-	refErr := sm.Ref.Delete(objectHash, shardIndex)
-	realErr := sm.Real.Delete(objectHash, shardIndex)
+	refDeleted, refErr := sm.Ref.Delete(objectHash, shardIndex)
+	realDeleted, realErr := sm.Real.Delete(objectHash, shardIndex)
 	if sm.Strict() && !errors.Is(realErr, refErr) {
 		t.Fatalf("delete: ref=%v real=%v", refErr, realErr)
+	}
+	if sm.Strict() && refErr == nil && refDeleted != realDeleted {
+		t.Fatalf("delete: ref deleted=%v real deleted=%v", refDeleted, realDeleted)
 	}
 }
 

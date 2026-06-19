@@ -161,7 +161,7 @@ func NewWithRetry(walDir string, addr string, maxRetries int, opts ...Option) (*
 		return nil, fmt.Errorf("quicserver: tls cert and key are required (use WithTLSCertFiles)")
 	}
 
-	s, err := store.Open(walDir, store.WithAEAD(qs.aead))
+	s, err := store.Open(walDir, store.WithAEAD(qs.aead), store.WithCompaction())
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("open store in %s: %w", walDir, err)

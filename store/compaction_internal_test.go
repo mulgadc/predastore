@@ -119,7 +119,7 @@ func TestCompactionPreservesFragNum(t *testing.T) {
 	wantFragNums := fragNumsAt(t, dir, before)
 	wantBody := readShard(t, st, oh, 1)
 
-	if err := st.Delete(oh, 0); err != nil {
+	if _, err := st.Delete(oh, 0); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if err := st.compactOnce(); err != nil {
@@ -148,7 +148,7 @@ func TestCompactionPreservesFragNum(t *testing.T) {
 
 func TestCompactionFragNumsGloballyUnique(t *testing.T) {
 	st, dir, oh := segment0LayoutStore(t)
-	if err := st.Delete(oh, 0); err != nil {
+	if _, err := st.Delete(oh, 0); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if err := st.compactOnce(); err != nil {
@@ -168,7 +168,7 @@ func TestCompactionFragNumsGloballyUnique(t *testing.T) {
 
 func TestCandidateSelectionAllDeadSegmentIsCandidate(t *testing.T) {
 	st, _, oh := segment0LayoutStore(t)
-	if err := st.Delete(oh, 0); err != nil {
+	if _, err := st.Delete(oh, 0); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
@@ -196,7 +196,7 @@ func TestCandidateSelectionNeverSelectsActiveSegment(t *testing.T) {
 	st, _ := openTestStore(t, WithMaxSegSize(64*KiB))
 	oh := [32]byte{0x7}
 	putShard(t, st, oh, 0, bytes.Repeat([]byte{0x1}, 4*KiB))
-	if err := st.Delete(oh, 0); err != nil {
+	if _, err := st.Delete(oh, 0); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
