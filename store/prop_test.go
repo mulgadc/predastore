@@ -182,6 +182,20 @@ func (sm *baseSM) Delete(t *rapid.T) {
 	}
 }
 
+// Compact runs one compaction cycle on the real store. Compaction is invisible
+// to logical state, so the reference oracle is untouched; the post-action Check
+// then asserts every live shard still reads back byte-identical — the central
+// compaction-correctness invariant. Under relaxed mode a fault-injected error
+// is tolerated.
+func (sm *baseSM) Compact(t *rapid.T) {
+	if sm.Ref.IsClosed() {
+		return
+	}
+	if err := sm.Real.CompactOnce(); err != nil && sm.Strict() {
+		t.Fatalf("compact: %v", err)
+	}
+}
+
 // Check is the invariant: every key present in the reference must read back
 // identical bytes from the real store. Under relaxed mode (post-fault),
 // per-key divergence is tolerated.
