@@ -410,16 +410,20 @@ func (store *Store) casExtent(key []byte, old, next extent) (committed bool, err
 // selector, then delete the live key. Tombstone and deletion commit together,
 // so the dead-space hint can never outlive or precede the deletion it records.
 // The on-disk extent becomes dead space reclaimable by the compactor.
-func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) error {
+// Delete tombstones the extent for the given shard and removes its index entry.
+// The bool reports whether an extent existed and was removed; a missing shard is
+// not an error and returns (false, nil), keeping deletes idempotent.
+func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) (bool, error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
 	if store.closed {
-		return ErrClosedStore
+		return false, ErrClosedStore
 	}
 
 	key := MakeShardKey(objectHash, shardIndex)
-	return store.index.Badger.Update(func(txn *badger.Txn) error {
+	deleted := false
+	err := store.index.Badger.Update(func(txn *badger.Txn) error {
 		item, err := txn.Get(key)
 		if errors.Is(err, badger.ErrKeyNotFound) {
 			return nil
@@ -440,8 +444,16 @@ func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) error {
 		if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
 			return fmt.Errorf("delete: put tombstone: %w", err)
 		}
-		return txn.Delete(key)
+		if err := txn.Delete(key); err != nil {
+			return err
+		}
+		deleted = true
+		return nil
 	})
+	if err != nil {
+		return false, err
+	}
+	return deleted, nil
 }
 
 // Close blocks until all outstanding segment references drain, then closes

@@ -82,7 +82,7 @@ func TestCompactionDropsDrainedSegmentAndShrinks(t *testing.T) {
 	}
 
 	before := dirBytes(t, dir)
-	if err := st.Delete(oh, 0); err != nil {
+	if _, err := st.Delete(oh, 0); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if err := st.CompactOnce(); err != nil {
@@ -122,7 +122,7 @@ func TestConcurrentOverwriteDuringCompaction(t *testing.T) {
 	write(t, st, oh, 1, filler) // segment 0
 	write(t, st, oh, 2, filler) // rolls; segment 0 now drainable once a shard dies
 
-	if err := st.Delete(oh, 0); err != nil {
+	if _, err := st.Delete(oh, 0); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
@@ -201,7 +201,7 @@ func TestCompactionFaultLeavesLiveDataReadable(t *testing.T) {
 	write(t, st, oh, 0, body)
 	write(t, st, oh, 1, body)
 	write(t, st, oh, 2, body)
-	if err := st.Delete(oh, 0); err != nil {
+	if _, err := st.Delete(oh, 0); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 

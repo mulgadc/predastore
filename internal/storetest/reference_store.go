@@ -67,14 +67,16 @@ func (st *RefStore) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 	}, nil
 }
 
-func (st *RefStore) Delete(objectHash [32]byte, shardIndex uint32) error {
+func (st *RefStore) Delete(objectHash [32]byte, shardIndex uint32) (bool, error) {
 	if st.closed {
-		return store.ErrClosedStore
+		return false, store.ErrClosedStore
 	}
 
-	delete(st.state, [36]byte(store.MakeShardKey(objectHash, shardIndex)))
+	key := [36]byte(store.MakeShardKey(objectHash, shardIndex))
+	_, existed := st.state[key]
+	delete(st.state, key)
 
-	return nil
+	return existed, nil
 }
 
 func (st *RefStore) Len() int {
