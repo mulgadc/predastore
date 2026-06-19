@@ -1,10 +1,5 @@
 nbdkit-perf*
 
-# Go workspace
-go.work
-go.work.sum
-.gocache
-
 # Build outputs
 bin/
 tmp/
