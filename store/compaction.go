@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	// compactionInterval is how often the background compactor runs a cycle.
-	compactionInterval = 5 * time.Minute
+	// defaultCompactionInterval is the fallback cycle period used when the
+	// caller does not supply one via WithCompaction.
+	defaultCompactionInterval = 5 * time.Minute
 
 	// compactionLiveThreshold is the live-byte fraction below which a segment
 	// becomes a compaction candidate. A segment whose live data is under this
@@ -40,7 +41,7 @@ func (store *Store) startCompactor() {
 
 func (c *compactor) loop() {
 	defer c.wg.Done()
-	ticker := time.NewTicker(compactionInterval)
+	ticker := time.NewTicker(c.store.compactionInterval)
 	defer ticker.Stop()
 
 	for {
@@ -72,7 +73,7 @@ func (store *Store) compactOnce() error {
 	}
 
 	start := time.Now()
-	slog.Info("compaction started", "interval", compactionInterval, "liveThreshold", compactionLiveThreshold)
+	slog.Info("compaction started", "interval", store.compactionInterval, "liveThreshold", compactionLiveThreshold)
 
 	candidates, err := store.candidateSegments()
 	if err != nil {
