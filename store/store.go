@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/mulgadc/predastore/s3db"
@@ -61,8 +62,9 @@ type Store struct {
 
 	maxSegSize uint64
 
-	compactionEnabled bool
-	compactor         *compactor
+	compactionEnabled  bool
+	compactionInterval time.Duration
+	compactor          *compactor
 
 	closed bool
 }
@@ -99,11 +101,15 @@ func WithMaxSegSize(n uint64) Option {
 	}
 }
 
-// WithCompaction starts a background compactor that reclaims dead space on an
-// interval. Without it, no compaction goroutine runs.
-func WithCompaction() Option {
+// WithCompaction starts a background compactor that reclaims dead space on the
+// given interval. A non-positive interval falls back to
+// defaultCompactionInterval. Without this option, no compaction goroutine runs.
+func WithCompaction(interval time.Duration) Option {
 	return func(s *Store) error {
 		s.compactionEnabled = true
+		if interval > 0 {
+			s.compactionInterval = interval
+		}
 		return nil
 	}
 }
@@ -137,9 +143,10 @@ func WithAEAD(aead cipher.AEAD) Option {
 // WithAEAD is mandatory — Open errors if no cipher was supplied.
 func Open(dir string, opts ...Option) (store *Store, err error) {
 	store = &Store{
-		dir:        dir,
-		segCache:   make(map[uint64]*segment),
-		maxSegSize: DefaultMaxSegSize,
+		dir:                dir,
+		segCache:           make(map[uint64]*segment),
+		maxSegSize:         DefaultMaxSegSize,
+		compactionInterval: defaultCompactionInterval,
 	}
 
 	for _, opt := range opts {

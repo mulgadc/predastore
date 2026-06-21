@@ -154,7 +154,7 @@ func TestConcurrentOverwriteDuringCompaction(t *testing.T) {
 }
 
 func TestCompactorLifecycleStartsAndStops(t *testing.T) {
-	st, _ := openStore(t, store.WithCompaction())
+	st, _ := openStore(t, store.WithCompaction(time.Hour))
 
 	done := make(chan error, 1)
 	go func() { done <- st.Close() }()

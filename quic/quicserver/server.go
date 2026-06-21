@@ -38,6 +38,8 @@ type QuicServer struct {
 	tlsCert string
 	tlsKey  string
 
+	compactionInterval time.Duration
+
 	store *store.Store
 
 	// Listener for graceful shutdown
@@ -86,6 +88,15 @@ func WithTLSCertFiles(certPath, keyPath string) Option {
 		}
 		qs.tlsCert = certPath
 		qs.tlsKey = keyPath
+		return nil
+	}
+}
+
+// WithCompactionInterval sets how often the store's background compactor runs.
+// A non-positive duration leaves the store's default in effect.
+func WithCompactionInterval(d time.Duration) Option {
+	return func(qs *QuicServer) error {
+		qs.compactionInterval = d
 		return nil
 	}
 }
@@ -161,7 +172,7 @@ func NewWithRetry(walDir string, addr string, maxRetries int, opts ...Option) (*
 		return nil, fmt.Errorf("quicserver: tls cert and key are required (use WithTLSCertFiles)")
 	}
 
-	s, err := store.Open(walDir, store.WithAEAD(qs.aead), store.WithCompaction())
+	s, err := store.Open(walDir, store.WithAEAD(qs.aead), store.WithCompaction(qs.compactionInterval))
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("open store in %s: %w", walDir, err)

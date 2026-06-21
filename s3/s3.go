@@ -28,6 +28,11 @@ type RS struct {
 	Parity int `toml:"parity"`
 }
 
+// Compaction holds tuning for the QUIC shard store's background compactor.
+type Compaction struct {
+	IntervalSeconds int `toml:"interval_seconds"`
+}
+
 type Nodes struct {
 	ID     int    `toml:"id"`
 	Host   string `toml:"host"`
@@ -60,6 +65,9 @@ type Config struct {
 
 	RS    RS      `toml:"rs"`
 	Nodes []Nodes `toml:"nodes"`
+
+	// Compaction tuning for the QUIC shard store (optional; store defaults apply).
+	Compaction Compaction `toml:"compaction"`
 
 	// Distributed database nodes for global state
 	DB []DBNode `toml:"db"`

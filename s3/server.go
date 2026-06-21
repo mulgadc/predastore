@@ -655,6 +655,7 @@ func (s *Server) launchQUICServers() {
 				quicserver.New(nodePath, quicAddr,
 					quicserver.WithMasterKey(s.masterKey),
 					quicserver.WithTLSCertFiles(s.tlsCert, s.tlsKey),
+					quicserver.WithCompactionInterval(s.compactionInterval()),
 				)
 				return
 			}
@@ -681,11 +682,18 @@ func (s *Server) launchQUICServers() {
 			quicserver.New(nodePath, quicAddr,
 				quicserver.WithMasterKey(s.masterKey),
 				quicserver.WithTLSCertFiles(s.tlsCert, s.tlsKey),
+				quicserver.WithCompactionInterval(s.compactionInterval()),
 			)
 		}
 	} else {
 		slog.Error("Distributed mode requires -node flag when nodes have different hosts")
 	}
+}
+
+// compactionInterval converts the configured interval (in seconds) to a
+// duration. A non-positive value yields zero, leaving the store default.
+func (s *Server) compactionInterval() time.Duration {
+	return time.Duration(s.config.Compaction.IntervalSeconds) * time.Second
 }
 
 // initCredentialProvider creates the appropriate CredentialProvider based on config.
