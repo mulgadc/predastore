@@ -34,6 +34,7 @@ func (store *Store) startCompactor() {
 	c := &compactor{store: store, done: make(chan struct{})}
 	store.compactor = c
 	c.wg.Add(1)
+	slog.Info("compactor started")
 	go c.loop()
 }
 
@@ -57,6 +58,7 @@ func (c *compactor) loop() {
 func (c *compactor) stop() {
 	close(c.done)
 	c.wg.Wait()
+	slog.Info("compactor stopped")
 }
 
 // compactOnce runs one full compaction cycle: select under-occupied segments,
@@ -69,20 +71,36 @@ func (store *Store) compactOnce() error {
 		return ErrClosedStore
 	}
 
+	start := time.Now()
+	slog.Info("compaction started", "interval", compactionInterval, "liveThreshold", compactionLiveThreshold)
+
 	candidates, err := store.candidateSegments()
 	if err != nil {
 		return fmt.Errorf("select candidates: %w", err)
 	}
 
+	var totalExtents int
+	var totalBytes int64
 	for _, num := range candidates {
-		if err := store.compactSegment(num); err != nil {
+		segStart := time.Now()
+		stats, err := store.compactSegment(num)
+		if err != nil {
 			return fmt.Errorf("compact segment %d: %w", num, err)
 		}
+		totalExtents += stats.extents
+		totalBytes += stats.bytes
+		slog.Info("compacted segment",
+			"segNum", num,
+			"extents", stats.extents,
+			"bytes", stats.bytes,
+			"duration", time.Since(segStart))
 	}
 
-	if len(candidates) > 0 {
-		slog.Info("compaction cycle complete", "segments", len(candidates))
-	}
+	slog.Info("compaction finished",
+		"segments", len(candidates),
+		"extents", totalExtents,
+		"bytes", totalBytes,
+		"duration", time.Since(start))
 	return nil
 }
 
@@ -128,14 +146,22 @@ func (store *Store) candidateSegments() ([]uint64, error) {
 	return candidates, nil
 }
 
+// segmentStats summarises the live data relocated out of one drained segment.
+type segmentStats struct {
+	extents int
+	bytes   int64
+}
+
 // compactSegment relocates every live extent the segment holds into the active
 // append segment, then drops the drained segment and clears its tombstones. An
 // extent enumerated from .idx is live only if the index still points at this
 // exact slot; anything deleted or superseded is skipped.
-func (store *Store) compactSegment(num uint64) error {
+func (store *Store) compactSegment(num uint64) (segmentStats, error) {
+	var stats segmentStats
+
 	entries, err := scanIdx(store.dir, num)
 	if err != nil {
-		return fmt.Errorf("scan idx %d: %w", num, err)
+		return stats, fmt.Errorf("scan idx %d: %w", num, err)
 	}
 
 	for _, e := range entries {
@@ -145,28 +171,30 @@ func (store *Store) compactSegment(num uint64) error {
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("get extent: %w", err)
+			return stats, fmt.Errorf("get extent: %w", err)
 		}
 		cur, err := decodeExtent(raw)
 		if err != nil {
-			return fmt.Errorf("decode extent: %w", err)
+			return stats, fmt.Errorf("decode extent: %w", err)
 		}
 		if cur.SegNum != num || cur.Off != e.Off {
 			continue
 		}
 		if err := store.relocateExtent(key, cur); err != nil {
-			return fmt.Errorf("relocate extent: %w", err)
+			return stats, fmt.Errorf("relocate extent: %w", err)
 		}
+		stats.extents++
+		stats.bytes += cur.PSize
 	}
 
 	store.mutex.Lock()
 	err = store.dropSegment(num)
 	store.mutex.Unlock()
 	if err != nil {
-		return fmt.Errorf("drop segment %d: %w", num, err)
+		return stats, fmt.Errorf("drop segment %d: %w", num, err)
 	}
 
-	return store.deleteTombstones(num)
+	return stats, store.deleteTombstones(num)
 }
 
 // relocateExtent copies an extent's raw fragment bytes verbatim into a freshly
