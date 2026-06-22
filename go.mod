@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/aws/aws-sdk-go-v2 v1.42.0
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.24
-	github.com/aws/aws-sdk-go-v2/service/s3 v1.103.3
+	github.com/aws/aws-sdk-go-v2/service/s3 v1.104.0
 	github.com/buraksezer/consistent v0.10.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dgraph-io/badger/v4 v4.9.2
@@ -13,10 +13,10 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
-	github.com/klauspost/reedsolomon v1.14.0
+	github.com/klauspost/reedsolomon v1.14.1
 	github.com/minio/crc64nvme v1.1.1
 	github.com/nats-io/nats.go v1.52.0
-	github.com/pelletier/go-toml/v2 v2.3.1
+	github.com/pelletier/go-toml/v2 v2.4.0
 	github.com/quic-go/quic-go v0.60.0
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/time v0.15.0
