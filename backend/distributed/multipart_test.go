@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/gob"
 	"fmt"
 	"io"
 	"os"
@@ -27,8 +28,10 @@ import (
 // bind conflicts when the OS hasn't fully released UDP ports from the prior test.
 var multipartPortCounter atomic.Int32
 
-// setupMultipartTestBackend creates a distributed backend with QUIC servers for testing
-func setupMultipartTestBackend(t *testing.T) (*Backend, func()) {
+// setupMultipartTestBackend creates a distributed backend with QUIC servers for testing.
+// The returned slice exposes the per-node QUIC servers (indexed by node number) so tests
+// can probe shard presence and inject node failures.
+func setupMultipartTestBackend(t *testing.T) (*Backend, []*quicserver.QuicServer, func()) {
 	t.Helper()
 
 	tmpDir := t.TempDir()
@@ -84,11 +87,97 @@ func setupMultipartTestBackend(t *testing.T) (*Backend, func()) {
 		be.Close()
 	}
 
-	return be, cleanup
+	return be, quicServers, cleanup
+}
+
+// shardExistsOnNode probes a single QUIC node for the presence of one shard of an object,
+// returning true if the node still serves it. Used to assert part shards are deleted on
+// cleanup while the assembled object's shards survive.
+func shardExistsOnNode(t *testing.T, be *Backend, node uint32, bucket, key string, shardIndex int) bool {
+	t.Helper()
+	ctx := context.Background()
+	client, err := quicclient.DialPooled(ctx, be.getNodeAddr(int(node)))
+	require.NoError(t, err)
+
+	rc, err := client.Get(ctx, quicserver.ObjectRequest{
+		Bucket:     bucket,
+		Object:     key,
+		RangeStart: -1,
+		RangeEnd:   -1,
+		ShardIndex: uint32(shardIndex),
+	})
+	if err != nil {
+		return false
+	}
+	_ = rc.Close()
+	return true
+}
+
+// loadPartShardNodes decodes the stored ObjectToShardNodes for a part from globalState.
+func loadPartShardNodes(t *testing.T, be *Backend, uploadID string, partNumber int) ObjectToShardNodes {
+	t.Helper()
+	key := fmt.Sprintf("part:%s:%05d", uploadID, partNumber)
+	data, err := be.globalState.Get(TableObjects, []byte(key))
+	require.NoError(t, err)
+
+	var nodes ObjectToShardNodes
+	require.NoError(t, gob.NewDecoder(bytes.NewReader(data)).Decode(&nodes))
+	return nodes
+}
+
+// assertAllPartShardsDeleted asserts every data+parity shard of the given part is gone
+// from its node.
+func assertAllPartShardsDeleted(t *testing.T, be *Backend, bucket, key, uploadID string, partNumber int, nodes ObjectToShardNodes) {
+	t.Helper()
+	partObjKey := partObjectKey(bucket, key, uploadID, partNumber)
+
+	for i, node := range nodes.DataShardNodes {
+		assert.False(t, shardExistsOnNode(t, be, node, bucket, partObjKey, i),
+			"data shard %d for part %d should be deleted on node %d", i, partNumber, node)
+	}
+	for i, node := range nodes.ParityShardNodes {
+		shardIndex := len(nodes.DataShardNodes) + i
+		assert.False(t, shardExistsOnNode(t, be, node, bucket, partObjKey, shardIndex),
+			"parity shard %d for part %d should be deleted on node %d", shardIndex, partNumber, node)
+	}
+}
+
+// createUploadWithParts creates a multipart upload and uploads partData in order,
+// returning the upload ID and the completed-part descriptors.
+func createUploadWithParts(t *testing.T, be *Backend, bucket, key string, partData [][]byte) (string, []backend.CompletedPart) {
+	t.Helper()
+	ctx := context.Background()
+
+	createResp, err := be.CreateMultipartUpload(ctx, &backend.CreateMultipartUploadRequest{Bucket: bucket, Key: key})
+	require.NoError(t, err)
+
+	parts := make([]backend.CompletedPart, len(partData))
+	for i, data := range partData {
+		resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
+			Bucket:     bucket,
+			Key:        key,
+			UploadID:   createResp.UploadID,
+			PartNumber: i + 1,
+			Body:       bytes.NewReader(data),
+		})
+		require.NoError(t, err)
+		parts[i] = backend.CompletedPart{PartNumber: i + 1, ETag: resp.ETag}
+	}
+	return createResp.UploadID, parts
+}
+
+// captureShardMaps records each part's ObjectToShardNodes before cleanup removes it.
+func captureShardMaps(t *testing.T, be *Backend, uploadID string, parts []backend.CompletedPart) map[int]ObjectToShardNodes {
+	t.Helper()
+	maps := make(map[int]ObjectToShardNodes, len(parts))
+	for _, p := range parts {
+		maps[p.PartNumber] = loadPartShardNodes(t, be, uploadID, p.PartNumber)
+	}
+	return maps
 }
 
 func TestDistributed_CreateMultipartUpload(t *testing.T) {
-	be, cleanup := setupMultipartTestBackend(t)
+	be, _, cleanup := setupMultipartTestBackend(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -140,7 +229,7 @@ func TestDistributed_CreateMultipartUpload(t *testing.T) {
 }
 
 func TestDistributed_UploadPart(t *testing.T) {
-	be, cleanup := setupMultipartTestBackend(t)
+	be, _, cleanup := setupMultipartTestBackend(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -254,7 +343,7 @@ func TestDistributed_UploadPart(t *testing.T) {
 }
 
 func TestDistributed_CompleteMultipartUpload(t *testing.T) {
-	be, cleanup := setupMultipartTestBackend(t)
+	be, _, cleanup := setupMultipartTestBackend(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -438,7 +527,7 @@ func TestDistributed_CompleteMultipartUpload(t *testing.T) {
 }
 
 func TestDistributed_AbortMultipartUpload(t *testing.T) {
-	be, cleanup := setupMultipartTestBackend(t)
+	be, _, cleanup := setupMultipartTestBackend(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -490,7 +579,7 @@ func TestDistributed_AbortMultipartUpload(t *testing.T) {
 }
 
 func TestDistributed_MultipartUpload_FullWorkflow(t *testing.T) {
-	be, cleanup := setupMultipartTestBackend(t)
+	be, _, cleanup := setupMultipartTestBackend(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -607,7 +696,7 @@ func TestDistributed_MultipartUpload_LargeNumberOfParts(t *testing.T) {
 		t.Skip("Skipping large parts test in short mode")
 	}
 
-	be, cleanup := setupMultipartTestBackend(t)
+	be, _, cleanup := setupMultipartTestBackend(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -694,7 +783,7 @@ func TestDistributed_MultipartUpload_LargeNumberOfParts(t *testing.T) {
 }
 
 func TestDistributed_MultipartUpload_PartOverwrite(t *testing.T) {
-	be, cleanup := setupMultipartTestBackend(t)
+	be, _, cleanup := setupMultipartTestBackend(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -807,7 +896,7 @@ func TestDistributed_MultipartUpload_PartOverwrite(t *testing.T) {
 // Scope note: the 90 s total-elapsed bound is a deadlock detector, not a
 // performance regression. A per-part benchmark belongs in s3_bench_test.go.
 func TestDistributed_MultipartUpload_ConcurrentParts_Contention(t *testing.T) {
-	be, cleanup := setupMultipartTestBackend(t)
+	be, _, cleanup := setupMultipartTestBackend(t)
 	defer cleanup()
 
 	ctx := context.Background()
@@ -930,4 +1019,175 @@ func sortPartsByNumber(parts []backend.CompletedPart) {
 			parts[j-1], parts[j] = parts[j], parts[j-1]
 		}
 	}
+}
+
+// Verification case 1: CompleteMultipartUpload issues a QUIC shard-delete for every
+// part shard (data + parity).
+func TestDistributed_CompleteMultipartUpload_DeletesPartShards(t *testing.T) {
+	be, _, cleanup := setupMultipartTestBackend(t)
+	defer cleanup()
+	ctx := context.Background()
+	const bucket, key = "test-bucket", "complete-deletes-shards.bin"
+
+	part1 := bytes.Repeat([]byte{0x11}, int(multipart.MinPartSize))
+	part2 := []byte("final small part")
+	uploadID, parts := createUploadWithParts(t, be, bucket, key, [][]byte{part1, part2})
+	shardMaps := captureShardMaps(t, be, uploadID, parts)
+
+	_, err := be.CompleteMultipartUpload(ctx, &backend.CompleteMultipartUploadRequest{
+		Bucket: bucket, Key: key, UploadID: uploadID, Parts: parts,
+	})
+	require.NoError(t, err)
+
+	for _, p := range parts {
+		assertAllPartShardsDeleted(t, be, bucket, key, uploadID, p.PartNumber, shardMaps[p.PartNumber])
+	}
+}
+
+// Verification case 2: AbortMultipartUpload issues a QUIC shard-delete for every part shard.
+func TestDistributed_AbortMultipartUpload_DeletesPartShards(t *testing.T) {
+	be, _, cleanup := setupMultipartTestBackend(t)
+	defer cleanup()
+	ctx := context.Background()
+	const bucket, key = "test-bucket", "abort-deletes-shards.bin"
+
+	part1 := bytes.Repeat([]byte{0x22}, int(multipart.MinPartSize))
+	part2 := []byte("another small part")
+	uploadID, parts := createUploadWithParts(t, be, bucket, key, [][]byte{part1, part2})
+	shardMaps := captureShardMaps(t, be, uploadID, parts)
+
+	require.NoError(t, be.AbortMultipartUpload(ctx, bucket, key, uploadID))
+
+	for _, p := range parts {
+		assertAllPartShardsDeleted(t, be, bucket, key, uploadID, p.PartNumber, shardMaps[p.PartNumber])
+	}
+}
+
+// Verification case 3: the completed object's own shards survive cleanup (regression guard
+// that cleanup deletes part shards, not the assembled object).
+func TestDistributed_CompleteMultipartUpload_PreservesAssembledObject(t *testing.T) {
+	be, _, cleanup := setupMultipartTestBackend(t)
+	defer cleanup()
+	ctx := context.Background()
+	const bucket, key = "test-bucket", "preserve-assembled.bin"
+
+	part1 := bytes.Repeat([]byte{0x33}, int(multipart.MinPartSize))
+	part2 := []byte("tail bytes")
+	uploadID, parts := createUploadWithParts(t, be, bucket, key, [][]byte{part1, part2})
+
+	_, err := be.CompleteMultipartUpload(ctx, &backend.CompleteMultipartUploadRequest{
+		Bucket: bucket, Key: key, UploadID: uploadID, Parts: parts,
+	})
+	require.NoError(t, err)
+
+	getResp, err := be.GetObject(ctx, &backend.GetObjectRequest{Bucket: bucket, Key: key, RangeStart: -1, RangeEnd: -1})
+	require.NoError(t, err)
+	defer getResp.Body.Close()
+
+	readData, err := io.ReadAll(getResp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, append(append([]byte{}, part1...), part2...), readData)
+}
+
+// Verification case 4: upload + part metadata are removed from globalState after
+// complete and after abort.
+func TestDistributed_MultipartCleanup_RemovesMetadata(t *testing.T) {
+	be, _, cleanup := setupMultipartTestBackend(t)
+	defer cleanup()
+	ctx := context.Background()
+	const bucket = "test-bucket"
+
+	assertMetadataGone := func(t *testing.T, uploadID string) {
+		t.Helper()
+		_, err := be.getUploadMetadata(uploadID)
+		assert.Error(t, err)
+
+		stored, err := be.getStoredParts(uploadID)
+		require.NoError(t, err)
+		assert.Empty(t, stored)
+	}
+
+	t.Run("complete", func(t *testing.T) {
+		const key = "removes-metadata-complete.bin"
+		part1 := bytes.Repeat([]byte{0x44}, int(multipart.MinPartSize))
+		part2 := []byte("done")
+		uploadID, parts := createUploadWithParts(t, be, bucket, key, [][]byte{part1, part2})
+
+		_, err := be.CompleteMultipartUpload(ctx, &backend.CompleteMultipartUploadRequest{
+			Bucket: bucket, Key: key, UploadID: uploadID, Parts: parts,
+		})
+		require.NoError(t, err)
+		assertMetadataGone(t, uploadID)
+	})
+
+	t.Run("abort", func(t *testing.T) {
+		const key = "removes-metadata-abort.bin"
+		part1 := bytes.Repeat([]byte{0x55}, int(multipart.MinPartSize))
+		uploadID, _ := createUploadWithParts(t, be, bucket, key, [][]byte{part1})
+
+		require.NoError(t, be.AbortMultipartUpload(ctx, bucket, key, uploadID))
+		assertMetadataGone(t, uploadID)
+	})
+}
+
+// Verification case 5: with one node unreachable during cleanup the request still
+// succeeds and the reachable nodes' shards are still deleted.
+func TestDistributed_MultipartCleanup_NodeUnreachableStillSucceeds(t *testing.T) {
+	be, quicServers, cleanup := setupMultipartTestBackend(t)
+	defer cleanup()
+	ctx := context.Background()
+	const bucket, key = "test-bucket", "node-unreachable.bin"
+
+	part1 := bytes.Repeat([]byte{0x66}, int(multipart.MinPartSize))
+	part2 := []byte("small tail")
+	uploadID, parts := createUploadWithParts(t, be, bucket, key, [][]byte{part1, part2})
+	shardMaps := captureShardMaps(t, be, uploadID, parts)
+
+	// Drop one node before cleanup; its shard deletes will fail and be skipped.
+	// Evict the pooled connection so the next dial gets connection-refused, faithfully
+	// simulating a down node rather than a half-open connection.
+	const downNode uint32 = 0
+	require.NoError(t, quicServers[downNode].Close())
+	quicclient.InvalidatePooled(be.getNodeAddr(int(downNode)))
+
+	require.NoError(t, be.AbortMultipartUpload(ctx, bucket, key, uploadID))
+
+	for _, p := range parts {
+		nodes := shardMaps[p.PartNumber]
+		partObjKey := partObjectKey(bucket, key, uploadID, p.PartNumber)
+		assertReachableShardGone := func(node uint32, shardIndex int) {
+			if node == downNode {
+				return
+			}
+			assert.False(t, shardExistsOnNode(t, be, node, bucket, partObjKey, shardIndex),
+				"shard %d for part %d should be deleted on reachable node %d", shardIndex, p.PartNumber, node)
+		}
+		for i, node := range nodes.DataShardNodes {
+			assertReachableShardGone(node, i)
+		}
+		for i, node := range nodes.ParityShardNodes {
+			assertReachableShardGone(node, len(nodes.DataShardNodes)+i)
+		}
+	}
+}
+
+// Verification case 6: a missing part shard-map entry is skipped during cleanup and the
+// upload metadata is still removed.
+func TestDistributed_MultipartCleanup_MissingShardMapSkipsPart(t *testing.T) {
+	be, _, cleanup := setupMultipartTestBackend(t)
+	defer cleanup()
+	ctx := context.Background()
+	const bucket, key = "test-bucket", "missing-shard-map.bin"
+
+	part1 := bytes.Repeat([]byte{0x77}, int(multipart.MinPartSize))
+	part2 := []byte("tail")
+	uploadID, _ := createUploadWithParts(t, be, bucket, key, [][]byte{part1, part2})
+
+	// Remove part 1's shard-location map so cleanup must skip its shard delete.
+	require.NoError(t, be.globalState.Delete(TableObjects, fmt.Appendf(nil, "part:%s:%05d", uploadID, 1)))
+
+	require.NoError(t, be.AbortMultipartUpload(ctx, bucket, key, uploadID))
+
+	_, err := be.getUploadMetadata(uploadID)
+	assert.Error(t, err)
 }
