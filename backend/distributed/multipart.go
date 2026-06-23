@@ -432,7 +432,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	}
 
 	// Clean up: delete parts and upload metadata
-	if err := b.cleanupMultipartUpload(req.UploadID, req.Parts); err != nil {
+	if err := b.cleanupMultipartUpload(ctx, req.Bucket, req.Key, req.UploadID, req.Parts); err != nil {
 		slog.Warn("Failed to cleanup multipart upload", "uploadID", req.UploadID, "error", err)
 		// Don't fail the request, cleanup is best-effort
 	}
@@ -484,17 +484,34 @@ func (b *Backend) getPartData(ctx context.Context, bucket, key, uploadID string,
 	return buf.Bytes(), nil
 }
 
-// cleanupMultipartUpload removes all parts and metadata for an upload
-func (b *Backend) cleanupMultipartUpload(uploadID string, parts []backend.CompletedPart) error {
-	// Delete part metadata
+// cleanupMultipartUpload removes all part shards (via QUIC), part/upload metadata,
+// and the shard-location map for an upload. Shard deletes are best-effort: a per-node
+// failure is logged and skipped, never failing the complete/abort request.
+func (b *Backend) cleanupMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts []backend.CompletedPart) error {
 	for _, part := range parts {
-		partKey := multipartPartKey(uploadID, part.PartNumber)
-		if err := b.globalState.Delete(TableParts, partKey); err != nil {
+		partShardKey := fmt.Sprintf("part:%s:%05d", uploadID, part.PartNumber)
+
+		// Drop the physical part shards before removing the shard-location map. A missing
+		// or corrupt map, or a per-node delete failure, is logged and skipped — cleanup is
+		// best-effort and must not fail the complete/abort request.
+		if data, err := b.globalState.Get(TableObjects, []byte(partShardKey)); err != nil {
+			slog.Warn("cleanup: part shard map missing, skipping shard delete", "uploadID", uploadID, "part", part.PartNumber)
+		} else {
+			var nodes ObjectToShardNodes
+			if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&nodes); err != nil {
+				slog.Warn("cleanup: part shard map corrupt, skipping shard delete", "uploadID", uploadID, "part", part.PartNumber, "error", err)
+			} else {
+				partObjKey := partObjectKey(bucket, key, uploadID, part.PartNumber)
+				if err := b.deleteObjectViaQUIC(ctx, bucket, partObjKey, nodes.Object, nodes); err != nil {
+					slog.Error("cleanup: QUIC shard delete failed, continuing", "uploadID", uploadID, "part", part.PartNumber, "error", err)
+				}
+			}
+		}
+
+		if err := b.globalState.Delete(TableParts, multipartPartKey(uploadID, part.PartNumber)); err != nil {
 			slog.Warn("Failed to delete part metadata", "uploadID", uploadID, "part", part.PartNumber, "error", err)
 		}
 
-		// Delete part shard location
-		partShardKey := fmt.Sprintf("part:%s:%05d", uploadID, part.PartNumber)
 		if err := b.globalState.Delete(TableObjects, []byte(partShardKey)); err != nil {
 			slog.Warn("Failed to delete part shard metadata", "uploadID", uploadID, "part", part.PartNumber, "error", err)
 		}
@@ -549,7 +566,7 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadI
 	}
 
 	// Clean up
-	if err := b.cleanupMultipartUpload(uploadID, parts); err != nil {
+	if err := b.cleanupMultipartUpload(ctx, bucket, key, uploadID, parts); err != nil {
 		slog.Warn("Failed to cleanup multipart upload", "uploadID", uploadID, "error", err)
 	}
 
