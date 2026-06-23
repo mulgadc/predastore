@@ -124,6 +124,23 @@ if [ ! -f "$TLS_CERT" ]; then
     log_info "Certificates written to $ROOT/"
 fi
 
+# --- Install cert into the OS trust store ---
+#
+# s3d verifies inter-node Raft and QUIC peer certs strictly against the OS
+# trust store (quicclient.tlsConfigForDial / raft_streamlayer.Dial), with no
+# CA-bundle flag. A self-signed cert that is not a trust anchor fails with
+# "x509: certificate signed by unknown authority", so the cluster never elects
+# a leader. Install it so the dialers trust it.
+
+TRUST_ANCHOR="/usr/local/share/ca-certificates/predastore-${CLUSTER_NAME}.crt"
+
+if ! cmp -s "$TLS_CERT" "$TRUST_ANCHOR" 2>/dev/null; then
+    log_info "Installing TLS cert into OS trust store..."
+    sudo cp "$TLS_CERT" "$TRUST_ANCHOR"
+    sudo update-ca-certificates >/dev/null
+    log_info "Trust anchor installed at $TRUST_ANCHOR"
+fi
+
 # --- Generate master encryption key ---
 #
 # s3d's keyfile loader is fail-closed on group/other-readable modes, so the
