@@ -676,8 +676,8 @@ func (p *NATSIAMProvider) resolveRolePolicies(accountID, roleName string) ([]iam
 }
 
 // resolveManagedPolicies resolves a list of managed-policy ARNs into parsed
-// policy documents from policiesBucket. Shared by the user and role resolvers:
-// both attach only managed policies, so the per-ARN resolution is identical.
+// policy documents from policiesBucket. Shared by the user and role resolvers;
+// the role resolver appends its inline-policy walk separately.
 func (p *NATSIAMProvider) resolveManagedPolicies(accountID string, arns []string) ([]iamPolicyDocument, error) {
 	var docs []iamPolicyDocument
 	for _, arn := range arns {
