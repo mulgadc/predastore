@@ -80,9 +80,10 @@ type iamUser struct {
 // trust policy (who may assume the role), not a permission policy, so it is
 // deliberately omitted here.
 type iamRole struct {
-	RoleName         string   `json:"role_name"`
-	AccountID        string   `json:"account_id"`
-	AttachedPolicies []string `json:"attached_policies"` // managed policy ARNs
+	RoleName         string            `json:"role_name"`
+	AccountID        string            `json:"account_id"`
+	AttachedPolicies []string          `json:"attached_policies"` // managed policy ARNs
+	InlinePolicies   map[string]string `json:"inline_policies"`   // policyName → document JSON
 }
 
 // iamPolicy mirrors the spinifex IAM Policy stored in NATS KV.
@@ -646,9 +647,8 @@ func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iam
 }
 
 // resolveRolePolicies resolves an assumed-role session's permissions: load the
-// role record from rolesBucket and resolve its attached managed policies. It
-// mirrors resolveUserPolicies — spinifex roles only ever carry managed policies
-// (no inline role policies exist), so the per-policy resolution is identical.
+// role record from rolesBucket and resolve its attached managed policies plus
+// any embedded inline policies.
 func (p *NATSIAMProvider) resolveRolePolicies(accountID, roleName string) ([]iamPolicyDocument, error) {
 	kvKey := accountID + "." + roleName
 	entry, err := p.rolesBucket.Get(kvKey)
@@ -661,12 +661,23 @@ func (p *NATSIAMProvider) resolveRolePolicies(accountID, roleName string) ([]iam
 		return nil, fmt.Errorf("unmarshal role: %w", err)
 	}
 
-	return p.resolveManagedPolicies(accountID, role.AttachedPolicies)
+	docs, err := p.resolveManagedPolicies(accountID, role.AttachedPolicies)
+	if err != nil {
+		return nil, err
+	}
+	for name, raw := range role.InlinePolicies {
+		var doc iamPolicyDocument
+		if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+			return nil, fmt.Errorf("parse inline policy %s: %w", name, err)
+		}
+		docs = append(docs, doc)
+	}
+	return docs, nil
 }
 
 // resolveManagedPolicies resolves a list of managed-policy ARNs into parsed
-// policy documents from policiesBucket. Shared by the user and role resolvers:
-// both attach only managed policies, so the per-ARN resolution is identical.
+// policy documents from policiesBucket. Shared by the user and role resolvers;
+// the role resolver appends its inline-policy walk separately.
 func (p *NATSIAMProvider) resolveManagedPolicies(accountID string, arns []string) ([]iamPolicyDocument, error) {
 	var docs []iamPolicyDocument
 	for _, arn := range arns {

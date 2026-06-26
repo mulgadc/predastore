@@ -254,3 +254,76 @@ func TestNewNATSIAMProvider_MissingMasterKeyPath(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "master_key_path is required")
 }
+
+// --- inline role policy resolution (resolveRolePolicies) ---
+
+const inlineTestAccount = "000000000001"
+
+// TestResolveRolePolicies_InlineAllow proves an inline Allow policy embedded in a
+// role resolves and authorizes on the S3 data path, with no managed attachment.
+func TestResolveRolePolicies_InlineAllow(t *testing.T) {
+	roles := map[string][]byte{
+		inlineTestAccount + ".InlineRole": mustMarshal(t, iamRole{
+			RoleName:       "InlineRole",
+			AccountID:      inlineTestAccount,
+			InlinePolicies: map[string]string{"AllowS3": allowAllS3Policy},
+		}),
+	}
+	p := &NATSIAMProvider{
+		rolesBucket:    &fakeKV{data: roles},
+		policiesBucket: &fakeKV{data: map[string][]byte{}},
+	}
+
+	docs, err := p.resolveRolePolicies(inlineTestAccount, "InlineRole")
+	require.NoError(t, err)
+	require.Len(t, docs, 1)
+	assert.True(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", docs), "inline Allow must be honoured")
+}
+
+// TestResolveRolePolicies_InlineDenyOverridesManagedAllow proves inline and
+// managed documents are evaluated together: an inline Deny overrides a managed
+// Allow, the standard IAM deny-wins outcome.
+func TestResolveRolePolicies_InlineDenyOverridesManagedAllow(t *testing.T) {
+	roles := map[string][]byte{
+		inlineTestAccount + ".DenyRole": mustMarshal(t, iamRole{
+			RoleName:         "DenyRole",
+			AccountID:        inlineTestAccount,
+			AttachedPolicies: []string{"arn:aws:iam::" + inlineTestAccount + ":policy/AllowAll"},
+			InlinePolicies:   map[string]string{"DenyS3": denyAllS3Policy},
+		}),
+	}
+	policies := map[string][]byte{
+		inlineTestAccount + ".AllowAll": mustMarshal(t, iamPolicy{
+			PolicyName:     "AllowAll",
+			PolicyDocument: allowAllS3Policy,
+		}),
+	}
+	p := &NATSIAMProvider{
+		rolesBucket:    &fakeKV{data: roles},
+		policiesBucket: &fakeKV{data: policies},
+	}
+
+	docs, err := p.resolveRolePolicies(inlineTestAccount, "DenyRole")
+	require.NoError(t, err)
+	require.Len(t, docs, 2, "managed Allow and inline Deny must both resolve")
+	assert.False(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", docs), "inline Deny must override managed Allow")
+}
+
+// TestResolveRolePolicies_InlineMalformed proves a corrupt inline document fails
+// closed rather than silently resolving to a partial set.
+func TestResolveRolePolicies_InlineMalformed(t *testing.T) {
+	roles := map[string][]byte{
+		inlineTestAccount + ".BadRole": mustMarshal(t, iamRole{
+			RoleName:       "BadRole",
+			AccountID:      inlineTestAccount,
+			InlinePolicies: map[string]string{"Broken": "{not json"},
+		}),
+	}
+	p := &NATSIAMProvider{
+		rolesBucket:    &fakeKV{data: roles},
+		policiesBucket: &fakeKV{data: map[string][]byte{}},
+	}
+
+	_, err := p.resolveRolePolicies(inlineTestAccount, "BadRole")
+	assert.Error(t, err, "a malformed inline document must fail closed")
+}
