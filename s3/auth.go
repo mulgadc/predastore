@@ -72,6 +72,7 @@ type iamUser struct {
 	UserName         string   `json:"user_name"`
 	AccountID        string   `json:"account_id"`
 	AttachedPolicies []string `json:"attached_policies"` // policy ARNs
+	Groups           []string `json:"groups"`            // group NAMES the user belongs to (≤10)
 }
 
 // iamRole mirrors the spinifex IAM Role stored in NATS KV (spinifex-iam-roles).
@@ -81,6 +82,17 @@ type iamUser struct {
 // deliberately omitted here.
 type iamRole struct {
 	RoleName         string            `json:"role_name"`
+	AccountID        string            `json:"account_id"`
+	AttachedPolicies []string          `json:"attached_policies"` // managed policy ARNs
+	InlinePolicies   map[string]string `json:"inline_policies"`   // policyName → document JSON
+}
+
+// iamGroup mirrors the spinifex IAM Group stored in NATS KV (spinifex-iam-groups).
+// Membership is canonical on iamUser.Groups, so the group's member list is not
+// replicated here — only the two grant-source fields predastore needs to resolve a
+// member's inherited permissions, exactly like iamRole.
+type iamGroup struct {
+	GroupName        string            `json:"group_name"`
 	AccountID        string            `json:"account_id"`
 	AttachedPolicies []string          `json:"attached_policies"` // managed policy ARNs
 	InlinePolicies   map[string]string `json:"inline_policies"`   // policyName → document JSON
@@ -163,6 +175,12 @@ const (
 	kvBucketRoles    = "spinifex-iam-roles"
 	kvBucketPolicies = "spinifex-iam-policies"
 
+	// kvBucketGroups holds IAM group records. It is opened lazily on its own
+	// readiness flag (like the session bucket) so a missing groups bucket — a
+	// predastore-ahead-of-spinifex rollout window — never disables the
+	// direct-grant IAM path; group resolution is simply skipped until it appears.
+	kvBucketGroups = "spinifex-iam-groups"
+
 	// kvBucketSessionCredentials holds STS-minted ASIA session records. It is a
 	// separate bucket from the AKIA access keys and is opened lazily on its own
 	// readiness flag so a missing session bucket never disables AKIA auth.
@@ -215,6 +233,12 @@ type NATSIAMProvider struct {
 	// independently of the AKIA buckets so either path can come up alone.
 	sessionsBucket nats.KeyValue
 	sessionsReady  bool
+
+	// Groups bucket has its own readiness flag for the same reason: a missing
+	// groups bucket must not disable direct-grant IAM auth for users who never
+	// use groups. Group resolution is an additive layer on the user path.
+	groupsBucket nats.KeyValue
+	groupsReady  bool
 
 	watcher   nats.KeyWatcher
 	done      chan struct{}
@@ -360,6 +384,28 @@ func (p *NATSIAMProvider) ensureSessionsBucket() error {
 	p.sessionsBucket = bucket
 	p.sessionsReady = true
 	slog.Info("STS session-credentials bucket now available — ASIA session auth is active")
+	return nil
+}
+
+// ensureGroupsBucket lazily opens the IAM groups KV bucket. Like the session
+// bucket it is decoupled from ensureBuckets: a missing groups bucket must not
+// disable direct-grant IAM auth. The caller must hold p.mu.
+func (p *NATSIAMProvider) ensureGroupsBucket() error {
+	if p.groupsReady {
+		return nil
+	}
+	if p.js == nil {
+		return fmt.Errorf("JetStream context not available")
+	}
+
+	bucket, err := p.js.KeyValue(kvBucketGroups)
+	if err != nil {
+		return fmt.Errorf("open groups bucket: %w", err)
+	}
+
+	p.groupsBucket = bucket
+	p.groupsReady = true
+	slog.Info("IAM groups bucket now available — group-inherited S3 permissions are active")
 	return nil
 }
 
@@ -643,7 +689,86 @@ func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iam
 		return nil, fmt.Errorf("unmarshal user: %w", err)
 	}
 
-	return p.resolveManagedPolicies(accountID, user.AttachedPolicies)
+	docs, err := p.resolveManagedPolicies(accountID, user.AttachedPolicies)
+	if err != nil {
+		return nil, err
+	}
+
+	// Group-inherited policies (managed + inline). Appended to the same slice so
+	// evaluateS3Access combines direct, group-managed, and group-inline grants
+	// under deny-wins. The common no-group user pays no extra lock or KV round-trip.
+	if len(user.Groups) > 0 {
+		groupDocs, err := p.resolveGroupPolicies(accountID, userName, user.Groups)
+		if err != nil {
+			return nil, err
+		}
+		docs = append(docs, groupDocs...)
+	}
+
+	return docs, nil
+}
+
+// resolveGroupPolicies resolves the managed and inline policies inherited from a
+// user's groups. It mirrors spinifex's GetUserPolicies group loop: a missing
+// group is skipped (a deleted group is inert), an unresolvable/malformed group
+// policy fails closed, an absent groups bucket skips all group resolution, and a
+// groups-bucket infra fault fails closed.
+func (p *NATSIAMProvider) resolveGroupPolicies(accountID, userName string, groups []string) ([]iamPolicyDocument, error) {
+	// Lazily open the groups bucket. A not-yet-created bucket means groups-v1 is
+	// not deployed on the spinifex side, so no group records exist anywhere and
+	// there is nothing (no Allow and no Deny) to resolve — skip safely. Any other
+	// open error is an infra fault: fail closed rather than risk dropping a Deny.
+	p.mu.Lock()
+	if !p.groupsReady {
+		if err := p.ensureGroupsBucket(); err != nil {
+			p.mu.Unlock()
+			if errors.Is(err, nats.ErrBucketNotFound) || errors.Is(err, nats.ErrStreamNotFound) {
+				slog.Warn("Groups bucket not available — skipping group-inherited policies "+
+					"(group grants will not apply until spinifex creates the bucket)",
+					"accountID", accountID, "user", userName)
+				return nil, nil
+			}
+			return nil, fmt.Errorf("open groups bucket: %w", err)
+		}
+	}
+	bucket := p.groupsBucket
+	p.mu.Unlock()
+
+	var docs []iamPolicyDocument
+	for _, groupName := range groups {
+		gEntry, err := bucket.Get(accountID + "." + groupName)
+		if err != nil {
+			if errors.Is(err, nats.ErrKeyNotFound) {
+				// Membership to a deleted group is inert (spinifex refuses to
+				// delete a non-empty group), so this is a benign racing-delete
+				// remnant. Skip it; a deleted group carries no grant to drop.
+				slog.Warn("resolveGroupPolicies: member references missing group; skipping",
+					"accountID", accountID, "user", userName, "group", groupName)
+				continue
+			}
+			return nil, fmt.Errorf("lookup group %s.%s: %w", accountID, groupName, err)
+		}
+
+		var group iamGroup
+		if err := json.Unmarshal(gEntry.Value(), &group); err != nil {
+			return nil, fmt.Errorf("unmarshal group %s: %w", groupName, err)
+		}
+
+		managed, err := p.resolveManagedPolicies(accountID, group.AttachedPolicies)
+		if err != nil {
+			return nil, err // fail closed (mirrors direct-policy handling)
+		}
+		docs = append(docs, managed...)
+
+		for name, raw := range group.InlinePolicies {
+			var doc iamPolicyDocument
+			if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+				return nil, fmt.Errorf("parse group inline policy %s/%s: %w", groupName, name, err)
+			}
+			docs = append(docs, doc)
+		}
+	}
+	return docs, nil
 }
 
 // resolveRolePolicies resolves an assumed-role session's permissions: load the
