@@ -742,7 +742,7 @@ func (p *NATSIAMProvider) resolveGroupPolicies(accountID, userName string, group
 				// Membership to a deleted group is inert (spinifex refuses to
 				// delete a non-empty group), so this is a benign racing-delete
 				// remnant. Skip it; a deleted group carries no grant to drop.
-				slog.Warn("resolveUserPolicies: member references missing group; skipping",
+				slog.Warn("resolveGroupPolicies: member references missing group; skipping",
 					"accountID", accountID, "user", userName, "group", groupName)
 				continue
 			}
