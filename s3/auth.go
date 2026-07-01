@@ -658,6 +658,15 @@ func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iam
 		return nil, err
 	}
 
+	// User-own inline policies. Shares the group/role parse helper so a malformed
+	// document fails closed identically; keeps the S3 decision in lockstep with
+	// spinifex's GetUserPolicies user-inline loop.
+	inline, err := resolveInlinePolicies(user.InlinePolicies, "user "+userName)
+	if err != nil {
+		return nil, err
+	}
+	docs = append(docs, inline...)
+
 	// Group-inherited policies (managed + inline). Appended to the same slice so
 	// iampolicy.Evaluate combines direct, group-managed, and group-inline grants
 	// under deny-wins. The common no-group user pays no extra lock or KV round-trip.
