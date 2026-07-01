@@ -79,7 +79,7 @@ func TestResolveUserPolicies_GroupManagedAllow(t *testing.T) {
 	docs, err := p.resolveUserPolicies(inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 1, "group-managed Allow must resolve")
-	assert.True(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", docs),
+	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs),
 		"group-managed Allow must be honoured")
 }
 
@@ -103,7 +103,7 @@ func TestResolveUserPolicies_GroupInlineAllow(t *testing.T) {
 	docs, err := p.resolveUserPolicies(inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 1, "group-inline Allow must resolve")
-	assert.True(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", docs),
+	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs),
 		"group-inline Allow must be honoured")
 }
 
@@ -136,7 +136,7 @@ func TestResolveUserPolicies_GroupDenyOverridesDirectAllow(t *testing.T) {
 	docs, err := p.resolveUserPolicies(inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 2, "direct Allow and group Deny must both resolve")
-	assert.False(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", docs),
+	assert.False(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs),
 		"group Deny must override direct Allow (deny-wins)")
 }
 
@@ -194,7 +194,7 @@ func TestResolveUserPolicies_MissingGroupSkipped(t *testing.T) {
 	docs, err := p.resolveUserPolicies(inlineTestAccount, "alice")
 	require.NoError(t, err, "a missing group must be skipped, not fail")
 	require.Len(t, docs, 1, "the user's direct policy must still resolve")
-	assert.True(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", docs))
+	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs))
 }
 
 // TestResolveUserPolicies_GroupInlineMalformedFailsClosed proves a corrupt inline
@@ -263,7 +263,7 @@ func TestResolveUserPolicies_GroupsBucketAbsent(t *testing.T) {
 	docs, err := p.resolveUserPolicies(inlineTestAccount, "alice")
 	require.NoError(t, err, "an absent groups bucket must skip group resolution, not fail")
 	require.Len(t, docs, 1, "the user's direct policy must still resolve")
-	assert.True(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", docs))
+	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs))
 	assert.False(t, p.groupsReady, "a failed open must not mark the groups bucket ready")
 }
 
@@ -303,7 +303,7 @@ func TestResolveUserPolicies_NoGroupsUnchanged(t *testing.T) {
 	docs, err := p.resolveUserPolicies(inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 1, "a no-groups user resolves direct policies only")
-	assert.True(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", docs))
+	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs))
 }
 
 // TestResolveUserPolicies_MultipleGroups proves the per-group loop accumulates
@@ -342,7 +342,7 @@ func TestResolveUserPolicies_MultipleGroups(t *testing.T) {
 	require.NoError(t, err, "a missing group mid-list must be skipped, not abort resolution")
 	require.Len(t, docs, 2,
 		"the managed grant from Engineers and the inline grant from Auditors must both resolve past the skipped Ghost")
-	assert.True(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", docs))
+	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs))
 }
 
 // TestResolveUserPolicies_GroupKVError proves a non-NotFound fault on a per-group
@@ -407,7 +407,7 @@ func TestLookupSession_UserGroupPoliciesResolve(t *testing.T) {
 	res, err := p.LookupCredentials(testSessionAKID)
 	require.NoError(t, err)
 	require.Len(t, res.PolicyDocuments, 1, "the group-inherited policy must resolve on the user-session path")
-	assert.True(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", res.PolicyDocuments),
+	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", res.PolicyDocuments),
 		"a user-session whose only grant is via a group must be authorized")
 }
 

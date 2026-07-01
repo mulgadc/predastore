@@ -1,15 +1,11 @@
 package s3
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
 
+	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -112,88 +108,9 @@ func TestChainProvider_BothNotFound(t *testing.T) {
 	assert.ErrorIs(t, err, ErrKeyNotFound)
 }
 
-// --- decrypt tests ---
-
-func TestDecrypt_Roundtrip(t *testing.T) {
-	// Generate a key and encrypt a secret
-	key := make([]byte, 32)
-	_, err := rand.Read(key)
-	require.NoError(t, err)
-
-	block, err := aes.NewCipher(key)
-	require.NoError(t, err)
-	gcm, err := cipher.NewGCM(block)
-	require.NoError(t, err)
-
-	plaintext := "my-super-secret-key-12345"
-	nonce := make([]byte, gcm.NonceSize())
-	_, err = rand.Read(nonce)
-	require.NoError(t, err)
-
-	ciphertext := gcm.Seal(nonce, nonce, []byte(plaintext), nil)
-	encoded := base64.StdEncoding.EncodeToString(ciphertext)
-
-	// Create provider with the same key
-	p := &NATSIAMProvider{gcm: gcm}
-	decrypted, err := p.decrypt(encoded)
-	require.NoError(t, err)
-	assert.Equal(t, plaintext, decrypted)
-}
-
-func TestDecrypt_InvalidBase64(t *testing.T) {
-	key := make([]byte, 32)
-	_, err := rand.Read(key)
-	require.NoError(t, err)
-
-	block, err := aes.NewCipher(key)
-	require.NoError(t, err)
-	gcm, err := cipher.NewGCM(block)
-	require.NoError(t, err)
-
-	p := &NATSIAMProvider{gcm: gcm}
-	_, err = p.decrypt("not-valid-base64!!!")
-	assert.Error(t, err)
-}
-
-func TestDecrypt_TooShort(t *testing.T) {
-	key := make([]byte, 32)
-	_, err := rand.Read(key)
-	require.NoError(t, err)
-
-	block, err := aes.NewCipher(key)
-	require.NoError(t, err)
-	gcm, err := cipher.NewGCM(block)
-	require.NoError(t, err)
-
-	p := &NATSIAMProvider{gcm: gcm}
-	// Encode just 2 bytes — too short for nonce
-	_, err = p.decrypt(base64.StdEncoding.EncodeToString([]byte{0x01, 0x02}))
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "too short")
-}
-
-// --- iamStringOrArr JSON tests ---
-
-func TestIamStringOrArr_UnmarshalString(t *testing.T) {
-	var s iamStringOrArr
-	err := json.Unmarshal([]byte(`"s3:GetObject"`), &s)
-	require.NoError(t, err)
-	assert.Equal(t, iamStringOrArr{"s3:GetObject"}, s)
-}
-
-func TestIamStringOrArr_UnmarshalArray(t *testing.T) {
-	var s iamStringOrArr
-	err := json.Unmarshal([]byte(`["s3:GetObject", "s3:PutObject"]`), &s)
-	require.NoError(t, err)
-	assert.Equal(t, iamStringOrArr{"s3:GetObject", "s3:PutObject"}, s)
-}
-
-func TestIamStringOrArr_UnmarshalNull(t *testing.T) {
-	var s iamStringOrArr
-	err := json.Unmarshal([]byte(`null`), &s)
-	require.NoError(t, err)
-	assert.Nil(t, s)
-}
+// Secret decryption (masterkey.Key.Decrypt) and the StringOrArr JSON forms are
+// unit-tested in pkg/masterkey and pkg/iampolicy respectively; the provider just
+// delegates to them.
 
 // --- ErrKeyNotFound sentinel tests ---
 
@@ -213,24 +130,15 @@ func TestNATSIAMProvider_LazyBucketsNotReady_InfraError(t *testing.T) {
 	// When buckets aren't ready due to infrastructure issues (no JetStream context),
 	// LookupCredentials should return an infrastructure error (NOT ErrKeyNotFound)
 	// so the caller can return 500 instead of a misleading 403.
-	key := make([]byte, 32)
-	_, err := rand.Read(key)
-	require.NoError(t, err)
-
-	block, err := aes.NewCipher(key)
-	require.NoError(t, err)
-	gcm, err := cipher.NewGCM(block)
-	require.NoError(t, err)
-
 	p := &NATSIAMProvider{
-		gcm:          gcm,
+		key:          loadTestKey(t),
 		bucketName:   "spinifex-iam-access-keys",
 		bucketsReady: false,
 		cache:        make(map[string]*cachedCredential),
 		done:         make(chan struct{}),
 	}
 
-	_, err = p.LookupCredentials("AKIAEXAMPLE")
+	_, err := p.LookupCredentials("AKIAEXAMPLE")
 	assert.Error(t, err)
 	assert.False(t, errors.Is(err, ErrKeyNotFound),
 		"infrastructure errors should NOT be mapped to ErrKeyNotFound")
@@ -277,7 +185,7 @@ func TestResolveRolePolicies_InlineAllow(t *testing.T) {
 	docs, err := p.resolveRolePolicies(inlineTestAccount, "InlineRole")
 	require.NoError(t, err)
 	require.Len(t, docs, 1)
-	assert.True(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", docs), "inline Allow must be honoured")
+	assert.Equal(t, iampolicy.Allow, iampolicy.Evaluate("s3:ListBucket", "arn:aws:s3:::any", docs), "inline Allow must be honoured")
 }
 
 // TestResolveRolePolicies_InlineDenyOverridesManagedAllow proves inline and
@@ -306,7 +214,7 @@ func TestResolveRolePolicies_InlineDenyOverridesManagedAllow(t *testing.T) {
 	docs, err := p.resolveRolePolicies(inlineTestAccount, "DenyRole")
 	require.NoError(t, err)
 	require.Len(t, docs, 2, "managed Allow and inline Deny must both resolve")
-	assert.False(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::any", docs), "inline Deny must override managed Allow")
+	assert.Equal(t, iampolicy.Deny, iampolicy.Evaluate("s3:ListBucket", "arn:aws:s3:::any", docs), "inline Deny must override managed Allow")
 }
 
 // TestResolveRolePolicies_InlineMalformed proves a corrupt inline document fails

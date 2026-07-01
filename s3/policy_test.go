@@ -3,6 +3,7 @@ package s3
 import (
 	"testing"
 
+	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -52,125 +53,89 @@ func TestS3Resource(t *testing.T) {
 	}
 }
 
-// --- evaluateS3Access tests ---
+// --- S3 access evaluation via the shared iampolicy.Evaluate ---
+//
+// The wildcard matcher and the deny-wins algorithm now live in pkg/iampolicy and
+// are unit-tested there; these cases pin the S3-flavoured behaviour end to end.
 
-func doc(effect, action, resource string) iamPolicyDocument {
-	return iamPolicyDocument{
+func doc(effect, action, resource string) iampolicy.PolicyDocument {
+	return iampolicy.PolicyDocument{
 		Version: "2012-10-17",
-		Statement: []iamStatement{
-			{Effect: effect, Action: iamStringOrArr{action}, Resource: iamStringOrArr{resource}},
+		Statement: []iampolicy.Statement{
+			{Effect: effect, Action: iampolicy.StringOrArr{action}, Resource: iampolicy.StringOrArr{resource}},
 		},
 	}
 }
 
+// allowed reports whether the S3 action on resource is permitted.
+func allowed(action, resource string, policies []iampolicy.PolicyDocument) bool {
+	return iampolicy.Evaluate(action, resource, policies) == iampolicy.Allow
+}
+
 func TestEvaluateS3Access_DefaultDeny(t *testing.T) {
-	assert.False(t, evaluateS3Access("s3:GetObject", "*", nil))
-	assert.False(t, evaluateS3Access("s3:GetObject", "*", []iamPolicyDocument{}))
+	assert.False(t, allowed("s3:GetObject", "*", nil))
+	assert.False(t, allowed("s3:GetObject", "*", []iampolicy.PolicyDocument{}))
 }
 
 func TestEvaluateS3Access_ExplicitAllow(t *testing.T) {
-	policies := []iamPolicyDocument{
+	policies := []iampolicy.PolicyDocument{
 		doc("Allow", "s3:GetObject", "*"),
 	}
-	assert.True(t, evaluateS3Access("s3:GetObject", "*", policies))
+	assert.True(t, allowed("s3:GetObject", "*", policies))
 }
 
 func TestEvaluateS3Access_ExplicitDenyWins(t *testing.T) {
-	policies := []iamPolicyDocument{
+	policies := []iampolicy.PolicyDocument{
 		doc("Allow", "s3:*", "*"),
 		doc("Deny", "s3:DeleteObject", "*"),
 	}
-	assert.False(t, evaluateS3Access("s3:DeleteObject", "*", policies))
-	assert.True(t, evaluateS3Access("s3:GetObject", "*", policies))
+	assert.False(t, allowed("s3:DeleteObject", "*", policies))
+	assert.True(t, allowed("s3:GetObject", "*", policies))
 }
 
 func TestEvaluateS3Access_WildcardAll(t *testing.T) {
-	policies := []iamPolicyDocument{
+	policies := []iampolicy.PolicyDocument{
 		doc("Allow", "*", "*"),
 	}
-	assert.True(t, evaluateS3Access("s3:GetObject", "*", policies))
-	assert.True(t, evaluateS3Access("s3:PutObject", "*", policies))
-	assert.True(t, evaluateS3Access("s3:DeleteBucket", "*", policies))
+	assert.True(t, allowed("s3:GetObject", "*", policies))
+	assert.True(t, allowed("s3:PutObject", "*", policies))
+	assert.True(t, allowed("s3:DeleteBucket", "*", policies))
 }
 
 func TestEvaluateS3Access_ServiceWildcard(t *testing.T) {
-	policies := []iamPolicyDocument{
+	policies := []iampolicy.PolicyDocument{
 		doc("Allow", "s3:*", "*"),
 	}
-	assert.True(t, evaluateS3Access("s3:GetObject", "*", policies))
-	assert.True(t, evaluateS3Access("s3:PutObject", "*", policies))
+	assert.True(t, allowed("s3:GetObject", "*", policies))
+	assert.True(t, allowed("s3:PutObject", "*", policies))
 }
 
 func TestEvaluateS3Access_ResourceScoped(t *testing.T) {
-	policies := []iamPolicyDocument{
+	policies := []iampolicy.PolicyDocument{
 		doc("Allow", "s3:GetObject", "arn:aws:s3:::my-bucket/*"),
 	}
-	assert.True(t, evaluateS3Access("s3:GetObject", "arn:aws:s3:::my-bucket/key.txt", policies))
-	assert.False(t, evaluateS3Access("s3:GetObject", "arn:aws:s3:::other-bucket/key.txt", policies))
+	assert.True(t, allowed("s3:GetObject", "arn:aws:s3:::my-bucket/key.txt", policies))
+	assert.False(t, allowed("s3:GetObject", "arn:aws:s3:::other-bucket/key.txt", policies))
 }
 
 func TestEvaluateS3Access_NoMatchingAction(t *testing.T) {
-	policies := []iamPolicyDocument{
+	policies := []iampolicy.PolicyDocument{
 		doc("Allow", "s3:GetObject", "*"),
 	}
-	assert.False(t, evaluateS3Access("s3:PutObject", "*", policies))
+	assert.False(t, allowed("s3:PutObject", "*", policies))
 }
 
 func TestEvaluateS3Access_PrefixWildcard(t *testing.T) {
-	policies := []iamPolicyDocument{
+	policies := []iampolicy.PolicyDocument{
 		doc("Allow", "s3:Get*", "*"),
 	}
-	assert.True(t, evaluateS3Access("s3:GetObject", "*", policies))
-	assert.False(t, evaluateS3Access("s3:PutObject", "*", policies))
+	assert.True(t, allowed("s3:GetObject", "*", policies))
+	assert.False(t, allowed("s3:PutObject", "*", policies))
 }
 
-func TestEvaluateS3Access_CaseInsensitive(t *testing.T) {
-	policies := []iamPolicyDocument{
+func TestEvaluateS3Access_CaseInsensitiveAction(t *testing.T) {
+	policies := []iampolicy.PolicyDocument{
 		doc("Allow", "S3:GetObject", "*"),
 	}
-	assert.True(t, evaluateS3Access("s3:GetObject", "*", policies))
-}
-
-// --- matchWildcardPattern tests ---
-
-func TestMatchWildcardPattern_CaseInsensitive(t *testing.T) {
-	tests := []struct {
-		pattern string
-		value   string
-		want    bool
-	}{
-		{"*", "anything", true},
-		{"*", "", true},
-		{"s3:*", "s3:GetObject", true},
-		{"s3:*", "ec2:RunInstances", false},
-		{"s3:Get*", "s3:GetObject", true},
-		{"s3:Get*", "s3:PutObject", false},
-		{"s3:GetObject", "s3:GetObject", true},
-		{"s3:GetObject", "s3:PutObject", false},
-		{"S3:GetObject", "s3:GetObject", true},
-	}
-
-	for _, tt := range tests {
-		got := matchWildcardPattern(tt.pattern, tt.value, true)
-		assert.Equal(t, tt.want, got, "matchWildcardPattern(%q, %q, true)", tt.pattern, tt.value)
-	}
-}
-
-func TestMatchWildcardPattern_CaseSensitive(t *testing.T) {
-	tests := []struct {
-		pattern string
-		value   string
-		want    bool
-	}{
-		{"*", "anything", true},
-		{"arn:aws:s3:::my-bucket/*", "arn:aws:s3:::my-bucket/key.txt", true},
-		{"arn:aws:s3:::my-bucket/*", "arn:aws:s3:::other-bucket/key.txt", false},
-		{"arn:aws:s3:::MyBucket", "arn:aws:s3:::MyBucket", true},
-		{"arn:aws:s3:::MyBucket", "arn:aws:s3:::mybucket", false}, // case-sensitive
-	}
-
-	for _, tt := range tests {
-		got := matchWildcardPattern(tt.pattern, tt.value, false)
-		assert.Equal(t, tt.want, got, "matchWildcardPattern(%q, %q, false)", tt.pattern, tt.value)
-	}
+	assert.True(t, allowed("s3:GetObject", "*", policies))
 }

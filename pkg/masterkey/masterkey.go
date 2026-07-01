@@ -10,7 +10,9 @@ package masterkey
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -73,6 +75,17 @@ func load(path string, denyMask os.FileMode, wantMode string) (*Key, error) {
 	return &Key{AEAD: aead, Fingerprint: Fingerprint(raw)}, nil
 }
 
+// New builds a *Key from raw 32-byte key material (AEAD + fingerprint), for
+// callers that hold the bytes directly rather than loading them from disk. The
+// raw key bytes are not retained on the returned value.
+func New(key []byte) (*Key, error) {
+	aead, err := NewAEAD(key)
+	if err != nil {
+		return nil, err
+	}
+	return &Key{AEAD: aead, Fingerprint: Fingerprint(key)}, nil
+}
+
 // NewAEAD builds an AES-256-GCM AEAD from a 32-byte master key. Exposed for
 // tests and for callers that already hold the key bytes (e.g. deterministic
 // test fixtures). Production code should prefer Load.
@@ -97,4 +110,39 @@ func NewAEAD(key []byte) (cipher.AEAD, error) {
 func Fingerprint(key []byte) string {
 	sum := sha256.Sum256(key)
 	return hex.EncodeToString(sum[:8])
+}
+
+// Encrypt seals plaintext as base64(nonce‖ciphertext‖tag) with a fresh 12-byte
+// nonce and nil AAD — the wire format predastore and spinifex already share for
+// IAM secrets at rest.
+func (k *Key) Encrypt(plaintext string) (string, error) {
+	nonce := make([]byte, k.AEAD.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("generate nonce: %w", err)
+	}
+	// Seal appends ciphertext+tag to the nonce prefix.
+	sealed := k.AEAD.Seal(nonce, nonce, []byte(plaintext), nil)
+	return base64.StdEncoding.EncodeToString(sealed), nil
+}
+
+// Decrypt reverses Encrypt: it base64-decodes, splits off the nonce, and opens
+// the AES-256-GCM ciphertext. Authentication failure (wrong key or tampering)
+// surfaces as an error.
+func (k *Key) Decrypt(ciphertext string) (string, error) {
+	data, err := base64.StdEncoding.DecodeString(ciphertext)
+	if err != nil {
+		return "", fmt.Errorf("base64 decode: %w", err)
+	}
+
+	nonceSize := k.AEAD.NonceSize()
+	if len(data) < nonceSize {
+		return "", fmt.Errorf("ciphertext too short")
+	}
+
+	nonce, sealed := data[:nonceSize], data[nonceSize:]
+	plaintext, err := k.AEAD.Open(nil, nonce, sealed, nil)
+	if err != nil {
+		return "", fmt.Errorf("decrypt: %w", err)
+	}
+	return string(plaintext), nil
 }

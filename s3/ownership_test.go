@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -157,12 +158,12 @@ const (
 )
 
 // allowAllPolicy is what spinifex's bootstrap AdministratorAccess looks like.
-var allowAllPolicy = iamPolicyDocument{
+var allowAllPolicy = iampolicy.PolicyDocument{
 	Version: "2012-10-17",
-	Statement: []iamStatement{{
+	Statement: []iampolicy.Statement{{
 		Effect:   "Allow",
-		Action:   iamStringOrArr{"s3:*"},
-		Resource: iamStringOrArr{"*"},
+		Action:   iampolicy.StringOrArr{"s3:*"},
+		Resource: iampolicy.StringOrArr{"*"},
 	}},
 }
 
@@ -183,8 +184,8 @@ func ownershipServer(t *testing.T) *HTTP2Server {
 		"public-bucket": {Name: "public-bucket", Region: "ap-southeast-2", AccountID: acctOwner, Public: true},
 	}}
 	credProv := &stubCredProvider{creds: map[string]*CredentialResult{
-		keyOwner:  {SecretAccessKey: secret, AccountID: acctOwner, PolicyDocuments: []iamPolicyDocument{allowAllPolicy}},
-		keyOther:  {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iamPolicyDocument{allowAllPolicy}},
+		keyOwner:  {SecretAccessKey: secret, AccountID: acctOwner, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
+		keyOther:  {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
 		keyConfig: {SecretAccessKey: secret, AccountID: acctSys, SkipPolicyCheck: true},
 		keyNoIAM:  {SecretAccessKey: secret, AccountID: acctOwner /* no policies */},
 	}}
@@ -359,7 +360,7 @@ func TestOwnership_BackendErrorReturnsInternalError(t *testing.T) {
 		metadataErr: errors.New("backend infrastructure failure"),
 	}
 	credProv := &stubCredProvider{creds: map[string]*CredentialResult{
-		keyOther: {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iamPolicyDocument{allowAllPolicy}},
+		keyOther: {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
 	}}
 	server := NewHTTP2ServerWithBackend(cfg, be, credProv)
 
