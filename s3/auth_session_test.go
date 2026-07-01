@@ -104,7 +104,7 @@ func mustMarshal(t *testing.T, v any) []byte {
 // are wired together whenever any IAM map is supplied.
 func newSessionProvider(k *masterkey.Key, sessions, users, roles, policies map[string][]byte) *NATSIAMProvider {
 	p := &NATSIAMProvider{
-		gcm:            k.AEAD,
+		key:            k,
 		cache:          make(map[string]*cachedCredential),
 		done:           make(chan struct{}),
 		sessionsBucket: &fakeKV{data: sessions},
@@ -252,7 +252,7 @@ func TestLookupSession_AssumedRoleResolvesPolicies(t *testing.T) {
 	assert.False(t, res.SkipPolicyCheck, "sessions never bypass policy/ownership checks")
 	require.Len(t, res.PolicyDocuments, 1, "the role's attached managed policy must resolve")
 	assert.True(t,
-		evaluateS3Access("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments),
+		allowed("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments),
 		"the resolved role policy must authorize the allowed action")
 }
 
@@ -273,7 +273,7 @@ func TestLookupSession_AssumedRoleNoAttachedPolicies(t *testing.T) {
 	res, err := p.LookupCredentials(testSessionAKID)
 	require.NoError(t, err)
 	assert.Empty(t, res.PolicyDocuments, "a role with no attached policies → implicit deny")
-	assert.False(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments))
+	assert.False(t, allowed("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments))
 }
 
 // TestLookupSession_AssumedRoleAccountMismatch: an ARN whose embedded account
@@ -395,7 +395,7 @@ func TestLookupSession_AssumedRoleSkipsUnparseablePolicyARN(t *testing.T) {
 	res, err := p.LookupCredentials(testSessionAKID)
 	require.NoError(t, err, "an unparseable ARN must be skipped, not error the whole lookup")
 	require.Len(t, res.PolicyDocuments, 1, "only the one valid attached policy resolves")
-	assert.True(t, evaluateS3Access("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments))
+	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments))
 }
 
 // TestLookupSession_UnrecognisedPrincipalType: a principal_type that is neither
@@ -490,7 +490,7 @@ func TestLookupSession_NonASIAUnaffected(t *testing.T) {
 func TestLookupSession_NoJetStream_InfraError(t *testing.T) {
 	k := loadTestKey(t)
 	p := &NATSIAMProvider{
-		gcm:           k.AEAD,
+		key:           k,
 		cache:         make(map[string]*cachedCredential),
 		done:          make(chan struct{}),
 		sessionsReady: false, // force ensureSessionsBucket, which fails: js is nil

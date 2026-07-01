@@ -1,8 +1,6 @@
 package s3
 
 import (
-	"crypto/cipher"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/auth"
+	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/nats-io/nats.go"
 )
@@ -29,7 +28,7 @@ type CredentialResult struct {
 	// check, granting unrestricted access to every bucket regardless of owner.
 	// Adding an [[auth]] entry to predastore.toml therefore grants god-mode.
 	SkipPolicyCheck bool
-	PolicyDocuments []iamPolicyDocument // resolved policies (only for NATS-sourced credentials)
+	PolicyDocuments []iampolicy.PolicyDocument // resolved policies (only for NATS-sourced credentials)
 }
 
 // CredentialProvider looks up credentials by access key ID.
@@ -102,41 +101,6 @@ type iamGroup struct {
 type iamPolicy struct {
 	PolicyName     string `json:"policy_name"`
 	PolicyDocument string `json:"policy_document"` // JSON string
-}
-
-// iamPolicyDocument is a parsed IAM policy JSON structure.
-type iamPolicyDocument struct {
-	Version   string         `json:"Version"`
-	Statement []iamStatement `json:"Statement"`
-}
-
-// iamStatement is a single statement within a policy document.
-type iamStatement struct {
-	Sid      string         `json:"Sid,omitempty"`
-	Effect   string         `json:"Effect"`
-	Action   iamStringOrArr `json:"Action"`
-	Resource iamStringOrArr `json:"Resource"`
-}
-
-// iamStringOrArr handles JSON fields that can be either a string or an array of strings.
-type iamStringOrArr []string
-
-func (s *iamStringOrArr) UnmarshalJSON(data []byte) error {
-	if string(data) == "null" {
-		*s = nil
-		return nil
-	}
-	var single string
-	if err := json.Unmarshal(data, &single); err == nil {
-		*s = []string{single}
-		return nil
-	}
-	var arr []string
-	if err := json.Unmarshal(data, &arr); err != nil {
-		return err
-	}
-	*s = arr
-	return nil
 }
 
 // --- ConfigProvider ---
@@ -216,7 +180,7 @@ type cachedCredential struct {
 type NATSIAMProvider struct {
 	conn       *nats.Conn
 	js         nats.JetStreamContext
-	gcm        cipher.AEAD
+	key        *masterkey.Key
 	bucketName string // access keys bucket name
 
 	mu    sync.RWMutex
@@ -266,7 +230,6 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load master key: %w", err)
 	}
-	gcm := key.AEAD
 
 	// Connect to NATS
 	opts := []nats.Option{nats.Name("predastore-iam")}
@@ -293,7 +256,7 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	p := &NATSIAMProvider{
 		conn:       conn,
 		js:         js,
-		gcm:        gcm,
+		key:        key,
 		bucketName: bucketName,
 		cache:      make(map[string]*cachedCredential),
 		done:       make(chan struct{}),
@@ -461,7 +424,7 @@ func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID string) (*Credent
 		return nil, fmt.Errorf("session credential %s has empty account_id", accessKeyID)
 	}
 
-	secret, err := p.decrypt(cred.SecretEncrypted)
+	secret, err := p.key.DecryptBase64(cred.SecretEncrypted)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt session secret: %w", err)
 	}
@@ -472,7 +435,7 @@ func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID string) (*Credent
 	// policies. Both feed the same policy + ownership evaluation downstream. An
 	// empty principal_type is treated as assumed-role for backward compat; any
 	// other value fails closed (no policies → implicit deny → 403 AccessDenied).
-	var policies []iamPolicyDocument
+	var policies []iampolicy.PolicyDocument
 	switch cred.PrincipalType {
 	case principalTypeUser:
 		if err := p.ensureIAMBucketsForSession(accessKeyID); err != nil {
@@ -618,7 +581,7 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 	}
 
 	// Decrypt the secret
-	secret, err := p.decrypt(ak.SecretAccessKey)
+	secret, err := p.key.DecryptBase64(ak.SecretAccessKey)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt secret: %w", err)
 	}
@@ -677,7 +640,7 @@ func mapSessionPrincipalError(accessKeyID string, err error) error {
 	return fmt.Errorf("resolve session policies: %w", err)
 }
 
-func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iamPolicyDocument, error) {
+func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iampolicy.PolicyDocument, error) {
 	kvKey := accountID + "." + userName
 	entry, err := p.usersBucket.Get(kvKey)
 	if err != nil {
@@ -695,7 +658,7 @@ func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iam
 	}
 
 	// Group-inherited policies (managed + inline). Appended to the same slice so
-	// evaluateS3Access combines direct, group-managed, and group-inline grants
+	// iampolicy.Evaluate combines direct, group-managed, and group-inline grants
 	// under deny-wins. The common no-group user pays no extra lock or KV round-trip.
 	if len(user.Groups) > 0 {
 		groupDocs, err := p.resolveGroupPolicies(accountID, userName, user.Groups)
@@ -713,7 +676,7 @@ func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iam
 // group is skipped (a deleted group is inert), an unresolvable/malformed group
 // policy fails closed, an absent groups bucket skips all group resolution, and a
 // groups-bucket infra fault fails closed.
-func (p *NATSIAMProvider) resolveGroupPolicies(accountID, userName string, groups []string) ([]iamPolicyDocument, error) {
+func (p *NATSIAMProvider) resolveGroupPolicies(accountID, userName string, groups []string) ([]iampolicy.PolicyDocument, error) {
 	// Lazily open the groups bucket. A not-yet-created bucket means groups-v1 is
 	// not deployed on the spinifex side, so no group records exist anywhere and
 	// there is nothing (no Allow and no Deny) to resolve — skip safely. Any other
@@ -734,7 +697,7 @@ func (p *NATSIAMProvider) resolveGroupPolicies(accountID, userName string, group
 	bucket := p.groupsBucket
 	p.mu.Unlock()
 
-	var docs []iamPolicyDocument
+	var docs []iampolicy.PolicyDocument
 	for _, groupName := range groups {
 		gEntry, err := bucket.Get(accountID + "." + groupName)
 		if err != nil {
@@ -760,13 +723,11 @@ func (p *NATSIAMProvider) resolveGroupPolicies(accountID, userName string, group
 		}
 		docs = append(docs, managed...)
 
-		for name, raw := range group.InlinePolicies {
-			var doc iamPolicyDocument
-			if err := json.Unmarshal([]byte(raw), &doc); err != nil {
-				return nil, fmt.Errorf("parse group inline policy %s/%s: %w", groupName, name, err)
-			}
-			docs = append(docs, doc)
+		inline, err := resolveInlinePolicies(group.InlinePolicies, "group "+groupName)
+		if err != nil {
+			return nil, err
 		}
+		docs = append(docs, inline...)
 	}
 	return docs, nil
 }
@@ -774,7 +735,7 @@ func (p *NATSIAMProvider) resolveGroupPolicies(accountID, userName string, group
 // resolveRolePolicies resolves an assumed-role session's permissions: load the
 // role record from rolesBucket and resolve its attached managed policies plus
 // any embedded inline policies.
-func (p *NATSIAMProvider) resolveRolePolicies(accountID, roleName string) ([]iamPolicyDocument, error) {
+func (p *NATSIAMProvider) resolveRolePolicies(accountID, roleName string) ([]iampolicy.PolicyDocument, error) {
 	kvKey := accountID + "." + roleName
 	entry, err := p.rolesBucket.Get(kvKey)
 	if err != nil {
@@ -790,10 +751,23 @@ func (p *NATSIAMProvider) resolveRolePolicies(accountID, roleName string) ([]iam
 	if err != nil {
 		return nil, err
 	}
-	for name, raw := range role.InlinePolicies {
-		var doc iamPolicyDocument
+	inline, err := resolveInlinePolicies(role.InlinePolicies, "role "+roleName)
+	if err != nil {
+		return nil, err
+	}
+	return append(docs, inline...), nil
+}
+
+// resolveInlinePolicies parses a principal's inline-policy map (policyName →
+// document JSON) into policy documents. A malformed document fails closed so
+// role- and group-inherited parsing cannot diverge; label identifies the owning
+// principal in error messages (e.g. "group Admins", "role InstanceRole").
+func resolveInlinePolicies(inline map[string]string, label string) ([]iampolicy.PolicyDocument, error) {
+	var docs []iampolicy.PolicyDocument
+	for name, raw := range inline {
+		var doc iampolicy.PolicyDocument
 		if err := json.Unmarshal([]byte(raw), &doc); err != nil {
-			return nil, fmt.Errorf("parse inline policy %s: %w", name, err)
+			return nil, fmt.Errorf("parse %s inline policy %s: %w", label, name, err)
 		}
 		docs = append(docs, doc)
 	}
@@ -803,8 +777,8 @@ func (p *NATSIAMProvider) resolveRolePolicies(accountID, roleName string) ([]iam
 // resolveManagedPolicies resolves a list of managed-policy ARNs into parsed
 // policy documents from policiesBucket. Shared by the user and role resolvers;
 // the role resolver appends its inline-policy walk separately.
-func (p *NATSIAMProvider) resolveManagedPolicies(accountID string, arns []string) ([]iamPolicyDocument, error) {
-	var docs []iamPolicyDocument
+func (p *NATSIAMProvider) resolveManagedPolicies(accountID string, arns []string) ([]iampolicy.PolicyDocument, error) {
+	var docs []iampolicy.PolicyDocument
 	for _, arn := range arns {
 		policyName := auth.ExtractPolicyName(arn)
 		if policyName == "" {
@@ -823,7 +797,7 @@ func (p *NATSIAMProvider) resolveManagedPolicies(accountID string, arns []string
 			return nil, fmt.Errorf("unmarshal policy: %w", err)
 		}
 
-		var doc iamPolicyDocument
+		var doc iampolicy.PolicyDocument
 		if err := json.Unmarshal([]byte(policy.PolicyDocument), &doc); err != nil {
 			return nil, fmt.Errorf("parse policy document %s: %w", policyName, err)
 		}
@@ -831,25 +805,6 @@ func (p *NATSIAMProvider) resolveManagedPolicies(accountID string, arns []string
 	}
 
 	return docs, nil
-}
-
-func (p *NATSIAMProvider) decrypt(ciphertext string) (string, error) {
-	data, err := base64.StdEncoding.DecodeString(ciphertext)
-	if err != nil {
-		return "", fmt.Errorf("base64 decode: %w", err)
-	}
-
-	nonceSize := p.gcm.NonceSize()
-	if len(data) < nonceSize {
-		return "", fmt.Errorf("ciphertext too short")
-	}
-
-	nonce, sealed := data[:nonceSize], data[nonceSize:]
-	plaintext, err := p.gcm.Open(nil, nonce, sealed, nil)
-	if err != nil {
-		return "", fmt.Errorf("decrypt: %w", err)
-	}
-	return string(plaintext), nil
 }
 
 func (p *NATSIAMProvider) Close() {

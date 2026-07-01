@@ -26,6 +26,7 @@ import (
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
+	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/mulgadc/predastore/ratelimit"
 	"github.com/mulgadc/predastore/s3/chunked"
 )
@@ -241,7 +242,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 				slog.Debug("No policies resolved for user, implicit deny",
 					"accessKeyID", accessKey, "accountID", credResult.AccountID)
 			}
-			if !evaluateS3Access(action, resource, credResult.PolicyDocuments) {
+			if iampolicy.Evaluate(action, resource, credResult.PolicyDocuments) == iampolicy.Deny {
 				slog.Debug("S3 access denied by policy",
 					"action", action, "resource", resource,
 					"accessKeyID", accessKey, "policyCount", len(credResult.PolicyDocuments))
