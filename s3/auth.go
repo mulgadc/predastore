@@ -424,7 +424,7 @@ func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID string) (*Credent
 		return nil, fmt.Errorf("session credential %s has empty account_id", accessKeyID)
 	}
 
-	secret, err := p.key.Decrypt(cred.SecretEncrypted)
+	secret, err := p.key.DecryptBase64(cred.SecretEncrypted)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt session secret: %w", err)
 	}
@@ -581,7 +581,7 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 	}
 
 	// Decrypt the secret
-	secret, err := p.key.Decrypt(ak.SecretAccessKey)
+	secret, err := p.key.DecryptBase64(ak.SecretAccessKey)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt secret: %w", err)
 	}

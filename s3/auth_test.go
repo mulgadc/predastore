@@ -108,7 +108,7 @@ func TestChainProvider_BothNotFound(t *testing.T) {
 	assert.ErrorIs(t, err, ErrKeyNotFound)
 }
 
-// Secret decryption (masterkey.Key.Decrypt) and the StringOrArr JSON forms are
+// Secret decryption (masterkey.Key.DecryptBase64) and the StringOrArr JSON forms are
 // unit-tested in pkg/masterkey and pkg/iampolicy respectively; the provider just
 // delegates to them.
 

@@ -207,11 +207,11 @@ func TestEncryptDecrypt_RoundTrip(t *testing.T) {
 	require.NoError(t, err)
 
 	secret := "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-	ct, err := k.Encrypt(secret)
+	ct, err := k.EncryptBase64(secret)
 	require.NoError(t, err)
 	assert.NotEqual(t, secret, ct, "ciphertext must differ from plaintext")
 
-	pt, err := k.Decrypt(ct)
+	pt, err := k.DecryptBase64(ct)
 	require.NoError(t, err)
 	assert.Equal(t, secret, pt)
 }
@@ -220,9 +220,9 @@ func TestEncrypt_FreshNoncePerCall(t *testing.T) {
 	k, err := masterkey.New(mustRandKey(t))
 	require.NoError(t, err)
 
-	ct1, err := k.Encrypt("same-plaintext")
+	ct1, err := k.EncryptBase64("same-plaintext")
 	require.NoError(t, err)
-	ct2, err := k.Encrypt("same-plaintext")
+	ct2, err := k.EncryptBase64("same-plaintext")
 	require.NoError(t, err)
 	assert.NotEqual(t, ct1, ct2,
 		"encrypting the same plaintext twice must produce different ciphertexts (random nonce)")
@@ -234,9 +234,9 @@ func TestDecrypt_WrongKeyFails(t *testing.T) {
 	k2, err := masterkey.New(mustRandKey(t))
 	require.NoError(t, err)
 
-	ct, err := k1.Encrypt("secret")
+	ct, err := k1.EncryptBase64("secret")
 	require.NoError(t, err)
-	_, err = k2.Decrypt(ct)
+	_, err = k2.DecryptBase64(ct)
 	assert.Error(t, err, "decrypting with the wrong key must fail")
 }
 
@@ -244,7 +244,7 @@ func TestDecrypt_TamperedFails(t *testing.T) {
 	k, err := masterkey.New(mustRandKey(t))
 	require.NoError(t, err)
 
-	ct, err := k.Encrypt("secret")
+	ct, err := k.EncryptBase64("secret")
 	require.NoError(t, err)
 	b := []byte(ct)
 	if b[len(b)-2] == 'A' {
@@ -252,26 +252,26 @@ func TestDecrypt_TamperedFails(t *testing.T) {
 	} else {
 		b[len(b)-2] = 'A'
 	}
-	_, err = k.Decrypt(string(b))
+	_, err = k.DecryptBase64(string(b))
 	assert.Error(t, err, "tampered ciphertext must fail the GCM auth tag check")
 }
 
 func TestDecrypt_InvalidBase64(t *testing.T) {
 	k, err := masterkey.New(mustRandKey(t))
 	require.NoError(t, err)
-	_, err = k.Decrypt("not-valid-base64!!!")
+	_, err = k.DecryptBase64("not-valid-base64!!!")
 	assert.Error(t, err)
 }
 
 func TestDecrypt_TooShort(t *testing.T) {
 	k, err := masterkey.New(mustRandKey(t))
 	require.NoError(t, err)
-	_, err = k.Decrypt(base64.StdEncoding.EncodeToString([]byte{0x01, 0x02}))
+	_, err = k.DecryptBase64(base64.StdEncoding.EncodeToString([]byte{0x01, 0x02}))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "too short")
 }
 
-// TestDecrypt_SpinifexWireFormat proves Key.Decrypt reads a ciphertext produced
+// TestDecrypt_SpinifexWireFormat proves Key.DecryptBase64 reads a ciphertext produced
 // by the exact byte layout spinifex handlers_iam.EncryptSecret writes:
 // base64(nonce + ciphertext + tag), 12-byte nonce, nil AAD. This is the
 // cross-project wire-format parity guarantee the consolidation must preserve.
@@ -291,7 +291,7 @@ func TestDecrypt_SpinifexWireFormat(t *testing.T) {
 	plaintext := "cross-project-secret-value"
 	wire := base64.StdEncoding.EncodeToString(gcm.Seal(nonce, nonce, []byte(plaintext), nil))
 
-	got, err := k.Decrypt(wire)
+	got, err := k.DecryptBase64(wire)
 	require.NoError(t, err)
-	assert.Equal(t, plaintext, got, "Key.Decrypt must read the spinifex wire format verbatim")
+	assert.Equal(t, plaintext, got, "Key.DecryptBase64 must read the spinifex wire format verbatim")
 }

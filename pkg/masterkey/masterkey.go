@@ -112,10 +112,10 @@ func Fingerprint(key []byte) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// Encrypt seals plaintext as base64(nonce‖ciphertext‖tag) with a fresh 12-byte
-// nonce and nil AAD — the wire format predastore and spinifex already share for
-// IAM secrets at rest.
-func (k *Key) Encrypt(plaintext string) (string, error) {
+// EncryptBase64 seals plaintext and returns base64(nonce‖ciphertext‖tag) with a
+// fresh 12-byte nonce and nil AAD — the wire format predastore and spinifex
+// already share for IAM secrets at rest.
+func (k *Key) EncryptBase64(plaintext string) (string, error) {
 	nonce := make([]byte, k.AEAD.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return "", fmt.Errorf("generate nonce: %w", err)
@@ -125,10 +125,10 @@ func (k *Key) Encrypt(plaintext string) (string, error) {
 	return base64.StdEncoding.EncodeToString(sealed), nil
 }
 
-// Decrypt reverses Encrypt: it base64-decodes, splits off the nonce, and opens
-// the AES-256-GCM ciphertext. Authentication failure (wrong key or tampering)
-// surfaces as an error.
-func (k *Key) Decrypt(ciphertext string) (string, error) {
+// DecryptBase64 reverses EncryptBase64: it base64-decodes, splits off the nonce,
+// and opens the AES-256-GCM ciphertext. Authentication failure (wrong key or
+// tampering) surfaces as an error.
+func (k *Key) DecryptBase64(ciphertext string) (string, error) {
 	data, err := base64.StdEncoding.DecodeString(ciphertext)
 	if err != nil {
 		return "", fmt.Errorf("base64 decode: %w", err)
