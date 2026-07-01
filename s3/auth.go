@@ -68,10 +68,11 @@ type sessionCredential struct {
 
 // iamUser mirrors the spinifex IAM User stored in NATS KV.
 type iamUser struct {
-	UserName         string   `json:"user_name"`
-	AccountID        string   `json:"account_id"`
-	AttachedPolicies []string `json:"attached_policies"` // policy ARNs
-	Groups           []string `json:"groups"`            // group NAMES the user belongs to (≤10)
+	UserName         string            `json:"user_name"`
+	AccountID        string            `json:"account_id"`
+	AttachedPolicies []string          `json:"attached_policies"` // policy ARNs
+	Groups           []string          `json:"groups"`            // group NAMES the user belongs to (≤10)
+	InlinePolicies   map[string]string `json:"inline_policies"`   // policyName → document JSON
 }
 
 // iamRole mirrors the spinifex IAM Role stored in NATS KV (spinifex-iam-roles).
@@ -656,6 +657,15 @@ func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iam
 	if err != nil {
 		return nil, err
 	}
+
+	// User-own inline policies. Shares the group/role parse helper so a malformed
+	// document fails closed identically; keeps the S3 decision in lockstep with
+	// spinifex's GetUserPolicies user-inline loop.
+	inline, err := resolveInlinePolicies(user.InlinePolicies, "user "+userName)
+	if err != nil {
+		return nil, err
+	}
+	docs = append(docs, inline...)
 
 	// Group-inherited policies (managed + inline). Appended to the same slice so
 	// iampolicy.Evaluate combines direct, group-managed, and group-inline grants
