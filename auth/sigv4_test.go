@@ -297,6 +297,52 @@ func TestStreamingSentinels(t *testing.T) {
 	}
 }
 
+// TestVerify_S3EncodedObjectKeys pins that Verify accepts requests signed
+// by a real AWS S3 client for object keys whose canonical URI contains
+// characters that require percent-encoding ('=', ' ', ...). S3 uses
+// single URI-encoding (the SDK's DisableURIPathEscaping=true / auth-scheme
+// DisableDoubleEncoding=true), so the server must not re-escape the
+// already-encoded canonical URI ('%3D' -> '%253D'). Hive-partitioned keys
+// (pen_id=abc/date=2026-07-03/...) are the motivating case.
+func TestVerify_S3EncodedObjectKeys(t *testing.T) {
+	body := []byte("frame-bytes")
+	sum := sha256.Sum256(body)
+	bodyHashHex := hex.EncodeToString(sum[:])
+
+	// signAsS3Client reproduces what boto3/aws-sdk-go-v2 emit for S3:
+	// single URI-path encoding. NewSigner's default (matching EC2/IAM)
+	// double-encodes, which is exactly the divergence under test.
+	signAsS3Client := func(target string) *http.Request {
+		req := httptest.NewRequest(http.MethodPut, target, bytes.NewReader(body))
+		req.Host = "s3.amazonaws.com"
+		req.Header.Set("X-Amz-Content-Sha256", bodyHashHex)
+		s3Signer := v4.NewSigner(func(o *v4.SignerOptions) {
+			o.DisableURIPathEscaping = true
+		})
+		require.NoError(t, s3Signer.SignHTTP(
+			context.Background(),
+			aws.Credentials{AccessKeyID: exAccessKeyID, SecretAccessKey: exSecret},
+			req, bodyHashHex, exService, exRegion, exTime,
+		))
+		return req
+	}
+
+	keys := []string{
+		"/bucket/test/pen_id=abc/x.txt",
+		"/bucket/pen_id=abc/date=2026-07-03/frame.jpg",
+		"/bucket/plain/key.txt",
+		"/bucket/has%20space/key.txt",
+	}
+	for _, target := range keys {
+		t.Run(target, func(t *testing.T) {
+			sig, err := auth.ParseReq(signAsS3Client(target))
+			require.NoError(t, err)
+			require.NoError(t, sig.Verify(exSecret, exService, exRegion,
+				auth.WithTime(exTime), auth.WithBodyHash(bodyHashHex)))
+		})
+	}
+}
+
 // TestVerify_WithBodyHash pins WithBodyHash's three contracts:
 //  1. matching hex hash accepts;
 //  2. mismatching hex hash returns ErrBodyHashMismatch;
