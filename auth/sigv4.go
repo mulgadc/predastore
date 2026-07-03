@@ -89,6 +89,19 @@ func WithBodyHash(hex string) func(*Options) {
 	return func(o *Options) { o.bodyHash = hex }
 }
 
+// newSigner builds an SDK signer configured for the signing service. S3
+// uses single URI-path encoding (auth-scheme DisableDoubleEncoding=true):
+// the canonical URI is the already-percent-encoded wire path, not re-
+// escaped. Without this, object keys whose canonical URI contains '=',
+// ' ', etc. get double-encoded ('%3D' -> '%253D') on re-sign and fail
+// verification — breaking Hive-partitioned keys (pen_id=x/date=y/...).
+// Non-S3 services (EC2/IAM/...) keep the SDK default double-encoding.
+func newSigner(service string) *v4.Signer {
+	return v4.NewSigner(func(o *v4.SignerOptions) {
+		o.DisableURIPathEscaping = service == "s3"
+	})
+}
+
 func resolveOpts(optFns []func(*Options)) Options {
 	o := Options{Time: time.Now}
 	for _, fn := range optFns {
@@ -129,7 +142,7 @@ func SignReq(
 	// client middleware does); set it here for direct-signing callers.
 	r.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
-	return v4.NewSigner().SignHTTP(
+	return newSigner(service).SignHTTP(
 		context.Background(),
 		aws.Credentials{AccessKeyID: accessKeyID, SecretAccessKey: secretAccessKey},
 		r, payloadHash, service, region, o.Time().UTC(),
@@ -252,7 +265,7 @@ func (req *Request) Verify(
 	}
 
 	req.Header.Del(authHeaderKey)
-	signErr := v4.NewSigner().SignHTTP(
+	signErr := newSigner(service).SignHTTP(
 		context.Background(),
 		aws.Credentials{AccessKeyID: req.AccessKeyID, SecretAccessKey: secretAccessKey},
 		req.Request, payloadHash, service, region, req.SignedTime.UTC(),
