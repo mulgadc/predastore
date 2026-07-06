@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -53,6 +54,7 @@ func Init(ctx context.Context, serviceName string) (func(context.Context) error,
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(traceExp),
 		sdktrace.WithResource(res),
+		sdktrace.WithSampler(rootSampler()),
 	)
 	otel.SetTracerProvider(tp)
 
@@ -80,6 +82,22 @@ func Init(ctx context.Context, serviceName string) (func(context.Context) error,
 		return errors.Join(tp.Shutdown(ctx), mp.Shutdown(ctx))
 	}
 	return shutdown, nil
+}
+
+// rootSampler samples locally-rooted traces at MULGA_ROOT_TRACE_RATIO
+// (default 1.0) while always honoring an inbound sampled traceparent. Lets
+// chatty services (background chunk I/O has no caller trace) shed root noise
+// without losing any request-linked span.
+func rootSampler() sdktrace.Sampler {
+	ratio := 1.0
+	if v := os.Getenv("MULGA_ROOT_TRACE_RATIO"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 && f <= 1 {
+			ratio = f
+		} else {
+			slog.Warn("invalid MULGA_ROOT_TRACE_RATIO, using 1.0", "value", v)
+		}
+	}
+	return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(ratio))
 }
 
 // exportEnabled reports whether any standard OTLP endpoint is configured and
