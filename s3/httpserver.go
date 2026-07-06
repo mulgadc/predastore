@@ -230,18 +230,18 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		if !credResult.SkipPolicyCheck {
 			action := s3Action(method, path)
 			if action == "" {
-				slog.Warn("Unsupported HTTP method for S3 action mapping",
+				slog.WarnContext(r.Context(), "Unsupported HTTP method for S3 action mapping",
 					"method", method, "path", path, "remoteAddr", r.RemoteAddr)
 				s.writeS3Error(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed", "The specified method is not allowed")
 				return
 			}
 			resource := s3Resource(path)
 			if len(credResult.PolicyDocuments) == 0 {
-				slog.Debug("No policies resolved for user, implicit deny",
+				slog.DebugContext(r.Context(), "No policies resolved for user, implicit deny",
 					"accessKeyID", accessKey, "accountID", credResult.AccountID)
 			}
 			if iampolicy.Evaluate(action, resource, credResult.PolicyDocuments) == iampolicy.Deny {
-				slog.Debug("S3 access denied by policy",
+				slog.DebugContext(r.Context(), "S3 access denied by policy",
 					"action", action, "resource", resource,
 					"accessKeyID", accessKey, "policyCount", len(credResult.PolicyDocuments))
 				s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
@@ -260,7 +260,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		if bucket != "" && !isCreateBucket {
 			meta, err := s.resolveBucketMetadata(bucket)
 			if err != nil {
-				slog.Error("Failed to resolve bucket metadata for ownership check",
+				slog.ErrorContext(r.Context(), "Failed to resolve bucket metadata for ownership check",
 					"bucket", bucket, "error", err, "accessKeyID", accessKey)
 				s.writeS3Error(w, r, http.StatusInternalServerError, "InternalError",
 					"An internal error occurred")
@@ -269,7 +269,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			// Unknown bucket — let the route handler return NoSuchBucket so
 			// existence is reported consistently with non-authenticated paths.
 			if meta != nil && !bucketAccessAllowed(method, credResult.AccountID, meta, credResult.SkipPolicyCheck) {
-				slog.Warn("Cross-account bucket access denied",
+				slog.WarnContext(r.Context(), "Cross-account bucket access denied",
 					"accessKeyID", accessKey,
 					"callerAccountID", credResult.AccountID,
 					"bucketAccountID", meta.AccountID,
@@ -292,12 +292,12 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string, err, lookupErr error) {
 	if lookupErr != nil {
 		if errors.Is(lookupErr, ErrKeyNotFound) {
-			slog.Warn("Unknown access key", "accessKeyID", claimedKey, "remoteAddr", r.RemoteAddr)
+			slog.WarnContext(r.Context(), "Unknown access key", "accessKeyID", claimedKey, "remoteAddr", r.RemoteAddr)
 			s.writeS3Error(w, r, http.StatusForbidden, "InvalidAccessKeyId",
 				"The AWS Access Key Id you provided does not exist in our records")
 			return
 		}
-		slog.Error("Credential lookup infrastructure error",
+		slog.ErrorContext(r.Context(), "Credential lookup infrastructure error",
 			"accessKeyID", claimedKey, "error", lookupErr, "remoteAddr", r.RemoteAddr)
 		s.writeS3Error(w, r, http.StatusInternalServerError, "InternalError",
 			"An internal error occurred while validating credentials")
@@ -316,13 +316,13 @@ func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, 
 	case errors.Is(err, auth.ErrMissingContentSHA):
 		s.writeS3Error(w, r, http.StatusBadRequest, "InvalidRequest", "Missing required header: X-Amz-Content-Sha256")
 	case errors.Is(err, auth.ErrClockSkew):
-		slog.Debug("Request timestamp outside allowed skew", "timestamp", r.Header.Get("X-Amz-Date"))
+		slog.DebugContext(r.Context(), "Request timestamp outside allowed skew", "timestamp", r.Header.Get("X-Amz-Date"))
 		s.writeS3Error(w, r, http.StatusForbidden, "RequestTimeTooSkewed",
 			"The difference between the request time and the current time is too large")
 	case errors.Is(err, auth.ErrSignatureMismatch):
 		var smErr *auth.SigMismatchError
 		if errors.As(err, &smErr) {
-			slog.Warn("SigV4 signature mismatch",
+			slog.WarnContext(r.Context(), "SigV4 signature mismatch",
 				"accessKeyID", smErr.AccessKeyID,
 				"method", r.Method,
 				"path", r.URL.Path,
@@ -339,7 +339,7 @@ func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, 
 		}
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request signature does not match")
 	default:
-		slog.Warn("Unexpected SigV4 verification error", "error", err, "accessKeyID", claimedKey)
+		slog.WarnContext(r.Context(), "Unexpected SigV4 verification error", "error", err, "accessKeyID", claimedKey)
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", err.Error())
 	}
 }
@@ -356,7 +356,7 @@ func (s *HTTP2Server) writeS3Error(w http.ResponseWriter, r *http.Request, statu
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(statusCode)
 	if err := xml.NewEncoder(w).Encode(s3error); err != nil {
-		slog.Debug("failed to encode XML error response", "error", err)
+		slog.DebugContext(r.Context(), "failed to encode XML error response", "error", err)
 	}
 }
 
@@ -402,7 +402,7 @@ func (s *HTTP2Server) handleError(w http.ResponseWriter, r *http.Request, err er
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(statusCode)
 	if err := xml.NewEncoder(w).Encode(s3error); err != nil {
-		slog.Debug("failed to encode XML error response", "error", err)
+		slog.DebugContext(r.Context(), "failed to encode XML error response", "error", err)
 	}
 }
 
@@ -435,7 +435,7 @@ func (s *HTTP2Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.writeXML(w, http.StatusOK, result); err != nil {
-		slog.Debug("failed to write XML response", "error", err)
+		slog.DebugContext(ctx, "failed to write XML response", "error", err)
 	}
 }
 
@@ -531,9 +531,9 @@ func (s *HTTP2Server) listObjects(w http.ResponseWriter, r *http.Request) {
 
 	// Return proper errors for unsupported bucket sub-resource operations
 	// that Terraform and other tools may call.
-	slog.Debug("listObjects called", "bucket", bucket, "query", r.URL.RawQuery)
+	slog.DebugContext(ctx, "listObjects called", "bucket", bucket, "query", r.URL.RawQuery)
 	if query.Has("policy") {
-		slog.Debug("returning NoSuchBucketPolicy for ?policy request", "bucket", bucket)
+		slog.DebugContext(ctx, "returning NoSuchBucketPolicy for ?policy request", "bucket", bucket)
 		s.writeS3Error(w, r, http.StatusNotFound, "NoSuchBucketPolicy", "The bucket policy does not exist")
 		return
 	}
@@ -583,7 +583,7 @@ func (s *HTTP2Server) listObjects(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.writeXML(w, http.StatusOK, result); err != nil {
-		slog.Debug("failed to write XML response", "error", err)
+		slog.DebugContext(ctx, "failed to write XML response", "error", err)
 	}
 }
 
@@ -654,7 +654,7 @@ func (s *HTTP2Server) getObject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		slog.Debug("failed to copy response body", "error", err)
+		slog.DebugContext(ctx, "failed to copy response body", "error", err)
 	}
 }
 
@@ -733,7 +733,7 @@ func (s *HTTP2Server) postObject(w http.ResponseWriter, r *http.Request) {
 			Key:      resp.Key,
 			UploadId: resp.UploadID,
 		}); err != nil {
-			slog.Debug("failed to write XML response", "error", err)
+			slog.DebugContext(ctx, "failed to write XML response", "error", err)
 		}
 		return
 	}
@@ -776,7 +776,7 @@ func (s *HTTP2Server) postObject(w http.ResponseWriter, r *http.Request) {
 		Key:      resp.Key,
 		ETag:     resp.ETag,
 	}); err != nil {
-		slog.Debug("failed to write XML response", "error", err)
+		slog.DebugContext(ctx, "failed to write XML response", "error", err)
 	}
 }
 
