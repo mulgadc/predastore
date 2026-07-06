@@ -3,18 +3,23 @@ package s3
 import (
 	"net/http"
 
+	"github.com/mulgadc/predastore/otelsetup"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
-// s3SpanMiddleware renames the request span to the resolved S3 action and
-// records bucket/key attributes once per request. No-op when tracing is not
-// exporting (the span is non-recording).
+// s3SpanMiddleware renames the request span to the resolved S3 action,
+// records bucket/key attributes once per request, and names the request
+// for metrics. Span work is a no-op when tracing is not exporting.
 func s3SpanMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		action := s3Action(r.Method, r.URL.Path)
+		if action != "" {
+			otelsetup.SetRequestAction(r.Context(), action)
+		}
 		span := trace.SpanFromContext(r.Context())
 		if span.IsRecording() {
-			if action := s3Action(r.Method, r.URL.Path); action != "" {
+			if action != "" {
 				span.SetName(action)
 			}
 			bucket, key := parseS3Path(r.URL.Path)
