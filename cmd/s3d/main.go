@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/s3"
 
 	_ "github.com/mulgadc/predastore/internal/fipsboot"
@@ -54,6 +55,20 @@ func main() {
 		slog.Error("Missing required flag: -encryption-key-file (or ENCRYPTION_KEY_FILE)")
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	// Telemetry is best-effort: a failed init never blocks the S3 server.
+	otelShutdown, err := otelsetup.Init(context.Background(), "predastore")
+	if err != nil {
+		slog.Warn("Telemetry init failed, continuing without export", "error", err)
+	} else {
+		defer func() {
+			flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := otelShutdown(flushCtx); err != nil {
+				slog.Warn("Telemetry shutdown", "error", err)
+			}
+		}()
 	}
 
 	// Create the S3 server with all options

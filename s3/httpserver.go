@@ -22,6 +22,7 @@ import (
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
+	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/mulgadc/predastore/ratelimit"
 	"github.com/mulgadc/predastore/s3/chunked"
@@ -132,10 +133,11 @@ func (s *HTTP2Server) setupRoutes() {
 		logLevel = slog.LevelInfo
 	}
 
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})
-	slog.SetDefault(slog.New(handler))
+	otelsetup.SetDefaultJSONLogger(logLevel)
 
 	// Middleware
+	r.Use(otelsetup.HTTPMiddleware("predastore"))
+	r.Use(s3SpanMiddleware)
 	if !s.config.DisableLogging {
 		r.Use(middleware.Logger)
 	}
