@@ -126,7 +126,11 @@ func newResource(ctx context.Context, serviceName string) (*resource.Resource, e
 		attrs = append(attrs, semconv.ServiceVersion(v))
 	}
 	if env := os.Getenv("MULGA_ENV"); env != "" {
-		attrs = append(attrs, attribute.String("mulga.env", env))
+		// deployment.environment maps to service.environment in Elastic APM,
+		// enabling the native environment selector across the APM UI.
+		attrs = append(attrs,
+			attribute.String("mulga.env", env),
+			semconv.DeploymentEnvironment(env))
 	}
 	if src := os.Getenv("MULGA_SOURCE"); src != "" {
 		attrs = append(attrs, attribute.String("mulga.source", src))
