@@ -16,6 +16,7 @@ import (
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
+	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3db"
@@ -250,10 +251,7 @@ func (s *Server) init() error {
 	} else {
 		logLevel = slog.LevelInfo
 	}
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: logLevel,
-	})
-	slog.SetDefault(slog.New(handler))
+	otelsetup.SetDefaultJSONLogger(logLevel)
 
 	if s.config.Debug {
 		slog.Info("Debug logging enabled")
