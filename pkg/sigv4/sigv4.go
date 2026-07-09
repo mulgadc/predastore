@@ -7,11 +7,6 @@ import (
 	"time"
 )
 
-type Scope struct {
-	Region  string
-	Service string
-}
-
 const (
 	amzTimeFormat = "20060102T150405Z"
 	amzDateFormat = "20060102"
@@ -27,82 +22,24 @@ const (
 	AlgorithmV4a Algorithm = "AWS4-ECDSA-P256-SHA256"
 )
 
-type Region string
+type ParsedRequest struct {
+	*http.Request
 
-const (
-	RegionUSEast2      Region = "us-east-2"
-	RegionUSEast1      Region = "us-east-1"
-	RegionUSWest1      Region = "us-west-1"
-	RegionUSWest2      Region = "us-west-2"
-	RegionAFSouth1     Region = "af-south-1"
-	RegionAPEast1      Region = "ap-east-1"
-	RegionAPSouth2     Region = "ap-south-2"
-	RegionAPSoutheast3 Region = "ap-southeast-3"
-	RegionAPSoutheast5 Region = "ap-southeast-5"
-	RegionAPSoutheast4 Region = "ap-southeast-4"
-	RegionAPSouth1     Region = "ap-south-1"
-	RegionAPSoutheast6 Region = "ap-southeast-6"
-	RegionAPNortheast3 Region = "ap-northeast-3"
-	RegionAPNortheast2 Region = "ap-northeast-2"
-	RegionAPSoutheast1 Region = "ap-southeast-1"
-	RegionAPSoutheast2 Region = "ap-southeast-2"
-	RegionAPEast2      Region = "ap-east-2"
-	RegionAPSoutheast7 Region = "ap-southeast-7"
-	RegionAPNortheast1 Region = "ap-northeast-1"
-	RegionCACentral1   Region = "ca-central-1"
-	RegionCAWest1      Region = "ca-west-1"
-	RegionEUCentral1   Region = "eu-central-1"
-	RegionEUWest1      Region = "eu-west-1"
-	RegionEUWest2      Region = "eu-west-2"
-	RegionEUSouth1     Region = "eu-south-1"
-	RegionEUWest3      Region = "eu-west-3"
-	RegionEUSouth2     Region = "eu-south-2"
-	RegionEUNorth1     Region = "eu-north-1"
-	RegionEUCentral2   Region = "eu-central-2"
-	RegionILCentral1   Region = "il-central-1"
-	RegionMXCentral1   Region = "mx-central-1"
-	RegionMESouth1     Region = "me-south-1"
-	RegionMECentral1   Region = "me-central-1"
-	RegionSAEast1      Region = "sa-east-1"
-	RegionUSGovEast1   Region = "us-gov-east-1"
-	RegionUSGovWest1   Region = "us-gov-west-1"
-)
-
-type Service string
-
-const (
-	ServiceS3  Service = "s3"
-	ServiceACM Service = "acm"
-	ServiceEC2 Service = "ec2"
-	ServiceECR Service = "ecr"
-	ServiceECS Service = "ecs"
-	ServiceEKS Service = "eks"
-	ServiceIAM Service = "iam"
-)
-
-type Payload int
-
-const (
-	PayloadSigned Payload = iota
-	PayloadUnsigned
-	PayloadStreamingSigned
-	PayloadStreamingSignedTrailer
-	PayloadStreamingUnsignedTrailer
-)
+	AccessKeyID   string
+	Timestamp     time.Time
+	Region        string
+	Service       string
+	SignedHeaders []string
+	Signature     string
+	Content       string
+}
 
 // TODO: Standardize errors.
 
-type ParsedRequest struct {
-	AccessKeyID   string
-	Timestamp     time.Time
-	Region        Region
-	Service       Service
-	SignedHeaders []string
-	Signature     string
-}
-
-func Parse(req *http.Request, region Region, service Service) (*ParsedRequest, error) {
-	parsed := &ParsedRequest{}
+func Parse(req *http.Request, region string, service string) (*ParsedRequest, error) {
+	parsed := &ParsedRequest{
+		Request: req,
+	}
 
 	// Get Authorization header.
 	authHdr := req.Header.Get("Authorization")
@@ -120,9 +57,9 @@ func Parse(req *http.Request, region Region, service Service) (*ParsedRequest, e
 		return nil, fmt.Errorf("unsupported Authorization type")
 	}
 
-	// Get contentHdr signature/scheme.
-	contentHdr := req.Header.Get("X-Amz-Content-Sha256")
-	if contentHdr == "" {
+	// Get content hash (or signing scheme).
+	parsed.Content = req.Header.Get("X-Amz-Content-Sha256")
+	if parsed.Content == "" {
 		return nil, fmt.Errorf("missing required header for this request: x-amz-content-sha256")
 	}
 
@@ -182,8 +119,8 @@ func Parse(req *http.Request, region Region, service Service) (*ParsedRequest, e
 	}
 
 	// Check that Credential region and service match the endpoint's expected values.
-	parsed.Region = Region(credParts[2])
-	parsed.Service = Service(credParts[3])
+	parsed.Region = credParts[2]
+	parsed.Service = credParts[3]
 	if parsed.Region != region {
 		return nil, fmt.Errorf("malformed Authorization header: incorrect region \"%s\"; expected \"%s\"", parsed.Region, region)
 	} else if parsed.Service != service {
@@ -192,7 +129,7 @@ func Parse(req *http.Request, region Region, service Service) (*ParsedRequest, e
 
 	// Check that Credential has the correct terminal value.
 	if credParts[4] != "aws4_request" {
-		return nil, fmt.Errorf("malformed Authorization header: terminal value; expected \"aws4_request\"", parsed.Service, service)
+		return nil, fmt.Errorf("malformed Authorization header: terminal value; expected \"aws4_request\"")
 	}
 
 	// Assign remaining fields to parsed request envelope.
