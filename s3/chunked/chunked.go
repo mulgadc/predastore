@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/minio/crc64nvme"
@@ -164,7 +164,7 @@ func (d *Decoder) readNextChunkHeader() error {
 		line = line[:idx]
 	}
 	sizeStr := strings.TrimSpace(line)
-	size, err := parseHexInt64(sizeStr)
+	size, err := strconv.ParseInt(sizeStr, 16, 64)
 	if err != nil {
 		return fmt.Errorf("invalid chunk size %q: %w", sizeStr, err)
 	}
@@ -223,32 +223,4 @@ func (d *Decoder) consumeCRLF() error {
 		return fmt.Errorf("invalid chunk terminator, want \\r\\n, got %q%q", b1, b2)
 	}
 	return nil
-}
-
-// parseHexInt64 parses a hex string (no 0x prefix) into int64.
-func parseHexInt64(s string) (int64, error) {
-	var n int64
-	if s == "" {
-		return 0, fmt.Errorf("empty hex string")
-	}
-	for _, ch := range s {
-		var v int64
-		switch {
-		case ch >= '0' && ch <= '9':
-			v = int64(ch - '0')
-		case ch >= 'a' && ch <= 'f':
-			v = int64(ch-'a') + 10
-		case ch >= 'A' && ch <= 'F':
-			v = int64(ch-'A') + 10
-		default:
-			return 0, fmt.Errorf("invalid hex digit %q", ch)
-		}
-		n = (n << 4) | v
-	}
-	return n, nil
-}
-
-// NewHTTPBodyReader returns an io.Reader for net/http request bodies.
-func NewHTTPBodyReader(r *http.Request) io.Reader {
-	return r.Body
 }

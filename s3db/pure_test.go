@@ -114,25 +114,6 @@ func TestEscapePathSegment(t *testing.T) {
 	}
 }
 
-func TestHexEncodeKey(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{"simple ascii", "hello", "68656c6c6f"},
-		{"empty", "", ""},
-		{"binary-like", "\x00\x01\xff", "0001ff"},
-		{"slash in key", "bucket/key", "6275636b65742f6b6579"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, hexEncodeKey(tt.input))
-		})
-	}
-}
-
 func TestDefaultClientConfig(t *testing.T) {
 	cfg := DefaultClientConfig()
 	require.NotNil(t, cfg)

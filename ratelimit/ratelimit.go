@@ -22,10 +22,6 @@ const (
 // Results are joined with ":" to form the limiter map key.
 type KeyFunc func(r *http.Request) (string, error)
 
-// ThrottleErrorWriter writes a service-appropriate throttle rejection response.
-// Called after the middleware sets the Retry-After header.
-type ThrottleErrorWriter func(w http.ResponseWriter, r *http.Request)
-
 type entry struct {
 	limiter  *rate.Limiter
 	lastSeen atomic.Int64 // unix nano
@@ -123,8 +119,9 @@ func (t *Throttler) getOrCreate(key, action string) *rate.Limiter {
 
 // Middleware returns net/http middleware that enforces rate limits.
 // keyFuncs extract the account-id and action from each request.
-// onThrottle writes the service-appropriate error response on rejection.
-func (t *Throttler) Middleware(keyFuncs []KeyFunc, onThrottle ThrottleErrorWriter) func(http.Handler) http.Handler {
+// onThrottle writes the service-appropriate error response on rejection,
+// called after the middleware sets the Retry-After header.
+func (t *Throttler) Middleware(keyFuncs []KeyFunc, onThrottle http.HandlerFunc) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			parts := make([]string, len(keyFuncs))

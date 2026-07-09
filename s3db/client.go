@@ -113,17 +113,10 @@ func escapePathSegment(s string) string {
 	return strings.ReplaceAll(escaped, "+", "%2B")
 }
 
-// hexEncodeKey hex-encodes a key for safe transport in URL paths.
-// This avoids issues with binary keys containing characters like '/' that
-// can cause path normalization differences between Go's URL parser and fasthttp.
-func hexEncodeKey(key string) string {
-	return hex.EncodeToString([]byte(key))
-}
-
 // Put stores a key-value pair in the specified table
 func (c *Client) Put(table, key string, value []byte) error {
 	// Hex-encode the key to avoid URL path issues with binary data
-	path := fmt.Sprintf("/v1/put/%s/%s", escapePathSegment(table), hexEncodeKey(key))
+	path := fmt.Sprintf("/v1/put/%s/%s", escapePathSegment(table), hex.EncodeToString([]byte(key)))
 	_, err := c.doWrite("POST", path, value)
 	return err
 }
@@ -131,7 +124,7 @@ func (c *Client) Put(table, key string, value []byte) error {
 // Get retrieves a value by key from the specified table
 func (c *Client) Get(table, key string) ([]byte, error) {
 	// Hex-encode the key to avoid URL path issues with binary data
-	path := fmt.Sprintf("/v1/get/%s/%s", escapePathSegment(table), hexEncodeKey(key))
+	path := fmt.Sprintf("/v1/get/%s/%s", escapePathSegment(table), hex.EncodeToString([]byte(key)))
 
 	resp, err := c.doRead(path)
 	if err != nil {
@@ -149,7 +142,7 @@ func (c *Client) Get(table, key string) ([]byte, error) {
 // Delete removes a key from the specified table
 func (c *Client) Delete(table, key string) error {
 	// Hex-encode the key to avoid URL path issues with binary data
-	path := fmt.Sprintf("/v1/delete/%s/%s", escapePathSegment(table), hexEncodeKey(key))
+	path := fmt.Sprintf("/v1/delete/%s/%s", escapePathSegment(table), hex.EncodeToString([]byte(key)))
 	_, err := c.doWrite("DELETE", path, nil)
 	return err
 }

@@ -25,7 +25,6 @@ import (
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/mulgadc/predastore/ratelimit"
-	"github.com/mulgadc/predastore/s3/chunked"
 )
 
 // HTTP2Server is an HTTP/2 compatible S3 server using net/http
@@ -674,7 +673,7 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 			Key:             key,
 			UploadID:        uploadID,
 			PartNumber:      partNumber,
-			Body:            chunked.NewHTTPBodyReader(r),
+			Body:            r.Body,
 			ContentEncoding: r.Header.Get("Content-Encoding"),
 			IsChunked:       r.Header.Get("Content-Encoding") == "aws-chunked",
 			DecodedLength:   decodedLen,
@@ -696,7 +695,7 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.backend.PutObject(ctx, &backend.PutObjectRequest{
 		Bucket:          bucket,
 		Key:             key,
-		Body:            chunked.NewHTTPBodyReader(r),
+		Body:            r.Body,
 		ContentEncoding: r.Header.Get("Content-Encoding"),
 		IsChunked:       r.Header.Get("Content-Encoding") == "aws-chunked",
 		DecodedLength:   decodedLen,

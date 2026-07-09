@@ -6,8 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -33,39 +31,6 @@ func crc64Base64(crc uint64) string {
 	var b [8]byte
 	binary.BigEndian.PutUint64(b[:], crc)
 	return base64.StdEncoding.EncodeToString(b[:])
-}
-
-func TestParseHexInt64(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   string
-		want    int64
-		wantErr string
-	}{
-		{"zero", "0", 0, ""},
-		{"single digit", "5", 5, ""},
-		{"lowercase hex", "ff", 255, ""},
-		{"uppercase hex", "FF", 255, ""},
-		{"mixed case", "aB", 0xAB, ""},
-		{"multi-byte", "1A2B", 0x1A2B, ""},
-		{"large value", "DEADBEEF", 0xDEADBEEF, ""},
-		{"empty string", "", 0, "empty hex string"},
-		{"invalid char", "1G", 0, "invalid hex digit"},
-		{"space", "1 2", 0, "invalid hex digit"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseHexInt64(tt.input)
-			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, tt.want, got)
-			}
-		})
-	}
 }
 
 func TestVerifyCRC64NVME(t *testing.T) {
@@ -362,16 +327,6 @@ func TestDecoder_NoDecodedLenHint(t *testing.T) {
 	data, err := io.ReadAll(dec)
 	require.NoError(t, err)
 	assert.Equal(t, "hello", string(data))
-}
-
-func TestNewHTTPBodyReader(t *testing.T) {
-	body := strings.NewReader("test body")
-	req := httptest.NewRequest(http.MethodPut, "/bucket/key", body)
-
-	reader := NewHTTPBodyReader(req)
-	data, err := io.ReadAll(reader)
-	require.NoError(t, err)
-	assert.Equal(t, "test body", string(data))
 }
 
 func TestDecoder_BinaryPayload(t *testing.T) {
