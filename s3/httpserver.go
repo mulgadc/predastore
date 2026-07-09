@@ -20,7 +20,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
@@ -35,29 +34,6 @@ type HTTP2Server struct {
 	server    *http.Server
 	credProv  CredentialProvider
 	throttler *ratelimit.Throttler
-}
-
-// NewHTTP2Server creates a new HTTP/2 compatible S3 server
-func NewHTTP2Server(config *Config) *HTTP2Server {
-	s := &HTTP2Server{
-		config:   config,
-		router:   chi.NewRouter(),
-		credProv: NewConfigProvider(config.Auth),
-	}
-
-	if config.RateLimit.Enabled {
-		s.throttler = ratelimit.New(config.RateLimit)
-	}
-
-	// Create backend based on config
-	if len(config.Nodes) > 0 {
-		s.backend = s.createDistributedBackend()
-	} else {
-		slog.Warn("No [[nodes]] configured, starting without storage backend")
-	}
-
-	s.setupRoutes()
-	return s
 }
 
 // NewHTTP2ServerWithBackend creates a new HTTP/2 server with an existing backend
@@ -75,48 +51,6 @@ func NewHTTP2ServerWithBackend(config *Config, be backend.Backend, credProv Cred
 
 	s.setupRoutes()
 	return s
-}
-
-func (s *HTTP2Server) createDistributedBackend() backend.Backend {
-	nodes := make([]distributed.NodeConfig, 0, len(s.config.Nodes))
-	for _, n := range s.config.Nodes {
-		nodes = append(nodes, distributed.NodeConfig{
-			ID:     n.ID,
-			Host:   n.Host,
-			Port:   n.Port,
-			Path:   n.Path,
-			DB:     n.DB,
-			DBPort: n.DBPort,
-			DBPath: n.DBPath,
-			Leader: n.Leader,
-			Epoch:  n.Epoch,
-		})
-	}
-
-	buckets := make([]distributed.BucketConfig, 0, len(s.config.Buckets))
-	for _, b := range s.config.Buckets {
-		buckets = append(buckets, distributed.BucketConfig{
-			Name:      b.Name,
-			Region:    b.Region,
-			Type:      b.Type,
-			Public:    b.Public,
-			AccountID: b.AccountID,
-		})
-	}
-
-	config := &distributed.Config{
-		BadgerDir:    s.config.BadgerDir,
-		DataShards:   s.config.RS.Data,
-		ParityShards: s.config.RS.Parity,
-		Nodes:        nodes,
-		Buckets:      buckets,
-	}
-
-	be, err := distributed.New(config)
-	if err != nil {
-		panic(fmt.Sprintf("Failed to create distributed backend: %v", err))
-	}
-	return be
 }
 
 func (s *HTTP2Server) setupRoutes() {
