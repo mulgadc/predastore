@@ -285,6 +285,7 @@ func (s *HTTP2Server) writeS3Error(w http.ResponseWriter, r *http.Request, statu
 		RequestId: uuid.NewString(),
 		HostId:    r.Host,
 	}
+	otelsetup.SetRequestErrorCode(r.Context(), code)
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(statusCode)
@@ -331,6 +332,7 @@ func (s *HTTP2Server) handleError(w http.ResponseWriter, r *http.Request, err er
 
 	s3error.RequestId = uuid.NewString()
 	s3error.HostId = r.Host
+	otelsetup.SetRequestErrorCode(r.Context(), s3error.Code)
 
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(statusCode)
