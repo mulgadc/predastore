@@ -252,16 +252,30 @@ func resolveContentHash(req *http.Request, presigned bool, service string) (stri
 // list, confirming that every header requiring a signature is signed. It returns the
 // header snapshot and the signed-header list.
 func parseHeaders(req *http.Request, rawSignedHeaders string) (map[string]string, map[string]struct{}, error) {
+	// canonicalHeaderValue renders a header's values into SigV4 canonical form: each
+	// value trimmed with internal whitespace runs collapsed to a single space, then
+	// comma-joined across a multi-valued header.
+	canonicalHeaderValue := func(values []string) string {
+		parts := make([]string, len(values))
+		for i, v := range values {
+			// Fields also drops spaces inside quoted strings; SDKs canonicalize the same way.
+			parts[i] = strings.Join(strings.Fields(v), " ")
+		}
+		return strings.Join(parts, ",")
+	}
+
 	// Snapshot every request header, keyed lowercase.
 	headers := make(map[string]string, len(req.Header)+2)
 	for name, values := range req.Header {
-		// Trimmed and comma-joined; lossy for the rare multi-valued header (no internal-space collapse).
-		headers[strings.ToLower(name)] = strings.TrimSpace(strings.Join(values, ","))
+		headers[strings.ToLower(name)] = canonicalHeaderValue(values)
 	}
 
 	// host and content-length live on the request struct, not req.Header.
 	headers["host"] = strings.TrimSpace(req.Host)
-	if req.ContentLength > 0 {
+	// Inject whenever the length is known (>= 0) so a signed content-length:0
+	// (empty-body PUT/DELETE) reproduces as "content-length:0". Go reports -1 for
+	// an unknown length, which is correctly excluded.
+	if req.ContentLength >= 0 {
 		headers["content-length"] = strconv.FormatInt(req.ContentLength, 10)
 	}
 
@@ -302,17 +316,18 @@ func parseURI(req *http.Request, service string) string {
 	return strings.Join(segments, "/")
 }
 
-// parseQuery captures the query parameters for canonical reconstruction.
-func parseQuery(req *http.Request) map[string]string {
+// parseQuery captures the query parameters for canonical reconstruction,
+// preserving every value of a repeated key.
+func parseQuery(req *http.Request) map[string][]string {
 	query := req.URL.Query()
-	snapshot := make(map[string]string, len(query))
+	snapshot := make(map[string][]string, len(query))
 	for key, values := range query {
 		// X-Amz-Signature is excluded; it signs the rest.
 		if key == "X-Amz-Signature" {
 			continue
 		}
 
-		snapshot[key] = values[0]
+		snapshot[key] = values
 	}
 
 	return snapshot

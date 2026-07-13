@@ -10,10 +10,9 @@ import (
 	"strings"
 )
 
-// Verify recomputes the request signature with secretAccessKey and reports whether
-// it matches the one supplied with the request. body is read (and consumed to EOF)
-// only when the content hash is a non-sentinel value to check against, or must be
-// derived from the body; pass a re-readable reader if the caller still needs the bytes.
+// Verify recomputes the request signature with secretAccessKey and reports whether it
+// matches the one supplied. It may read body to EOF to check the payload hash, so pass
+// a re-readable reader if the caller still needs the bytes.
 func (req *SignedRequest) Verify(secretAccessKey string, body io.Reader) error {
 	// The signed content hash was resolved by Parse (a sentinel, or a body hash checked below).
 	contentHash := req.Canonical.ContentHash
@@ -30,10 +29,13 @@ func (req *SignedRequest) Verify(secretAccessKey string, body io.Reader) error {
 		bodyHashed = true
 	}
 
-	// Canonical query string: sorted by encoded key, "k=v" pairs joined with '&'.
+	// Canonical query string: every value of each key encoded into a "k=v" pair,
+	// then sorted (by encoded key, then value) and joined with '&'.
 	pairs := make([]string, 0, len(req.Canonical.Query))
-	for key, value := range req.Canonical.Query {
-		pairs = append(pairs, uriEncode(key)+"="+uriEncode(value))
+	for key, values := range req.Canonical.Query {
+		for _, value := range values {
+			pairs = append(pairs, uriEncode(key)+"="+uriEncode(value))
+		}
 	}
 	sort.Strings(pairs)
 
@@ -95,7 +97,7 @@ func (req *SignedRequest) Verify(secretAccessKey string, body io.Reader) error {
 	if bodyHashed {
 		return nil
 	}
-	switch contentStrategy(contentHash) {
+	switch contentSentinel(contentHash) {
 	// Sentinels are signed verbatim; the body is never read here.
 	case UnsignedPayload, StreamingUnsignedPayloadTrailer, StreamingV4Payload, StreamingV4PayloadTrailer:
 	// A real hash: confirm the body matches what was signed.

@@ -7,10 +7,6 @@ import (
 	"time"
 )
 
-// TODO: Support SigV4a (AWS4-ECDSA-P256-SHA256) — ECDSA-P256 signatures with an
-// X-Amz-Region-Set header and a region-less credential scope, used by Multi-Region
-// Access Points.
-//
 // TODO: Support browser-based POST policy uploads, which sign a base64-encoded
 // policy document instead of a canonical request.
 
@@ -26,17 +22,19 @@ const (
 type algorithm string
 
 const (
-	algorithmV4  algorithm = "AWS4-HMAC-SHA256"
+	algorithmV4 algorithm = "AWS4-HMAC-SHA256"
+	// TODO: SigV4a (ECDSA-P256, X-Amz-Region-Set, region-less scope; Multi-Region
+	// Access Points) is defined but not verified — getAuthComponents rejects it.
 	algorithmV4a algorithm = "AWS4-ECDSA-P256-SHA256"
 )
 
-type contentStrategy string
+type contentSentinel string
 
 const (
-	UnsignedPayload                 contentStrategy = "UNSIGNED-PAYLOAD"
-	StreamingUnsignedPayloadTrailer contentStrategy = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
-	StreamingV4Payload              contentStrategy = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-	StreamingV4PayloadTrailer       contentStrategy = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+	UnsignedPayload                 contentSentinel = "UNSIGNED-PAYLOAD"
+	StreamingUnsignedPayloadTrailer contentSentinel = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+	StreamingV4Payload              contentSentinel = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+	StreamingV4PayloadTrailer       contentSentinel = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
 )
 
 // Sentinel errors returned by Parse and Verify. Callers match them with
@@ -102,8 +100,9 @@ type SignedRequest struct {
 type canonicalRequest struct {
 	Method string
 	URI    string
-	// Query excludes X-Amz-Signature, which signs the rest.
-	Query map[string]string
+	// Query excludes X-Amz-Signature, which signs the rest. Each key maps to all
+	// of its values so repeated query keys canonicalize correctly.
+	Query map[string][]string
 	// Headers is every request header keyed lowercase, a superset of SignedHeaders.
 	Headers map[string]string
 	// SignedHeaders is the set of header names covered by the signature.
