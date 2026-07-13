@@ -232,14 +232,14 @@ func parseCanonicalRequest(req *http.Request, presigned bool, service string, ra
 
 // resolveContentHash returns the hashed payload signed into the canonical request.
 func resolveContentHash(req *http.Request, presigned bool, service string) (string, error) {
-	if presigned {
-		// Presigned URLs sign the UNSIGNED-PAYLOAD constant.
-		return string(UnsignedPayload), nil
-	}
-
 	if service == "s3" {
+		if presigned {
+			// S3 presigned URLs sign the UNSIGNED-PAYLOAD sentinel; the body is not covered.
+			return string(UnsignedPayload), nil
+		}
+
 		// S3 mandates x-amz-content-sha256 and signs its value verbatim — a hex digest or
-		// a sentinel; Parse never interprets it. Read directly since it need not be signed.
+		// a sentinel.
 		if h := strings.TrimSpace(req.Header.Get("X-Amz-Content-Sha256")); h != "" {
 			return h, nil
 		}
@@ -247,8 +247,7 @@ func resolveContentHash(req *http.Request, presigned bool, service string) (stri
 		return "", ErrMissingContentSHA256
 	}
 
-	// Every other service signs SHA-256 of the body, so the header is not authoritative.
-	// A bodyless request signs the empty-body digest.
+	// If the request is bodyless, sign the hash of the empty string.
 	if req.Body == nil || req.Body == http.NoBody {
 		return EmptyPayload, nil
 	}

@@ -27,8 +27,8 @@ const (
 type ContentMode string
 
 const (
-	// UnsignedPayload signs no payload hash: the body is not covered by the signature.
-	// Parse signs it into a presigned URL's canonical request.
+	// UnsignedPayload signs no payload hash indicates that the request body is not covered
+	// by the signature. S3 only.
 	UnsignedPayload ContentMode = "UNSIGNED-PAYLOAD"
 
 	// EmptyPayload is the hex SHA-256 of an empty body, signed by a bodyless non-S3 request.

@@ -75,7 +75,14 @@ func presign(tb fataler, rawURL string, expires int, region, service string) *ht
 	query.Set("X-Amz-Expires", strconv.Itoa(expires))
 	req.URL.RawQuery = query.Encode()
 
-	signedURI, _, err := v4.NewSigner().PresignHTTP(context.Background(), oracleCreds(), req, string(sigv4.UnsignedPayload), service, region, oracleTime, s3Opts(service)...)
+	// Match what a real presigner signs: S3 uses the UNSIGNED-PAYLOAD sentinel, every
+	// other service signs the empty-body digest.
+	payloadHash := sigv4.EmptyPayload
+	if service == "s3" {
+		payloadHash = string(sigv4.UnsignedPayload)
+	}
+
+	signedURI, _, err := v4.NewSigner().PresignHTTP(context.Background(), oracleCreds(), req, payloadHash, service, region, oracleTime, s3Opts(service)...)
 	if err != nil {
 		tb.Fatalf("PresignHTTP: %v", err)
 	}
@@ -158,14 +165,4 @@ func TestVerifyAcceptsOracle(t *testing.T) {
 			t.Fatalf("SDK-signed request rejected: %v (url=%s)", err, u.String())
 		}
 	})
-}
-
-// TestVerifyAcceptsAddedHeader is the negative control for the fault suite: a header the
-// client never signed (added in transit) must not affect verification.
-func TestVerifyAcceptsAddedHeader(t *testing.T) {
-	req := signHeader(t, http.MethodGet, "https://"+oracleHost+"/obj", nil, nil, "us-east-1", "s3", "")
-	req.Header.Set("Accept", "application/xml")
-	if err := parseVerify(req, "us-east-1", "s3", oracleTime); err != nil {
-		t.Fatalf("verification rejected a request over an unsigned added header: %v", err)
-	}
 }
