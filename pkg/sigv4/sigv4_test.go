@@ -154,12 +154,12 @@ func TestParseVerifyAWSExamples(t *testing.T) {
 				t.Fatalf("Parse: %v", err)
 			}
 
-			if err := signed.Verify(exampleSecret, newBody()); err != nil {
+			if _, err := signed.Verify(exampleSecret); err != nil {
 				t.Fatalf("Verify rejected the AWS-published signature: %v", err)
 			}
 
 			// A different secret yields a different signature and must be rejected.
-			if err := signed.Verify("wrong"+exampleSecret, newBody()); !errors.Is(err, sigv4.ErrSignatureMismatch) {
+			if _, err := signed.Verify("wrong" + exampleSecret); !errors.Is(err, sigv4.ErrSignatureMismatch) {
 				t.Fatalf("wrong secret: got %v, want ErrSignatureMismatch", err)
 			}
 		})

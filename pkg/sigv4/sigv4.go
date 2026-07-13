@@ -2,8 +2,6 @@ package sigv4
 
 import (
 	"errors"
-	"fmt"
-	"strings"
 	"time"
 )
 
@@ -28,13 +26,25 @@ const (
 	algorithmV4a algorithm = "AWS4-ECDSA-P256-SHA256"
 )
 
-type contentSentinel string
+// ContentMode is an x-amz-content-sha256 value that names how the payload is framed
+// instead of giving a literal hash. It tells the payload pipeline how to read the body.
+type ContentMode string
 
 const (
-	UnsignedPayload                 contentSentinel = "UNSIGNED-PAYLOAD"
-	StreamingUnsignedPayloadTrailer contentSentinel = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
-	StreamingV4Payload              contentSentinel = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-	StreamingV4PayloadTrailer       contentSentinel = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+	// UnsignedPayload signs no payload hash: the body is transmitted as-is and is not
+	// covered by the signature.
+	UnsignedPayload ContentMode = "UNSIGNED-PAYLOAD"
+
+	// StreamingUnsignedPayloadTrailer frames the body as aws-chunked with a trailer but no
+	// per-chunk signatures; only the trailer checksum protects the payload.
+	StreamingUnsignedPayloadTrailer ContentMode = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+
+	// StreamingV4Payload frames the body as aws-chunked with a per-chunk signature chain
+	// seeded by the request signature.
+	StreamingV4Payload ContentMode = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+
+	// StreamingV4PayloadTrailer is StreamingV4Payload followed by a signed trailer chunk.
+	StreamingV4PayloadTrailer ContentMode = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
 )
 
 // Sentinel errors returned by Parse and Verify. Callers match them with
@@ -76,28 +86,33 @@ var (
 	// Content-MD5, or an x-amz-* header) is absent from SignedHeaders.
 	ErrUnsignedHeader = errors.New("required header is not signed")
 
-	// ErrContentSHA256Mismatch is returned when the request body does not hash to
-	// the signed x-amz-content-sha256 value.
-	ErrContentSHA256Mismatch = errors.New("x-amz-content-sha256 does not match request body")
-
 	// ErrSignatureMismatch is returned when the computed signature does not match
 	// the one supplied with the request.
 	ErrSignatureMismatch = errors.New("signature mismatch")
 )
 
+// VerifiedRequest is the result of a successful Verify. It embeds the authenticated
+// SignedRequest and carries the derived signing key.
+type VerifiedRequest struct {
+	*SignedRequest
+
+	// SigningKey is the request's dated SigV4 signing key, exposed so a streaming decoder
+	// can continue the chunk-signature chain without re-deriving it.
+	SigningKey []byte
+}
+
 // SignedRequest is the validated signing metadata Parse extracts from a request,
-// carrying everything Verify needs to recompute and check the signature.
+// carrying everything Verify needs to check the signature.
 type SignedRequest struct {
-	Canonical  canonicalRequest
-	Credential scopedCredential
+	Canonical  CanonicalRequest
+	Credential ScopedCredential
 	Algorithm  algorithm
 	Timestamp  time.Time
 	Signature  string
 }
 
-// canonicalRequest holds the elements Verify reassembles into the SigV4 canonical
-// request string before hashing it.
-type canonicalRequest struct {
+// CanonicalRequest holds the parsed components of the SigV4 canonical request.
+type CanonicalRequest struct {
 	Method string
 	URI    string
 	// Query excludes X-Amz-Signature, which signs the rest. Each key maps to all
@@ -107,32 +122,17 @@ type canonicalRequest struct {
 	Headers map[string]string
 	// SignedHeaders is the set of header names covered by the signature.
 	SignedHeaders map[string]struct{}
-	// ContentHash is the signed payload hash: a sentinel, a hex digest, or empty
-	// when Verify must derive it from the body.
+	// ContentHash is the signed payload hash, used verbatim in the canonical request:
+	// a mode sentinel, a hex digest, or empty for a non-S3 request that omits
+	// x-amz-content-sha256.
 	ContentHash string
 }
 
-// scopedCredential is the parsed "<AKID>/YYYYMMDD/region/service/aws4_request"
+// ScopedCredential is the parsed "<AKID>/YYYYMMDD/region/service/aws4_request"
 // credential scope that keys the signing-key derivation.
-type scopedCredential struct {
+type ScopedCredential struct {
 	AccessKeyID string
 	Date        string
 	Region      string
 	Service     string
-}
-
-// uriEncode applies RFC 3986 percent-encoding to a canonical query component
-// (space becomes %20, not '+').
-func uriEncode(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' ||
-			c == '-' || c == '_' || c == '.' || c == '~' {
-			b.WriteByte(c)
-		} else {
-			fmt.Fprintf(&b, "%%%02X", c)
-		}
-	}
-	return b.String()
 }

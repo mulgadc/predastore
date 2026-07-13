@@ -4,39 +4,43 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
-	"io"
 	"sort"
 	"strings"
 )
 
-// Verify recomputes the request signature with secretAccessKey and reports whether it
-// matches the one supplied. It may read body to EOF to check the payload hash, so pass
-// a re-readable reader if the caller still needs the bytes.
-func (req *SignedRequest) Verify(secretAccessKey string, body io.Reader) error {
-	// The signed content hash was resolved by Parse (a sentinel, or a body hash checked below).
-	contentHash := req.Canonical.ContentHash
+// Verify checks the request signature under secretAccessKey, returning a VerifiedRequest
+// when the request is authentic and ErrSignatureMismatch when it is not.
+//
+// It authenticates the request metadata and the signed payload hash only; it does not read
+// the body. Confirming that the body actually hashes to the signed value is the caller's
+// responsibility.
+func (req *SignedRequest) Verify(secretAccessKey string) (*VerifiedRequest, error) {
+	stringToSign := req.buildStringToSign()
+	signingKey := req.buildSigningKey(secretAccessKey)
 
-	// A non-S3 request without x-amz-content-sha256 leaves it empty; hash the body now
-	// (the signature check below then covers body integrity).
-	bodyHashed := false
-	if contentHash == "" {
-		sum := sha256.New()
-		if _, err := io.Copy(sum, body); err != nil {
-			return fmt.Errorf("failed to read request body: %w", err)
-		}
-		contentHash = hex.EncodeToString(sum.Sum(nil))
-		bodyHashed = true
+	// Constant-time compare our signature against the one the client provided.
+	signature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
+	if !hmac.Equal([]byte(signature), []byte(req.Signature)) {
+		return nil, ErrSignatureMismatch
 	}
 
-	// Canonical query string: every value of each key encoded into a "k=v" pair,
-	// then sorted (by encoded key, then value) and joined with '&'.
+	return &VerifiedRequest{SignedRequest: req, SigningKey: signingKey}, nil
+}
+
+// buildCanonicalHash returns the hex SHA256 of the request's SigV4 canonical request.
+func (req *SignedRequest) buildCanonicalHash() string {
+	// The signed content hash was resolved by Parse (a sentinel or a hex digest) and is
+	// used verbatim; Verify never derives it from the body.
+	contentHash := req.Canonical.ContentHash
+
+	// Canonical query: encode every value of each key into a "k=v" pair.
 	pairs := make([]string, 0, len(req.Canonical.Query))
 	for key, values := range req.Canonical.Query {
 		for _, value := range values {
 			pairs = append(pairs, uriEncode(key)+"="+uriEncode(value))
 		}
 	}
+	// Sort by encoded key, then value; the '&' join happens in the canonical request below.
 	sort.Strings(pairs)
 
 	// SigV4 signs the headers in sorted order, for both the header block and the list below.
@@ -70,51 +74,32 @@ func (req *SignedRequest) Verify(secretAccessKey string, body io.Reader) error {
 		contentHash,
 	}, "\n")
 	canonicalSum := sha256.Sum256([]byte(canonicalRequest))
+	return hex.EncodeToString(canonicalSum[:])
+}
 
+// buildStringToSign returns the SigV4 string-to-sign for the given canonical-request hash.
+func (req *SignedRequest) buildStringToSign() string {
 	// String-to-sign over the credential scope and canonical request hash.
 	scope := req.Credential.Date + "/" + req.Credential.Region + "/" + req.Credential.Service + "/" + amzScopeTerminator
-	stringToSign := strings.Join([]string{
+	return strings.Join([]string{
 		string(algorithmV4),
 		req.Timestamp.Format(amzTimeFormat),
 		scope,
-		hex.EncodeToString(canonicalSum[:]),
+		req.buildCanonicalHash(),
 	}, "\n")
-
-	// Derive the dated signing key: AWS4<secret> -> date -> region -> service -> aws4_request.
-	signingKey := hmacSHA256([]byte("AWS4"+secretAccessKey), req.Credential.Date)
-	signingKey = hmacSHA256(signingKey, req.Credential.Region)
-	signingKey = hmacSHA256(signingKey, req.Credential.Service)
-	signingKey = hmacSHA256(signingKey, amzScopeTerminator)
-
-	// Constant-time compare our signature against the one the client provided.
-	signature := hex.EncodeToString(hmacSHA256(signingKey, stringToSign))
-	if !hmac.Equal([]byte(signature), []byte(req.Signature)) {
-		return ErrSignatureMismatch
-	}
-
-	// The signature is authentic, so the signed content hash is now trusted. A hash we
-	// computed from the body above is already covered by that check.
-	if bodyHashed {
-		return nil
-	}
-	switch contentSentinel(contentHash) {
-	// Sentinels are signed verbatim; the body is never read here.
-	case UnsignedPayload, StreamingUnsignedPayloadTrailer, StreamingV4Payload, StreamingV4PayloadTrailer:
-	// A real hash: confirm the body matches what was signed.
-	default:
-		sum := sha256.New()
-		if _, err := io.Copy(sum, body); err != nil {
-			return fmt.Errorf("failed to read request body: %w", err)
-		}
-		if hex.EncodeToString(sum.Sum(nil)) != contentHash {
-			return ErrContentSHA256Mismatch
-		}
-	}
-
-	return nil
 }
 
-// hmacSHA256 returns the HMAC-SHA256 of data under key, one link in the signing-key chain.
+// buildSigningKey derives the dated SigV4 signing key from secretAccessKey.
+func (req *SignedRequest) buildSigningKey(secretAccessKey string) []byte {
+	// AWS4<secret> -> date -> region -> service -> aws4_request.
+	key := hmacSHA256([]byte("AWS4"+secretAccessKey), req.Credential.Date)
+	key = hmacSHA256(key, req.Credential.Region)
+	key = hmacSHA256(key, req.Credential.Service)
+	key = hmacSHA256(key, amzScopeTerminator)
+	return key
+}
+
+// hmacSHA256 returns the HMAC-SHA256 of data under key.
 func hmacSHA256(key []byte, data string) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(data))

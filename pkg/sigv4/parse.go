@@ -173,32 +173,32 @@ func parseTimestamp(req *http.Request, presigned bool, now time.Time) (time.Time
 // parseCredential splits and validates the credential scope
 // ("<AKID>/YYYYMMDD/region/service/aws4_request") against the request time and
 // the endpoint's expected region and service.
-func parseCredential(credential, region, service string, t time.Time) (scopedCredential, error) {
+func parseCredential(credential, region, service string, t time.Time) (ScopedCredential, error) {
 	parts := strings.Split(credential, "/")
 	if len(parts) != 5 {
-		return scopedCredential{}, fmt.Errorf("%w: expected Credential to be in the format \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\"", ErrMalformedAuthorization)
+		return ScopedCredential{}, fmt.Errorf("%w: expected Credential to be in the format \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\"", ErrMalformedAuthorization)
 	}
 
 	// The date must be well-formed and match the date component of the request timestamp.
 	if _, err := time.Parse(amzDateFormat, parts[1]); err != nil {
-		return scopedCredential{}, fmt.Errorf("%w: the second Credential element must be a date in the format \"YYYYMMDD\"", ErrMalformedAuthorization)
+		return ScopedCredential{}, fmt.Errorf("%w: the second Credential element must be a date in the format \"YYYYMMDD\"", ErrMalformedAuthorization)
 	} else if parts[1] != t.Format(amzDateFormat) {
-		return scopedCredential{}, fmt.Errorf("%w: date does not match X-Amz-Date (or Date, if X-Amz-Date is not set)", ErrMalformedAuthorization)
+		return ScopedCredential{}, fmt.Errorf("%w: date does not match X-Amz-Date (or Date, if X-Amz-Date is not set)", ErrMalformedAuthorization)
 	}
 
 	// Region and service must match the endpoint's expected values.
 	if parts[2] != region {
-		return scopedCredential{}, fmt.Errorf("%w: incorrect region %q; expected %q", ErrMalformedAuthorization, parts[2], region)
+		return ScopedCredential{}, fmt.Errorf("%w: incorrect region %q; expected %q", ErrMalformedAuthorization, parts[2], region)
 	} else if parts[3] != service {
-		return scopedCredential{}, fmt.Errorf("%w: incorrect service %q; expected %q", ErrMalformedAuthorization, parts[3], service)
+		return ScopedCredential{}, fmt.Errorf("%w: incorrect service %q; expected %q", ErrMalformedAuthorization, parts[3], service)
 	}
 
 	// The scope must end with the fixed terminator.
 	if parts[4] != amzScopeTerminator {
-		return scopedCredential{}, fmt.Errorf("%w: terminal value; expected %q", ErrMalformedAuthorization, amzScopeTerminator)
+		return ScopedCredential{}, fmt.Errorf("%w: terminal value; expected %q", ErrMalformedAuthorization, amzScopeTerminator)
 	}
 
-	return scopedCredential{
+	return ScopedCredential{
 		AccessKeyID: parts[0],
 		Date:        parts[1],
 		Region:      parts[2],
@@ -207,18 +207,18 @@ func parseCredential(credential, region, service string, t time.Time) (scopedCre
 }
 
 // parseCanonicalRequest assembles and validates the canonical request from req.
-func parseCanonicalRequest(req *http.Request, presigned bool, service string, rawSignedHeaders string) (canonicalRequest, error) {
+func parseCanonicalRequest(req *http.Request, presigned bool, service string, rawSignedHeaders string) (CanonicalRequest, error) {
 	contentHash, err := resolveContentHash(req, presigned, service)
 	if err != nil {
-		return canonicalRequest{}, err
+		return CanonicalRequest{}, err
 	}
 
 	headers, signedHeaders, err := parseHeaders(req, rawSignedHeaders)
 	if err != nil {
-		return canonicalRequest{}, err
+		return CanonicalRequest{}, err
 	}
 
-	return canonicalRequest{
+	return CanonicalRequest{
 		Method:        req.Method,
 		URI:           parseURI(req, service),
 		Query:         parseQuery(req),
@@ -240,11 +240,12 @@ func resolveContentHash(req *http.Request, presigned bool, service string) (stri
 		return h, nil
 	}
 
-	// S3 requires the header; other services leave it empty for Verify to hash the body.
+	// S3 mandates the header.
 	if service == "s3" {
 		return "", ErrMissingContentSHA256
 	}
 
+	// Other services may omit it; the empty hash is signed verbatim into the canonical request.
 	return "", nil
 }
 
@@ -272,10 +273,10 @@ func parseHeaders(req *http.Request, rawSignedHeaders string) (map[string]string
 
 	// host and content-length live on the request struct, not req.Header.
 	headers["host"] = strings.TrimSpace(req.Host)
-	// Inject whenever the length is known (>= 0) so a signed content-length:0
-	// (empty-body PUT/DELETE) reproduces as "content-length:0". Go reports -1 for
-	// an unknown length, which is correctly excluded.
+	// Reproduce content-length only when the length is known: Go reports -1 for an
+	// unknown length, which must stay excluded from the canonical headers.
 	if req.ContentLength >= 0 {
+		// A known length includes 0, so an empty-body PUT/DELETE reproduces as "content-length:0".
 		headers["content-length"] = strconv.FormatInt(req.ContentLength, 10)
 	}
 
