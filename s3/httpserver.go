@@ -71,7 +71,10 @@ func (s *HTTP2Server) setupRoutes() {
 	// Middleware
 	r.Use(otelsetup.HTTPMiddleware("predastore"))
 	r.Use(s3SpanMiddleware)
-	if !s.config.DisableLogging {
+	// chi's access log duplicates the APM transaction from HTTPMiddleware and
+	// is a synchronous per-request write on the hot path; only enable it for
+	// explicit debug sessions.
+	if s.config.Debug {
 		r.Use(middleware.Logger)
 	}
 	r.Use(middleware.Recoverer)
