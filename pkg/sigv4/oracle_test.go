@@ -1,6 +1,7 @@
 package sigv4_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -40,9 +41,10 @@ type fataler interface {
 
 // signHeader signs req with the SDK and returns it ready for Parse. payloadHash is the
 // x-amz-content-sha256 value; empty means hash body. It is set as a header (as a real S3
-// client does) so the SDK signs it and Parse finds it.
+// client does) so the SDK signs it and Parse finds it. The body is attached so a non-S3
+// Parse can hash it (S3 ignores the body and reads the header verbatim).
 func signHeader(tb fataler, method, rawURL string, body []byte, hdrs map[string]string, region, service, payloadHash string) *http.Request {
-	req, err := http.NewRequest(method, rawURL, nil)
+	req, err := http.NewRequest(method, rawURL, bytes.NewReader(body))
 	if err != nil {
 		tb.Fatalf("build request: %v", err)
 	}
@@ -140,8 +142,12 @@ func TestVerifyAcceptsOracle(t *testing.T) {
 		}
 
 		body := rapid.SliceOfN(rapid.Byte(), 0, 64).Draw(t, "body")
+		// UNSIGNED-PAYLOAD is an S3-only sentinel. On a non-S3 service Parse hashes the
+		// body regardless, so a request the SDK signs with the sentinel is correctly a
+		// mismatch there — restrict it to S3 so the oracle stays realistic.
+		useUnsigned := rapid.Bool().Draw(t, "unsignedPayload")
 		payloadHash := ""
-		if rapid.Bool().Draw(t, "unsignedPayload") {
+		if service == "s3" && useUnsigned {
 			payloadHash = string(sigv4.UnsignedPayload)
 		}
 

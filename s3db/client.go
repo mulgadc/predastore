@@ -2,6 +2,7 @@ package s3db
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -16,13 +17,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mulgadc/predastore/auth"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
+	"github.com/mulgadc/predastore/pkg/sigv4"
 )
-
-// emptyPayloadSHA256 is sha256("") in hex — the payload hash for any
-// request without a body.
-const emptyPayloadSHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 // Client provides access to the distributed database cluster
 type Client struct {
@@ -34,6 +33,7 @@ type Client struct {
 	secretAccessKey string
 	region          string
 	service         string
+	signer          *v4.Signer
 	maxRetries      int
 }
 
@@ -89,18 +89,35 @@ func NewClient(config *ClientConfig) *Client {
 		ForceAttemptHTTP2: true,
 	}
 
+	// S3 single-encodes the URI path; every other service double-encodes. The verifier
+	// must agree, so key the signer's escaping off the same service name.
+	signer := v4.NewSigner(func(o *v4.SignerOptions) {
+		o.DisableURIPathEscaping = service == "s3"
+	})
+
 	return &Client{
 		nodes:           config.Nodes,
 		accessKeyID:     config.AccessKeyID,
 		secretAccessKey: config.SecretAccessKey,
 		region:          region,
 		service:         service,
+		signer:          signer,
 		maxRetries:      config.MaxRetries,
 		httpClient: &http.Client{
 			Timeout:   config.Timeout,
 			Transport: transport,
 		},
 	}
+}
+
+// signRequest signs req in place with SigV4 headers via the AWS SDK signer.
+// payloadHash is the hex SHA-256 of the body, or the empty-body digest.
+func (c *Client) signRequest(req *http.Request, payloadHash string) error {
+	// The server recovers the signed hash from this header; the SDK signer doesn't set it.
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+	return c.signer.SignHTTP(context.Background(),
+		aws.Credentials{AccessKeyID: c.accessKeyID, SecretAccessKey: c.secretAccessKey},
+		req, payloadHash, c.service, c.region, time.Now().UTC())
 }
 
 // escapePathSegment escapes a path segment, ensuring all special characters
@@ -231,7 +248,7 @@ func (c *Client) doRead(path string) ([]byte, error) {
 
 			// Sign the request if credentials are configured
 			if c.accessKeyID != "" && c.secretAccessKey != "" {
-				if err := auth.SignReq(req, c.accessKeyID, c.secretAccessKey, emptyPayloadSHA256, c.service, c.region); err != nil {
+				if err := c.signRequest(req, sigv4.EmptyPayload); err != nil {
 					lastErr = fmt.Errorf("failed to sign request: %w", err)
 					continue
 				}
@@ -356,7 +373,7 @@ func (c *Client) tryWrite(method, node, path string, body []byte) ([]byte, strin
 	if c.accessKeyID != "" && c.secretAccessKey != "" {
 		sum := sha256.Sum256(body)
 		payloadHash := hex.EncodeToString(sum[:])
-		if err := auth.SignReq(req, c.accessKeyID, c.secretAccessKey, payloadHash, c.service, c.region); err != nil {
+		if err := c.signRequest(req, payloadHash); err != nil {
 			return nil, "", fmt.Errorf("failed to sign request: %w", err)
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mulgadc/predastore/pkg/awschunked"
 	"github.com/mulgadc/predastore/pkg/sigv4"
 )
 
@@ -19,10 +20,9 @@ import (
 //	https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming.html
 //	https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming-trailers.html
 const (
-	katAccessKeyID   = "AKIAIOSFODNN7EXAMPLE"
-	katSecret        = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-	katScope         = "20130524/us-east-1/s3/aws4_request"
-	emptyPayloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	katAccessKeyID = "AKIAIOSFODNN7EXAMPLE"
+	katSecret      = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	katScope       = "20130524/us-east-1/s3/aws4_request"
 )
 
 // katTime is the signing instant every AWS example shares (Fri, 24 May 2013 00:00:00 GMT);
@@ -48,7 +48,7 @@ func TestKnownAnswers(t *testing.T) {
 			uri:    "/test.txt",
 			headers: map[string]string{
 				"range":                "bytes=0-9",
-				"x-amz-content-sha256": emptyPayloadHash,
+				"x-amz-content-sha256": sigv4.EmptyPayload,
 				"x-amz-date":           "20130524T000000Z",
 			},
 			signedHeaders: []string{"host", "range", "x-amz-content-sha256", "x-amz-date"},
@@ -74,7 +74,7 @@ func TestKnownAnswers(t *testing.T) {
 			host:          "examplebucket.s3.amazonaws.com",
 			uri:           "/",
 			query:         map[string]string{"lifecycle": ""},
-			headers:       map[string]string{"x-amz-content-sha256": emptyPayloadHash, "x-amz-date": "20130524T000000Z"},
+			headers:       map[string]string{"x-amz-content-sha256": sigv4.EmptyPayload, "x-amz-date": "20130524T000000Z"},
 			signedHeaders: []string{"host", "x-amz-content-sha256", "x-amz-date"},
 			signature:     "fea454ca298b7da1c68078a5d1bdbfbbe0d65c699e0f91ac7a200a0136783543",
 		},
@@ -84,7 +84,7 @@ func TestKnownAnswers(t *testing.T) {
 			host:          "examplebucket.s3.amazonaws.com",
 			uri:           "/",
 			query:         map[string]string{"max-keys": "2", "prefix": "J"},
-			headers:       map[string]string{"x-amz-content-sha256": emptyPayloadHash, "x-amz-date": "20130524T000000Z"},
+			headers:       map[string]string{"x-amz-content-sha256": sigv4.EmptyPayload, "x-amz-date": "20130524T000000Z"},
 			signedHeaders: []string{"host", "x-amz-content-sha256", "x-amz-date"},
 			signature:     "34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7",
 		},
@@ -110,7 +110,7 @@ func TestKnownAnswers(t *testing.T) {
 			uri:    "/examplebucket/chunkObject.txt",
 			headers: map[string]string{
 				"content-encoding":             "aws-chunked",
-				"x-amz-content-sha256":         string(sigv4.StreamingV4Payload),
+				"x-amz-content-sha256":         string(awschunked.StreamingV4Payload),
 				"x-amz-date":                   "20130524T000000Z",
 				"x-amz-decoded-content-length": "66560",
 				"x-amz-storage-class":          "REDUCED_REDUNDANCY",
@@ -126,7 +126,7 @@ func TestKnownAnswers(t *testing.T) {
 			uri:    "/examplebucket/chunkObject.txt",
 			headers: map[string]string{
 				"content-encoding":             "aws-chunked",
-				"x-amz-content-sha256":         string(sigv4.StreamingV4PayloadTrailer),
+				"x-amz-content-sha256":         string(awschunked.StreamingV4PayloadTrailer),
 				"x-amz-date":                   "20130524T000000Z",
 				"x-amz-decoded-content-length": "66560",
 				"x-amz-storage-class":          "REDUCED_REDUNDANCY",

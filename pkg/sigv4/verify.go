@@ -10,10 +10,6 @@ import (
 
 // Verify checks the request signature under secretAccessKey, returning a VerifiedRequest
 // when the request is authentic and ErrSignatureMismatch when it is not.
-//
-// It authenticates the request metadata and the signed payload hash only; it does not read
-// the body. Confirming that the body actually hashes to the signed value is the caller's
-// responsibility.
 func (req *SignedRequest) Verify(secretAccessKey string) (*VerifiedRequest, error) {
 	stringToSign := req.buildStringToSign()
 	signingKey := req.buildSigningKey(secretAccessKey)
@@ -74,16 +70,17 @@ func (req *SignedRequest) buildCanonicalHash() string {
 		contentHash,
 	}, "\n")
 	canonicalSum := sha256.Sum256([]byte(canonicalRequest))
+
 	return hex.EncodeToString(canonicalSum[:])
 }
 
 // buildStringToSign returns the SigV4 string-to-sign for the given canonical-request hash.
 func (req *SignedRequest) buildStringToSign() string {
 	// String-to-sign over the credential scope and canonical request hash.
-	scope := req.Credential.Date + "/" + req.Credential.Region + "/" + req.Credential.Service + "/" + amzScopeTerminator
+	scope := req.Credential.Date + "/" + req.Credential.Region + "/" + req.Credential.Service + "/" + AmzScopeTerminator
 	return strings.Join([]string{
-		string(algorithmV4),
-		req.Timestamp.Format(amzTimeFormat),
+		string(AlgorithmV4),
+		req.Timestamp.Format(AmzTimeFormat),
 		scope,
 		req.buildCanonicalHash(),
 	}, "\n")
@@ -95,7 +92,7 @@ func (req *SignedRequest) buildSigningKey(secretAccessKey string) []byte {
 	key := hmacSHA256([]byte("AWS4"+secretAccessKey), req.Credential.Date)
 	key = hmacSHA256(key, req.Credential.Region)
 	key = hmacSHA256(key, req.Credential.Service)
-	key = hmacSHA256(key, amzScopeTerminator)
+	key = hmacSHA256(key, AmzScopeTerminator)
 	return key
 }
 
@@ -103,5 +100,6 @@ func (req *SignedRequest) buildSigningKey(secretAccessKey string) []byte {
 func hmacSHA256(key []byte, data string) []byte {
 	mac := hmac.New(sha256.New, key)
 	mac.Write([]byte(data))
+
 	return mac.Sum(nil)
 }

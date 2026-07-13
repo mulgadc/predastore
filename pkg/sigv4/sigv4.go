@@ -9,42 +9,39 @@ import (
 // policy document instead of a canonical request.
 
 const (
-	amzTimeFormat      = "20060102T150405Z"
-	amzDateFormat      = "20060102"
-	amzScopeTerminator = "aws4_request"
+	AmzTimeFormat      = "20060102T150405Z"
+	AmzDateFormat      = "20060102"
+	AmzScopeTerminator = "aws4_request"
+
+	// MaxPayloadLen caps the body Parse will buffer to derive the content hash
+	// for a non-S3 request. Non-S3 (control-plane) bodies are small; the cap bounds
+	// pre-auth memory use.
+	MaxPayloadLen = 8 << 20 // 8 MiB
 
 	MaxClockSkew  = 15 * time.Minute
 	MaxPresignAge = 7 * 24 * time.Hour
 )
 
-type algorithm string
-
-const (
-	algorithmV4 algorithm = "AWS4-HMAC-SHA256"
-	// TODO: SigV4a (ECDSA-P256, X-Amz-Region-Set, region-less scope; Multi-Region
-	// Access Points) is defined but not verified — getAuthComponents rejects it.
-	algorithmV4a algorithm = "AWS4-ECDSA-P256-SHA256"
-)
-
-// ContentMode is an x-amz-content-sha256 value that names how the payload is framed
-// instead of giving a literal hash. It tells the payload pipeline how to read the body.
+// ContentMode is an x-amz-content-sha256 sentinel used in place of a literal payload
+// hash.
 type ContentMode string
 
 const (
-	// UnsignedPayload signs no payload hash: the body is transmitted as-is and is not
-	// covered by the signature.
+	// UnsignedPayload signs no payload hash: the body is not covered by the signature.
+	// Parse signs it into a presigned URL's canonical request.
 	UnsignedPayload ContentMode = "UNSIGNED-PAYLOAD"
 
-	// StreamingUnsignedPayloadTrailer frames the body as aws-chunked with a trailer but no
-	// per-chunk signatures; only the trailer checksum protects the payload.
-	StreamingUnsignedPayloadTrailer ContentMode = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
+	// EmptyPayload is the hex SHA-256 of an empty body, signed by a bodyless non-S3 request.
+	EmptyPayload string = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+)
 
-	// StreamingV4Payload frames the body as aws-chunked with a per-chunk signature chain
-	// seeded by the request signature.
-	StreamingV4Payload ContentMode = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+type Algorithm string
 
-	// StreamingV4PayloadTrailer is StreamingV4Payload followed by a signed trailer chunk.
-	StreamingV4PayloadTrailer ContentMode = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+const (
+	AlgorithmV4 Algorithm = "AWS4-HMAC-SHA256"
+	// TODO: SigV4a (ECDSA-P256, X-Amz-Region-Set, region-less scope; Multi-Region
+	// Access Points) is defined but not verified — getAuthComponents rejects it.
+	AlgorithmV4a Algorithm = "AWS4-ECDSA-P256-SHA256"
 )
 
 // Sentinel errors returned by Parse and Verify. Callers match them with
@@ -82,6 +79,10 @@ var (
 	// required x-amz-content-sha256 header.
 	ErrMissingContentSHA256 = errors.New("missing x-amz-content-sha256 header")
 
+	// ErrPayloadTooLarge is returned when a non-S3 request's body exceeds the size
+	// Parse will buffer to derive the signed content hash.
+	ErrPayloadTooLarge = errors.New("request payload exceeds maximum size for hashing")
+
 	// ErrUnsignedHeader is returned when a header that must be signed (host,
 	// Content-MD5, or an x-amz-* header) is absent from SignedHeaders.
 	ErrUnsignedHeader = errors.New("required header is not signed")
@@ -96,8 +97,8 @@ var (
 type VerifiedRequest struct {
 	*SignedRequest
 
-	// SigningKey is the request's dated SigV4 signing key, exposed so a streaming decoder
-	// can continue the chunk-signature chain without re-deriving it.
+	// SigningKey is the request's dated SigV4 signing key, exposed so a caller that signs
+	// follow-on operations keyed on it need not re-derive the key.
 	SigningKey []byte
 }
 
@@ -106,7 +107,7 @@ type VerifiedRequest struct {
 type SignedRequest struct {
 	Canonical  CanonicalRequest
 	Credential ScopedCredential
-	Algorithm  algorithm
+	Algorithm  Algorithm
 	Timestamp  time.Time
 	Signature  string
 }

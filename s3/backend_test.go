@@ -12,7 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mulgadc/predastore/auth"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/internal/storetest"
@@ -22,16 +23,39 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// signTestReq signs req with the given credentials and body payload hash.
-// body may be nil for body-less requests (sha256.Sum256(nil) is the empty
-// SHA-256 the server expects). Fails the test on signer error.
+// signOpts configures signTestReq.
+type signOpts struct{ signingTime time.Time }
+
+// withSignTime overrides the signing time, used to forge clock skew. The
+// server derives "now" itself, so a skewed signing time exercises its
+// timestamp validation.
+func withSignTime(t time.Time) func(*signOpts) {
+	return func(o *signOpts) { o.signingTime = t }
+}
+
+// signTestReq signs req with the given credentials and body payload hash via
+// the AWS SDK SigV4 signer. body may be nil for body-less requests
+// (sha256.Sum256(nil) is the empty SHA-256 the server expects). Fails the
+// test on signer error.
 func signTestReq(t *testing.T, req *http.Request, body []byte,
-	accessKey, secret, region, service string, opts ...func(*auth.Options)) {
+	accessKey, secret, region, service string, opts ...func(*signOpts)) {
 	t.Helper()
+	o := signOpts{signingTime: time.Now().UTC()}
+	for _, fn := range opts {
+		fn(&o)
+	}
+
 	sum := sha256.Sum256(body)
 	payloadHash := hex.EncodeToString(sum[:])
-	require.NoError(t,
-		auth.SignReq(req, accessKey, secret, payloadHash, service, region, opts...))
+	// The server recovers the signed payload hash from this header; the SDK doesn't set it.
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+
+	signer := v4.NewSigner(func(so *v4.SignerOptions) {
+		so.DisableURIPathEscaping = service == "s3"
+	})
+	require.NoError(t, signer.SignHTTP(context.Background(),
+		aws.Credentials{AccessKeyID: accessKey, SecretAccessKey: secret},
+		req, payloadHash, service, region, o.signingTime))
 }
 
 // s3BackendPortCounter gives each setupDistributedBackend invocation a unique

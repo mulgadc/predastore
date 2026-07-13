@@ -18,11 +18,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
-	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
+	"github.com/mulgadc/predastore/pkg/sigv4"
 	"github.com/mulgadc/predastore/ratelimit"
 )
 
@@ -132,35 +132,36 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		path := r.URL.Path
 		method := r.Method
 
-		// Skip auth only when no Authorization header is present; a
-		// presented header always goes through the verifier.
 		publicBucketAccess := s.config.validatePublicBucketPermission(method, path)
-		if r.Header.Get("Authorization") == "" {
-			if publicBucketAccess == nil {
-				next.ServeHTTP(w, r)
+
+		// Parse recognizes both header-authed and presigned requests; only a request with
+		// neither returns ErrMissingAuthentication.
+		sig, err := sigv4.Parse(r, s.config.Region, "s3")
+		if err != nil {
+			// Unsigned: fall back to public-bucket access rather than a parse error.
+			if errors.Is(err, sigv4.ErrMissingAuthentication) {
+				if publicBucketAccess == nil {
+					next.ServeHTTP(w, r)
+					return
+				}
+				s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 				return
 			}
-			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
-			return
-		}
-
-		sig, err := auth.ParseReq(r)
-		if err != nil {
 			s.respondSigV4Error(w, r, "", err, nil)
 			return
 		}
 
-		credResult, err := s.credProv.LookupCredentials(sig.AccessKeyID)
+		accessKey := sig.Credential.AccessKeyID
+		credResult, err := s.credProv.LookupCredentials(accessKey)
 		if err != nil {
-			s.respondSigV4Error(w, r, sig.AccessKeyID, nil, err)
+			s.respondSigV4Error(w, r, accessKey, nil, err)
 			return
 		}
 
-		if err := sig.Verify(credResult.SecretAccessKey, "s3", s.config.Region); err != nil {
-			s.respondSigV4Error(w, r, sig.AccessKeyID, err, nil)
+		if _, err := sig.Verify(credResult.SecretAccessKey); err != nil {
+			s.respondSigV4Error(w, r, accessKey, err, nil)
 			return
 		}
-		accessKey := sig.AccessKeyID
 
 		// IAM policy evaluation (NATS-sourced credentials only).
 		if !credResult.SkipPolicyCheck {
@@ -241,38 +242,40 @@ func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, 
 	}
 
 	switch {
-	case errors.Is(err, auth.ErrMissingAuth):
+	case errors.Is(err, sigv4.ErrMissingAuthentication):
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing Authorization header")
-	case errors.Is(err, auth.ErrMissingSignedHeader):
+	case errors.Is(err, sigv4.ErrUnsignedHeader):
 		s.writeS3Error(w, r, http.StatusForbidden, "AuthorizationHeaderMalformed", err.Error())
-	case errors.Is(err, auth.ErrInvalidAuthFormat):
+	case errors.Is(err, sigv4.ErrUnsupportedAlgorithm):
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid Authorization header format")
-	case errors.Is(err, auth.ErrMissingDate):
+	case errors.Is(err, sigv4.ErrMalformedAuthorization):
+		s.writeS3Error(w, r, http.StatusForbidden, "AuthorizationHeaderMalformed", err.Error())
+	case errors.Is(err, sigv4.ErrMalformedPresignedURL):
+		s.writeS3Error(w, r, http.StatusForbidden, "AuthorizationQueryParametersError", err.Error())
+	case errors.Is(err, sigv4.ErrRequestTimeInvalid):
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing required header: X-Amz-Date")
-	case errors.Is(err, auth.ErrMissingContentSHA):
+	case errors.Is(err, sigv4.ErrMissingContentSHA256):
 		s.writeS3Error(w, r, http.StatusBadRequest, "InvalidRequest", "Missing required header: X-Amz-Content-Sha256")
-	case errors.Is(err, auth.ErrClockSkew):
+	case errors.Is(err, sigv4.ErrRequestTimeTooSkewed):
 		slog.DebugContext(r.Context(), "Request timestamp outside allowed skew", "timestamp", r.Header.Get("X-Amz-Date"))
 		s.writeS3Error(w, r, http.StatusForbidden, "RequestTimeTooSkewed",
 			"The difference between the request time and the current time is too large")
-	case errors.Is(err, auth.ErrSignatureMismatch):
-		var smErr *auth.SigMismatchError
-		if errors.As(err, &smErr) {
-			slog.WarnContext(r.Context(), "SigV4 signature mismatch",
-				"accessKeyID", smErr.AccessKeyID,
-				"method", r.Method,
-				"path", r.URL.Path,
-				"host", r.Host,
-				"amzDate", r.Header.Get("X-Amz-Date"),
-				"payloadHashHeader", r.Header.Get("X-Amz-Content-Sha256"),
-				"contentLength", r.Header.Get("Content-Length"),
-				"userAgent", r.Header.Get("User-Agent"),
-				"proto", r.Proto,
-				"remoteAddr", r.RemoteAddr,
-				"expectedAuthHdr", smErr.ExpectedAuthHdr,
-				"providedAuthHdr", smErr.ProvidedAuthHdr,
-			)
-		}
+	case errors.Is(err, sigv4.ErrPresignedURLExpired):
+		slog.DebugContext(r.Context(), "Presigned URL expired or not yet valid", "timestamp", r.URL.Query().Get("X-Amz-Date"))
+		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Request has expired")
+	case errors.Is(err, sigv4.ErrSignatureMismatch):
+		slog.WarnContext(r.Context(), "SigV4 signature mismatch",
+			"accessKeyID", claimedKey,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"host", r.Host,
+			"amzDate", r.Header.Get("X-Amz-Date"),
+			"payloadHashHeader", r.Header.Get("X-Amz-Content-Sha256"),
+			"contentLength", r.Header.Get("Content-Length"),
+			"userAgent", r.Header.Get("User-Agent"),
+			"proto", r.Proto,
+			"remoteAddr", r.RemoteAddr,
+		)
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request signature does not match")
 	default:
 		slog.WarnContext(r.Context(), "Unexpected SigV4 verification error", "error", err, "accessKeyID", claimedKey)

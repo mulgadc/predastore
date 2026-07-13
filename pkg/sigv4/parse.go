@@ -1,7 +1,11 @@
 package sigv4
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -61,7 +65,7 @@ func Parse(req *http.Request, region string, service string, opts ...parseOption
 // getAuthComponents pulls the raw signing components from the Authorization header, or
 // the X-Amz-* query parameters when the request is presigned, and returns the signing
 // algorithm after confirming it is one this package supports.
-func getAuthComponents(req *http.Request) (presigned bool, algo algorithm, credential, signedHeaders, signature string, err error) {
+func getAuthComponents(req *http.Request) (presigned bool, algo Algorithm, credential, signedHeaders, signature string, err error) {
 	query := req.URL.Query()
 	authHdr := req.Header.Get("Authorization")
 	// Presigned when the Authorization header is absent but X-Amz-Algorithm is in the query.
@@ -105,11 +109,11 @@ func getAuthComponents(req *http.Request) (presigned bool, algo algorithm, crede
 		}
 	}
 
-	if rawAlgo != string(algorithmV4) {
+	if rawAlgo != string(AlgorithmV4) {
 		return false, "", "", "", "", fmt.Errorf("%w: %q", ErrUnsupportedAlgorithm, rawAlgo)
 	}
 
-	return presigned, algorithm(rawAlgo), credential, signedHeaders, signature, nil
+	return presigned, Algorithm(rawAlgo), credential, signedHeaders, signature, nil
 }
 
 // parseTimestamp resolves the request timestamp and enforces its validity window.
@@ -119,7 +123,7 @@ func parseTimestamp(req *http.Request, presigned bool, now time.Time) (time.Time
 	var ts time.Time
 	if presigned {
 		// Presigned URLs carry the time in the X-Amz-Date query parameter.
-		t, err := time.Parse(amzTimeFormat, query.Get("X-Amz-Date"))
+		t, err := time.Parse(AmzTimeFormat, query.Get("X-Amz-Date"))
 		if err != nil {
 			return time.Time{}, fmt.Errorf("%w: X-Amz-Date query parameter is missing or invalid", ErrMalformedPresignedURL)
 		}
@@ -127,7 +131,7 @@ func parseTimestamp(req *http.Request, presigned bool, now time.Time) (time.Time
 		ts = t
 	} else if dateHdr := req.Header.Get("X-Amz-Date"); dateHdr != "" {
 		// Header-authed requests prefer the X-Amz-Date header.
-		t, err := time.Parse(amzTimeFormat, dateHdr)
+		t, err := time.Parse(AmzTimeFormat, dateHdr)
 		if err != nil {
 			// Present but unparseable: fail rather than falling through to the Date header.
 			return time.Time{}, fmt.Errorf("%w: requires a valid X-Amz-Date or Date header", ErrRequestTimeInvalid)
@@ -180,9 +184,9 @@ func parseCredential(credential, region, service string, t time.Time) (ScopedCre
 	}
 
 	// The date must be well-formed and match the date component of the request timestamp.
-	if _, err := time.Parse(amzDateFormat, parts[1]); err != nil {
+	if _, err := time.Parse(AmzDateFormat, parts[1]); err != nil {
 		return ScopedCredential{}, fmt.Errorf("%w: the second Credential element must be a date in the format \"YYYYMMDD\"", ErrMalformedAuthorization)
-	} else if parts[1] != t.Format(amzDateFormat) {
+	} else if parts[1] != t.Format(AmzDateFormat) {
 		return ScopedCredential{}, fmt.Errorf("%w: date does not match X-Amz-Date (or Date, if X-Amz-Date is not set)", ErrMalformedAuthorization)
 	}
 
@@ -194,8 +198,8 @@ func parseCredential(credential, region, service string, t time.Time) (ScopedCre
 	}
 
 	// The scope must end with the fixed terminator.
-	if parts[4] != amzScopeTerminator {
-		return ScopedCredential{}, fmt.Errorf("%w: terminal value; expected %q", ErrMalformedAuthorization, amzScopeTerminator)
+	if parts[4] != AmzScopeTerminator {
+		return ScopedCredential{}, fmt.Errorf("%w: terminal value; expected %q", ErrMalformedAuthorization, AmzScopeTerminator)
 	}
 
 	return ScopedCredential{
@@ -235,18 +239,36 @@ func resolveContentHash(req *http.Request, presigned bool, service string) (stri
 		return string(UnsignedPayload), nil
 	}
 
-	// Read directly since x-amz-content-sha256 need not be a signed header.
-	if h := strings.TrimSpace(req.Header.Get("X-Amz-Content-Sha256")); h != "" {
-		return h, nil
-	}
-
-	// S3 mandates the header.
 	if service == "s3" {
+		// S3 mandates x-amz-content-sha256 and signs its value verbatim — a hex digest or
+		// a sentinel; Parse never interprets it. Read directly since it need not be signed.
+		if h := strings.TrimSpace(req.Header.Get("X-Amz-Content-Sha256")); h != "" {
+			return h, nil
+		}
 		return "", ErrMissingContentSHA256
 	}
 
-	// Other services may omit it; the empty hash is signed verbatim into the canonical request.
-	return "", nil
+	// Every other service signs SHA-256 of the body, so the header is not authoritative.
+	// A bodyless request signs the empty-body digest.
+	if req.Body == nil || req.Body == http.NoBody {
+		return EmptyPayload, nil
+	}
+
+	// Cap the read so an oversized body can't exhaust memory before authentication.
+	buf, err := io.ReadAll(io.LimitReader(req.Body, MaxPayloadLen+1))
+	if err != nil {
+		return "", fmt.Errorf("reading request body to hash payload: %w", err)
+	}
+	if int64(len(buf)) > MaxPayloadLen {
+		return "", ErrPayloadTooLarge
+	}
+
+	// Rewind the consumed body so the handler can still read it.
+	_ = req.Body.Close()
+	req.Body = io.NopCloser(bytes.NewReader(buf))
+
+	sum := sha256.Sum256(buf)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // parseHeaders snapshots the request headers and splits the raw SignedHeaders

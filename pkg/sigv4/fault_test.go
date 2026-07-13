@@ -135,8 +135,8 @@ var presignFaults = map[string]fault{
 		return sigv4.ErrPresignedURLExpired
 	},
 	"expiry beyond max": func(t *rapid.T, r *http.Request) error {
-		max := int(sigv4.MaxPresignAge / time.Second)
-		setQuery(r, "X-Amz-Expires", strconv.Itoa(max+rapid.IntRange(1, 100000).Draw(t, "expiryExcess")))
+		maxExpires := int(sigv4.MaxPresignAge / time.Second)
+		setQuery(r, "X-Amz-Expires", strconv.Itoa(maxExpires+rapid.IntRange(1, 100000).Draw(t, "expiryExcess")))
 		return sigv4.ErrMalformedPresignedURL
 	},
 	"removed expires": func(_ *rapid.T, r *http.Request) error {
