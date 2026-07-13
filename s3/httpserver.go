@@ -136,7 +136,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		// Parse recognizes both header-authed and presigned requests; only a request with
 		// neither returns ErrMissingAuthentication.
-		sig, err := sigv4.Parse(r, s.config.Region, "s3")
+		sig, err := sigv4.Parse(r)
 		if err != nil {
 			// Unsigned: fall back to public-bucket access rather than a parse error.
 			if errors.Is(err, sigv4.ErrMissingAuthentication) {
@@ -158,7 +158,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if _, err := sig.Verify(credResult.SecretAccessKey); err != nil {
+		if _, err := sig.Verify(credResult.SecretAccessKey, s.config.Region, "s3"); err != nil {
 			s.respondSigV4Error(w, r, accessKey, err, nil)
 			return
 		}

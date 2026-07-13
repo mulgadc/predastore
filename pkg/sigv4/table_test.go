@@ -172,11 +172,11 @@ func TestKnownAnswers(t *testing.T) {
 					"Signature="+tc.signature)
 			}
 
-			signed, err := sigv4.Parse(req, "us-east-1", "s3", sigv4.WithTime(katTime))
+			signed, err := sigv4.Parse(req, sigv4.WithTime(katTime))
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}
-			if _, err := signed.Verify(katSecret); err != nil {
+			if _, err := signed.Verify(katSecret, "us-east-1", "s3"); err != nil {
 				t.Fatalf("Verify rejected the AWS-published signature: %v", err)
 			}
 		})

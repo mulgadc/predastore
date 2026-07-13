@@ -101,11 +101,11 @@ func s3Opts(service string) []func(*v4.SignerOptions) {
 // parseVerify runs the full sigv4 pipeline and returns the first error, so a test can match
 // it against the sentinel it expects.
 func parseVerify(req *http.Request, region, service string, now time.Time) error {
-	signed, err := sigv4.Parse(req, region, service, sigv4.WithTime(now))
+	signed, err := sigv4.Parse(req, sigv4.WithTime(now))
 	if err != nil {
 		return err
 	}
-	_, err = signed.Verify(oracleSecret)
+	_, err = signed.Verify(oracleSecret, region, service)
 	return err
 }
 
@@ -125,7 +125,9 @@ func TestVerifyAcceptsOracle(t *testing.T) {
 		u := &url.URL{Scheme: "https", Host: oracleHost, Path: "/" + strings.Join(segs, "/")}
 
 		query := url.Values{}
-		keys := rapid.SliceOfN(rapid.StringMatching(`q[0-9]`), 0, 3).Draw(t, "queryKeys")
+		// "q" alone plus "q<digit>" so prefix-name pairs (e.g. "q" and "q0") occur, where a
+		// naive sort of joined "k=v" strings would misorder the canonical query.
+		keys := rapid.SliceOfN(rapid.StringMatching(`q[0-9]?`), 0, 3).Draw(t, "queryKeys")
 		for i, key := range keys {
 			vals := rapid.SliceOfN(rapid.StringMatching(`[a-zA-Z0-9]{1,8}`), 1, 2).Draw(t, fmt.Sprintf("queryVals%d", i))
 			for _, v := range vals {

@@ -16,7 +16,7 @@ const (
 	// MaxPayloadLen caps the body Parse will buffer to derive the content hash
 	// for a non-S3 request. Non-S3 (control-plane) bodies are small; the cap bounds
 	// pre-auth memory use.
-	MaxPayloadLen = 8 << 20 // 8 MiB
+	MaxPayloadLen = 10 << 20 // 10 MiB
 
 	MaxClockSkew  = 15 * time.Minute
 	MaxPresignAge = 7 * 24 * time.Hour

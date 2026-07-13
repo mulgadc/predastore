@@ -25,9 +25,10 @@ func WithTime(t time.Time) parseOption {
 	return func(o *parseOptions) { o.now = t }
 }
 
-// Parse extracts and validates the SigV4 signing metadata from req, accepting
-// both Authorization-header and presigned-URL requests.
-func Parse(req *http.Request, region string, service string, opts ...parseOption) (*SignedRequest, error) {
+// Parse extracts the SigV4 signing metadata from req, accepting both
+// Authorization-header and presigned-URL requests. It does not match the credential
+// scope's region and service against an expected endpoint; Verify does that.
+func Parse(req *http.Request, opts ...parseOption) (*SignedRequest, error) {
 	cfg := parseOptions{now: time.Now()}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -43,12 +44,15 @@ func Parse(req *http.Request, region string, service string, opts ...parseOption
 		return nil, err
 	}
 
-	credential, err := parseCredential(rawCredential, region, service, timestamp)
+	credential, err := parseCredential(rawCredential, timestamp)
 	if err != nil {
 		return nil, err
 	}
 
-	canonical, err := parseCanonicalRequest(req, presigned, service, rawSignedHeaders)
+	// Build the canonical request with the service the client signed under (from the
+	// scope), so the reconstruction matches the wire signature. Verify then checks that
+	// service against the endpoint's expected value.
+	canonical, err := parseCanonicalRequest(req, presigned, credential.Service, rawSignedHeaders)
 	if err != nil {
 		return nil, err
 	}
@@ -147,6 +151,7 @@ func parseTimestamp(req *http.Request, presigned bool, now time.Time) (time.Time
 
 		ts = t
 	}
+
 	// Normalize to UTC for easy downstream comparison.
 	ts = ts.UTC()
 
@@ -174,10 +179,10 @@ func parseTimestamp(req *http.Request, presigned bool, now time.Time) (time.Time
 	return ts, nil
 }
 
-// parseCredential splits and validates the credential scope
-// ("<AKID>/YYYYMMDD/region/service/aws4_request") against the request time and
-// the endpoint's expected region and service.
-func parseCredential(credential, region, service string, t time.Time) (ScopedCredential, error) {
+// parseCredential splits and structurally validates the credential scope
+// ("<AKID>/YYYYMMDD/region/service/aws4_request") against the request time. It extracts
+// the region and service but does not match them against an endpoint; Verify does that.
+func parseCredential(credential string, t time.Time) (ScopedCredential, error) {
 	parts := strings.Split(credential, "/")
 	if len(parts) != 5 {
 		return ScopedCredential{}, fmt.Errorf("%w: expected Credential to be in the format \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\"", ErrMalformedAuthorization)
@@ -188,13 +193,6 @@ func parseCredential(credential, region, service string, t time.Time) (ScopedCre
 		return ScopedCredential{}, fmt.Errorf("%w: the second Credential element must be a date in the format \"YYYYMMDD\"", ErrMalformedAuthorization)
 	} else if parts[1] != t.Format(AmzDateFormat) {
 		return ScopedCredential{}, fmt.Errorf("%w: date does not match X-Amz-Date (or Date, if X-Amz-Date is not set)", ErrMalformedAuthorization)
-	}
-
-	// Region and service must match the endpoint's expected values.
-	if parts[2] != region {
-		return ScopedCredential{}, fmt.Errorf("%w: incorrect region %q; expected %q", ErrMalformedAuthorization, parts[2], region)
-	} else if parts[3] != service {
-		return ScopedCredential{}, fmt.Errorf("%w: incorrect service %q; expected %q", ErrMalformedAuthorization, parts[3], service)
 	}
 
 	// The scope must end with the fixed terminator.
@@ -245,6 +243,7 @@ func resolveContentHash(req *http.Request, presigned bool, service string) (stri
 		if h := strings.TrimSpace(req.Header.Get("X-Amz-Content-Sha256")); h != "" {
 			return h, nil
 		}
+
 		return "", ErrMissingContentSHA256
 	}
 
@@ -259,6 +258,7 @@ func resolveContentHash(req *http.Request, presigned bool, service string) (stri
 	if err != nil {
 		return "", fmt.Errorf("reading request body to hash payload: %w", err)
 	}
+
 	if int64(len(buf)) > MaxPayloadLen {
 		return "", ErrPayloadTooLarge
 	}
@@ -268,6 +268,7 @@ func resolveContentHash(req *http.Request, presigned bool, service string) (stri
 	req.Body = io.NopCloser(bytes.NewReader(buf))
 
 	sum := sha256.Sum256(buf)
+
 	return hex.EncodeToString(sum[:]), nil
 }
 

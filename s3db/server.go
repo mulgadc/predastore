@@ -149,7 +149,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			service = DefaultService
 		}
 
-		sig, err := sigv4.Parse(r, region, service)
+		sig, err := sigv4.Parse(r)
 		if err != nil {
 			slog.Debug("Auth parse failed", "error", err)
 			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
@@ -170,7 +170,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if _, err := sig.Verify(secret); err != nil {
+		if _, err := sig.Verify(secret, region, service); err != nil {
 			slog.Debug("Auth verify failed", "error", err)
 			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
 				Error:   "AccessDenied",

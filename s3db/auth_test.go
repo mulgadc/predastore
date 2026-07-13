@@ -28,7 +28,7 @@ func TestVerifySigV4Request_Integration(t *testing.T) {
 	r := chi.NewRouter()
 	r.Use(func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			sig, err := sigv4.Parse(r, region, service)
+			sig, err := sigv4.Parse(r)
 			if err != nil {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
@@ -40,7 +40,7 @@ func TestVerifySigV4Request_Integration(t *testing.T) {
 				w.WriteHeader(http.StatusForbidden)
 				return
 			}
-			if _, err := sig.Verify(secret); err != nil {
+			if _, err := sig.Verify(secret, region, service); err != nil {
 				w.WriteHeader(http.StatusForbidden)
 				return
 			}
