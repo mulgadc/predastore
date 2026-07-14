@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mulgadc/predastore/pkg/awschunked"
 	"github.com/mulgadc/predastore/pkg/sigv4"
 )
 
@@ -110,7 +109,7 @@ func TestKnownAnswers(t *testing.T) {
 			uri:    "/examplebucket/chunkObject.txt",
 			headers: map[string]string{
 				"content-encoding":             "aws-chunked",
-				"x-amz-content-sha256":         string(awschunked.StreamingV4Payload),
+				"x-amz-content-sha256":         "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
 				"x-amz-date":                   "20130524T000000Z",
 				"x-amz-decoded-content-length": "66560",
 				"x-amz-storage-class":          "REDUCED_REDUNDANCY",
@@ -126,7 +125,7 @@ func TestKnownAnswers(t *testing.T) {
 			uri:    "/examplebucket/chunkObject.txt",
 			headers: map[string]string{
 				"content-encoding":             "aws-chunked",
-				"x-amz-content-sha256":         string(awschunked.StreamingV4PayloadTrailer),
+				"x-amz-content-sha256":         "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
 				"x-amz-date":                   "20130524T000000Z",
 				"x-amz-decoded-content-length": "66560",
 				"x-amz-storage-class":          "REDUCED_REDUNDANCY",

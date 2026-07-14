@@ -78,8 +78,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			setupHeaders: func(t *testing.T, req *http.Request) {
 				signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-1", "s3")
 			},
-			expectStatus:   http.StatusForbidden,
-			expectResponse: "Request authenticated",
+			expectStatus:   http.StatusBadRequest,
+			expectResponse: "AuthorizationHeaderMalformed",
 		},
 
 		{
@@ -240,7 +240,7 @@ func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
 			rr := httptest.NewRecorder()
 			server.sigV4AuthMiddleware(next).ServeHTTP(rr, req)
 
-			assert.Equal(t, http.StatusForbidden, rr.Code)
+			assert.Equal(t, http.StatusBadRequest, rr.Code)
 			assert.Contains(t, rr.Body.String(), "AuthorizationHeaderMalformed")
 		})
 	}

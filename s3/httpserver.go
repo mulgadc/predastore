@@ -245,13 +245,13 @@ func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, 
 	case errors.Is(err, sigv4.ErrMissingAuthentication):
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing Authorization header")
 	case errors.Is(err, sigv4.ErrUnsignedHeader):
-		s.writeS3Error(w, r, http.StatusForbidden, "AuthorizationHeaderMalformed", err.Error())
+		s.writeS3Error(w, r, http.StatusBadRequest, "AuthorizationHeaderMalformed", err.Error())
 	case errors.Is(err, sigv4.ErrUnsupportedAlgorithm):
-		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Invalid Authorization header format")
+		s.writeS3Error(w, r, http.StatusBadRequest, "AuthorizationHeaderMalformed", "Invalid Authorization header format")
 	case errors.Is(err, sigv4.ErrMalformedAuthorization):
-		s.writeS3Error(w, r, http.StatusForbidden, "AuthorizationHeaderMalformed", err.Error())
+		s.writeS3Error(w, r, http.StatusBadRequest, "AuthorizationHeaderMalformed", err.Error())
 	case errors.Is(err, sigv4.ErrMalformedPresignedURL):
-		s.writeS3Error(w, r, http.StatusForbidden, "AuthorizationQueryParametersError", err.Error())
+		s.writeS3Error(w, r, http.StatusBadRequest, "AuthorizationQueryParametersError", err.Error())
 	case errors.Is(err, sigv4.ErrRequestTimeInvalid):
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing required header: X-Amz-Date")
 	case errors.Is(err, sigv4.ErrMissingContentSHA256):
@@ -276,7 +276,8 @@ func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, 
 			"proto", r.Proto,
 			"remoteAddr", r.RemoteAddr,
 		)
-		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "The request signature does not match")
+		s.writeS3Error(w, r, http.StatusForbidden, "SignatureDoesNotMatch",
+			"The request signature we calculated does not match the signature you provided. Check your key and signing method.")
 	default:
 		slog.WarnContext(r.Context(), "Unexpected SigV4 verification error", "error", err, "accessKeyID", claimedKey)
 		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", err.Error())
