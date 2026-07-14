@@ -197,7 +197,9 @@ func sortedFaults(m map[string]fault) []string {
 	for name := range m {
 		names = append(names, name)
 	}
+
 	sort.Strings(names)
+
 	return names
 }
 
@@ -209,6 +211,7 @@ func methodsExcept(cur string) []string {
 			out = append(out, m)
 		}
 	}
+
 	return out
 }
 
@@ -221,6 +224,7 @@ func corruptHexDigit(t *rapid.T, s string) string {
 	offset := rapid.IntRange(1, 15).Draw(t, "hexOffset")
 	b := []byte(s)
 	b[i] = hexits[(cur+offset)%16]
+
 	return string(b)
 }
 
@@ -228,6 +232,7 @@ func corruptHexDigit(t *rapid.T, s string) string {
 func corruptAuthSignature(t *rapid.T, auth string) string {
 	const marker = "Signature="
 	i := strings.LastIndex(auth, marker)
+
 	return auth[:i+len(marker)] + corruptHexDigit(t, auth[i+len(marker):])
 }
 

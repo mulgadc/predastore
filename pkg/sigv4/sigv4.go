@@ -27,8 +27,8 @@ const (
 type ContentMode string
 
 const (
-	// UnsignedPayload signs no payload hash indicates that the request body is not covered
-	// by the signature. S3 only.
+	// UnsignedPayload indicates that the request body is not covered by the signature.
+	// S3 only.
 	UnsignedPayload ContentMode = "UNSIGNED-PAYLOAD"
 
 	// EmptyPayload is the hex SHA-256 of an empty body, signed by a bodyless non-S3 request.
@@ -75,8 +75,8 @@ var (
 	// validity window.
 	ErrPresignedURLExpired = errors.New("presigned URL expired or not yet valid")
 
-	// ErrMissingContentSHA256 is returned when a header-authed request omits the
-	// required x-amz-content-sha256 header.
+	// ErrMissingContentSHA256 is returned when a header-authed request to S3 omits
+	// the x-amz-content-sha256 header.
 	ErrMissingContentSHA256 = errors.New("missing x-amz-content-sha256 header")
 
 	// ErrPayloadTooLarge is returned when a non-S3 request's body exceeds the size

@@ -26,8 +26,7 @@ func WithTime(t time.Time) parseOption {
 }
 
 // Parse extracts the SigV4 signing metadata from req, accepting both
-// Authorization-header and presigned-URL requests. It does not match the credential
-// scope's region and service against an expected endpoint; Verify does that.
+// Authorization-header and presigned-URL requests.
 func Parse(req *http.Request, opts ...parseOption) (*SignedRequest, error) {
 	cfg := parseOptions{now: time.Now()}
 	for _, opt := range opts {
@@ -50,8 +49,7 @@ func Parse(req *http.Request, opts ...parseOption) (*SignedRequest, error) {
 	}
 
 	// Build the canonical request with the service the client signed under (from the
-	// scope), so the reconstruction matches the wire signature. Verify then checks that
-	// service against the endpoint's expected value.
+	// scope), so the reconstruction matches the wire signature.
 	canonical, err := parseCanonicalRequest(req, presigned, credential.Service, rawSignedHeaders)
 	if err != nil {
 		return nil, err
@@ -293,10 +291,10 @@ func parseHeaders(req *http.Request, rawSignedHeaders string) (map[string]string
 		headers[strings.ToLower(name)] = canonicalHeaderValue(values)
 	}
 
-	// host and content-length live on the request struct, not req.Header.
+	// host lives on the request struct, not req.Header.
 	headers["host"] = strings.TrimSpace(req.Host)
-	// Reproduce content-length only when the length is known: Go reports -1 for an
-	// unknown length, which must stay excluded from the canonical headers.
+	// content-length also lives on the request struct. Reproduce it only when the length is
+	// known: Go reports -1 for an unknown length, which must stay excluded from the headers.
 	if req.ContentLength >= 0 {
 		// A known length includes 0, so an empty-body PUT/DELETE reproduces as "content-length:0".
 		headers["content-length"] = strconv.FormatInt(req.ContentLength, 10)

@@ -11,16 +11,12 @@ import (
 
 // Verify checks the request signature under secretAccessKey and confirms the credential
 // scope's region and service match the endpoint's expected values, returning a
-// VerifiedRequest when the request is authentic. It yields ErrMalformedAuthorization on a
-// region/service mismatch and ErrSignatureMismatch when the signature does not check out.
+// VerifiedRequest when the request is authentic.
 func (req *SignedRequest) Verify(secretAccessKey, region, service string) (*VerifiedRequest, error) {
-	// The scope is validated here (not in Parse) so a caller can read the access key id
-	// and scope out of the parsed request before deciding what to verify against.
+	// Ensure client region and service match the caller's expected values.
 	if req.Credential.Region != region {
 		return nil, fmt.Errorf("%w: incorrect region %q; expected %q", ErrMalformedAuthorization, req.Credential.Region, region)
-	}
-
-	if req.Credential.Service != service {
+	} else if req.Credential.Service != service {
 		return nil, fmt.Errorf("%w: incorrect service %q; expected %q", ErrMalformedAuthorization, req.Credential.Service, service)
 	}
 
@@ -38,13 +34,8 @@ func (req *SignedRequest) Verify(secretAccessKey, region, service string) (*Veri
 
 // buildCanonicalHash returns the hex SHA256 of the request's SigV4 canonical request.
 func (req *SignedRequest) buildCanonicalHash() string {
-	// The signed content hash was resolved by Parse (a sentinel or a hex digest) and is
-	// used verbatim; Verify never derives it from the body.
-	contentHash := req.Canonical.ContentHash
-
 	// Canonical query: encode every value of each key into an (encoded key, encoded value) pair.
 	type queryParam struct{ key, value string }
-
 	params := make([]queryParam, 0, len(req.Canonical.Query))
 	for key, values := range req.Canonical.Query {
 		for _, value := range values {
@@ -63,7 +54,7 @@ func (req *SignedRequest) buildCanonicalHash() string {
 		return params[i].value < params[j].value
 	})
 
-	// Join each pair once ordering is settled; the '&' join happens in the canonical request below.
+	// Join each pair once ordering is settled.
 	pairs := make([]string, len(params))
 	for i, p := range params {
 		pairs[i] = p.key + "=" + p.value
@@ -98,7 +89,7 @@ func (req *SignedRequest) buildCanonicalHash() string {
 		strings.Join(pairs, "&"),
 		headers.String(), // trailing '\n' plus the join give the blank line before signed headers
 		strings.Join(signedHeaders, ";"),
-		contentHash,
+		req.Canonical.ContentHash,
 	}, "\n")
 	canonicalSum := sha256.Sum256([]byte(canonicalRequest))
 

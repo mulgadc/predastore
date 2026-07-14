@@ -158,6 +158,7 @@ func TestKnownAnswers(t *testing.T) {
 			if err != nil {
 				t.Fatalf("build request: %v", err)
 			}
+
 			req.Host = tc.host
 			for name, value := range tc.headers {
 				req.Header.Set(name, value)
@@ -176,6 +177,7 @@ func TestKnownAnswers(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Parse: %v", err)
 			}
+
 			if _, err := signed.Verify(katSecret, "us-east-1", "s3"); err != nil {
 				t.Fatalf("Verify rejected the AWS-published signature: %v", err)
 			}

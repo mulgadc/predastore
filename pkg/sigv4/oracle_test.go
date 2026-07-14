@@ -40,27 +40,30 @@ type fataler interface {
 }
 
 // signHeader signs req with the SDK and returns it ready for Parse. payloadHash is the
-// x-amz-content-sha256 value; empty means hash body. It is set as a header (as a real S3
-// client does) so the SDK signs it and Parse finds it. The body is attached so a non-S3
-// Parse can hash it (S3 ignores the body and reads the header verbatim).
+// x-amz-content-sha256 value to sign; empty means hash the body.
 func signHeader(tb fataler, method, rawURL string, body []byte, hdrs map[string]string, region, service, payloadHash string) *http.Request {
+	// Attach the body so a non-S3 Parse can hash it; S3 ignores it and reads the header verbatim.
 	req, err := http.NewRequest(method, rawURL, bytes.NewReader(body))
 	if err != nil {
 		tb.Fatalf("build request: %v", err)
 	}
+
 	for name, value := range hdrs {
 		req.Header.Set(name, value)
 	}
+
 	if payloadHash == "" {
 		sum := sha256.Sum256(body)
 		payloadHash = hex.EncodeToString(sum[:])
 	}
+	// Set as a header, as a real S3 client does, so the SDK signs it and Parse finds it.
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 	req.ContentLength = int64(len(body))
 
 	if err := v4.NewSigner().SignHTTP(context.Background(), oracleCreds(), req, payloadHash, service, region, oracleTime, s3Opts(service)...); err != nil {
 		tb.Fatalf("SignHTTP: %v", err)
 	}
+
 	return req
 }
 
@@ -71,6 +74,7 @@ func presign(tb fataler, rawURL string, expires int, region, service string) *ht
 	if err != nil {
 		tb.Fatalf("build request: %v", err)
 	}
+
 	query := req.URL.Query()
 	query.Set("X-Amz-Expires", strconv.Itoa(expires))
 	req.URL.RawQuery = query.Encode()
@@ -86,10 +90,12 @@ func presign(tb fataler, rawURL string, expires int, region, service string) *ht
 	if err != nil {
 		tb.Fatalf("PresignHTTP: %v", err)
 	}
+
 	out, err := http.NewRequest(http.MethodGet, signedURI, nil)
 	if err != nil {
 		tb.Fatalf("rebuild presigned request: %v", err)
 	}
+
 	return out
 }
 
@@ -102,6 +108,7 @@ func s3Opts(service string) []func(*v4.SignerOptions) {
 	if service == "s3" {
 		return []func(*v4.SignerOptions){func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true }}
 	}
+
 	return nil
 }
 
@@ -112,7 +119,9 @@ func parseVerify(req *http.Request, region, service string, now time.Time) error
 	if err != nil {
 		return err
 	}
+
 	_, err = signed.Verify(oracleSecret, region, service)
+
 	return err
 }
 
