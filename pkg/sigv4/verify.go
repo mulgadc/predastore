@@ -34,30 +34,32 @@ func (req *SignedRequest) Verify(secretAccessKey, region, service string) (*Veri
 
 // buildCanonicalHash returns the hex SHA256 of the request's SigV4 canonical request.
 func (req *SignedRequest) buildCanonicalHash() string {
-	// Canonical query: encode every value of each key into an (encoded key, encoded value) pair.
+	// One (key, value) pair per value; the raw forms drive ordering.
 	type queryParam struct{ key, value string }
 	params := make([]queryParam, 0, len(req.Canonical.Query))
 	for key, values := range req.Canonical.Query {
 		for _, value := range values {
-			params = append(params, queryParam{uriEncode(key), uriEncode(value)})
+			params = append(params, queryParam{key, value})
 		}
 	}
 
-	// Sort by encoded key, then value, as separate fields. Sorting the joined "k=v" string
-	// would misorder a key that is a prefix of another, since '=' outranks the encoded value
-	// bytes that follow the shorter key (digits, '-', '.', '%').
 	sort.Slice(params, func(i, j int) bool {
+		// Key then value as separate fields, never the joined "k=v": '=' outranks the value
+		// bytes, so a key that is a prefix of another would sort wrong.
 		if params[i].key != params[j].key {
 			return params[i].key < params[j].key
 		}
 
+		// Order on raw decoded bytes as AWS does (the SDK sorts req.URL.Query() before
+		// encoding); encoded order differs once a byte drops below the unreserved range, so
+		// "é" sorts after "a" but its "%C3%A9" encoding before it.
 		return params[i].value < params[j].value
 	})
 
-	// Join each pair once ordering is settled.
+	// Encode once, now that ordering is settled.
 	pairs := make([]string, len(params))
 	for i, p := range params {
-		pairs[i] = p.key + "=" + p.value
+		pairs[i] = uriEncode(p.key) + "=" + uriEncode(p.value)
 	}
 
 	// SigV4 signs the headers in sorted order, for both the header block and the list below.

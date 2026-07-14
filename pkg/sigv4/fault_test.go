@@ -13,80 +13,85 @@ import (
 	"pgregory.net/rapid"
 )
 
-// A fault mutates a signed request in place and returns the sentinel Verify must then yield.
-// Because a fault is a request edit, Parse's early checks (time, credential, framing) run
-// before the signature check, so each fault's sentinel is deterministic. Each fault draws
-// its own randomness, so the exact corruption varies across rapid iterations.
-type fault func(t *rapid.T, r *http.Request) error
+// A fault mutates a signed request in place and returns the sentinel Verify must then yield. It
+// returns skip=true when it does not apply to the request's auth mode, telling the test to move
+// on. It receives presigned/region/service to pick the mutation and error for the mode and endpoint.
+type fault func(t *rapid.T, r *http.Request, presigned bool, region, service string) (skip bool, want error)
 
 // amzTime formats t as an X-Amz-Date value.
 func amzTime(t time.Time) string { return t.UTC().Format("20060102T150405Z") }
 
-// bogusRegions and bogusServices are values guaranteed to differ from the ones the fault
-// tests sign with, so a scope rewrite always mismatches.
-var (
-	bogusRegions  = []string{"ap-south-1", "sa-east-1", "ca-central-1", "me-south-1"}
-	bogusServices = []string{"iam", "dynamodb", "sqs", "lambda", "ec2"}
-)
-
-// headerFaults perturb a header-authenticated request signed for service s3.
-var headerFaults = map[string]fault{
-	"tampered signature": func(t *rapid.T, r *http.Request) error {
-		r.Header.Set("Authorization", corruptAuthSignature(t, r.Header.Get("Authorization")))
-		return sigv4.ErrSignatureMismatch
-	},
-	"changed method": func(t *rapid.T, r *http.Request) error {
-		r.Method = rapid.SampledFrom(methodsExcept(r.Method)).Draw(t, "newMethod")
-		return sigv4.ErrSignatureMismatch
-	},
-	"injected query param": func(t *rapid.T, r *http.Request) error {
-		key := rapid.StringMatching(`[a-z]{1,6}`).Draw(t, "injectKey")
-		val := rapid.StringMatching(`[a-zA-Z0-9]{1,6}`).Draw(t, "injectVal")
-		if r.URL.RawQuery == "" {
-			r.URL.RawQuery = key + "=" + val
+// faults corrupts a signed request in every way Verify must reject. A single fault covers both
+// auth modes, branching on presigned, or skips the mode it cannot touch.
+var faults = map[string]fault{
+	"tampered signature": func(t *rapid.T, r *http.Request, presigned bool, _, _ string) (bool, error) {
+		// Flip a hex digit of the signature, wherever the mode carries it.
+		if presigned {
+			setQuery(r, "X-Amz-Signature", corruptHexDigit(t, r.URL.Query().Get("X-Amz-Signature")))
 		} else {
-			r.URL.RawQuery += "&" + key + "=" + val
+			const marker = "Signature="
+			auth := r.Header.Get("Authorization")
+			i := strings.LastIndex(auth, marker)
+			r.Header.Set("Authorization", auth[:i+len(marker)]+corruptHexDigit(t, auth[i+len(marker):]))
 		}
-		return sigv4.ErrSignatureMismatch
+		return false, sigv4.ErrSignatureMismatch
 	},
-	"tampered payload hash": func(t *rapid.T, r *http.Request) error {
-		r.Header.Set("X-Amz-Content-Sha256", corruptHexDigit(t, r.Header.Get("X-Amz-Content-Sha256")))
-		return sigv4.ErrSignatureMismatch
+	"changed method": func(t *rapid.T, r *http.Request, _ bool, _, _ string) (bool, error) {
+		// Any standard method other than the signed one.
+		var others []string
+		for _, m := range []string{http.MethodGet, http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodHead} {
+			if m != r.Method {
+				others = append(others, m)
+			}
+		}
+		r.Method = rapid.SampledFrom(others).Draw(t, "newMethod")
+		return false, sigv4.ErrSignatureMismatch
 	},
-	"added unsigned x-amz header": func(t *rapid.T, r *http.Request) error {
-		// "Inj-" prefix keeps the name off the signed X-Amz-Meta-Foo header.
+	"injected query param": func(t *rapid.T, r *http.Request, _ bool, _, _ string) (bool, error) {
+		// "inj-" keeps the key off the request's own harsh query parameters.
+		key := rapid.StringMatching(`inj-[a-z]{1,6}`).Draw(t, "injectKey")
+		setQuery(r, key, rapid.StringMatching(`[a-zA-Z0-9]{1,6}`).Draw(t, "injectVal"))
+		return false, sigv4.ErrSignatureMismatch
+	},
+	"added unsigned x-amz header": func(t *rapid.T, r *http.Request, _ bool, _, _ string) (bool, error) {
+		// The "Inj-" infix keeps the name off any signed X-Amz-Meta-* header.
 		suffix := rapid.StringMatching(`[a-z]{1,6}`).Draw(t, "injectHeader")
 		r.Header.Set("X-Amz-Meta-Inj-"+suffix, rapid.StringMatching(`[a-zA-Z0-9]{1,6}`).Draw(t, "injectHeaderValue"))
-		return sigv4.ErrUnsignedHeader
+		return false, sigv4.ErrUnsignedHeader
 	},
-	"removed content-sha256": func(_ *rapid.T, r *http.Request) error {
-		r.Header.Del("X-Amz-Content-Sha256")
-		return sigv4.ErrMissingContentSHA256
+	"removed authentication": func(_ *rapid.T, r *http.Request, presigned bool, _, _ string) (bool, error) {
+		// Drop the marker that names the scheme; without it neither path authenticates.
+		if presigned {
+			delQuery(r, "X-Amz-Algorithm")
+		} else {
+			r.Header.Del("Authorization")
+		}
+		return false, sigv4.ErrMissingAuthentication
 	},
-	"removed authorization": func(_ *rapid.T, r *http.Request) error {
-		r.Header.Del("Authorization")
-		return sigv4.ErrMissingAuthentication
-	},
-	"unsupported algorithm": func(t *rapid.T, r *http.Request) error {
+	"unsupported algorithm": func(t *rapid.T, r *http.Request, presigned bool, _, _ string) (bool, error) {
 		algo := rapid.SampledFrom([]string{"AWS4-ECDSA-P256-SHA256", "AWS4-HMAC-SHA1", "AWS3-HMAC-SHA256", "BOGUS-ALGO"}).Draw(t, "algorithm")
-		_, rest, _ := strings.Cut(r.Header.Get("Authorization"), " ")
-		r.Header.Set("Authorization", algo+" "+rest)
-		return sigv4.ErrUnsupportedAlgorithm
+		// Overwrite the algorithm, wherever the mode carries it.
+		if presigned {
+			setQuery(r, "X-Amz-Algorithm", algo)
+		} else {
+			_, rest, _ := strings.Cut(r.Header.Get("Authorization"), " ")
+			r.Header.Set("Authorization", algo+" "+rest)
+		}
+		return false, sigv4.ErrUnsupportedAlgorithm
 	},
-	"wrong credential region": func(t *rapid.T, r *http.Request) error {
-		bogus := rapid.SampledFrom(bogusRegions).Draw(t, "bogusRegion")
-		rewriteCredential(r, func(p []string) []string { p[2] = bogus; return p })
-		return sigv4.ErrMalformedAuthorization
+	"wrong credential region": func(_ *rapid.T, r *http.Request, presigned bool, region, _ string) (bool, error) {
+		// A region that cannot equal the signed one, so Verify's scope check fires.
+		rewriteCredential(r, presigned, func(p []string) []string { p[2] = "x" + region; return p })
+		return false, sigv4.ErrMalformedAuthorization
 	},
-	"wrong credential service": func(t *rapid.T, r *http.Request) error {
-		bogus := rapid.SampledFrom(bogusServices).Draw(t, "bogusService")
-		rewriteCredential(r, func(p []string) []string { p[3] = bogus; return p })
-		return sigv4.ErrMalformedAuthorization
+	"wrong credential service": func(_ *rapid.T, r *http.Request, presigned bool, _, service string) (bool, error) {
+		rewriteCredential(r, presigned, func(p []string) []string { p[3] = "x" + service; return p })
+		return false, sigv4.ErrMalformedAuthorization
 	},
-	"malformed credential scope": func(t *rapid.T, r *http.Request) error {
+	"malformed credential scope": func(t *rapid.T, r *http.Request, presigned bool, _, _ string) (bool, error) {
 		kind := rapid.SampledFrom([]string{"drop", "extra", "bad-terminator"}).Draw(t, "scopeMutation")
 		keep := rapid.IntRange(1, 4).Draw(t, "keepParts")
-		rewriteCredential(r, func(p []string) []string {
+		rewriteCredential(r, presigned, func(p []string) []string {
 			switch kind {
 			case "drop":
 				return p[:keep]
@@ -97,147 +102,121 @@ var headerFaults = map[string]fault{
 				return p
 			}
 		})
-		return sigv4.ErrMalformedAuthorization
+		return false, sigv4.ErrMalformedAuthorization
 	},
-	"skewed date": func(t *rapid.T, r *http.Request) error {
+	"unparseable date": func(t *rapid.T, r *http.Request, presigned bool, _, _ string) (bool, error) {
+		bad := rapid.StringMatching(`[A-Za-z]{3,10}`).Draw(t, "badDate")
+		// A garbage date is a malformed URL when presigned, an invalid request time otherwise.
+		if presigned {
+			setQuery(r, "X-Amz-Date", bad)
+			return false, sigv4.ErrMalformedPresignedURL
+		}
+		r.Header.Set("X-Amz-Date", bad)
+		return false, sigv4.ErrRequestTimeInvalid
+	},
+	"tampered payload hash": func(t *rapid.T, r *http.Request, presigned bool, _, _ string) (bool, error) {
+		// x-amz-content-sha256 is a header-auth concern; presigned signs UNSIGNED-PAYLOAD.
+		if presigned {
+			return true, nil
+		}
+		r.Header.Set("X-Amz-Content-Sha256", corruptHexDigit(t, r.Header.Get("X-Amz-Content-Sha256")))
+		return false, sigv4.ErrSignatureMismatch
+	},
+	"removed content-sha256": func(_ *rapid.T, r *http.Request, presigned bool, _, service string) (bool, error) {
+		// Presigned requests carry no content-sha256 header to remove.
+		if presigned {
+			return true, nil
+		}
+		r.Header.Del("X-Amz-Content-Sha256")
+		// Mandatory only for S3; elsewhere its removal merely breaks the signature.
+		if service == "s3" {
+			return false, sigv4.ErrMissingContentSHA256
+		}
+		return false, sigv4.ErrSignatureMismatch
+	},
+	"skewed date": func(t *rapid.T, r *http.Request, presigned bool, _, _ string) (bool, error) {
+		// Header auth enforces clock skew; presigned uses the expiry window (see "expired").
+		if presigned {
+			return true, nil
+		}
 		d := sigv4.MaxClockSkew + time.Duration(rapid.IntRange(1, 2880).Draw(t, "skewMinutes"))*time.Minute
 		if !rapid.Bool().Draw(t, "skewAhead") {
 			d = -d
 		}
 		r.Header.Set("X-Amz-Date", amzTime(oracleTime.Add(d)))
-		return sigv4.ErrRequestTimeTooSkewed
+		return false, sigv4.ErrRequestTimeTooSkewed
 	},
-	"unparseable date": func(t *rapid.T, r *http.Request) error {
-		r.Header.Set("X-Amz-Date", rapid.StringMatching(`[A-Za-z]{3,10}`).Draw(t, "badDate"))
-		return sigv4.ErrRequestTimeInvalid
-	},
-}
-
-// presignFaults perturb a presigned-URL request signed for service s3.
-var presignFaults = map[string]fault{
-	"tampered signature": func(t *rapid.T, r *http.Request) error {
-		setQuery(r, "X-Amz-Signature", corruptHexDigit(t, r.URL.Query().Get("X-Amz-Signature")))
-		return sigv4.ErrSignatureMismatch
-	},
-	"injected query param": func(t *rapid.T, r *http.Request) error {
-		key := rapid.StringMatching(`[a-z]{1,6}`).Draw(t, "injectKey")
-		setQuery(r, key, rapid.StringMatching(`[a-zA-Z0-9]{1,6}`).Draw(t, "injectVal"))
-		return sigv4.ErrSignatureMismatch
-	},
-	"expired": func(t *rapid.T, r *http.Request) error {
-		// Either well past expiry (behind) or too far in the future (ahead); both expire.
-		offset := time.Duration(rapid.IntRange(2, 48).Draw(t, "expiredHours")) * time.Hour
-		ts := oracleTime.Add(-offset)
-		if rapid.Bool().Draw(t, "expiredAhead") {
-			ts = oracleTime.Add(sigv4.MaxClockSkew + offset)
+	"expired": func(t *rapid.T, r *http.Request, presigned bool, _, _ string) (bool, error) {
+		if !presigned {
+			return true, nil
 		}
-		setQuery(r, "X-Amz-Date", amzTime(ts))
-		return sigv4.ErrPresignedURLExpired
+		// Either well past expiry (behind) or too far ahead; both expire. The behind offset is
+		// measured from the request's own X-Amz-Expires window, which reqGen randomizes.
+		extra := time.Duration(rapid.IntRange(1, 48).Draw(t, "expiredHours")) * time.Hour
+		if rapid.Bool().Draw(t, "expiredAhead") {
+			setQuery(r, "X-Amz-Date", amzTime(oracleTime.Add(sigv4.MaxClockSkew+extra)))
+			return false, sigv4.ErrPresignedURLExpired
+		}
+		expires, _ := strconv.Atoi(r.URL.Query().Get("X-Amz-Expires"))
+		setQuery(r, "X-Amz-Date", amzTime(oracleTime.Add(-time.Duration(expires)*time.Second-extra)))
+		return false, sigv4.ErrPresignedURLExpired
 	},
-	"expiry beyond max": func(t *rapid.T, r *http.Request) error {
+	"expiry beyond max": func(t *rapid.T, r *http.Request, presigned bool, _, _ string) (bool, error) {
+		if !presigned {
+			return true, nil
+		}
 		maxExpires := int(sigv4.MaxPresignAge / time.Second)
 		setQuery(r, "X-Amz-Expires", strconv.Itoa(maxExpires+rapid.IntRange(1, 100000).Draw(t, "expiryExcess")))
-		return sigv4.ErrMalformedPresignedURL
+		return false, sigv4.ErrMalformedPresignedURL
 	},
-	"removed expires": func(_ *rapid.T, r *http.Request) error {
+	"removed expires": func(_ *rapid.T, r *http.Request, presigned bool, _, _ string) (bool, error) {
+		if !presigned {
+			return true, nil
+		}
 		delQuery(r, "X-Amz-Expires")
-		return sigv4.ErrMalformedPresignedURL
+		return false, sigv4.ErrMalformedPresignedURL
 	},
-	"wrong credential region": func(t *rapid.T, r *http.Request) error {
-		bogus := rapid.SampledFrom(bogusRegions).Draw(t, "bogusRegion")
+}
+
+// TestVerifyRejectsFaults checks that every fault rejects with its sentinel, proving the
+// signature covers what it claims and that scope, time, and framing checks fire. Each fault
+// runs against a fresh signature over the same randomized request (any service, any auth mode).
+func TestVerifyRejectsFaults(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		gr := reqGen().Draw(t, "req")
+
+		// Stable fault order so rapid's draw sequence stays deterministic across replays.
+		names := make([]string, 0, len(faults))
+		for name := range faults {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		for _, name := range names {
+			// Fresh signed request per fault: the mutation is destructive.
+			req := sign(t, gr)
+			skip, want := faults[name](t, req, gr.Presigned, gr.Region, gr.Service)
+			if skip {
+				continue
+			}
+
+			if got := parseVerify(req, gr.Region, gr.Service, oracleTime); !errors.Is(got, want) {
+				t.Fatalf("fault %q: got %v, want %v", name, got, want)
+			}
+		}
+	})
+}
+
+// rewriteCredential rewrites the request's 5-part credential scope through fn, for either auth mode.
+func rewriteCredential(r *http.Request, presigned bool, fn func(parts []string) []string) {
+	if presigned {
+		// Presigned carries the scope in the X-Amz-Credential query parameter.
 		parts := strings.Split(r.URL.Query().Get("X-Amz-Credential"), "/")
-		parts[2] = bogus
-		setQuery(r, "X-Amz-Credential", strings.Join(parts, "/"))
-		return sigv4.ErrMalformedAuthorization
-	},
-}
-
-// TestVerifyRejectsHeaderFaults checks that every header fault rejects with its sentinel,
-// proving the signature covers what it claims and that scope, time, and framing checks fire.
-func TestVerifyRejectsHeaderFaults(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		method := rapid.SampledFrom([]string{http.MethodGet, http.MethodPut, http.MethodPost, http.MethodDelete}).Draw(t, "method")
-		region := rapid.SampledFrom([]string{"us-east-1", "eu-west-1"}).Draw(t, "region")
-		path := "/" + rapid.StringMatching(`[a-zA-Z0-9][a-zA-Z0-9._~-]{0,15}`).Draw(t, "path")
-		rawURL := "https://" + oracleHost + path
-
-		for _, name := range sortedFaults(headerFaults) {
-			// Fresh request per fault: the mutation is destructive.
-			req := signHeader(t, method, rawURL, nil, map[string]string{"X-Amz-Meta-Foo": "bar"}, region, "s3", "")
-			want := headerFaults[name](t, req)
-			if got := parseVerify(req, region, "s3", oracleTime); !errors.Is(got, want) {
-				t.Fatalf("fault %q: got %v, want %v", name, got, want)
-			}
-		}
-	})
-}
-
-// TestVerifyRejectsPresignFaults is the presigned-URL counterpart.
-func TestVerifyRejectsPresignFaults(t *testing.T) {
-	rapid.Check(t, func(t *rapid.T) {
-		region := rapid.SampledFrom([]string{"us-east-1", "eu-west-1"}).Draw(t, "region")
-		path := "/" + rapid.StringMatching(`[a-zA-Z0-9][a-zA-Z0-9._~-]{0,15}`).Draw(t, "path")
-		rawURL := "https://" + oracleHost + path
-
-		for _, name := range sortedFaults(presignFaults) {
-			// Fresh request per fault: the mutation is destructive.
-			req := presign(t, rawURL, 3600, region, "s3")
-			want := presignFaults[name](t, req)
-			if got := parseVerify(req, region, "s3", oracleTime); !errors.Is(got, want) {
-				t.Fatalf("fault %q: got %v, want %v", name, got, want)
-			}
-		}
-	})
-}
-
-// sortedFaults returns the fault names in a stable order so the sequence of rapid draws is
-// deterministic across runs — a requirement for rapid to replay and shrink failures.
-func sortedFaults(m map[string]fault) []string {
-	names := make([]string, 0, len(m))
-	for name := range m {
-		names = append(names, name)
+		setQuery(r, "X-Amz-Credential", strings.Join(fn(parts), "/"))
+		return
 	}
 
-	sort.Strings(names)
-
-	return names
-}
-
-// methodsExcept returns the standard methods minus cur, so a mutation always changes it.
-func methodsExcept(cur string) []string {
-	var out []string
-	for _, m := range []string{http.MethodGet, http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodHead} {
-		if m != cur {
-			out = append(out, m)
-		}
-	}
-
-	return out
-}
-
-// corruptHexDigit replaces one randomly chosen hex digit of s with a different one, so the
-// result is a valid but guaranteed-different hex string.
-func corruptHexDigit(t *rapid.T, s string) string {
-	const hexits = "0123456789abcdef"
-	i := rapid.IntRange(0, len(s)-1).Draw(t, "hexIndex")
-	cur := max(strings.IndexByte(hexits, s[i]), 0)
-	offset := rapid.IntRange(1, 15).Draw(t, "hexOffset")
-	b := []byte(s)
-	b[i] = hexits[(cur+offset)%16]
-
-	return string(b)
-}
-
-// corruptAuthSignature corrupts the Signature= value inside an Authorization header.
-func corruptAuthSignature(t *rapid.T, auth string) string {
-	const marker = "Signature="
-	i := strings.LastIndex(auth, marker)
-
-	return auth[:i+len(marker)] + corruptHexDigit(t, auth[i+len(marker):])
-}
-
-// rewriteCredential rewrites the 5-part credential scope in the Authorization header.
-func rewriteCredential(r *http.Request, fn func(parts []string) []string) {
+	// Header auth carries it in the Authorization header's Credential= element.
 	const prefix = "Credential="
 	auth := r.Header.Get("Authorization")
 	i := strings.Index(auth, prefix)
@@ -247,12 +226,28 @@ func rewriteCredential(r *http.Request, fn func(parts []string) []string) {
 	r.Header.Set("Authorization", auth[:i+len(prefix)]+scope+rest[j:])
 }
 
+// corruptHexDigit replaces one byte of s with a different hex digit, yielding a guaranteed-different
+// string; s need not be entirely hex.
+func corruptHexDigit(t *rapid.T, s string) string {
+	const hexits = "0123456789abcdef"
+	i := rapid.IntRange(0, len(s)-1).Draw(t, "hexIndex")
+	// A non-hex byte maps to index 0; the non-zero offset still lands on a different digit.
+	cur := max(strings.IndexByte(hexits, s[i]), 0)
+	offset := rapid.IntRange(1, 15).Draw(t, "hexOffset")
+	b := []byte(s)
+	b[i] = hexits[(cur+offset)%16]
+
+	return string(b)
+}
+
+// setQuery sets a query parameter on r and re-encodes the URL.
 func setQuery(r *http.Request, key, value string) {
 	q := r.URL.Query()
 	q.Set(key, value)
 	r.URL.RawQuery = q.Encode()
 }
 
+// delQuery removes a query parameter from r and re-encodes the URL.
 func delQuery(r *http.Request, key string) {
 	q := r.URL.Query()
 	q.Del(key)

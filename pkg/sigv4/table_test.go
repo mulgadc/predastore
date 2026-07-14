@@ -138,6 +138,7 @@ func TestKnownAnswers(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			// Presigned fixtures carry the algorithm — and the signature — in the query.
 			presigned := tc.query["X-Amz-Algorithm"] != ""
 
 			values := url.Values{}
@@ -165,6 +166,7 @@ func TestKnownAnswers(t *testing.T) {
 			if tc.contentLength != 0 {
 				req.ContentLength = tc.contentLength
 			}
+			// Header-auth fixtures carry the signature in the Authorization header instead.
 			if !presigned {
 				req.Header.Set("Authorization", "AWS4-HMAC-SHA256 "+
 					"Credential="+katAccessKeyID+"/"+katScope+","+
