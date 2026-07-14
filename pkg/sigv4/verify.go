@@ -10,8 +10,9 @@ import (
 )
 
 // Verify checks the request signature under secretAccessKey and confirms the credential
-// scope's region and service match the endpoint's expected values, returning a
-// VerifiedRequest when the request is authentic.
+// scope's region and service match region and service, returning a VerifiedRequest when
+// the request is authentic. region is the region the caller requires the client to have
+// signed with, which is not necessarily the endpoint's own.
 func (req *SignedRequest) Verify(secretAccessKey, region, service string) (*VerifiedRequest, error) {
 	// Ensure client region and service match the caller's expected values.
 	if req.Credential.Region != region {

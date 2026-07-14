@@ -26,6 +26,10 @@ import (
 	"github.com/mulgadc/predastore/ratelimit"
 )
 
+// globalSigningRegion is the region clients sign S3's global operations against,
+// independent of the region they are configured for or the endpoint they target.
+const globalSigningRegion = "us-east-1"
+
 // HTTP2Server is an HTTP/2 compatible S3 server using net/http
 type HTTP2Server struct {
 	config    *Config
@@ -158,7 +162,17 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		if _, err := sig.Verify(credResult.SecretAccessKey, s.config.Region, "s3"); err != nil {
+		// Regional operations must carry the endpoint's own region, as AWS enforces.
+		expectedRegion := s.config.Region
+
+		// ListBuckets is the only global operation served here, and clients sign it against
+		// us-east-1 whatever region they are configured for. Some SDKs sign it with the
+		// configured region instead, so accept either rather than pinning to us-east-1.
+		if bucket, _ := parseS3Path(path); bucket == "" && sig.Credential.Region == globalSigningRegion {
+			expectedRegion = globalSigningRegion
+		}
+
+		if _, err := sig.Verify(credResult.SecretAccessKey, expectedRegion, "s3"); err != nil {
 			s.respondSigV4Error(w, r, accessKey, err, nil)
 			return
 		}
