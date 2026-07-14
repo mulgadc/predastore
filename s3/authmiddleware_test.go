@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mulgadc/predastore/auth"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -79,8 +78,8 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			setupHeaders: func(t *testing.T, req *http.Request) {
 				signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-1", "s3")
 			},
-			expectStatus:   http.StatusForbidden,
-			expectResponse: "Request authenticated",
+			expectStatus:   http.StatusBadRequest,
+			expectResponse: "AuthorizationHeaderMalformed",
 		},
 
 		{
@@ -108,9 +107,9 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			method: "GET",
 			path:   "/test-bucket01",
 			setupHeaders: func(t *testing.T, req *http.Request) {
-				// 6 minutes in the past — exceeds the 5-minute maxClockSkew
+				// 16 minutes in the past — exceeds sigv4.MaxClockSkew (15 min)
 				signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3",
-					auth.WithTime(time.Now().UTC().Add(-6*time.Minute)))
+					withSignTime(time.Now().UTC().Add(-16*time.Minute)))
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "RequestTimeTooSkewed",
@@ -120,9 +119,9 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			method: "GET",
 			path:   "/test-bucket01",
 			setupHeaders: func(t *testing.T, req *http.Request) {
-				// 6 minutes in the future
+				// 16 minutes in the future — exceeds sigv4.MaxClockSkew (15 min)
 				signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3",
-					auth.WithTime(time.Now().UTC().Add(6*time.Minute)))
+					withSignTime(time.Now().UTC().Add(16*time.Minute)))
 			},
 			expectStatus:   http.StatusForbidden,
 			expectResponse: "RequestTimeTooSkewed",
@@ -241,7 +240,7 @@ func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
 			rr := httptest.NewRecorder()
 			server.sigV4AuthMiddleware(next).ServeHTTP(rr, req)
 
-			assert.Equal(t, http.StatusForbidden, rr.Code)
+			assert.Equal(t, http.StatusBadRequest, rr.Code)
 			assert.Contains(t, rr.Body.String(), "AuthorizationHeaderMalformed")
 		})
 	}

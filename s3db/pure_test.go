@@ -118,7 +118,7 @@ func TestDefaultClientConfig(t *testing.T) {
 	cfg := DefaultClientConfig()
 	require.NotNil(t, cfg)
 	assert.Equal(t, "us-east-1", cfg.Region)
-	assert.Equal(t, "s3db", cfg.Service)
+	assert.Equal(t, "s3", cfg.Service)
 	assert.Equal(t, 10*time.Second, cfg.Timeout)
 	assert.Equal(t, 3, cfg.MaxRetries)
 	assert.Nil(t, cfg.RootCAs)

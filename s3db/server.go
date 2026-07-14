@@ -16,8 +16,8 @@ import (
 	"github.com/dgraph-io/badger/v4"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/mulgadc/predastore/auth"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
+	"github.com/mulgadc/predastore/pkg/sigv4"
 )
 
 // Server provides HTTP REST API for the distributed database
@@ -149,7 +149,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			service = DefaultService
 		}
 
-		sig, err := auth.ParseReq(r)
+		sig, err := sigv4.Parse(r)
 		if err != nil {
 			slog.Debug("Auth parse failed", "error", err)
 			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
@@ -159,17 +159,18 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		secret, ok := s.config.Credentials[sig.AccessKeyID]
+		accessKey := sig.Credential.AccessKeyID
+		secret, ok := s.config.Credentials[accessKey]
 		if !ok {
-			slog.Debug("Unknown access key", "accessKey", sig.AccessKeyID)
+			slog.Debug("Unknown access key", "accessKey", accessKey)
 			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
 				Error:   "AccessDenied",
-				Message: fmt.Sprintf("invalid access key: %s", sig.AccessKeyID),
+				Message: fmt.Sprintf("invalid access key: %s", accessKey),
 			})
 			return
 		}
 
-		if err := sig.Verify(secret, service, region); err != nil {
+		if _, err := sig.Verify(secret, region, service); err != nil {
 			slog.Debug("Auth verify failed", "error", err)
 			s.writeJSON(w, http.StatusForbidden, ErrorResponse{
 				Error:   "AccessDenied",
@@ -178,7 +179,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), contextKeyAccessKey, sig.AccessKeyID)
+		ctx := context.WithValue(r.Context(), contextKeyAccessKey, accessKey)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
