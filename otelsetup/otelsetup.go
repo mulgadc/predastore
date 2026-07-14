@@ -85,7 +85,7 @@ func Init(ctx context.Context, serviceName string) (func(context.Context) error,
 	}
 	lp := sdklog.NewLoggerProvider(
 		sdklog.WithResource(res),
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExp)),
+		sdklog.WithProcessor(newUTF8Processor(sdklog.NewBatchProcessor(logExp))),
 	)
 	loggerglobal.SetLoggerProvider(lp)
 
