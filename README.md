@@ -63,9 +63,7 @@ make build              # builds ./bin/s3d (also generates dev TLS certs)
 
 ### Run a Dev Cluster
 
-The `./scripts/` directory contains helpers for running a multi-node cluster
-locally on loopback IP aliases — the recommended way to exercise the
-distributed code paths in development:
+The `./scripts/` directory contains helpers for running a multi-node cluster locally on loopback IP aliases.
 
 ```bash
 ./scripts/start.sh 3node        # launch a 3-node cluster
@@ -76,16 +74,11 @@ distributed code paths in development:
 ./scripts/bench.sh disk         # run raw-disk fio benchmark
 ```
 
-Cluster runtime data (logs, PID files, segment files, BadgerDB indexes) lives
-under `$PREDA_DIR` (default `/tmp/predastore/<clustername>/`). The start script
-sets up loopback IP aliases (requires `sudo`) and generates TLS certs on first
-run.
+Cluster runtime data (logs, PID files, segment files, BadgerDB indexes) lives under `$PREDA_DIR` (default `/tmp/predastore/<clustername>/`). The start script sets up loopback IP aliases (requires `sudo`) and generates TLS certs on first run.
 
 ### Run a Single Node
 
-`./bin/s3d` is a single-node process — for running one node of a cluster
-directly (e.g. on a dedicated host in production, or for inspecting one
-node in isolation):
+`./bin/s3d` is a single-node process — for running one node of a cluster directly (e.g. on a dedicated host in production, or for inspecting one node in isolation):
 
 ```bash
 ./bin/s3d \
@@ -99,11 +92,7 @@ node in isolation):
   --encryption-key-file /tmp/predastore/3node/master.key
 ```
 
-The encryption key file must be exactly 32 raw bytes (no base64, no header)
-with mode `0600` — group/other-readable keys are rejected outright. Generate
-one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key
-must be supplied to every node in a cluster; rotating it is not supported
-(see Roadmap → envelope encryption).
+The encryption key file must be exactly 32 raw bytes (no base64, no header) with mode `0600`. Generate one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key must be supplied to every node in a cluster; rotating it is not currently supported (see Roadmap → envelope encryption).
 
 ### Configuration
 
@@ -116,8 +105,7 @@ config/
   7node.toml    # 7 db + 7 storage nodes
 ```
 
-Each config defines `[[db]]` and `[[storage]]` sections specifying node IDs,
-hosts, ports, and Reed-Solomon parameters.
+Each config defines `[[db]]` and `[[storage]]` sections specifying node IDs, hosts, ports, and Reed-Solomon parameters.
 
 TLS certificates are generated on first build:
 
@@ -127,12 +115,7 @@ make certs              # Generate certs/server.{pem,key}
 
 ### Standalone TLS Trust
 
-The QUIC inter-node transport and the s3db REST client now verify the server
-certificate — `InsecureSkipVerify` is gone from both the production code path
-and the test fixtures (tests inject an ephemeral CA via
-`quicclient.SetDefaultRootCAs`). Standalone operators must install the cluster
-CA into the host trust store before launching `s3d`, otherwise nodes cannot
-dial each other:
+When predastore is deployed by Spinifex, the cluster CA is installed into the host trust store automatically as part of node bootstrap — no manual action is required. Standalone operators must install the cluster CA into the host trust store before launching `s3d`, otherwise nodes cannot dial each other:
 
 ```bash
 # Debian / Ubuntu
@@ -143,10 +126,6 @@ sudo update-ca-certificates
 sudo cp cluster-ca.pem /etc/pki/ca-trust/source/anchors/predastore-cluster-ca.pem
 sudo update-ca-trust
 ```
-
-When predastore is deployed by Spinifex, the cluster CA is installed into the
-host trust store automatically as part of node bootstrap — no manual action is
-required.
 
 ### AWS CLI Examples
 
@@ -166,8 +145,7 @@ aws --endpoint-url https://10.11.12.1:8443/ s3 cp s3://my-bucket/file.txt ./down
 
 ## Storage Backend
 
-Distributed storage with erasure coding, Raft-consensus metadata, and QUIC transport.
-The simplest way to bring up a cluster locally:
+Distributed storage with erasure coding, Raft-consensus metadata, and QUIC transport. The simplest way to bring up a cluster locally:
 
 ```bash
 ./scripts/start.sh -w 3node     # 3-node cluster on loopback aliases
@@ -240,4 +218,4 @@ sudo sysctl -w net.core.wmem_max=7500000
 
 ## License
 
-Apache 2.0 License. See [LICENSE](LICENSE) for details.
+Predastore is open source under the [GNU Affero General Public License v3.0](LICENSE). You're free to use, modify, and deploy it anywhere you need reliable infrastructure without depending on centralized cloud platforms.
