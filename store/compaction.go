@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -202,6 +203,11 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 // reserved slot in the active append segment, then compare-and-swaps the index
 // onto the new slot. Verbatim is load-bearing: fragNum rides along inside the
 // copied bytes, so the GCM nonce is preserved and never reused.
+//
+// The copy runs without store.mutex so it never stalls the write path, which
+// leaves room for a concurrent overwrite or delete of the same key to land
+// first and win the slot. The swap resolves that race and accounts for the
+// copy either way.
 func (store *Store) relocateExtent(key []byte, old extent) error {
 	fragCount := uint64(old.PSize / totalFragSize) //nolint:gosec // PSize is a non-negative multiple of totalFragSize.
 
@@ -243,10 +249,45 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 		return fmt.Errorf("sync destination idx: %w", err)
 	}
 
-	if _, err := store.casExtent(key, old, newExt); err != nil {
-		return fmt.Errorf("commit relocation: %w", err)
+	// Swap the index onto the new slot, but only if the key still points at the
+	// one we copied from — an overwrite or delete may have landed while we copied
+	// without the mutex. Losing that race strands the copy: only this swap could
+	// ever have referenced it, and slots are never reissued, so it is dead the
+	// moment the swap fails. Tombstone it in the same transaction, or those bytes
+	// pad their segment's live count and mask it from a later compaction.
+	for {
+		err := store.index.Badger.Update(func(txn *badger.Txn) error {
+			stale := false
+			item, err := txn.Get(key)
+			switch {
+			case errors.Is(err, badger.ErrKeyNotFound):
+				stale = true
+			case err != nil:
+				return err
+			default:
+				cur, err := item.ValueCopy(nil)
+				if err != nil {
+					return err
+				}
+				stale = !bytes.Equal(cur, old.encode())
+			}
+
+			if stale {
+				return txn.Set(tombstoneKey(newExt.SegNum, newExt.Off), tombstoneValue(newExt.PSize))
+			}
+			return txn.Set(key, newExt.encode())
+		})
+
+		// Reading the key before writing it puts this txn under badger's conflict
+		// detection, which a concurrent commit on the same key trips.
+		if errors.Is(err, badger.ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("commit relocation: %w", err)
+		}
+		return nil
 	}
-	return nil
 }
 
 // copyExtent streams size bytes from src@srcOff to dst@dstOff via disjoint
