@@ -17,10 +17,9 @@ const (
 	idxSegFilename = "%016d.idx"
 )
 
-// idxEntry is one row of a segment's reverse sidecar (.idx): the in-segment
-// offset of an allocated extent, the shard key it holds, and its physical size.
-// Append-only; one row written per allocation so compaction can enumerate a
-// segment's extents without a full index scan.
+// idxEntry is one row of a segment's append-only reverse sidecar (.idx), written
+// per allocation so compaction can enumerate a segment's extents without
+// scanning the whole index.
 const idxEntrySize = 52 // Off(8) ‖ Key(36) ‖ PSize(8)
 
 type idxEntry struct {
@@ -47,9 +46,9 @@ func decodeIdxEntry(b []byte) (e idxEntry, err error) {
 	return e, nil
 }
 
-// scanIdx sequentially reads a segment's whole .idx sidecar into memory. Used
-// by compaction to enumerate every extent ever allocated in the segment; the
-// returned rows are selection hints back-checked against the index authority.
+// scanIdx reads a segment's whole .idx into memory, listing every extent ever
+// allocated there. The rows are hints: callers must back-check each against the
+// index, which is the authority on what is live.
 func scanIdx(dir string, segNum uint64) ([]idxEntry, error) {
 	f, err := openFile(filepath.Join(dir, fmt.Sprintf(idxSegFilename, segNum)))
 	if err != nil {
@@ -66,9 +65,8 @@ func scanIdx(dir string, segNum uint64) ([]idxEntry, error) {
 		return nil, err
 	}
 
-	// A torn trailing record is a crash mid-append: since .idx is fsynced before
-	// the index commit, that extent never went live, so dropping the partial row
-	// is safe. Enumerate only whole records.
+	// Whole records only. A torn trailing row is a crash mid-append, and since
+	// .idx is fsynced before the index commit, that extent never went live.
 	count := info.Size() / idxEntrySize
 	entries := make([]idxEntry, 0, count)
 	buf := make([]byte, idxEntrySize)
@@ -139,13 +137,7 @@ var openFile = func(path string) (file, error) {
 	return os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
 }
 
-// segment is an open segment file handle with a reference count. refs tracks
-// active readers and writers; Store.Close calls refs.Wait to drain them
-// before closing the file descriptor. The WaitGroup is safe because addRef is
-// only called from Lookup/Append (which hold store.mutex), and Close flips
-// store.closed under the same mutex before waiting — so no new addRef can
-// race with Wait. full caches the on-disk full flag so the hot Append path
-// avoids a ReadAt per call.
+// segment is an open segment file handle with a reference count.
 type segment struct {
 	file // .seg
 
@@ -153,7 +145,13 @@ type segment struct {
 	idxSize int64  // .idx append cursor, guarded by store.mutex
 	num     uint64 // for unlink paths on drop
 
+	// Active readers and writers, drained before the fd closes. Safe as a
+	// WaitGroup because addRef only runs from Lookup/Append under store.mutex,
+	// and Close flips store.closed under that same mutex before waiting — so no
+	// addRef can race a Wait.
 	refs sync.WaitGroup
+
+	// Caches the on-disk full flag, sparing the hot Append path a ReadAt.
 	full atomic.Bool
 }
 
@@ -173,9 +171,9 @@ func (seg *segment) appendIdx(e idxEntry) error {
 
 func (seg *segment) syncIdx() error { return seg.idx.Sync() }
 
-// dropSegment removes a fully-drained segment: evict from segCache, drain refs,
-// close both fds, and unlink .seg + .idx. Caller holds store.mutex. Safe only
-// after every live extent the segment held has been CAS-committed elsewhere.
+// dropSegment unlinks a drained segment and its sidecar. Caller holds
+// store.mutex. Safe only once every live extent it held has been committed
+// elsewhere.
 func (store *Store) dropSegment(num uint64) error {
 	seg, ok := store.segCache[num]
 	if !ok {

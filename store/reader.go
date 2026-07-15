@@ -9,20 +9,20 @@ import (
 
 var ErrClosedReader = errors.New("closed reader")
 
-// reader provides random and sequential access to a single shard's data.
-// It reads fragments from disk in batches of up to bufLen, opens each under
-// AES-256-GCM, and copies the plaintext into the caller's buffer. readPos
-// tracks the logical position for sequential Read() calls; ReadAt is stateless.
+// reader gives random and sequential access to one shard, decrypting fragments
+// as it goes.
 type reader struct {
 	objectHash [32]byte
 	shardIndex uint32
 	storeID    uint32
-	aead       cipher.AEAD // shared cipher.AEAD built once at Store.Open; safe for concurrent use.
+	aead       cipher.AEAD
 
 	seg *segment
 	ext extent
 
-	buf     []byte
+	buf []byte
+
+	// Sequential position for Read; ReadAt is stateless.
 	readPos int64
 
 	closed bool
@@ -43,19 +43,9 @@ func (r *reader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// ReadAt reads len(p) bytes from the shard starting at logical byte offset.
-// Translates logical offsets to on-disk fragment positions:
-//
-//	fragIndex = logicalPos / fragBodySize
-//	diskOff   = ext.Off + fragIndex * totalFragSize
-//
-// Fragments are read in batches of up to bufLen at a time — one seg.ReadAt
-// fills the buffer, then each fragment is opened in place. This mirrors the
-// writer's one-WriteAt-per-window pattern so bufLen acts as a tunable
-// syscall-batch knob symmetric on both sides.
-//
-// A failed Open wraps ErrIntegrity — disk corruption, tamper, and wrong
-// master key share one path.
+// ReadAt reads len(p) bytes from the shard's logical offset, translating it to
+// on-disk fragment positions. A failed decrypt wraps ErrIntegrity, so
+// corruption, tamper and a wrong master key all surface the same way.
 func (r *reader) ReadAt(p []byte, off int64) (int, error) {
 	if r.closed {
 		return 0, ErrClosedReader
@@ -70,13 +60,15 @@ func (r *reader) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	totalCopied := 0
-	// Only the very first fragment we touch can start mid-body; all
-	// subsequent fragments (within or across batches) begin at body offset 0
-	// because each non-final copy consumes exactly fragBodySize logical bytes.
+
+	// Only the first fragment can start mid-body; every later one begins at 0,
+	// since each non-final copy consumes exactly fragBodySize logical bytes.
 	bodyOffset := int(off % fragBodySize)
 
 	batchCap := len(r.buf) / totalFragSize
 
+	// One seg.ReadAt fills the window, then each fragment is opened in place —
+	// mirroring the writer, so bufLen tunes syscall batching on both sides.
 	for totalCopied < len(p) {
 		logicalPos := off + int64(totalCopied)
 		startFragIdx := logicalPos / fragBodySize

@@ -9,11 +9,8 @@ import (
 
 var ErrClosedWriter = errors.New("closed writer")
 
-// writer buffers a single shard's fragments and seals each body in place
-// before flushing. The internal buffer mirrors the on-disk layout (headers,
-// body slots, and tag slots interleaved) so flush can issue one WriteAt for
-// the whole window. cursor advances past each fragment's tag slot when the
-// body fills, so the next iteration starts cleanly on a fragment boundary.
+// writer buffers one shard's fragments and seals each body in place before
+// flushing.
 type writer struct {
 	store      *Store
 	objectHash [32]byte
@@ -26,15 +23,18 @@ type writer struct {
 	shardNum uint64
 	fragNum  uint64
 
-	// buf holds the unflushed fragment window. cursor is the offset into the
-	// shard's extent where the next byte will go; flushedTo is the same kind
-	// of offset, fixed to the last successful WriteAt. cursor - flushedTo is
-	// the live buffer-fill in bytes. dataLen tracks logical bytes written so
-	// we don't recompute it from cursor on every iteration.
-	buf       []byte
+	// The unflushed fragment window, mirroring the on-disk layout so flush can
+	// issue one WriteAt for the whole thing.
+	buf []byte
+
+	// Offsets into the shard's extent: cursor is where the next byte goes,
+	// flushedTo is fixed to the last successful WriteAt, and their difference is
+	// the live buffer fill.
 	cursor    int64
 	flushedTo int64
-	dataLen   int64
+
+	// Logical bytes written, tracked so it isn't recomputed from cursor per loop.
+	dataLen int64
 
 	closed bool
 }
@@ -57,14 +57,10 @@ func (w *writer) Write(p []byte) (int, error) {
 }
 
 // ReadFrom streams from r into the shard, one fragment per iteration.
-// io.ReadFull fills the body, capped at the remaining shard bytes so the
-// final partial fragment doesn't try to over-read. Flush triggers when the
-// buffer window fills or the shard is done.
 //
-// If r is exhausted before the shard is filled (underfill), returns the
-// bytes consumed and io.EOF — the writer's Close will still flush whatever
-// partial bytes were buffered, but the index entry's LSize will exceed the
-// actual data; ReadAt of the unfilled tail will surface ErrIntegrity.
+// If r runs dry before the shard is full, returns the bytes consumed and
+// io.EOF. Close still flushes what was buffered, but the extent's LSize will
+// overstate the data, and reading the unfilled tail surfaces ErrIntegrity.
 func (w *writer) ReadFrom(r io.Reader) (total int64, err error) {
 	if w.closed {
 		return 0, ErrClosedWriter
@@ -77,6 +73,8 @@ func (w *writer) ReadFrom(r io.Reader) (total int64, err error) {
 		w.fragNum++
 		w.cursor += fragHeaderSize
 
+		// Cap the fill at the shard's remaining bytes so the final partial
+		// fragment doesn't over-read.
 		dataLeft := w.ext.LSize - w.dataLen
 		want := int(min(int64(fragBodySize), dataLeft))
 		n, readErr := io.ReadFull(r, frag.body()[:want])
@@ -87,9 +85,8 @@ func (w *writer) ReadFrom(r io.Reader) (total int64, err error) {
 		w.dataLen += int64(n)
 		total += int64(n)
 
-		// Skip the tag slot when the body filled, so the next iteration
-		// starts at a fragment boundary. The tag bytes themselves are
-		// written in place by flush()'s Seal.
+		// Skip the tag slot so the next iteration lands on a fragment boundary;
+		// flush's Seal writes the tag bytes themselves.
 		if n == fragBodySize {
 			w.cursor += fragTagSize
 		}
@@ -108,10 +105,10 @@ func (w *writer) ReadFrom(r io.Reader) (total int64, err error) {
 	return total, nil
 }
 
-// Close flushes any remaining buffered data, syncs the segment file, then
-// commits the extent to the index. Must be called exactly once. The segment
-// ref is always decremented on exit; the index commit only runs when the
-// data is fully durable, preserving rollback on flush/Sync failure.
+// Close flushes, makes the data durable, then commits the extent to the index —
+// so a failure before that last step leaves the shard's previous data intact.
+// Must be called exactly once; it is what releases the segment reference Append
+// took.
 func (w *writer) Close() (err error) {
 	if w.closed {
 		return ErrClosedWriter
