@@ -241,7 +241,7 @@ func TestCalculateMultipartETag(t *testing.T) {
 
 	// Verify format: "md5-partcount"
 	assert.Contains(t, result, "-2\"")
-	assert.True(t, len(result) > 35) // md5 hex (32) + quotes + dash + count
+	assert.Greater(t, len(result), 35) // md5 hex (32) + quotes + dash + count
 
 	// Calculate expected manually
 	concat := append(part1MD5[:], part2MD5[:]...)
@@ -306,12 +306,12 @@ func TestCompareETags(t *testing.T) {
 
 func TestS3APILimits(t *testing.T) {
 	// Verify the constants match S3 API documentation
-	assert.Equal(t, int64(5*1024*1024), MinPartSize, "Min part size should be 5MB")
-	assert.Equal(t, int64(5*1024*1024*1024), MaxPartSize, "Max part size should be 5GB")
+	assert.Equal(t, MinPartSize, int64(5*1024*1024), "Min part size should be 5MB")
+	assert.Equal(t, MaxPartSize, int64(5*1024*1024*1024), "Max part size should be 5GB")
 	assert.Equal(t, 10000, MaxPartsCount, "Max parts should be 10000")
 	assert.Equal(t, 1, MinPartNumber, "Min part number should be 1")
 	assert.Equal(t, 10000, MaxPartNumber, "Max part number should be 10000")
-	assert.Equal(t, int64(5*1024*1024*1024*1024), MaxObjectSize, "Max object size should be 5TB")
+	assert.Equal(t, MaxObjectSize, int64(5*1024*1024*1024*1024), "Max object size should be 5TB")
 }
 
 func TestMultipartETagFormat(t *testing.T) {

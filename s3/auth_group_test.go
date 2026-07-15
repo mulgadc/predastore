@@ -356,7 +356,7 @@ func TestResolveUserPolicies_GroupKVError(t *testing.T) {
 
 	_, err := p.resolveUserPolicies(inlineTestAccount, "alice")
 	require.Error(t, err, "a per-group KV fault must fail closed, not be skipped")
-	assert.False(t, errors.Is(err, nats.ErrKeyNotFound),
+	assert.NotErrorIs(t, err, nats.ErrKeyNotFound,
 		"an infra fault must not be mistaken for a missing group")
 }
 

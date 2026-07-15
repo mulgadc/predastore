@@ -116,10 +116,10 @@ func TestChainProvider_BothNotFound(t *testing.T) {
 
 func TestErrKeyNotFound_IsDetectable(t *testing.T) {
 	wrapped := fmt.Errorf("%w: AK123", ErrKeyNotFound)
-	assert.True(t, errors.Is(wrapped, ErrKeyNotFound))
+	assert.ErrorIs(t, wrapped, ErrKeyNotFound)
 
 	unrelated := errors.New("NATS connection timeout")
-	assert.False(t, errors.Is(unrelated, ErrKeyNotFound))
+	assert.NotErrorIs(t, unrelated, ErrKeyNotFound)
 }
 
 // --- IAMConfig validation tests ---
@@ -140,7 +140,7 @@ func TestNATSIAMProvider_LazyBucketsNotReady_InfraError(t *testing.T) {
 
 	_, err := p.LookupCredentials("AKIAEXAMPLE")
 	assert.Error(t, err)
-	assert.False(t, errors.Is(err, ErrKeyNotFound),
+	assert.NotErrorIs(t, err, ErrKeyNotFound,
 		"infrastructure errors should NOT be mapped to ErrKeyNotFound")
 	assert.Contains(t, err.Error(), "IAM lookup unavailable")
 }

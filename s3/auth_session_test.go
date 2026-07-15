@@ -329,7 +329,7 @@ func TestLookupSession_AssumedRoleKVError(t *testing.T) {
 
 	_, err := p.LookupCredentials(testSessionAKID)
 	require.Error(t, err)
-	assert.False(t, errors.Is(err, ErrKeyNotFound), "infra faults must not be mapped to ErrKeyNotFound")
+	assert.NotErrorIs(t, err, ErrKeyNotFound, "infra faults must not be mapped to ErrKeyNotFound")
 	assert.Contains(t, err.Error(), "resolve session policies")
 }
 
@@ -360,7 +360,7 @@ func TestLookupSession_AssumedRolePolicyKVError(t *testing.T) {
 
 	_, err := p.LookupCredentials(testSessionAKID)
 	require.Error(t, err)
-	assert.False(t, errors.Is(err, ErrKeyNotFound), "infra faults must not be mapped to ErrKeyNotFound")
+	assert.NotErrorIs(t, err, ErrKeyNotFound, "infra faults must not be mapped to ErrKeyNotFound")
 	assert.Contains(t, err.Error(), "resolve session policies")
 }
 
@@ -476,7 +476,7 @@ func TestLookupSession_NonASIAUnaffected(t *testing.T) {
 
 	_, err := p.LookupCredentials("AKIAEXAMPLE")
 	require.Error(t, err)
-	assert.False(t, errors.Is(err, ErrKeyNotFound), "AKIA key must hit the AKIA path, not the session bucket")
+	assert.NotErrorIs(t, err, ErrKeyNotFound, "AKIA key must hit the AKIA path, not the session bucket")
 	assert.Contains(t, err.Error(), "IAM lookup unavailable")
 }
 
@@ -494,7 +494,7 @@ func TestLookupSession_NoJetStream_InfraError(t *testing.T) {
 
 	_, err := p.LookupCredentials(testSessionAKID)
 	require.Error(t, err)
-	assert.False(t, errors.Is(err, ErrKeyNotFound), "infra errors must not be mapped to ErrKeyNotFound")
+	assert.NotErrorIs(t, err, ErrKeyNotFound, "infra errors must not be mapped to ErrKeyNotFound")
 	assert.Contains(t, err.Error(), "session credential lookup unavailable")
 }
 

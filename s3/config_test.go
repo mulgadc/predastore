@@ -16,10 +16,10 @@ func TestReadConfig(t *testing.T) {
 	assert.Equal(t, "ap-southeast-2", s3.Region, "Region should match")
 	assert.Equal(t, 4, s3.RS.Data, "RS data shards should match")
 	assert.Equal(t, 3, s3.RS.Parity, "RS parity shards should match")
-	assert.Equal(t, 0, len(s3.Buckets), "Should have no buckets")
-	assert.Equal(t, 7, len(s3.Nodes), "Should have 7 storage nodes")
-	assert.Equal(t, 7, len(s3.DB), "Should have 7 database nodes")
-	assert.Equal(t, 1, len(s3.Auth), "Should have 1 auth entry")
+	assert.Empty(t, s3.Buckets, "Should have no buckets")
+	assert.Len(t, s3.Nodes, 7, "Should have 7 storage nodes")
+	assert.Len(t, s3.DB, 7, "Should have 7 database nodes")
+	assert.Len(t, s3.Auth, 1, "Should have 1 auth entry")
 }
 
 func TestReadInvalidConfig(t *testing.T) {
@@ -31,7 +31,7 @@ func TestReadInvalidConfig(t *testing.T) {
 	assert.Equal(t, "ap-southeast-2", s3.Region, "Region should match")
 
 	// All bucket names are invalid — none should survive validation
-	assert.Zero(t, len(s3.Buckets))
+	assert.Empty(t, s3.Buckets)
 }
 
 func TestReadConfig_AuthMissingAccountIDIsHardError(t *testing.T) {

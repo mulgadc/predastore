@@ -325,7 +325,7 @@ func TestHandleRangeWithFullReconstructionFallback(t *testing.T) {
 			}
 
 			rangeData := orig[tc.start : tc.end+1]
-			require.Equal(t, tc.expectLen, len(rangeData), "extracted range length")
+			require.Len(t, rangeData, tc.expectLen, "extracted range length")
 
 			for i, b := range rangeData {
 				expected := byte((int64(i) + tc.start + int64(size)) % 251)

@@ -75,7 +75,7 @@ func TestS3DB_BucketsByAccountID(t *testing.T) {
 	assert.NoError(t, err, "Failed to list keys by account ID")
 
 	expectedCount := 5
-	assert.Equal(t, expectedCount, len(keys), "Expected %d buckets for account 123456789012, got %d", expectedCount, len(keys))
+	assert.Len(t, keys, expectedCount, "Expected %d buckets for account 123456789012, got %d", expectedCount, len(keys))
 
 	// Verify all returned keys belong to the account
 	for _, key := range keys {
@@ -90,7 +90,7 @@ func TestS3DB_BucketsByAccountID(t *testing.T) {
 	assert.NoError(t, err, "Failed to list keys by account ID")
 
 	expectedCount2 := 3
-	assert.Equal(t, expectedCount2, len(keys2), "Expected %d buckets for account 987654321098, got %d", expectedCount2, len(keys2))
+	assert.Len(t, keys2, expectedCount2, "Expected %d buckets for account 987654321098, got %d", expectedCount2, len(keys2))
 
 	// Test: Filter by account ID 555555555555
 	accountPrefix3 := []byte("arn:aws:s3::555555555555:")
@@ -98,7 +98,7 @@ func TestS3DB_BucketsByAccountID(t *testing.T) {
 	assert.NoError(t, err, "Failed to list keys by account ID")
 
 	expectedCount3 := 2
-	assert.Equal(t, expectedCount3, len(keys3), "Expected %d buckets for account 555555555555, got %d", expectedCount3, len(keys3))
+	assert.Len(t, keys3, expectedCount3, "Expected %d buckets for account 555555555555, got %d", expectedCount3, len(keys3))
 }
 
 func TestS3DB_ObjectsByPrefix(t *testing.T) {
@@ -175,7 +175,7 @@ func TestS3DB_ObjectsByPrefix(t *testing.T) {
 	assert.NoError(t, err, "Failed to list keys for prefix1")
 
 	expectedPrefix1Count := expectedCounts["prefix1"]
-	assert.Equal(t, expectedPrefix1Count, len(keys),
+	assert.Len(t, keys, expectedPrefix1Count,
 		"Expected %d objects for prefix1, got %d", expectedPrefix1Count, len(keys))
 
 	// Verify all keys belong to prefix1
@@ -199,7 +199,7 @@ func TestS3DB_ObjectsByPrefix(t *testing.T) {
 		}
 	}
 
-	assert.Equal(t, expectedDeepCount, len(deepKeys),
+	assert.Len(t, deepKeys, expectedDeepCount,
 		"Expected %d objects at level3 for prefix1, got %d", expectedDeepCount, len(deepKeys))
 
 	// Verify all keys belong to the deep prefix
@@ -222,7 +222,7 @@ func TestS3DB_ObjectsByPrefix(t *testing.T) {
 		}
 	}
 
-	assert.Equal(t, expectedLevel2Count, len(level2Keys),
+	assert.Len(t, level2Keys, expectedLevel2Count,
 		"Expected %d objects at level2+level3 for prefix1, got %d", expectedLevel2Count, len(level2Keys))
 
 	// Test 4: Verify all prefixes have correct object counts
@@ -232,7 +232,7 @@ func TestS3DB_ObjectsByPrefix(t *testing.T) {
 		assert.NoError(t, err, "Failed to list keys for prefix: %s", prefix)
 
 		expectedCount := expectedCounts[prefix]
-		assert.Equal(t, expectedCount, len(keys),
+		assert.Len(t, keys, expectedCount,
 			"Expected %d objects for %s, got %d", expectedCount, prefix, len(keys))
 	}
 
@@ -241,7 +241,7 @@ func TestS3DB_ObjectsByPrefix(t *testing.T) {
 	allKeys, err := db.ListKeys([]byte(bucketARN))
 	assert.NoError(t, err, "Failed to list all keys for bucket")
 
-	assert.Equal(t, totalObjects, len(allKeys),
+	assert.Len(t, allKeys, totalObjects,
 		"Expected %d total objects in bucket, got %d", totalObjects, len(allKeys))
 }
 
@@ -305,7 +305,7 @@ func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
 	allAccountKeys, err := db.ListKeys(accountPrefix)
 	assert.NoError(t, err, "Failed to list all keys for account")
 
-	assert.Equal(t, totalObjects, len(allAccountKeys),
+	assert.Len(t, allAccountKeys, totalObjects,
 		"Expected %d total objects for account, got %d", totalObjects, len(allAccountKeys))
 
 	// Test: Filter by specific bucket
@@ -319,7 +319,7 @@ func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
 		expectedBucket1Count += objectCounts[key]
 	}
 
-	assert.Equal(t, expectedBucket1Count, len(bucket1Keys),
+	assert.Len(t, bucket1Keys, expectedBucket1Count,
 		"Expected %d objects in bucket1, got %d", expectedBucket1Count, len(bucket1Keys))
 
 	// Test: Filter by specific bucket and prefix
@@ -328,7 +328,7 @@ func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
 	assert.NoError(t, err, "Failed to list keys for bucket1/prefix1")
 
 	expectedCount := objectCounts["bucket1/prefix1"]
-	assert.Equal(t, expectedCount, len(bucket1Prefix1Keys),
+	assert.Len(t, bucket1Prefix1Keys, expectedCount,
 		"Expected %d objects in bucket1/prefix1, got %d", expectedCount, len(bucket1Prefix1Keys))
 
 	// Test: Filter by deep prefix
@@ -344,6 +344,6 @@ func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
 		}
 	}
 
-	assert.Equal(t, expectedDeepCount, len(deepKeys),
+	assert.Len(t, deepKeys, expectedDeepCount,
 		"Expected %d objects at level3, got %d", expectedDeepCount, len(deepKeys))
 }
