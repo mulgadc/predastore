@@ -107,7 +107,7 @@ func TestNewResourceAttributes(t *testing.T) {
 	}
 	got := map[string]string{}
 	for _, kv := range res.Attributes() {
-		got[string(kv.Key)] = kv.Value.Emit()
+		got[string(kv.Key)] = kv.Value.String()
 	}
 	for key, want := range map[string]string{
 		"service.name": "test-svc",
@@ -285,7 +285,7 @@ func TestSetDefaultJSONLoggerBridgesWithoutClobbering(t *testing.T) {
 		}
 		attrs := map[string]string{}
 		for _, kv := range rec.Resource().Attributes() {
-			attrs[string(kv.Key)] = kv.Value.Emit()
+			attrs[string(kv.Key)] = kv.Value.String()
 		}
 		if attrs["service.name"] != "predastore" {
 			t.Errorf("record %d resource service.name = %q, want predastore", i, attrs["service.name"])

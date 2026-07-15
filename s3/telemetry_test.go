@@ -45,7 +45,7 @@ func TestS3SpanMiddlewareRenamesSpan(t *testing.T) {
 			}
 			attrs := map[string]string{}
 			for _, kv := range got.Attributes() {
-				attrs[string(kv.Key)] = kv.Value.Emit()
+				attrs[string(kv.Key)] = kv.Value.String()
 			}
 			if attrs["s3.bucket"] != tt.wantBucket {
 				t.Errorf("s3.bucket = %q, want %q", attrs["s3.bucket"], tt.wantBucket)

@@ -68,7 +68,7 @@ func attrsOf(t *testing.T, m *metricdata.Metrics) map[string]string {
 	}
 	got := map[string]string{}
 	for _, kv := range sum.DataPoints[0].Attributes.ToSlice() {
-		got[string(kv.Key)] = kv.Value.Emit()
+		got[string(kv.Key)] = kv.Value.String()
 	}
 	return got
 }
