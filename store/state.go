@@ -20,12 +20,10 @@ type state struct {
 	StoreID          uint32 `json:"storeID"`
 }
 
-// loadState reads state.json from the Store directory and restores monotonic
-// counters. If state.json does not exist, a fresh storeID is generated and
-// the in-memory counters are zeroed; callers MUST follow up with a durable
-// saveState before any fragment is written under this storeID — otherwise a
-// crash + restart could regenerate a different storeID and orphan any data
-// written under the old one.
+// loadState restores the monotonic counters, generating a fresh storeID when
+// the data dir has no state.json. Callers must follow with a durable saveState
+// before any fragment is sealed: a crash first would regenerate a different
+// storeID and orphan everything written under the old one.
 func (store *Store) loadState() error {
 	data, err := os.ReadFile(filepath.Join(store.dir, stateFilename))
 	if err != nil {
@@ -50,16 +48,14 @@ func (store *Store) loadState() error {
 	store.shardNum = sta.ShardNum
 	store.storeID = sta.StoreID
 	store.fragNumHighWater = sta.FragNumHighWater
-	// fragNum resumes from the persisted high-water mark: the unflushed
-	// reservation window from before the crash is sacrificed to guarantee
-	// nonce uniqueness (see Stage 1 plan, "fragNum high-water reservation").
+	// Resume from the high-water, not the last fragNum: the unflushed window from
+	// before a crash is sacrificed to keep nonces unique.
 	store.fragNum = sta.FragNumHighWater
 	return nil
 }
 
-// saveState atomically and durably persists the Store's counters to disk:
-// write to state.json.tmp, fsync the file, rename to state.json, fsync the
-// parent directory. Returns when all writes are guaranteed durable.
+// saveState persists the counters atomically, returning only once they are
+// durable.
 func (store *Store) saveState() (retErr error) {
 	sta := state{
 		SegNum:           store.segNum,
@@ -105,6 +101,7 @@ func (store *Store) saveState() (retErr error) {
 		return err
 	}
 
+	// The rename itself is only durable once the parent directory is fsynced.
 	dir, err := os.Open(store.dir)
 	if err != nil {
 		return err

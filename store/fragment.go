@@ -27,10 +27,8 @@ const (
 	fragTagSize    = 16
 	totalFragSize  = fragHeaderSize + fragBodySize + fragTagSize
 
-	// bufLen is the per-shard fragment window: shardWriter buffers this many
-	// fragments before issuing one WriteAt, and shardReader fills the same
-	// window per seg.ReadAt. Trades RAM (≈ bufLen * 8 KiB per reader/writer)
-	// for syscall amortization. Cap at shard's fragment count when smaller.
+	// bufLen is the per-shard fragment window each reader and writer batches
+	// into one syscall, trading ≈ bufLen * 8 KiB of RAM apiece for fewer of them.
 	bufLen = 32
 )
 
@@ -53,14 +51,10 @@ const (
 // or the master key / storeID do not match what was bound at seal time.
 var ErrIntegrity = errors.New("fragment integrity check failed")
 
-// fragment is a fixed-size view over the on-disk fragment layout. Callers
-// instantiate it by casting a slice of a window buffer:
+// fragment is a fixed-size view over the on-disk layout, instantiated by casting
+// a slice of a window buffer:
 //
 //	frag := (*fragment)(buf[pos : pos+totalFragSize])
-//
-// Header reads/writes, body fill, seal/open, and AAD/nonce construction all
-// live here so reader.go and writer.go can stay focused on streaming and
-// batching.
 type fragment [totalFragSize]byte
 
 func (f *fragment) fragNum() uint64       { return binary.BigEndian.Uint64(f[0:8]) }
@@ -88,11 +82,10 @@ func (f *fragment) ciphertext() []byte {
 	return f[fragHeaderSize:totalFragSize]
 }
 
-// seal writes size + flags into the header, zero-pads the body past size
-// (the ciphertext is fixed-length under GCM), then encrypts the body in
-// place under aead. shardNum and fragNum are read from the just-stamped
-// header.
+// seal stamps size and flags, then encrypts the body in place. shardNum and
+// fragNum come from the already-stamped header.
 func (f *fragment) seal(aead cipher.AEAD, objectHash [32]byte, shardIndex, storeID uint32, size uint32, flags fragFlags) {
+	// Zero the tail: the ciphertext is fixed-length under GCM regardless of size.
 	if size < fragBodySize {
 		clear(f[fragHeaderSize+size : fragHeaderSize+fragBodySize])
 	}
@@ -104,9 +97,9 @@ func (f *fragment) seal(aead cipher.AEAD, objectHash [32]byte, shardIndex, store
 	aead.Seal(f.body()[:0], nonce[:], f.body(), aad[:])
 }
 
-// open decrypts the body in place, verifies the GCM tag, validates the
-// header size field, and returns the plaintext slice (length == size).
-// shardNum/fragNum come from the on-disk header.
+// open decrypts and authenticates the body in place, returning the plaintext.
+// shardNum and fragNum come from the on-disk header, so tampering with them
+// fails the tag.
 func (f *fragment) open(aead cipher.AEAD, objectHash [32]byte, shardIndex, storeID uint32) ([]byte, error) {
 	aad := makeAAD(objectHash, shardIndex, f.shardNum(), f.fragNum())
 	nonce := makeNonce(f.fragNum(), storeID)
@@ -123,10 +116,9 @@ func (f *fragment) open(aead cipher.AEAD, objectHash [32]byte, shardIndex, store
 	return plaintext[:sz], nil
 }
 
-// makeNonce builds the 12-byte GCM nonce: BE(fragNum) || BE(storeID).
-// fragNum is monotonic per data dir (crash-safe via state.json high-water);
-// storeID is 4 random bytes generated on first Store.Open. Together they are
-// unique for the lifetime of the master key.
+// makeNonce builds the 12-byte GCM nonce as BE(fragNum) ‖ BE(storeID). fragNum
+// is monotonic per data dir and storeID is random per data dir, so the pair is
+// unique for the master key's lifetime — which GCM requires absolutely.
 func makeNonce(fragNum uint64, storeID uint32) [12]byte {
 	var nonce [12]byte
 	binary.BigEndian.PutUint64(nonce[0:8], fragNum)
@@ -134,10 +126,9 @@ func makeNonce(fragNum uint64, storeID uint32) [12]byte {
 	return nonce
 }
 
-// makeAAD binds each fragment to its logical position. A tampered fragment
-// header or a fragment spliced into a different shard / object / position
-// produces a different AAD at read time, and GCM Open fails. Returned by
-// value so it stays on the stack on the per-fragment hot path.
+// makeAAD binds a fragment to its logical position, so one spliced into a
+// different shard, object or offset fails to open. Returned by value to stay on
+// the stack on the per-fragment hot path.
 func makeAAD(objectHash [32]byte, shardIndex uint32, shardNum, fragNum uint64) [aadSize]byte {
 	var aad [aadSize]byte
 	copy(aad[0:32], objectHash[:])

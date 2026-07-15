@@ -22,41 +22,39 @@ import (
 
 const indexFilename = "db"
 
-// fragNumReservation is the size of each batched fragNum allocation written
-// durably to state.json. Append hands out fragNums freely below the persisted
-// high-water; only an allocation that crosses the high-water triggers an
-// fsync. Sized so a typical 100-fragment shard fsyncs roughly every 10k
-// Append calls. Tunable; not on-disk-format-critical.
+// fragNumReservation is how many fragNums one durable state.json reservation
+// covers; only an allocation that crosses the high-water costs an fsync. Sized
+// so a typical shard fsyncs about every 10k Appends. Tunable, and not
+// on-disk-format-critical.
 const fragNumReservation = 1 << 20 // 1 048 576
 
-// Store manages segment files and an index mapping shard keys to on-disk extents.
-// All public methods are safe for concurrent use. Segment files are pre-allocated
-// via Truncate and written lock-free with WriteAt; the mutex protects only metadata
-// (counters, segment cache, index commits).
-//
-// segCache is unbounded — entries accumulate as the store touches old
-// segments. Fine for the current single-data-dir scale; a long-lived store
-// reading from thousands of distinct segments will need an LRU.
+// Store manages segment files and an index mapping shard keys to on-disk
+// extents. All public methods are safe for concurrent use.
 type Store struct {
-	dir      string
-	index    *s3db.S3DB
-	segCache map[uint64]*segment
-	mutex    sync.Mutex
+	dir   string
+	index *s3db.S3DB
 
-	// At-rest encryption: aead is supplied by the caller via WithAEAD and
-	// shared (concurrency-safe per stdlib contract) across every shardWriter
-	// and shardReader. The store never sees raw key bytes — cipher construction
-	// lives at the layer that loads the key file. storeID is intrinsic per
-	// data dir, generated on first Open and bound into every nonce.
-	aead    cipher.AEAD
+	// Unbounded: entries accumulate as the store touches old segments. Fine at
+	// single-data-dir scale; thousands of distinct segments would want an LRU.
+	segCache map[uint64]*segment
+
+	// Guards metadata only — counters, segCache, index commits. Segment bytes
+	// are pre-allocated via Truncate and written lock-free through WriteAt.
+	mutex sync.Mutex
+
+	// Shared by every reader and writer; GCM permits concurrent Seal/Open.
+	aead cipher.AEAD
+
+	// Intrinsic to the data dir, generated on first Open and bound into every
+	// nonce.
 	storeID uint32
 
 	// Monotonic counters persisted to state.json across restarts.
-	// fragNumHighWater is the durably-reserved upper bound on fragNum; Append
-	// extends it (and fsyncs) only when an allocation would cross it.
-	segNum           uint64
-	shardNum         uint64
-	fragNum          uint64
+	segNum   uint64
+	shardNum uint64
+	fragNum  uint64
+
+	// The durably-reserved ceiling on fragNum; Append fsyncs only to raise it.
 	fragNumHighWater uint64
 
 	maxSegSize uint64
@@ -113,13 +111,9 @@ func WithCompaction(interval time.Duration) Option {
 	}
 }
 
-// WithAEAD configures the cipher.AEAD used to seal/open every fragment. The
-// AEAD is shared across all writers and readers; the stdlib's GCM guarantees
-// concurrent Seal/Open are safe. The store builds 12-byte nonces as
-// BE(fragNum) || BE(storeID), so the AEAD must report NonceSize() == 12.
-//
-// Cipher construction (and the raw key it consumes) live at the operator
-// layer — the store deliberately never sees key bytes.
+// WithAEAD sets the cipher sealing every fragment, and is mandatory. The nonce
+// layout fixes NonceSize at 12. Callers build the cipher themselves, so the
+// store never sees raw key bytes.
 func WithAEAD(aead cipher.AEAD) Option {
 	return func(s *Store) error {
 		if aead == nil {
@@ -133,13 +127,8 @@ func WithAEAD(aead cipher.AEAD) Option {
 	}
 }
 
-// Open recovers or creates a Store in dir. On startup it restores monotonic
-// counters from state.json (or generates a fresh storeID for a new data dir),
-// advances and durably persists the fragNum high-water reservation, opens the
-// index, then advances segNum past any full segments left over from a prior
-// crash so the first Append sees a writable segment.
-//
-// WithAEAD is mandatory — Open errors if no cipher was supplied.
+// Open recovers or creates a Store in dir, leaving it ready for the first
+// Append. WithAEAD is mandatory.
 func Open(dir string, opts ...Option) (store *Store, err error) {
 	store = &Store{
 		dir:                dir,
@@ -162,10 +151,9 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("load state: %w", err)
 	}
 
-	// Reserve a fresh high-water window. For fresh stores this also locks in
-	// the just-generated storeID before any fragment can be sealed under it.
-	// The save MUST be durable before Open returns — see plan §"first save of
-	// state.json".
+	// Reserve a fresh window durably before Open returns. On a new data dir this
+	// is also what locks in the generated storeID, before any fragment can be
+	// sealed under it.
 	store.fragNumHighWater = store.fragNum + fragNumReservation
 	if err := store.saveState(); err != nil {
 		return nil, fmt.Errorf("save state: %w", err)
@@ -237,11 +225,8 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (Reader, erro
 }
 
 // Append reserves space for a shard of the given logical size and returns a
-// writer. The segment file is pre-allocated (Truncated) to fit all fragments,
-// so subsequent WriteAt calls from the writer never extend the file. If the
-// current segment can't fit the shard, it is marked full and the store rolls
-// to the next segment. The index entry is committed only when the writer is
-// closed.
+// writer. The shard reaches the index only when that writer is closed, so an
+// overwrite keeps serving its previous data until then.
 func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (Writer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("negative size %d", size)
@@ -254,15 +239,12 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		return nil, ErrClosedStore
 	}
 
-	// Ceiling division: number of fragments needed to hold size logical bytes.
-	// size == 0 yields fragCount == 0; the writer's ReadFrom loop never runs
-	// and Close commits an empty-extent index entry.
+	// Ceiling division; size == 0 yields an empty extent the writer never fills.
 	fragCount := (uint64(size) + fragBodySize - 1) / fragBodySize
 
-	// Reserve fragNums durably before handing them out. We must fsync before
-	// any fragment can be sealed under (storeID, fragNum) — otherwise a crash
-	// after the writer returns could rewind fragNum on restart and cause
-	// catastrophic GCM nonce reuse.
+	// fragNums must be durable before they are handed out. A crash that rewound
+	// fragNum would reissue a nonce under the same key, which breaks GCM
+	// catastrophically, so this fsync is not optional.
 	if store.fragNum+fragCount > store.fragNumHighWater {
 		for store.fragNumHighWater < store.fragNum+fragCount {
 			store.fragNumHighWater += fragNumReservation
@@ -329,9 +311,7 @@ func (store *Store) reserveExtent(fragCount uint64) (*segment, int64, error) {
 	newSegSize := uint64(segSize) + fragCount*totalFragSize //nolint:gosec // segSize from os.File.Stat().Size() is always non-negative.
 
 	if newSegSize >= store.maxSegSize {
-		// Mark full once we've decided this is the last shard for this segment.
-		// markFull failure is non-fatal: next Append re-reads the on-disk flag
-		// (cache stays as-is here too), so we'll retry the mark naturally.
+		// Non-fatal: the next Append re-reads the on-disk flag and retries the mark.
 		if err := seg.markFull(); err != nil {
 			slog.Warn("failed to mark segment full",
 				"segNum", store.segNum,
@@ -340,9 +320,8 @@ func (store *Store) reserveExtent(fragCount uint64) (*segment, int64, error) {
 		}
 	}
 
-	// Roll if this shard would overflow the segment, unless the segment is
-	// fresh (header-only) — then we let one oversized shard through so a
-	// pathological size still makes forward progress.
+	// Roll if the shard would overflow, unless the segment is fresh: one
+	// oversized shard is let through so a pathological size still makes progress.
 	if newSegSize > store.maxSegSize && segSize != segHeaderSize {
 		seg, err = store.rollSegment()
 		if err != nil {
@@ -363,16 +342,9 @@ func (store *Store) reserveExtent(fragCount uint64) (*segment, int64, error) {
 	return seg, off, nil
 }
 
-// commitExtent persists a shard's extent to the index. Called by writers from
-// Close once the data is durable. Concurrency-safe via badger; no Store-level
-// lock needed.
-//
-// An overwrite supersedes whatever extent the key already held, so the old slot
-// becomes dead space. Its tombstone is written in the same transaction that
-// repoints the key — the commit is the instant the supersession happens, so the
-// dead-space hint can neither precede nor outlive it. Without this the orphaned
-// bytes stay invisible to compaction's selector and mask their segment from
-// candidacy forever.
+// commitExtent points a shard's key at ext, tombstoning any extent it
+// supersedes. Called from writer.Close once the data is durable; takes no
+// store.mutex.
 func (store *Store) commitExtent(objectHash [32]byte, shardIndex uint32, ext extent) error {
 	key := MakeShardKey(objectHash, shardIndex)
 
@@ -380,11 +352,13 @@ func (store *Store) commitExtent(objectHash [32]byte, shardIndex uint32, ext ext
 		err := store.index.Badger.Update(func(txn *badger.Txn) error {
 			old, err := readExtent(txn, key)
 			switch {
-			// A first write has nothing to supersede.
+			// A first write supersedes nothing.
 			case errors.Is(err, badger.ErrKeyNotFound):
 			case err != nil:
 				return err
 			default:
+				// The old extent dies at this commit and nowhere else, so its hint
+				// rides the same txn and can neither precede nor outlive it.
 				if err := txn.Set(tombstoneKey(old.SegNum, old.Off), tombstoneValue(old.PSize)); err != nil {
 					return fmt.Errorf("put tombstone: %w", err)
 				}
@@ -393,8 +367,8 @@ func (store *Store) commitExtent(objectHash [32]byte, shardIndex uint32, ext ext
 			return txn.Set(key, ext.encode())
 		})
 
-		// Reading the key before writing it puts this txn under badger's conflict
-		// detection: a compactor relocating the same key races us here.
+		// The read above puts this txn under badger's conflict detection, which a
+		// compactor relocating the same key trips.
 		if errors.Is(err, badger.ErrConflict) {
 			continue
 		}
@@ -423,14 +397,10 @@ func readExtent(txn *badger.Txn, key []byte) (extent, error) {
 	return ext, nil
 }
 
-// Delete removes the index entry for a shard in a single index transaction:
-// read the current extent, write a slot-keyed tombstone for compaction's
-// selector, then delete the live key. Tombstone and deletion commit together,
-// so the dead-space hint can never outlive or precede the deletion it records.
-// The on-disk extent becomes dead space reclaimable by the compactor.
-// Delete tombstones the extent for the given shard and removes its index entry.
-// The bool reports whether an extent existed and was removed; a missing shard is
-// not an error and returns (false, nil), keeping deletes idempotent.
+// Delete removes a shard's index entry and tombstones its extent, in one
+// transaction so the dead-space hint cannot outlive or precede the deletion.
+// Reports whether an extent existed; a missing shard is not an error, which
+// keeps deletes idempotent.
 func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) (bool, error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
@@ -477,9 +447,8 @@ func (store *Store) Close() error {
 	c := store.compactor
 	store.mutex.Unlock()
 
-	// Stop the compactor without holding the mutex: an in-flight cycle takes
-	// store.mutex, so joining under the lock would deadlock. closed is already
-	// set, so no new public mutation slips in behind the join.
+	// Join without the mutex: an in-flight cycle takes it, so joining under the
+	// lock would deadlock. closed is already set, so nothing new slips in behind.
 	if c != nil {
 		c.stop()
 	}
@@ -508,11 +477,11 @@ func (store *Store) Close() error {
 	return errors.Join(errs...)
 }
 
-// Slot-keyed tombstones live in the index under the tombstonePrefix namespace:
-// Delete writes d ‖ BE(segNum) ‖ BE(off) → BE(PSize) for the extent it removes.
-// They are a candidate-selection accelerator for compaction only — never
-// consulted for correctness. Keyed by physical slot so the same object key
-// dying more than once stays unique.
+// Tombstones record a dead extent as d ‖ BE(segNum) ‖ BE(off) → BE(PSize). They
+// only accelerate compaction's candidate selection and are never consulted for
+// correctness. Keying by physical slot rather than object key is what lets one
+// key die repeatedly: on delete, on overwrite, and on a relocation that lost
+// its race.
 const tombstonePrefix = 'd'
 
 const tombstoneKeySize = 17 // prefix(1) ‖ segNum(8) ‖ off(8)

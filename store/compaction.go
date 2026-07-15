@@ -154,10 +154,8 @@ type segmentStats struct {
 	bytes   int64
 }
 
-// compactSegment relocates every live extent the segment holds into the active
-// append segment, then drops the drained segment and clears its tombstones. An
-// extent enumerated from .idx is live only if the index still points at this
-// exact slot; anything deleted or superseded is skipped.
+// compactSegment relocates a segment's live extents into the active append
+// segment, then drops it and clears its tombstones.
 func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 	var stats segmentStats
 
@@ -179,6 +177,8 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 		if err != nil {
 			return stats, fmt.Errorf("decode extent: %w", err)
 		}
+		// A .idx row is only live if the index still points at this exact slot;
+		// anything deleted or superseded is already dead.
 		if cur.SegNum != num || cur.Off != e.Off {
 			continue
 		}
@@ -199,15 +199,9 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 	return stats, store.deleteTombstones(num)
 }
 
-// relocateExtent copies an extent's raw fragment bytes verbatim into a freshly
-// reserved slot in the active append segment, then compare-and-swaps the index
-// onto the new slot. Verbatim is load-bearing: fragNum rides along inside the
-// copied bytes, so the GCM nonce is preserved and never reused.
-//
-// The copy runs without store.mutex so it never stalls the write path, which
-// leaves room for a concurrent overwrite or delete of the same key to land
-// first and win the slot. The swap resolves that race and accounts for the
-// copy either way.
+// relocateExtent moves an extent into the active append segment and repoints
+// the index at it, unless a concurrent overwrite or delete of the same key gets
+// there first.
 func (store *Store) relocateExtent(key []byte, old extent) error {
 	fragCount := uint64(old.PSize / totalFragSize) //nolint:gosec // PSize is a non-negative multiple of totalFragSize.
 
@@ -234,11 +228,15 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 		store.mutex.Unlock()
 		return fmt.Errorf("append destination idx: %w", err)
 	}
+	// Copy without the mutex so compaction never stalls the write path. This is
+	// the window a racing overwrite or delete lands in.
 	store.mutex.Unlock()
 
 	defer srcSeg.releaseRef()
 	defer dstSeg.releaseRef()
 
+	// Verbatim is load-bearing: fragNum rides inside the copied bytes, so the
+	// nonce moves with them and is never reissued.
 	if err := copyExtent(srcSeg, old.Off, dstSeg, dstOff, old.PSize); err != nil {
 		return fmt.Errorf("copy extent bytes: %w", err)
 	}
@@ -249,12 +247,7 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 		return fmt.Errorf("sync destination idx: %w", err)
 	}
 
-	// Swap the index onto the new slot, but only if the key still points at the
-	// one we copied from — an overwrite or delete may have landed while we copied
-	// without the mutex. Losing that race strands the copy: only this swap could
-	// ever have referenced it, and slots are never reissued, so it is dead the
-	// moment the swap fails. Tombstone it in the same transaction, or those bytes
-	// pad their segment's live count and mask it from a later compaction.
+	// Swap onto the new slot only if the key still holds the one we copied from.
 	for {
 		err := store.index.Badger.Update(func(txn *badger.Txn) error {
 			stale := false
@@ -272,14 +265,17 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 				stale = !bytes.Equal(cur, old.encode())
 			}
 
+			// Losing the race strands the copy for good — only this swap could have
+			// referenced it, and slots are never reissued — so tombstone it here
+			// rather than let it pad its segment's live count.
 			if stale {
 				return txn.Set(tombstoneKey(newExt.SegNum, newExt.Off), tombstoneValue(newExt.PSize))
 			}
 			return txn.Set(key, newExt.encode())
 		})
 
-		// Reading the key before writing it puts this txn under badger's conflict
-		// detection, which a concurrent commit on the same key trips.
+		// The read above puts this txn under badger's conflict detection, which a
+		// concurrent commit on the same key trips.
 		if errors.Is(err, badger.ErrConflict) {
 			continue
 		}
