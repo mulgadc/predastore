@@ -250,7 +250,7 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 	// Swap onto the new slot only if the key still holds the one we copied from.
 	for {
 		err := store.index.Badger.Update(func(txn *badger.Txn) error {
-			stale := false
+			var stale bool
 			item, err := txn.Get(key)
 			switch {
 			case errors.Is(err, badger.ErrKeyNotFound):
