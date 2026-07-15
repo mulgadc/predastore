@@ -125,8 +125,8 @@ linters:
         - ".*"
 
     testifylint:
-      enable-all: true
       disable:
+        - encoded-compare # misidentifies non-JSON strings when identifiers contain "JSON"
         - float-compare # false positives
         - require-error # assert-on-error is deliberate where a test continues to collect further failures
 
