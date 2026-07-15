@@ -71,23 +71,8 @@ func (qs *QuicServer) handleGET(bw *bufio.Writer, req quicproto.Header, objectRe
 		src = io.NewSectionReader(reader, 0, totalSize)
 	}
 
-	bytesWritten, err := io.Copy(bw, src)
-	if err != nil {
+	if _, err := io.Copy(bw, src); err != nil {
 		slog.Error("handleGET: streaming failed", "error", err)
 		return
-	}
-
-	if isRangeRequest {
-		slog.Debug("handleGET: range request completed",
-			"bucket", objectRequest.Bucket,
-			"object", objectRequest.Object,
-			"rangeStart", rangeStart,
-			"rangeEnd", rangeEnd,
-			"bytesWritten", bytesWritten)
-	} else {
-		slog.Debug("handleGET: completed",
-			"bucket", objectRequest.Bucket,
-			"object", objectRequest.Object,
-			"bytes", bytesWritten)
 	}
 }

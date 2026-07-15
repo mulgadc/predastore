@@ -78,18 +78,6 @@ func (b *Backend) handleRangeRequest(ctx context.Context, req *backend.GetObject
 		endShardIdx = b.rsDataShard - 1
 	}
 
-	slog.Debug("Range request",
-		"bucket", req.Bucket,
-		"key", req.Key,
-		"start", start,
-		"end", end,
-		"totalSize", totalSize,
-		"shardSize", shardSize,
-		"startShard", startShardIdx,
-		"endShard", endShardIdx,
-		"rsDataShard", b.rsDataShard,
-	)
-
 	// Optimization: if range is within a single shard, fetch just that shard portion
 	if startShardIdx == endShardIdx {
 		data, err := b.readRangeFromSingleShard(ctx, req.Bucket, req.Key, shards, startShardIdx, start, end, shardSize, totalSize)
@@ -140,13 +128,6 @@ func (b *Backend) readRangeFromSingleShard(ctx context.Context, bucket, key stri
 	if endInShard >= actualShardSize {
 		endInShard = actualShardSize - 1
 	}
-
-	slog.Debug("Reading from single shard",
-		"shardIdx", shardIdx,
-		"offsetInShard", offsetInShard,
-		"endInShard", endInShard,
-		"actualShardSize", actualShardSize,
-	)
 
 	// Request the specific range from the shard via QUIC
 	nodeNum := int(shards.DataShardNodes[shardIdx])

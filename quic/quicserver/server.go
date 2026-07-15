@@ -314,9 +314,8 @@ func (qs *QuicServer) serveConn(conn *quic.Conn) {
 }
 
 func (qs *QuicServer) handleStream(s *quic.Stream) {
-	activeCount := qs.activeStreams.Add(1)
+	qs.activeStreams.Add(1)
 	streamID := s.StreamID()
-	slog.Debug("handleStream: started", "streamID", streamID, "activeStreams", activeCount)
 
 	defer func() {
 		// Close both sides of the stream to fully release it.
@@ -328,13 +327,8 @@ func (qs *QuicServer) handleStream(s *quic.Stream) {
 		if err := s.Close(); err != nil {
 			slog.Debug("handleStream: close error", "streamID", streamID, "error", err)
 		}
-		finalCount := qs.activeStreams.Add(-1)
-		slog.Debug("handleStream: closed", "streamID", streamID, "activeStreams", finalCount)
+		qs.activeStreams.Add(-1)
 	}()
-
-	if activeCount%100 == 0 || activeCount > 50 {
-		slog.Debug("handleStream: active streams high", "count", activeCount, "streamID", streamID)
-	}
 
 	br := bufio.NewReaderSize(s, 128*1024)
 	bw := bufio.NewWriterSize(s, 128*1024)

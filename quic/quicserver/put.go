@@ -14,13 +14,6 @@ import (
 // Append reserves slots under a short lock, then the caller streams directly
 // from the QUIC stream lock-free — no pre-buffer needed.
 func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req quicproto.Header, putReq PutRequest) {
-	slog.Debug("handlePUTShard: starting",
-		"bucket", putReq.Bucket,
-		"shardIndex", putReq.ShardIndex,
-		"shardSize", putReq.ShardSize,
-		"bodyLen", req.BodyLen,
-	)
-
 	// Determine how many bytes to read
 	var bodyLen int64
 	if req.BodyLen > 0 {
@@ -51,13 +44,6 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		return
 	}
 
-	slog.Debug("handlePUTShard: stored shard",
-		"bucket", putReq.Bucket,
-		"object", putReq.Object,
-		"shardIndex", putReq.ShardIndex,
-		"size", bodyLen,
-	)
-
 	response := PutResponse{ShardSize: bodyLen}
 	respBytes, err := json.Marshal(response)
 	if err != nil {
@@ -86,9 +72,4 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		slog.Error("handlePUTShard: flush failed", "error", err)
 		return
 	}
-
-	slog.Debug("handlePUTShard: response sent",
-		"bucket", putReq.Bucket,
-		"shardIndex", putReq.ShardIndex,
-	)
 }

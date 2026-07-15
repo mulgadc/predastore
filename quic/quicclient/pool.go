@@ -90,9 +90,7 @@ func (p *Pool) Get(ctx context.Context, addr string) (*Client, error) {
 			// Connection exists and is still open
 			pc.lastUsed = time.Now()
 			pc.useCount++
-			useCount := pc.useCount
 			pc.mu.Unlock()
-			slog.Debug("Pool.Get: reusing connection", "addr", addr, "useCount", useCount)
 			return pc.client, nil
 		}
 		pc.mu.Unlock()

@@ -19,8 +19,6 @@ const arnObjectPrefixPut = "arn:aws:s3:::"
 
 // PutObject stores an object using Reed-Solomon encoding across multiple nodes
 func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) (*backend.PutObjectResponse, error) {
-	slog.Debug("distributed.PutObject: starting", "bucket", req.Bucket, "key", req.Key)
-
 	if req.Bucket == "" {
 		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
 	}
@@ -54,7 +52,6 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 		if req.IsChunked && req.ContentEncoding == "aws-chunked" {
 			reader = chunked.NewDecoder(req.Body, req.DecodedLength)
 		}
-		slog.Debug("distributed.PutObject: copying body to temp file")
 		_, err = io.Copy(tmpFile, reader)
 		if err != nil {
 			slog.Error("distributed.PutObject: copy to temp file failed", "error", err)
@@ -64,7 +61,6 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	if closeErr := tmpFile.Close(); closeErr != nil {
 		slog.Debug("Failed to close temp file", "path", tmpFile.Name(), "error", closeErr)
 	}
-	slog.Debug("distributed.PutObject: temp file created", "path", tmpFile.Name())
 
 	var size int64
 	size, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
@@ -72,7 +68,6 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 		slog.Error("distributed.PutObject: shard distribution failed", "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
-	slog.Debug("distributed.PutObject: shards distributed", "size", size)
 
 	objectToShardNodes.Size = size
 
