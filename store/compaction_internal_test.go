@@ -211,6 +211,144 @@ func TestCandidateSelectionNeverSelectsActiveSegment(t *testing.T) {
 	}
 }
 
+// tombstones reads the whole slot-keyed tombstone namespace, mapping each
+// dead slot to the byte count it records.
+func tombstones(t *testing.T, st *Store) map[slot]int64 {
+	t.Helper()
+	found := map[slot]int64{}
+	err := st.index.Scan([]byte{tombstonePrefix}, func(k, v []byte) error {
+		s := slot{segNum: tombstoneSegNum(k), off: int64(binary.BigEndian.Uint64(k[9:17]))}
+		found[s] = int64(binary.BigEndian.Uint64(v))
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan tombstones: %v", err)
+	}
+	return found
+}
+
+type slot struct {
+	segNum uint64
+	off    int64
+}
+
+func slotOf(ext extent) slot { return slot{segNum: ext.SegNum, off: ext.Off} }
+
+// An overwrite supersedes the key's previous extent, so those bytes are dead
+// the moment the new one commits and must carry a tombstone. The live slot
+// must not.
+func TestOverwriteTombstonesSupersededExtent(t *testing.T) {
+	st, _ := openTestStore(t, WithMaxSegSize(1*MiB))
+	oh := [32]byte{0x11}
+
+	putShard(t, st, oh, 0, bytes.Repeat([]byte{0xaa}, 12*KiB))
+	old := extentOf(t, st, oh, 0)
+
+	putShard(t, st, oh, 0, bytes.Repeat([]byte{0xbb}, 12*KiB))
+	cur := extentOf(t, st, oh, 0)
+
+	if slotOf(cur) == slotOf(old) {
+		t.Fatalf("overwrite reused slot %v; test cannot distinguish live from dead", slotOf(old))
+	}
+
+	found := tombstones(t, st)
+	if got, ok := found[slotOf(old)]; !ok {
+		t.Fatalf("superseded slot %v has no tombstone; it is invisible to compaction", slotOf(old))
+	} else if got != old.PSize {
+		t.Fatalf("tombstone for %v records %d bytes, want PSize %d", slotOf(old), got, old.PSize)
+	}
+	if _, ok := found[slotOf(cur)]; ok {
+		t.Fatalf("live slot %v was tombstoned", slotOf(cur))
+	}
+}
+
+// A first write supersedes nothing, so it must leave the tombstone namespace
+// untouched — a spurious tombstone would understate a segment's live bytes.
+func TestFirstWriteLeavesNoTombstone(t *testing.T) {
+	st, _ := openTestStore(t, WithMaxSegSize(1*MiB))
+	oh := [32]byte{0x22}
+
+	putShard(t, st, oh, 0, bytes.Repeat([]byte{0xcc}, 12*KiB))
+
+	if found := tombstones(t, st); len(found) != 0 {
+		t.Fatalf("first write produced %d tombstone(s): %v", len(found), found)
+	}
+}
+
+// Append only reserves space; the old extent stays live and readable until the
+// writer commits. The tombstone must land at commit and not one moment sooner,
+// or an abandoned write would permanently mark still-live bytes dead.
+func TestTombstoneLandsAtCommitNotAppend(t *testing.T) {
+	st, _ := openTestStore(t, WithMaxSegSize(1*MiB))
+	oh := [32]byte{0x33}
+	body := bytes.Repeat([]byte{0xdd}, 12*KiB)
+
+	putShard(t, st, oh, 0, body)
+	old := extentOf(t, st, oh, 0)
+
+	// Reserve and fill an overwrite, but hold it short of Close.
+	w, err := st.Append(oh, 0, int64(len(body)))
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if _, err := w.Write(bytes.Repeat([]byte{0xee}, 12*KiB)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	if found := tombstones(t, st); len(found) != 0 {
+		t.Fatalf("uncommitted append produced %d tombstone(s): %v", len(found), found)
+	}
+	if got := extentOf(t, st, oh, 0); slotOf(got) != slotOf(old) {
+		t.Fatalf("uncommitted append moved the index off %v to %v", slotOf(old), slotOf(got))
+	}
+	if got := readShard(t, st, oh, 0); !bytes.Equal(got, body) {
+		t.Fatalf("uncommitted append changed the readable body")
+	}
+
+	// Committing is what supersedes the old extent — and it also releases the
+	// segment ref Append took, which store.Close waits on.
+	if err := w.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+	if _, ok := tombstones(t, st)[slotOf(old)]; !ok {
+		t.Fatalf("commit did not tombstone superseded slot %v", slotOf(old))
+	}
+}
+
+// The reclaim path this bug is about: a segment emptied purely by overwrite
+// churn (no Delete) must become a candidate and drain. Before the fix its dead
+// bytes carried no tombstone, so it read as fully live and was never selected.
+func TestOverwriteChurnDrainsSegment(t *testing.T) {
+	st, dir, oh := segment0LayoutStore(t)
+	body := bytes.Repeat([]byte{0x99}, 12*KiB)
+
+	// Shards 0 and 1 fill segment 0; rewriting both relocates them and leaves
+	// segment 0 entirely dead.
+	putShard(t, st, oh, 0, body)
+	putShard(t, st, oh, 1, body)
+
+	cands, err := st.candidateSegments()
+	if err != nil {
+		t.Fatalf("candidates: %v", err)
+	}
+	if len(cands) != 1 || cands[0] != 0 {
+		t.Fatalf("expected overwrite-dead segment 0 as sole candidate, got %v", cands)
+	}
+
+	if err := st.compactOnce(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf(segFilename, uint64(0)))); !os.IsNotExist(err) {
+		t.Fatalf("drained segment 0 still on disk: %v", err)
+	}
+	for _, idx := range []uint32{0, 1} {
+		if got := readShard(t, st, oh, idx); !bytes.Equal(got, body) {
+			t.Fatalf("shard %d body wrong after overwrite churn + compaction", idx)
+		}
+	}
+}
+
 // Every index-committed extent must already be enumerable from its segment's
 // .idx, or a drop could lose a live extent. Assert the back-check slot for each
 // live shard appears in scanIdx of its segment.
