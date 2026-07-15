@@ -44,7 +44,7 @@ type Header struct {
 	BodyLen uint64 // optional, 0 means "stream until EOF" or "no body"
 }
 
-// Fixed header size: 1+1+2+2+2 +8+4+4+8 = 32 bytes
+// Fixed header size: 1+1+2+2+2 +8+4+4+8 = 32 bytes.
 const headerSize = 32
 
 func WriteHeader(w io.Writer, h Header) error {

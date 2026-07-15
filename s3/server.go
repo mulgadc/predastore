@@ -22,15 +22,15 @@ import (
 	"github.com/mulgadc/predastore/s3db"
 )
 
-// BackendType specifies the storage backend type
+// BackendType specifies the storage backend type.
 type BackendType string
 
 const (
-	// BackendDistributed uses distributed storage with erasure coding
+	// BackendDistributed uses distributed storage with erasure coding.
 	BackendDistributed BackendType = "distributed"
 )
 
-// Server encapsulates the S3-compatible server with all its components
+// Server encapsulates the S3-compatible server with all its components.
 type Server struct {
 	// Configuration
 	configPath        string
@@ -64,7 +64,7 @@ type Server struct {
 	dbFailed chan error // signals when an embedded DB goroutine crashes
 }
 
-// Option configures a Server
+// Option configures a Server.
 type Option func(*Server) error
 
 // NewServer creates a new S3 server with the given options.
@@ -93,7 +93,7 @@ func NewServer(opts ...Option) (*Server, error) {
 	return s, nil
 }
 
-// WithConfigPath sets the path to the TOML configuration file
+// WithConfigPath sets the path to the TOML configuration file.
 func WithConfigPath(path string) Option {
 	return func(s *Server) error {
 		s.configPath = path
@@ -101,7 +101,7 @@ func WithConfigPath(path string) Option {
 	}
 }
 
-// WithAddress sets the server host and port
+// WithAddress sets the server host and port.
 func WithAddress(host string, port int) Option {
 	return func(s *Server) error {
 		s.host = host
@@ -110,7 +110,7 @@ func WithAddress(host string, port int) Option {
 	}
 }
 
-// WithTLS sets the TLS certificate and key paths
+// WithTLS sets the TLS certificate and key paths.
 func WithTLS(certPath, keyPath string) Option {
 	return func(s *Server) error {
 		s.tlsCert = certPath
@@ -119,7 +119,7 @@ func WithTLS(certPath, keyPath string) Option {
 	}
 }
 
-// WithBasePath sets the base directory for data storage
+// WithBasePath sets the base directory for data storage.
 func WithBasePath(path string) Option {
 	return func(s *Server) error {
 		s.basePath = path
@@ -127,7 +127,7 @@ func WithBasePath(path string) Option {
 	}
 }
 
-// WithDebug enables debug logging
+// WithDebug enables debug logging.
 func WithDebug(enabled bool) Option {
 	return func(s *Server) error {
 		s.debug = enabled
@@ -174,7 +174,7 @@ func WithEncryptionKeyFile(path string) Option {
 
 // WithPprof enables CPU profiling.
 // The profile is written to a temp file during operation and saved to outputPath on shutdown.
-// If outputPath is empty, it defaults to /tmp/predastore-cpu.prof
+// If outputPath is empty, it defaults to /tmp/predastore-cpu.prof.
 func WithPprof(enabled bool, outputPath string) Option {
 	return func(s *Server) error {
 		s.pprofEnabled = enabled
@@ -186,7 +186,7 @@ func WithPprof(enabled bool, outputPath string) Option {
 	}
 }
 
-// init initializes the server components
+// init initializes the server components.
 func (s *Server) init() error {
 	// Check environment variable for pprof if not already enabled
 	if !s.pprofEnabled && os.Getenv("PPROF_ENABLED") == "1" {
@@ -282,7 +282,7 @@ func (s *Server) init() error {
 	return nil
 }
 
-// initDistributedBackend initializes the distributed storage backend with DB and QUIC servers
+// initDistributedBackend initializes the distributed storage backend with DB and QUIC servers.
 func (s *Server) initDistributedBackend() error {
 	// Launch DB servers first (required for distributed state)
 	hasDBNodes := len(s.config.DB) > 0
@@ -311,7 +311,7 @@ func (s *Server) initDistributedBackend() error {
 	return nil
 }
 
-// launchDBServers starts the distributed database servers from config
+// launchDBServers starts the distributed database servers from config.
 func (s *Server) launchDBServers() []*s3db.Server {
 	var servers []*s3db.Server
 
@@ -428,7 +428,7 @@ func (s *Server) launchDBServers() []*s3db.Server {
 	return servers
 }
 
-// launchDefaultDB creates a default embedded database when no [[db]] is configured
+// launchDefaultDB creates a default embedded database when no [[db]] is configured.
 func (s *Server) launchDefaultDB() []*s3db.Server {
 	slog.Info("No [[db]] configuration found, launching default embedded database")
 
@@ -500,7 +500,7 @@ func (s *Server) launchDefaultDB() []*s3db.Server {
 	return []*s3db.Server{server}
 }
 
-// waitForDBLeader waits for leader election in the DB cluster
+// waitForDBLeader waits for leader election in the DB cluster.
 func (s *Server) waitForDBLeader() {
 	if len(s.dbServers) == 0 {
 		return
@@ -521,7 +521,7 @@ func (s *Server) waitForDBLeader() {
 	slog.Warn("No leader elected within timeout, continuing anyway")
 }
 
-// createDistributedBackend creates a distributed storage backend
+// createDistributedBackend creates a distributed storage backend.
 func (s *Server) createDistributedBackend() (backend.Backend, error) {
 	nodes := make([]distributed.NodeConfig, len(s.config.Nodes))
 	for i, n := range s.config.Nodes {
@@ -628,7 +628,7 @@ func (s *Server) createDistributedBackend() (backend.Backend, error) {
 	return be, nil
 }
 
-// launchQUICServers starts QUIC servers for shard storage
+// launchQUICServers starts QUIC servers for shard storage.
 func (s *Server) launchQUICServers() {
 	if len(s.config.Nodes) == 0 {
 		slog.Warn("No nodes configured, skipping QUIC server launch")
@@ -717,7 +717,7 @@ func (s *Server) initCredentialProvider() (CredentialProvider, error) {
 	return NewChainProvider(natsProv, configProv), nil
 }
 
-// ListenAndServe starts the server and blocks until shutdown
+// ListenAndServe starts the server and blocks until shutdown.
 func (s *Server) ListenAndServe() error {
 	s.mu.Lock()
 	if s.running {
@@ -738,7 +738,7 @@ func (s *Server) ListenAndServe() error {
 	return s.server.ListenAndServe(addr, s.tlsCert, s.tlsKey)
 }
 
-// ListenAndServeAsync starts the server in a goroutine
+// ListenAndServeAsync starts the server in a goroutine.
 func (s *Server) ListenAndServeAsync() error {
 	s.mu.Lock()
 	if s.running {
@@ -765,7 +765,7 @@ func (s *Server) ListenAndServeAsync() error {
 	return nil
 }
 
-// startProfiling starts CPU profiling to a temp file
+// startProfiling starts CPU profiling to a temp file.
 func (s *Server) startProfiling() error {
 	// Create temp file for profiling
 	tmpFile, err := os.CreateTemp("", "predastore-cpu-*.prof.tmp")
@@ -788,7 +788,7 @@ func (s *Server) startProfiling() error {
 	return nil
 }
 
-// stopProfiling stops CPU profiling and saves the profile to the output path
+// stopProfiling stops CPU profiling and saves the profile to the output path.
 func (s *Server) stopProfiling() error {
 	if s.pprofFile == nil {
 		return nil
@@ -815,7 +815,7 @@ func (s *Server) stopProfiling() error {
 	return nil
 }
 
-// copyFile copies a file from src to dst
+// copyFile copies a file from src to dst.
 func copyFile(src, dst string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -840,7 +840,7 @@ func copyFile(src, dst string) error {
 	return dstFile.Sync()
 }
 
-// Shutdown gracefully shuts down the server
+// Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -964,7 +964,7 @@ func allHostsSame(nodes []Nodes) bool {
 	return true
 }
 
-// Base directory checks
+// Base directory checks.
 func checkBaseDir(baseDir, path string) (newpath string) {
 	if path == "" {
 		return ""

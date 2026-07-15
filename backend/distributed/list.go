@@ -11,15 +11,15 @@ import (
 	"github.com/mulgadc/predastore/backend"
 )
 
-// ARN key format constants
+// ARN key format constants.
 const (
 	// Bucket ARN format: arn:aws:s3::<account_id>:<bucket_name>
-	// Object ARN format: arn:aws:s3:::<bucket_name>/<key>
+	// Object ARN format: arn:aws:s3:::<bucket_name>/<key>.
 	arnBucketPrefix = "arn:aws:s3::"
 	arnObjectPrefix = "arn:aws:s3:::"
 )
 
-// ListBuckets returns a list of buckets from s3db filtered by account
+// ListBuckets returns a list of buckets from s3db filtered by account.
 func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.ListBucketsResponse, error) {
 	bucketMap := make(map[string]backend.BucketInfo)
 
@@ -72,7 +72,7 @@ func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.L
 }
 
 // ListObjects returns a list of objects in a bucket by scanning global state
-// Objects are stored with ARN key format: arn:aws:s3:::<bucket>/<key>
+// Objects are stored with ARN key format: arn:aws:s3:::<bucket>/<key>.
 func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsRequest) (*backend.ListObjectsResponse, error) {
 	if req.Bucket == "" {
 		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)

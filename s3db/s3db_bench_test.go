@@ -30,7 +30,7 @@ import (
 	"time"
 )
 
-// benchFixture holds pre-populated test data
+// benchFixture holds pre-populated test data.
 type benchFixture struct {
 	db       *S3DB
 	tmpDir   string
@@ -38,7 +38,7 @@ type benchFixture struct {
 	buckets  map[string][]string // account -> bucket names
 }
 
-// setupFixture creates and populates a test database
+// setupFixture creates and populates a test database.
 func setupFixture(b *testing.B) *benchFixture {
 	b.Helper()
 
@@ -109,14 +109,14 @@ func setupFixture(b *testing.B) *benchFixture {
 	return fixture
 }
 
-// teardownFixture cleans up test resources
+// teardownFixture cleans up test resources.
 func (f *benchFixture) teardown() {
 	if f.db != nil {
 		f.db.Close()
 	}
 }
 
-// generateObjectKey creates realistic S3 object keys with various patterns
+// generateObjectKey creates realistic S3 object keys with various patterns.
 func generateObjectKey(bucketName string, fileIdx int, totalFiles int) string {
 	switch bucketName {
 	case "images":
@@ -154,7 +154,7 @@ func generateObjectKey(bucketName string, fileIdx int, totalFiles int) string {
 	}
 }
 
-// BenchmarkInsert tests insert performance
+// BenchmarkInsert tests insert performance.
 func BenchmarkInsert(b *testing.B) {
 	tmpDir := b.TempDir()
 
@@ -197,7 +197,7 @@ func BenchmarkInsert(b *testing.B) {
 	}
 }
 
-// BenchmarkPrefixScan tests prefix scan performance with various scenarios
+// BenchmarkPrefixScan tests prefix scan performance with various scenarios.
 func BenchmarkPrefixScan(b *testing.B) {
 	fixture := setupFixture(b)
 	defer fixture.teardown()
@@ -261,7 +261,7 @@ func BenchmarkPrefixScan(b *testing.B) {
 	}
 }
 
-// BenchmarkPrefixScanByResultSize tests prefix scans categorized by result set size
+// BenchmarkPrefixScanByResultSize tests prefix scans categorized by result set size.
 func BenchmarkPrefixScanByResultSize(b *testing.B) {
 	fixture := setupFixture(b)
 	defer fixture.teardown()
@@ -317,7 +317,7 @@ func BenchmarkPrefixScanByResultSize(b *testing.B) {
 	}
 }
 
-// BenchmarkGet tests point lookup performance
+// BenchmarkGet tests point lookup performance.
 func BenchmarkGet(b *testing.B) {
 	fixture := setupFixture(b)
 	defer fixture.teardown()
@@ -351,7 +351,7 @@ func BenchmarkGet(b *testing.B) {
 	}
 }
 
-// BenchmarkMixedWorkload tests a mixed read/write workload
+// BenchmarkMixedWorkload tests a mixed read/write workload.
 func BenchmarkMixedWorkload(b *testing.B) {
 	fixture := setupFixture(b)
 	defer fixture.teardown()
@@ -399,7 +399,7 @@ func BenchmarkMixedWorkload(b *testing.B) {
 	}
 }
 
-// BenchmarkConcurrentPrefixScan tests concurrent prefix scanning
+// BenchmarkConcurrentPrefixScan tests concurrent prefix scanning.
 func BenchmarkConcurrentPrefixScan(b *testing.B) {
 	fixture := setupFixture(b)
 	defer fixture.teardown()
@@ -420,7 +420,7 @@ func BenchmarkConcurrentPrefixScan(b *testing.B) {
 	})
 }
 
-// BenchmarkPrefixDepth tests how prefix depth affects performance
+// BenchmarkPrefixDepth tests how prefix depth affects performance.
 func BenchmarkPrefixDepth(b *testing.B) {
 	fixture := setupFixture(b)
 	defer fixture.teardown()
@@ -466,7 +466,7 @@ func BenchmarkPrefixDepth(b *testing.B) {
 	}
 }
 
-// BenchmarkMultiAccountScan tests scanning across different accounts
+// BenchmarkMultiAccountScan tests scanning across different accounts.
 func BenchmarkMultiAccountScan(b *testing.B) {
 	fixture := setupFixture(b)
 	defer fixture.teardown()
@@ -504,7 +504,7 @@ func BenchmarkMultiAccountScan(b *testing.B) {
 	}
 }
 
-// BenchmarkConcurrentScans tests concurrent scanning with different goroutine counts
+// BenchmarkConcurrentScans tests concurrent scanning with different goroutine counts.
 func BenchmarkConcurrentScans(b *testing.B) {
 	fixture := setupFixture(b)
 	defer fixture.teardown()
@@ -565,7 +565,7 @@ func BenchmarkConcurrentScans(b *testing.B) {
 	}
 }
 
-// BenchmarkConcurrentMixedOperations tests concurrent mixed read/write operations
+// BenchmarkConcurrentMixedOperations tests concurrent mixed read/write operations.
 func BenchmarkConcurrentMixedOperations(b *testing.B) {
 	fixture := setupFixture(b)
 	defer fixture.teardown()
@@ -629,7 +629,7 @@ func BenchmarkConcurrentMixedOperations(b *testing.B) {
 	}
 }
 
-// BenchmarkConcurrentScansWithContention tests concurrent scans on the same prefixes
+// BenchmarkConcurrentScansWithContention tests concurrent scans on the same prefixes.
 func BenchmarkConcurrentScansWithContention(b *testing.B) {
 	fixture := setupFixture(b)
 	defer fixture.teardown()

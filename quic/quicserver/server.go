@@ -27,7 +27,7 @@ const (
 	maxMetaLen uint32 = 64 * 1024
 )
 
-// QuicServer handles QUIC RPC requests for shard storage operations
+// QuicServer handles QUIC RPC requests for shard storage operations.
 type QuicServer struct {
 	Addr   string
 	WalDir string
@@ -110,7 +110,7 @@ type ObjectRequest struct {
 	ShardIndex uint32 `json:"shard_index"` // Index of shard being requested (for multi-shard objects)
 }
 
-// PutRequest contains metadata for storing a shard via QUIC PUT
+// PutRequest contains metadata for storing a shard via QUIC PUT.
 type PutRequest struct {
 	Bucket     string   `json:"bucket"`
 	Object     string   `json:"object"`
@@ -119,13 +119,13 @@ type PutRequest struct {
 	ShardIndex uint32   `json:"shard_index"` // Index of this shard (0-based, for multi-shard objects)
 }
 
-// PutResponse contains the result of a QUIC PUT operation
+// PutResponse contains the result of a QUIC PUT operation.
 type PutResponse struct {
 	ShardSize int64  `json:"shard_size"`
 	Error     string `json:"error,omitempty"`
 }
 
-// DeleteRequest contains metadata for deleting a shard via QUIC DELETE
+// DeleteRequest contains metadata for deleting a shard via QUIC DELETE.
 type DeleteRequest struct {
 	Bucket     string   `json:"bucket"`
 	Object     string   `json:"object"`
@@ -133,7 +133,7 @@ type DeleteRequest struct {
 	ShardIndex uint32   `json:"shard_index"` // Index of shard to delete
 }
 
-// DeleteResponse contains the result of a QUIC DELETE operation
+// DeleteResponse contains the result of a QUIC DELETE operation.
 type DeleteResponse struct {
 	Deleted bool   `json:"deleted"`
 	Error   string `json:"error,omitempty"`
@@ -230,7 +230,7 @@ func NewWithRetry(walDir string, addr string, maxRetries int, opts ...Option) (*
 // New creates and starts a new QUIC server for shard operations
 // The WAL is opened once and shared across all request handlers
 // Returns the server instance for graceful shutdown control
-// Panics on error - use NewWithRetry for error handling
+// Panics on error - use NewWithRetry for error handling.
 func New(walDir string, addr string, opts ...Option) *QuicServer {
 	qs, err := NewWithRetry(walDir, addr, 10, opts...)
 	if err != nil {
@@ -240,7 +240,7 @@ func New(walDir string, addr string, opts ...Option) *QuicServer {
 	return qs
 }
 
-// acceptLoop handles incoming connections until shutdown
+// acceptLoop handles incoming connections until shutdown.
 func (qs *QuicServer) acceptLoop() {
 	for {
 		// Use cancellable context for Accept
@@ -263,7 +263,7 @@ func (qs *QuicServer) acceptLoop() {
 	}
 }
 
-// Close gracefully shuts down the QUIC server and releases the WAL lock
+// Close gracefully shuts down the QUIC server and releases the WAL lock.
 func (qs *QuicServer) Close() error {
 	qs.shutdownMu.Lock()
 	if qs.closed {

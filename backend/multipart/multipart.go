@@ -17,26 +17,26 @@ import (
 // S3 API Limits for multipart uploads
 // Reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
 const (
-	// MinPartSize is the minimum size for any part except the last (5MB)
+	// MinPartSize is the minimum size for any part except the last (5MB).
 	MinPartSize int64 = 5 * 1024 * 1024
 
-	// MaxPartSize is the maximum size for any single part (5GB)
+	// MaxPartSize is the maximum size for any single part (5GB).
 	MaxPartSize int64 = 5 * 1024 * 1024 * 1024
 
-	// MaxPartsCount is the maximum number of parts in a multipart upload (10,000)
+	// MaxPartsCount is the maximum number of parts in a multipart upload (10,000).
 	MaxPartsCount = 10000
 
-	// MinPartNumber is the minimum valid part number
+	// MinPartNumber is the minimum valid part number.
 	MinPartNumber = 1
 
-	// MaxPartNumber is the maximum valid part number
+	// MaxPartNumber is the maximum valid part number.
 	MaxPartNumber = 10000
 
-	// MaxObjectSize is the maximum size for the final object (5TB)
+	// MaxObjectSize is the maximum size for the final object (5TB).
 	MaxObjectSize int64 = 5 * 1024 * 1024 * 1024 * 1024
 )
 
-// UploadMetadata contains metadata about an active multipart upload
+// UploadMetadata contains metadata about an active multipart upload.
 type UploadMetadata struct {
 	UploadID    string         `json:"upload_id"`
 	Bucket      string         `json:"bucket"`
@@ -46,7 +46,7 @@ type UploadMetadata struct {
 	Parts       []PartMetadata `json:"parts,omitempty"`
 }
 
-// PartMetadata contains metadata about a single uploaded part
+// PartMetadata contains metadata about a single uploaded part.
 type PartMetadata struct {
 	PartNumber   int       `json:"part_number"`
 	Size         int64     `json:"size"`
@@ -54,7 +54,7 @@ type PartMetadata struct {
 	LastModified time.Time `json:"last_modified"`
 }
 
-// ValidatePartNumber validates that a part number is within S3 API limits
+// ValidatePartNumber validates that a part number is within S3 API limits.
 func ValidatePartNumber(partNumber int) error {
 	if partNumber < MinPartNumber || partNumber > MaxPartNumber {
 		return backend.NewS3Error(
@@ -66,7 +66,7 @@ func ValidatePartNumber(partNumber int) error {
 	return nil
 }
 
-// ValidatePartSize validates part size for non-last parts
+// ValidatePartSize validates part size for non-last parts.
 func ValidatePartSize(size int64, isLastPart bool) error {
 	if size > MaxPartSize {
 		return backend.NewS3Error(
@@ -85,7 +85,7 @@ func ValidatePartSize(size int64, isLastPart bool) error {
 	return nil
 }
 
-// ValidatePartsCount validates the number of parts
+// ValidatePartsCount validates the number of parts.
 func ValidatePartsCount(count int) error {
 	if count < 1 {
 		return backend.NewS3Error(
@@ -105,7 +105,7 @@ func ValidatePartsCount(count int) error {
 }
 
 // ValidatePartsForCompletion validates parts array for CompleteMultipartUpload
-// Parts must be in ascending order by part number and all referenced parts must exist
+// Parts must be in ascending order by part number and all referenced parts must exist.
 func ValidatePartsForCompletion(requestedParts []backend.CompletedPart, storedParts []PartMetadata) error {
 	if err := ValidatePartsCount(len(requestedParts)); err != nil {
 		return err
@@ -172,14 +172,14 @@ func ValidatePartsForCompletion(requestedParts []backend.CompletedPart, storedPa
 }
 
 // CalculatePartETag calculates the MD5-based ETag for a part
-// Returns ETag in S3 format: "md5hex"
+// Returns ETag in S3 format: "md5hex".
 func CalculatePartETag(data []byte) string {
 	hash := md5.Sum(data)
 	return fmt.Sprintf("\"%x\"", hash)
 }
 
 // CalculatePartETagFromReader calculates the MD5-based ETag while reading from a reader
-// Returns the ETag and all data read
+// Returns the ETag and all data read.
 func CalculatePartETagFromReader(r io.Reader) (etag string, data []byte, err error) {
 	hash := md5.New()
 	data, err = io.ReadAll(io.TeeReader(r, hash))
@@ -191,7 +191,7 @@ func CalculatePartETagFromReader(r io.Reader) (etag string, data []byte, err err
 }
 
 // CalculateMultipartETag calculates the ETag for a completed multipart upload
-// Format: "md5(concat(md5(part1), md5(part2), ...))-partCount"
+// Format: "md5(concat(md5(part1), md5(part2), ...))-partCount".
 func CalculateMultipartETag(partETags []string, numParts int) string {
 	// Concatenate all part MD5s
 	concat := make([]byte, 0, len(partETags)*16)
@@ -212,12 +212,12 @@ func CalculateMultipartETag(partETags []string, numParts int) string {
 	return fmt.Sprintf("\"%x-%d\"", finalMD5, numParts)
 }
 
-// NormalizeETag removes quotes and normalizes an ETag for comparison
+// NormalizeETag removes quotes and normalizes an ETag for comparison.
 func NormalizeETag(etag string) string {
 	return strings.Trim(etag, "\"")
 }
 
-// CompareETags compares two ETags (case-insensitive, quote-insensitive)
+// CompareETags compares two ETags (case-insensitive, quote-insensitive).
 func CompareETags(etag1, etag2 string) bool {
 	return strings.EqualFold(NormalizeETag(etag1), NormalizeETag(etag2))
 }

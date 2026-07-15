@@ -38,7 +38,7 @@ type LocalState struct {
 	db *s3db.S3DB
 }
 
-// NewLocalState creates a GlobalState backed by a local BadgerDB
+// NewLocalState creates a GlobalState backed by a local BadgerDB.
 func NewLocalState(dbPath string) (*LocalState, error) {
 	db, err := s3db.New(dbPath)
 	if err != nil {
@@ -47,31 +47,31 @@ func NewLocalState(dbPath string) (*LocalState, error) {
 	return &LocalState{db: db}, nil
 }
 
-// Get retrieves a value by key (table is encoded in the key)
+// Get retrieves a value by key (table is encoded in the key).
 func (l *LocalState) Get(table string, key []byte) ([]byte, error) {
 	fullKey := makeKey(table, key)
 	return l.db.Get(fullKey)
 }
 
-// Set stores a key-value pair
+// Set stores a key-value pair.
 func (l *LocalState) Set(table string, key []byte, value []byte) error {
 	fullKey := makeKey(table, key)
 	return l.db.Set(fullKey, value)
 }
 
-// Delete removes a key
+// Delete removes a key.
 func (l *LocalState) Delete(table string, key []byte) error {
 	fullKey := makeKey(table, key)
 	return l.db.Delete(fullKey)
 }
 
-// Exists checks if a key exists
+// Exists checks if a key exists.
 func (l *LocalState) Exists(table string, key []byte) (bool, error) {
 	fullKey := makeKey(table, key)
 	return l.db.Exists(fullKey)
 }
 
-// ListKeys returns all keys with the given prefix
+// ListKeys returns all keys with the given prefix.
 func (l *LocalState) ListKeys(table string, prefix []byte) ([][]byte, error) {
 	fullPrefix := makeKey(table, prefix)
 	keys, err := l.db.ListKeys(fullPrefix)
@@ -92,7 +92,7 @@ func (l *LocalState) ListKeys(table string, prefix []byte) ([][]byte, error) {
 	return result, nil
 }
 
-// Scan iterates over all keys with the given prefix
+// Scan iterates over all keys with the given prefix.
 func (l *LocalState) Scan(table string, prefix []byte, fn func(key, value []byte) error) error {
 	fullPrefix := makeKey(table, prefix)
 	tablePrefix := table + ":"
@@ -107,12 +107,12 @@ func (l *LocalState) Scan(table string, prefix []byte, fn func(key, value []byte
 	})
 }
 
-// Close closes the underlying database
+// Close closes the underlying database.
 func (l *LocalState) Close() error {
 	return l.db.Close()
 }
 
-// DB returns the underlying S3DB for backward compatibility
+// DB returns the underlying S3DB for backward compatibility.
 func (l *LocalState) DB() *s3db.S3DB {
 	return l.db
 }
@@ -123,7 +123,7 @@ type DistributedState struct {
 	client *s3db.Client
 }
 
-// DBClientConfig holds configuration for connecting to the distributed database
+// DBClientConfig holds configuration for connecting to the distributed database.
 type DBClientConfig struct {
 	Nodes           []string // List of DB node addresses
 	AccessKeyID     string   // AWS-style access key ID
@@ -131,7 +131,7 @@ type DBClientConfig struct {
 	Region          string   // Region for signing (default: us-east-1)
 }
 
-// NewDistributedState creates a GlobalState backed by a distributed s3db cluster
+// NewDistributedState creates a GlobalState backed by a distributed s3db cluster.
 func NewDistributedState(cfg *DBClientConfig) (*DistributedState, error) {
 	if cfg == nil || len(cfg.Nodes) == 0 {
 		return nil, nil
@@ -154,22 +154,22 @@ func NewDistributedState(cfg *DBClientConfig) (*DistributedState, error) {
 	return &DistributedState{client: client}, nil
 }
 
-// Get retrieves a value by key from the distributed database
+// Get retrieves a value by key from the distributed database.
 func (d *DistributedState) Get(table string, key []byte) ([]byte, error) {
 	return d.client.Get(table, string(key))
 }
 
-// Set stores a key-value pair in the distributed database
+// Set stores a key-value pair in the distributed database.
 func (d *DistributedState) Set(table string, key []byte, value []byte) error {
 	return d.client.Put(table, string(key), value)
 }
 
-// Delete removes a key from the distributed database
+// Delete removes a key from the distributed database.
 func (d *DistributedState) Delete(table string, key []byte) error {
 	return d.client.Delete(table, string(key))
 }
 
-// Exists checks if a key exists in the distributed database
+// Exists checks if a key exists in the distributed database.
 func (d *DistributedState) Exists(table string, key []byte) (bool, error) {
 	_, err := d.client.Get(table, string(key))
 	if errors.Is(err, s3db.ErrKeyNotFound) {
@@ -181,7 +181,7 @@ func (d *DistributedState) Exists(table string, key []byte) (bool, error) {
 	return true, nil
 }
 
-// ListKeys returns all keys with the given prefix (via Scan)
+// ListKeys returns all keys with the given prefix (via Scan).
 func (d *DistributedState) ListKeys(table string, prefix []byte) ([][]byte, error) {
 	items, err := d.client.Scan(table, string(prefix), 10000) // Large limit
 	if err != nil {
@@ -195,7 +195,7 @@ func (d *DistributedState) ListKeys(table string, prefix []byte) ([][]byte, erro
 	return keys, nil
 }
 
-// Scan iterates over all keys with the given prefix
+// Scan iterates over all keys with the given prefix.
 func (d *DistributedState) Scan(table string, prefix []byte, fn func(key, value []byte) error) error {
 	items, err := d.client.Scan(table, string(prefix), 10000)
 	if err != nil {
@@ -210,22 +210,22 @@ func (d *DistributedState) Scan(table string, prefix []byte, fn func(key, value 
 	return nil
 }
 
-// Close is a no-op for the distributed client (connections are reused)
+// Close is a no-op for the distributed client (connections are reused).
 func (d *DistributedState) Close() error {
 	return nil
 }
 
-// Client returns the underlying s3db.Client
+// Client returns the underlying s3db.Client.
 func (d *DistributedState) Client() *s3db.Client {
 	return d.client
 }
 
-// makeKey creates a full key by prepending the table name
+// makeKey creates a full key by prepending the table name.
 func makeKey(table string, key []byte) []byte {
 	return append([]byte(table+":"), key...)
 }
 
-// Table names for global state
+// Table names for global state.
 const (
 	TableObjects   = "objects"   // Object metadata (hash -> shard locations)
 	TableBuckets   = "buckets"   // Bucket metadata

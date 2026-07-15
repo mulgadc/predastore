@@ -12,7 +12,7 @@ type S3DB struct {
 	Badger *badger.DB
 }
 
-// DB functions
+// DB functions.
 func New(dir string) (s3db *S3DB, err error) {
 	s3db = &S3DB{}
 	s3db.Badger, err = badger.Open(badger.DefaultOptions(dir).WithLoggingLevel(badger.WARNING))
@@ -100,7 +100,7 @@ func (s3db *S3DB) ListKeys(prefix []byte) ([][]byte, error) {
 	return keys, err
 }
 
-// Scan iterates over keys with the given prefix and calls the callback for each key-value pair
+// Scan iterates over keys with the given prefix and calls the callback for each key-value pair.
 func (s3db *S3DB) Scan(prefix []byte, fn func(key, value []byte) error) error {
 	return s3db.Badger.View(func(tx *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions

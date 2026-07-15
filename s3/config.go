@@ -96,7 +96,7 @@ func (s3 *Config) BucketConfig(bucket string) (S3_Buckets, error) {
 }
 
 // validatePublicBucketPermission checks if the request is allowed for a public bucket
-// Returns nil if the request is allowed, otherwise returns an error
+// Returns nil if the request is allowed, otherwise returns an error.
 func (s3 *Config) validatePublicBucketPermission(method, path string) error {
 	// Extract bucket name from path
 	parts := filepath.SplitList(path)
@@ -152,7 +152,7 @@ func (s3 *Config) validatePublicBucketPermission(method, path string) error {
 	}
 }
 
-// findSlash finds the first / in a string
+// findSlash finds the first / in a string.
 func findSlash(s string) int {
 	for i, c := range s {
 		if c == '/' {

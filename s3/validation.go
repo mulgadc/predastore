@@ -12,7 +12,7 @@ var (
 	ipAddrPatternRe   = regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`)
 )
 
-// IsValidKeyName validates an object key name
+// IsValidKeyName validates an object key name.
 func IsValidKeyName(key string) error {
 	// Test for a valid UTF-8 character
 	// https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-guidelines

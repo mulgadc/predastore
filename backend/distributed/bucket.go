@@ -16,7 +16,7 @@ import (
 // Compile-time check that *Backend satisfies backend.Backend.
 var _ backend.Backend = (*Backend)(nil)
 
-// CreateBucket creates a new bucket in the distributed store
+// CreateBucket creates a new bucket in the distributed store.
 func (b *Backend) CreateBucket(ctx context.Context, req *backend.CreateBucketRequest) (*backend.CreateBucketResponse, error) {
 	// Validate bucket name
 	if err := backend.IsValidBucketName(req.Bucket); err != nil {
@@ -77,7 +77,7 @@ func (b *Backend) CreateBucket(ctx context.Context, req *backend.CreateBucketReq
 	}, nil
 }
 
-// DeleteBucket deletes a bucket from the distributed store
+// DeleteBucket deletes a bucket from the distributed store.
 func (b *Backend) DeleteBucket(ctx context.Context, req *backend.DeleteBucketRequest) error {
 	// Check if bucket exists and get owner
 	exists, ownerID, err := b.bucketExists(req.Bucket)
@@ -120,7 +120,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, req *backend.DeleteBucketReq
 	return nil
 }
 
-// HeadBucket checks if a bucket exists
+// HeadBucket checks if a bucket exists.
 func (b *Backend) HeadBucket(ctx context.Context, req *backend.HeadBucketRequest) (*backend.HeadBucketResponse, error) {
 	// First check local config (for backward compatibility with configured buckets)
 	for _, bucket := range b.buckets {
@@ -160,7 +160,7 @@ func (b *Backend) HeadBucket(ctx context.Context, req *backend.HeadBucketRequest
 	}, nil
 }
 
-// bucketExists checks if a bucket exists and returns the owner ID
+// bucketExists checks if a bucket exists and returns the owner ID.
 func (b *Backend) bucketExists(bucket string) (exists bool, ownerID string, err error) {
 	// Check s3db first (authoritative source with owner info)
 	data, err := b.globalState.Get(TableBuckets, []byte(bucket))
@@ -190,7 +190,7 @@ func (b *Backend) bucketExists(bucket string) (exists bool, ownerID string, err 
 	return false, "", nil
 }
 
-// addBucketToCache adds a bucket to the local cache for immediate availability
+// addBucketToCache adds a bucket to the local cache for immediate availability.
 func (b *Backend) addBucketToCache(name, region string, public bool) {
 	b.buckets = append(b.buckets, BucketConfig{
 		Name:   name,
@@ -200,7 +200,7 @@ func (b *Backend) addBucketToCache(name, region string, public bool) {
 	})
 }
 
-// removeBucketFromCache removes a bucket from the local cache
+// removeBucketFromCache removes a bucket from the local cache.
 func (b *Backend) removeBucketFromCache(name string) {
 	newBuckets := make([]BucketConfig, 0, len(b.buckets))
 	for _, bc := range b.buckets {
@@ -211,7 +211,7 @@ func (b *Backend) removeBucketFromCache(name string) {
 	b.buckets = newBuckets
 }
 
-// GetBucketMetadata retrieves bucket metadata from s3db
+// GetBucketMetadata retrieves bucket metadata from s3db.
 func (b *Backend) GetBucketMetadata(bucket string) (*backend.BucketMetadata, error) {
 	data, err := b.globalState.Get(TableBuckets, []byte(bucket))
 	if err != nil {

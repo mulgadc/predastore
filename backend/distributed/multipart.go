@@ -21,28 +21,28 @@ import (
 	s3db "github.com/mulgadc/predastore/s3db"
 )
 
-// multipartUploadKey generates the key for storing upload metadata
+// multipartUploadKey generates the key for storing upload metadata.
 func multipartUploadKey(uploadID string) []byte {
 	return []byte(uploadID)
 }
 
-// multipartPartKey generates the key for storing part metadata
+// multipartPartKey generates the key for storing part metadata.
 func multipartPartKey(uploadID string, partNumber int) []byte {
 	return fmt.Appendf(nil, "%s:%05d", uploadID, partNumber)
 }
 
-// multipartPartsPrefix returns the prefix for all parts of an upload
+// multipartPartsPrefix returns the prefix for all parts of an upload.
 func multipartPartsPrefix(uploadID string) []byte {
 	return []byte(uploadID + ":")
 }
 
-// partObjectKey generates the S3 object key for storing a part
+// partObjectKey generates the S3 object key for storing a part.
 func partObjectKey(bucket, key, uploadID string, partNumber int) string {
 	// Store parts in a hidden directory structure
 	return fmt.Sprintf(".multipart/%s/%s/%05d", uploadID, key, partNumber)
 }
 
-// CreateMultipartUpload initiates a multipart upload
+// CreateMultipartUpload initiates a multipart upload.
 func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.CreateMultipartUploadRequest) (*backend.CreateMultipartUploadResponse, error) {
 	if req.Bucket == "" {
 		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
@@ -89,7 +89,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.Create
 	}, nil
 }
 
-// getUploadMetadata retrieves and validates upload metadata
+// getUploadMetadata retrieves and validates upload metadata.
 func (b *Backend) getUploadMetadata(uploadID string) (*multipart.UploadMetadata, error) {
 	data, err := b.globalState.Get(TableMultipart, multipartUploadKey(uploadID))
 	if err != nil {
@@ -108,7 +108,7 @@ func (b *Backend) getUploadMetadata(uploadID string) (*multipart.UploadMetadata,
 	return &metadata, nil
 }
 
-// UploadPart uploads a part in a multipart upload
+// UploadPart uploads a part in a multipart upload.
 func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest) (*backend.UploadPartResponse, error) {
 	if req.Bucket == "" {
 		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
@@ -247,7 +247,7 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 	}, nil
 }
 
-// getStoredParts retrieves all stored parts for an upload
+// getStoredParts retrieves all stored parts for an upload.
 func (b *Backend) getStoredParts(uploadID string) ([]multipart.PartMetadata, error) {
 	var parts []multipart.PartMetadata
 
@@ -273,7 +273,7 @@ func (b *Backend) getStoredParts(uploadID string) ([]multipart.PartMetadata, err
 	return parts, nil
 }
 
-// CompleteMultipartUpload completes a multipart upload by assembling all parts
+// CompleteMultipartUpload completes a multipart upload by assembling all parts.
 func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.CompleteMultipartUploadRequest) (*backend.CompleteMultipartUploadResponse, error) {
 	if req.Bucket == "" {
 		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
@@ -451,7 +451,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	}, nil
 }
 
-// getPartData retrieves the data for a specific part
+// getPartData retrieves the data for a specific part.
 func (b *Backend) getPartData(ctx context.Context, bucket, key, uploadID string, partNumber int) ([]byte, error) {
 	// Look up shard location using the key format from UploadPart
 	partShardKey := fmt.Sprintf("part:%s:%05d", uploadID, partNumber)
@@ -526,7 +526,7 @@ func (b *Backend) cleanupMultipartUpload(ctx context.Context, bucket, key, uploa
 	return nil
 }
 
-// AbortMultipartUpload aborts a multipart upload and cleans up all parts
+// AbortMultipartUpload aborts a multipart upload and cleans up all parts.
 func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
 	if bucket == "" {
 		return backend.ErrNoSuchBucketError.WithResource(bucket)

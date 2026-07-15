@@ -30,7 +30,7 @@ import (
 // independent of the region they are configured for or the endpoint they target.
 const globalSigningRegion = "us-east-1"
 
-// HTTP2Server is an HTTP/2 compatible S3 server using net/http
+// HTTP2Server is an HTTP/2 compatible S3 server using net/http.
 type HTTP2Server struct {
 	config    *Config
 	backend   backend.Backend
@@ -40,7 +40,7 @@ type HTTP2Server struct {
 	throttler *ratelimit.Throttler
 }
 
-// NewHTTP2ServerWithBackend creates a new HTTP/2 server with an existing backend
+// NewHTTP2ServerWithBackend creates a new HTTP/2 server with an existing backend.
 func NewHTTP2ServerWithBackend(config *Config, be backend.Backend, credProv CredentialProvider) *HTTP2Server {
 	s := &HTTP2Server{
 		config:   config,
@@ -298,7 +298,7 @@ func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, 
 	}
 }
 
-// writeS3Error writes an S3 error response
+// writeS3Error writes an S3 error response.
 func (s *HTTP2Server) writeS3Error(w http.ResponseWriter, r *http.Request, statusCode int, code, message string) {
 	s3error := S3Error{
 		Code:      code,
@@ -315,14 +315,14 @@ func (s *HTTP2Server) writeS3Error(w http.ResponseWriter, r *http.Request, statu
 	}
 }
 
-// writeXML writes an XML response
+// writeXML writes an XML response.
 func (s *HTTP2Server) writeXML(w http.ResponseWriter, statusCode int, v any) error {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(statusCode)
 	return xml.NewEncoder(w).Encode(v)
 }
 
-// handleError converts backend errors to S3 error responses
+// handleError converts backend errors to S3 error responses.
 func (s *HTTP2Server) handleError(w http.ResponseWriter, r *http.Request, err error) {
 	statusCode := http.StatusInternalServerError
 	var s3error S3Error
@@ -753,7 +753,7 @@ func (s *HTTP2Server) deleteObject(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ListenAndServe starts the HTTP/2 server with TLS
+// ListenAndServe starts the HTTP/2 server with TLS.
 func (s *HTTP2Server) ListenAndServe(addr, certFile, keyFile string) error {
 	// Load TLS certificates
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
@@ -795,7 +795,7 @@ func (s *HTTP2Server) ListenAndServe(addr, certFile, keyFile string) error {
 	return s.server.Serve(tlsListener)
 }
 
-// ListenAndServeAsync starts the server in a goroutine
+// ListenAndServeAsync starts the server in a goroutine.
 func (s *HTTP2Server) ListenAndServeAsync(addr, certFile, keyFile string) error {
 	go func() {
 		if err := s.ListenAndServe(addr, certFile, keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -805,7 +805,7 @@ func (s *HTTP2Server) ListenAndServeAsync(addr, certFile, keyFile string) error 
 	return nil
 }
 
-// Shutdown gracefully shuts down the server
+// Shutdown gracefully shuts down the server.
 func (s *HTTP2Server) Shutdown(ctx context.Context) error {
 	if s.throttler != nil {
 		s.throttler.Stop()
@@ -816,12 +816,12 @@ func (s *HTTP2Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// GetRouter returns the chi router for testing
+// GetRouter returns the chi router for testing.
 func (s *HTTP2Server) GetRouter() chi.Router {
 	return s.router
 }
 
-// GetHandler returns the HTTP handler for testing with httptest
+// GetHandler returns the HTTP handler for testing with httptest.
 func (s *HTTP2Server) GetHandler() http.Handler {
 	return s.router
 }

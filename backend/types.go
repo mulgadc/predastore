@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// ObjectInfo contains metadata about an object
+// ObjectInfo contains metadata about an object.
 type ObjectInfo struct {
 	Key          string
 	Size         int64
@@ -16,14 +16,14 @@ type ObjectInfo struct {
 	IsDir        bool
 }
 
-// BucketInfo contains metadata about a bucket
+// BucketInfo contains metadata about a bucket.
 type BucketInfo struct {
 	Name         string
 	CreationDate time.Time
 	Region       string
 }
 
-// GetObjectRequest contains parameters for GetObject operation
+// GetObjectRequest contains parameters for GetObject operation.
 type GetObjectRequest struct {
 	Bucket     string
 	Key        string
@@ -31,7 +31,7 @@ type GetObjectRequest struct {
 	RangeEnd   int64 // -1 means not specified
 }
 
-// GetObjectResponse contains the result of GetObject operation
+// GetObjectResponse contains the result of GetObject operation.
 type GetObjectResponse struct {
 	Body         io.ReadCloser
 	ContentType  string
@@ -42,7 +42,7 @@ type GetObjectResponse struct {
 	StatusCode   int // 200 for full content, 206 for partial
 }
 
-// PutObjectRequest contains parameters for PutObject operation
+// PutObjectRequest contains parameters for PutObject operation.
 type PutObjectRequest struct {
 	Bucket          string
 	Key             string
@@ -54,18 +54,18 @@ type PutObjectRequest struct {
 	DecodedLength   int64 // For aws-chunked encoding
 }
 
-// PutObjectResponse contains the result of PutObject operation
+// PutObjectResponse contains the result of PutObject operation.
 type PutObjectResponse struct {
 	ETag string
 }
 
-// DeleteObjectRequest contains parameters for DeleteObject operation
+// DeleteObjectRequest contains parameters for DeleteObject operation.
 type DeleteObjectRequest struct {
 	Bucket string
 	Key    string
 }
 
-// ListObjectsRequest contains parameters for ListObjectsV2 operation
+// ListObjectsRequest contains parameters for ListObjectsV2 operation.
 type ListObjectsRequest struct {
 	Bucket       string
 	Prefix       string
@@ -75,7 +75,7 @@ type ListObjectsRequest struct {
 	EncodingType string
 }
 
-// ListObjectsResponse contains the result of ListObjectsV2 operation
+// ListObjectsResponse contains the result of ListObjectsV2 operation.
 type ListObjectsResponse struct {
 	Name           string
 	Prefix         string
@@ -87,33 +87,33 @@ type ListObjectsResponse struct {
 	CommonPrefixes []string
 }
 
-// ListBucketsResponse contains the result of ListBuckets operation
+// ListBucketsResponse contains the result of ListBuckets operation.
 type ListBucketsResponse struct {
 	Buckets []BucketInfo
 	Owner   OwnerInfo
 }
 
-// OwnerInfo contains owner information
+// OwnerInfo contains owner information.
 type OwnerInfo struct {
 	ID          string
 	DisplayName string
 }
 
-// CreateMultipartUploadRequest contains parameters for InitiateMultipartUpload
+// CreateMultipartUploadRequest contains parameters for InitiateMultipartUpload.
 type CreateMultipartUploadRequest struct {
 	Bucket      string
 	Key         string
 	ContentType string
 }
 
-// CreateMultipartUploadResponse contains the result of InitiateMultipartUpload
+// CreateMultipartUploadResponse contains the result of InitiateMultipartUpload.
 type CreateMultipartUploadResponse struct {
 	Bucket   string
 	Key      string
 	UploadID string
 }
 
-// UploadPartRequest contains parameters for UploadPart operation
+// UploadPartRequest contains parameters for UploadPart operation.
 type UploadPartRequest struct {
 	Bucket          string
 	Key             string
@@ -126,19 +126,19 @@ type UploadPartRequest struct {
 	DecodedLength   int64
 }
 
-// UploadPartResponse contains the result of UploadPart operation
+// UploadPartResponse contains the result of UploadPart operation.
 type UploadPartResponse struct {
 	ETag       string
 	PartNumber int
 }
 
-// CompletedPart represents a completed part in multipart upload
+// CompletedPart represents a completed part in multipart upload.
 type CompletedPart struct {
 	PartNumber int
 	ETag       string
 }
 
-// CompleteMultipartUploadRequest contains parameters for CompleteMultipartUpload
+// CompleteMultipartUploadRequest contains parameters for CompleteMultipartUpload.
 type CompleteMultipartUploadRequest struct {
 	Bucket   string
 	Key      string
@@ -146,7 +146,7 @@ type CompleteMultipartUploadRequest struct {
 	Parts    []CompletedPart
 }
 
-// CompleteMultipartUploadResponse contains the result of CompleteMultipartUpload
+// CompleteMultipartUploadResponse contains the result of CompleteMultipartUpload.
 type CompleteMultipartUploadResponse struct {
 	Location string
 	Bucket   string
@@ -154,7 +154,7 @@ type CompleteMultipartUploadResponse struct {
 	ETag     string
 }
 
-// HeadObjectResponse contains the result of HeadObject operation
+// HeadObjectResponse contains the result of HeadObject operation.
 type HeadObjectResponse struct {
 	ContentType   string
 	ContentLength int64
@@ -162,7 +162,7 @@ type HeadObjectResponse struct {
 	LastModified  time.Time
 }
 
-// CreateBucketRequest contains parameters for CreateBucket operation
+// CreateBucketRequest contains parameters for CreateBucket operation.
 type CreateBucketRequest struct {
 	Bucket            string
 	Region            string // From LocationConstraint in request body
@@ -173,29 +173,29 @@ type CreateBucketRequest struct {
 	ObjectOwnership   string // BucketOwnerEnforced, BucketOwnerPreferred, ObjectWriter
 }
 
-// CreateBucketResponse contains the result of CreateBucket operation
+// CreateBucketResponse contains the result of CreateBucket operation.
 type CreateBucketResponse struct {
 	Location string // The bucket's location (e.g., /bucket-name)
 }
 
-// DeleteBucketRequest contains parameters for DeleteBucket operation
+// DeleteBucketRequest contains parameters for DeleteBucket operation.
 type DeleteBucketRequest struct {
 	Bucket  string
 	OwnerID string // For ownership verification
 }
 
-// HeadBucketRequest contains parameters for HeadBucket operation
+// HeadBucketRequest contains parameters for HeadBucket operation.
 type HeadBucketRequest struct {
 	Bucket string
 }
 
-// HeadBucketResponse contains the result of HeadBucket operation
+// HeadBucketResponse contains the result of HeadBucket operation.
 type HeadBucketResponse struct {
 	Region string
 	Name   string
 }
 
-// BucketMetadata contains complete bucket metadata stored in s3db
+// BucketMetadata contains complete bucket metadata stored in s3db.
 type BucketMetadata struct {
 	Name         string    `json:"name"`
 	Region       string    `json:"region"`

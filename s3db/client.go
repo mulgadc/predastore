@@ -24,7 +24,7 @@ import (
 	"github.com/mulgadc/predastore/pkg/sigv4"
 )
 
-// Client provides access to the distributed database cluster
+// Client provides access to the distributed database cluster.
 type Client struct {
 	mu              sync.RWMutex
 	nodes           []string // List of node addresses
@@ -38,7 +38,7 @@ type Client struct {
 	maxRetries      int
 }
 
-// ClientConfig holds client configuration
+// ClientConfig holds client configuration.
 type ClientConfig struct {
 	Nodes           []string      // Initial list of node addresses
 	AccessKeyID     string        // AWS-style access key ID
@@ -54,7 +54,7 @@ type ClientConfig struct {
 	RootCAs *x509.CertPool
 }
 
-// DefaultClientConfig returns sensible defaults
+// DefaultClientConfig returns sensible defaults.
 func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{
 		Region:     DefaultRegion,
@@ -64,7 +64,7 @@ func DefaultClientConfig() *ClientConfig {
 	}
 }
 
-// NewClient creates a new database client
+// NewClient creates a new database client.
 func NewClient(config *ClientConfig) *Client {
 	if config == nil {
 		config = DefaultClientConfig()
@@ -131,7 +131,7 @@ func escapePathSegment(s string) string {
 	return strings.ReplaceAll(escaped, "+", "%2B")
 }
 
-// Put stores a key-value pair in the specified table
+// Put stores a key-value pair in the specified table.
 func (c *Client) Put(table, key string, value []byte) error {
 	// Hex-encode the key to avoid URL path issues with binary data
 	path := fmt.Sprintf("/v1/put/%s/%s", escapePathSegment(table), hex.EncodeToString([]byte(key)))
@@ -139,7 +139,7 @@ func (c *Client) Put(table, key string, value []byte) error {
 	return err
 }
 
-// Get retrieves a value by key from the specified table
+// Get retrieves a value by key from the specified table.
 func (c *Client) Get(table, key string) ([]byte, error) {
 	// Hex-encode the key to avoid URL path issues with binary data
 	path := fmt.Sprintf("/v1/get/%s/%s", escapePathSegment(table), hex.EncodeToString([]byte(key)))
@@ -157,7 +157,7 @@ func (c *Client) Get(table, key string) ([]byte, error) {
 	return result.Value, nil
 }
 
-// Delete removes a key from the specified table
+// Delete removes a key from the specified table.
 func (c *Client) Delete(table, key string) error {
 	// Hex-encode the key to avoid URL path issues with binary data
 	path := fmt.Sprintf("/v1/delete/%s/%s", escapePathSegment(table), hex.EncodeToString([]byte(key)))
@@ -165,7 +165,7 @@ func (c *Client) Delete(table, key string) error {
 	return err
 }
 
-// Scan lists keys with optional prefix in the specified table
+// Scan lists keys with optional prefix in the specified table.
 func (c *Client) Scan(table, prefix string, limit int) ([]ScanItem, error) {
 	path := fmt.Sprintf("/v1/scan/%s?prefix=%s&limit=%d",
 		url.PathEscape(table),
@@ -185,7 +185,7 @@ func (c *Client) Scan(table, prefix string, limit int) ([]ScanItem, error) {
 	return result.Items, nil
 }
 
-// Status returns the status of the connected node
+// Status returns the status of the connected node.
 func (c *Client) Status() (*StatusResponse, error) {
 	resp, err := c.doRead("/status")
 	if err != nil {
@@ -200,7 +200,7 @@ func (c *Client) Status() (*StatusResponse, error) {
 	return &result, nil
 }
 
-// Leader returns information about the current leader
+// Leader returns information about the current leader.
 func (c *Client) Leader() (string, string, error) {
 	resp, err := c.doRead("/v1/leader")
 	if err != nil {
@@ -218,7 +218,7 @@ func (c *Client) Leader() (string, string, error) {
 	return result.LeaderID, result.LeaderAddr, nil
 }
 
-// doRead performs a GET request, tries leader first then all other nodes
+// doRead performs a GET request, tries leader first then all other nodes.
 func (c *Client) doRead(path string) ([]byte, error) {
 	c.mu.RLock()
 	leaderAddr := c.leaderAddr
@@ -301,7 +301,7 @@ func (c *Client) doRead(path string) ([]byte, error) {
 	return nil, fmt.Errorf("all nodes failed: %w", lastErr)
 }
 
-// doWrite performs a write request, must go to leader
+// doWrite performs a write request, must go to leader.
 func (c *Client) doWrite(method, path string, body []byte) ([]byte, error) {
 	c.mu.RLock()
 	leaderAddr := c.leaderAddr
@@ -352,7 +352,7 @@ func (c *Client) doWrite(method, path string, body []byte) ([]byte, error) {
 }
 
 // tryWrite attempts a write to a specific node
-// Returns (response, leaderAddr, error)
+// Returns (response, leaderAddr, error).
 func (c *Client) tryWrite(method, node, path string, body []byte) ([]byte, string, error) {
 	reqURL := "https://" + node + path
 
@@ -410,7 +410,7 @@ func (c *Client) tryWrite(method, node, path string, body []byte) ([]byte, strin
 	return nil, "", fmt.Errorf("request failed with status %d", resp.StatusCode)
 }
 
-// AddNode adds a node to the client's node list
+// AddNode adds a node to the client's node list.
 func (c *Client) AddNode(addr string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -422,7 +422,7 @@ func (c *Client) AddNode(addr string) {
 	c.nodes = append(c.nodes, addr)
 }
 
-// RemoveNode removes a node from the client's node list
+// RemoveNode removes a node from the client's node list.
 func (c *Client) RemoveNode(addr string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -435,7 +435,7 @@ func (c *Client) RemoveNode(addr string) {
 	}
 }
 
-// Errors
+// Errors.
 var (
 	ErrKeyNotFound = fmt.Errorf("key not found")
 )

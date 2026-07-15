@@ -14,10 +14,10 @@ import (
 )
 
 // arnObjectPrefix is the ARN prefix for object keys
-// Format: arn:aws:s3:::<bucket>/<key>
+// Format: arn:aws:s3:::<bucket>/<key>.
 const arnObjectPrefixPut = "arn:aws:s3:::"
 
-// PutObject stores an object using Reed-Solomon encoding across multiple nodes
+// PutObject stores an object using Reed-Solomon encoding across multiple nodes.
 func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) (*backend.PutObjectResponse, error) {
 	if req.Bucket == "" {
 		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
@@ -117,7 +117,7 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	}, nil
 }
 
-// PutObjectFromPath stores an object from a file path (used internally and for testing)
+// PutObjectFromPath stores an object from a file path (used internally and for testing).
 func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath string) error {
 	objectHash := s3db.GenObjectHash(bucket, objectPath)
 
@@ -184,7 +184,7 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 	return b.globalState.Set(TableObjects, objectHash[:], buf.Bytes())
 }
 
-// GetFromPath retrieves an object and writes to the provided writer (used for testing)
+// GetFromPath retrieves an object and writes to the provided writer (used for testing).
 func (b *Backend) GetFromPath(ctx context.Context, bucket, objectPath string, out *bytes.Buffer) error {
 	req := &backend.GetObjectRequest{
 		Bucket:     bucket,

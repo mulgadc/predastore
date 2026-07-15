@@ -21,7 +21,7 @@ import (
 	"github.com/mulgadc/predastore/pkg/sigv4"
 )
 
-// Server provides HTTP REST API for the distributed database
+// Server provides HTTP REST API for the distributed database.
 type Server struct {
 	config *ServerConfig
 	router chi.Router
@@ -29,7 +29,7 @@ type Server struct {
 	node   *RaftNode
 }
 
-// ServerConfig holds server configuration
+// ServerConfig holds server configuration.
 type ServerConfig struct {
 	// HTTP settings
 	Addr         string
@@ -54,7 +54,7 @@ type ServerConfig struct {
 	Debug bool
 }
 
-// DefaultServerConfig returns sensible defaults
+// DefaultServerConfig returns sensible defaults.
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
 		Addr:         "0.0.0.0:6660",
@@ -66,7 +66,7 @@ func DefaultServerConfig() *ServerConfig {
 	}
 }
 
-// NewServer creates a new database server
+// NewServer creates a new database server.
 func NewServer(config *ServerConfig) (*Server, error) {
 	if config.ClusterConfig == nil {
 		return nil, fmt.Errorf("cluster config is required")
@@ -109,7 +109,7 @@ func NewServer(config *ServerConfig) (*Server, error) {
 	return s, nil
 }
 
-// setupRoutes configures all HTTP endpoints
+// setupRoutes configures all HTTP endpoints.
 func (s *Server) setupRoutes() {
 	// Health check (no auth required - handled in middleware)
 	s.router.Get("/health", s.handleHealth)
@@ -185,12 +185,12 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// contextKey for storing values in request context
+// contextKey for storing values in request context.
 type contextKey string
 
 const contextKeyAccessKey contextKey = "accessKey"
 
-// writeJSON writes a JSON response
+// writeJSON writes a JSON response.
 func (s *Server) writeJSON(w http.ResponseWriter, statusCode int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
@@ -199,7 +199,7 @@ func (s *Server) writeJSON(w http.ResponseWriter, statusCode int, v any) {
 	}
 }
 
-// handleHealth returns server health status
+// handleHealth returns server health status.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"status": "healthy",
@@ -207,7 +207,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleStatus returns detailed server status
+// handleStatus returns detailed server status.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	stats := s.node.Stats()
 
@@ -223,7 +223,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleGet retrieves a value by key
+// handleGet retrieves a value by key.
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	table := chi.URLParam(r, "table")
 	hexKey := chi.URLParam(r, "key")
@@ -271,7 +271,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handlePut stores a key-value pair
+// handlePut stores a key-value pair.
 func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	table := chi.URLParam(r, "table")
 	hexKey := chi.URLParam(r, "key")
@@ -338,7 +338,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDelete removes a key
+// handleDelete removes a key.
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	table := chi.URLParam(r, "table")
 	hexKey := chi.URLParam(r, "key")
@@ -385,7 +385,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleScan lists keys with optional prefix
+// handleScan lists keys with optional prefix.
 func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	table := chi.URLParam(r, "table")
 	prefix := r.URL.Query().Get("prefix")
@@ -436,7 +436,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleJoin adds a new node to the cluster
+// handleJoin adds a new node to the cluster.
 func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -489,7 +489,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleLeader returns the current leader information
+// handleLeader returns the current leader information.
 func (s *Server) handleLeader(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"leader_id":   s.node.LeaderID(),
@@ -498,7 +498,7 @@ func (s *Server) handleLeader(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Start begins listening for HTTPS requests with TLS and HTTP/2 support
+// Start begins listening for HTTPS requests with TLS and HTTP/2 support.
 func (s *Server) Start() error {
 	slog.Info("Starting database server with TLS/HTTP2", "addr", s.config.Addr, "node_id", s.config.ClusterConfig.NodeID)
 
@@ -537,7 +537,7 @@ func (s *Server) Start() error {
 	return s.server.Serve(tlsListener)
 }
 
-// Shutdown gracefully stops the server
+// Shutdown gracefully stops the server.
 func (s *Server) Shutdown() error {
 	slog.Info("DBServer: shutting down", "node_id", s.config.ClusterConfig.NodeID)
 
@@ -559,36 +559,36 @@ func (s *Server) Shutdown() error {
 	return nil
 }
 
-// WaitForLeader blocks until a leader is elected
+// WaitForLeader blocks until a leader is elected.
 func (s *Server) WaitForLeader(timeout time.Duration) error {
 	return s.node.WaitForLeader(timeout)
 }
 
-// IsLeader returns true if this node is the leader
+// IsLeader returns true if this node is the leader.
 func (s *Server) IsLeader() bool {
 	return s.node.IsLeader()
 }
 
-// Node returns the underlying Raft node
+// Node returns the underlying Raft node.
 func (s *Server) Node() *RaftNode {
 	return s.node
 }
 
-// GetRouter returns the chi router for testing
+// GetRouter returns the chi router for testing.
 func (s *Server) GetRouter() chi.Router {
 	return s.router
 }
 
 // Response types
 
-// ErrorResponse represents an error response
+// ErrorResponse represents an error response.
 type ErrorResponse struct {
 	Error   string `json:"error"`
 	Message string `json:"message"`
 	Leader  string `json:"leader,omitempty"` // Set when NotLeader error
 }
 
-// StatusResponse represents server status
+// StatusResponse represents server status.
 type StatusResponse struct {
 	NodeID     string `json:"node_id"`
 	State      string `json:"state"`
@@ -600,27 +600,27 @@ type StatusResponse struct {
 	IsLeader   bool   `json:"is_leader"`
 }
 
-// GetResponse represents a successful GET response
+// GetResponse represents a successful GET response.
 type GetResponse struct {
 	Table string `json:"table"`
 	Key   string `json:"key"`
 	Value []byte `json:"value"`
 }
 
-// PutResponse represents a successful PUT response
+// PutResponse represents a successful PUT response.
 type PutResponse struct {
 	Table string `json:"table"`
 	Key   string `json:"key"`
 	Size  int    `json:"size"`
 }
 
-// ScanItem represents a single item in scan results
+// ScanItem represents a single item in scan results.
 type ScanItem struct {
 	Key   string `json:"key"`
 	Value []byte `json:"value"`
 }
 
-// ScanResponse represents scan results
+// ScanResponse represents scan results.
 type ScanResponse struct {
 	Table  string     `json:"table"`
 	Prefix string     `json:"prefix"`
@@ -628,7 +628,7 @@ type ScanResponse struct {
 	Items  []ScanItem `json:"items"`
 }
 
-// JoinRequest represents a request to join the cluster
+// JoinRequest represents a request to join the cluster.
 type JoinRequest struct {
 	NodeID string `json:"node_id"`
 	Addr   string `json:"addr"`

@@ -69,7 +69,7 @@ func (c *Client) nextID() uint64 {
 	return c.reqID.Add(1)
 }
 
-// Put sends a shard to the QUIC server and returns the WriteResult
+// Put sends a shard to the QUIC server and returns the WriteResult.
 func (c *Client) Put(ctx context.Context, putReq quicserver.PutRequest, shardData io.Reader) (*quicserver.PutResponse, error) {
 	putReqBytes, err := json.Marshal(putReq)
 	if err != nil {
@@ -102,7 +102,7 @@ func (c *Client) Put(ctx context.Context, putReq quicserver.PutRequest, shardDat
 	return &response, nil
 }
 
-// doPut performs a PUT RPC with body streaming
+// doPut performs a PUT RPC with body streaming.
 func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader, bodyLen int64) (quicproto.Header, []byte, error) {
 	s, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
@@ -186,7 +186,7 @@ func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader,
 	return respHdr, respMeta, nil
 }
 
-// Delete sends a delete request to the QUIC server for a shard
+// Delete sends a delete request to the QUIC server for a shard.
 func (c *Client) Delete(ctx context.Context, delReq quicserver.DeleteRequest) (*quicserver.DeleteResponse, error) {
 	delReqBytes, err := json.Marshal(delReq)
 	if err != nil {
@@ -214,7 +214,7 @@ func (c *Client) Delete(ctx context.Context, delReq quicserver.DeleteRequest) (*
 	return &response, nil
 }
 
-// doDelete performs a DELETE RPC (no body)
+// doDelete performs a DELETE RPC (no body).
 func (c *Client) doDelete(ctx context.Context, requestBytes []byte) (quicproto.Header, []byte, error) {
 	s, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {

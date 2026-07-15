@@ -92,7 +92,7 @@ func newAuthTestConfig() *Config {
 	}
 }
 
-// TestBackend holds the configuration and server for a specific backend
+// TestBackend holds the configuration and server for a specific backend.
 type TestBackend struct {
 	Type        BackendType
 	Config      *Config
@@ -103,7 +103,7 @@ type TestBackend struct {
 	Cleanup     func()
 }
 
-// setupDistributedBackend creates a distributed backend for testing with QUIC servers
+// setupDistributedBackend creates a distributed backend for testing with QUIC servers.
 func setupDistributedBackend(t *testing.T) *TestBackend {
 	t.Helper()
 
@@ -206,7 +206,7 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 	}
 }
 
-// RunWithBackends runs a test function against multiple backends
+// RunWithBackends runs a test function against multiple backends.
 func RunWithBackends(t *testing.T, backends []BackendType, testFn func(t *testing.T, tb *TestBackend)) {
 	for _, backendType := range backends {
 		t.Run(string(backendType), func(t *testing.T) {
@@ -224,12 +224,12 @@ func RunWithBackends(t *testing.T, backends []BackendType, testFn func(t *testin
 	}
 }
 
-// AllBackends returns all available backend types for testing
+// AllBackends returns all available backend types for testing.
 func AllBackends() []BackendType {
 	return []BackendType{BackendDistributed}
 }
 
-// DistributedOnly returns only the distributed backend for testing
+// DistributedOnly returns only the distributed backend for testing.
 func DistributedOnly() []BackendType {
 	return []BackendType{BackendDistributed}
 }

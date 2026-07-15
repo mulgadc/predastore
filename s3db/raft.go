@@ -16,7 +16,7 @@ import (
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
 
-// RaftNode wraps Raft consensus with Badger storage
+// RaftNode wraps Raft consensus with Badger storage.
 type RaftNode struct {
 	config    *ClusterConfig
 	raft      *raft.Raft
@@ -28,7 +28,7 @@ type RaftNode struct {
 	badgerDB  *badger.DB
 }
 
-// NewRaftNode creates and initializes a new Raft node
+// NewRaftNode creates and initializes a new Raft node.
 func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 	node := &RaftNode{config: config}
 
@@ -157,7 +157,7 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 	return node, nil
 }
 
-// bootstrap initializes the cluster with all configured nodes
+// bootstrap initializes the cluster with all configured nodes.
 func (n *RaftNode) bootstrap() error {
 	servers := make([]raft.Server, 0, len(n.config.Nodes))
 	for _, node := range n.config.Nodes {
@@ -178,7 +178,7 @@ func (n *RaftNode) bootstrap() error {
 	return nil
 }
 
-// Put stores a key-value pair through Raft consensus
+// Put stores a key-value pair through Raft consensus.
 func (n *RaftNode) Put(table, key string, value []byte) error {
 	if n.raft.State() != raft.Leader {
 		return ErrNotLeader
@@ -211,7 +211,7 @@ func (n *RaftNode) Put(table, key string, value []byte) error {
 	return nil
 }
 
-// Delete removes a key through Raft consensus
+// Delete removes a key through Raft consensus.
 func (n *RaftNode) Delete(table, key string) error {
 	if n.raft.State() != raft.Leader {
 		return ErrNotLeader
@@ -250,29 +250,29 @@ func (n *RaftNode) Get(table, key string) ([]byte, error) {
 	return n.fsm.Get(table, key)
 }
 
-// Scan iterates over keys with prefix in the given table
+// Scan iterates over keys with prefix in the given table.
 func (n *RaftNode) Scan(table, prefix string, fn func(key string, value []byte) error) error {
 	return n.fsm.Scan(table, prefix, fn)
 }
 
-// IsLeader returns true if this node is the current Raft leader
+// IsLeader returns true if this node is the current Raft leader.
 func (n *RaftNode) IsLeader() bool {
 	return n.raft.State() == raft.Leader
 }
 
-// LeaderAddr returns the address of the current leader
+// LeaderAddr returns the address of the current leader.
 func (n *RaftNode) LeaderAddr() string {
 	addr, _ := n.raft.LeaderWithID()
 	return string(addr)
 }
 
-// LeaderID returns the ID of the current leader
+// LeaderID returns the ID of the current leader.
 func (n *RaftNode) LeaderID() string {
 	_, id := n.raft.LeaderWithID()
 	return string(id)
 }
 
-// WaitForLeader blocks until a leader is elected or timeout
+// WaitForLeader blocks until a leader is elected or timeout.
 func (n *RaftNode) WaitForLeader(timeout time.Duration) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -292,7 +292,7 @@ func (n *RaftNode) WaitForLeader(timeout time.Duration) error {
 	}
 }
 
-// Stats returns Raft statistics
+// Stats returns Raft statistics.
 func (n *RaftNode) Stats() map[string]string {
 	return n.raft.Stats()
 }
@@ -302,7 +302,7 @@ func (n *RaftNode) Stats() map[string]string {
 // 1. Close transport first to stop network activity immediately
 // 2. Attempt graceful Raft shutdown with 5s timeout
 // 3. Close BoltDB log store
-// 4. Close Badger FSM storage
+// 4. Close Badger FSM storage.
 func (n *RaftNode) Close() error {
 	slog.Info("RaftNode: starting shutdown")
 
@@ -360,7 +360,7 @@ func (n *RaftNode) Close() error {
 	return nil
 }
 
-// Join adds a new node to the cluster (must be called on leader)
+// Join adds a new node to the cluster (must be called on leader).
 func (n *RaftNode) Join(nodeID string, addr string) error {
 	if n.raft.State() != raft.Leader {
 		return ErrNotLeader
@@ -395,7 +395,7 @@ func (n *RaftNode) Join(nodeID string, addr string) error {
 	return nil
 }
 
-// Leave removes this node from the cluster
+// Leave removes this node from the cluster.
 func (n *RaftNode) Leave() error {
 	if n.raft.State() == raft.Leader {
 		// Transfer leadership first
@@ -408,7 +408,7 @@ func (n *RaftNode) Leave() error {
 	return nil
 }
 
-// Errors
+// Errors.
 var (
 	ErrNotLeader = fmt.Errorf("not the leader")
 )

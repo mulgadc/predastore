@@ -14,15 +14,15 @@ import (
 	s3db "github.com/mulgadc/predastore/s3db"
 )
 
-// arnObjectPrefixDel is the ARN prefix for object keys
+// arnObjectPrefixDel is the ARN prefix for object keys.
 const arnObjectPrefixDel = "arn:aws:s3:::"
 
 // deletedObjectPrefix is the key prefix for tracking deleted objects
 // Format: deleted:<bucket>/<key> -> DeletedObjectInfo (gob encoded)
-// This allows querying all deleted objects for a future compaction coordinator
+// This allows querying all deleted objects for a future compaction coordinator.
 const deletedObjectPrefix = "deleted:"
 
-// DeletedObjectInfo tracks a deleted object for compaction coordination
+// DeletedObjectInfo tracks a deleted object for compaction coordination.
 type DeletedObjectInfo struct {
 	Bucket         string   `json:"bucket"`
 	Key            string   `json:"key"`
@@ -32,7 +32,7 @@ type DeletedObjectInfo struct {
 	ParityNodes    []uint32 `json:"parity_nodes"`     // Which nodes had parity shards
 }
 
-// DeleteObject removes an object from the distributed storage
+// DeleteObject removes an object from the distributed storage.
 func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectRequest) error {
 	if req.Bucket == "" {
 		return backend.ErrNoSuchBucketError.WithResource(req.Bucket)
@@ -95,7 +95,7 @@ func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectReq
 	return nil
 }
 
-// deleteObjectViaQUIC sends DELETE requests to all shard nodes
+// deleteObjectViaQUIC sends DELETE requests to all shard nodes.
 func (b *Backend) deleteObjectViaQUIC(ctx context.Context, bucket, key string, objectHash [32]byte, shards ObjectToShardNodes) error {
 	// Build (node, shardIndex) pairs so each delete carries the correct shard index.
 	type nodeShard struct {

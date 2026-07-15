@@ -27,7 +27,7 @@ func installTestTLS(t *testing.T) (certPath, keyPath string) {
 	return certPath, keyPath
 }
 
-// TestSingleNodeRaft tests basic operations on a single Raft node
+// TestSingleNodeRaft tests basic operations on a single Raft node.
 func TestSingleNodeRaft(t *testing.T) {
 	tmpDir := t.TempDir()
 	certPath, keyPath := installTestTLS(t)
@@ -100,7 +100,7 @@ func TestSingleNodeRaft(t *testing.T) {
 	assert.Equal(t, []byte("value-1"), value)
 }
 
-// TestMultipleTablesIsolation tests that tables are isolated from each other
+// TestMultipleTablesIsolation tests that tables are isolated from each other.
 func TestMultipleTablesIsolation(t *testing.T) {
 	tmpDir := t.TempDir()
 	certPath, keyPath := installTestTLS(t)
@@ -150,7 +150,7 @@ func TestMultipleTablesIsolation(t *testing.T) {
 	assert.Equal(t, []byte("object-metadata"), val2) // Still exists
 }
 
-// TestThreeNodeCluster tests a 3-node Raft cluster
+// TestThreeNodeCluster tests a 3-node Raft cluster.
 func TestThreeNodeCluster(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping cluster test in short mode")
@@ -219,7 +219,7 @@ func TestThreeNodeCluster(t *testing.T) {
 	}
 }
 
-// TestLeaderFailover tests that cluster continues after leader failure
+// TestLeaderFailover tests that cluster continues after leader failure.
 func TestLeaderFailover(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping failover test in short mode")
@@ -325,7 +325,7 @@ func TestLeaderFailover(t *testing.T) {
 	assert.Equal(t, []byte("after-failover"), value)
 }
 
-// TestConcurrentWrites tests concurrent writes to the cluster
+// TestConcurrentWrites tests concurrent writes to the cluster.
 func TestConcurrentWrites(t *testing.T) {
 	tmpDir := t.TempDir()
 	certPath, keyPath := installTestTLS(t)
@@ -389,7 +389,7 @@ func TestConcurrentWrites(t *testing.T) {
 	t.Logf("Successfully wrote and verified %d keys", numWriters*numWrites)
 }
 
-// TestLargeValues tests storing large values
+// TestLargeValues tests storing large values.
 func TestLargeValues(t *testing.T) {
 	tmpDir := t.TempDir()
 	certPath, keyPath := installTestTLS(t)

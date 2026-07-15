@@ -45,7 +45,7 @@ func (b *Backend) GetObject(ctx context.Context, req *backend.GetObjectRequest) 
 // For Reed-Solomon, data is split sequentially across data shards:
 // - shardSize = ceil(originalSize / dataShards)
 // - shardIndex = offset / shardSize
-// - offsetWithinShard = offset % shardSize
+// - offsetWithinShard = offset % shardSize.
 func (b *Backend) handleRangeRequest(ctx context.Context, req *backend.GetObjectRequest, shards ObjectToShardNodes, totalSize int64) (*backend.GetObjectResponse, error) {
 	// Normalize range values
 	start := req.RangeStart
@@ -273,7 +273,7 @@ func (b *Backend) getFullObject(ctx context.Context, req *backend.GetObjectReque
 	}, nil
 }
 
-// HeadObject returns object metadata
+// HeadObject returns object metadata.
 func (b *Backend) HeadObject(ctx context.Context, bucket, key string) (*backend.HeadObjectResponse, error) {
 	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: bucket}); err != nil {
 		return nil, err
@@ -291,7 +291,7 @@ func (b *Backend) HeadObject(ctx context.Context, bucket, key string) (*backend.
 	}, nil
 }
 
-// reconstructObject attempts to rebuild an object using parity shards
+// reconstructObject attempts to rebuild an object using parity shards.
 func (b *Backend) reconstructObject(ctx context.Context, bucket, key string, shards ObjectToShardNodes, enc reedsolomon.StreamEncoder, size int64) (*bytes.Buffer, error) {
 	// Get all shard readers including parity
 	shardReaders, err := b.shardReaders(bucket, key, shards, true)
@@ -364,7 +364,7 @@ func (b *Backend) reconstructObject(ctx context.Context, bucket, key string, sha
 	return &out, nil
 }
 
-// generateDistributedETag creates an ETag for a distributed object
+// generateDistributedETag creates an ETag for a distributed object.
 func generateDistributedETag(bucket, key string) string {
 	hash := s3db.GenObjectHash(bucket, key)
 	return hex.EncodeToString(hash[:16])

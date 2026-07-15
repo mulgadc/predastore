@@ -187,7 +187,7 @@ func TestFSMSnapshot_Release(t *testing.T) {
 	snap.Release() // Should not panic
 }
 
-// mockSnapshotSink implements raft.SnapshotSink for testing
+// mockSnapshotSink implements raft.SnapshotSink for testing.
 type mockSnapshotSink struct {
 	buf       []byte
 	closed    bool
@@ -222,7 +222,7 @@ func TestS3DB_Close(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// s3db.New error path
+// s3db.New error path.
 func TestS3DB_New_BadDir(t *testing.T) {
 	db, err := New("/nonexistent/path/that/should/fail")
 	if err == nil {

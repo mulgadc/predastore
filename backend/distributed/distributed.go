@@ -24,7 +24,7 @@ import (
 	s3db "github.com/mulgadc/predastore/s3db"
 )
 
-// NodeConfig holds configuration for a single node
+// NodeConfig holds configuration for a single node.
 type NodeConfig struct {
 	ID     int
 	Host   string
@@ -37,7 +37,7 @@ type NodeConfig struct {
 	Epoch  int
 }
 
-// BucketConfig holds configuration for a bucket
+// BucketConfig holds configuration for a bucket.
 type BucketConfig struct {
 	Name      string
 	Region    string
@@ -46,7 +46,7 @@ type BucketConfig struct {
 	AccountID string
 }
 
-// Config holds distributed backend configuration
+// Config holds distributed backend configuration.
 type Config struct {
 	// DataDir is the root directory for distributed node storage
 	DataDir string
@@ -76,7 +76,7 @@ type Config struct {
 	DBClient *DBClientConfig
 }
 
-// Backend implements the distributed storage backend with Reed-Solomon erasure coding
+// Backend implements the distributed storage backend with Reed-Solomon erasure coding.
 type Backend struct {
 	config        *Config
 	rsDataShard   int
@@ -90,7 +90,7 @@ type Backend struct {
 	buckets       []BucketConfig // bucket configurations
 }
 
-// ObjectToShardNodes maps an object to its shard locations
+// ObjectToShardNodes maps an object to its shard locations.
 type ObjectToShardNodes struct {
 	Object           [32]byte
 	Size             int64
@@ -98,28 +98,28 @@ type ObjectToShardNodes struct {
 	ParityShardNodes []uint32
 }
 
-// hasher implements consistent.Hasher using xxhash
+// hasher implements consistent.Hasher using xxhash.
 type hasher struct{}
 
 func (h hasher) Sum64(data []byte) uint64 {
 	return xxhash.Sum64(data)
 }
 
-// myMember implements consistent.Member
+// myMember implements consistent.Member.
 type myMember string
 
 func (m myMember) String() string {
 	return string(m)
 }
 
-// shardWriteOutcome captures the result of writing a shard via QUIC
+// shardWriteOutcome captures the result of writing a shard via QUIC.
 type shardWriteOutcome struct {
 	shardIndex int
 	shardSize  int64
 	err        error
 }
 
-// bytesBufferWriter wraps a byte slice pointer for use as io.Writer
+// bytesBufferWriter wraps a byte slice pointer for use as io.Writer.
 type bytesBufferWriter struct {
 	buf *[]byte
 }
@@ -129,7 +129,7 @@ func (w *bytesBufferWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-// New creates a new distributed backend
+// New creates a new distributed backend.
 func New(config any) (backend.Backend, error) {
 	cfg, ok := config.(*Config)
 	if !ok {
@@ -234,12 +234,12 @@ func New(config any) (backend.Backend, error) {
 	}, nil
 }
 
-// Type returns the backend type identifier
+// Type returns the backend type identifier.
 func (b *Backend) Type() string {
 	return "distributed"
 }
 
-// Close cleans up resources
+// Close cleans up resources.
 func (b *Backend) Close() error {
 	if b.globalState != nil {
 		return b.globalState.Close()
@@ -248,7 +248,7 @@ func (b *Backend) Close() error {
 }
 
 // getNodeAddr returns the QUIC address for a node
-// It uses the nodeAddrs map from config if available, otherwise falls back to computed address
+// It uses the nodeAddrs map from config if available, otherwise falls back to computed address.
 func (b *Backend) getNodeAddr(nodeNum int) string {
 	if addr, ok := b.nodeAddrs[nodeNum]; ok {
 		return addr
@@ -257,33 +257,33 @@ func (b *Backend) getNodeAddr(nodeNum int) string {
 	return fmt.Sprintf("127.0.0.1:%d", b.quicBasePort+nodeNum)
 }
 
-// DataDir returns the data directory (for testing)
+// DataDir returns the data directory (for testing).
 func (b *Backend) DataDir() string {
 	return b.dataDir
 }
 
-// SetDataDir sets the data directory (for testing)
+// SetDataDir sets the data directory (for testing).
 func (b *Backend) SetDataDir(dir string) {
 	b.dataDir = dir
 }
 
-// RsDataShard returns the number of data shards (for testing)
+// RsDataShard returns the number of data shards (for testing).
 func (b *Backend) RsDataShard() int {
 	return b.rsDataShard
 }
 
-// RsParityShard returns the number of parity shards (for testing)
+// RsParityShard returns the number of parity shards (for testing).
 func (b *Backend) RsParityShard() int {
 	return b.rsParityShard
 }
 
-// HashRing returns the hash ring (for testing)
+// HashRing returns the hash ring (for testing).
 func (b *Backend) HashRing() *consistent.Consistent {
 	return b.hashRing
 }
 
 // DB returns the local badger database (for testing/backward compatibility)
-// Returns nil if using distributed state
+// Returns nil if using distributed state.
 func (b *Backend) DB() *s3db.S3DB {
 	if localState, ok := b.globalState.(*LocalState); ok {
 		return localState.DB()
@@ -291,7 +291,7 @@ func (b *Backend) DB() *s3db.S3DB {
 	return nil
 }
 
-// GlobalState returns the global state interface
+// GlobalState returns the global state interface.
 func (b *Backend) GlobalState() GlobalState {
 	return b.globalState
 }
@@ -484,7 +484,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	return size, nil
 }
 
-// openInput retrieves shard location metadata for an object
+// openInput retrieves shard location metadata for an object.
 func (b *Backend) openInput(bucket string, object string) (ObjectToShardNodes, int64, error) {
 	key := s3db.GenObjectHash(bucket, object)
 

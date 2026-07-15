@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// S3ErrorCode represents standardized S3 error codes
+// S3ErrorCode represents standardized S3 error codes.
 type S3ErrorCode string
 
 const (
@@ -28,7 +28,7 @@ const (
 	ErrChecksumMismatch        S3ErrorCode = "XAmzContentChecksumMismatch"
 )
 
-// S3Error represents a typed S3 error with code and message
+// S3Error represents a typed S3 error with code and message.
 type S3Error struct {
 	Code       S3ErrorCode
 	Message    string
@@ -36,7 +36,7 @@ type S3Error struct {
 	Resource   string
 }
 
-// Error implements the error interface
+// Error implements the error interface.
 func (e *S3Error) Error() string {
 	if e.Resource != "" {
 		return fmt.Sprintf("%s: %s (resource: %s)", e.Code, e.Message, e.Resource)
@@ -44,7 +44,7 @@ func (e *S3Error) Error() string {
 	return fmt.Sprintf("%s: %s", e.Code, e.Message)
 }
 
-// Is implements error comparison for errors.Is()
+// Is implements error comparison for errors.Is().
 func (e *S3Error) Is(target error) bool {
 	t, ok := target.(*S3Error)
 	if !ok {
@@ -53,7 +53,7 @@ func (e *S3Error) Is(target error) bool {
 	return e.Code == t.Code
 }
 
-// Predefined errors for common cases
+// Predefined errors for common cases.
 var (
 	ErrNoSuchBucketError = &S3Error{
 		Code:       ErrNoSuchBucket,
@@ -128,7 +128,7 @@ var (
 	}
 )
 
-// NewS3Error creates a new S3Error with the given code
+// NewS3Error creates a new S3Error with the given code.
 func NewS3Error(code S3ErrorCode, message string, statusCode int) *S3Error {
 	return &S3Error{
 		Code:       code,
@@ -137,7 +137,7 @@ func NewS3Error(code S3ErrorCode, message string, statusCode int) *S3Error {
 	}
 }
 
-// WithResource adds a resource path to an S3Error
+// WithResource adds a resource path to an S3Error.
 func (e *S3Error) WithResource(resource string) *S3Error {
 	return &S3Error{
 		Code:       e.Code,
@@ -147,7 +147,7 @@ func (e *S3Error) WithResource(resource string) *S3Error {
 	}
 }
 
-// IsS3Error checks if an error is an S3Error and returns it
+// IsS3Error checks if an error is an S3Error and returns it.
 func IsS3Error(err error) (*S3Error, bool) {
 	var s3err *S3Error
 	if errors.As(err, &s3err) {
@@ -156,7 +156,7 @@ func IsS3Error(err error) (*S3Error, bool) {
 	return nil, false
 }
 
-// GetHTTPStatus returns the HTTP status code for an error
+// GetHTTPStatus returns the HTTP status code for an error.
 func GetHTTPStatus(err error) int {
 	if s3err, ok := IsS3Error(err); ok {
 		return s3err.StatusCode

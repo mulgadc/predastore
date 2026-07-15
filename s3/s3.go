@@ -45,7 +45,7 @@ type Nodes struct {
 	Epoch  int    `toml:"epoch"`
 }
 
-// DBNode represents a distributed database node configuration
+// DBNode represents a distributed database node configuration.
 type DBNode struct {
 	ID              uint64 `toml:"id"`
 	Host            string `toml:"host"`
@@ -97,7 +97,7 @@ type Config struct {
 	BadgerDir string `toml:"badger_dir"`
 }
 
-// Authentication and policy
+// Authentication and policy.
 type AuthEntry struct {
 	AccessKeyID     string       `toml:"access_key_id"`
 	SecretAccessKey string       `toml:"secret_access_key"`
@@ -212,25 +212,25 @@ type S3Error struct {
 	HostId     string   `xml:"HostId"`
 }
 
-// CreateBucketConfiguration is the request body for CreateBucket
+// CreateBucketConfiguration is the request body for CreateBucket.
 type CreateBucketConfiguration struct {
 	XMLName            xml.Name `xml:"CreateBucketConfiguration"`
 	LocationConstraint string   `xml:"LocationConstraint"`
 }
 
-// CreateBucketResult is the response for CreateBucket
+// CreateBucketResult is the response for CreateBucket.
 type CreateBucketResult struct {
 	XMLName  xml.Name `xml:"CreateBucketResult"`
 	Location string   `xml:"Location"`
 }
 
-// Context key for storing authenticated user info
+// Context key for storing authenticated user info.
 type contextKey string
 
 const (
-	// ContextKeyAccessKeyID is the context key for the authenticated user's access key ID
+	// ContextKeyAccessKeyID is the context key for the authenticated user's access key ID.
 	ContextKeyAccessKeyID contextKey = "accessKeyID"
-	// ContextKeyAccountID is the context key for the authenticated user's account ID
+	// ContextKeyAccountID is the context key for the authenticated user's account ID.
 	ContextKeyAccountID contextKey = "accountID"
 )
 

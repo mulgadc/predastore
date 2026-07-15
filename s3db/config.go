@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// DBNodeConfig represents a single database node in the cluster
+// DBNodeConfig represents a single database node in the cluster.
 type DBNodeConfig struct {
 	ID              uint64 `toml:"id"`
 	Host            string `toml:"host"`
@@ -18,7 +18,7 @@ type DBNodeConfig struct {
 	Leader          bool   `toml:"leader"` // Initial bootstrap leader hint
 }
 
-// ClusterConfig represents the full cluster configuration
+// ClusterConfig represents the full cluster configuration.
 type ClusterConfig struct {
 	NodeID    uint64         // This node's ID
 	Nodes     []DBNodeConfig // All nodes in cluster
@@ -42,7 +42,7 @@ type ClusterConfig struct {
 	LeaderLeaseTimeout time.Duration
 }
 
-// DefaultClusterConfig returns sensible defaults for a cluster
+// DefaultClusterConfig returns sensible defaults for a cluster.
 func DefaultClusterConfig() *ClusterConfig {
 	return &ClusterConfig{
 		HeartbeatTimeout:   1000 * time.Millisecond,
@@ -56,7 +56,7 @@ func DefaultClusterConfig() *ClusterConfig {
 	}
 }
 
-// GetNode returns the node config for the given ID
+// GetNode returns the node config for the given ID.
 func (c *ClusterConfig) GetNode(id uint64) *DBNodeConfig {
 	for i := range c.Nodes {
 		if c.Nodes[i].ID == id {
@@ -66,17 +66,17 @@ func (c *ClusterConfig) GetNode(id uint64) *DBNodeConfig {
 	return nil
 }
 
-// GetThisNode returns the config for this node
+// GetThisNode returns the config for this node.
 func (c *ClusterConfig) GetThisNode() *DBNodeConfig {
 	return c.GetNode(c.NodeID)
 }
 
-// HTTPAddr returns the HTTP address for a node
+// HTTPAddr returns the HTTP address for a node.
 func (n *DBNodeConfig) HTTPAddr() string {
 	return fmt.Sprintf("%s:%d", n.Host, n.Port)
 }
 
-// RaftAddr returns the Raft transport bind address for a node
+// RaftAddr returns the Raft transport bind address for a node.
 func (n *DBNodeConfig) RaftAddr() string {
 	port := n.RaftPort
 	if port == 0 {
@@ -86,7 +86,7 @@ func (n *DBNodeConfig) RaftAddr() string {
 }
 
 // RaftAdvertiseAddr returns the address to advertise to other Raft nodes
-// If AdvertiseHost is set, use it. If Host is 0.0.0.0, default to 127.0.0.1
+// If AdvertiseHost is set, use it. If Host is 0.0.0.0, default to 127.0.0.1.
 func (n *DBNodeConfig) RaftAdvertiseAddr() string {
 	port := n.RaftPort
 	if port == 0 {

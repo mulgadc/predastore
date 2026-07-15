@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// doRequest is a helper function to execute requests against a TestBackend
+// doRequest is a helper function to execute requests against a TestBackend.
 func doRequest(t *testing.T, tb *TestBackend, req *http.Request) *http.Response {
 	t.Helper()
 	rr := httptest.NewRecorder()
@@ -21,14 +21,14 @@ func doRequest(t *testing.T, tb *TestBackend, req *http.Request) *http.Response 
 	return rr.Result()
 }
 
-// TestCRUD tests basic CRUD operations with all backends
+// TestCRUD tests basic CRUD operations with all backends.
 func TestCRUD(t *testing.T) {
 	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
 		testCRUD(t, tb)
 	})
 }
 
-// testCRUD performs the actual CRUD test against the provided backend
+// testCRUD performs the actual CRUD test against the provided backend.
 func testCRUD(t *testing.T, tb *TestBackend) {
 	t.Helper()
 
@@ -101,7 +101,7 @@ func testCRUD(t *testing.T, tb *TestBackend) {
 	assert.Equal(t, 404, resp.StatusCode, "GET after DELETE should return 404")
 }
 
-// TestListBucketsAllBackends tests ListBuckets with all backends
+// TestListBucketsAllBackends tests ListBuckets with all backends.
 func TestListBucketsAllBackends(t *testing.T) {
 	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
 		// For distributed backend, create a bucket first (config buckets are not listed)
@@ -132,7 +132,7 @@ func TestListBucketsAllBackends(t *testing.T) {
 	})
 }
 
-// TestListObjectsAllBackends tests ListObjects with all backends
+// TestListObjectsAllBackends tests ListObjects with all backends.
 func TestListObjectsAllBackends(t *testing.T) {
 	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
 		bucketName := getBucketForBackend(tb.Type)
@@ -159,21 +159,21 @@ func getBucketForBackend(_ BackendType) string {
 	return testBucket
 }
 
-// TestPutOverwrite tests that PUT overwrites existing objects correctly with all backends
+// TestPutOverwrite tests that PUT overwrites existing objects correctly with all backends.
 func TestPutOverwrite(t *testing.T) {
 	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
 		testPutOverwrite(t, tb)
 	})
 }
 
-// TestListObjectsReturnsCorrectSize verifies that ListObjects returns the correct file size
+// TestListObjectsReturnsCorrectSize verifies that ListObjects returns the correct file size.
 func TestListObjectsReturnsCorrectSize(t *testing.T) {
 	RunWithBackends(t, AllBackends(), func(t *testing.T, tb *TestBackend) {
 		testListObjectsReturnsCorrectSize(t, tb)
 	})
 }
 
-// testListObjectsReturnsCorrectSize tests that object size is correctly returned in ListObjects
+// testListObjectsReturnsCorrectSize tests that object size is correctly returned in ListObjects.
 func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
 	t.Helper()
 
@@ -236,7 +236,7 @@ func testListObjectsReturnsCorrectSize(t *testing.T, tb *TestBackend) {
 }
 
 // testPutOverwrite verifies that uploading a file, modifying bytes, and re-uploading
-// correctly overwrites the original content
+// correctly overwrites the original content.
 func testPutOverwrite(t *testing.T, tb *TestBackend) {
 	t.Helper()
 

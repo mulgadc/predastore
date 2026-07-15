@@ -11,7 +11,7 @@ import (
 	"github.com/hashicorp/raft"
 )
 
-// CommandType represents the type of operation
+// CommandType represents the type of operation.
 type CommandType uint8
 
 const (
@@ -19,7 +19,7 @@ const (
 	CommandDelete
 )
 
-// Command represents a database operation that goes through Raft
+// Command represents a database operation that goes through Raft.
 type Command struct {
 	Type  CommandType `json:"type"`
 	Table string      `json:"table"`
@@ -27,19 +27,19 @@ type Command struct {
 	Value []byte      `json:"value,omitempty"`
 }
 
-// FSM implements raft.FSM interface backed by Badger
+// FSM implements raft.FSM interface backed by Badger.
 type FSM struct {
 	mu sync.RWMutex
 	db *badger.DB
 }
 
-// NewFSM creates a new FSM with the given Badger database
+// NewFSM creates a new FSM with the given Badger database.
 func NewFSM(db *badger.DB) *FSM {
 	return &FSM{db: db}
 }
 
 // Apply is called once a log entry is committed by Raft
-// It applies the command to the Badger database
+// It applies the command to the Badger database.
 func (f *FSM) Apply(log *raft.Log) any {
 	var cmd Command
 	if err := json.Unmarshal(log.Data, &cmd); err != nil {
@@ -59,7 +59,7 @@ func (f *FSM) Apply(log *raft.Log) any {
 	}
 }
 
-// applyPut stores a key-value pair
+// applyPut stores a key-value pair.
 func (f *FSM) applyPut(table, key string, value []byte) error {
 	fullKey := makeKey(table, key)
 	return f.db.Update(func(txn *badger.Txn) error {
@@ -67,7 +67,7 @@ func (f *FSM) applyPut(table, key string, value []byte) error {
 	})
 }
 
-// applyDelete removes a key
+// applyDelete removes a key.
 func (f *FSM) applyDelete(table, key string) error {
 	fullKey := makeKey(table, key)
 	return f.db.Update(func(txn *badger.Txn) error {
@@ -75,7 +75,7 @@ func (f *FSM) applyDelete(table, key string) error {
 	})
 }
 
-// Snapshot returns an FSMSnapshot for creating a point-in-time snapshot
+// Snapshot returns an FSMSnapshot for creating a point-in-time snapshot.
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -106,7 +106,7 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	return &FSMSnapshot{data: data}, nil
 }
 
-// Restore restores the FSM from a snapshot
+// Restore restores the FSM from a snapshot.
 func (f *FSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
 
@@ -147,7 +147,7 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	})
 }
 
-// Get reads a value from the local store (can be stale on non-leader)
+// Get reads a value from the local store (can be stale on non-leader).
 func (f *FSM) Get(table, key string) ([]byte, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -165,7 +165,7 @@ func (f *FSM) Get(table, key string) ([]byte, error) {
 	return value, err
 }
 
-// Scan iterates over keys with the given table and prefix
+// Scan iterates over keys with the given table and prefix.
 func (f *FSM) Scan(table, prefix string, fn func(key string, value []byte) error) error {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -197,12 +197,12 @@ func (f *FSM) Scan(table, prefix string, fn func(key string, value []byte) error
 	})
 }
 
-// FSMSnapshot implements raft.FSMSnapshot
+// FSMSnapshot implements raft.FSMSnapshot.
 type FSMSnapshot struct {
 	data map[string][]byte
 }
 
-// Persist writes the snapshot to the given sink
+// Persist writes the snapshot to the given sink.
 func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	err := func() error {
 		// Encode data to JSON
@@ -227,10 +227,10 @@ func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	return err
 }
 
-// Release is called when the snapshot is no longer needed
+// Release is called when the snapshot is no longer needed.
 func (s *FSMSnapshot) Release() {}
 
-// makeKey creates a composite key from table and key
+// makeKey creates a composite key from table and key.
 func makeKey(table, key string) []byte {
 	return []byte(table + "/" + key)
 }
