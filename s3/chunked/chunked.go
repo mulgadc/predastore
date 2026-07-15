@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -61,7 +62,7 @@ func (d *Decoder) Read(p []byte) (int, error) {
 	// Ensure we have an active chunk.
 	if d.curChunkRemaining == 0 {
 		if err := d.readNextChunkHeader(); err != nil {
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				return 0, io.EOF
 			}
 			return 0, err

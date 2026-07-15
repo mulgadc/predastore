@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -109,7 +110,7 @@ func TestDecoder_SmallReadBuffer(t *testing.T) {
 	for {
 		n, err := dec.Read(buf)
 		result = append(result, buf[:n]...)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		require.NoError(t, err)

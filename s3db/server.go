@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -248,7 +249,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 
 	value, err := s.node.Get(table, key)
 	if err != nil {
-		if err == badger.ErrKeyNotFound {
+		if errors.Is(err, badger.ErrKeyNotFound) {
 			s.writeJSON(w, http.StatusNotFound, ErrorResponse{
 				Error:   "KeyNotFound",
 				Message: fmt.Sprintf("Key '%s' not found in table '%s'", key, table),

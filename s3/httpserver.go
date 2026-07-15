@@ -798,7 +798,7 @@ func (s *HTTP2Server) ListenAndServe(addr, certFile, keyFile string) error {
 // ListenAndServeAsync starts the server in a goroutine
 func (s *HTTP2Server) ListenAndServeAsync(addr, certFile, keyFile string) error {
 	go func() {
-		if err := s.ListenAndServe(addr, certFile, keyFile); err != nil && err != http.ErrServerClosed {
+		if err := s.ListenAndServe(addr, certFile, keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("HTTP/2 server error", "error", err)
 		}
 	}()

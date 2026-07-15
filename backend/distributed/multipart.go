@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -92,7 +93,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.Create
 func (b *Backend) getUploadMetadata(uploadID string) (*multipart.UploadMetadata, error) {
 	data, err := b.globalState.Get(TableMultipart, multipartUploadKey(uploadID))
 	if err != nil {
-		if err == s3db.ErrKeyNotFound {
+		if errors.Is(err, s3db.ErrKeyNotFound) {
 			return nil, backend.ErrNoSuchUploadError.WithResource(uploadID)
 		}
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to retrieve upload metadata", 500)

@@ -1,6 +1,9 @@
 package backend
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
 // S3ErrorCode represents standardized S3 error codes
 type S3ErrorCode string
@@ -146,7 +149,8 @@ func (e *S3Error) WithResource(resource string) *S3Error {
 
 // IsS3Error checks if an error is an S3Error and returns it
 func IsS3Error(err error) (*S3Error, bool) {
-	if s3err, ok := err.(*S3Error); ok {
+	var s3err *S3Error
+	if errors.As(err, &s3err) {
 		return s3err, true
 	}
 	return nil, false

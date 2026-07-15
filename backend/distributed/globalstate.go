@@ -1,6 +1,8 @@
 package distributed
 
 import (
+	"errors"
+
 	"github.com/mulgadc/predastore/s3db"
 )
 
@@ -170,7 +172,7 @@ func (d *DistributedState) Delete(table string, key []byte) error {
 // Exists checks if a key exists in the distributed database
 func (d *DistributedState) Exists(table string, key []byte) (bool, error) {
 	_, err := d.client.Get(table, string(key))
-	if err == s3db.ErrKeyNotFound {
+	if errors.Is(err, s3db.ErrKeyNotFound) {
 		return false, nil
 	}
 	if err != nil {

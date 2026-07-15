@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -294,7 +295,7 @@ func (c *Client) doRead(path string) ([]byte, error) {
 	}
 
 	// If we exhausted retries and the last error was KeyNotFound, return that
-	if lastErr == ErrKeyNotFound {
+	if errors.Is(lastErr, ErrKeyNotFound) {
 		return nil, ErrKeyNotFound
 	}
 	return nil, fmt.Errorf("all nodes failed: %w", lastErr)

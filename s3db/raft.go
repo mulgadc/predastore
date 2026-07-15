@@ -2,6 +2,7 @@ package s3db
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -170,7 +171,7 @@ func (n *RaftNode) bootstrap() error {
 	future := n.raft.BootstrapCluster(config)
 	if err := future.Error(); err != nil {
 		// ErrCantBootstrap is ok - means cluster already bootstrapped
-		if err != raft.ErrCantBootstrap {
+		if !errors.Is(err, raft.ErrCantBootstrap) {
 			return err
 		}
 	}
