@@ -6,7 +6,6 @@
 package store
 
 import (
-	"bytes"
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
@@ -422,43 +421,6 @@ func readExtent(txn *badger.Txn, key []byte) (extent, error) {
 		return extent{}, fmt.Errorf("decode extent: %w", err)
 	}
 	return ext, nil
-}
-
-// errStaleSlot signals that a compare-and-swap found the key no longer pointing
-// at the expected extent — a concurrent overwrite or delete won the race.
-var errStaleSlot = errors.New("extent slot moved")
-
-// casExtent commits new only if key still encodes old, in a single index
-// transaction; it retries on badger write conflicts. committed is false (with a
-// nil error) when the slot moved out from under us or the key was deleted — the
-// caller treats the just-copied bytes as harmless dead space.
-func (store *Store) casExtent(key []byte, old, next extent) (committed bool, err error) {
-	for {
-		err = store.index.Badger.Update(func(txn *badger.Txn) error {
-			item, err := txn.Get(key)
-			if err != nil {
-				return err
-			}
-			cur, err := item.ValueCopy(nil)
-			if err != nil {
-				return err
-			}
-			if !bytes.Equal(cur, old.encode()) {
-				return errStaleSlot
-			}
-			return txn.Set(key, next.encode())
-		})
-
-		switch {
-		case errors.Is(err, badger.ErrConflict):
-			continue
-		case errors.Is(err, errStaleSlot), errors.Is(err, badger.ErrKeyNotFound):
-			return false, nil
-		case err != nil:
-			return false, err
-		}
-		return true, nil
-	}
 }
 
 // Delete removes the index entry for a shard in a single index transaction:
