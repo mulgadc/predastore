@@ -367,12 +367,61 @@ func (store *Store) reserveExtent(fragCount uint64) (*segment, int64, error) {
 // commitExtent persists a shard's extent to the index. Called by writers from
 // Close once the data is durable. Concurrency-safe via badger; no Store-level
 // lock needed.
+//
+// An overwrite supersedes whatever extent the key already held, so the old slot
+// becomes dead space. Its tombstone is written in the same transaction that
+// repoints the key — the commit is the instant the supersession happens, so the
+// dead-space hint can neither precede nor outlive it. Without this the orphaned
+// bytes stay invisible to compaction's selector and mask their segment from
+// candidacy forever.
 func (store *Store) commitExtent(objectHash [32]byte, shardIndex uint32, ext extent) error {
 	key := MakeShardKey(objectHash, shardIndex)
-	if err := store.index.Set(key, ext.encode()); err != nil {
-		return fmt.Errorf("commit: %w", err)
+
+	for {
+		err := store.index.Badger.Update(func(txn *badger.Txn) error {
+			old, err := readExtent(txn, key)
+			switch {
+			// A first write has nothing to supersede.
+			case errors.Is(err, badger.ErrKeyNotFound):
+			case err != nil:
+				return err
+			default:
+				if err := txn.Set(tombstoneKey(old.SegNum, old.Off), tombstoneValue(old.PSize)); err != nil {
+					return fmt.Errorf("put tombstone: %w", err)
+				}
+			}
+
+			return txn.Set(key, ext.encode())
+		})
+
+		// Reading the key before writing it puts this txn under badger's conflict
+		// detection: a compactor relocating the same key races us here.
+		if errors.Is(err, badger.ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("commit: %w", err)
+		}
+		return nil
 	}
-	return nil
+}
+
+// readExtent decodes the extent a key currently points at, propagating
+// badger.ErrKeyNotFound unwrapped so callers can branch on a missing key.
+func readExtent(txn *badger.Txn, key []byte) (extent, error) {
+	item, err := txn.Get(key)
+	if err != nil {
+		return extent{}, err
+	}
+	raw, err := item.ValueCopy(nil)
+	if err != nil {
+		return extent{}, fmt.Errorf("copy extent: %w", err)
+	}
+	ext, err := decodeExtent(raw)
+	if err != nil {
+		return extent{}, fmt.Errorf("decode extent: %w", err)
+	}
+	return ext, nil
 }
 
 // errStaleSlot signals that a compare-and-swap found the key no longer pointing
@@ -431,21 +480,12 @@ func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) (bool, error)
 	key := MakeShardKey(objectHash, shardIndex)
 	deleted := false
 	err := store.index.Badger.Update(func(txn *badger.Txn) error {
-		item, err := txn.Get(key)
+		ext, err := readExtent(txn, key)
 		if errors.Is(err, badger.ErrKeyNotFound) {
 			return nil
 		}
 		if err != nil {
 			return fmt.Errorf("delete: read extent: %w", err)
-		}
-
-		raw, err := item.ValueCopy(nil)
-		if err != nil {
-			return fmt.Errorf("delete: copy extent: %w", err)
-		}
-		ext, err := decodeExtent(raw)
-		if err != nil {
-			return fmt.Errorf("delete: decode extent: %w", err)
 		}
 
 		if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
