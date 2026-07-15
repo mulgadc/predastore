@@ -71,12 +71,6 @@ func (c *Client) nextID() uint64 {
 
 // Put sends a shard to the QUIC server and returns the WriteResult
 func (c *Client) Put(ctx context.Context, putReq quicserver.PutRequest, shardData io.Reader) (*quicserver.PutResponse, error) {
-	slog.Debug("QUIC Put starting",
-		"bucket", putReq.Bucket,
-		"shardIndex", putReq.ShardIndex,
-		"shardSize", putReq.ShardSize,
-	)
-
 	putReqBytes, err := json.Marshal(putReq)
 	if err != nil {
 		return nil, fmt.Errorf("marshal put request: %w", err)
@@ -92,12 +86,6 @@ func (c *Client) Put(ctx context.Context, putReq quicserver.PutRequest, shardDat
 		return nil, fmt.Errorf("put request failed: %w", err)
 	}
 
-	slog.Debug("QUIC Put doPut completed",
-		"bucket", putReq.Bucket,
-		"shardIndex", putReq.ShardIndex,
-		"status", rh.Status,
-	)
-
 	if rh.Status != quicproto.StatusOK {
 		return nil, fmt.Errorf("put: status %d", rh.Status)
 	}
@@ -111,18 +99,11 @@ func (c *Client) Put(ctx context.Context, putReq quicserver.PutRequest, shardDat
 		return nil, fmt.Errorf("put error: %s", response.Error)
 	}
 
-	slog.Debug("QUIC Put completed successfully",
-		"bucket", putReq.Bucket,
-		"shardIndex", putReq.ShardIndex,
-		"shardSize", response.ShardSize,
-	)
-
 	return &response, nil
 }
 
 // doPut performs a PUT RPC with body streaming
 func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader, bodyLen int64) (quicproto.Header, []byte, error) {
-	slog.Debug("doPut: opening stream")
 	s, err := c.conn.OpenStreamSync(ctx)
 	if err != nil {
 		slog.Error("doPut: failed to open stream", "error", err)
@@ -130,7 +111,6 @@ func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader,
 	}
 	c.incActive()
 	defer c.decActive()
-	slog.Debug("doPut: stream opened", "streamID", s.StreamID())
 
 	br := bufio.NewReaderSize(s, 128*1024)
 	bw := bufio.NewWriterSize(s, 128*1024)
@@ -165,14 +145,12 @@ func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader,
 	}
 
 	// Stream the body data
-	slog.Debug("doPut: streaming body", "bodyLen", bodyLen)
 	written, err := io.CopyN(bw, body, bodyLen)
 	if err != nil {
 		slog.Error("doPut: body write failed", "written", written, "bodyLen", bodyLen, "error", err)
 		_ = s.Close()
 		return quicproto.Header{}, nil, fmt.Errorf("write body: %w (wrote %d of %d)", err, written, bodyLen)
 	}
-	slog.Debug("doPut: body written", "written", written)
 
 	// Flush the body
 	if err := bw.Flush(); err != nil {
@@ -180,7 +158,6 @@ func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader,
 		_ = s.Close()
 		return quicproto.Header{}, nil, fmt.Errorf("flush body: %w", err)
 	}
-	slog.Debug("doPut: body flushed, waiting for response")
 
 	// Read response header
 	respHdr, err := quicproto.ReadHeader(br)
@@ -189,7 +166,6 @@ func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader,
 		_ = s.Close()
 		return quicproto.Header{}, nil, fmt.Errorf("read response header: %w", err)
 	}
-	slog.Debug("doPut: response header received", "status", respHdr.Status, "metaLen", respHdr.MetaLen)
 
 	// Read response metadata
 	var respMeta []byte
@@ -207,7 +183,6 @@ func (c *Client) doPut(ctx context.Context, requestBytes []byte, body io.Reader,
 	// Both are needed for the stream to be fully released in QUIC.
 	s.CancelRead(0)
 	_ = s.Close()
-	slog.Debug("doPut: stream closed", "streamID", s.StreamID())
 	return respHdr, respMeta, nil
 }
 

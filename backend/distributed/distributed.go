@@ -3,9 +3,7 @@ package distributed
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/gob"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -300,8 +298,6 @@ func (b *Backend) GlobalState() GlobalState {
 
 // putObjectViaQUIC splits a file into RS shards and sends each to the appropriate node via QUIC.
 func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPath string, objectHash [32]byte) (size int64, err error) {
-	slog.Debug("putObjectViaQUIC: starting", "bucket", bucket, "objectPath", objectPath)
-
 	enc, err := reedsolomon.NewStream(b.rsDataShard, b.rsParityShard)
 	if err != nil {
 		return 0, err
@@ -319,7 +315,6 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	}
 
 	size = instat.Size()
-	slog.Debug("putObjectViaQUIC: file size", "size", size)
 
 	// Use objectHash for hash ring placement for consistency with storage and retrieval
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
@@ -405,8 +400,6 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	// Step 3: Encode parity shards using the buffered data shards
 	dataReaders := make([]io.Reader, b.rsDataShard)
 	for i := 0; i < b.rsDataShard; i++ {
-		shardHash := sha256.Sum256(dataShardBuffers[i])
-		slog.Debug("parity encoding: data shard", "shard", i, "len", len(dataShardBuffers[i]), "sha256", hex.EncodeToString(shardHash[:4]))
 		dataReaders[i] = bytes.NewReader(dataShardBuffers[i])
 	}
 
@@ -488,7 +481,6 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 		return 0, firstErr
 	}
 
-	slog.Debug("putObjectViaQUIC: completed successfully", "size", size)
 	return size, nil
 }
 
