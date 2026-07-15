@@ -127,6 +127,7 @@ linters:
     testifylint:
       enable-all: true
       disable:
+        - float-compare # false positives
         - require-error # assert-on-error is deliberate where a test continues to collect further failures
 
   exclusions:
