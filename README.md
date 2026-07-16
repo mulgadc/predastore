@@ -218,4 +218,4 @@ sudo sysctl -w net.core.wmem_max=7500000
 
 ## License
 
-Predastore is open source under the [GNU Affero General Public License v3.0](LICENSE). You're free to use, modify, and deploy it anywhere you need reliable infrastructure without depending on centralized cloud platforms.
+Predastore is licensed under the GNU Affero General Public License v3.0 (AGPLv3). See [LICENSE](LICENSE) for the full text.
