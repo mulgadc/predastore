@@ -1,6 +1,8 @@
 package s3db
 
 import (
+	"bufio"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -106,17 +108,39 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	return &FSMSnapshot{data: data}, nil
 }
 
-// Restore restores the FSM from a snapshot.
+// Restore restores the FSM from a snapshot written by FSMSnapshot.Persist,
+// reading the length-prefixed key/value frames back byte-exact.
 func (f *FSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// Decode the snapshot data
-	var data map[string][]byte
-	if err := json.NewDecoder(rc).Decode(&data); err != nil {
-		return fmt.Errorf("failed to decode snapshot: %w", err)
+	type kv struct{ key, value []byte }
+	var entries []kv
+	r := bufio.NewReader(rc)
+	var lenBuf [4]byte
+	for {
+		// A clean EOF on the frame boundary ends the stream; a short read mid-frame
+		// is a truncated snapshot and must surface as an error, not a silent stop.
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("read key length: %w", err)
+		}
+		key := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
+		if _, err := io.ReadFull(r, key); err != nil {
+			return fmt.Errorf("read key: %w", err)
+		}
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+			return fmt.Errorf("read value length: %w", err)
+		}
+		value := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
+		if _, err := io.ReadFull(r, value); err != nil {
+			return fmt.Errorf("read value: %w", err)
+		}
+		entries = append(entries, kv{key: key, value: value})
 	}
 
 	// Clear existing data and restore from snapshot
@@ -138,8 +162,8 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 		}
 
 		// Restore snapshot data
-		for key, value := range data {
-			if err := txn.Set([]byte(key), value); err != nil {
+		for _, e := range entries {
+			if err := txn.Set(e.key, e.value); err != nil {
 				return err
 			}
 		}
@@ -202,20 +226,36 @@ type FSMSnapshot struct {
 	data map[string][]byte
 }
 
-// Persist writes the snapshot to the given sink.
+// Persist writes the snapshot to the given sink as a stream of length-prefixed
+// key/value frames: BE uint32 keyLen, key, BE uint32 valLen, value.
+//
+// The keys are raw badger keys, and object metadata hash rows are keyed
+// "objects/"+sha256, which is not valid UTF-8. A JSON or other text encoding
+// silently rewrites those bytes to U+FFFD and loses the row on restore, so the
+// wire format must preserve keys byte-for-byte.
 func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
 	err := func() error {
-		// Encode data to JSON
-		b, err := json.Marshal(s.data)
-		if err != nil {
+		w := bufio.NewWriter(sink)
+		var lenBuf [4]byte
+		for k, v := range s.data {
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(k))) //nolint:gosec // key length is bounded by badger's key-size limit.
+			if _, err := w.Write(lenBuf[:]); err != nil {
+				return err
+			}
+			if _, err := w.WriteString(k); err != nil {
+				return err
+			}
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(v))) //nolint:gosec // value length is bounded by badger's value-size limit.
+			if _, err := w.Write(lenBuf[:]); err != nil {
+				return err
+			}
+			if _, err := w.Write(v); err != nil {
+				return err
+			}
+		}
+		if err := w.Flush(); err != nil {
 			return err
 		}
-
-		// Write to sink
-		if _, err := sink.Write(b); err != nil {
-			return err
-		}
-
 		return sink.Close()
 	}()
 

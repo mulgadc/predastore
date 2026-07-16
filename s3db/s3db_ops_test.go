@@ -1,11 +1,10 @@
 package s3db
 
 import (
-	"encoding/json"
+	"bytes"
 	"errors"
 	"io"
 	"os"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -136,20 +135,19 @@ func TestFSM_Restore(t *testing.T) {
 	// Add pre-existing data
 	require.NoError(t, db.Set([]byte("old/key"), []byte("old-val")))
 
-	// Create snapshot data
-	snapData := map[string][]byte{
+	// Build the snapshot stream in the on-wire frame format via Persist.
+	snap := &FSMSnapshot{data: map[string][]byte{
 		"new/key1": []byte("new-val1"),
 		"new/key2": []byte("new-val2"),
-	}
-	encoded, err := json.Marshal(snapData)
-	require.NoError(t, err)
+	}}
+	sink := &mockSnapshotSink{}
+	require.NoError(t, snap.Persist(sink))
 
 	// Restore from snapshot
-	rc := io.NopCloser(strings.NewReader(string(encoded)))
-	require.NoError(t, fsm.Restore(rc))
+	require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(sink.buf))))
 
 	// Old data should be gone
-	_, err = db.Get([]byte("old/key"))
+	_, err := db.Get([]byte("old/key"))
 	assert.Error(t, err)
 
 	// New data should be present
@@ -176,10 +174,50 @@ func TestFSMSnapshot_Persist(t *testing.T) {
 	assert.True(t, sink.closed)
 	assert.False(t, sink.cancelled)
 
-	// Verify the data is valid JSON
-	var decoded map[string][]byte
-	require.NoError(t, json.Unmarshal(sink.buf, &decoded))
-	assert.Equal(t, snap.data, decoded)
+	// The stream must round-trip byte-exact through Restore.
+	db := newTestDB(t)
+	require.NoError(t, NewFSM(db.Badger).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
+	for k, v := range snap.data {
+		got, err := db.Get([]byte(k))
+		require.NoError(t, err)
+		assert.Equal(t, v, got)
+	}
+}
+
+// TestFSM_SnapshotRestore_BinaryKeyRoundTrip guards the metadata-loss defect
+// where the snapshot was JSON-encoded: object hash rows are keyed
+// "objects/"+sha256, which is not valid UTF-8, and encoding/json rewrites those
+// bytes to U+FFFD, destroying the row on restore. The stream must preserve keys
+// byte-for-byte.
+func TestFSM_SnapshotRestore_BinaryKeyRoundTrip(t *testing.T) {
+	// A key whose bytes are all >= 0x80 — invalid UTF-8, the JSON failure case.
+	var hash [32]byte
+	for i := range hash {
+		hash[i] = byte(0x80 + i)
+	}
+	binKey := append([]byte("objects/"), hash[:]...)
+	val := []byte("shard-metadata")
+
+	src := newTestDB(t)
+	require.NoError(t, src.Set(binKey, val))
+
+	snap, err := NewFSM(src.Badger).Snapshot()
+	require.NoError(t, err)
+	sink := &mockSnapshotSink{}
+	require.NoError(t, snap.(*FSMSnapshot).Persist(sink))
+
+	// The raw binary key must appear verbatim, with no U+FFFD substitution.
+	assert.False(t, bytes.Contains(sink.buf, []byte{0xEF, 0xBF, 0xBD}),
+		"snapshot stream must not contain the UTF-8 replacement char")
+	assert.True(t, bytes.Contains(sink.buf, binKey),
+		"snapshot stream must carry the binary key byte-for-byte")
+
+	// Restore into a fresh store and confirm the exact key resolves.
+	dst := newTestDB(t)
+	require.NoError(t, NewFSM(dst.Badger).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
+	got, err := dst.Get(binKey)
+	require.NoError(t, err)
+	assert.Equal(t, val, got)
 }
 
 func TestFSMSnapshot_Release(t *testing.T) {
