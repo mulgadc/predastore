@@ -108,39 +108,27 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	return &FSMSnapshot{data: data}, nil
 }
 
+// snapshotEntry is one key/value pair read from a snapshot stream.
+type snapshotEntry struct{ key, value []byte }
+
 // Restore restores the FSM from a snapshot written by FSMSnapshot.Persist,
 // reading the length-prefixed key/value frames back byte-exact.
+//
+// It also reads the legacy JSON snapshot format (a single map object) so a node
+// upgraded on top of a store with pre-existing snapshots still starts. Legacy
+// snapshots lost binary keys to U+FFFD substitution before the upgrade; they are
+// decoded as-is (no recovery) and future snapshots are written in the frame
+// format.
 func (f *FSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	type kv struct{ key, value []byte }
-	var entries []kv
 	r := bufio.NewReader(rc)
-	var lenBuf [4]byte
-	for {
-		// A clean EOF on the frame boundary ends the stream; a short read mid-frame
-		// is a truncated snapshot and must surface as an error, not a silent stop.
-		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("read key length: %w", err)
-		}
-		key := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
-		if _, err := io.ReadFull(r, key); err != nil {
-			return fmt.Errorf("read key: %w", err)
-		}
-		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-			return fmt.Errorf("read value length: %w", err)
-		}
-		value := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
-		if _, err := io.ReadFull(r, value); err != nil {
-			return fmt.Errorf("read value: %w", err)
-		}
-		entries = append(entries, kv{key: key, value: value})
+	entries, err := readSnapshot(r)
+	if err != nil {
+		return err
 	}
 
 	// Clear existing data and restore from snapshot
@@ -169,6 +157,58 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 		}
 		return nil
 	})
+}
+
+// readSnapshot reads snapshot entries, accepting both the current binary frame
+// format and the legacy JSON map format.
+func readSnapshot(r *bufio.Reader) ([]snapshotEntry, error) {
+	// Legacy snapshots are a JSON object, so they begin with '{'. A frame stream
+	// begins with a big-endian key length whose high byte is 0x00 for any
+	// realistic key (< 16 MiB), never '{', so the first byte disambiguates.
+	first, err := r.Peek(1)
+	if err != nil {
+		if err == io.EOF {
+			return nil, nil // empty snapshot
+		}
+		return nil, fmt.Errorf("peek snapshot: %w", err)
+	}
+	if first[0] == '{' {
+		var data map[string][]byte
+		if err := json.NewDecoder(r).Decode(&data); err != nil {
+			return nil, fmt.Errorf("decode legacy json snapshot: %w", err)
+		}
+		entries := make([]snapshotEntry, 0, len(data))
+		for k, v := range data {
+			entries = append(entries, snapshotEntry{key: []byte(k), value: v})
+		}
+		return entries, nil
+	}
+
+	var entries []snapshotEntry
+	var lenBuf [4]byte
+	for {
+		// A clean EOF on the frame boundary ends the stream; a short read mid-frame
+		// is a truncated snapshot and must surface as an error, not a silent stop.
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("read key length: %w", err)
+		}
+		key := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
+		if _, err := io.ReadFull(r, key); err != nil {
+			return nil, fmt.Errorf("read key: %w", err)
+		}
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+			return nil, fmt.Errorf("read value length: %w", err)
+		}
+		value := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
+		if _, err := io.ReadFull(r, value); err != nil {
+			return nil, fmt.Errorf("read value: %w", err)
+		}
+		entries = append(entries, snapshotEntry{key: key, value: value})
+	}
+	return entries, nil
 }
 
 // Get reads a value from the local store (can be stale on non-leader).

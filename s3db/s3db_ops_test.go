@@ -2,6 +2,7 @@ package s3db
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -218,6 +219,23 @@ func TestFSM_SnapshotRestore_BinaryKeyRoundTrip(t *testing.T) {
 	got, err := dst.Get(binKey)
 	require.NoError(t, err)
 	assert.Equal(t, val, got)
+}
+
+// TestFSM_Restore_LegacyJSON pins backward compatibility: a node upgraded on top
+// of a store with pre-existing JSON-format snapshots must still start, so Restore
+// has to accept the legacy map encoding as well as the new frame format.
+func TestFSM_Restore_LegacyJSON(t *testing.T) {
+	legacy, err := json.Marshal(map[string][]byte{
+		"objects/legacy-key": []byte("legacy-val"),
+	})
+	require.NoError(t, err)
+
+	db := newTestDB(t)
+	require.NoError(t, NewFSM(db.Badger).Restore(io.NopCloser(bytes.NewReader(legacy))))
+
+	got, err := db.Get([]byte("objects/legacy-key"))
+	require.NoError(t, err)
+	assert.Equal(t, []byte("legacy-val"), got)
 }
 
 func TestFSMSnapshot_Release(t *testing.T) {
