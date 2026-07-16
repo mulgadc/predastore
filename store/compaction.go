@@ -81,6 +81,21 @@ func (store *Store) compactOnce() error {
 		return fmt.Errorf("select candidates: %w", err)
 	}
 
+	// Persist the active segNum before dropping any source segment. Every
+	// candidate is below the active segment (candidateSegments excludes it), and
+	// the append path never unlinks segments, so it flushes segNum only lazily.
+	// Without this flush a restart could read a stale, lower segNum and recreate
+	// an empty segment at a number this cycle is about to drop, shadowing the live
+	// data now sitting above it.
+	if len(candidates) > 0 {
+		store.mutex.Lock()
+		err = store.saveState()
+		store.mutex.Unlock()
+		if err != nil {
+			return fmt.Errorf("persist segment counter before compaction drops: %w", err)
+		}
+	}
+
 	var totalExtents int
 	var totalBytes int64
 	for _, num := range candidates {

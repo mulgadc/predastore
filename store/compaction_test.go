@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -107,6 +108,65 @@ func TestCompactionDropsDrainedSegmentAndShrinks(t *testing.T) {
 		if !bytes.Equal(got, body) {
 			t.Errorf("surviving shard %d corrupted", idx)
 		}
+	}
+}
+
+// persistedSegNum reads the active segment counter back out of state.json.
+func persistedSegNum(t *testing.T, dir string) uint64 {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatalf("read state.json: %v", err)
+	}
+	var s struct {
+		SegNum uint64 `json:"segNum"`
+	}
+	if err := json.Unmarshal(data, &s); err != nil {
+		t.Fatalf("unmarshal state.json: %v", err)
+	}
+	return s.SegNum
+}
+
+// A compaction that drops a segment must persist the advanced segNum before the
+// unlink. The append path flushes state.json only when it crosses a fragNum
+// reservation boundary (every 1<<20 fragNums), so after a handful of writes the
+// persisted segNum is still the value Open wrote while the active segment has
+// rolled forward. If a dropped segment's number is at or above that stale value,
+// an ungraceful restart reads it back and getSegment recreates an empty segment
+// below the live data. Graceful Close would mask this by flushing on the way
+// out, so the check is on state.json directly, not a reopen.
+func TestCompactionPersistsSegNumBeforeDrop(t *testing.T) {
+	st, dir := openStore(t, store.WithMaxSegSize(20*store.KiB))
+	defer st.Close()
+
+	oh := [32]byte{0x4}
+	body := bytes.Repeat([]byte{0xaa}, 12*store.KiB)
+	write(t, st, oh, 0, body) // segment 0
+	write(t, st, oh, 1, body) // rolls to segment 1
+	write(t, st, oh, 2, body) // rolls to segment 2 (active)
+
+	// The writes never crossed a reservation boundary, so state.json is still
+	// pinned at the segNum Open persisted while the active segment is now 2.
+	if got := persistedSegNum(t, dir); got != 0 {
+		t.Fatalf("precondition: expected stale persisted segNum 0, got %d", got)
+	}
+
+	if _, err := st.Delete(oh, 0); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if err := st.CompactOnce(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	seg0 := filepath.Join(dir, fmt.Sprintf("%016d.seg", 0))
+	if _, err := os.Stat(seg0); !os.IsNotExist(err) {
+		t.Fatalf("segment 0 should be unlinked by compaction, stat err=%v", err)
+	}
+
+	// The drop unlinked segment 0; the persisted segNum must now sit above it so a
+	// restart resumes at the live active segment instead of recreating segment 0.
+	if got := persistedSegNum(t, dir); got != 2 {
+		t.Errorf("compaction must persist active segNum before dropping: state.json segNum=%d, want 2", got)
 	}
 }
 
