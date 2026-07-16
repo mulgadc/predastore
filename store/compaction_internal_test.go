@@ -226,6 +226,11 @@ func tombstones(t *testing.T, st *Store) map[slot]int64 {
 	t.Helper()
 	found := map[slot]int64{}
 	err := st.index.Scan([]byte{tombstonePrefix}, func(k, v []byte) error {
+		// Shard keys whose hash starts with tombstonePrefix share this scan, so
+		// width-check before decoding a slot out of one.
+		if len(k) != tombstoneKeySize {
+			return nil
+		}
 		s := slot{segNum: tombstoneSegNum(k), off: int64(binary.BigEndian.Uint64(k[9:17]))}
 		found[s] = int64(binary.BigEndian.Uint64(v))
 		return nil
