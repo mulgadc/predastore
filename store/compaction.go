@@ -76,7 +76,7 @@ func (store *Store) compactOnce() error {
 	start := time.Now()
 	slog.Info("compaction started", "interval", store.compactionInterval, "liveThreshold", compactionLiveThreshold)
 
-	candidates, err := store.candidateSegments()
+	candidates, failed, err := store.candidateSegments()
 	if err != nil {
 		return fmt.Errorf("select candidates: %w", err)
 	}
@@ -87,7 +87,11 @@ func (store *Store) compactOnce() error {
 		segStart := time.Now()
 		stats, err := store.compactSegment(num)
 		if err != nil {
-			return fmt.Errorf("compact segment %d: %w", num, err)
+			// One bad segment must not strand the rest of the cycle: log it
+			// loudly and move on rather than aborting every other candidate.
+			slog.Error("compaction skipped segment", "segNum", num, "error", err)
+			failed++
+			continue
 		}
 		totalExtents += stats.extents
 		totalBytes += stats.bytes
@@ -102,39 +106,54 @@ func (store *Store) compactOnce() error {
 		"segments", len(candidates),
 		"extents", totalExtents,
 		"bytes", totalBytes,
+		"failed", failed,
 		"duration", time.Since(start))
 	return nil
 }
 
 // candidateSegments scans the tombstone namespace, sums dead bytes per segment,
-// and returns segments whose live fraction is below the threshold. The active
-// append segment is never a candidate — it is the relocation destination.
-func (store *Store) candidateSegments() ([]uint64, error) {
+// and returns segments whose live fraction is below the threshold, plus a
+// count of segments that could not be inspected. The active append segment is
+// never a candidate — it is the relocation destination.
+//
+// A segment that fails to open or stat is skipped rather than aborting the
+// whole scan: one bad segment (e.g. dropped out from under a stale tombstone)
+// must not strand every other reclaimable candidate. The skip is logged loudly
+// so a persistently bad segment stays visible rather than silently dropped.
+func (store *Store) candidateSegments() ([]uint64, int, error) {
 	dead := make(map[uint64]int64)
 	err := store.index.Scan([]byte{tombstonePrefix}, func(k, v []byte) error {
 		dead[tombstoneSegNum(k)] += int64(binary.BigEndian.Uint64(v)) //nolint:gosec // tombstone value is a non-negative byte count.
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("scan tombstones: %w", err)
+		return nil, 0, fmt.Errorf("scan tombstones: %w", err)
 	}
 
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
 	var candidates []uint64
+	var failed int
 	for num, deadBytes := range dead {
 		if num == store.segNum {
 			continue
 		}
 
-		seg, err := store.getSegment(num)
+		// Read path: a candidate must already exist. If it doesn't (e.g. a
+		// tombstone survived a segment already dropped), skip it and keep
+		// going rather than fabricating a stub or stalling the whole scan.
+		seg, err := store.getSegment(num, false)
 		if err != nil {
-			return nil, fmt.Errorf("get segment %d: %w", num, err)
+			slog.Error("compaction candidate segment unreadable, skipping", "segNum", num, "error", err)
+			failed++
+			continue
 		}
 		info, err := seg.Stat()
 		if err != nil {
-			return nil, fmt.Errorf("stat segment %d: %w", num, err)
+			slog.Error("compaction candidate segment unreadable, skipping", "segNum", num, "error", err)
+			failed++
+			continue
 		}
 
 		size := info.Size()
@@ -145,7 +164,7 @@ func (store *Store) candidateSegments() ([]uint64, error) {
 			candidates = append(candidates, num)
 		}
 	}
-	return candidates, nil
+	return candidates, failed, nil
 }
 
 // segmentStats summarises the live data relocated out of one drained segment.
@@ -206,7 +225,9 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 	fragCount := uint64(old.PSize / totalFragSize) //nolint:gosec // PSize is a non-negative multiple of totalFragSize.
 
 	store.mutex.Lock()
-	srcSeg, err := store.getSegment(old.SegNum)
+	// Read path: the extent's index entry claims this segment holds live data,
+	// so a missing segment here must be reported rather than fabricated.
+	srcSeg, err := store.getSegment(old.SegNum, false)
 	if err != nil {
 		store.mutex.Unlock()
 		return fmt.Errorf("get source segment %d: %w", old.SegNum, err)
@@ -221,7 +242,10 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 	}
 	dstSeg.addRef()
 
-	newExt := extent{SegNum: store.segNum, Off: dstOff, PSize: old.PSize, LSize: old.LSize}
+	// dstSeg, not store.segNum: reserveExtent can roll onto a new segment, and
+	// the destination the extent actually landed in is the one that must be
+	// recorded, not whatever store.segNum happens to be afterward.
+	newExt := extent{SegNum: dstSeg.num, Off: dstOff, PSize: old.PSize, LSize: old.LSize}
 	if err := dstSeg.appendIdx(idxEntry{Off: dstOff, Key: [36]byte(key), PSize: old.PSize}); err != nil {
 		srcSeg.releaseRef()
 		dstSeg.releaseRef()

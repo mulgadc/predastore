@@ -50,7 +50,9 @@ func decodeIdxEntry(b []byte) (e idxEntry, err error) {
 // allocated there. The rows are hints: callers must back-check each against the
 // index, which is the authority on what is live.
 func scanIdx(dir string, segNum uint64) ([]idxEntry, error) {
-	f, err := openFile(filepath.Join(dir, fmt.Sprintf(idxSegFilename, segNum)))
+	// Read-only: a segment scanned by compaction is expected to already exist,
+	// so a missing .idx must be reported rather than fabricated.
+	f, err := openFile(filepath.Join(dir, fmt.Sprintf(idxSegFilename, segNum)), false)
 	if err != nil {
 		return nil, err
 	}
@@ -131,10 +133,17 @@ type file interface {
 	Close() error
 }
 
-// openFile is the package-level opener used by openSegment. Production code
-// uses os.OpenFile; tests override via export_test.go.
-var openFile = func(path string) (file, error) {
-	return os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+// openFile is the package-level opener used by openSegment and scanIdx.
+// create distinguishes the append path, which may fabricate a fresh segment,
+// from read paths (lookup, compaction), which must report a missing segment
+// as an error rather than silently creating a header-only stand-in.
+// Production code uses os.OpenFile; tests override via export_test.go.
+var openFile = func(path string, create bool) (file, error) {
+	flags := os.O_RDWR
+	if create {
+		flags |= os.O_CREATE
+	}
+	return os.OpenFile(path, flags, 0600)
 }
 
 // segment is an open segment file handle with a reference count.
@@ -198,14 +207,17 @@ func (store *Store) dropSegment(num uint64) error {
 	return errors.Join(errs...)
 }
 
-// getSegment returns a cached segment or opens it from disk. Callers must hold
+// getSegment returns a cached segment or opens it from disk. create selects
+// the append path (fabricate a fresh segment if none exists) versus a read
+// path (report a missing segment as an error). A cache hit ignores create,
+// since the segment already exists either way. Callers must hold
 // store.mutex.
-func (store *Store) getSegment(num uint64) (*segment, error) {
+func (store *Store) getSegment(num uint64, create bool) (*segment, error) {
 	if seg, ok := store.segCache[num]; ok {
 		return seg, nil
 	}
 
-	seg, err := openSegment(store.dir, num)
+	seg, err := openSegment(store.dir, num, create)
 	if err != nil {
 		return nil, err
 	}
@@ -220,7 +232,8 @@ func (store *Store) getSegment(num uint64) (*segment, error) {
 // over. Callers must hold store.mutex.
 func (store *Store) nextAvailableSegment() (*segment, error) {
 	for range maxSegmentScanAttempts {
-		seg, err := store.getSegment(store.segNum)
+		// Append path: fabricate the segment if it doesn't exist yet.
+		seg, err := store.getSegment(store.segNum, true)
 		if err != nil {
 			return nil, fmt.Errorf("get segment %d: %w", store.segNum, err)
 		}
@@ -241,18 +254,19 @@ func (store *Store) nextAvailableSegment() (*segment, error) {
 // incoming shard. Callers must hold store.mutex.
 func (store *Store) rollSegment() (*segment, error) {
 	store.segNum++
-	return store.getSegment(store.segNum)
+	// Append path: fabricate the segment if it doesn't exist yet.
+	return store.getSegment(store.segNum, true)
 }
 
-func openSegment(dir string, num uint64) (*segment, error) {
+func openSegment(dir string, num uint64, create bool) (*segment, error) {
 	path := filepath.Join(dir, fmt.Sprintf(segFilename, num))
 
-	f, err := openFile(path)
+	f, err := openFile(path, create)
 	if err != nil {
 		return nil, err
 	}
 
-	idxFile, err := openFile(filepath.Join(dir, fmt.Sprintf(idxSegFilename, num)))
+	idxFile, err := openFile(filepath.Join(dir, fmt.Sprintf(idxSegFilename, num)), create)
 	if err != nil {
 		if closeErr := f.Close(); closeErr != nil {
 			slog.Warn("failed to close segment", "segNum", num, "error", closeErr)

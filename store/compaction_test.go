@@ -180,8 +180,12 @@ func TestNoCompactorWithoutOption(t *testing.T) {
 // cycle loses nothing.
 func TestCompactionFaultLeavesLiveDataReadable(t *testing.T) {
 	var armed bool
-	restore := store.SetOpenFile(func(path string) (store.File, error) {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	restore := store.SetOpenFile(func(path string, create bool) (store.File, error) {
+		flags := os.O_RDWR
+		if create {
+			flags |= os.O_CREATE
+		}
+		f, err := os.OpenFile(path, flags, 0600)
 		if err != nil {
 			return nil, err
 		}

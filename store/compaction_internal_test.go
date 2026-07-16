@@ -172,9 +172,12 @@ func TestCandidateSelectionAllDeadSegmentIsCandidate(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 
-	cands, err := st.candidateSegments()
+	cands, failed, err := st.candidateSegments()
 	if err != nil {
 		t.Fatalf("candidates: %v", err)
+	}
+	if failed != 0 {
+		t.Fatalf("candidate scan reported %d failures, want 0", failed)
 	}
 	if len(cands) != 1 || cands[0] != 0 {
 		t.Fatalf("expected segment 0 as sole candidate, got %v", cands)
@@ -183,9 +186,12 @@ func TestCandidateSelectionAllDeadSegmentIsCandidate(t *testing.T) {
 
 func TestCandidateSelectionAllLiveNoCandidates(t *testing.T) {
 	st, _, _ := segment0LayoutStore(t)
-	cands, err := st.candidateSegments()
+	cands, failed, err := st.candidateSegments()
 	if err != nil {
 		t.Fatalf("candidates: %v", err)
+	}
+	if failed != 0 {
+		t.Fatalf("candidate scan reported %d failures, want 0", failed)
 	}
 	if len(cands) != 0 {
 		t.Fatalf("no deletes, expected no candidates, got %v", cands)
@@ -200,9 +206,12 @@ func TestCandidateSelectionNeverSelectsActiveSegment(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 
-	cands, err := st.candidateSegments()
+	cands, failed, err := st.candidateSegments()
 	if err != nil {
 		t.Fatalf("candidates: %v", err)
+	}
+	if failed != 0 {
+		t.Fatalf("candidate scan reported %d failures, want 0", failed)
 	}
 	for _, c := range cands {
 		if c == st.segNum {
@@ -327,9 +336,12 @@ func TestOverwriteChurnDrainsSegment(t *testing.T) {
 	putShard(t, st, oh, 0, body)
 	putShard(t, st, oh, 1, body)
 
-	cands, err := st.candidateSegments()
+	cands, failed, err := st.candidateSegments()
 	if err != nil {
 		t.Fatalf("candidates: %v", err)
+	}
+	if failed != 0 {
+		t.Fatalf("candidate scan reported %d failures, want 0", failed)
 	}
 	if len(cands) != 1 || cands[0] != 0 {
 		t.Fatalf("expected overwrite-dead segment 0 as sole candidate, got %v", cands)

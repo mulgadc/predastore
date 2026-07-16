@@ -206,7 +206,9 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (Reader, erro
 		return nil, fmt.Errorf("decode extent: %w", err)
 	}
 
-	seg, err := store.getSegment(ext.SegNum)
+	// Read path: a segment the index still points at must exist; report it
+	// missing rather than fabricating a stub.
+	seg, err := store.getSegment(ext.SegNum, false)
 	if err != nil {
 		return nil, fmt.Errorf("get segment %d: %w", ext.SegNum, err)
 	}
