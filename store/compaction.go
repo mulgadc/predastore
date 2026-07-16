@@ -215,6 +215,17 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 		stats.bytes += cur.PSize
 	}
 
+	// The relocations above CAS-committed the repointed rows into badger, which
+	// runs with SyncWrites off, so they may still be only in the OS page cache.
+	// dropSegment durably unlinks the source, so without this fsync a power loss
+	// or kernel panic between the two could revert the index to a segment that is
+	// already gone. Skip it when nothing moved: an empty drop repoints nothing.
+	if stats.extents > 0 {
+		if err := store.index.Badger.Sync(); err != nil {
+			return stats, fmt.Errorf("sync index before drop %d: %w", num, err)
+		}
+	}
+
 	store.mutex.Lock()
 	err = store.dropSegment(num)
 	store.mutex.Unlock()
