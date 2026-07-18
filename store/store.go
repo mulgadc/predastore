@@ -63,6 +63,20 @@ type Store struct {
 	compactionInterval time.Duration
 	compactor          *compactor
 
+	// Free-space watermark fractions gating Append; see WithFreeSpaceWatermark.
+	nearfullFreeFrac float64
+	fullFreeFrac     float64
+
+	// statfs cache backing freeSpaceFraction, throttled to statfsThrottleInterval
+	// so Append's hot path pays for at most one syscall per interval.
+	statfsAt time.Time
+	freeFrac float64
+
+	// bytesSinceStatfs accumulates reserved extent bytes since the last statfs,
+	// forcing a refresh once it crosses statfsBytesInterval so the watermark
+	// tracks a fast write burst instead of serving a stale reading.
+	bytesSinceStatfs uint64
+
 	closed bool
 }
 
@@ -83,6 +97,14 @@ var (
 	ErrClosedStore = errors.New("closed store")
 	ErrKeyNotFound = errors.New("key not found")
 	ErrShardFull   = errors.New("shard full")
+
+	// ErrStoreFull is returned by Append when the store's backing filesystem
+	// free-space fraction has dropped below the full watermark (see
+	// WithFreeSpaceWatermark). It is the store-side half of the pool
+	// free-space watermark: callers translate it into a client-visible
+	// out-of-space error (e.g. a 507 S3 response) at the seam where a store
+	// error crosses into a wire protocol.
+	ErrStoreFull = errors.New("store full")
 )
 
 // Option configures a Store at Open time. Options may fail (e.g. invalid key
@@ -111,6 +133,29 @@ func WithCompaction(interval time.Duration) Option {
 	}
 }
 
+// WithFreeSpaceWatermark overrides the free-space watermark fractions that
+// gate Append (see freeSpaceFraction in freespace.go). Both are free-space
+// fractions of the store's backing filesystem, not used-space fractions:
+// crossing below nearfullFreeFrac kicks an immediate compaction pass but
+// still accepts the write; crossing below fullFreeFrac rejects the write
+// with ErrStoreFull. fullFreeFrac must not exceed nearfullFreeFrac — full is
+// the stricter, lower threshold. Without this option the store defaults to
+// nearfull 0.15 (85% used) / full 0.05 (95% used), following Ceph's
+// nearfull/full watermarks.
+func WithFreeSpaceWatermark(nearfullFreeFrac, fullFreeFrac float64) Option {
+	return func(s *Store) error {
+		if nearfullFreeFrac < 0 || nearfullFreeFrac > 1 || fullFreeFrac < 0 || fullFreeFrac > 1 {
+			return fmt.Errorf("free-space watermark fractions must be in [0,1], got nearfull=%v full=%v", nearfullFreeFrac, fullFreeFrac)
+		}
+		if fullFreeFrac > nearfullFreeFrac {
+			return fmt.Errorf("full watermark (%v) must not exceed nearfull watermark (%v)", fullFreeFrac, nearfullFreeFrac)
+		}
+		s.nearfullFreeFrac = nearfullFreeFrac
+		s.fullFreeFrac = fullFreeFrac
+		return nil
+	}
+}
+
 // WithAEAD sets the cipher sealing every fragment, and is mandatory. The nonce
 // layout fixes NonceSize at 12. Callers build the cipher themselves, so the
 // store never sees raw key bytes.
@@ -135,6 +180,8 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		segCache:           make(map[uint64]*segment),
 		maxSegSize:         DefaultMaxSegSize,
 		compactionInterval: defaultCompactionInterval,
+		nearfullFreeFrac:   defaultNearfullFreeFrac,
+		fullFreeFrac:       defaultFullFreeFrac,
 	}
 
 	for _, opt := range opts {
@@ -241,6 +288,20 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		return nil, ErrClosedStore
 	}
 
+	// Pool free-space watermark: reject before reserving any extent so a full
+	// store fails fast rather than partially committing. A statfs error is
+	// logged and treated as permissive — a monitoring hiccup must not itself
+	// take writes down.
+	if frac, err := store.freeSpaceFraction(); err != nil {
+		slog.Warn("free-space check failed, proceeding without a watermark decision", "dir", store.dir, "error", err)
+	} else if frac < store.fullFreeFrac {
+		return nil, ErrStoreFull
+	} else if frac < store.nearfullFreeFrac {
+		// Still under budget: accept the write but kick reclaim now rather
+		// than waiting for the next ticker cycle.
+		store.kickCompaction()
+	}
+
 	// Ceiling division; size == 0 yields an empty extent the writer never fills.
 	fragCount := (uint64(size) + fragBodySize - 1) / fragBodySize
 
@@ -290,6 +351,10 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 
 	store.shardNum += 1
 	store.fragNum += fragCount
+
+	// Count the reserved bytes toward the statfs byte bound so a burst of
+	// Appends forces a fresh free-space reading before it can overshoot full.
+	store.bytesSinceStatfs += uint64(ext.PSize) //nolint:gosec // PSize is a non-negative on-disk byte count.
 
 	return w, nil
 }

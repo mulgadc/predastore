@@ -1,10 +1,34 @@
 package quicclient
 
 import (
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mulgadc/predastore/quic/quicproto"
 )
+
+// classifyPutStatus is the seam Put uses to turn a non-OK response status
+// into an error. A status of StatusInsufficientStorage must be
+// distinguishable via errors.Is(err, ErrInsufficientStorage) so callers
+// (the distributed backend) can translate it into a 507 S3 response instead
+// of collapsing it into a generic failure.
+func TestClassifyPutStatusInsufficientStorageIsDistinguishable(t *testing.T) {
+	err := classifyPutStatus(quicproto.StatusInsufficientStorage)
+	if !errors.Is(err, ErrInsufficientStorage) {
+		t.Fatalf("classifyPutStatus(%d) = %v, want an error wrapping ErrInsufficientStorage", quicproto.StatusInsufficientStorage, err)
+	}
+}
+
+func TestClassifyPutStatusOtherStatusIsNotInsufficientStorage(t *testing.T) {
+	for _, status := range []uint16{quicproto.StatusBadRequest, quicproto.StatusServerError, quicproto.StatusUnavailable, quicproto.StatusNotFound} {
+		err := classifyPutStatus(status)
+		if errors.Is(err, ErrInsufficientStorage) {
+			t.Fatalf("classifyPutStatus(%d) unexpectedly wraps ErrInsufficientStorage", status)
+		}
+	}
+}
 
 func TestClientActiveStreams(t *testing.T) {
 	c := &Client{}

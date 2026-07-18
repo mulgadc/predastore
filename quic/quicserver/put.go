@@ -3,11 +3,13 @@ package quicserver
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 
 	"github.com/mulgadc/predastore/quic/quicproto"
+	"github.com/mulgadc/predastore/store"
 )
 
 // handlePUTShard receives shard data via QUIC and writes it to the local store.
@@ -27,6 +29,23 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 
 	writer, err := qs.store.Append(putReq.ObjectHash, putReq.ShardIndex, bodyLen)
 	if err != nil {
+		// Append rejected before consuming the request body. The client is
+		// still streaming it, so drain (and discard) the body before replying:
+		// returning without reading resets the un-drained QUIC stream mid-upload,
+		// and the client sees a stream cancellation instead of our status code —
+		// which loses the out-of-space signal entirely. Draining lets the client
+		// finish its write and read the real status.
+		if _, derr := io.Copy(io.Discard, io.LimitReader(br, bodyLen)); derr != nil {
+			slog.Warn("handlePUTShard: draining body after append error failed", "error", derr)
+		}
+		// The pool free-space watermark tripped: surface a distinguishable
+		// status so the client sees a real out-of-space error instead of a
+		// generic server failure. Every other Append error stays 500.
+		if errors.Is(err, store.ErrStoreFull) {
+			slog.Warn("handlePUTShard: store full, rejecting write", "error", err)
+			writeErr(bw, req, quicproto.StatusInsufficientStorage, fmt.Sprintf("append: %v", err))
+			return
+		}
 		slog.Error("handlePUTShard: append failed", "error", err)
 		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("append: %v", err))
 		return
@@ -44,7 +63,10 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		return
 	}
 
-	response := PutResponse{ShardSize: bodyLen}
+	// Surface pool pressure on the success path so a client backing off early
+	// (e.g. viperblock refusing new guest writes) learns about the nearfull
+	// band before this node ever rejects a write outright.
+	response := PutResponse{ShardSize: bodyLen, PoolNearFull: qs.store.NearFull()}
 	respBytes, err := json.Marshal(response)
 	if err != nil {
 		writeErr(bw, req, quicproto.StatusServerError, "marshal response failed")

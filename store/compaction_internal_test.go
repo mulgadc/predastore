@@ -25,7 +25,14 @@ func testAEAD(t *testing.T) cipher.AEAD {
 func openTestStore(t *testing.T, opts ...Option) (*Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := Open(dir, append(opts, WithAEAD(testAEAD(t)))...)
+	// Tests share a host whose real free-space fraction is outside this
+	// suite's control (CI runners, busy dev boxes, tmpfs-backed TempDir all
+	// fluctuate). Default the watermark off (0, 0 never crosses either
+	// threshold) so ordinary tests don't flake on ambient disk pressure;
+	// callers that actually want to exercise the watermark pass their own
+	// WithFreeSpaceWatermark in opts, which is applied after and wins.
+	base := append([]Option{WithFreeSpaceWatermark(0, 0)}, opts...)
+	st, err := Open(dir, append(base, WithAEAD(testAEAD(t)))...)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

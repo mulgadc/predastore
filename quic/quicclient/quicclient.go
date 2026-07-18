@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,6 +20,24 @@ import (
 const (
 	alpn = "mulga-repl-v1"
 )
+
+// ErrInsufficientStorage is returned by Put when the remote node's store
+// rejected the write because its backing filesystem crossed the full
+// free-space watermark (quicproto.StatusInsufficientStorage). Callers that
+// need to distinguish "backend is full" from an ordinary transport/server
+// failure should errors.Is against this rather than parsing status text.
+var ErrInsufficientStorage = errors.New("insufficient storage")
+
+// classifyPutStatus turns a non-OK PUT response status into the error Put
+// returns, preserving StatusInsufficientStorage as a distinguishable
+// sentinel instead of collapsing every non-OK status into the same generic
+// "put: status N" error.
+func classifyPutStatus(status uint16) error {
+	if status == quicproto.StatusInsufficientStorage {
+		return fmt.Errorf("put: status %d: %w", status, ErrInsufficientStorage)
+	}
+	return fmt.Errorf("put: status %d", status)
+}
 
 type Client struct {
 	conn          *quic.Conn
@@ -87,7 +106,7 @@ func (c *Client) Put(ctx context.Context, putReq quicserver.PutRequest, shardDat
 	}
 
 	if rh.Status != quicproto.StatusOK {
-		return nil, fmt.Errorf("put: status %d", rh.Status)
+		return nil, classifyPutStatus(rh.Status)
 	}
 
 	var response quicserver.PutResponse

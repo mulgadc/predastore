@@ -36,6 +36,22 @@ func TestHandleError_BackendS3Error(t *testing.T) {
 	assert.Equal(t, "NoSuchBucket", s3error.Code)
 }
 
+// The pool free-space watermark's 507 must reach the HTTP client verbatim,
+// the same forwarding path any other *backend.S3Error takes.
+func TestHandleError_InsufficientStorage(t *testing.T) {
+	server := setupHandleErrorServer(t)
+	req := httptest.NewRequest(http.MethodPut, "/bucket/key", nil)
+	rr := httptest.NewRecorder()
+
+	server.handleError(rr, req, backend.ErrInsufficientStorageError)
+
+	assert.Equal(t, http.StatusInsufficientStorage, rr.Code)
+
+	var s3error S3Error
+	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &s3error))
+	assert.Equal(t, "InsufficientStorage", s3error.Code)
+}
+
 func TestHandleError_NoSuchBucketString(t *testing.T) {
 	server := setupHandleErrorServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)

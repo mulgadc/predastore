@@ -29,11 +29,18 @@ const (
 type compactor struct {
 	store *Store
 	done  chan struct{}
-	wg    sync.WaitGroup
+
+	// kick requests an out-of-cycle compaction pass. Buffered to 1 so a
+	// non-blocking send never stalls the caller (Append holds store.mutex
+	// while it sends); a pending kick already covers any kick that arrives
+	// before the loop drains it, so coalescing is correct, not lossy.
+	kick chan struct{}
+
+	wg sync.WaitGroup
 }
 
 func (store *Store) startCompactor() {
-	c := &compactor{store: store, done: make(chan struct{})}
+	c := &compactor{store: store, done: make(chan struct{}), kick: make(chan struct{}, 1)}
 	store.compactor = c
 	c.wg.Add(1)
 	slog.Info("compactor started")
@@ -53,7 +60,27 @@ func (c *compactor) loop() {
 			if err := c.store.compactOnce(); err != nil {
 				slog.Error("compaction cycle failed", "error", err)
 			}
+		case <-c.kick:
+			if err := c.store.compactOnce(); err != nil {
+				slog.Error("kicked compaction cycle failed", "error", err)
+			}
 		}
+	}
+}
+
+// kickCompaction requests an immediate compaction pass without blocking the
+// caller. compactOnce takes store.mutex, which Append (the caller on the
+// nearfull path) already holds for its whole body, so this can never call
+// compactOnce inline — it only signals the independent compactor goroutine,
+// which picks the kick up on its own schedule. A no-op if compaction is
+// disabled (no WithCompaction) or a kick is already pending.
+func (store *Store) kickCompaction() {
+	if store.compactor == nil {
+		return
+	}
+	select {
+	case store.compactor.kick <- struct{}{}:
+	default:
 	}
 }
 

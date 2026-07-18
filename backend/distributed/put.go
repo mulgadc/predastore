@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 
 	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/s3/chunked"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
@@ -16,6 +18,19 @@ import (
 // arnObjectPrefix is the ARN prefix for object keys
 // Format: arn:aws:s3:::<bucket>/<key>.
 const arnObjectPrefixPut = "arn:aws:s3:::"
+
+// mapPutErr translates an error from putObjectViaQUIC into the S3 error a
+// client should see. A shard write that failed because a remote node's store
+// crossed its full free-space watermark carries quicclient.ErrInsufficientStorage
+// through the RS shard fan-out unwrapped (see putObjectViaQUIC's firstErr);
+// that specific case must reach the client as 507, not collapse into the
+// generic 500 every other shard-write failure gets.
+func mapPutErr(err error) *backend.S3Error {
+	if errors.Is(err, quicclient.ErrInsufficientStorage) {
+		return backend.ErrInsufficientStorageError
+	}
+	return backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+}
 
 // PutObject stores an object using Reed-Solomon encoding across multiple nodes.
 func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) (*backend.PutObjectResponse, error) {
@@ -63,10 +78,11 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	}
 
 	var size int64
-	size, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
+	var poolNearFull bool
+	size, poolNearFull, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
 	if err != nil {
 		slog.Error("distributed.PutObject: shard distribution failed", "error", err)
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+		return nil, mapPutErr(err)
 	}
 
 	objectToShardNodes.Size = size
@@ -113,7 +129,8 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	}
 
 	return &backend.PutObjectResponse{
-		ETag: generateDistributedETag(req.Bucket, req.Key),
+		ETag:         generateDistributedETag(req.Bucket, req.Key),
+		PoolNearFull: poolNearFull,
 	}, nil
 }
 
@@ -144,7 +161,7 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 	}
 
 	var size int64
-	size, err = b.putObjectViaQUIC(ctx, bucket, objectPath, objectHash)
+	size, _, err = b.putObjectViaQUIC(ctx, bucket, objectPath, objectHash)
 	if err != nil {
 		return err
 	}

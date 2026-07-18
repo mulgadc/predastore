@@ -662,6 +662,12 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pool free-space watermark: a nearfull node still accepted this write,
+	// but a client (e.g. viperblock) that sees this header can stop admitting
+	// new work early rather than waiting to hit the hard 507 full rejection.
+	if resp.PoolNearFull {
+		w.Header().Set("X-Predastore-Pool-Pressure", "nearfull")
+	}
 	w.Header().Set("ETag", resp.ETag)
 	w.WriteHeader(http.StatusOK)
 }
