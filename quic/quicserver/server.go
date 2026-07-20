@@ -41,9 +41,8 @@ type QuicServer struct {
 	compactionInterval time.Duration
 
 	// Free-space watermark override for the store; see WithFreeSpaceWatermark.
-	// watermarkSet distinguishes "explicitly set to 0" from "unset, use the
-	// store's own defaults" — a zero fullFreeFrac is a legitimate (if
-	// permissive) configuration.
+	// watermarkSet distinguishes "explicitly set to 0" from "unset, use
+	// store defaults", since a zero fullFreeFrac is otherwise legitimate.
 	nearfullFreeFrac float64
 	fullFreeFrac     float64
 	watermarkSet     bool
@@ -143,11 +142,8 @@ type PutRequest struct {
 type PutResponse struct {
 	ShardSize int64 `json:"shard_size"`
 	// PoolNearFull reports whether this node's store was in the nearfull
-	// free-space band (accepted the write but under pressure) at commit time.
-	// Only ever set on a successful response — a rejected write fails with
-	// StatusInsufficientStorage instead. Aggregated across shards by the
-	// distributed backend into PutObjectResponse.PoolNearFull so callers see
-	// the pressure signal before any node actually goes full.
+	// free-space band at commit time. Only set on success — a rejected
+	// write fails with StatusInsufficientStorage instead.
 	PoolNearFull bool   `json:"pool_near_full,omitempty"`
 	Error        string `json:"error,omitempty"`
 }

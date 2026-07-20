@@ -19,9 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// mapPutErr is the seam between a QUIC shard-write failure and the S3
-// response a client sees. It must preserve the pool-full signal instead of
-// collapsing every putObjectViaQUIC failure into the same generic 500.
 func TestMapPutErrInsufficientStorage(t *testing.T) {
 	err := fmt.Errorf("put failed: %w", quicclient.ErrInsufficientStorage)
 
@@ -46,13 +43,9 @@ func TestMapPutErrOtherErrorStaysInternalError(t *testing.T) {
 	}
 }
 
-// TestPutObjectFullPoolReturns507EndToEnd drives the real seam: five live
-// QuicServer nodes, each opened with an unsatisfiable free-space watermark
-// (0.9999 free-space fraction, above any real disk), so every shard PUT hits
-// store.ErrStoreFull. That crosses handlePUTShard (quicproto.StatusInsufficientStorage),
-// quicclient.Put (ErrInsufficientStorage), and mapPutErr (backend.S3Error),
-// landing on Backend.PutObject as a real 507 — the same status handleError
-// forwards verbatim to the HTTP client.
+// TestPutObjectFullPoolReturns507EndToEnd drives PutObject against five QUIC
+// nodes opened with an unsatisfiable free-space watermark, so every shard
+// write is rejected and the failure must surface as a 507 end-to-end.
 func TestPutObjectFullPoolReturns507EndToEnd(t *testing.T) {
 	const bucket = "test-bucket-full"
 
@@ -82,8 +75,7 @@ func TestPutObjectFullPoolReturns507EndToEnd(t *testing.T) {
 	quicclient.SetDefaultRootCAs(pool)
 	t.Cleanup(func() { quicclient.SetDefaultRootCAs(nil) })
 
-	// Every node's store is opened full: whichever nodes the hash ring picks
-	// for this object's data/parity shards, the write is rejected.
+	// Every node is opened full, so whichever ones the hash ring picks reject the write.
 	quicServers := make([]*quicserver.QuicServer, 5)
 	for i := range 5 {
 		nodeDir := filepath.Join(dataDir, fmt.Sprintf("node-%d", i))

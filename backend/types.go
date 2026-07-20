@@ -57,10 +57,8 @@ type PutObjectRequest struct {
 // PutObjectResponse contains the result of PutObject operation.
 type PutObjectResponse struct {
 	ETag string
-	// PoolNearFull reports whether any node holding a shard of this object
-	// was in the nearfull free-space band. The S3 handler surfaces this as
-	// the X-Predastore-Pool-Pressure response header so clients can start
-	// backing off before the pool actually goes full.
+	// PoolNearFull reports whether any shard's node was in the nearfull
+	// free-space band; surfaced to clients via the X-Predastore-Pool-Pressure header.
 	PoolNearFull bool
 }
 

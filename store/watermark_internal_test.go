@@ -9,9 +9,8 @@ import (
 	"time"
 )
 
-// A fullFreeFrac this close to 1 is guaranteed to sit above any real disk's
-// free-space fraction, so Append must reject deterministically without
-// mocking statfs — exactly the property the watermark exists to guarantee.
+// A fullFreeFrac this close to 1 sits above any real disk's free-space
+// fraction, so this rejects deterministically without mocking statfs.
 func TestAppendRejectsWhenFull(t *testing.T) {
 	st, _ := openTestStore(t, WithFreeSpaceWatermark(0.9999, 0.9999))
 
@@ -21,8 +20,7 @@ func TestAppendRejectsWhenFull(t *testing.T) {
 	}
 }
 
-// Zero thresholds accept any positive free-space fraction, which every real
-// filesystem this test can run on has.
+// Zero thresholds accept any positive free-space fraction.
 func TestAppendAcceptsWhenPermissive(t *testing.T) {
 	st, _ := openTestStore(t, WithFreeSpaceWatermark(0, 0))
 
@@ -35,15 +33,9 @@ func TestAppendAcceptsWhenPermissive(t *testing.T) {
 	}
 }
 
-// Fail-without: with the watermark check removed (or with a fullFreeFrac
-// that can never be crossed), Append must NOT return ErrStoreFull even
-// though the configured "full" threshold is nominally in force everywhere
-// else in this file — this pins down that WithFreeSpaceWatermark(0, 0) is
-// truly a no-op, not accidentally permissive by some other path.
+// Opens directly (bypassing openTestStore's watermark override) to check the
+// real package defaults against a dev disk.
 func TestAppendNotFullByDefaultOnDevDisk(t *testing.T) {
-	// openTestStore defaults the watermark off for test isolation (see its
-	// comment), so this test opens directly to get the real package
-	// defaults (nearfull 0.15 / full 0.05) unmasked by that helper.
 	st, err := Open(t.TempDir(), WithAEAD(testAEAD(t)))
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -73,8 +65,6 @@ func TestWithFreeSpaceWatermarkRejectsOutOfRange(t *testing.T) {
 	}
 }
 
-// freeSpaceFraction must reuse the cached value within statfsThrottleInterval
-// rather than paying for a statfs syscall on every Append.
 func TestFreeSpaceFractionThrottled(t *testing.T) {
 	st, _ := openTestStore(t)
 
@@ -97,8 +87,6 @@ func TestFreeSpaceFractionThrottled(t *testing.T) {
 	}
 }
 
-// Once the throttle interval elapses, the next call must re-measure rather
-// than serve a value that could be arbitrarily stale.
 func TestFreeSpaceFractionRefreshesAfterInterval(t *testing.T) {
 	st, _ := openTestStore(t)
 
@@ -123,10 +111,8 @@ func TestFreeSpaceFractionRefreshesAfterInterval(t *testing.T) {
 	}
 }
 
-// A large write burst must not outrun the watermark inside the throttle
-// window: once statfsBytesInterval bytes have been reserved, freeSpaceFraction
-// re-measures even though statfsThrottleInterval has not elapsed. Without this
-// the store can race from below-threshold to 0 free between timed refreshes.
+// Crossing statfsBytesInterval must force a re-measure even though
+// statfsThrottleInterval has not elapsed.
 func TestFreeSpaceFractionRefreshesAfterByteThreshold(t *testing.T) {
 	st, _ := openTestStore(t)
 
@@ -154,8 +140,6 @@ func TestFreeSpaceFractionRefreshesAfterByteThreshold(t *testing.T) {
 	}
 }
 
-// Append must count the bytes it reserves toward the statfs byte bound, so a
-// run of writes eventually forces a fresh measurement even within one second.
 func TestAppendAccumulatesBytesSinceStatfs(t *testing.T) {
 	st, _ := openTestStore(t)
 
@@ -166,16 +150,15 @@ func TestAppendAccumulatesBytesSinceStatfs(t *testing.T) {
 	if err := w.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
-	// Append re-measured at entry (resetting the counter to 0), then reserved an
-	// extent — so the counter must reflect that reservation.
+	// Append re-measures at entry (resetting the counter), then reserves an
+	// extent, so the counter must reflect that reservation.
 	if st.bytesSinceStatfs == 0 {
 		t.Fatalf("bytesSinceStatfs = 0 after Append, want the reserved extent size")
 	}
 }
 
-// kickCompaction must send without blocking, whether or not a kick is
-// already pending — Append holds store.mutex while it calls this, so any
-// blocking here is a deadlock waiting to happen.
+// Append holds store.mutex while calling kickCompaction, so a blocking send
+// here would deadlock.
 func TestKickCompactionNonBlockingSend(t *testing.T) {
 	st, _ := openTestStore(t)
 	st.compactor = &compactor{store: st, done: make(chan struct{}), kick: make(chan struct{}, 1)}
@@ -208,15 +191,12 @@ func TestKickCompactionCoalescesWithoutBlocking(t *testing.T) {
 	}
 }
 
-// A no-op when compaction was never enabled: nothing to kick, and Append
-// must not panic reaching for a nil compactor.
 func TestKickCompactionNoopWithoutCompactor(t *testing.T) {
 	st, _ := openTestStore(t)
 	st.kickCompaction() // must not panic
 }
 
-// Crossing the nearfull threshold on Append must kick the compactor while
-// still accepting the write — nearfull is advisory pressure, not a reject.
+// nearfull is advisory pressure, not a reject.
 func TestAppendKicksCompactorOnNearfullButAccepts(t *testing.T) {
 	st, _ := openTestStore(t, WithFreeSpaceWatermark(0.9999, 0))
 	st.compactor = &compactor{store: st, done: make(chan struct{}), kick: make(chan struct{}, 1)}
@@ -236,8 +216,6 @@ func TestAppendKicksCompactorOnNearfullButAccepts(t *testing.T) {
 	}
 }
 
-// Append below the full threshold must NOT kick the compactor — only
-// crossing nearfull-but-not-full should trigger reclaim pressure.
 func TestAppendDoesNotKickCompactorWhenPermissive(t *testing.T) {
 	st, _ := openTestStore(t, WithFreeSpaceWatermark(0, 0))
 	st.compactor = &compactor{store: st, done: make(chan struct{}), kick: make(chan struct{}, 1)}
@@ -257,9 +235,8 @@ func TestAppendDoesNotKickCompactorWhenPermissive(t *testing.T) {
 	}
 }
 
-// The compactor's own goroutine must react to a kick, not just the helper
-// that sends on the channel — this exercises the real select-case wiring in
-// loop() with WithCompaction actually running.
+// Exercises the real select-case wiring in loop(), not just the helper that
+// sends on the channel.
 func TestCompactorLoopRunsOnKick(t *testing.T) {
 	st, dir := openTestStore(t, WithMaxSegSize(40*KiB), WithCompaction(time.Hour))
 	oh := [32]byte{0x66}
@@ -275,9 +252,7 @@ func TestCompactorLoopRunsOnKick(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 
-	// The ticker won't fire for an hour; only the kick can drive this
-	// compaction pass. Segment 0 is now under the live threshold and must
-	// drop once the kicked cycle runs.
+	// The ticker won't fire for an hour; only the kick drives this pass.
 	st.compactor.kick <- struct{}{}
 
 	segPath := filepath.Join(dir, fmt.Sprintf(segFilename, uint64(0)))

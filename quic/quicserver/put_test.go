@@ -21,10 +21,7 @@ func readPutResponse(t *testing.T, out *bytes.Buffer) quicproto.Header {
 	return hdr
 }
 
-// A store whose full watermark is set to reject everything (0.9999 free-space
-// fraction, guaranteed above any real disk's free fraction) exercises the
-// exact seam handlePUTShard uses to translate store.ErrStoreFull into a wire
-// status, without mocking statfs.
+// fullStore sets a full watermark that rejects everything, without mocking statfs.
 func fullStore(t *testing.T) *store.Store {
 	t.Helper()
 	st, err := store.Open(t.TempDir(),
@@ -56,10 +53,8 @@ func TestHandlePUTShardStoreFullReturnsInsufficientStorage(t *testing.T) {
 	}
 }
 
-// A store that is not full must still surface an ordinary 500 for an
-// unrelated Append failure — the 507 path must not swallow other errors.
-// Closing the store makes Append fail with store.ErrClosedStore, which is
-// deliberately NOT store.ErrStoreFull.
+// Closing the store makes Append fail with store.ErrClosedStore, not
+// store.ErrStoreFull, so the 507 path must not swallow it.
 func TestHandlePUTShardOtherAppendErrorStaysServerError(t *testing.T) {
 	st, err := store.Open(t.TempDir(), store.WithAEAD(storetest.TestAEAD()))
 	if err != nil {

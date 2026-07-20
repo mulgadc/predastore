@@ -19,12 +19,9 @@ import (
 // Format: arn:aws:s3:::<bucket>/<key>.
 const arnObjectPrefixPut = "arn:aws:s3:::"
 
-// mapPutErr translates an error from putObjectViaQUIC into the S3 error a
-// client should see. A shard write that failed because a remote node's store
-// crossed its full free-space watermark carries quicclient.ErrInsufficientStorage
-// through the RS shard fan-out unwrapped (see putObjectViaQUIC's firstErr);
-// that specific case must reach the client as 507, not collapse into the
-// generic 500 every other shard-write failure gets.
+// mapPutErr translates a putObjectViaQUIC error into the S3 error returned
+// to the client. A pool-full shard write must surface as 507, not the
+// generic 500 other failures get.
 func mapPutErr(err error) *backend.S3Error {
 	if errors.Is(err, quicclient.ErrInsufficientStorage) {
 		return backend.ErrInsufficientStorageError

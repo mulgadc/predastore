@@ -36,8 +36,7 @@ func TestHandleError_BackendS3Error(t *testing.T) {
 	assert.Equal(t, "NoSuchBucket", s3error.Code)
 }
 
-// The pool free-space watermark's 507 must reach the HTTP client verbatim,
-// the same forwarding path any other *backend.S3Error takes.
+// The 507 must reach the HTTP client verbatim, like any other *backend.S3Error.
 func TestHandleError_InsufficientStorage(t *testing.T) {
 	server := setupHandleErrorServer(t)
 	req := httptest.NewRequest(http.MethodPut, "/bucket/key", nil)

@@ -298,9 +298,8 @@ func (b *Backend) GlobalState() GlobalState {
 }
 
 // putObjectViaQUIC splits a file into RS shards and sends each to the
-// appropriate node via QUIC. poolNearFull reports whether ANY shard's target
-// node responded with PoolNearFull set — one node under pressure is enough
-// to warn the caller, even though the object as a whole still wrote fine.
+// appropriate node via QUIC. poolNearFull is set if any shard's target node
+// reported pressure.
 func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPath string, objectHash [32]byte) (size int64, poolNearFull bool, err error) {
 	enc, err := reedsolomon.NewStream(b.rsDataShard, b.rsParityShard)
 	if err != nil {

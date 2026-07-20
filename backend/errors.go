@@ -129,11 +129,9 @@ var (
 		StatusCode: 409,
 	}
 
-	// ErrInsufficientStorageError is returned when the store's backing
-	// filesystem has crossed the full free-space watermark and rejected a
-	// write. StatusCode 507 (Insufficient Storage) lets the client
-	// distinguish "the pool is full, stop and back off" from a transient
-	// 500.
+	// ErrInsufficientStorageError is returned when the store's free-space
+	// watermark rejects a write; 507 lets clients distinguish this from a
+	// transient 500.
 	ErrInsufficientStorageError = &S3Error{
 		Code:       ErrInsufficientStorage,
 		Message:    "The storage pool is at capacity and cannot accept new writes",

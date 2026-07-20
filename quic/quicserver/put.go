@@ -29,18 +29,11 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 
 	writer, err := qs.store.Append(putReq.ObjectHash, putReq.ShardIndex, bodyLen)
 	if err != nil {
-		// Append rejected before consuming the request body. The client is
-		// still streaming it, so drain (and discard) the body before replying:
-		// returning without reading resets the un-drained QUIC stream mid-upload,
-		// and the client sees a stream cancellation instead of our status code —
-		// which loses the out-of-space signal entirely. Draining lets the client
-		// finish its write and read the real status.
+		// An un-drained QUIC stream gets reset instead of carrying our status
+		// code, so drain the client's in-flight body before replying.
 		if _, derr := io.Copy(io.Discard, io.LimitReader(br, bodyLen)); derr != nil {
 			slog.Warn("handlePUTShard: draining body after append error failed", "error", derr)
 		}
-		// The pool free-space watermark tripped: surface a distinguishable
-		// status so the client sees a real out-of-space error instead of a
-		// generic server failure. Every other Append error stays 500.
 		if errors.Is(err, store.ErrStoreFull) {
 			slog.Warn("handlePUTShard: store full, rejecting write", "error", err)
 			writeErr(bw, req, quicproto.StatusInsufficientStorage, fmt.Sprintf("append: %v", err))
@@ -63,9 +56,8 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		return
 	}
 
-	// Surface pool pressure on the success path so a client backing off early
-	// (e.g. viperblock refusing new guest writes) learns about the nearfull
-	// band before this node ever rejects a write outright.
+	// Surface nearfull pressure on success too, so callers can back off
+	// before a write is ever outright rejected.
 	response := PutResponse{ShardSize: bodyLen, PoolNearFull: qs.store.NearFull()}
 	respBytes, err := json.Marshal(response)
 	if err != nil {

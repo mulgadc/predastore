@@ -67,14 +67,12 @@ type Store struct {
 	nearfullFreeFrac float64
 	fullFreeFrac     float64
 
-	// statfs cache backing freeSpaceFraction, throttled to statfsThrottleInterval
-	// so Append's hot path pays for at most one syscall per interval.
+	// statfs cache backing freeSpaceFraction; see statfsThrottleInterval.
 	statfsAt time.Time
 	freeFrac float64
 
-	// bytesSinceStatfs accumulates reserved extent bytes since the last statfs,
-	// forcing a refresh once it crosses statfsBytesInterval so the watermark
-	// tracks a fast write burst instead of serving a stale reading.
+	// bytesSinceStatfs accumulates reserved extent bytes since the last
+	// statfs; see statfsBytesInterval.
 	bytesSinceStatfs uint64
 
 	closed bool
@@ -98,12 +96,8 @@ var (
 	ErrKeyNotFound = errors.New("key not found")
 	ErrShardFull   = errors.New("shard full")
 
-	// ErrStoreFull is returned by Append when the store's backing filesystem
-	// free-space fraction has dropped below the full watermark (see
-	// WithFreeSpaceWatermark). It is the store-side half of the pool
-	// free-space watermark: callers translate it into a client-visible
-	// out-of-space error (e.g. a 507 S3 response) at the seam where a store
-	// error crosses into a wire protocol.
+	// ErrStoreFull is returned by Append when free space has dropped below
+	// the full watermark (see WithFreeSpaceWatermark).
 	ErrStoreFull = errors.New("store full")
 )
 
@@ -133,15 +127,11 @@ func WithCompaction(interval time.Duration) Option {
 	}
 }
 
-// WithFreeSpaceWatermark overrides the free-space watermark fractions that
-// gate Append (see freeSpaceFraction in freespace.go). Both are free-space
-// fractions of the store's backing filesystem, not used-space fractions:
+// WithFreeSpaceWatermark overrides the free-space fractions that gate Append:
 // crossing below nearfullFreeFrac kicks an immediate compaction pass but
-// still accepts the write; crossing below fullFreeFrac rejects the write
-// with ErrStoreFull. fullFreeFrac must not exceed nearfullFreeFrac — full is
-// the stricter, lower threshold. Without this option the store defaults to
-// nearfull 0.15 (85% used) / full 0.05 (95% used), following Ceph's
-// nearfull/full watermarks.
+// still accepts the write; crossing below fullFreeFrac rejects it with
+// ErrStoreFull. fullFreeFrac must not exceed nearfullFreeFrac. Defaults to
+// nearfull 0.15 / full 0.05 if unset.
 func WithFreeSpaceWatermark(nearfullFreeFrac, fullFreeFrac float64) Option {
 	return func(s *Store) error {
 		if nearfullFreeFrac < 0 || nearfullFreeFrac > 1 || fullFreeFrac < 0 || fullFreeFrac > 1 {
@@ -288,17 +278,14 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		return nil, ErrClosedStore
 	}
 
-	// Pool free-space watermark: reject before reserving any extent so a full
-	// store fails fast rather than partially committing. A statfs error is
-	// logged and treated as permissive — a monitoring hiccup must not itself
-	// take writes down.
+	// Check the watermark before reserving any extent so a full store fails
+	// fast. Treat a statfs error as permissive — a monitoring hiccup must not
+	// itself take writes down.
 	if frac, err := store.freeSpaceFraction(); err != nil {
 		slog.Warn("free-space check failed, proceeding without a watermark decision", "dir", store.dir, "error", err)
 	} else if frac < store.fullFreeFrac {
 		return nil, ErrStoreFull
 	} else if frac < store.nearfullFreeFrac {
-		// Still under budget: accept the write but kick reclaim now rather
-		// than waiting for the next ticker cycle.
 		store.kickCompaction()
 	}
 
@@ -352,8 +339,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 	store.shardNum += 1
 	store.fragNum += fragCount
 
-	// Count the reserved bytes toward the statfs byte bound so a burst of
-	// Appends forces a fresh free-space reading before it can overshoot full.
+	// Count toward the statfs byte bound; see statfsBytesInterval.
 	store.bytesSinceStatfs += uint64(ext.PSize) //nolint:gosec // PSize is a non-negative on-disk byte count.
 
 	return w, nil

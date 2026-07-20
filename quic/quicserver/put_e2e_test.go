@@ -36,19 +36,11 @@ func newFullTestQuicServer(t *testing.T) (*quicserver.QuicServer, string) {
 	return qs, addr
 }
 
-// TestHandlePUTShardDrainsBodyBeforeRejectingOverQUIC is a regression test
-// for a bug where handlePUTShard replied with an error status without first
-// draining the client's in-flight body. Returning early left the QUIC stream
-// un-drained; when handleStream's deferred cleanup then called
-// s.CancelRead(0), a client still blocked writing the body saw the stream
-// reset instead of the response — the 507 out-of-space status never arrived.
-//
-// The body here (4 MiB) exceeds quicconf.InitialStreamReceiveWindow (2 MiB)
-// and the server never reads application-level bytes from a rejected PUT, so
-// the client's write blocks on flow control until the server actually drains
-// it. That only happens post-fix, which is what makes this reproduce the bug
-// without the drain: without it, client.Put fails with a transport-level
-// stream error instead of wrapping quicclient.ErrInsufficientStorage.
+// TestHandlePUTShardDrainsBodyBeforeRejectingOverQUIC pins down that a
+// rejected PUT drains the client's in-flight body before replying, so the
+// client observes the real status instead of a stream reset. The body size
+// exceeds the QUIC receive window, so the client blocks on flow control
+// until the server drains it.
 func TestHandlePUTShardDrainsBodyBeforeRejectingOverQUIC(t *testing.T) {
 	qs, addr := newFullTestQuicServer(t)
 	defer qs.Close()
