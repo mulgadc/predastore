@@ -1,10 +1,29 @@
 package quicclient
 
 import (
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mulgadc/predastore/quic/quicproto"
 )
+
+func TestClassifyPutStatusInsufficientStorageIsDistinguishable(t *testing.T) {
+	err := classifyPutStatus(quicproto.StatusInsufficientStorage)
+	if !errors.Is(err, ErrInsufficientStorage) {
+		t.Fatalf("classifyPutStatus(%d) = %v, want an error wrapping ErrInsufficientStorage", quicproto.StatusInsufficientStorage, err)
+	}
+}
+
+func TestClassifyPutStatusOtherStatusIsNotInsufficientStorage(t *testing.T) {
+	for _, status := range []uint16{quicproto.StatusBadRequest, quicproto.StatusServerError, quicproto.StatusUnavailable, quicproto.StatusNotFound} {
+		err := classifyPutStatus(status)
+		if errors.Is(err, ErrInsufficientStorage) {
+			t.Fatalf("classifyPutStatus(%d) unexpectedly wraps ErrInsufficientStorage", status)
+		}
+	}
+}
 
 func TestClientActiveStreams(t *testing.T) {
 	c := &Client{}

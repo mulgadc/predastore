@@ -23,6 +23,11 @@ const (
 	StatusServerError  uint16 = 500
 	StatusUnavailable  uint16 = 503
 	StatusUnauthorized uint16 = 401
+
+	// StatusInsufficientStorage signals that the store's backing filesystem
+	// crossed the full free-space watermark and rejected the write. Mirrors
+	// HTTP 507 so it survives translation straight through to the S3 client.
+	StatusInsufficientStorage uint16 = 507
 )
 
 var (

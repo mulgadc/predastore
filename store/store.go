@@ -63,6 +63,18 @@ type Store struct {
 	compactionInterval time.Duration
 	compactor          *compactor
 
+	// Free-space watermark fractions gating Append; see WithFreeSpaceWatermark.
+	nearfullFreeFrac float64
+	fullFreeFrac     float64
+
+	// statfs cache backing freeSpaceFraction; see statfsThrottleInterval.
+	statfsAt time.Time
+	freeFrac float64
+
+	// bytesSinceStatfs accumulates reserved extent bytes since the last
+	// statfs; see statfsBytesInterval.
+	bytesSinceStatfs uint64
+
 	closed bool
 }
 
@@ -83,6 +95,10 @@ var (
 	ErrClosedStore = errors.New("closed store")
 	ErrKeyNotFound = errors.New("key not found")
 	ErrShardFull   = errors.New("shard full")
+
+	// ErrStoreFull is returned by Append when free space has dropped below
+	// the full watermark (see WithFreeSpaceWatermark).
+	ErrStoreFull = errors.New("store full")
 )
 
 // Option configures a Store at Open time. Options may fail (e.g. invalid key
@@ -111,6 +127,25 @@ func WithCompaction(interval time.Duration) Option {
 	}
 }
 
+// WithFreeSpaceWatermark overrides the free-space fractions that gate Append:
+// crossing below nearfullFreeFrac kicks an immediate compaction pass but
+// still accepts the write; crossing below fullFreeFrac rejects it with
+// ErrStoreFull. fullFreeFrac must not exceed nearfullFreeFrac. Defaults to
+// nearfull 0.15 / full 0.05 if unset.
+func WithFreeSpaceWatermark(nearfullFreeFrac, fullFreeFrac float64) Option {
+	return func(s *Store) error {
+		if nearfullFreeFrac < 0 || nearfullFreeFrac > 1 || fullFreeFrac < 0 || fullFreeFrac > 1 {
+			return fmt.Errorf("free-space watermark fractions must be in [0,1], got nearfull=%v full=%v", nearfullFreeFrac, fullFreeFrac)
+		}
+		if fullFreeFrac > nearfullFreeFrac {
+			return fmt.Errorf("full watermark (%v) must not exceed nearfull watermark (%v)", fullFreeFrac, nearfullFreeFrac)
+		}
+		s.nearfullFreeFrac = nearfullFreeFrac
+		s.fullFreeFrac = fullFreeFrac
+		return nil
+	}
+}
+
 // WithAEAD sets the cipher sealing every fragment, and is mandatory. The nonce
 // layout fixes NonceSize at 12. Callers build the cipher themselves, so the
 // store never sees raw key bytes.
@@ -135,6 +170,8 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		segCache:           make(map[uint64]*segment),
 		maxSegSize:         DefaultMaxSegSize,
 		compactionInterval: defaultCompactionInterval,
+		nearfullFreeFrac:   defaultNearfullFreeFrac,
+		fullFreeFrac:       defaultFullFreeFrac,
 	}
 
 	for _, opt := range opts {
@@ -241,6 +278,17 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		return nil, ErrClosedStore
 	}
 
+	// Check the watermark before reserving any extent so a full store fails
+	// fast. Treat a statfs error as permissive — a monitoring hiccup must not
+	// itself take writes down.
+	if frac, err := store.freeSpaceFraction(); err != nil {
+		slog.Warn("free-space check failed, proceeding without a watermark decision", "dir", store.dir, "error", err)
+	} else if frac < store.fullFreeFrac {
+		return nil, ErrStoreFull
+	} else if frac < store.nearfullFreeFrac {
+		store.kickCompaction()
+	}
+
 	// Ceiling division; size == 0 yields an empty extent the writer never fills.
 	fragCount := (uint64(size) + fragBodySize - 1) / fragBodySize
 
@@ -290,6 +338,9 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 
 	store.shardNum += 1
 	store.fragNum += fragCount
+
+	// Count toward the statfs byte bound; see statfsBytesInterval.
+	store.bytesSinceStatfs += uint64(ext.PSize) //nolint:gosec // PSize is a non-negative on-disk byte count.
 
 	return w, nil
 }

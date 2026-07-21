@@ -179,9 +179,9 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 		slog.Debug("Failed to close temp file", "path", tmpPath, "error", closeErr)
 	}
 
-	if _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpPath, objectHash); err != nil {
+	if _, _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpPath, objectHash); err != nil {
 		slog.Error("Failed to store part", "uploadID", req.UploadID, "part", req.PartNumber, "error", err)
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store part", 500)
+		return nil, mapPutErr(err)
 	}
 
 	// Create part metadata
@@ -383,9 +383,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	// Store the final object using PutObject mechanism
 	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
 
-	if _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash); err != nil {
+	if _, _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash); err != nil {
 		slog.Error("Failed to store final object", "uploadID", req.UploadID, "error", err)
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store final object", 500)
+		return nil, mapPutErr(err)
 	}
 
 	// Get final object size

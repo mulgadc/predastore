@@ -40,6 +40,13 @@ type QuicServer struct {
 
 	compactionInterval time.Duration
 
+	// Free-space watermark override for the store; see WithFreeSpaceWatermark.
+	// watermarkSet distinguishes "explicitly set to 0" from "unset, use
+	// store defaults", since a zero fullFreeFrac is otherwise legitimate.
+	nearfullFreeFrac float64
+	fullFreeFrac     float64
+	watermarkSet     bool
+
 	store *store.Store
 
 	// Listener for graceful shutdown
@@ -101,6 +108,18 @@ func WithCompactionInterval(d time.Duration) Option {
 	}
 }
 
+// WithFreeSpaceWatermark overrides the store's pool free-space watermark
+// fractions (see store.WithFreeSpaceWatermark). Without this option the
+// store's built-in defaults apply (nearfull 0.15 / full 0.05 free).
+func WithFreeSpaceWatermark(nearfullFreeFrac, fullFreeFrac float64) Option {
+	return func(qs *QuicServer) error {
+		qs.nearfullFreeFrac = nearfullFreeFrac
+		qs.fullFreeFrac = fullFreeFrac
+		qs.watermarkSet = true
+		return nil
+	}
+}
+
 type ObjectRequest struct {
 	Bucket     string `json:"bucket"`
 	Object     string `json:"object"`
@@ -121,8 +140,12 @@ type PutRequest struct {
 
 // PutResponse contains the result of a QUIC PUT operation.
 type PutResponse struct {
-	ShardSize int64  `json:"shard_size"`
-	Error     string `json:"error,omitempty"`
+	ShardSize int64 `json:"shard_size"`
+	// PoolNearFull reports whether this node's store was in the nearfull
+	// free-space band at commit time. Only set on success — a rejected
+	// write fails with StatusInsufficientStorage instead.
+	PoolNearFull bool   `json:"pool_near_full,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 // DeleteRequest contains metadata for deleting a shard via QUIC DELETE.
@@ -172,7 +195,11 @@ func NewWithRetry(walDir string, addr string, maxRetries int, opts ...Option) (*
 		return nil, fmt.Errorf("quicserver: tls cert and key are required (use WithTLSCertFiles)")
 	}
 
-	s, err := store.Open(walDir, store.WithAEAD(qs.aead), store.WithCompaction(qs.compactionInterval))
+	storeOpts := []store.Option{store.WithAEAD(qs.aead), store.WithCompaction(qs.compactionInterval)}
+	if qs.watermarkSet {
+		storeOpts = append(storeOpts, store.WithFreeSpaceWatermark(qs.nearfullFreeFrac, qs.fullFreeFrac))
+	}
+	s, err := store.Open(walDir, storeOpts...)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("open store in %s: %w", walDir, err)

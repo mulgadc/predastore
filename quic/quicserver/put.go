@@ -3,11 +3,13 @@ package quicserver
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 
 	"github.com/mulgadc/predastore/quic/quicproto"
+	"github.com/mulgadc/predastore/store"
 )
 
 // handlePUTShard receives shard data via QUIC and writes it to the local store.
@@ -27,6 +29,16 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 
 	writer, err := qs.store.Append(putReq.ObjectHash, putReq.ShardIndex, bodyLen)
 	if err != nil {
+		// An un-drained QUIC stream gets reset instead of carrying our status
+		// code, so drain the client's in-flight body before replying.
+		if _, derr := io.Copy(io.Discard, io.LimitReader(br, bodyLen)); derr != nil {
+			slog.Warn("handlePUTShard: draining body after append error failed", "error", derr)
+		}
+		if errors.Is(err, store.ErrStoreFull) {
+			slog.Warn("handlePUTShard: store full, rejecting write", "error", err)
+			writeErr(bw, req, quicproto.StatusInsufficientStorage, fmt.Sprintf("append: %v", err))
+			return
+		}
 		slog.Error("handlePUTShard: append failed", "error", err)
 		writeErr(bw, req, quicproto.StatusServerError, fmt.Sprintf("append: %v", err))
 		return
@@ -44,7 +56,9 @@ func (qs *QuicServer) handlePUTShard(br *bufio.Reader, bw *bufio.Writer, req qui
 		return
 	}
 
-	response := PutResponse{ShardSize: bodyLen}
+	// Surface nearfull pressure on success too, so callers can back off
+	// before a write is ever outright rejected.
+	response := PutResponse{ShardSize: bodyLen, PoolNearFull: qs.store.NearFull()}
 	respBytes, err := json.Marshal(response)
 	if err != nil {
 		writeErr(bw, req, quicproto.StatusServerError, "marshal response failed")

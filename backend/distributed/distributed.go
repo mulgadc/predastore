@@ -114,9 +114,10 @@ func (m myMember) String() string {
 
 // shardWriteOutcome captures the result of writing a shard via QUIC.
 type shardWriteOutcome struct {
-	shardIndex int
-	shardSize  int64
-	err        error
+	shardIndex   int
+	shardSize    int64
+	poolNearFull bool // mirrors PutResponse.PoolNearFull for this shard's node.
+	err          error
 }
 
 // bytesBufferWriter wraps a byte slice pointer for use as io.Writer.
@@ -296,22 +297,24 @@ func (b *Backend) GlobalState() GlobalState {
 	return b.globalState
 }
 
-// putObjectViaQUIC splits a file into RS shards and sends each to the appropriate node via QUIC.
-func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPath string, objectHash [32]byte) (size int64, err error) {
+// putObjectViaQUIC splits a file into RS shards and sends each to the
+// appropriate node via QUIC. poolNearFull is set if any shard's target node
+// reported pressure.
+func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPath string, objectHash [32]byte) (size int64, poolNearFull bool, err error) {
 	enc, err := reedsolomon.NewStream(b.rsDataShard, b.rsParityShard)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	f, err := os.Open(objectPath)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 	defer f.Close()
 
 	instat, err := f.Stat()
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	size = instat.Size()
@@ -319,7 +322,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	// Use objectHash for hash ring placement for consistency with storage and retrieval
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
 
 	// Calculate shard size
@@ -337,7 +340,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 	}
 
 	if splitErr := enc.Split(f, dataWriters, fileSize); splitErr != nil {
-		return 0, splitErr
+		return 0, false, splitErr
 	}
 
 	// Step 2: Send data shards to nodes via QUIC
@@ -378,7 +381,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				return
 			}
 
-			dataCh <- shardWriteOutcome{shardIndex: idx, shardSize: resp.ShardSize}
+			dataCh <- shardWriteOutcome{shardIndex: idx, shardSize: resp.ShardSize, poolNearFull: resp.PoolNearFull}
 		}(i, dataShardBuffers[i])
 	}
 
@@ -392,9 +395,12 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 		if outcome.err != nil && firstErr == nil {
 			firstErr = outcome.err
 		}
+		if outcome.poolNearFull {
+			poolNearFull = true
+		}
 	}
 	if firstErr != nil {
-		return 0, firstErr
+		return 0, false, firstErr
 	}
 
 	// Step 3: Encode parity shards using the buffered data shards
@@ -449,7 +455,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				return
 			}
 
-			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, shardSize: resp.ShardSize}
+			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, shardSize: resp.ShardSize, poolNearFull: resp.PoolNearFull}
 		}(i, parityIdx, pr)
 	}
 
@@ -473,15 +479,18 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 		if outcome.err != nil && firstErr == nil {
 			firstErr = outcome.err
 		}
+		if outcome.poolNearFull {
+			poolNearFull = true
+		}
 	}
 	if encodeErr != nil && firstErr == nil {
 		firstErr = encodeErr
 	}
 	if firstErr != nil {
-		return 0, firstErr
+		return 0, false, firstErr
 	}
 
-	return size, nil
+	return size, poolNearFull, nil
 }
 
 // openInput retrieves shard location metadata for an object.

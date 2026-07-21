@@ -662,6 +662,11 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Nearfull writes still succeed; the header lets clients back off before
+	// hitting the hard 507 rejection.
+	if resp.PoolNearFull {
+		w.Header().Set("X-Predastore-Pool-Pressure", "nearfull")
+	}
 	w.Header().Set("ETag", resp.ETag)
 	w.WriteHeader(http.StatusOK)
 }

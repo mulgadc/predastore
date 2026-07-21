@@ -57,6 +57,9 @@ type PutObjectRequest struct {
 // PutObjectResponse contains the result of PutObject operation.
 type PutObjectResponse struct {
 	ETag string
+	// PoolNearFull reports whether any shard's node was in the nearfull
+	// free-space band; surfaced to clients via the X-Predastore-Pool-Pressure header.
+	PoolNearFull bool
 }
 
 // DeleteObjectRequest contains parameters for DeleteObject operation.

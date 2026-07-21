@@ -3,6 +3,7 @@ package backend
 import (
 	"errors"
 	"fmt"
+	"net/http"
 )
 
 // S3ErrorCode represents standardized S3 error codes.
@@ -26,6 +27,7 @@ const (
 	ErrInvalidBucketName       S3ErrorCode = "InvalidBucketName"
 	ErrMissingParameter        S3ErrorCode = "MissingParameter"
 	ErrChecksumMismatch        S3ErrorCode = "XAmzContentChecksumMismatch"
+	ErrInsufficientStorage     S3ErrorCode = "InsufficientStorage"
 )
 
 // S3Error represents a typed S3 error with code and message.
@@ -125,6 +127,15 @@ var (
 		Code:       ErrBucketNotEmpty,
 		Message:    "The bucket you tried to delete is not empty.",
 		StatusCode: 409,
+	}
+
+	// ErrInsufficientStorageError is returned when the store's free-space
+	// watermark rejects a write; 507 lets clients distinguish this from a
+	// transient 500.
+	ErrInsufficientStorageError = &S3Error{
+		Code:       ErrInsufficientStorage,
+		Message:    "The storage pool is at capacity and cannot accept new writes",
+		StatusCode: http.StatusInsufficientStorage,
 	}
 )
 
