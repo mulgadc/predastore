@@ -131,32 +131,42 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 		return err
 	}
 
-	// Clear existing data and restore from snapshot
-	return f.db.Update(func(txn *badger.Txn) error {
-		// Drop all existing data
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchValues = false
-		it := txn.NewIterator(opts)
-		var keysToDelete [][]byte
-		for it.Rewind(); it.Valid(); it.Next() {
-			keysToDelete = append(keysToDelete, it.Item().KeyCopy(nil))
-		}
-		it.Close()
+	// Clear, then rewrite in batches.
+	//
+	// Both halves used to run inside a single db.Update. Badger caps how much
+	// one transaction may hold, so once the metadata set outgrew that cap every
+	// snapshot became permanently unrestorable:
+	//
+	//   raft: snapshot restore progress: ... percent-complete="100.00%"
+	//   raft: failed to restore snapshot: error="Txn is too big to fit into one request"
+	//   failed to create raft node: failed to load any existing snapshots
+	//
+	// and the node could never start again — on every node at once, since they
+	// all restore the same oversized snapshot, taking the metadata plane (and
+	// with it the AMI catalogue, so DescribeImages) down with it. The write path
+	// has no matching limit, so snapshots that cannot be read back are written
+	// happily. See mulga-tjoz9.
+	//
+	// DropAll is badger's own bulk clear and is not bounded by a transaction;
+	// WriteBatch commits in chunks as it fills, so restore cost no longer scales
+	// into a hard wall.
+	if err := f.db.DropAll(); err != nil {
+		return fmt.Errorf("restore: drop existing data: %w", err)
+	}
 
-		for _, key := range keysToDelete {
-			if err := txn.Delete(key); err != nil {
-				return err
-			}
-		}
+	wb := f.db.NewWriteBatch()
+	defer wb.Cancel()
 
-		// Restore snapshot data
-		for _, e := range entries {
-			if err := txn.Set(e.key, e.value); err != nil {
-				return err
-			}
+	for _, e := range entries {
+		if err := wb.Set(e.key, e.value); err != nil {
+			return fmt.Errorf("restore: set key: %w", err)
 		}
-		return nil
-	})
+	}
+
+	if err := wb.Flush(); err != nil {
+		return fmt.Errorf("restore: flush batch: %w", err)
+	}
+	return nil
 }
 
 // readSnapshot reads snapshot entries, accepting both the current binary frame
