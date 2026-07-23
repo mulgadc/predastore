@@ -104,6 +104,11 @@ fix:
 govulncheck:
 	go tool govulncheck ./...
 
+# NilAway — advisory nil-panic analysis. Not in preflight: it has a known
+# false-positive rate, so findings are triaged by hand rather than gating commits.
+nilaway:
+	go tool nilaway -include-pkgs=github.com/mulgadc/predastore -exclude-test-files ./...
+
 .PHONY: certs build go_build go_build_docker preflight test test-cover test-race test-integration diff-coverage \
 	docker_s3d docker_compose_up docker_compose_down docker docker_clean docker_test \
-	clean lint fix govulncheck
+	clean lint fix govulncheck nilaway
