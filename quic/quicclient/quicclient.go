@@ -2,6 +2,7 @@ package quicclient
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -313,6 +314,12 @@ func (c *Client) Get(ctx context.Context, objectRequest quicserver.ObjectRequest
 			}
 		}
 		return nil, fmt.Errorf("get: status %d (expected %d)", rh.Status, quicproto.StatusOK)
+	}
+
+	// A zero-length body yields a nil stream from do(); this method's contract
+	// promises a closeable reader, so hand back an empty ReadCloser instead of nil.
+	if rc == nil {
+		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
 
 	return rc, nil
