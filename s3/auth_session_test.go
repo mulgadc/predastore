@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"context"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
@@ -15,15 +16,15 @@ import (
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/pkg/masterkey"
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// --- fake nats.KeyValue (embeds the interface; only Get is exercised) ---
+// --- fake jetstream.KeyValue (embeds the interface; only Get is exercised) ---
 
 type fakeKVEntry struct {
-	nats.KeyValueEntry
+	jetstream.KeyValueEntry
 
 	val []byte
 }
@@ -31,19 +32,19 @@ type fakeKVEntry struct {
 func (e fakeKVEntry) Value() []byte { return e.val }
 
 type fakeKV struct {
-	nats.KeyValue
+	jetstream.KeyValue
 
 	data   map[string][]byte
 	getErr error // when set, Get returns this error (simulates a non-NotFound KV fault)
 }
 
-func (k *fakeKV) Get(key string) (nats.KeyValueEntry, error) {
+func (k *fakeKV) Get(_ context.Context, key string) (jetstream.KeyValueEntry, error) {
 	if k.getErr != nil {
 		return nil, k.getErr
 	}
 	v, ok := k.data[key]
 	if !ok {
-		return nil, nats.ErrKeyNotFound
+		return nil, jetstream.ErrKeyNotFound
 	}
 	return fakeKVEntry{val: v}, nil
 }

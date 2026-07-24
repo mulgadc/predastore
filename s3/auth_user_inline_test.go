@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,7 +21,7 @@ func TestResolveUserPolicies_UserInlineAllow(t *testing.T) {
 	}
 	p := newGroupProvider(users, map[string][]byte{}, nil)
 
-	docs, err := p.resolveUserPolicies(inlineTestAccount, "alice")
+	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 1, "user-inline Allow must resolve")
 	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs),
@@ -47,7 +48,7 @@ func TestResolveUserPolicies_UserInlineDenyOverridesManagedAllow(t *testing.T) {
 	}
 	p := newGroupProvider(users, policies, nil)
 
-	docs, err := p.resolveUserPolicies(inlineTestAccount, "alice")
+	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 2, "direct Allow and user-inline Deny must both resolve")
 	assert.False(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs),
@@ -67,6 +68,6 @@ func TestResolveUserPolicies_UserInlineMalformedFailsClosed(t *testing.T) {
 	}
 	p := newGroupProvider(users, map[string][]byte{}, nil)
 
-	_, err := p.resolveUserPolicies(inlineTestAccount, "alice")
+	_, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	assert.Error(t, err, "a malformed user inline document must fail closed")
 }
