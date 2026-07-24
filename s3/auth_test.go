@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"testing"
@@ -182,7 +183,7 @@ func TestResolveRolePolicies_InlineAllow(t *testing.T) {
 		policiesBucket: &fakeKV{data: map[string][]byte{}},
 	}
 
-	docs, err := p.resolveRolePolicies(inlineTestAccount, "InlineRole")
+	docs, err := p.resolveRolePolicies(context.Background(), inlineTestAccount, "InlineRole")
 	require.NoError(t, err)
 	require.Len(t, docs, 1)
 	assert.Equal(t, iampolicy.Allow, iampolicy.Evaluate("s3:ListBucket", "arn:aws:s3:::any", docs), "inline Allow must be honoured")
@@ -211,7 +212,7 @@ func TestResolveRolePolicies_InlineDenyOverridesManagedAllow(t *testing.T) {
 		policiesBucket: &fakeKV{data: policies},
 	}
 
-	docs, err := p.resolveRolePolicies(inlineTestAccount, "DenyRole")
+	docs, err := p.resolveRolePolicies(context.Background(), inlineTestAccount, "DenyRole")
 	require.NoError(t, err)
 	require.Len(t, docs, 2, "managed Allow and inline Deny must both resolve")
 	assert.Equal(t, iampolicy.Deny, iampolicy.Evaluate("s3:ListBucket", "arn:aws:s3:::any", docs), "inline Deny must override managed Allow")
@@ -232,6 +233,6 @@ func TestResolveRolePolicies_InlineMalformed(t *testing.T) {
 		policiesBucket: &fakeKV{data: map[string][]byte{}},
 	}
 
-	_, err := p.resolveRolePolicies(inlineTestAccount, "BadRole")
+	_, err := p.resolveRolePolicies(context.Background(), inlineTestAccount, "BadRole")
 	assert.Error(t, err, "a malformed inline document must fail closed")
 }

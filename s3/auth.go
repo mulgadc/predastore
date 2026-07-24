@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // ErrKeyNotFound is returned when an access key does not exist in the provider.
@@ -178,9 +180,16 @@ type cachedCredential struct {
 // NATSIAMProvider looks up credentials from NATS KV and decrypts secrets.
 // Buckets are lazily initialized to handle the bootstrap case where predastore
 // starts before the spinifex daemon creates IAM KV buckets.
+//
+// The CredentialProvider contract carries no context: the S3 middleware calls
+// LookupCredentials in-process off a SigV4 request and does not pass one through.
+// LookupCredentials therefore binds context.Background() for its KV work, which
+// leaves the jetstream package's own 5s API timeout in force — the same wait the
+// legacy KV API applied. Every helper below it takes the context as its leading
+// parameter, so the day the contract gains one only that binding line changes.
 type NATSIAMProvider struct {
 	conn       *nats.Conn
-	js         nats.JetStreamContext
+	js         jetstream.JetStream
 	key        *masterkey.Key
 	bucketName string // access keys bucket name
 
@@ -188,24 +197,24 @@ type NATSIAMProvider struct {
 	cache map[string]*cachedCredential
 
 	// Lazy-initialized KV buckets — nil until spinifex daemon creates them.
-	accessKeysBucket nats.KeyValue
-	usersBucket      nats.KeyValue
-	rolesBucket      nats.KeyValue
-	policiesBucket   nats.KeyValue
+	accessKeysBucket jetstream.KeyValue
+	usersBucket      jetstream.KeyValue
+	rolesBucket      jetstream.KeyValue
+	policiesBucket   jetstream.KeyValue
 	bucketsReady     bool
 
 	// Session-credentials bucket has its own readiness flag: it is opened
 	// independently of the AKIA buckets so either path can come up alone.
-	sessionsBucket nats.KeyValue
+	sessionsBucket jetstream.KeyValue
 	sessionsReady  bool
 
 	// Groups bucket has its own readiness flag for the same reason: a missing
 	// groups bucket must not disable direct-grant IAM auth for users who never
 	// use groups. Group resolution is an additive layer on the user path.
-	groupsBucket nats.KeyValue
+	groupsBucket jetstream.KeyValue
 	groupsReady  bool
 
-	watcher   nats.KeyWatcher
+	watcher   jetstream.KeyWatcher
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -243,7 +252,7 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 		return nil, fmt.Errorf("connect to NATS: %w", err)
 	}
 
-	js, err := conn.JetStream()
+	js, err := jetstream.New(conn)
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("get JetStream context: %w", err)
@@ -264,8 +273,9 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	}
 
 	// Try to open KV buckets now. If they don't exist yet (spinifex daemon hasn't
-	// bootstrapped), we'll retry on each lookup until they appear.
-	if err := p.ensureBuckets(); err != nil {
+	// bootstrapped), we'll retry on each lookup until they appear. This runs at
+	// startup with no request in flight, so it opens buckets against Background.
+	if err := p.ensureBuckets(context.Background()); err != nil {
 		slog.Warn("IAM KV buckets not available yet — IAM auth will activate once "+
 			"spinifex daemon creates them (config-based auth works immediately)",
 			"error", err)
@@ -279,7 +289,7 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 // ensureBuckets attempts to open the four IAM KV buckets and start the watcher.
 // Returns nil if all buckets are ready, or an error describing what's missing.
 // Safe to call multiple times — no-ops once buckets are ready.
-func (p *NATSIAMProvider) ensureBuckets() error {
+func (p *NATSIAMProvider) ensureBuckets(ctx context.Context) error {
 	if p.bucketsReady {
 		return nil
 	}
@@ -287,22 +297,22 @@ func (p *NATSIAMProvider) ensureBuckets() error {
 		return fmt.Errorf("JetStream context not available")
 	}
 
-	akBucket, err := p.js.KeyValue(p.bucketName)
+	akBucket, err := p.js.KeyValue(ctx, p.bucketName)
 	if err != nil {
 		return fmt.Errorf("open access keys bucket %q: %w", p.bucketName, err)
 	}
 
-	usersBucket, err := p.js.KeyValue(kvBucketUsers)
+	usersBucket, err := p.js.KeyValue(ctx, kvBucketUsers)
 	if err != nil {
 		return fmt.Errorf("open users bucket: %w", err)
 	}
 
-	rolesBucket, err := p.js.KeyValue(kvBucketRoles)
+	rolesBucket, err := p.js.KeyValue(ctx, kvBucketRoles)
 	if err != nil {
 		return fmt.Errorf("open roles bucket: %w", err)
 	}
 
-	policiesBucket, err := p.js.KeyValue(kvBucketPolicies)
+	policiesBucket, err := p.js.KeyValue(ctx, kvBucketPolicies)
 	if err != nil {
 		return fmt.Errorf("open policies bucket: %w", err)
 	}
@@ -313,8 +323,9 @@ func (p *NATSIAMProvider) ensureBuckets() error {
 	p.policiesBucket = policiesBucket
 	p.bucketsReady = true
 
-	// Start KV watcher for cache invalidation
-	watcher, err := akBucket.WatchAll()
+	// Start KV watcher for cache invalidation. ensureBuckets is only ever called
+	// with Background, so the watcher lives for the process, not a single request.
+	watcher, err := akBucket.WatchAll(ctx)
 	if err != nil {
 		slog.Error("Failed to start NATS KV watcher — cache invalidation will not work, "+
 			"credential changes will only take effect after cache TTL expiry",
@@ -332,7 +343,7 @@ func (p *NATSIAMProvider) ensureBuckets() error {
 // deliberately decoupled from ensureBuckets: a missing session bucket must not
 // disable AKIA auth, and an unbootstrapped AKIA path must not block sessions.
 // The caller must hold p.mu.
-func (p *NATSIAMProvider) ensureSessionsBucket() error {
+func (p *NATSIAMProvider) ensureSessionsBucket(ctx context.Context) error {
 	if p.sessionsReady {
 		return nil
 	}
@@ -340,7 +351,7 @@ func (p *NATSIAMProvider) ensureSessionsBucket() error {
 		return fmt.Errorf("JetStream context not available")
 	}
 
-	bucket, err := p.js.KeyValue(kvBucketSessionCredentials)
+	bucket, err := p.js.KeyValue(ctx, kvBucketSessionCredentials)
 	if err != nil {
 		return fmt.Errorf("open session credentials bucket: %w", err)
 	}
@@ -354,7 +365,7 @@ func (p *NATSIAMProvider) ensureSessionsBucket() error {
 // ensureGroupsBucket lazily opens the IAM groups KV bucket. Like the session
 // bucket it is decoupled from ensureBuckets: a missing groups bucket must not
 // disable direct-grant IAM auth. The caller must hold p.mu.
-func (p *NATSIAMProvider) ensureGroupsBucket() error {
+func (p *NATSIAMProvider) ensureGroupsBucket(ctx context.Context) error {
 	if p.groupsReady {
 		return nil
 	}
@@ -362,7 +373,7 @@ func (p *NATSIAMProvider) ensureGroupsBucket() error {
 		return fmt.Errorf("JetStream context not available")
 	}
 
-	bucket, err := p.js.KeyValue(kvBucketGroups)
+	bucket, err := p.js.KeyValue(ctx, kvBucketGroups)
 	if err != nil {
 		return fmt.Errorf("open groups bucket: %w", err)
 	}
@@ -378,15 +389,15 @@ func (p *NATSIAMProvider) ensureGroupsBucket() error {
 // The request's SigV4 signature (over the decrypted secret) is what
 // authenticates the caller — identical to the AKIA path, plus an expiry check.
 // Session lookups are never cached so expiry is re-checked on every request.
-func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID string) (*CredentialResult, error) {
+func (p *NATSIAMProvider) lookupSessionCredentials(ctx context.Context, accessKeyID string) (*CredentialResult, error) {
 	// Lazily open the session bucket. A not-yet-created bucket is the bootstrap
 	// case — surface it as key-not-found (403) so AKIA auth is unaffected; any
 	// other infra error propagates so the caller returns 500, not a misleading 403.
 	p.mu.Lock()
 	if !p.sessionsReady {
-		if err := p.ensureSessionsBucket(); err != nil {
+		if err := p.ensureSessionsBucket(ctx); err != nil {
 			p.mu.Unlock()
-			if errors.Is(err, nats.ErrBucketNotFound) || errors.Is(err, nats.ErrStreamNotFound) {
+			if errors.Is(err, jetstream.ErrBucketNotFound) || errors.Is(err, jetstream.ErrStreamNotFound) {
 				return nil, fmt.Errorf("%w: %s (session bucket not yet created)", ErrKeyNotFound, accessKeyID)
 			}
 			return nil, fmt.Errorf("session credential lookup unavailable: %w", err)
@@ -395,9 +406,9 @@ func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID string) (*Credent
 	bucket := p.sessionsBucket
 	p.mu.Unlock()
 
-	entry, err := bucket.Get(accessKeyID)
+	entry, err := bucket.Get(ctx, accessKeyID)
 	if err != nil {
-		if errors.Is(err, nats.ErrKeyNotFound) {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, accessKeyID)
 		}
 		return nil, fmt.Errorf("NATS KV lookup failed for session key %s: %w", accessKeyID, err)
@@ -439,10 +450,10 @@ func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID string) (*Credent
 	var policies []iampolicy.PolicyDocument
 	switch cred.PrincipalType {
 	case principalTypeUser:
-		if err := p.ensureIAMBucketsForSession(accessKeyID); err != nil {
+		if err := p.ensureIAMBucketsForSession(ctx, accessKeyID); err != nil {
 			return nil, err
 		}
-		policies, err = p.resolveUserPolicies(cred.AccountID, cred.SessionName)
+		policies, err = p.resolveUserPolicies(ctx, cred.AccountID, cred.SessionName)
 		if err != nil {
 			return nil, mapSessionPrincipalError(accessKeyID, err)
 		}
@@ -464,10 +475,10 @@ func (p *NATSIAMProvider) lookupSessionCredentials(accessKeyID string) (*Credent
 				"accessKeyID", accessKeyID, "sessionAccountID", cred.AccountID,
 				"arnAccountID", arnAccount, "underlyingRoleARN", cred.UnderlyingRoleARN)
 		default:
-			if err := p.ensureIAMBucketsForSession(accessKeyID); err != nil {
+			if err := p.ensureIAMBucketsForSession(ctx, accessKeyID); err != nil {
 				return nil, err
 			}
-			policies, err = p.resolveRolePolicies(cred.AccountID, roleName)
+			policies, err = p.resolveRolePolicies(ctx, cred.AccountID, roleName)
 			if err != nil {
 				return nil, mapSessionPrincipalError(accessKeyID, err)
 			}
@@ -514,11 +525,15 @@ func (p *NATSIAMProvider) watchChanges() {
 }
 
 func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResult, error) {
+	// The CredentialProvider contract passes no context, so bind Background here
+	// and thread it into every KV op below (see the type doc for the rationale).
+	ctx := context.Background()
+
 	// STS session credentials live in a separate bucket and follow a distinct
 	// resolution path (expiry check, no caching). Dispatch on the AWS access-key
 	// prefix before the AKIA cache check.
 	if strings.HasPrefix(accessKeyID, sessionAccessKeyIDPrefix) {
-		return p.lookupSessionCredentials(accessKeyID)
+		return p.lookupSessionCredentials(ctx, accessKeyID)
 	}
 
 	// Check cache
@@ -534,14 +549,14 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 	// spinifex daemon creates IAM KV buckets.
 	p.mu.Lock()
 	if !p.bucketsReady {
-		if err := p.ensureBuckets(); err != nil {
+		if err := p.ensureBuckets(ctx); err != nil {
 			p.mu.Unlock()
 			// Distinguish "buckets don't exist yet" (bootstrap) from NATS infra errors.
 			// Bucket/stream-not-found means spinifex daemon hasn't created them yet — treat
 			// as key-not-found so ChainProvider falls back to config.
 			// Any other error (NATS down, auth failure) must propagate so callers
 			// return 500 instead of a misleading 403.
-			if errors.Is(err, nats.ErrBucketNotFound) || errors.Is(err, nats.ErrStreamNotFound) {
+			if errors.Is(err, jetstream.ErrBucketNotFound) || errors.Is(err, jetstream.ErrStreamNotFound) {
 				return nil, fmt.Errorf("%w: %s (IAM buckets not yet created)", ErrKeyNotFound, accessKeyID)
 			}
 			return nil, fmt.Errorf("IAM lookup unavailable: %w", err)
@@ -550,9 +565,9 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 	p.mu.Unlock()
 
 	// Lookup access key in NATS KV
-	entry, err := p.accessKeysBucket.Get(accessKeyID)
+	entry, err := p.accessKeysBucket.Get(ctx, accessKeyID)
 	if err != nil {
-		if errors.Is(err, nats.ErrKeyNotFound) {
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			return nil, fmt.Errorf("%w: %s", ErrKeyNotFound, accessKeyID)
 		}
 		return nil, fmt.Errorf("NATS KV lookup failed for access key %s: %w", accessKeyID, err)
@@ -588,7 +603,7 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 	}
 
 	// Resolve user policies
-	policies, err := p.resolveUserPolicies(ak.AccountID, ak.UserName)
+	policies, err := p.resolveUserPolicies(ctx, ak.AccountID, ak.UserName)
 	if err != nil {
 		return nil, fmt.Errorf("resolve policies: %w", err)
 	}
@@ -617,11 +632,11 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 // path): a not-yet-created bucket surfaces as ErrKeyNotFound (403) so a session
 // arriving before any AKIA request never dereferences a nil bucket; any other
 // infra error propagates so the caller returns 500, not a misleading 403.
-func (p *NATSIAMProvider) ensureIAMBucketsForSession(accessKeyID string) error {
+func (p *NATSIAMProvider) ensureIAMBucketsForSession(ctx context.Context, accessKeyID string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if err := p.ensureBuckets(); err != nil {
-		if errors.Is(err, nats.ErrBucketNotFound) || errors.Is(err, nats.ErrStreamNotFound) {
+	if err := p.ensureBuckets(ctx); err != nil {
+		if errors.Is(err, jetstream.ErrBucketNotFound) || errors.Is(err, jetstream.ErrStreamNotFound) {
 			return fmt.Errorf("%w: %s (IAM buckets not yet created)", ErrKeyNotFound, accessKeyID)
 		}
 		return fmt.Errorf("session credential lookup unavailable: %w", err)
@@ -635,15 +650,15 @@ func (p *NATSIAMProvider) ensureIAMBucketsForSession(accessKeyID string) error {
 // fault. Any other error is an infrastructure fault (500). Shared by the user
 // and assumed-role arms so both report identical semantics.
 func mapSessionPrincipalError(accessKeyID string, err error) error {
-	if errors.Is(err, nats.ErrKeyNotFound) {
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
 		return fmt.Errorf("%w: %s (session principal no longer exists)", ErrKeyNotFound, accessKeyID)
 	}
 	return fmt.Errorf("resolve session policies: %w", err)
 }
 
-func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iampolicy.PolicyDocument, error) {
+func (p *NATSIAMProvider) resolveUserPolicies(ctx context.Context, accountID, userName string) ([]iampolicy.PolicyDocument, error) {
 	kvKey := accountID + "." + userName
-	entry, err := p.usersBucket.Get(kvKey)
+	entry, err := p.usersBucket.Get(ctx, kvKey)
 	if err != nil {
 		return nil, fmt.Errorf("lookup user %s: %w", kvKey, err)
 	}
@@ -653,7 +668,7 @@ func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iam
 		return nil, fmt.Errorf("unmarshal user: %w", err)
 	}
 
-	docs, err := p.resolveManagedPolicies(accountID, user.AttachedPolicies)
+	docs, err := p.resolveManagedPolicies(ctx, accountID, user.AttachedPolicies)
 	if err != nil {
 		return nil, err
 	}
@@ -671,7 +686,7 @@ func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iam
 	// iampolicy.Evaluate combines direct, group-managed, and group-inline grants
 	// under deny-wins. The common no-group user pays no extra lock or KV round-trip.
 	if len(user.Groups) > 0 {
-		groupDocs, err := p.resolveGroupPolicies(accountID, userName, user.Groups)
+		groupDocs, err := p.resolveGroupPolicies(ctx, accountID, userName, user.Groups)
 		if err != nil {
 			return nil, err
 		}
@@ -686,16 +701,16 @@ func (p *NATSIAMProvider) resolveUserPolicies(accountID, userName string) ([]iam
 // group is skipped (a deleted group is inert), an unresolvable/malformed group
 // policy fails closed, an absent groups bucket skips all group resolution, and a
 // groups-bucket infra fault fails closed.
-func (p *NATSIAMProvider) resolveGroupPolicies(accountID, userName string, groups []string) ([]iampolicy.PolicyDocument, error) {
+func (p *NATSIAMProvider) resolveGroupPolicies(ctx context.Context, accountID, userName string, groups []string) ([]iampolicy.PolicyDocument, error) {
 	// Lazily open the groups bucket. A not-yet-created bucket means groups-v1 is
 	// not deployed on the spinifex side, so no group records exist anywhere and
 	// there is nothing (no Allow and no Deny) to resolve — skip safely. Any other
 	// open error is an infra fault: fail closed rather than risk dropping a Deny.
 	p.mu.Lock()
 	if !p.groupsReady {
-		if err := p.ensureGroupsBucket(); err != nil {
+		if err := p.ensureGroupsBucket(ctx); err != nil {
 			p.mu.Unlock()
-			if errors.Is(err, nats.ErrBucketNotFound) || errors.Is(err, nats.ErrStreamNotFound) {
+			if errors.Is(err, jetstream.ErrBucketNotFound) || errors.Is(err, jetstream.ErrStreamNotFound) {
 				slog.Warn("Groups bucket not available — skipping group-inherited policies "+
 					"(group grants will not apply until spinifex creates the bucket)",
 					"accountID", accountID, "user", userName)
@@ -709,9 +724,9 @@ func (p *NATSIAMProvider) resolveGroupPolicies(accountID, userName string, group
 
 	var docs []iampolicy.PolicyDocument
 	for _, groupName := range groups {
-		gEntry, err := bucket.Get(accountID + "." + groupName)
+		gEntry, err := bucket.Get(ctx, accountID+"."+groupName)
 		if err != nil {
-			if errors.Is(err, nats.ErrKeyNotFound) {
+			if errors.Is(err, jetstream.ErrKeyNotFound) {
 				// Membership to a deleted group is inert (spinifex refuses to
 				// delete a non-empty group), so this is a benign racing-delete
 				// remnant. Skip it; a deleted group carries no grant to drop.
@@ -727,7 +742,7 @@ func (p *NATSIAMProvider) resolveGroupPolicies(accountID, userName string, group
 			return nil, fmt.Errorf("unmarshal group %s: %w", groupName, err)
 		}
 
-		managed, err := p.resolveManagedPolicies(accountID, group.AttachedPolicies)
+		managed, err := p.resolveManagedPolicies(ctx, accountID, group.AttachedPolicies)
 		if err != nil {
 			return nil, err // fail closed (mirrors direct-policy handling)
 		}
@@ -745,9 +760,9 @@ func (p *NATSIAMProvider) resolveGroupPolicies(accountID, userName string, group
 // resolveRolePolicies resolves an assumed-role session's permissions: load the
 // role record from rolesBucket and resolve its attached managed policies plus
 // any embedded inline policies.
-func (p *NATSIAMProvider) resolveRolePolicies(accountID, roleName string) ([]iampolicy.PolicyDocument, error) {
+func (p *NATSIAMProvider) resolveRolePolicies(ctx context.Context, accountID, roleName string) ([]iampolicy.PolicyDocument, error) {
 	kvKey := accountID + "." + roleName
-	entry, err := p.rolesBucket.Get(kvKey)
+	entry, err := p.rolesBucket.Get(ctx, kvKey)
 	if err != nil {
 		return nil, fmt.Errorf("lookup role %s: %w", kvKey, err)
 	}
@@ -757,7 +772,7 @@ func (p *NATSIAMProvider) resolveRolePolicies(accountID, roleName string) ([]iam
 		return nil, fmt.Errorf("unmarshal role: %w", err)
 	}
 
-	docs, err := p.resolveManagedPolicies(accountID, role.AttachedPolicies)
+	docs, err := p.resolveManagedPolicies(ctx, accountID, role.AttachedPolicies)
 	if err != nil {
 		return nil, err
 	}
@@ -787,7 +802,7 @@ func resolveInlinePolicies(inline map[string]string, label string) ([]iampolicy.
 // resolveManagedPolicies resolves a list of managed-policy ARNs into parsed
 // policy documents from policiesBucket. Shared by the user and role resolvers;
 // the role resolver appends its inline-policy walk separately.
-func (p *NATSIAMProvider) resolveManagedPolicies(accountID string, arns []string) ([]iampolicy.PolicyDocument, error) {
+func (p *NATSIAMProvider) resolveManagedPolicies(ctx context.Context, accountID string, arns []string) ([]iampolicy.PolicyDocument, error) {
 	var docs []iampolicy.PolicyDocument
 	for _, arn := range arns {
 		policyName := auth.ExtractPolicyName(arn)
@@ -797,7 +812,7 @@ func (p *NATSIAMProvider) resolveManagedPolicies(accountID string, arns []string
 		}
 
 		policyKey := accountID + "." + policyName
-		pEntry, err := p.policiesBucket.Get(policyKey)
+		pEntry, err := p.policiesBucket.Get(ctx, policyKey)
 		if err != nil {
 			return nil, fmt.Errorf("lookup policy %s: %w", policyKey, err)
 		}
