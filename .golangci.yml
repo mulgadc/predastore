@@ -62,6 +62,7 @@ linters:
       forbid-mutex: true
 
     forbidigo:
+      analyze-types: true
       forbid:
         - pattern: '\.JetStream$'
           pkg: '^github\.com/nats-io/nats\.go$'
