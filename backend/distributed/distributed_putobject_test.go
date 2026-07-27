@@ -13,6 +13,7 @@ import (
 	s3backend "github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/internal/testport"
 	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/require"
@@ -28,8 +29,7 @@ func TestPutObjectWithTempFile(t *testing.T) {
 
 	tmpDir := t.TempDir()
 
-	// Use high ports to avoid conflicts with running services
-	testBasePort := 29991
+	testBasePort := testport.Block(t, 5)
 
 	cfg := &Config{
 		BadgerDir:      tmpDir,

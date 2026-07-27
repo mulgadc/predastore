@@ -4,17 +4,14 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/internal/testport"
 	quic "github.com/quic-go/quic-go"
 	"github.com/stretchr/testify/require"
 )
-
-// poolTestPortCounter hands each test invocation a unique UDP port.
-var poolTestPortCounter atomic.Int32
 
 // startMinimalQUICListener spins up a trivial quic-go listener that accepts
 // connections and streams but never replies. Enough to exercise the pool's
@@ -35,7 +32,7 @@ func startMinimalQUICListener(t *testing.T) (string, func()) {
 	SetDefaultRootCAs(pool)
 	t.Cleanup(func() { SetDefaultRootCAs(nil) })
 
-	port := 47000 + int(poolTestPortCounter.Add(1))
+	port := testport.Block(t, 1)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 
 	ln, err := quic.ListenAddr(addr, tlsConf, &quic.Config{

@@ -14,7 +14,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +25,7 @@ import (
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/internal/testport"
 	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/assert"
@@ -36,11 +36,6 @@ const (
 	S3_ENDPOINT = "https://localhost:6443"
 	S3_BUCKET   = "test-bucket01"
 )
-
-// s3IntegrationPortCounter gives each setupServer invocation a unique port
-// range so concurrent or rapidly-sequenced test setups don't collide on QUIC
-// (UDP) ports the OS hasn't released yet.
-var s3IntegrationPortCounter atomic.Int32
 
 // setupServer starts an S3 server backed by a distributed backend for testing.
 // Returns the per-node data directory so callers can scan segment files on
@@ -74,7 +69,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup, n
 		nodeCount = 5
 	}
 
-	basePort := 17001 + int(s3IntegrationPortCounter.Add(1)-1)*20
+	basePort := testport.Block(t, nodeCount)
 
 	be, err := distributed.New(&distributed.Config{
 		BadgerDir:      badgerDir,

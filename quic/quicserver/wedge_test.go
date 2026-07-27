@@ -9,25 +9,21 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/internal/testport"
 	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/require"
 )
 
-// quicServerTestPortCounter hands each test invocation a unique port to avoid
-// UDP bind conflicts when the OS has not fully released prior test sockets.
-var quicServerTestPortCounter atomic.Int32
-
 func newTestQuicServer(t *testing.T) (*quicserver.QuicServer, string) {
 	t.Helper()
 	dir := t.TempDir()
-	port := 46000 + int(quicServerTestPortCounter.Add(1))
+	port := testport.Block(t, 1)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	certPath, keyPath, pool := testcerts.Generate(t)
 	quicclient.SetDefaultRootCAs(pool)

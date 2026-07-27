@@ -14,6 +14,7 @@ import (
 	s3backend "github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/internal/testport"
 	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/require"
@@ -50,7 +51,7 @@ func TestPutObjectFullPoolReturns507EndToEnd(t *testing.T) {
 	const bucket = "test-bucket-full"
 
 	tmpDir := t.TempDir()
-	testBasePort := 29981
+	testBasePort := testport.Block(t, 5)
 
 	cfg := &Config{
 		BadgerDir:      tmpDir,

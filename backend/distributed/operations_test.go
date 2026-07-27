@@ -6,29 +6,25 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/internal/testport"
 	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// operationsPortCounter gives each test invocation a unique port range to
-// avoid bind conflicts when the OS hasn't released UDP ports from the prior test.
-var operationsPortCounter atomic.Int32
-
 // setupTestBackend creates a distributed backend with QUIC servers for testing.
 func setupTestBackend(t *testing.T) *Backend {
 	t.Helper()
 	tmpDir := t.TempDir()
 
-	testBasePort := 24991 + int(operationsPortCounter.Add(1)-1)*20
+	testBasePort := testport.Block(t, 5)
 
 	cfg := &Config{
 		BadgerDir:      tmpDir,
@@ -67,6 +63,9 @@ func setupTestBackend(t *testing.T) *Backend {
 	time.Sleep(200 * time.Millisecond)
 
 	t.Cleanup(func() {
+		// Pooled client connections are keyed by node address in a package global,
+		// so they must go before the servers they point at.
+		quicclient.DefaultPool.Close()
 		for _, qs := range quicServers {
 			if qs != nil {
 				_ = qs.Close()

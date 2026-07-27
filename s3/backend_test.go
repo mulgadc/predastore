@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/internal/testport"
 	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/require"
@@ -57,11 +57,6 @@ func signTestReq(t *testing.T, req *http.Request, body []byte,
 		aws.Credentials{AccessKeyID: accessKey, SecretAccessKey: secret},
 		req, payloadHash, service, region, o.signingTime))
 }
-
-// s3BackendPortCounter gives each setupDistributedBackend invocation a unique
-// port range so concurrent or rapidly-sequenced test setups don't collide on
-// QUIC (UDP) ports the OS hasn't released yet.
-var s3BackendPortCounter atomic.Int32
 
 // testBucket is the bucket name used by all unit and integration tests.
 const testBucket = "test"
@@ -141,7 +136,7 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 		})
 	}
 
-	basePort := 14001 + int(s3BackendPortCounter.Add(1)-1)*20
+	basePort := testport.Block(t, nodeCount)
 
 	config := &distributed.Config{
 		BadgerDir:      badgerDir,
