@@ -53,11 +53,13 @@ func OpenStream[T Header](
 	if !ok {
 		tr, ok := c.trs[addr.Network()]
 		if !ok {
-			return nil, fmt.Errorf("no %s transport available")
+			c.mu.Unlock()
+			return nil, fmt.Errorf("no %s transport available", addr.Network())
 		}
 		var err error
 		conn, err = tr.Dial(ctx, addr)
 		if err != nil {
+			c.mu.Unlock()
 			return nil, fmt.Errorf("dial target address: %w", err)
 		}
 		c.conns[key] = conn

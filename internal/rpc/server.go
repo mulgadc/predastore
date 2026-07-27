@@ -15,17 +15,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const maxHeaderSize = 1024 * 1024
-
-var ErrHeaderTooLarge = errors.New("header too large")
-
-type Opcode uint32
-
-type Header interface {
-	Append(buf []byte) ([]byte, error)
-	Unmarshal([]byte) error
-}
-
 type rawHandler func(ctx context.Context, header []byte, stream transport.Stream) error
 type Handler[T any] func(ctx context.Context, header T, stream transport.Stream) error
 
@@ -67,7 +56,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.DrainTimeout = defaultDrainTimeout
 	}
 
-	lns := make([]transport.Listener, len(cfg.Transports))
+	lns := make([]transport.Listener, 0, len(cfg.Transports))
 	for _, tr := range cfg.Transports {
 		ln, err := tr.Listen()
 		if err != nil {
