@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/cluster"
 	"github.com/mulgadc/predastore/ratelimit"
 )
 
@@ -65,6 +66,12 @@ type Config struct {
 
 	RS    RS      `toml:"rs"`
 	Nodes []Nodes `toml:"nodes"`
+
+	// Cluster topology: hosts are processes owning a socket, cluster nodes
+	// are roles pinned to hosts. Supersedes the flat [[db]]/[[nodes]]
+	// lists; both formats parse while the migration is in flight.
+	Hosts        []cluster.Host `toml:"host"`
+	ClusterNodes []cluster.Node `toml:"node"`
 
 	// Compaction tuning for the QUIC shard store (optional; store defaults apply).
 	Compaction Compaction `toml:"compaction"`
