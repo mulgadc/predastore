@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,15 +17,12 @@ import (
 	"github.com/mulgadc/predastore/backend/multipart"
 	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/internal/testport"
 	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-// multipartPortCounter gives each test invocation a unique port range to avoid
-// bind conflicts when the OS hasn't fully released UDP ports from the prior test.
-var multipartPortCounter atomic.Int32
 
 // setupMultipartTestBackend creates a distributed backend with QUIC servers for testing.
 // The returned slice exposes the per-node QUIC servers (indexed by node number) so tests
@@ -36,9 +32,7 @@ func setupMultipartTestBackend(t *testing.T) (*Backend, []*quicserver.QuicServer
 
 	tmpDir := t.TempDir()
 
-	// Each invocation gets a unique port range to avoid bind conflicts.
-	// Spacing of 20 (with 5 nodes per test) leaves headroom for OS socket teardown on CI.
-	testBasePort := 39991 + int(multipartPortCounter.Add(1)-1)*20
+	testBasePort := testport.Block(t, 5)
 
 	cfg := &Config{
 		BadgerDir:      tmpDir,
@@ -79,6 +73,10 @@ func setupMultipartTestBackend(t *testing.T) (*Backend, []*quicserver.QuicServer
 	time.Sleep(200 * time.Millisecond)
 
 	cleanup := func() {
+		// Drop pooled client connections first: they are keyed by node address in a
+		// package global, so leaving them open outlives the servers they point at
+		// and leaks a socket (and its goroutines) for the rest of the test binary.
+		quicclient.DefaultPool.Close()
 		for _, qs := range quicServers {
 			if qs != nil {
 				_ = qs.Close()

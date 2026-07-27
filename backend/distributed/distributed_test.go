@@ -14,6 +14,7 @@ import (
 	s3backend "github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/internal/testport"
 	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3db"
@@ -30,10 +31,10 @@ func TestPutObject_ShardPlacementAndReconstruction(t *testing.T) {
 	const (
 		bucket         = "test-bucket"
 		partitionCount = 5
-		testBasePort   = 59991
 		objectSize     = 256*1024 + 123
 	)
 
+	testBasePort := testport.Block(t, partitionCount)
 	tmpDir := t.TempDir()
 	cfg := &Config{
 		BadgerDir:      tmpDir,
@@ -142,10 +143,10 @@ func TestPutGetRoundTrip(t *testing.T) {
 	const (
 		bucket         = "test-bucket"
 		partitionCount = 11
-		testBasePort   = 49991
 		objectSize     = 128 * 1024
 	)
 
+	testBasePort := testport.Block(t, partitionCount)
 	tmpDir := t.TempDir()
 	cfg := &Config{
 		BadgerDir:      tmpDir,
@@ -342,7 +343,7 @@ func TestGetObjectByteRange(t *testing.T) {
 	const objectSize = 128 * 1024
 
 	tmpDir := t.TempDir()
-	testBasePort := 19991
+	testBasePort := testport.Block(t, 5)
 
 	cfg := &Config{
 		BadgerDir:      tmpDir,
