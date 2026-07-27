@@ -145,9 +145,10 @@ func New(config any) (backend.Backend, error) {
 		return nil, errors.New("invalid configuration type for distributed backend")
 	}
 
-	// Either DBClient or BadgerDir must be configured
-	if cfg.DBClient == nil && cfg.BadgerDir == "" {
-		return nil, errors.New("either DBClient or BadgerDir is required for distributed backend")
+	// Global state needs a source: an injected client, a DB cluster, or a
+	// local BadgerDB.
+	if cfg.StateClient == nil && cfg.DBClient == nil && cfg.BadgerDir == "" {
+		return nil, errors.New("one of StateClient, DBClient or BadgerDir is required for distributed backend")
 	}
 
 	// Set defaults

@@ -46,11 +46,12 @@ type Server struct {
 	masterKey         *masterkey.Key // Loaded master key handle (AEAD + fingerprint, no raw bytes).
 
 	// Runtime state
-	config    *Config
-	server    *HTTP2Server
-	backend   backend.Backend
-	credProv  CredentialProvider
-	dbServers []*s3db.Server
+	config          *Config
+	server          *HTTP2Server
+	backend         backend.Backend
+	preparedBackend backend.Backend // externally wired backend; skips backend launch
+	credProv        CredentialProvider
+	dbServers       []*s3db.Server
 
 	// Profiling
 	pprofEnabled    bool
@@ -143,6 +144,18 @@ func WithBackend(backendType BackendType) Option {
 		if backendType != "" {
 			s.backendType = backendType
 		}
+		return nil
+	}
+}
+
+// WithPreparedBackend supplies an externally wired storage backend. The
+// server then only runs the S3 HTTPS frontend on top of it: no DB or QUIC
+// servers are launched, and the caller owns the backend's supporting
+// runtime (rpc server, raft nodes, shard stores). Used by cluster mode,
+// where cmd/s3d assembles the topology.
+func WithPreparedBackend(be backend.Backend) Option {
+	return func(s *Server) error {
+		s.preparedBackend = be
 		return nil
 	}
 }
@@ -257,14 +270,19 @@ func (s *Server) init() error {
 		slog.Info("Debug logging enabled")
 	}
 
-	// Initialize the appropriate backend
-	switch s.backendType {
-	case BackendDistributed:
-		if err := s.initDistributedBackend(); err != nil {
-			return err
+	// Initialize the appropriate backend. A prepared backend arrives fully
+	// wired, so no DB or QUIC servers are launched here.
+	if s.preparedBackend != nil {
+		s.backend = s.preparedBackend
+	} else {
+		switch s.backendType {
+		case BackendDistributed:
+			if err := s.initDistributedBackend(); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("unknown backend type: %s", s.backendType)
 		}
-	default:
-		return fmt.Errorf("unknown backend type: %s", s.backendType)
 	}
 
 	// Initialize credential provider
