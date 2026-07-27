@@ -24,6 +24,8 @@ func ResolveAddr(network, addr string) (net.Addr, error) {
 	switch network {
 	case string(NetworkPipe):
 		return newPipeAddr(addr), nil
+	case string(NetworkQUIC):
+		return newQUICAddr(addr), nil
 	default:
 		return nil, UnknownNetworkError(network)
 	}
