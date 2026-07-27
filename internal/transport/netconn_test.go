@@ -130,7 +130,7 @@ func TestStreamConnCloseSignalsDoneAndPeer(t *testing.T) {
 	// The peer's blocked read terminates: the write side closed cleanly.
 	select {
 	case err := <-readErr:
-		if err != io.EOF {
+		if !errors.Is(err, io.EOF) {
 			// Abort-before-close can surface as a StreamError instead of
 			// EOF; either way the read must not hang.
 			var se *StreamError

@@ -32,7 +32,7 @@ func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client
 	t.Cleanup(func() { st.Close() })
 
 	svc := storage.NewService()
-	svc.AddNode(uint64(nodeID), st) //nolint:gosec // G115: test node ids are small positives.
+	svc.AddNode(uint64(nodeID), st)
 	mux := rpc.NewMux()
 	svc.Register(mux)
 

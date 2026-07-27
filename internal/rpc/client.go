@@ -76,7 +76,7 @@ func OpenStream[T Header](
 	if n > maxHeaderSize {
 		return nil, fmt.Errorf("%w: %v", ErrHeaderTooLarge, n)
 	}
-	binary.BigEndian.PutUint32(buf[4:8], uint32(n))
+	binary.BigEndian.PutUint32(buf[4:8], uint32(n)) //nolint:gosec // G115: n is bounded by maxHeaderSize above.
 
 	stream, err := conn.OpenStream(ctx)
 	if err != nil {

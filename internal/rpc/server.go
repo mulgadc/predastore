@@ -173,9 +173,7 @@ func (s *Server) serveConn(
 			break
 		}
 
-		streams.Add(1)
-		go func() {
-			defer streams.Done()
+		streams.Go(func() {
 			if err := s.handleStream(handlerCtx, stream); err != nil {
 				slog.ErrorContext(handlerCtx, "handle stream",
 					"err", err,
@@ -187,7 +185,7 @@ func (s *Server) serveConn(
 				return
 			}
 			stream.Close()
-		}()
+		})
 	}
 }
 

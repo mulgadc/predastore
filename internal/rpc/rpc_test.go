@@ -11,6 +11,7 @@ import (
 
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/testcerts"
+	"github.com/mulgadc/predastore/internal/testport"
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
@@ -128,25 +129,16 @@ func TestRPCEchoOverPipe(t *testing.T) {
 
 func TestRPCEchoOverQUIC(t *testing.T) {
 	certPath, keyPath, pool := testcerts.Generate(t)
+	bind := fmt.Sprintf("127.0.0.1:%d", testport.Block(t, 1))
 	server := transport.NewQUICTransport(transport.QUICTransportConfig{
-		BindAddr: "127.0.0.1:0",
+		BindAddr: bind,
 		TLSCert:  certPath,
 		TLSKey:   keyPath,
 	})
-	// Bind before starting the server so the test knows the ephemeral port.
-	ln, err := server.Listen()
+	addr, err := transport.ResolveAddr(string(transport.NetworkQUIC), bind)
 	if err != nil {
-		t.Fatalf("Listen: %v", err)
+		t.Fatalf("ResolveAddr: %v", err)
 	}
-	addr := ln.Addr()
-	if err := ln.Close(); err != nil {
-		t.Fatalf("close probe listener: %v", err)
-	}
-	server = transport.NewQUICTransport(transport.QUICTransportConfig{
-		BindAddr: addr.String(),
-		TLSCert:  certPath,
-		TLSKey:   keyPath,
-	})
 	runServer(t, echoMux(), server)
 
 	client := rpc.NewClient(rpc.ClientConfig{
