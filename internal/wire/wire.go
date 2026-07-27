@@ -36,6 +36,7 @@ const (
 const (
 	ErrCodeNotFound  = "not-found"
 	ErrCodeNotLeader = "not-leader"
+	ErrCodeStoreFull = "store-full"
 )
 
 // raftAddrPrefix builds the node-identifying raft advertise address space
@@ -105,4 +106,37 @@ type StateResponse struct {
 type ScanItem struct {
 	Key   string `json:"key"`
 	Value []byte `json:"value"`
+}
+
+// ShardRequest is the header for every storage service operation. Put shard
+// data travels in the stream body after the header.
+type ShardRequest struct {
+	Target     uint64   `json:"target"`
+	Bucket     string   `json:"bucket"`
+	Object     string   `json:"object"`
+	ObjectHash [32]byte `json:"object_hash"`
+	ShardIndex uint32   `json:"shard_index"`
+	// ShardSize is the body length for puts.
+	ShardSize int64 `json:"shard_size,omitempty"`
+	// RangeStart and RangeEnd bound gets; -1 means unset.
+	RangeStart int64 `json:"range_start"`
+	RangeEnd   int64 `json:"range_end"`
+}
+
+func (h *ShardRequest) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
+func (h *ShardRequest) Unmarshal(b []byte) error          { return json.Unmarshal(b, h) }
+
+// ShardResponse is the JSON envelope answering every shard stream. It is
+// newline-terminated; get responses stream BodyLen shard bytes after it.
+type ShardResponse struct {
+	Err string `json:"err,omitempty"`
+	// ShardSize echoes the committed byte count for puts.
+	ShardSize int64 `json:"shard_size,omitempty"`
+	// PoolNearFull reports nearfull free-space pressure at commit time so
+	// callers can back off before writes are rejected outright.
+	PoolNearFull bool `json:"pool_near_full,omitempty"`
+	// Deleted reports whether a delete removed an existing shard.
+	Deleted bool `json:"deleted,omitempty"`
+	// BodyLen is the number of shard bytes following the envelope.
+	BodyLen int64 `json:"body_len,omitempty"`
 }
