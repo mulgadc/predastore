@@ -19,7 +19,6 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
@@ -74,6 +73,14 @@ type Config struct {
 	// DBClient holds configuration for the distributed database client
 	// When set, uses distributed s3db for global state instead of local BadgerDB
 	DBClient *DBClientConfig
+
+	// ShardClient overrides how storage nodes are reached. Nil falls back
+	// to pooled QUIC connections against per-node addresses.
+	ShardClient ShardClient
+
+	// StateClient overrides how global state is reached. Nil falls back to
+	// the DBClient HTTP path (or local BadgerDB when that is nil too).
+	StateClient StateClient
 }
 
 // Backend implements the distributed storage backend with Reed-Solomon erasure coding.
@@ -85,6 +92,7 @@ type Backend struct {
 	dataDir       string
 	badgerDir     string
 	globalState   GlobalState // abstraction for global state storage (local or distributed)
+	shards        ShardClient // transport for shard operations against storage nodes
 	quicBasePort  int
 	nodeAddrs     map[int]string // node ID -> "host:port"
 	buckets       []BucketConfig // bucket configurations
@@ -173,7 +181,11 @@ func New(config any) (backend.Backend, error) {
 	var globalState GlobalState
 	var err error
 
-	if cfg.DBClient != nil && len(cfg.DBClient.Nodes) > 0 {
+	if cfg.StateClient != nil {
+		// An injected client decides its own transport and topology.
+		slog.Info("Using injected state client for global state")
+		globalState = NewDistributedStateWithClient(cfg.StateClient)
+	} else if cfg.DBClient != nil && len(cfg.DBClient.Nodes) > 0 {
 		// Use distributed s3db cluster for global state
 		slog.Info("Using distributed database for global state",
 			"nodes", cfg.DBClient.Nodes,
@@ -221,7 +233,7 @@ func New(config any) (backend.Backend, error) {
 		nodeAddrs[node.ID] = fmt.Sprintf("%s:%d", node.Host, node.Port)
 	}
 
-	return &Backend{
+	b := &Backend{
 		config:        cfg,
 		rsDataShard:   dataShards,
 		rsParityShard: parityShards,
@@ -232,7 +244,12 @@ func New(config any) (backend.Backend, error) {
 		quicBasePort:  quicBasePort,
 		nodeAddrs:     nodeAddrs,
 		buckets:       cfg.Buckets,
-	}, nil
+	}
+	b.shards = cfg.ShardClient
+	if b.shards == nil {
+		b.shards = &quicShardClient{addr: b.getNodeAddr}
+	}
+	return b, nil
 }
 
 // Type returns the backend type identifier.
@@ -358,14 +375,6 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				return
 			}
 
-			addr := b.getNodeAddr(int(nodeNum))
-			client, dialErr := quicclient.DialPooled(ctx, addr)
-			if dialErr != nil {
-				slog.Error("putObjectViaQUIC: dial failed", "node", nodeNum, "addr", addr, "error", dialErr)
-				dataCh <- shardWriteOutcome{shardIndex: idx, err: dialErr}
-				return
-			}
-
 			putReq := quicserver.PutRequest{
 				Bucket:     bucket,
 				Object:     objectPath,
@@ -374,7 +383,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				ShardIndex: uint32(idx), //nolint:gosec // G115: idx bounded by rsDataShard (small uint).
 			}
 
-			resp, putErr := client.Put(ctx, putReq, bytes.NewReader(shardData))
+			resp, putErr := b.shards.PutShard(ctx, int(nodeNum), putReq, bytes.NewReader(shardData))
 			if putErr != nil {
 				slog.Error("putObjectViaQUIC: put failed", "node", nodeNum, "error", putErr)
 				dataCh <- shardWriteOutcome{shardIndex: idx, err: putErr}
@@ -431,15 +440,6 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				return
 			}
 
-			addr := b.getNodeAddr(int(nodeNum))
-			client, dialErr := quicclient.DialPooled(ctx, addr)
-			if dialErr != nil {
-				slog.Error("putObjectViaQUIC: dial failed for parity", "node", nodeNum, "addr", addr, "error", dialErr)
-				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, err: dialErr}
-				_, _ = io.Copy(io.Discard, r)
-				return
-			}
-
 			putReq := quicserver.PutRequest{
 				Bucket:     bucket,
 				Object:     objectPath,
@@ -448,7 +448,7 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				ShardIndex: uint32(hashRingIdx), //nolint:gosec // G115: hashRingIdx bounded by rsDataShard + rsParityShard (small uint).
 			}
 
-			resp, putErr := client.Put(ctx, putReq, r)
+			resp, putErr := b.shards.PutShard(ctx, int(nodeNum), putReq, r)
 			if putErr != nil {
 				slog.Error("putObjectViaQUIC: put parity failed", "node", nodeNum, "error", putErr)
 				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, err: putErr}
@@ -540,12 +540,6 @@ func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShar
 
 	for i := range totalNodes {
 		nodeNum := int(totalNodes[i])
-		// Use pooled connection to avoid TLS handshake overhead
-		c, err := quicclient.DialPooled(context.Background(), b.getNodeAddr(nodeNum))
-		if err != nil {
-			slog.Error("Failed to dial QUIC server", "node", nodeNum, "err", err)
-			continue
-		}
 
 		objectRequest := quicserver.ObjectRequest{
 			Bucket:     bucket,
@@ -555,7 +549,7 @@ func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShar
 			ShardIndex: uint32(i), // Include shard index for unique lookup
 		}
 
-		reader, err := c.Get(context.Background(), objectRequest)
+		reader, err := b.shards.GetShard(context.Background(), nodeNum, objectRequest)
 		if err != nil {
 			slog.Error("Error reading from QUIC server", "node", nodeNum, "err", err)
 			// Don't close - connection stays in pool
