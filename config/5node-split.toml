@@ -1,0 +1,91 @@
+# 5-node cluster split across two processes.
+#
+# The same logical cluster as 5node.toml — RS(3,2) over five shard-storage
+# nodes plus five state replicas — but pinned to two hosts instead of five:
+# storage nodes 1-3 and their replicas run in one process, 4-5 in the other.
+#
+# Used to measure the cost of process boundaries independently of node count:
+# 5node.toml (five hosts), this file (two hosts) and 5node.toml launched with
+# no -nodes selection (one host, pipe only) describe identical clusters.
+#
+#     s3d -config config/5node-split.toml -nodes 1,2,3,6,7,8
+#     s3d -config config/5node-split.toml -nodes 4,5,9,10
+#
+# No buckets defined - tests and benchmarks create their own.
+
+version = "1.0"
+region = "ap-southeast-2"
+
+[rs]
+data = 3
+parity = 2
+
+[[host]]
+id = 1
+bind_addr = "10.11.12.1:6660"
+public_addr = "10.11.12.1:6660"
+data_dir = "data/host-1"
+
+[[host]]
+id = 2
+bind_addr = "10.11.12.2:6660"
+public_addr = "10.11.12.2:6660"
+data_dir = "data/host-2"
+
+[[node]]
+id = 1
+host_id = 1
+role = "shard-storage"
+
+[[node]]
+id = 2
+host_id = 1
+role = "shard-storage"
+
+[[node]]
+id = 3
+host_id = 1
+role = "shard-storage"
+
+[[node]]
+id = 4
+host_id = 2
+role = "shard-storage"
+
+[[node]]
+id = 5
+host_id = 2
+role = "shard-storage"
+
+[[node]]
+id = 6
+host_id = 1
+role = "state-replica"
+
+[[node]]
+id = 7
+host_id = 1
+role = "state-replica"
+
+[[node]]
+id = 8
+host_id = 1
+role = "state-replica"
+
+[[node]]
+id = 9
+host_id = 2
+role = "state-replica"
+
+[[node]]
+id = 10
+host_id = 2
+role = "state-replica"
+
+[[auth]]
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+account_id = "123456789012"
+policy = [
+  { bucket = "*", actions = ["s3:*"] },
+]

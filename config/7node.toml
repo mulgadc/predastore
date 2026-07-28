@@ -4,6 +4,9 @@
 # Nodes are roles pinned to a host; everything per-node derives from the
 # host base and the node id (pipe name, ALPN key, data subdirectory).
 #
+# These hosts share one machine over loopback aliases, so each binds its
+# own address rather than 0.0.0.0 — three processes cannot share a port.
+#
 # Run the whole cluster in one process:
 #     s3d -config config/7node.toml
 # Run one host per process:
@@ -25,43 +28,43 @@ parity = 3
 
 [[host]]
 id = 1
-bind_addr = "0.0.0.0:6660"
+bind_addr = "10.11.12.1:6660"
 public_addr = "10.11.12.1:6660"
 data_dir = "data/host-1"
 
 [[host]]
 id = 2
-bind_addr = "0.0.0.0:6660"
+bind_addr = "10.11.12.2:6660"
 public_addr = "10.11.12.2:6660"
 data_dir = "data/host-2"
 
 [[host]]
 id = 3
-bind_addr = "0.0.0.0:6660"
+bind_addr = "10.11.12.3:6660"
 public_addr = "10.11.12.3:6660"
 data_dir = "data/host-3"
 
 [[host]]
 id = 4
-bind_addr = "0.0.0.0:6660"
+bind_addr = "10.11.12.4:6660"
 public_addr = "10.11.12.4:6660"
 data_dir = "data/host-4"
 
 [[host]]
 id = 5
-bind_addr = "0.0.0.0:6660"
+bind_addr = "10.11.12.5:6660"
 public_addr = "10.11.12.5:6660"
 data_dir = "data/host-5"
 
 [[host]]
 id = 6
-bind_addr = "0.0.0.0:6660"
+bind_addr = "10.11.12.6:6660"
 public_addr = "10.11.12.6:6660"
 data_dir = "data/host-6"
 
 [[host]]
 id = 7
-bind_addr = "0.0.0.0:6660"
+bind_addr = "10.11.12.7:6660"
 public_addr = "10.11.12.7:6660"
 data_dir = "data/host-7"
 
