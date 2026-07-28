@@ -108,11 +108,14 @@ mkdir -p "$ROOT" "$LOGS" "$PIDS"
 
 # --- Parse host IPs from config ---
 
+# Emits each host's public IP. An empty result is normal for a config with no
+# routable hosts, so the pipeline must not abort under `set -e`.
 parse_host_ips() {
-    grep -E '^\s*host\s*=' "$CONFIG_FILE" | \
+    grep -E '^\s*public_addr\s*=' "$CONFIG_FILE" | \
         sed 's/.*=\s*"\(.*\)".*/\1/' | \
+        cut -d: -f1 | \
         grep -v '0\.0\.0\.0' | \
-        sort -u
+        sort -u || true
 }
 
 # --- Generate certs ---
@@ -120,11 +123,27 @@ parse_host_ips() {
 TLS_KEY="$ROOT/server.key"
 TLS_CERT="$ROOT/server.pem"
 
-if [ ! -f "$TLS_CERT" ]; then
-    SAN="DNS:localhost,IP:127.0.0.1"
+SAN="DNS:localhost,IP:127.0.0.1"
+for ip in $(parse_host_ips); do
+    SAN="${SAN},IP:${ip}"
+done
+
+# Regenerate whenever the existing certificate does not cover every host in
+# this config. $PREDA_DIR is shared across clusters, so a cert left by a
+# smaller topology otherwise survives and peers fail verification at dial
+# time with an error that points at TLS rather than at the stale cert.
+cert_covers_hosts() {
+    [ -f "$TLS_CERT" ] || return 1
+    local have
+    have=$(openssl x509 -in "$TLS_CERT" -noout -ext subjectAltName 2>/dev/null) || return 1
     for ip in $(parse_host_ips); do
-        SAN="${SAN},IP:${ip}"
+        echo "$have" | grep -qw "$ip" || return 1
     done
+    return 0
+}
+
+if ! cert_covers_hosts; then
+    [ -f "$TLS_CERT" ] && log_warn "Existing certificate does not cover every host, regenerating"
 
     log_info "Generating TLS certificates..."
     openssl req -x509 -newkey rsa:2048 -nodes \
@@ -168,8 +187,10 @@ fi
 
 # --- Build s3d if needed ---
 
-if [ ! -f "$S3D_BINARY" ]; then
-    log_warn "s3d binary not found, building..."
+# Rebuild when the binary is missing or older than any source file: a stale
+# binary silently benchmarks the wrong revision.
+if [ ! -f "$S3D_BINARY" ] || [ -n "$(find "$REPO_DIR" -name '*.go' -newer "$S3D_BINARY" -print -quit 2>/dev/null)" ]; then
+    log_warn "s3d binary missing or stale, building..."
     make -C "$REPO_DIR" build
 fi
 
