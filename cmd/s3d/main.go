@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mulgadc/predastore/internal/clusterrun"
+	"github.com/mulgadc/predastore/clusterrun"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/predastore/s3"
@@ -166,11 +166,7 @@ func applyEnvOverrides(config, tlsKey, tlsCert *string, port *int, nodes, encryp
 // topology, running the whole cluster in one process.
 func parseNodeIDs(selection string, cfg *s3.Config) ([]int, error) {
 	if selection == "" {
-		ids := make([]int, len(cfg.ClusterNodes))
-		for i, n := range cfg.ClusterNodes {
-			ids[i] = n.ID
-		}
-		return ids, nil
+		return clusterrun.AllNodeIDs(cfg), nil
 	}
 	parts := strings.Split(selection, ",")
 	ids := make([]int, 0, len(parts))

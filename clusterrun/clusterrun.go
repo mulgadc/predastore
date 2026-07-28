@@ -2,8 +2,9 @@
 // per network, and for every node this process runs, a service and the rpc
 // server carrying it. cmd/s3d is a thin entrypoint over Build and Run.
 //
-// It lives outside package main because the entrypoint's FIPS boot guard
-// panics under a plain `go test`, which would make this untestable there.
+// It is public because s3d is not the only entrypoint: embedders that host
+// predastore in their own process (spinifex's service supervisor) need the
+// same assembly before handing the backend to s3.WithPreparedBackend.
 package clusterrun
 
 import (
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -42,11 +44,36 @@ type Runtime struct {
 	// Backend is the fully wired storage backend for the S3 frontend.
 	Backend backend.Backend
 
-	nodes  []node
-	client *rpc.Client
-	trs    []transport.Transport
+	nodes    []node
+	client   *rpc.Client
+	trs      []transport.Transport
+	basePath string
 	// raftNodes back WaitReady; consensus is what the S3 frontend waits on.
 	raftNodes []*s3db.RaftNode
+}
+
+// AllNodeIDs returns every node id in the topology: the selection for a
+// process that runs the whole cluster over the in-process pipe.
+func AllNodeIDs(cfg *s3.Config) []int {
+	ids := make([]int, len(cfg.ClusterNodes))
+	for i, n := range cfg.ClusterNodes {
+		ids[i] = n.ID
+	}
+	return ids
+}
+
+// NodeIDsForHost returns the ids of the nodes pinned to hostID: the selection
+// for the process that owns that host's socket and data directory. Callers
+// select nodes by host rather than by id because the host is the unit an
+// operator places, and everything per-node derives from it.
+func NodeIDsForHost(cfg *s3.Config, hostID int) []int {
+	var ids []int
+	for _, n := range cfg.ClusterNodes {
+		if n.HostID == hostID {
+			ids = append(ids, n.ID)
+		}
+	}
+	return ids
 }
 
 // Build assembles the process for the selected nodes. Every node gets its own
@@ -73,8 +100,9 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 	}
 
 	rt := &Runtime{
-		trs:    trs,
-		client: rpc.NewClient(rpc.ClientConfig{Transports: trs}),
+		trs:      trs,
+		client:   rpc.NewClient(rpc.ClientConfig{Transports: trs}),
+		basePath: cfg.BasePath,
 	}
 
 	// Raft dials peers through the same client; its advertise addresses are
@@ -156,7 +184,13 @@ func (rt *Runtime) addNode(
 	storeOpts []store.Option,
 ) error {
 	id := uint64(n.ID) //nolint:gosec // G115: validated positive node ids.
+
+	// A relative data_dir is resolved against -base-path, so a config can be
+	// shared across machines and the launcher decides where state lands.
 	dataDir := topo.DataDir(n.ID)
+	if !filepath.IsAbs(dataDir) && rt.basePath != "" {
+		dataDir = filepath.Join(rt.basePath, dataDir)
+	}
 	addrs, err := topo.ListenAddrs(n.ID)
 	if err != nil {
 		return err

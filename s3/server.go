@@ -208,8 +208,6 @@ func (s *Server) init() error {
 	// Create and load configuration
 	s.config = &Config{
 		ConfigPath: s.configPath,
-		Port:       s.port,
-		Host:       s.host,
 		Debug:      s.debug,
 		BasePath:   s.basePath,
 	}

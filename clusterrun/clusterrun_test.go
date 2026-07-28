@@ -148,3 +148,35 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 		t.Fatal("GetObject after delete succeeded")
 	}
 }
+
+// TestRelativeDataDirUsesBasePath pins the launcher contract: a config with a
+// relative data_dir must land under -base-path, not the working directory.
+// Getting this wrong writes cluster state into the repo.
+func TestRelativeDataDirUsesBasePath(t *testing.T) {
+	base := t.TempDir()
+	cfg := &s3.Config{
+		BasePath: base,
+		RS:       s3.RS{Data: 2, Parity: 1},
+		Hosts: []cluster.Host{
+			{ID: 1, BindAddr: "127.0.0.1:16661", PublicAddr: "127.0.0.1:16661", DataDir: "data/host-1"},
+		},
+		ClusterNodes: []cluster.Node{
+			{ID: 1, HostID: 1, Role: cluster.RoleShardStorage},
+			{ID: 2, HostID: 1, Role: cluster.RoleShardStorage},
+			{ID: 3, HostID: 1, Role: cluster.RoleStateReplica},
+		},
+	}
+
+	rt, err := Build(cfg, []int{1, 2, 3}, "", "", testMasterKey(t))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer rt.Close()
+
+	if _, err := os.Stat(filepath.Join(base, "data", "host-1", "node-1")); err != nil {
+		t.Fatalf("shard store not under base path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join("data", "host-1")); err == nil {
+		t.Fatal("relative data_dir leaked into the working directory")
+	}
+}
