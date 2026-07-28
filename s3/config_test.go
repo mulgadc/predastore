@@ -18,8 +18,6 @@ func TestReadConfig(t *testing.T) {
 	assert.Equal(t, 4, s3.RS.Data, "RS data shards should match")
 	assert.Equal(t, 3, s3.RS.Parity, "RS parity shards should match")
 	assert.Empty(t, s3.Buckets, "Should have no buckets")
-	assert.Len(t, s3.Nodes, 7, "Should have 7 storage nodes")
-	assert.Len(t, s3.DB, 7, "Should have 7 database nodes")
 	assert.Len(t, s3.Auth, 1, "Should have 1 auth entry")
 }
 
@@ -52,7 +50,7 @@ func TestReadConfig_BucketMissingAccountIDIsHardError(t *testing.T) {
 }
 
 func TestReadConfig_ClusterTopology(t *testing.T) {
-	s3 := New(&Config{ConfigPath: filepath.Join("..", "config", "new.toml")})
+	s3 := New(&Config{ConfigPath: filepath.Join("testdata", "cluster_topology.toml")})
 	err := s3.ReadConfig()
 
 	assert.NoError(t, err, "Should read config without error")

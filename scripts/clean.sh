@@ -16,8 +16,11 @@ NC='\033[0m'
 
 log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
 
-# Stop any running processes first
-"$SCRIPT_DIR/stop.sh"
+# Stop any running processes first. A failed teardown must not prevent the
+# cleanup below: leaving gigabytes behind is worse than a stale loopback alias.
+if ! "$SCRIPT_DIR/stop.sh"; then
+    echo "[WARN] stop.sh failed; cleaning up anyway" >&2
+fi
 
 PREDA_DIR="${PREDA_DIR:-/tmp/predastore}"
 

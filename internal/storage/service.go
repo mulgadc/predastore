@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/transport"
@@ -19,32 +18,28 @@ import (
 	"github.com/mulgadc/predastore/store"
 )
 
-// Service serves shard rpc requests for the storage nodes hosted in this
-// process, one shard store per node.
+// Service serves shard rpc requests for one storage node. A process running
+// several nodes builds one Service per node, each on its own rpc server, so
+// the service itself never learns that it has siblings.
 type Service struct {
-	mu     sync.RWMutex
-	stores map[uint64]*store.Store
+	id    uint64
+	store *store.Store
 }
 
-func NewService() *Service {
-	return &Service{stores: make(map[uint64]*store.Store)}
+// NewService builds the service for one node's shard store.
+func NewService(id uint64, st *store.Store) *Service {
+	return &Service{id: id, store: st}
 }
 
-// AddNode registers a locally hosted storage node's shard store.
-func (s *Service) AddNode(id uint64, st *store.Store) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.stores[id] = st
-}
+// ID is the node this service serves.
+func (s *Service) ID() uint64 { return s.id }
 
-func (s *Service) store(id uint64) (*store.Store, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	st, ok := s.stores[id]
-	if !ok {
-		return nil, fmt.Errorf("storage node %d is not hosted here", id)
-	}
-	return st, nil
+// Run holds the node open until ctx is cancelled, then closes its store. The
+// rpc server draining is the caller's concern; by the time Run returns no
+// handler is still touching the store.
+func (s *Service) Run(ctx context.Context) error {
+	<-ctx.Done()
+	return s.store.Close()
 }
 
 // Register installs the storage service handlers on the mux.
@@ -61,10 +56,7 @@ func respondShard(stream transport.Stream, resp *wire.ShardResponse) error {
 }
 
 func (s *Service) handlePut(ctx context.Context, h wire.ShardRequest, stream transport.Stream) error {
-	st, err := s.store(h.Target)
-	if err != nil {
-		return respondShard(stream, &wire.ShardResponse{Err: err.Error()})
-	}
+	st := s.store
 	if h.ShardSize <= 0 {
 		return respondShard(stream, &wire.ShardResponse{Err: "no shard size specified"})
 	}
@@ -95,10 +87,7 @@ func (s *Service) handlePut(ctx context.Context, h wire.ShardRequest, stream tra
 }
 
 func (s *Service) handleGet(ctx context.Context, h wire.ShardRequest, stream transport.Stream) error {
-	st, err := s.store(h.Target)
-	if err != nil {
-		return respondShard(stream, &wire.ShardResponse{Err: err.Error()})
-	}
+	st := s.store
 
 	objectHash := s3db.GenObjectHash(h.Bucket, h.Object)
 	reader, err := st.Lookup(objectHash, h.ShardIndex)
@@ -134,10 +123,7 @@ func (s *Service) handleGet(ctx context.Context, h wire.ShardRequest, stream tra
 }
 
 func (s *Service) handleDelete(ctx context.Context, h wire.ShardRequest, stream transport.Stream) error {
-	st, err := s.store(h.Target)
-	if err != nil {
-		return respondShard(stream, &wire.ShardResponse{Err: err.Error()})
-	}
+	st := s.store
 	deleted, err := st.Delete(h.ObjectHash, h.ShardIndex)
 	if err != nil {
 		return respondShard(stream, &wire.ShardResponse{Err: err.Error()})

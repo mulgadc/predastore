@@ -18,8 +18,8 @@ func dialedPair(t *testing.T, name string) (dial, accepted Conn, ln Listener) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 
-	lt := NewPipeTransport(name)
-	ln, err := lt.Listen()
+	lt := NewPipeTransport()
+	ln, err := lt.Listen(newPipeAddr(name))
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -36,7 +36,7 @@ func dialedPair(t *testing.T, name string) (dial, accepted Conn, ln Listener) {
 		acceptedCh <- c
 	}()
 
-	dt := NewPipeTransport(name + "-client")
+	dt := NewPipeTransport()
 	dial, err = dt.Dial(ctx, ln.Addr())
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -94,7 +94,7 @@ func TestPipeResolveAddr(t *testing.T) {
 }
 
 func TestPipeDialNoListener(t *testing.T) {
-	pt := NewPipeTransport("dial-no-listener-client")
+	pt := NewPipeTransport()
 	_, err := pt.Dial(context.Background(), newPipeAddr("dial-no-listener"))
 	if !errors.Is(err, ErrNoListener) {
 		t.Fatalf("got %v, want ErrNoListener", err)
@@ -102,29 +102,29 @@ func TestPipeDialNoListener(t *testing.T) {
 }
 
 func TestPipeDialNilAddr(t *testing.T) {
-	pt := NewPipeTransport("dial-nil-addr")
+	pt := NewPipeTransport()
 	if _, err := pt.Dial(context.Background(), nil); !errors.Is(err, ErrMissingAddr) {
 		t.Fatalf("got %v, want ErrMissingAddr", err)
 	}
 }
 
 func TestPipeListenTwiceSameName(t *testing.T) {
-	a := NewPipeTransport("listen-twice")
-	ln, err := a.Listen()
+	a := NewPipeTransport()
+	ln, err := a.Listen(newPipeAddr("listen-twice"))
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
 	defer ln.Close()
 
-	b := NewPipeTransport("listen-twice")
-	if _, err := b.Listen(); !errors.Is(err, ErrAddrAlreadyInUse) {
+	b := NewPipeTransport()
+	if _, err := b.Listen(newPipeAddr("listen-twice")); !errors.Is(err, ErrAddrAlreadyInUse) {
 		t.Fatalf("got %v, want ErrAddrAlreadyInUse", err)
 	}
 }
 
 func TestPipeListenerCloseUnblocksAccept(t *testing.T) {
-	pt := NewPipeTransport("close-unblocks-accept")
-	ln, err := pt.Listen()
+	pt := NewPipeTransport()
+	ln, err := pt.Listen(newPipeAddr("close-unblocks-accept"))
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -149,14 +149,14 @@ func TestPipeListenerCloseUnblocksAccept(t *testing.T) {
 	}
 
 	// The name is free again after close.
-	if _, err := NewPipeTransport("close-unblocks-accept").Listen(); err != nil {
+	if _, err := NewPipeTransport().Listen(newPipeAddr("close-unblocks-accept")); err != nil {
 		t.Fatalf("relisten after close: %v", err)
 	}
 }
 
 func TestPipeTransportCloseClosesListener(t *testing.T) {
-	pt := NewPipeTransport("transport-close")
-	ln, err := pt.Listen()
+	pt := NewPipeTransport()
+	ln, err := pt.Listen(newPipeAddr("transport-close"))
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestPipeTransportCloseClosesListener(t *testing.T) {
 	if _, err := ln.Accept(ctx); !errors.Is(err, ErrListenerClosed) {
 		t.Fatalf("Accept: got %v, want ErrListenerClosed", err)
 	}
-	if _, err := pt.Listen(); !errors.Is(err, ErrTransportClosed) {
+	if _, err := pt.Listen(newPipeAddr("transport-close-again")); !errors.Is(err, ErrTransportClosed) {
 		t.Fatalf("Listen: got %v, want ErrTransportClosed", err)
 	}
 	if _, err := pt.Dial(context.Background(), newPipeAddr("x")); !errors.Is(err, ErrTransportClosed) {
@@ -342,8 +342,8 @@ func TestPipeStreamsSurviveConnClose(t *testing.T) {
 }
 
 func TestPipeDialContextCanceled(t *testing.T) {
-	pt := NewPipeTransport("dial-ctx")
-	ln, err := pt.Listen()
+	pt := NewPipeTransport()
+	ln, err := pt.Listen(newPipeAddr("dial-ctx-canceled"))
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -352,14 +352,14 @@ func TestPipeDialContextCanceled(t *testing.T) {
 	// Nobody accepts, so the dial rendezvous blocks until the context fires.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	dt := NewPipeTransport("dial-ctx-client")
+	dt := NewPipeTransport()
 	if _, err := dt.Dial(ctx, ln.Addr()); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v, want context.DeadlineExceeded", err)
 	}
 }
 
 func TestPipeOpErrorsCarryAddrs(t *testing.T) {
-	pt := NewPipeTransport("operr-client")
+	pt := NewPipeTransport()
 	_, err := pt.Dial(context.Background(), newPipeAddr("operr-missing"))
 	var oe *net.OpError
 	if !errors.As(err, &oe) {

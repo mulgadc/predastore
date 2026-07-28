@@ -57,10 +57,13 @@ for cluster_dir in "$BASE_DIR"/*/; do
     config="$CONFIG_DIR/${cluster}.toml"
     [ -f "$config" ] || continue
 
-    ips=$(grep -E '^\s*host\s*=' "$config" | \
+    # An absent or all-wildcard address list is normal, not an error: the
+    # pipeline must not abort the script under `set -e`.
+    ips=$(grep -E '^\s*public_addr\s*=' "$config" | \
         sed 's/.*=\s*"\(.*\)".*/\1/' | \
+        cut -d: -f1 | \
         grep -v '0\.0\.0\.0' | \
-        sort -u)
+        sort -u || true)
 
     for ip in $ips; do
         sudo ip addr del "${ip}/24" dev lo 2>/dev/null || true

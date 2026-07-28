@@ -31,14 +31,19 @@ func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client
 	}
 	t.Cleanup(func() { st.Close() })
 
-	svc := storage.NewService()
-	svc.AddNode(uint64(nodeID), st)
+	svc := storage.NewService(uint64(nodeID), st)
 	mux := rpc.NewMux()
 	svc.Register(mux)
 
+	pipeTr := transport.NewPipeTransport()
+	srvAddr, err := transport.ResolveAddr(string(transport.NetworkPipe), pipeName)
+	if err != nil {
+		t.Fatalf("ResolveAddr: %v", err)
+	}
 	srv, err := rpc.NewServer(rpc.ServerConfig{
 		Mux:          mux,
-		Transports:   []transport.Transport{transport.NewPipeTransport(pipeName)},
+		Addrs:        []net.Addr{srvAddr},
+		Transports:   []transport.Transport{pipeTr},
 		DrainTimeout: 50 * time.Millisecond,
 	})
 	if err != nil {
@@ -56,7 +61,7 @@ func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client
 	})
 
 	rpcClient := rpc.NewClient(rpc.ClientConfig{
-		Transports: []transport.Transport{transport.NewPipeTransport(pipeName + "-client")},
+		Transports: []transport.Transport{pipeTr},
 	})
 	cli, err := storage.NewClient(storage.ClientConfig{
 		Client: rpcClient,

@@ -1,7 +1,7 @@
 // Package wire defines the intra-cluster rpc protocol: opcode allocation,
-// stream header types, and response envelopes. Every header carries the
-// target node id, so all of a process's nodes multiplex over one socket and
-// requests route in-band.
+// stream header types, and response envelopes. Headers carry no routing: the
+// address a stream was opened on identifies the target node, so a process's
+// nodes share one socket without the protocol knowing about it.
 package wire
 
 import (
@@ -67,10 +67,10 @@ func appendJSON(buf []byte, v any) ([]byte, error) {
 	return append(buf, b...), nil
 }
 
-// RaftDial routes an inbound raft connection to the target state replica.
-type RaftDial struct {
-	Target uint64 `json:"target"`
-}
+// RaftDial opens a raft connection to the state replica the stream is
+// addressed to. It carries no fields: the address selects the replica, and
+// the stream is the raft wire protocol from here on.
+type RaftDial struct{}
 
 func (h *RaftDial) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
 func (h *RaftDial) Unmarshal(b []byte) error          { return json.Unmarshal(b, h) }
@@ -79,10 +79,9 @@ func (h *RaftDial) Unmarshal(b []byte) error          { return json.Unmarshal(b,
 // travel in the stream body after the header; Key doubles as the prefix for
 // scans.
 type StateRequest struct {
-	Target uint64 `json:"target"`
-	Table  string `json:"table"`
-	Key    string `json:"key"`
-	Limit  int    `json:"limit,omitempty"`
+	Table string `json:"table"`
+	Key   string `json:"key"`
+	Limit int    `json:"limit,omitempty"`
 }
 
 func (h *StateRequest) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
@@ -111,7 +110,6 @@ type ScanItem struct {
 // ShardRequest is the header for every storage service operation. Put shard
 // data travels in the stream body after the header.
 type ShardRequest struct {
-	Target     uint64   `json:"target"`
 	Bucket     string   `json:"bucket"`
 	Object     string   `json:"object"`
 	ObjectHash [32]byte `json:"object_hash"`

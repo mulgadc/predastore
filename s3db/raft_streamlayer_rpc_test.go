@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"testing"
@@ -46,10 +47,9 @@ type raftTestProc struct {
 func startRaftProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers []s3db.RaftPeer) *raftTestProc {
 	t.Helper()
 
+	pipeTr := transport.NewPipeTransport()
 	client := rpc.NewClient(rpc.ClientConfig{
-		Transports: []transport.Transport{
-			transport.NewPipeTransport(pipeNames[id] + "-client"),
-		},
+		Transports: []transport.Transport{pipeTr},
 	})
 
 	// Dialing a peer resolves the node-identifying raft address to the
@@ -77,9 +77,14 @@ func startRaftProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers [
 		return layer.Deliver(ctx, stream)
 	})
 
+	srvAddr, err := transport.ResolveAddr(string(transport.NetworkPipe), pipeNames[id])
+	if err != nil {
+		t.Fatalf("ResolveAddr: %v", err)
+	}
 	srv, err := rpc.NewServer(rpc.ServerConfig{
 		Mux:        mux,
-		Transports: []transport.Transport{transport.NewPipeTransport(pipeNames[id])},
+		Addrs:      []net.Addr{srvAddr},
+		Transports: []transport.Transport{pipeTr},
 		// Raft connections are long-lived; don't stall shutdown on them.
 		DrainTimeout: 50 * time.Millisecond,
 	})

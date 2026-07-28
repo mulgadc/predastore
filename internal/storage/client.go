@@ -52,7 +52,6 @@ func (c *Client) open(ctx context.Context, nodeID int, op rpc.Opcode, h *wire.Sh
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage node %d: %w", nodeID, err)
 	}
-	h.Target = uint64(nodeID) //nolint:gosec // G115: node ids are small positive integers from validated topology.
 	stream, err := rpc.OpenStream(ctx, c.rpc, addr, op, h)
 	if err != nil {
 		return nil, fmt.Errorf("open stream to storage node %d: %w", nodeID, err)

@@ -3,7 +3,9 @@ package transport
 import (
 	"context"
 	"io"
+	"maps"
 	"net"
+	"slices"
 	"sync"
 )
 
@@ -38,90 +40,107 @@ var pipeReg = &pipeRegistry{m: make(map[string]*PipeListener)}
 
 var _ Transport = (*PipeTransport)(nil)
 
+// pipeDialerAddr is the local address reported by the dialing side of a pipe
+// connection. Dialers hold no registry entry, so they have no name of their
+// own; the address exists to keep connection logging symmetric.
+var pipeDialerAddr = newPipeAddr("dialer")
+
 // PipeTransport connects endpoints within a single process: connections are
 // channel-linked endpoint pairs and streams are in-memory pipes. It carries
 // traffic between colocated nodes, where no network or auth is required.
+//
+// One instance serves a whole process. Listen may be called once per name,
+// so every node registers its own endpoint in the shared registry.
 type PipeTransport struct {
-	pa *PipeAddr
-
-	mu       sync.Mutex
-	ln       *PipeListener
-	closeErr error
+	mu     sync.Mutex
+	lns    map[string]*PipeListener
+	closed bool
 }
 
-func NewPipeTransport(name string) *PipeTransport {
-	return &PipeTransport{pa: newPipeAddr(name)}
+func NewPipeTransport() *PipeTransport {
+	return &PipeTransport{lns: make(map[string]*PipeListener)}
 }
 
-func (pt *PipeTransport) Addr() net.Addr { return pt.pa }
+func (pt *PipeTransport) Network() string { return string(NetworkPipe) }
 
-func (pt *PipeTransport) Listen() (Listener, error) {
+func (pt *PipeTransport) Listen(addr net.Addr) (Listener, error) {
+	if addr == nil {
+		return nil, &net.OpError{Op: "listen", Net: string(NetworkPipe), Err: ErrMissingAddr}
+	}
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
-	if pt.closeErr != nil {
-		return nil, pt.closeErr
+	if pt.closed {
+		return nil, ErrTransportClosed
 	}
 
+	pa := newPipeAddr(addr.String())
 	pl := &PipeListener{
-		pa:     pt.pa,
+		tr:     pt,
+		pa:     pa,
 		accept: make(chan *PipeConn),
 		closed: make(chan struct{}),
 	}
 
 	pipeReg.mu.Lock()
 	defer pipeReg.mu.Unlock()
-	if _, ok := pipeReg.m[pt.pa.String()]; ok {
-		return nil, &net.OpError{Op: "listen", Net: string(NetworkPipe), Addr: pt.pa, Err: ErrAddrAlreadyInUse}
+	if _, ok := pipeReg.m[pa.String()]; ok {
+		return nil, &net.OpError{Op: "listen", Net: string(NetworkPipe), Addr: pa, Err: ErrAddrAlreadyInUse}
 	}
-	pipeReg.m[pt.pa.String()] = pl
-	pt.ln = pl
+	pipeReg.m[pa.String()] = pl
+	pt.lns[pa.String()] = pl
 
 	return pl, nil
 }
 
 func (pt *PipeTransport) Dial(ctx context.Context, addr net.Addr) (Conn, error) {
 	if addr == nil {
-		return nil, &net.OpError{Op: "dial", Net: string(NetworkPipe), Source: pt.pa, Err: ErrMissingAddr}
+		return nil, &net.OpError{Op: "dial", Net: string(NetworkPipe), Source: pipeDialerAddr, Err: ErrMissingAddr}
 	}
 	pt.mu.Lock()
-	closeErr := pt.closeErr
+	closed := pt.closed
 	pt.mu.Unlock()
-	if closeErr != nil {
-		return nil, &net.OpError{Op: "dial", Net: string(NetworkPipe), Source: pt.pa, Addr: addr, Err: closeErr}
+	if closed {
+		return nil, &net.OpError{Op: "dial", Net: string(NetworkPipe), Source: pipeDialerAddr, Addr: addr, Err: ErrTransportClosed}
 	}
 
 	pipeReg.mu.RLock()
 	pl, ok := pipeReg.m[addr.String()]
 	pipeReg.mu.RUnlock()
 	if !ok {
-		return nil, &net.OpError{Op: "dial", Net: string(NetworkPipe), Source: pt.pa, Addr: addr, Err: ErrNoListener}
+		return nil, &net.OpError{Op: "dial", Net: string(NetworkPipe), Source: pipeDialerAddr, Addr: addr, Err: ErrNoListener}
 	}
 
-	local, remote := newPipeConnPair(pt.pa, pl.pa)
+	local, remote := newPipeConnPair(pipeDialerAddr, pl.pa)
 
 	// Rendezvous with the listener's accept loop; a listener that closes
 	// while we wait is equivalent to it never having existed.
 	select {
 	case <-ctx.Done():
-		return nil, &net.OpError{Op: "dial", Net: string(NetworkPipe), Source: pt.pa, Addr: addr, Err: ctx.Err()}
+		return nil, &net.OpError{Op: "dial", Net: string(NetworkPipe), Source: pipeDialerAddr, Addr: addr, Err: ctx.Err()}
 	case <-pl.closed:
-		return nil, &net.OpError{Op: "dial", Net: string(NetworkPipe), Source: pt.pa, Addr: addr, Err: ErrNoListener}
+		return nil, &net.OpError{Op: "dial", Net: string(NetworkPipe), Source: pipeDialerAddr, Addr: addr, Err: ErrNoListener}
 	case pl.accept <- remote:
 		return local, nil
 	}
 }
 
-// Close closes the transport and its active listener. Established connections
-// are unaffected.
+// Close closes the transport and every listener it opened. Established
+// connections are unaffected.
 func (pt *PipeTransport) Close() error {
+	// Detach the listeners under the lock and close them outside it: each
+	// Close reaches back into this map to deregister itself.
 	pt.mu.Lock()
-	defer pt.mu.Unlock()
-	if pt.closeErr != nil {
+	if pt.closed {
+		pt.mu.Unlock()
 		return nil
 	}
-	pt.closeErr = ErrTransportClosed
-	if pt.ln != nil {
-		pt.ln.Close()
+	pt.closed = true
+	lns := slices.Collect(maps.Values(pt.lns))
+	clear(pt.lns)
+	pt.mu.Unlock()
+
+	for _, ln := range lns {
+		ln.Close()
 	}
 	return nil
 }
@@ -129,6 +148,7 @@ func (pt *PipeTransport) Close() error {
 var _ Listener = (*PipeListener)(nil)
 
 type PipeListener struct {
+	tr     *PipeTransport
 	pa     *PipeAddr
 	accept chan *PipeConn
 	closed chan struct{}
@@ -158,6 +178,17 @@ func (pl *PipeListener) Close() error {
 			delete(pipeReg.m, pl.pa.String())
 		}
 		pipeReg.mu.Unlock()
+
+		// Drop the transport's own reference so a long-lived process does
+		// not accumulate closed listeners as nodes come and go.
+		if pl.tr != nil {
+			pl.tr.mu.Lock()
+			if pl.tr.lns[pl.pa.String()] == pl {
+				delete(pl.tr.lns, pl.pa.String())
+			}
+			pl.tr.mu.Unlock()
+		}
+
 		close(pl.closed)
 	})
 	return nil
@@ -166,9 +197,13 @@ func (pl *PipeListener) Close() error {
 var _ Conn = (*PipeConn)(nil)
 
 // pipeConnShared is the closure state common to both endpoints of a pipe
-// connection: closing either endpoint closes the connection for both.
+// connection: closing either endpoint closes the connection for both. The
+// context mirrors closed as a cancellation signal, so callers can probe
+// liveness without a stream operation.
 type pipeConnShared struct {
 	closed chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
 	once   sync.Once
 }
 
@@ -185,7 +220,8 @@ type PipeConn struct {
 // newPipeConnPair builds the two endpoints of one connection, cross-wiring
 // their stream channels.
 func newPipeConnPair(dialer, listener net.Addr) (dc, lc *PipeConn) {
-	shared := &pipeConnShared{closed: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	shared := &pipeConnShared{closed: make(chan struct{}), ctx: ctx, cancel: cancel}
 	d2l := make(chan *PipeStream)
 	l2d := make(chan *PipeStream)
 	dc = &PipeConn{laddr: dialer, raddr: listener, accept: l2d, peer: d2l, shared: shared}
@@ -195,6 +231,11 @@ func newPipeConnPair(dialer, listener net.Addr) (dc, lc *PipeConn) {
 
 func (pc *PipeConn) LocalAddr() net.Addr  { return pc.laddr }
 func (pc *PipeConn) RemoteAddr() net.Addr { return pc.raddr }
+
+// Context returns a context that is cancelled when either endpoint closes the
+// connection, letting callers detect a dead connection without a stream
+// operation.
+func (pc *PipeConn) Context() context.Context { return pc.shared.ctx }
 
 func (pc *PipeConn) OpenStream(ctx context.Context) (Stream, error) {
 	local, remote := newPipeStreamPair(pc.laddr, pc.raddr)
@@ -223,7 +264,10 @@ func (pc *PipeConn) AcceptStream(ctx context.Context) (Stream, error) {
 // OpenStream/AcceptStream calls fail with ErrConnClosed. Streams already
 // established are unaffected.
 func (pc *PipeConn) Close() error {
-	pc.shared.once.Do(func() { close(pc.shared.closed) })
+	pc.shared.once.Do(func() {
+		close(pc.shared.closed)
+		pc.shared.cancel()
+	})
 	return nil
 }
 

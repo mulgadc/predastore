@@ -1,4 +1,4 @@
-package s3db_test
+package state_test
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 
 	"github.com/hashicorp/raft"
 	"github.com/mulgadc/predastore/internal/rpc"
+	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/transport"
 	"github.com/mulgadc/predastore/internal/wire"
 	"github.com/mulgadc/predastore/s3db"
@@ -20,10 +21,9 @@ import (
 func startStateProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers []s3db.RaftPeer) *s3db.RaftNode {
 	t.Helper()
 
+	pipeTr := transport.NewPipeTransport()
 	client := rpc.NewClient(rpc.ClientConfig{
-		Transports: []transport.Transport{
-			transport.NewPipeTransport(pipeNames[id] + "-client"),
-		},
+		Transports: []transport.Transport{pipeTr},
 	})
 
 	dial := func(ctx context.Context, address raft.ServerAddress) (transport.Stream, error) {
@@ -35,7 +35,7 @@ func startStateProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers 
 		if err != nil {
 			return nil, err
 		}
-		return rpc.OpenStream(ctx, client, addr, wire.OpRaftDial, &wire.RaftDial{Target: target})
+		return rpc.OpenStream(ctx, client, addr, wire.OpRaftDial, &wire.RaftDial{})
 	}
 
 	layer := s3db.NewRPCStreamLayer(wire.RaftAddress(id), dial)
@@ -54,14 +54,18 @@ func startStateProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers 
 	}
 	t.Cleanup(func() { node.Close() })
 
-	svc := s3db.NewStateService()
-	svc.AddReplica(id, node, layer)
+	svc := state.NewService(id, node, layer)
 	mux := rpc.NewMux()
 	svc.Register(mux)
 
+	srvAddr, err := transport.ResolveAddr(string(transport.NetworkPipe), pipeNames[id])
+	if err != nil {
+		t.Fatalf("ResolveAddr: %v", err)
+	}
 	srv, err := rpc.NewServer(rpc.ServerConfig{
 		Mux:          mux,
-		Transports:   []transport.Transport{transport.NewPipeTransport(pipeNames[id])},
+		Addrs:        []net.Addr{srvAddr},
+		Transports:   []transport.Transport{pipeTr},
 		DrainTimeout: 50 * time.Millisecond,
 	})
 	if err != nil {
@@ -105,9 +109,9 @@ func TestStateServiceOverRPC(t *testing.T) {
 
 	// The client is its own "process": it reaches every replica over rpc.
 	rpcClient := rpc.NewClient(rpc.ClientConfig{
-		Transports: []transport.Transport{transport.NewPipeTransport("state-svc-client")},
+		Transports: []transport.Transport{transport.NewPipeTransport()},
 	})
-	cli, err := s3db.NewRPCClient(s3db.RPCClientConfig{
+	cli, err := state.NewClient(state.ClientConfig{
 		Client: rpcClient,
 		Resolve: func(nodeID uint64) (net.Addr, error) {
 			name, ok := pipeNames[nodeID]

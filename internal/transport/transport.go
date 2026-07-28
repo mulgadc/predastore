@@ -31,10 +31,18 @@ func ResolveAddr(network, addr string) (net.Addr, error) {
 	}
 }
 
+// Transport carries streams over one network. A process creates one instance
+// per network and uses it for every node it runs: Listen may be called
+// repeatedly for different addresses, and implementations share whatever
+// underlying resources that allows.
 type Transport interface {
+	// Network names the network this transport serves, matching the Network()
+	// of every address it accepts.
+	Network() string
 	Dial(ctx context.Context, addr net.Addr) (Conn, error)
-	Listen() (Listener, error)
-	Addr() net.Addr
+	// Listen serves addr. Calling it again for a different address adds
+	// another listener rather than replacing the first.
+	Listen(addr net.Addr) (Listener, error)
 }
 
 type Listener interface {
@@ -48,12 +56,17 @@ type Listener interface {
 	Close() error
 }
 
+// ConnErrorCode is reported to the peer when a connection is closed with a
+// reason; see the transport's ConnCode constants.
+type ConnErrorCode uint64
+
 type Conn interface {
 	AcceptStream(ctx context.Context) (Stream, error)
 	OpenStream(ctx context.Context) (Stream, error)
 	LocalAddr() net.Addr
 	RemoteAddr() net.Addr
-	Close() error
+	Context() context.Context
+	Close() error // Idempotent
 }
 
 type StreamErrorCode uint64

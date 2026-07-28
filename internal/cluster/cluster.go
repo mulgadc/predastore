@@ -7,6 +7,7 @@ package cluster
 import (
 	"fmt"
 	"net"
+	"path/filepath"
 	"slices"
 
 	"github.com/mulgadc/predastore/internal/transport"
@@ -97,28 +98,35 @@ func Validate(hosts []Host, nodes []Node) error {
 	return nil
 }
 
+// NodeKey is the name a node answers to on both transports: its pipe
+// registry entry in-process, and the ALPN key selecting it on its host's
+// shared socket. Everything per-node derives from the host base and this.
+func NodeKey(nodeID int) string {
+	return fmt.Sprintf("node-%d", nodeID)
+}
+
 // Topology resolves node ids to dialable addresses for one process. Nodes
-// launched in this process resolve to the process pipe endpoint; all others
-// resolve to their host's public address over the network.
+// launched in this process resolve to their in-process pipe endpoint; all
+// others resolve to their host's public address, keyed by node.
 type Topology struct {
 	hosts map[int]Host
 	nodes map[int]Node
 	local map[int]bool
-	// pipeAddr is this process's pipe endpoint, shared by all local nodes.
-	pipeAddr net.Addr
+	// host is the host this process runs; every local node belongs to it.
+	host Host
 }
 
-// NewTopology validates the topology and the local node selection. pipeName
-// names this process's pipe endpoint; every local node is reachable there.
-func NewTopology(hosts []Host, nodes []Node, localNodeIDs []int, pipeName string) (*Topology, error) {
+// NewTopology validates the topology and the local node selection.
+//
+// A process that has remote peers binds one host's socket, so its local nodes
+// must all be pinned to that host. A process running the entire cluster binds
+// nothing, so its nodes may span hosts: that is the single-process mode.
+func NewTopology(hosts []Host, nodes []Node, localNodeIDs []int) (*Topology, error) {
 	if err := Validate(hosts, nodes); err != nil {
 		return nil, err
 	}
 	if len(localNodeIDs) == 0 {
 		return nil, fmt.Errorf("cluster: no local nodes selected")
-	}
-	if pipeName == "" {
-		return nil, fmt.Errorf("cluster: missing pipe endpoint name")
 	}
 
 	t := &Topology{
@@ -132,24 +140,37 @@ func NewTopology(hosts []Host, nodes []Node, localNodeIDs []int, pipeName string
 	for _, n := range nodes {
 		t.nodes[n.ID] = n
 	}
+
+	hostID := 0
+	spansHosts := false
 	for _, id := range localNodeIDs {
-		if _, ok := t.nodes[id]; !ok {
+		n, ok := t.nodes[id]
+		if !ok {
 			return nil, fmt.Errorf("cluster: local node %d not in topology", id)
 		}
 		if t.local[id] {
 			return nil, fmt.Errorf("cluster: local node %d selected twice", id)
 		}
+		if hostID == 0 {
+			hostID = n.HostID
+		} else if n.HostID != hostID {
+			spansHosts = true
+		}
 		t.local[id] = true
 	}
-
-	pipeAddr, err := transport.ResolveAddr(string(transport.NetworkPipe), pipeName)
-	if err != nil {
-		return nil, err
+	// Spanning hosts is only coherent when nothing is reachable over the
+	// network, since otherwise there is no single socket to bind.
+	if spansHosts && t.NeedsNetwork() {
+		return nil, fmt.Errorf("cluster: local nodes span hosts but some node runs elsewhere; a process with remote peers runs one host")
 	}
-	t.pipeAddr = pipeAddr
+	t.host = t.hosts[hostID]
 
 	return t, nil
 }
+
+// LocalHost is the host whose socket this process binds. It is meaningful
+// only when NeedsNetwork reports true.
+func (t *Topology) LocalHost() Host { return t.host }
 
 // IsLocal reports whether the node runs in this process.
 func (t *Topology) IsLocal(nodeID int) bool { return t.local[nodeID] }
@@ -166,23 +187,45 @@ func (t *Topology) Host(hostID int) (Host, bool) {
 	return h, ok
 }
 
-// NodeAddr resolves a node id to the address a client should dial: the
-// process pipe endpoint for local nodes, the node's host public address
-// over the network otherwise.
+// NodeAddr resolves a node id to the address a client should dial: its
+// in-process pipe endpoint for local nodes, its host's public address keyed
+// by node otherwise. Callers never learn which they got.
 func (t *Topology) NodeAddr(nodeID int) (net.Addr, error) {
 	n, ok := t.nodes[nodeID]
 	if !ok {
 		return nil, fmt.Errorf("cluster: unknown node %d", nodeID)
 	}
 	if t.local[n.ID] {
-		return t.pipeAddr, nil
+		return transport.ResolveAddr(string(transport.NetworkPipe), NodeKey(n.ID))
 	}
 	h := t.hosts[n.HostID]
-	return transport.ResolveAddr(string(transport.NetworkQUIC), h.PublicAddr)
+	return transport.NewQUICAddr(h.PublicAddr, NodeKey(n.ID)), nil
 }
 
-// PipeName is the name of this process's pipe endpoint.
-func (t *Topology) PipeName() string { return t.pipeAddr.String() }
+// ListenAddrs are the addresses a local node's rpc server serves: its pipe
+// endpoint always, plus this host's socket when some peer runs elsewhere.
+// A process whose peers are all local never opens a network socket.
+func (t *Topology) ListenAddrs(nodeID int) ([]net.Addr, error) {
+	if !t.local[nodeID] {
+		return nil, fmt.Errorf("cluster: node %d does not run in this process", nodeID)
+	}
+	pipeAddr, err := transport.ResolveAddr(string(transport.NetworkPipe), NodeKey(nodeID))
+	if err != nil {
+		return nil, err
+	}
+	addrs := []net.Addr{pipeAddr}
+	if t.NeedsNetwork() {
+		addrs = append(addrs, transport.NewQUICAddr(t.host.BindAddr, NodeKey(nodeID)))
+	}
+	return addrs, nil
+}
+
+// DataDir is where a node keeps its state, derived from its own host's base
+// directory and its node id.
+func (t *Topology) DataDir(nodeID int) string {
+	h := t.hosts[t.nodes[nodeID].HostID]
+	return filepath.Join(h.DataDir, NodeKey(nodeID))
+}
 
 // LocalNodes returns the nodes running in this process, sorted by id.
 func (t *Topology) LocalNodes() []Node {
@@ -203,22 +246,6 @@ func (t *Topology) NeedsNetwork() bool {
 		}
 	}
 	return false
-}
-
-// LocalBindAddrs returns the distinct bind addresses of hosts with a node in
-// this process, sorted; these are the network listen addresses.
-func (t *Topology) LocalBindAddrs() []string {
-	seen := make(map[string]bool)
-	var addrs []string
-	for id := range t.local {
-		h := t.hosts[t.nodes[id].HostID]
-		if !seen[h.BindAddr] {
-			seen[h.BindAddr] = true
-			addrs = append(addrs, h.BindAddr)
-		}
-	}
-	slices.Sort(addrs)
-	return addrs
 }
 
 func (t *Topology) selectNodes(keep func(Node) bool) []Node {

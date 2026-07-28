@@ -23,11 +23,10 @@ func quicPair(t *testing.T) (dial, accepted transport.Conn) {
 	certPath, keyPath, pool := testcerts.Generate(t)
 
 	server := transport.NewQUICTransport(transport.QUICTransportConfig{
-		BindAddr: "127.0.0.1:0",
-		TLSCert:  certPath,
-		TLSKey:   keyPath,
+		TLSCert: certPath,
+		TLSKey:  keyPath,
 	})
-	ln, err := server.Listen()
+	ln, err := server.Listen(transport.NewQUICAddr("127.0.0.1:0", "node-1"))
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -71,12 +70,15 @@ func TestQUICResolveAddr(t *testing.T) {
 }
 
 func TestQUICListenRequiresCerts(t *testing.T) {
-	qt := transport.NewQUICTransport(transport.QUICTransportConfig{BindAddr: "127.0.0.1:0"})
-	if _, err := qt.Listen(); err == nil {
+	qt := transport.NewQUICTransport(transport.QUICTransportConfig{})
+	if _, err := qt.Listen(transport.NewQUICAddr("127.0.0.1:0", "node-1")); err == nil {
 		t.Fatal("Listen without certs succeeded")
 	}
-	qt = transport.NewQUICTransport(transport.QUICTransportConfig{})
-	if _, err := qt.Listen(); !errors.Is(err, transport.ErrMissingAddr) {
+	if _, err := qt.Listen(nil); !errors.Is(err, transport.ErrMissingAddr) {
+		t.Fatalf("got %v, want ErrMissingAddr", err)
+	}
+	// An address without a node key names no listener.
+	if _, err := qt.Listen(transport.NewQUICAddr("127.0.0.1:0", "")); !errors.Is(err, transport.ErrMissingAddr) {
 		t.Fatalf("got %v, want ErrMissingAddr", err)
 	}
 }
@@ -194,11 +196,10 @@ func TestQUICStreamReadFromWriteTo(t *testing.T) {
 func TestQUICListenerCloseUnblocksAccept(t *testing.T) {
 	certPath, keyPath, _ := testcerts.Generate(t)
 	qt := transport.NewQUICTransport(transport.QUICTransportConfig{
-		BindAddr: "127.0.0.1:0",
-		TLSCert:  certPath,
-		TLSKey:   keyPath,
+		TLSCert: certPath,
+		TLSKey:  keyPath,
 	})
-	ln, err := qt.Listen()
+	ln, err := qt.Listen(transport.NewQUICAddr("127.0.0.1:0", "node-1"))
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -224,11 +225,10 @@ func TestQUICListenerCloseUnblocksAccept(t *testing.T) {
 func TestQUICDialUntrustedServer(t *testing.T) {
 	certPath, keyPath, _ := testcerts.Generate(t)
 	server := transport.NewQUICTransport(transport.QUICTransportConfig{
-		BindAddr: "127.0.0.1:0",
-		TLSCert:  certPath,
-		TLSKey:   keyPath,
+		TLSCert: certPath,
+		TLSKey:  keyPath,
 	})
-	ln, err := server.Listen()
+	ln, err := server.Listen(transport.NewQUICAddr("127.0.0.1:0", "node-1"))
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}

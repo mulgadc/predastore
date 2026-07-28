@@ -54,39 +54,40 @@ func TestValidate(t *testing.T) {
 }
 
 func TestNewTopologyRejectsBadSelection(t *testing.T) {
-	if _, err := NewTopology(testHosts(), testNodes(), nil, "p"); err == nil {
+	if _, err := NewTopology(testHosts(), testNodes(), nil); err == nil {
 		t.Fatal("empty local selection accepted")
 	}
-	if _, err := NewTopology(testHosts(), testNodes(), []int{99}, "p"); err == nil {
+	if _, err := NewTopology(testHosts(), testNodes(), []int{99}); err == nil {
 		t.Fatal("unknown local node accepted")
 	}
-	if _, err := NewTopology(testHosts(), testNodes(), []int{1, 1}, "p"); err == nil {
+	if _, err := NewTopology(testHosts(), testNodes(), []int{1, 1}); err == nil {
 		t.Fatal("duplicate local node accepted")
 	}
-	if _, err := NewTopology(testHosts(), testNodes(), []int{1}, ""); err == nil {
+	// Local nodes may not span hosts while some node runs elsewhere.
+	if _, err := NewTopology(testHosts(), testNodes(), []int{1, 3}); err == nil {
 		t.Fatal("empty pipe name accepted")
 	}
 }
 
 func TestTopologyNodeAddr(t *testing.T) {
-	topo, err := NewTopology(testHosts(), testNodes(), []int{1, 2}, "s3d-test")
+	topo, err := NewTopology(testHosts(), testNodes(), []int{1, 2})
 	if err != nil {
 		t.Fatalf("NewTopology: %v", err)
 	}
 
-	// Local nodes resolve to the shared process pipe endpoint.
+	// Local nodes resolve to their own in-process pipe endpoint.
 	for _, id := range []int{1, 2} {
 		addr, err := topo.NodeAddr(id)
 		if err != nil {
 			t.Fatalf("NodeAddr(%d): %v", id, err)
 		}
-		if addr.Network() != "pipe" || addr.String() != "s3d-test" {
-			t.Fatalf("node %d resolved to %s/%s, want pipe/s3d-test", id, addr.Network(), addr.String())
+		if want := NodeKey(id); addr.Network() != "pipe" || addr.String() != want {
+			t.Fatalf("node %d resolved to %s/%s, want pipe/%s", id, addr.Network(), addr.String(), want)
 		}
 	}
 
-	// Remote nodes resolve to their host's public address over quic.
-	for id, want := range map[int]string{3: "10.11.12.2:6660", 4: "10.11.12.2:6660"} {
+	// Remote nodes resolve to their host's public address, keyed by node.
+	for id, want := range map[int]string{3: "10.11.12.2:6660/node-3", 4: "10.11.12.2:6660/node-4"} {
 		addr, err := topo.NodeAddr(id)
 		if err != nil {
 			t.Fatalf("NodeAddr(%d): %v", id, err)
@@ -102,7 +103,7 @@ func TestTopologyNodeAddr(t *testing.T) {
 }
 
 func TestTopologySelectors(t *testing.T) {
-	topo, err := NewTopology(testHosts(), testNodes(), []int{2, 1}, "s3d-test")
+	topo, err := NewTopology(testHosts(), testNodes(), []int{2, 1})
 	if err != nil {
 		t.Fatalf("NewTopology: %v", err)
 	}
@@ -120,8 +121,20 @@ func TestTopologySelectors(t *testing.T) {
 	if !topo.NeedsNetwork() {
 		t.Fatal("NeedsNetwork = false with remote nodes present")
 	}
-	if got := topo.LocalBindAddrs(); len(got) != 1 || got[0] != "0.0.0.0:6660" {
-		t.Fatalf("LocalBindAddrs = %v", got)
+	if got := topo.LocalHost().BindAddr; got != "0.0.0.0:6660" {
+		t.Fatalf("LocalHost().BindAddr = %v", got)
+	}
+
+	// A local node serves its pipe endpoint and this host's socket.
+	addrs, err := topo.ListenAddrs(1)
+	if err != nil {
+		t.Fatalf("ListenAddrs: %v", err)
+	}
+	if len(addrs) != 2 || addrs[0].Network() != "pipe" || addrs[1].Network() != "quic" {
+		t.Fatalf("ListenAddrs(1) = %v", addrs)
+	}
+	if _, err := topo.ListenAddrs(3); err == nil {
+		t.Fatal("ListenAddrs resolved a node that runs elsewhere")
 	}
 
 	if !topo.IsLocal(1) || topo.IsLocal(3) {
@@ -130,12 +143,24 @@ func TestTopologySelectors(t *testing.T) {
 }
 
 func TestTopologyAllLocal(t *testing.T) {
-	topo, err := NewTopology(testHosts(), testNodes(), []int{1, 2, 3, 4}, "s3d-all")
+	topo, err := NewTopology(testHosts(), testNodes(), []int{1, 2, 3, 4})
 	if err != nil {
 		t.Fatalf("NewTopology: %v", err)
 	}
-	// Peers all run locally: the process opens no network socket.
+	// Peers all run locally: the process opens no network socket, and nodes
+	// may span hosts because there is no socket to disambiguate.
 	if topo.NeedsNetwork() {
 		t.Fatal("NeedsNetwork = true with every node local")
+	}
+	addrs, err := topo.ListenAddrs(3)
+	if err != nil {
+		t.Fatalf("ListenAddrs: %v", err)
+	}
+	if len(addrs) != 1 || addrs[0].Network() != "pipe" {
+		t.Fatalf("single-process node listens on %v, want one pipe address", addrs)
+	}
+	// Data directories still come from each node's own host.
+	if got := topo.DataDir(3); got != "/var/lib/predastore/node-3" {
+		t.Fatalf("DataDir(3) = %s", got)
 	}
 }

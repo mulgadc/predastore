@@ -1,15 +1,16 @@
-// Package clusterrun assembles the per-process cluster runtime: transports,
-// the rpc server multiplexing every local node, and each node's raft replica
-// or shard store. cmd/s3d builds one and hands its backend to the S3 server.
+// Package clusterrun assembles the per-process cluster runtime: one transport
+// per network, and for every node this process runs, a service and the rpc
+// server carrying it. cmd/s3d is a thin entrypoint over Build and Run.
+//
+// It lives outside package main because the entrypoint's FIPS boot guard
+// panics under a plain `go test`, which would make this untestable there.
 package clusterrun
 
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/hashicorp/raft"
@@ -17,6 +18,7 @@ import (
 	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/internal/cluster"
 	"github.com/mulgadc/predastore/internal/rpc"
+	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/storage"
 	"github.com/mulgadc/predastore/internal/transport"
 	"github.com/mulgadc/predastore/internal/wire"
@@ -24,80 +26,59 @@ import (
 	"github.com/mulgadc/predastore/s3"
 	"github.com/mulgadc/predastore/s3db"
 	"github.com/mulgadc/predastore/store"
+	"golang.org/x/sync/errgroup"
 )
 
-// pipeEndpoint names the process's in-process transport endpoint; every
-// colocated node is reachable there.
-const pipeEndpoint = "s3d"
+// node is one storage or state replica running in this process: a service
+// serving its rpc endpoint, and the server carrying it.
+type node struct {
+	id  int
+	svc interface{ Run(context.Context) error }
+	srv *rpc.Server
+}
 
-// Runtime is everything a process runs besides the S3 frontend.
+// Runtime is everything this process runs besides the S3 frontend.
 type Runtime struct {
 	// Backend is the fully wired storage backend for the S3 frontend.
 	Backend backend.Backend
 
-	rpcCancel context.CancelFunc
-	rpcDone   chan struct{}
+	nodes  []node
+	client *rpc.Client
+	trs    []transport.Transport
+	// raftNodes back WaitReady; consensus is what the S3 frontend waits on.
 	raftNodes []*s3db.RaftNode
-	stores    []*store.Store
 }
 
-// Build assembles the process for the selected nodes: local nodes talk over
-// the pipe, remote nodes over quic, and rpc clients pick the transport per
-// address.
+// Build assembles the process for the selected nodes. Every node gets its own
+// service and rpc server; whether a peer is reached over the pipe or the
+// network follows from its address, so nothing below here branches on it.
 func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterkey.Key) (*Runtime, error) {
-	topo, err := cluster.NewTopology(cfg.Hosts, cfg.ClusterNodes, localIDs, pipeEndpoint)
+	topo, err := cluster.NewTopology(cfg.Hosts, cfg.ClusterNodes, localIDs)
 	if err != nil {
 		return nil, err
 	}
 
-	// The pipe transport serves and dials in-process traffic. The network
-	// only comes up when some node runs outside this process: one quic
-	// listener per local bind address, plus a dial-only transport for
-	// clients.
-	pipeTr := transport.NewPipeTransport(topo.PipeName())
-	serverTrs := []transport.Transport{pipeTr}
-	clientTrs := []transport.Transport{pipeTr}
+	// One transport per network for the whole process. The pipe carries
+	// in-process traffic; the QUIC socket only comes up when some node runs
+	// elsewhere, so a single-process cluster needs no certificates.
+	trs := []transport.Transport{transport.NewPipeTransport()}
 	if topo.NeedsNetwork() {
 		if tlsCert == "" || tlsKey == "" {
 			return nil, fmt.Errorf("cluster has remote nodes: -tls-cert and -tls-key are required")
 		}
-		for _, bind := range topo.LocalBindAddrs() {
-			serverTrs = append(serverTrs, transport.NewQUICTransport(transport.QUICTransportConfig{
-				BindAddr: bind,
-				TLSCert:  tlsCert,
-				TLSKey:   tlsKey,
-			}))
-		}
-		clientTrs = append(clientTrs, transport.NewQUICTransport(transport.QUICTransportConfig{}))
+		trs = append(trs, transport.NewQUICTransport(transport.QUICTransportConfig{
+			TLSCert: tlsCert,
+			TLSKey:  tlsKey,
+		}))
 	}
 
-	rpcClient := rpc.NewClient(rpc.ClientConfig{Transports: clientTrs})
-
-	// Services register before the server starts; replicas and stores
-	// attach as they come up, and peers retry until they do.
-	stateSvc := s3db.NewStateService()
-	storageSvc := storage.NewService()
-	mux := rpc.NewMux()
-	stateSvc.Register(mux)
-	storageSvc.Register(mux)
-
-	rpcSrv, err := rpc.NewServer(rpc.ServerConfig{Mux: mux, Transports: serverTrs})
-	if err != nil {
-		return nil, fmt.Errorf("start rpc server: %w", err)
+	rt := &Runtime{
+		trs:    trs,
+		client: rpc.NewClient(rpc.ClientConfig{Transports: trs}),
 	}
-	rpcCtx, rpcCancel := context.WithCancel(context.Background())
-	rpcDone := make(chan struct{})
-	go func() {
-		defer close(rpcDone)
-		if err := rpcSrv.Run(rpcCtx); err != nil {
-			slog.Error("rpc server exited", "error", err)
-		}
-	}()
 
-	rt := &Runtime{rpcCancel: rpcCancel, rpcDone: rpcDone}
-
-	// Raft traffic dials peers through the same client, resolving the
-	// node-identifying advertise address to a pipe or quic endpoint.
+	// Raft dials peers through the same client; its advertise addresses are
+	// node keys, which the topology resolves to whichever transport applies.
 	raftDial := func(ctx context.Context, address raft.ServerAddress) (transport.Stream, error) {
 		target, err := wire.ParseRaftAddress(string(address))
 		if err != nil {
@@ -107,7 +88,7 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 		if err != nil {
 			return nil, err
 		}
-		return rpc.OpenStream(ctx, rpcClient, addr, wire.OpRaftDial, &wire.RaftDial{Target: target})
+		return rpc.OpenStream(ctx, rt.client, addr, wire.OpRaftDial, &wire.RaftDial{})
 	}
 
 	replicas := topo.NodesByRole(cluster.RoleStateReplica)
@@ -119,63 +100,23 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 		replicaIDs[i] = id
 	}
 
-	// Compaction tuning is optional; the store applies its own default
-	// interval when enabled without one.
-	storeOpts := []store.Option{store.WithAEAD(key.AEAD)}
-	if cfg.Compaction.IntervalSeconds > 0 {
-		storeOpts = append(storeOpts, store.WithCompaction(time.Duration(cfg.Compaction.IntervalSeconds)*time.Second))
+	// Compaction is always enabled: without it, overwrite and delete churn
+	// never reclaims dead shards and the store fills. A zero interval falls
+	// back to the store's default.
+	storeOpts := []store.Option{
+		store.WithAEAD(key.AEAD),
+		store.WithCompaction(time.Duration(cfg.Compaction.IntervalSeconds) * time.Second),
 	}
 
 	for _, n := range topo.LocalNodes() {
-		host, _ := topo.Host(n.HostID)
-		id := uint64(n.ID) //nolint:gosec // G115: validated positive node ids.
-		dataDir := filepath.Join(host.DataDir, fmt.Sprintf("node-%d", n.ID), string(n.Role))
-
-		switch n.Role {
-		case cluster.RoleStateReplica:
-			layer := s3db.NewRPCStreamLayer(wire.RaftAddress(id), raftDial)
-			ccfg := s3db.DefaultClusterConfig()
-			ccfg.NodeID = id
-			ccfg.DataDir = dataDir
-			// Bootstrapping with an identical peer set is idempotent
-			// across replicas, so every replica may attempt it.
-			ccfg.Bootstrap = true
-			ccfg.StreamLayer = layer
-			ccfg.Peers = peers
-			node, err := s3db.NewRaftNode(ccfg)
-			if err != nil {
-				rt.Close()
-				return nil, fmt.Errorf("start state replica %d: %w", n.ID, err)
-			}
-			rt.raftNodes = append(rt.raftNodes, node)
-			stateSvc.AddReplica(id, node, layer)
-
-		case cluster.RoleShardStorage:
-			// The store expects its directory to exist.
-			if err := os.MkdirAll(dataDir, 0750); err != nil {
-				rt.Close()
-				return nil, fmt.Errorf("create shard store directory %s: %w", dataDir, err)
-			}
-			st, err := store.Open(dataDir, storeOpts...)
-			if err != nil {
-				rt.Close()
-				return nil, fmt.Errorf("open shard store for node %d: %w", n.ID, err)
-			}
-			rt.stores = append(rt.stores, st)
-			storageSvc.AddNode(id, st)
+		if err := rt.addNode(topo, n, raftDial, peers, storeOpts); err != nil {
+			rt.Close()
+			return nil, err
 		}
 	}
 
-	// Give consensus a chance to settle before serving S3 traffic; the
-	// state client retries, so a slow election degrades rather than fails.
-	if len(rt.raftNodes) > 0 {
-		if err := rt.raftNodes[0].WaitForLeader(30 * time.Second); err != nil {
-			slog.Warn("No leader elected within timeout, continuing anyway", "error", err)
-		}
-	}
-
-	stateClient, err := s3db.NewRPCClient(s3db.RPCClientConfig{
-		Client: rpcClient,
+	stateClient, err := state.NewClient(state.ClientConfig{
+		Client: rt.client,
 		Resolve: func(nodeID uint64) (net.Addr, error) {
 			return topo.NodeAddr(int(nodeID)) //nolint:gosec // G115: validated positive node ids.
 		},
@@ -186,7 +127,7 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 		return nil, err
 	}
 	shardClient, err := storage.NewClient(storage.ClientConfig{
-		Client:  rpcClient,
+		Client:  rt.client,
 		Resolve: topo.NodeAddr,
 	})
 	if err != nil {
@@ -194,8 +135,94 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 		return nil, err
 	}
 
-	// The hash ring places shards on the shard-storage nodes by id; the
-	// injected clients make addressing the transports' concern.
+	be, err := rt.buildBackend(cfg, topo, stateClient, shardClient)
+	if err != nil {
+		rt.Close()
+		return nil, err
+	}
+	rt.Backend = be
+
+	return rt, nil
+}
+
+// addNode builds one node's service and the rpc server that carries it. The
+// server is constructed but not started: handlers must be registered on every
+// node before any of them accepts, or early peer traffic finds no handler.
+func (rt *Runtime) addNode(
+	topo *cluster.Topology,
+	n cluster.Node,
+	raftDial func(context.Context, raft.ServerAddress) (transport.Stream, error),
+	peers []s3db.RaftPeer,
+	storeOpts []store.Option,
+) error {
+	id := uint64(n.ID) //nolint:gosec // G115: validated positive node ids.
+	dataDir := topo.DataDir(n.ID)
+	addrs, err := topo.ListenAddrs(n.ID)
+	if err != nil {
+		return err
+	}
+
+	mux := rpc.NewMux()
+	var svc interface{ Run(context.Context) error }
+
+	switch n.Role {
+	case cluster.RoleStateReplica:
+		layer := s3db.NewRPCStreamLayer(wire.RaftAddress(id), raftDial)
+		ccfg := s3db.DefaultClusterConfig()
+		ccfg.NodeID = id
+		ccfg.DataDir = dataDir
+		// Bootstrapping with an identical peer set is idempotent across
+		// replicas, so every replica may attempt it.
+		ccfg.Bootstrap = true
+		ccfg.StreamLayer = layer
+		ccfg.Peers = peers
+		raftNode, err := s3db.NewRaftNode(ccfg)
+		if err != nil {
+			return fmt.Errorf("start state replica %d: %w", n.ID, err)
+		}
+		stateSvc := state.NewService(id, raftNode, layer)
+		stateSvc.Register(mux)
+		svc = stateSvc
+		rt.raftNodes = append(rt.raftNodes, raftNode)
+
+	case cluster.RoleShardStorage:
+		// The store expects its directory to exist.
+		if err := os.MkdirAll(dataDir, 0750); err != nil {
+			return fmt.Errorf("create shard store directory %s: %w", dataDir, err)
+		}
+		st, err := store.Open(dataDir, storeOpts...)
+		if err != nil {
+			return fmt.Errorf("open shard store for node %d: %w", n.ID, err)
+		}
+		storageSvc := storage.NewService(id, st)
+		storageSvc.Register(mux)
+		svc = storageSvc
+
+	default:
+		return fmt.Errorf("node %d has unknown role %q", n.ID, n.Role)
+	}
+
+	srv, err := rpc.NewServer(rpc.ServerConfig{
+		Mux:        mux,
+		Addrs:      addrs,
+		Transports: rt.trs,
+	})
+	if err != nil {
+		return fmt.Errorf("serve node %d: %w", n.ID, err)
+	}
+
+	rt.nodes = append(rt.nodes, node{id: n.ID, svc: svc, srv: srv})
+	return nil
+}
+
+// buildBackend wires the hash ring over the cluster's storage nodes; the
+// injected clients make addressing the transports' concern.
+func (rt *Runtime) buildBackend(
+	cfg *s3.Config,
+	topo *cluster.Topology,
+	stateClient *state.Client,
+	shardClient *storage.Client,
+) (backend.Backend, error) {
 	storageNodes := topo.NodesByRole(cluster.RoleShardStorage)
 	beNodes := make([]distributed.NodeConfig, len(storageNodes))
 	for i, n := range storageNodes {
@@ -221,31 +248,58 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 		ShardClient:  shardClient,
 	})
 	if err != nil {
-		rt.Close()
 		return nil, fmt.Errorf("create distributed backend: %w", err)
 	}
-	rt.Backend = be
-
-	return rt, nil
+	return be, nil
 }
 
-// Close tears the runtime down: stop accepting rpc streams, then the raft
-// replicas, then the shard stores.
+// Run serves every node until ctx is cancelled, then drains. Each node's rpc
+// server and service share the process context, so one signal stops them all.
+func (rt *Runtime) Run(ctx context.Context) error {
+	g, gctx := errgroup.WithContext(ctx)
+	for _, n := range rt.nodes {
+		g.Go(func() error {
+			if err := n.srv.Run(gctx); err != nil {
+				return fmt.Errorf("node %d rpc server: %w", n.id, err)
+			}
+			return nil
+		})
+		g.Go(func() error {
+			if err := n.svc.Run(gctx); err != nil {
+				return fmt.Errorf("node %d service: %w", n.id, err)
+			}
+			return nil
+		})
+	}
+
+	err := g.Wait()
+	rt.Close()
+	return err
+}
+
+// WaitReady blocks until consensus has a leader, so callers do not serve S3
+// traffic into a cluster that cannot commit yet. Election needs the rpc
+// servers running, so this is only meaningful once Run has started.
+//
+// A cluster with no replicas is ready immediately. A slow election degrades
+// rather than fails: the state client retries, so callers may proceed on a
+// timeout with a warning.
+func (rt *Runtime) WaitReady(timeout time.Duration) error {
+	if len(rt.raftNodes) == 0 {
+		return nil
+	}
+	return rt.raftNodes[0].WaitForLeader(timeout)
+}
+
+// Close releases the process-wide resources the nodes share. Node state is
+// closed by each service's Run as it returns.
 func (rt *Runtime) Close() {
-	rt.rpcCancel()
-	select {
-	case <-rt.rpcDone:
-	case <-time.After(35 * time.Second):
-		slog.Warn("rpc server did not drain in time")
+	if rt.client != nil {
+		rt.client.Close()
 	}
-	for _, node := range rt.raftNodes {
-		if err := node.Close(); err != nil {
-			slog.Warn("closing raft node", "error", err)
-		}
-	}
-	for _, st := range rt.stores {
-		if err := st.Close(); err != nil {
-			slog.Warn("closing shard store", "error", err)
+	for _, tr := range rt.trs {
+		if c, ok := tr.(interface{ Close() error }); ok {
+			c.Close()
 		}
 	}
 }

@@ -3,6 +3,7 @@ package distributed
 import (
 	"errors"
 
+	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/s3db"
 )
 
@@ -118,8 +119,8 @@ func (l *LocalState) DB() *s3db.S3DB {
 }
 
 // StateClient reads and writes global state against the state replicas.
-// Implementations pick the transport; both the legacy HTTP client and the
-// rpc client satisfy it.
+// Implementations pick the transport; the rpc client in internal/state is
+// the production one.
 type StateClient interface {
 	Put(table, key string, value []byte) error
 	Get(table, key string) ([]byte, error)
@@ -128,7 +129,7 @@ type StateClient interface {
 }
 
 var _ StateClient = (*s3db.Client)(nil)
-var _ StateClient = (*s3db.RPCClient)(nil)
+var _ StateClient = (*state.Client)(nil)
 
 // DistributedState wraps a StateClient for GlobalState operations.
 // This is used when a distributed database cluster is configured.

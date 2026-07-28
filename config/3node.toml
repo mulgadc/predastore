@@ -1,10 +1,15 @@
-# 3-node distributed cluster configuration.
+# 3-host distributed cluster.
 #
-# 3 database (Raft) + 3 storage (QUIC) nodes on loopback aliases.
-# Each node N runs on 10.11.12.N — launch with: s3d -config clusters/3node/cluster.toml -node N
-# Loopback aliases must be configured before use (see scripts/launch-cluster.sh).
+# Hosts are s3d processes: each owns one socket and one data directory.
+# Nodes are roles pinned to a host; everything per-node derives from the
+# host base and the node id (pipe name, ALPN key, data subdirectory).
 #
-# No buckets defined — tests and benchmarks create their own.
+# Run the whole cluster in one process:
+#     s3d -config config/3node.toml
+# Run one host per process:
+#     s3d -config config/3node.toml -nodes 1,4
+#
+# No buckets defined - tests and benchmarks create their own.
 
 version = "1.0"
 region = "ap-southeast-2"
@@ -13,53 +18,58 @@ region = "ap-southeast-2"
 data = 2
 parity = 1
 
-# Background compactor for the QUIC shard store. Omit to use the default
-# interval (300s).
+# Background compactor for the shard store. Omit interval_seconds to use
+# the store default (300s).
 # [compaction]
 # interval_seconds = 300
 
-[[db]]
+[[host]]
 id = 1
-host = "10.11.12.1"
-port = 6660
-path = "db/node-1/"
-access_key_id = "AKIAIOSFODNN7EXAMPLE"
-secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-leader = true
+bind_addr = "0.0.0.0:6660"
+public_addr = "10.11.12.1:6660"
+data_dir = "data/host-1"
 
-[[db]]
+[[host]]
 id = 2
-host = "10.11.12.2"
-port = 6660
-path = "db/node-2/"
-access_key_id = "AKIAIOSFODNN7EXAMPLE"
-secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+bind_addr = "0.0.0.0:6660"
+public_addr = "10.11.12.2:6660"
+data_dir = "data/host-2"
 
-[[db]]
+[[host]]
 id = 3
-host = "10.11.12.3"
-port = 6660
-path = "db/node-3/"
-access_key_id = "AKIAIOSFODNN7EXAMPLE"
-secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+bind_addr = "0.0.0.0:6660"
+public_addr = "10.11.12.3:6660"
+data_dir = "data/host-3"
 
-[[nodes]]
+[[node]]
 id = 1
-host = "10.11.12.1"
-port = 9991
-path = "store/node-1/"
+host_id = 1
+role = "shard-storage"
 
-[[nodes]]
+[[node]]
 id = 2
-host = "10.11.12.2"
-port = 9991
-path = "store/node-2/"
+host_id = 2
+role = "shard-storage"
 
-[[nodes]]
+[[node]]
 id = 3
-host = "10.11.12.3"
-port = 9991
-path = "store/node-3/"
+host_id = 3
+role = "shard-storage"
+
+[[node]]
+id = 4
+host_id = 1
+role = "state-replica"
+
+[[node]]
+id = 5
+host_id = 2
+role = "state-replica"
+
+[[node]]
+id = 6
+host_id = 3
+role = "state-replica"
 
 [[auth]]
 access_key_id = "AKIAIOSFODNN7EXAMPLE"

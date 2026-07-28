@@ -1,4 +1,4 @@
-package s3db
+package state
 
 import (
 	"context"
@@ -10,12 +10,13 @@ import (
 
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/wire"
+	"github.com/mulgadc/predastore/s3db"
 )
 
-// RPCClient reads and writes global state over rpc streams. It mirrors the
-// HTTP client's semantics: reads try the cached leader then every replica,
+// Client reads and writes global state over rpc streams, hiding the wire
+// protocol from callers. Reads try the cached leader then every replica;
 // writes follow not-leader redirects and cache the leader they land on.
-type RPCClient struct {
+type Client struct {
 	rpc        *rpc.Client
 	resolve    func(nodeID uint64) (net.Addr, error)
 	replicas   []uint64
@@ -26,8 +27,8 @@ type RPCClient struct {
 	leader uint64 // cached leader replica id; 0 means unknown
 }
 
-// RPCClientConfig configures an RPCClient.
-type RPCClientConfig struct {
+// ClientConfig configures a Client.
+type ClientConfig struct {
 	// Client carries the streams; its transports decide pipe vs network
 	// per address.
 	Client *rpc.Client
@@ -42,15 +43,15 @@ type RPCClientConfig struct {
 	MaxRetries int
 }
 
-func NewRPCClient(cfg RPCClientConfig) (*RPCClient, error) {
+func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.Client == nil {
-		return nil, fmt.Errorf("s3db rpc client: missing rpc client")
+		return nil, fmt.Errorf("state client: missing rpc client")
 	}
 	if cfg.Resolve == nil {
-		return nil, fmt.Errorf("s3db rpc client: missing resolver")
+		return nil, fmt.Errorf("state client: missing resolver")
 	}
 	if len(cfg.Replicas) == 0 {
-		return nil, fmt.Errorf("s3db rpc client: no state replicas")
+		return nil, fmt.Errorf("state client: no state replicas")
 	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 10 * time.Second
@@ -58,7 +59,7 @@ func NewRPCClient(cfg RPCClientConfig) (*RPCClient, error) {
 	if cfg.MaxRetries == 0 {
 		cfg.MaxRetries = 3
 	}
-	return &RPCClient{
+	return &Client{
 		rpc:        cfg.Client,
 		resolve:    cfg.Resolve,
 		replicas:   cfg.Replicas,
@@ -69,7 +70,7 @@ func NewRPCClient(cfg RPCClientConfig) (*RPCClient, error) {
 
 // call performs one request round trip against a replica: header, optional
 // body, half-close, then the response envelope.
-func (c *RPCClient) call(target uint64, op rpc.Opcode, req *wire.StateRequest, body []byte) (*wire.StateResponse, error) {
+func (c *Client) call(target uint64, op rpc.Opcode, req *wire.StateRequest, body []byte) (*wire.StateResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -77,7 +78,6 @@ func (c *RPCClient) call(target uint64, op rpc.Opcode, req *wire.StateRequest, b
 	if err != nil {
 		return nil, fmt.Errorf("resolve replica %d: %w", target, err)
 	}
-	req.Target = target
 	stream, err := rpc.OpenStream(ctx, c.rpc, addr, op, req)
 	if err != nil {
 		return nil, fmt.Errorf("open stream to replica %d: %w", target, err)
@@ -107,7 +107,7 @@ func (c *RPCClient) call(target uint64, op rpc.Opcode, req *wire.StateRequest, b
 }
 
 // readOrder returns replicas with the cached leader first.
-func (c *RPCClient) readOrder() []uint64 {
+func (c *Client) readOrder() []uint64 {
 	c.mu.Lock()
 	leader := c.leader
 	c.mu.Unlock()
@@ -124,7 +124,7 @@ func (c *RPCClient) readOrder() []uint64 {
 	return order
 }
 
-func (c *RPCClient) cacheLeader(id uint64) {
+func (c *Client) cacheLeader(id uint64) {
 	c.mu.Lock()
 	c.leader = id
 	c.mu.Unlock()
@@ -132,7 +132,7 @@ func (c *RPCClient) cacheLeader(id uint64) {
 
 // Get retrieves a value. A replica that has not applied the key yet answers
 // not-found, so every replica is consulted before giving up.
-func (c *RPCClient) Get(table, key string) ([]byte, error) {
+func (c *Client) Get(table, key string) ([]byte, error) {
 	var lastErr error
 	notFound := false
 	for _, id := range c.readOrder() {
@@ -151,7 +151,7 @@ func (c *RPCClient) Get(table, key string) ([]byte, error) {
 		}
 	}
 	if notFound {
-		return nil, ErrKeyNotFound
+		return nil, s3db.ErrKeyNotFound
 	}
 	if lastErr != nil {
 		return nil, lastErr
@@ -161,7 +161,7 @@ func (c *RPCClient) Get(table, key string) ([]byte, error) {
 
 // Scan lists up to limit keys with the prefix, preferring the leader for
 // freshness but accepting any replica.
-func (c *RPCClient) Scan(table, prefix string, limit int) ([]ScanItem, error) {
+func (c *Client) Scan(table, prefix string, limit int) ([]s3db.ScanItem, error) {
 	var lastErr error
 	for _, id := range c.readOrder() {
 		resp, err := c.call(id, wire.OpStateScan, &wire.StateRequest{Table: table, Key: prefix, Limit: limit}, nil)
@@ -173,9 +173,9 @@ func (c *RPCClient) Scan(table, prefix string, limit int) ([]ScanItem, error) {
 			lastErr = fmt.Errorf("replica %d: %s", id, resp.Err)
 			continue
 		}
-		items := make([]ScanItem, len(resp.Items))
+		items := make([]s3db.ScanItem, len(resp.Items))
 		for i, it := range resp.Items {
-			items[i] = ScanItem{Key: it.Key, Value: it.Value}
+			items[i] = s3db.ScanItem{Key: it.Key, Value: it.Value}
 		}
 		return items, nil
 	}
@@ -183,18 +183,18 @@ func (c *RPCClient) Scan(table, prefix string, limit int) ([]ScanItem, error) {
 }
 
 // Put stores a key-value pair through the leader.
-func (c *RPCClient) Put(table, key string, value []byte) error {
+func (c *Client) Put(table, key string, value []byte) error {
 	return c.write(wire.OpStatePut, &wire.StateRequest{Table: table, Key: key}, value)
 }
 
 // Delete removes a key through the leader.
-func (c *RPCClient) Delete(table, key string) error {
+func (c *Client) Delete(table, key string) error {
 	return c.write(wire.OpStateDelete, &wire.StateRequest{Table: table, Key: key}, nil)
 }
 
 // write drives a consensus write to the leader, following not-leader
 // redirects and rotating through replicas while an election settles.
-func (c *RPCClient) write(op rpc.Opcode, req *wire.StateRequest, body []byte) error {
+func (c *Client) write(op rpc.Opcode, req *wire.StateRequest, body []byte) error {
 	candidates := c.readOrder()
 	next := 0
 	target := candidates[next]
@@ -210,7 +210,7 @@ func (c *RPCClient) write(op rpc.Opcode, req *wire.StateRequest, body []byte) er
 			c.cacheLeader(target)
 			return nil
 		case resp.Err == wire.ErrCodeNotLeader:
-			lastErr = ErrNotLeader
+			lastErr = s3db.ErrNotLeader
 			if id, perr := wire.ParseRaftAddress(resp.Leader); perr == nil {
 				// The replica knows the leader: go straight there.
 				target = id

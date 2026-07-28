@@ -71,11 +71,17 @@ REGION=$(grep -E '^\s*region\s*=' "$CONFIG_FILE" | head -1 | sed 's/.*=\s*"\(.*\
 ACCESS_KEY=$(awk '/^\[\[auth\]\]/{a=1} a && /access_key_id/{gsub(/.*= *"/,""); gsub(/".*/,""); print; exit}' "$CONFIG_FILE")
 SECRET_KEY=$(awk '/^\[\[auth\]\]/{a=1} a && /secret_access_key/{gsub(/.*= *"/,""); gsub(/".*/,""); print; exit}' "$CONFIG_FILE")
 
-HOST_LIST=""
-for ip in $(parse_host_ips); do
-    [ -n "$HOST_LIST" ] && HOST_LIST="${HOST_LIST},"
-    HOST_LIST="${HOST_LIST}${ip}:${S3_PORT}"
-done
+# A [[host]]/[[node]] topology config runs colocated in one process with a
+# single S3 frontend on loopback; otherwise each node exposes its own endpoint.
+if grep -qE '^\s*\[\[host\]\]' "$CONFIG_FILE"; then
+    HOST_LIST="127.0.0.1:${S3_PORT}"
+else
+    HOST_LIST=""
+    for ip in $(parse_host_ips); do
+        [ -n "$HOST_LIST" ] && HOST_LIST="${HOST_LIST},"
+        HOST_LIST="${HOST_LIST}${ip}:${S3_PORT}"
+    done
+fi
 
 # --- Start cluster ---
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"slices"
 	"sync"
 	"time"
@@ -39,8 +40,13 @@ func RegisterHandler[T any, PT interface {
 	}
 }
 
+// ServerConfig describes one node's rpc endpoint. Addrs are every address the
+// node answers on: an in-process pipe address always, plus a network address
+// when peers run outside this process. Transports are the process-wide set,
+// shared with every other node's server.
 type ServerConfig struct {
 	Mux          *Mux
+	Addrs        []net.Addr
 	Transports   []transport.Transport
 	DrainTimeout time.Duration
 }
@@ -56,11 +62,28 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		cfg.DrainTimeout = defaultDrainTimeout
 	}
 
-	lns := make([]transport.Listener, 0, len(cfg.Transports))
+	trs := make(map[string]transport.Transport, len(cfg.Transports))
 	for _, tr := range cfg.Transports {
-		ln, err := tr.Listen()
+		trs[tr.Network()] = tr
+	}
+
+	lns := make([]transport.Listener, 0, len(cfg.Addrs))
+	// Release the addresses already bound on any failure; leaving them held
+	// would fail a retry of this same config with "address already in use".
+	bail := func(err error) error {
+		for _, bound := range lns {
+			bound.Close()
+		}
+		return err
+	}
+	for _, addr := range cfg.Addrs {
+		tr, ok := trs[addr.Network()]
+		if !ok {
+			return nil, bail(fmt.Errorf("no %s transport available", addr.Network()))
+		}
+		ln, err := tr.Listen(addr)
 		if err != nil {
-			return nil, err
+			return nil, bail(err)
 		}
 		lns = append(lns, ln)
 	}
@@ -87,6 +110,9 @@ func (s *Server) Run(ctx context.Context) error {
 				errors.Is(err, transport.ErrListenerClosed):
 				return nil
 			default:
+				slog.ErrorContext(acceptCtx, "listener error",
+					"err", err,
+					"addr", ln.Addr())
 				return err
 			}
 		})
@@ -97,6 +123,9 @@ func (s *Server) Run(ctx context.Context) error {
 		ln.Close()
 	}
 
+	// Each conns goroutine waits for its own handlers, so this covers every
+	// in-flight request: once it returns, nothing is still touching state the
+	// caller is about to tear down.
 	done := make(chan struct{})
 	go func() {
 		conns.Wait()
@@ -131,18 +160,18 @@ func (s *Server) acceptConns(
 	for {
 		conn, err := ln.Accept(acceptCtx)
 		if err != nil {
-			slog.ErrorContext(acceptCtx, "accept connection",
-				"err", err,
-				"addr", ln.Addr())
 			var te interface{ Temporary() bool }
 			if errors.As(err, &te) && te.Temporary() {
+				// The timer is stopped rather than deferred: this loop runs
+				// for the life of the listener, so a deferred Stop per retry
+				// would accumulate for as long as the errors keep coming.
 				t := time.NewTimer(backoff)
-				defer t.Stop()
 				select {
 				case <-t.C:
 					backoff = min(backoff*2, maxBackoff)
 					continue
 				case <-acceptCtx.Done():
+					t.Stop()
 					return acceptCtx.Err()
 				}
 			}
@@ -150,41 +179,67 @@ func (s *Server) acceptConns(
 		}
 		backoff = 5 * time.Millisecond
 
-		conns.Add(1)
-		go s.serveConn(acceptCtx, handlerCtx, conn, conns)
+		conns.Go(func() {
+			// Handlers outlive the accept loop, so the connection is tracked
+			// here and closed only once they have drained. Waiting inside the
+			// conns goroutine is what makes Run's conns.Wait a full drain.
+			var streams sync.WaitGroup
+			defer conn.Close()
+
+			// Cancelled handlers mean the drain deadline expired. Aborting the
+			// connection is the only way to unblock a handler parked in a
+			// stream read, which has no deadline and never observes ctx.
+			drained := make(chan struct{})
+			defer close(drained)
+			go func() {
+				select {
+				case <-handlerCtx.Done():
+					conn.Close()
+				case <-drained:
+				}
+			}()
+
+			err := s.acceptStreams(acceptCtx, handlerCtx, conn, &streams)
+			streams.Wait()
+
+			switch {
+			case err == nil,
+				errors.Is(err, context.Canceled),
+				errors.Is(err, transport.ErrListenerClosed),
+				errors.Is(err, transport.ErrConnClosed):
+			default:
+				slog.ErrorContext(acceptCtx, "connection error",
+					"err", err,
+					"source", conn.LocalAddr(),
+					"addr", conn.RemoteAddr())
+			}
+		})
 	}
 }
 
-func (s *Server) serveConn(
+func (s *Server) acceptStreams(
 	acceptCtx, handlerCtx context.Context,
 	conn transport.Conn,
-	conns *sync.WaitGroup,
-) {
-	defer conns.Done()
-
-	var streams sync.WaitGroup
+	streams *sync.WaitGroup,
+) error {
 	for {
 		stream, err := conn.AcceptStream(acceptCtx)
 		if err != nil {
-			slog.ErrorContext(acceptCtx, "accept stream",
-				"err", err,
-				"source", conn.LocalAddr(),
-				"addr", conn.RemoteAddr())
-			break
+			return fmt.Errorf("accept stream: %w", err)
 		}
 
 		streams.Go(func() {
 			if err := s.handleStream(handlerCtx, stream); err != nil {
-				slog.ErrorContext(handlerCtx, "handle stream",
+				slog.ErrorContext(acceptCtx, "stream error",
 					"err", err,
-					"source", stream.LocalAddr(),
-					"addr", stream.RemoteAddr())
+					"source", conn.LocalAddr(),
+					"addr", conn.RemoteAddr())
 				// TODO: Figure out better error codes.
 				stream.CancelRead(0)
 				stream.CancelWrite(0)
-				return
+			} else {
+				stream.Close()
 			}
-			stream.Close()
 		})
 	}
 }
