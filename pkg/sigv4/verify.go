@@ -35,6 +35,15 @@ func (req *SignedRequest) Verify(secretAccessKey, region, service string) (*Veri
 
 // buildCanonicalHash returns the hex SHA256 of the request's SigV4 canonical request.
 func (req *SignedRequest) buildCanonicalHash() string {
+	canonicalSum := sha256.Sum256([]byte(req.CanonicalRequest()))
+
+	return hex.EncodeToString(canonicalSum[:])
+}
+
+// CanonicalRequest returns the server-side reconstruction of the client's SigV4 canonical
+// request. A signature mismatch means this string differs from the one the client signed, so
+// diffing the two is the only way to localise the disagreement; nothing else needs it.
+func (req *SignedRequest) CanonicalRequest() string {
 	// One (key, value) pair per value; the raw forms drive ordering.
 	type queryParam struct{ key, value string }
 	params := make([]queryParam, 0, len(req.Canonical.Query))
@@ -85,8 +94,7 @@ func (req *SignedRequest) buildCanonicalHash() string {
 		uri = "/"
 	}
 
-	// Assemble the canonical request and hash it.
-	canonicalRequest := strings.Join([]string{
+	return strings.Join([]string{
 		req.Canonical.Method,
 		uri,
 		strings.Join(pairs, "&"),
@@ -94,9 +102,6 @@ func (req *SignedRequest) buildCanonicalHash() string {
 		strings.Join(signedHeaders, ";"),
 		req.Canonical.ContentHash,
 	}, "\n")
-	canonicalSum := sha256.Sum256([]byte(canonicalRequest))
-
-	return hex.EncodeToString(canonicalSum[:])
 }
 
 // buildStringToSign returns the SigV4 string-to-sign for the given canonical-request hash.
