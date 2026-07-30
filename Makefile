@@ -63,7 +63,9 @@ test-race:
 
 # Run integration tests (gated behind the 'integration' build tag — these
 # bind real network ports and are excluded from default/test-race runs).
-test-integration:
+# certs is a prerequisite: these serve TLS, and certs/ is gitignored, so a
+# fresh worktree has none and every one of them fails to dial.
+test-integration: certs
 	@echo -e "\n....Running integration tests for $(GO_PROJECT_NAME)...."
 	$(_Q)LOG_IGNORE=1 go test -tags=integration -timeout 300s ./... $(_RACEQ)
 
