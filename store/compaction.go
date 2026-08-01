@@ -153,8 +153,20 @@ func (store *Store) compactOnce() error {
 
 // candidateSegments scans the tombstone namespace, sums dead bytes per segment,
 // and returns segments whose live fraction is below the threshold, plus a
-// count of segments that could not be inspected. The active append segment is
-// never a candidate — it is the relocation destination.
+// count of segments that could not be inspected.
+//
+// The active append segment is never returned as a candidate in this pass —
+// it is the relocation destination, and it may still be receiving writes. But
+// if its own live fraction is below the threshold, it is sealed (the same
+// markFull a size-triggered roll uses) and store.segNum is advanced past it,
+// exactly like a normal roll. Without this, a store whose data never crosses
+// maxSegSize keeps its only segment active forever, and its dead bytes are
+// never reclaimable no matter how large. The sealed segment is left for the
+// next cycle to pick up as an ordinary, no-longer-active candidate: any
+// writer that reserved a slot in it before the roll is only guaranteed to
+// have finished by dropSegment's addRef/waitForRefs pairing, not by elapsed
+// time, but deferring candidacy by one cycle keeps its exposure no worse than
+// any size-rolled segment gets.
 //
 // A segment that fails to open or stat is skipped rather than aborting the
 // whole scan: one bad segment (e.g. dropped out from under a stale tombstone)
@@ -183,10 +195,6 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 	var candidates []uint64
 	var failed int
 	for num, deadBytes := range dead {
-		if num == store.segNum {
-			continue
-		}
-
 		// Read path: a candidate must already exist. If it doesn't (e.g. a
 		// tombstone survived a segment already dropped), skip it and keep
 		// going rather than fabricating a stub or stalling the whole scan.
@@ -207,9 +215,27 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 		if size <= segHeaderSize {
 			continue
 		}
-		if float64(size-deadBytes)/float64(size) < compactionLiveThreshold {
-			candidates = append(candidates, num)
+		if float64(size-deadBytes)/float64(size) >= compactionLiveThreshold {
+			continue
 		}
+
+		if num == store.segNum {
+			// Seal and roll now so next cycle sees a normal, non-active
+			// candidate; do not compact it in this same pass (see doc comment).
+			if err := seg.markFull(); err != nil {
+				slog.Error("compaction: failed to seal stale active segment, will retry next cycle", "segNum", num, "error", err)
+				failed++
+				continue
+			}
+			if _, err := store.rollSegment(); err != nil {
+				slog.Error("compaction: failed to roll past sealed active segment, will retry next cycle", "segNum", num, "error", err)
+				failed++
+				continue
+			}
+			continue
+		}
+
+		candidates = append(candidates, num)
 	}
 	return candidates, failed, nil
 }
