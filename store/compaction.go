@@ -220,10 +220,40 @@ type segmentStats struct {
 	bytes   int64
 }
 
+// compactionAfterScan fires between a segment's liveness scan and its drop.
+// Production leaves it a no-op; tests override it to commit inside that window,
+// the way SetOpenFile overrides the segment opener.
+var compactionAfterScan = func(segNum uint64) {}
+
 // compactSegment relocates a segment's live extents into the active append
-// segment, then drops it and clears its tombstones.
+// segment, then drops it and clears its tombstones. A segment still holding an
+// uncommitted write is deferred to a later cycle instead.
 func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 	var stats segmentStats
+
+	store.mutex.Lock()
+	// Read path: candidateSegments already opened this one, so a segment that
+	// has gone missing since must be reported rather than fabricated.
+	seg, err := store.getSegment(num, false)
+	var deferred bool
+	if err == nil {
+		// segNum only ever advances, so a segment already below it can never be an
+		// append target again: a zero pending count there can never rise back, which
+		// is what makes one reading here hold for the whole scan that follows.
+		deferred = num >= store.segNum || seg.pendingWrites() > 0
+	}
+	store.mutex.Unlock()
+	if err != nil {
+		return stats, fmt.Errorf("get segment %d: %w", num, err)
+	}
+
+	// A writer publishes its .idx row and reserves its extent at Append but only
+	// reaches the index at Close, so scanning now would read it as absent and take
+	// it for dead — and dropSegment's waitForRefs runs too late to undo that.
+	if deferred {
+		slog.Info("compaction deferred segment with uncommitted writes", "segNum", num, "pending", seg.pendingWrites())
+		return stats, nil
+	}
 
 	entries, err := scanIdx(store.dir, num)
 	if err != nil {
@@ -254,6 +284,8 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 		stats.extents++
 		stats.bytes += cur.PSize
 	}
+
+	compactionAfterScan(num)
 
 	// The relocations above CAS-committed the repointed rows into badger, which
 	// runs with SyncWrites off, so they may still be only in the OS page cache.

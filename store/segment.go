@@ -160,6 +160,11 @@ type segment struct {
 	// addRef can race a Wait.
 	refs sync.WaitGroup
 
+	// Writers that reserved an extent here but have not yet committed it to the
+	// index. Counted apart from refs because a reader pins the fd without
+	// hiding anything from a liveness lookup, whereas an uncommitted writer does.
+	pending atomic.Int64
+
 	// Caches the on-disk full flag, sparing the hot Append path a ReadAt.
 	full atomic.Bool
 }
@@ -167,6 +172,20 @@ type segment struct {
 func (seg *segment) addRef()      { seg.refs.Add(1) }
 func (seg *segment) releaseRef()  { seg.refs.Done() }
 func (seg *segment) waitForRefs() { seg.refs.Wait() }
+
+// addWriteRef pins the segment for a writer whose extent is reserved but not
+// yet in the index. releaseWriteRef must run only after that commit lands.
+func (seg *segment) addWriteRef() {
+	seg.pending.Add(1)
+	seg.refs.Add(1)
+}
+
+func (seg *segment) releaseWriteRef() {
+	seg.pending.Add(-1)
+	seg.refs.Done()
+}
+
+func (seg *segment) pendingWrites() int64 { return seg.pending.Load() }
 
 // appendIdx writes one row at the .idx append cursor and advances it. Caller
 // holds store.mutex.
@@ -182,7 +201,8 @@ func (seg *segment) syncIdx() error { return seg.idx.Sync() }
 
 // dropSegment unlinks a drained segment and its sidecar. Caller holds
 // store.mutex. Safe only once every live extent it held has been committed
-// elsewhere.
+// elsewhere. waitForRefs below guards the unlink alone: it runs after the
+// caller has already judged liveness, so it cannot make that judgement safe.
 func (store *Store) dropSegment(num uint64) error {
 	seg, ok := store.segCache[num]
 	if !ok {

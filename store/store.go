@@ -309,7 +309,9 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		return nil, err
 	}
 
-	seg.addRef()
+	// Marks the extent as reserved-but-uncommitted, which is what keeps
+	// compaction from judging this segment's liveness before the writer closes.
+	seg.addWriteRef()
 
 	ext := extent{
 		SegNum: store.segNum,
@@ -320,7 +322,7 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 
 	key := MakeShardKey(objectHash, shardIndex)
 	if err := seg.appendIdx(idxEntry{Off: off, Key: [36]byte(key), PSize: ext.PSize}); err != nil {
-		seg.releaseRef()
+		seg.releaseWriteRef()
 		return nil, fmt.Errorf("append idx: %w", err)
 	}
 

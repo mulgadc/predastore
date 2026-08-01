@@ -405,3 +405,125 @@ func TestIdxCoversEveryCommittedExtent(t *testing.T) {
 		}
 	}
 }
+
+// inFlightSegment0Store leaves segment 0 as a compaction candidate that still
+// holds one reserved-but-uncommitted extent: a deleted shard supplies the dead
+// bytes, the returned writer is open, and a third shard rolls the store off
+// segment 0 so it stops being the active segment.
+func inFlightSegment0Store(t *testing.T) (st *Store, dir string, live [32]byte, body []byte, w Writer) {
+	t.Helper()
+	st, dir = openTestStore(t, WithMaxSegSize(40*KiB))
+
+	dead := [32]byte{0x71}
+	live = [32]byte{0x72}
+	body = bytes.Repeat([]byte{0x5a}, 12*KiB)
+
+	putShard(t, st, dead, 0, body)
+
+	w, err := st.Append(live, 0, int64(len(body)))
+	if err != nil {
+		t.Fatalf("append in-flight shard: %v", err)
+	}
+	if _, err := w.Write(body); err != nil {
+		t.Fatalf("write in-flight shard: %v", err)
+	}
+	if ext := extentOf(t, st, dead, 0); ext.SegNum != 0 {
+		t.Fatalf("precondition: dead shard should be in segment 0, got %d", ext.SegNum)
+	}
+
+	if _, err := st.Delete(dead, 0); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// Rolls onto segment 1, so segment 0 is no longer the active segment and
+	// becomes eligible for candidate selection with the writer above still open.
+	putShard(t, st, [32]byte{0x73}, 0, bytes.Repeat([]byte{0x5b}, 20*KiB))
+	if st.segNum == 0 {
+		t.Fatalf("precondition: store should have rolled off segment 0")
+	}
+
+	cands, failed, err := st.candidateSegments()
+	if err != nil {
+		t.Fatalf("candidates: %v", err)
+	}
+	if failed != 0 {
+		t.Fatalf("candidate scan reported %d failures, want 0", failed)
+	}
+	if len(cands) != 1 || cands[0] != 0 {
+		t.Fatalf("precondition: expected segment 0 as sole candidate, got %v", cands)
+	}
+
+	return st, dir, live, body, w
+}
+
+// A writer reserves its extent and publishes its .idx row at Append but only
+// reaches the index at Close, so compaction's per-key liveness check reads a
+// mid-write key as absent and takes it for dead. dropSegment's waitForRefs then
+// waits for that very writer before unlinking, which guarantees the commit lands
+// first — the segment is deleted out from under a live index entry.
+func TestCompactionDoesNotDropSegmentWithInFlightWrite(t *testing.T) {
+	st, _, live, body, w := inFlightSegment0Store(t)
+
+	// Force the losing interleave: commit the in-flight shard after the liveness
+	// scan and before the drop. Fires at most once; the deferral fix means the
+	// first cycle never reaches the seam at all.
+	closedByHook := false
+	prev := compactionAfterScan
+	compactionAfterScan = func(segNum uint64) {
+		if segNum != 0 || closedByHook {
+			return
+		}
+		closedByHook = true
+		if err := w.Close(); err != nil {
+			t.Errorf("close in-flight writer: %v", err)
+		}
+	}
+	defer func() { compactionAfterScan = prev }()
+
+	if err := st.compactOnce(); err != nil {
+		t.Fatalf("compact cycle 1: %v", err)
+	}
+
+	if !closedByHook {
+		if err := w.Close(); err != nil {
+			t.Fatalf("close in-flight writer: %v", err)
+		}
+	}
+
+	// Whichever way the cycle went, the shard that was mid-write must survive.
+	if got := readShard(t, st, live, 0); !bytes.Equal(got, body) {
+		t.Fatalf("mid-write shard body wrong after compaction")
+	}
+	if closedByHook {
+		t.Fatalf("compaction scanned segment 0 for liveness while a write to it was uncommitted")
+	}
+}
+
+// Deferring must cost nothing permanently: once the writer drains, the very next
+// cycle reclaims the segment. Otherwise the fix trades data loss for a segment
+// that is never reclaimed, which is the failure mode compaction exists to avoid.
+func TestCompactionReclaimsDeferredSegmentOnceWriteCommits(t *testing.T) {
+	st, dir, live, body, w := inFlightSegment0Store(t)
+	seg0 := filepath.Join(dir, fmt.Sprintf(segFilename, uint64(0)))
+
+	if err := st.compactOnce(); err != nil {
+		t.Fatalf("compact cycle 1: %v", err)
+	}
+	if _, err := os.Stat(seg0); err != nil {
+		t.Fatalf("segment 0 must survive a cycle that could not judge its liveness: %v", err)
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatalf("close in-flight writer: %v", err)
+	}
+
+	if err := st.compactOnce(); err != nil {
+		t.Fatalf("compact cycle 2: %v", err)
+	}
+	if _, err := os.Stat(seg0); !os.IsNotExist(err) {
+		t.Fatalf("segment 0 stranded after its writer drained, stat gave %v", err)
+	}
+	if got := readShard(t, st, live, 0); !bytes.Equal(got, body) {
+		t.Fatalf("relocated shard body wrong after the deferred segment was reclaimed")
+	}
+}

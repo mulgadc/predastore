@@ -115,7 +115,9 @@ func (w *writer) Close() (err error) {
 	}
 
 	w.closed = true
-	defer w.seg.releaseRef()
+	// Deferred, so the segment stays marked as holding an uncommitted write
+	// until commitExtent below has either landed or failed for good.
+	defer w.seg.releaseWriteRef()
 
 	if w.cursor > w.flushedTo {
 		if err = w.flush(true); err != nil {
