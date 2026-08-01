@@ -396,8 +396,9 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 
 	// Store object metadata (same as regular PutObject)
 	objectToShardNodes := ObjectToShardNodes{
-		Object: objectHash,
-		Size:   finalInfo.Size(),
+		Object:       objectHash,
+		Size:         finalInfo.Size(),
+		LastModified: b.now(),
 	}
 
 	// Use objectHash for hash ring placement - must match what putObjectViaQUIC uses

@@ -126,8 +126,11 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 			}
 		}
 
-		// Look up object metadata using the objectHash (value) to get size
+		// Look up object metadata using the objectHash (value) to get size and
+		// LastModified. Entries that fail to resolve (corrupt/missing metadata)
+		// report a zero LastModified rather than a fabricated one.
 		var objectSize int64
+		var lastModified time.Time
 
 		if len(value) == 32 {
 			// value is the objectHash, look up the full metadata
@@ -138,6 +141,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 				dec := gob.NewDecoder(r)
 				if err := dec.Decode(&objMeta); err == nil {
 					objectSize = objMeta.Size
+					lastModified = objMeta.LastModified
 				}
 			}
 		}
@@ -145,7 +149,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 		// Add as content
 		contents = append(contents, backend.ObjectInfo{
 			Key:          objectKey,
-			LastModified: time.Now(), // TODO: Store actual modification time
+			LastModified: lastModified,
 			Size:         objectSize,
 			StorageClass: "STANDARD",
 		})

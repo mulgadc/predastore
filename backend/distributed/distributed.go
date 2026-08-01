@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash/v2"
@@ -88,14 +89,20 @@ type Backend struct {
 	quicBasePort  int
 	nodeAddrs     map[int]string // node ID -> "host:port"
 	buckets       []BucketConfig // bucket configurations
+	clock         func() time.Time
 }
 
 // ObjectToShardNodes maps an object to its shard locations.
+//
+// LastModified is gob-encoded by field name: objects written before this field
+// existed decode with it zeroed rather than erroring, so old objects report the
+// zero time until they are next written (see Backend.now/SetClock).
 type ObjectToShardNodes struct {
 	Object           [32]byte
 	Size             int64
 	DataShardNodes   []uint32
 	ParityShardNodes []uint32
+	LastModified     time.Time
 }
 
 // hasher implements consistent.Hasher using xxhash.
@@ -232,6 +239,7 @@ func New(config any) (backend.Backend, error) {
 		quicBasePort:  quicBasePort,
 		nodeAddrs:     nodeAddrs,
 		buckets:       cfg.Buckets,
+		clock:         time.Now,
 	}, nil
 }
 
@@ -266,6 +274,20 @@ func (b *Backend) DataDir() string {
 // SetDataDir sets the data directory (for testing).
 func (b *Backend) SetDataDir(dir string) {
 	b.dataDir = dir
+}
+
+// now returns the current time via the injectable clock, so writes are
+// tied to a single timestamp source that tests can override.
+func (b *Backend) now() time.Time {
+	if b.clock != nil {
+		return b.clock()
+	}
+	return time.Now()
+}
+
+// SetClock overrides the backend's time source (for testing).
+func (b *Backend) SetClock(clock func() time.Time) {
+	b.clock = clock
 }
 
 // RsDataShard returns the number of data shards (for testing).

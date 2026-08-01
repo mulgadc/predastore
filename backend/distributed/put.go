@@ -83,6 +83,7 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	}
 
 	objectToShardNodes.Size = size
+	objectToShardNodes.LastModified = b.now()
 
 	// Get hash ring placement using objectHash for consistency with storage and retrieval
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
@@ -164,6 +165,7 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 	}
 
 	objectToShardNodes.Size = size
+	objectToShardNodes.LastModified = b.now()
 
 	// Get hash ring placement using objectHash for consistency with putObjectViaQUIC
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)

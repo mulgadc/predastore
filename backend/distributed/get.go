@@ -94,6 +94,7 @@ func (b *Backend) handleRangeRequest(ctx context.Context, req *backend.GetObject
 			ContentRange: contentRange,
 			Size:         int64(len(data)),
 			ETag:         generateDistributedETag(req.Bucket, req.Key),
+			LastModified: shards.LastModified,
 			StatusCode:   206, // Partial Content
 		}, nil
 	}
@@ -227,6 +228,7 @@ func (b *Backend) handleRangeWithFullReconstruction(ctx context.Context, req *ba
 		ContentRange: contentRange,
 		Size:         int64(len(rangeData)),
 		ETag:         generateDistributedETag(req.Bucket, req.Key),
+		LastModified: shards.LastModified,
 		StatusCode:   206, // Partial Content
 	}, nil
 }
@@ -265,11 +267,12 @@ func (b *Backend) getFullObject(ctx context.Context, req *backend.GetObjectReque
 
 	// Create response with io.ReadCloser wrapper
 	return &backend.GetObjectResponse{
-		Body:        io.NopCloser(bytes.NewReader(out.Bytes())),
-		ContentType: "application/octet-stream",
-		Size:        int64(out.Len()),
-		ETag:        generateDistributedETag(req.Bucket, req.Key),
-		StatusCode:  200,
+		Body:         io.NopCloser(bytes.NewReader(out.Bytes())),
+		ContentType:  "application/octet-stream",
+		Size:         int64(out.Len()),
+		ETag:         generateDistributedETag(req.Bucket, req.Key),
+		LastModified: shards.LastModified,
+		StatusCode:   200,
 	}, nil
 }
 
@@ -279,7 +282,7 @@ func (b *Backend) HeadObject(ctx context.Context, bucket, key string) (*backend.
 		return nil, err
 	}
 
-	_, size, err := b.openInput(bucket, key)
+	shards, size, err := b.openInput(bucket, key)
 	if err != nil {
 		return nil, backend.ErrNoSuchKeyError.WithResource(key)
 	}
@@ -288,6 +291,7 @@ func (b *Backend) HeadObject(ctx context.Context, bucket, key string) (*backend.
 		ContentType:   "application/octet-stream",
 		ContentLength: size,
 		ETag:          generateDistributedETag(bucket, key),
+		LastModified:  shards.LastModified,
 	}, nil
 }
 
