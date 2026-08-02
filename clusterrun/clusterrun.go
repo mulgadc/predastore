@@ -120,12 +120,14 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 	}
 
 	replicas := topo.NodesByRole(cluster.RoleStateReplica)
-	peers := make([]s3db.RaftPeer, len(replicas))
-	replicaIDs := make([]uint64, len(replicas))
+	replicaIDs := make([]int, len(replicas))
 	for i, n := range replicas {
-		id := uint64(n.ID) //nolint:gosec // G115: validated positive node ids.
-		peers[i] = s3db.RaftPeer{ID: id, Address: wire.RaftAddress(id)}
-		replicaIDs[i] = id
+		replicaIDs[i] = n.ID
+	}
+	peers := RaftPeers(replicaIDs)
+	replicaNodeIDs := make([]uint64, len(peers))
+	for i, p := range peers {
+		replicaNodeIDs[i] = p.ID
 	}
 
 	// Compaction is always enabled: without it, overwrite and delete churn
@@ -148,7 +150,7 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 		Resolve: func(nodeID uint64) (net.Addr, error) {
 			return topo.NodeAddr(int(nodeID)) //nolint:gosec // G115: validated positive node ids.
 		},
-		Replicas: replicaIDs,
+		Replicas: replicaNodeIDs,
 	})
 	if err != nil {
 		rt.Close()
