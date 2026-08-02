@@ -120,7 +120,7 @@ func setupDistributedBackend(t *testing.T) *TestBackend {
 	s3.BadgerDir = badgerDir
 
 	// Create distributed backend with QUIC enabled
-	nodeCount := len(s3.Nodes)
+	nodeCount := len(s3.ClusterNodes)
 	if nodeCount == 0 {
 		nodeCount = 5 // Default to 5 nodes if none configured
 	}

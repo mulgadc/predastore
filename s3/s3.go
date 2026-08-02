@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/cluster"
 	"github.com/mulgadc/predastore/ratelimit"
 )
 
@@ -33,44 +34,21 @@ type Compaction struct {
 	IntervalSeconds int `toml:"interval_seconds"`
 }
 
-type Nodes struct {
-	ID     int    `toml:"id"`
-	Host   string `toml:"host"`
-	Port   int    `toml:"port"`
-	Path   string `toml:"path"`
-	DB     bool   `toml:"db"`
-	DBPort int    `toml:"dbport"`
-	DBPath string `toml:"dbpath"`
-	Leader bool   `toml:"leader"`
-	Epoch  int    `toml:"epoch"`
-}
-
-// DBNode represents a distributed database node configuration.
-type DBNode struct {
-	ID              uint64 `toml:"id"`
-	Host            string `toml:"host"`
-	Port            int    `toml:"port"`
-	RaftPort        int    `toml:"raft_port"` // Port for Raft consensus (default: Port + 1000)
-	Path            string `toml:"path"`
-	AccessKeyID     string `toml:"access_key_id"`
-	SecretAccessKey string `toml:"secret_access_key"`
-	Leader          bool   `toml:"leader"`
-	Epoch           int    `toml:"epoch"`
-}
-
 type Config struct {
 	ConfigPath string // Path to config file
 	Version    string `toml:"version"`
 	Region     string `toml:"region"`
 
-	RS    RS      `toml:"rs"`
-	Nodes []Nodes `toml:"nodes"`
+	RS RS `toml:"rs"`
+
+	// Cluster topology: hosts are processes owning a socket and a data
+	// directory, cluster nodes are roles pinned to hosts. Everything
+	// per-node derives from the host base and the node id.
+	Hosts        []cluster.Host `toml:"host"`
+	ClusterNodes []cluster.Node `toml:"node"`
 
 	// Compaction tuning for the QUIC shard store (optional; store defaults apply).
 	Compaction Compaction `toml:"compaction"`
-
-	// Distributed database nodes for global state
-	DB []DBNode `toml:"db"`
 
 	Buckets []S3_Buckets `toml:"buckets"`
 
@@ -82,9 +60,9 @@ type Config struct {
 	// IAM authentication via NATS KV (optional, enables multi-account S3 access)
 	IAM *IAMConfig `toml:"iam"`
 
-	// Only needed on local (filesystem)
-	Port int    `toml:"port"`
-	Host string `toml:"host"`
+	// The gateway's listen address comes from WithAddress, not the config:
+	// a `host` key here would collide with the [[host]] topology table, which
+	// TOML rejects outright.
 
 	Debug          bool   `toml:"debug"`
 	BasePath       string `toml:"base_path"`
