@@ -1,0 +1,64 @@
+# Fixture for cluster topology parsing: three hosts, six nodes, one auth entry.
+
+version = "1.0"
+region = "ap-southeast-2"
+
+[rs]
+data = 2
+parity = 1
+
+[[host]]
+id = 1
+bind_addr = "0.0.0.0:6660"
+public_addr = "10.11.12.1:6660"
+data_dir = "/var/lib/predastore"
+
+[[host]]
+id = 2
+bind_addr = "0.0.0.0:6660"
+public_addr = "10.11.12.2:6660"
+data_dir = "/var/lib/predastore"
+
+[[host]]
+id = 3
+bind_addr = "0.0.0.0:6660"
+public_addr = "10.11.12.3:6660"
+data_dir = "/var/lib/predastore"
+
+[[node]]
+id = 1
+host_id = 1
+role = "shard-storage"
+
+[[node]]
+id = 2
+host_id = 1
+role = "state-replica"
+
+[[node]]
+id = 3
+host_id = 2
+role = "shard-storage"
+
+[[node]]
+id = 4
+host_id = 2
+role = "state-replica"
+
+[[node]]
+id = 5
+host_id = 3
+role = "shard-storage"
+
+[[node]]
+id = 6
+host_id = 3
+role = "state-replica"
+
+[[auth]]
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+account_id = "123456789012"
+policy = [
+  { bucket = "*", actions = ["s3:*"] },
+]
