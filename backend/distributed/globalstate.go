@@ -3,7 +3,6 @@ package distributed
 import (
 	"errors"
 
-	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/s3db"
 )
 
@@ -118,29 +117,10 @@ func (l *LocalState) DB() *s3db.S3DB {
 	return l.db
 }
 
-// StateClient reads and writes global state against the state replicas.
-// Implementations pick the transport; the rpc client in internal/state is
-// the production one.
-type StateClient interface {
-	Put(table, key string, value []byte) error
-	Get(table, key string) ([]byte, error)
-	Delete(table, key string) error
-	Scan(table, prefix string, limit int) ([]s3db.ScanItem, error)
-}
-
-var _ StateClient = (*s3db.Client)(nil)
-var _ StateClient = (*state.Client)(nil)
-
-// DistributedState wraps a StateClient for GlobalState operations.
+// DistributedState wraps an s3db.Client for GlobalState operations.
 // This is used when a distributed database cluster is configured.
 type DistributedState struct {
-	client StateClient
-}
-
-// NewDistributedStateWithClient creates a GlobalState over an injected state
-// client.
-func NewDistributedStateWithClient(client StateClient) *DistributedState {
-	return &DistributedState{client: client}
+	client *s3db.Client
 }
 
 // DBClientConfig holds configuration for connecting to the distributed database.
@@ -235,8 +215,8 @@ func (d *DistributedState) Close() error {
 	return nil
 }
 
-// Client returns the underlying state client.
-func (d *DistributedState) Client() StateClient {
+// Client returns the underlying s3db.Client.
+func (d *DistributedState) Client() *s3db.Client {
 	return d.client
 }
 

@@ -64,7 +64,7 @@ func setupServer(t *testing.T) (cancel context.CancelFunc, wg *sync.WaitGroup, n
 	s3config := loadTestConfig(t)
 	s3config.BadgerDir = badgerDir
 
-	nodeCount := len(s3config.ClusterNodes)
+	nodeCount := len(s3config.Nodes)
 	if nodeCount == 0 {
 		nodeCount = 5
 	}

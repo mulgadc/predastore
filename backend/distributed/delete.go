@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
@@ -117,6 +118,14 @@ func (b *Backend) deleteObjectViaQUIC(ctx context.Context, bucket, key string, o
 		go func(ns nodeShard) {
 			defer wg.Done()
 
+			addr := b.getNodeAddr(int(ns.node))
+			client, err := quicclient.DialPooled(ctx, addr)
+			if err != nil {
+				slog.Error("deleteObjectViaQUIC: dial failed", "node", ns.node, "addr", addr, "error", err)
+				errCh <- err
+				return
+			}
+
 			delReq := quicserver.DeleteRequest{
 				Bucket:     bucket,
 				Object:     key,
@@ -124,7 +133,7 @@ func (b *Backend) deleteObjectViaQUIC(ctx context.Context, bucket, key string, o
 				ShardIndex: uint32(ns.shardIndex), //nolint:gosec // G115: shardIndex bounded by rsDataShard + rsParityShard (small uint).
 			}
 
-			resp, err := b.shards.DeleteShard(ctx, int(ns.node), delReq)
+			resp, err := client.Delete(ctx, delReq)
 			if err != nil {
 				slog.Error("deleteObjectViaQUIC: delete failed", "node", ns.node, "error", err)
 				errCh <- err

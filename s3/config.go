@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mulgadc/predastore/internal/cluster"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -37,14 +36,6 @@ func (s3 *Config) ReadConfig() (err error) {
 	for i, a := range s3.Auth {
 		if a.AccountID == "" {
 			return fmt.Errorf("auth entry %d (access_key_id=%q) missing account_id", i, a.AccessKeyID)
-		}
-	}
-
-	// Cluster topology, when present, must be internally consistent before
-	// anything derives placement or addresses from it.
-	if len(s3.Hosts) > 0 || len(s3.ClusterNodes) > 0 {
-		if err := cluster.Validate(s3.Hosts, s3.ClusterNodes); err != nil {
-			return err
 		}
 	}
 
