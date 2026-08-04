@@ -1,7 +1,9 @@
 package state_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -84,13 +86,15 @@ func startStateProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers 
 	return node
 }
 
-// TestStateServiceOverRPC drives the full state path — client, wire
-// protocol, service, raft — across three replicas over pipe streams.
-func TestStateServiceOverRPC(t *testing.T) {
+// startStateCluster brings up a three-replica cluster over pipe streams and
+// returns a client that reaches every replica.
+func startStateCluster(t *testing.T, prefix string) *state.Client {
+	t.Helper()
+
 	pipeNames := map[uint64]string{
-		1: "state-svc-proc1",
-		2: "state-svc-proc2",
-		3: "state-svc-proc3",
+		1: prefix + "-proc1",
+		2: prefix + "-proc2",
+		3: prefix + "-proc3",
 	}
 	peers := []s3db.RaftPeer{
 		{ID: 1, Address: state.RaftAddress(1)},
@@ -122,8 +126,15 @@ func TestStateServiceOverRPC(t *testing.T) {
 		Replicas: []uint64{1, 2, 3},
 	})
 	if err != nil {
-		t.Fatalf("NewRPCClient: %v", err)
+		t.Fatalf("NewClient: %v", err)
 	}
+	return cli
+}
+
+// TestStateServiceOverRPC drives the full state path — client, wire
+// protocol, service, raft — across three replicas over pipe streams.
+func TestStateServiceOverRPC(t *testing.T) {
+	cli := startStateCluster(t, "state-svc")
 
 	// Writes land regardless of which replica is dialed first: the client
 	// follows not-leader redirects.
@@ -169,5 +180,59 @@ func TestStateServiceOverRPC(t *testing.T) {
 			t.Fatalf("deleted key still readable: %v", err)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestStateBinaryKeysRoundTrip proves a key of arbitrary bytes survives put,
+// get and scan byte-identically. Encoding keys as JSON strings replaced every
+// byte that is not valid UTF-8 with U+FFFD, which silently collapsed the
+// entropy of the sha256 keys object metadata is stored under.
+func TestStateBinaryKeysRoundTrip(t *testing.T) {
+	cli := startStateCluster(t, "state-binkey")
+
+	// A raw sha256 stands in for the object metadata keys the backend writes.
+	hash := sha256.Sum256([]byte("bucket/object"))
+
+	prefix := "bin\x00\xff/"
+	want := map[string][]byte{
+		prefix + string([]byte{0x00, 0xff, 0x41, 0x80, 0xfe, 0x42}) + "é世🙂": []byte("mixed"),
+		prefix + string(hash[:]): []byte("object-metadata"),
+		// These two differ only in a byte that a JSON string collapses to
+		// U+FFFD, so they must not land on one stored key.
+		prefix + "\x80": []byte("first"),
+		prefix + "\xfe": []byte("second"),
+	}
+
+	for k, v := range want {
+		if err := cli.Put("objects", k, v); err != nil {
+			t.Fatalf("Put %q: %v", k, err)
+		}
+	}
+
+	for k, v := range want {
+		got, err := cli.Get("objects", k)
+		if err != nil {
+			t.Fatalf("Get %q: %v", k, err)
+		}
+		if !bytes.Equal(got, v) {
+			t.Fatalf("Get %q = %q, want %q", k, got, v)
+		}
+	}
+
+	items, err := cli.Scan("objects", prefix, 0)
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if len(items) != len(want) {
+		t.Fatalf("Scan returned %d items, want %d", len(items), len(want))
+	}
+	for _, item := range items {
+		v, ok := want[item.Key]
+		if !ok {
+			t.Fatalf("Scan returned key %q, which was never written", item.Key)
+		}
+		if !bytes.Equal(item.Value, v) {
+			t.Fatalf("Scan key %q = %q, want %q", item.Key, item.Value, v)
+		}
 	}
 }

@@ -61,7 +61,9 @@ func respond(stream transport.Stream, resp *StateResponse) error {
 }
 
 func (s *Service) handleGet(ctx context.Context, h StateRequest, stream transport.Stream) error {
-	value, err := s.node.Get(h.Table, h.Key)
+	// The raft node keys by Go string; the bytes survive the conversion, so
+	// the key badger stores is the one the client sent.
+	value, err := s.node.Get(h.Table, string(h.Key))
 	switch {
 	case errors.Is(err, badger.ErrKeyNotFound):
 		return respond(stream, &StateResponse{Err: ErrCodeNotFound})
@@ -77,11 +79,11 @@ func (s *Service) handlePut(ctx context.Context, h StateRequest, stream transpor
 	if err != nil {
 		return fmt.Errorf("read put value: %w", err)
 	}
-	return respond(stream, writeResult(s.node, s.node.Put(h.Table, h.Key, value)))
+	return respond(stream, writeResult(s.node, s.node.Put(h.Table, string(h.Key), value)))
 }
 
 func (s *Service) handleDelete(ctx context.Context, h StateRequest, stream transport.Stream) error {
-	return respond(stream, writeResult(s.node, s.node.Delete(h.Table, h.Key)))
+	return respond(stream, writeResult(s.node, s.node.Delete(h.Table, string(h.Key))))
 }
 
 // writeResult maps a consensus write outcome onto the response envelope,
@@ -101,11 +103,11 @@ func (s *Service) handleScan(ctx context.Context, h StateRequest, stream transpo
 	// surfacing an error to the client.
 	errScanLimit := errors.New("scan limit reached")
 	var items []ScanItem
-	err := s.node.Scan(h.Table, h.Key, func(key string, value []byte) error {
+	err := s.node.Scan(h.Table, string(h.Key), func(key string, value []byte) error {
 		if h.Limit > 0 && len(items) >= h.Limit {
 			return errScanLimit
 		}
-		items = append(items, ScanItem{Key: key, Value: value})
+		items = append(items, ScanItem{Key: []byte(key), Value: value})
 		return nil
 	})
 	if err != nil && !errors.Is(err, errScanLimit) {

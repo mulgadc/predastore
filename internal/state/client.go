@@ -129,13 +129,19 @@ func (c *Client) cacheLeader(id uint64) {
 	c.mu.Unlock()
 }
 
+// request builds a wire header for a table-scoped key. Callers hand keys over
+// as strings; the wire carries them as bytes so binary keys survive JSON.
+func request(table, key string, limit int) *StateRequest {
+	return &StateRequest{Table: table, Key: []byte(key), Limit: limit}
+}
+
 // Get retrieves a value. A replica that has not applied the key yet answers
 // not-found, so every replica is consulted before giving up.
 func (c *Client) Get(table, key string) ([]byte, error) {
 	var lastErr error
 	notFound := false
 	for _, id := range c.readOrder() {
-		resp, err := c.call(id, OpStateGet, &StateRequest{Table: table, Key: key}, nil)
+		resp, err := c.call(id, OpStateGet, request(table, key, 0), nil)
 		if err != nil {
 			lastErr = err
 			continue
@@ -155,7 +161,7 @@ func (c *Client) Get(table, key string) ([]byte, error) {
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, fmt.Errorf("get %s/%s: no replica answered", table, key)
+	return nil, fmt.Errorf("get %s/%q: no replica answered", table, key)
 }
 
 // Scan lists up to limit keys with the prefix, preferring the leader for
@@ -163,7 +169,7 @@ func (c *Client) Get(table, key string) ([]byte, error) {
 func (c *Client) Scan(table, prefix string, limit int) ([]s3db.ScanItem, error) {
 	var lastErr error
 	for _, id := range c.readOrder() {
-		resp, err := c.call(id, OpStateScan, &StateRequest{Table: table, Key: prefix, Limit: limit}, nil)
+		resp, err := c.call(id, OpStateScan, request(table, prefix, limit), nil)
 		if err != nil {
 			lastErr = err
 			continue
@@ -174,7 +180,7 @@ func (c *Client) Scan(table, prefix string, limit int) ([]s3db.ScanItem, error) 
 		}
 		items := make([]s3db.ScanItem, len(resp.Items))
 		for i, it := range resp.Items {
-			items[i] = s3db.ScanItem{Key: it.Key, Value: it.Value}
+			items[i] = s3db.ScanItem{Key: string(it.Key), Value: it.Value}
 		}
 		return items, nil
 	}
@@ -183,12 +189,12 @@ func (c *Client) Scan(table, prefix string, limit int) ([]s3db.ScanItem, error) 
 
 // Put stores a key-value pair through the leader.
 func (c *Client) Put(table, key string, value []byte) error {
-	return c.write(OpStatePut, &StateRequest{Table: table, Key: key}, value)
+	return c.write(OpStatePut, request(table, key, 0), value)
 }
 
 // Delete removes a key through the leader.
 func (c *Client) Delete(table, key string) error {
-	return c.write(OpStateDelete, &StateRequest{Table: table, Key: key}, nil)
+	return c.write(OpStateDelete, request(table, key, 0), nil)
 }
 
 // write drives a consensus write to the leader, following not-leader
@@ -227,5 +233,5 @@ func (c *Client) write(op rpc.Opcode, req *StateRequest, body []byte) error {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
-	return fmt.Errorf("write %s/%s failed after %d attempts: %w", req.Table, req.Key, attempts, lastErr)
+	return fmt.Errorf("write %s/%q failed after %d attempts: %w", req.Table, req.Key, attempts, lastErr)
 }

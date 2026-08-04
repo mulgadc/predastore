@@ -72,7 +72,10 @@ func (h *RaftDial) Unmarshal(b []byte) error          { return json.Unmarshal(b,
 // scans.
 type StateRequest struct {
 	Table string `json:"table"`
-	Key   string `json:"key"`
+	// Key is bytes rather than a string because object metadata is keyed by a
+	// raw sha256: JSON rewrites every byte of a string that is not valid UTF-8
+	// to U+FFFD, so a string key would not survive the wire.
+	Key   []byte `json:"key"`
 	Limit int    `json:"limit,omitempty"`
 }
 
@@ -93,8 +96,9 @@ type StateResponse struct {
 	Items []ScanItem `json:"items,omitempty"`
 }
 
-// ScanItem is one key-value pair in a scan response.
+// ScanItem is one key-value pair in a scan response. Key is bytes for the same
+// reason StateRequest.Key is.
 type ScanItem struct {
-	Key   string `json:"key"`
+	Key   []byte `json:"key"`
 	Value []byte `json:"value"`
 }
