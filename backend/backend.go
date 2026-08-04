@@ -30,5 +30,4 @@ type Backend interface {
 
 	// Backend info
 	Type() string
-	Close() error
 }

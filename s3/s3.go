@@ -70,9 +70,6 @@ type Config struct {
 
 	// API request throttling
 	RateLimit ratelimit.Config `toml:"ratelimit"`
-
-	// Distributed backend config (deprecated - use DB nodes instead)
-	BadgerDir string `toml:"badger_dir"`
 }
 
 // Authentication and policy.

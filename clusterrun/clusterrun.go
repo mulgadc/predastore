@@ -259,9 +259,9 @@ func (rt *Runtime) buildBackend(
 	shardClient *storage.Client,
 ) (backend.Backend, error) {
 	storageNodes := topo.NodesByRole(cluster.RoleShardStorage)
-	beNodes := make([]distributed.NodeConfig, len(storageNodes))
+	beNodes := make([]int, len(storageNodes))
 	for i, n := range storageNodes {
-		beNodes[i] = distributed.NodeConfig{ID: n.ID}
+		beNodes[i] = n.ID
 	}
 	beBuckets := make([]distributed.BucketConfig, len(cfg.Buckets))
 	for i, b := range cfg.Buckets {
@@ -277,10 +277,10 @@ func (rt *Runtime) buildBackend(
 	be, err := distributed.New(&distributed.Config{
 		DataShards:   cfg.RS.Data,
 		ParityShards: cfg.RS.Parity,
-		Nodes:        beNodes,
+		StorageNodes: beNodes,
 		Buckets:      beBuckets,
-		StateClient:  stateClient,
-		ShardClient:  shardClient,
+		State:        stateClient,
+		Storage:      shardClient,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create distributed backend: %w", err)

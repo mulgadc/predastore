@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"math"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,24 +17,10 @@ import (
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/reedsolomon"
-	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/storage"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
-
-// NodeConfig holds configuration for a single node.
-type NodeConfig struct {
-	ID     int
-	Host   string
-	Port   int
-	Path   string
-	DB     bool
-	DBPort int
-	DBPath string
-	Leader bool
-	Epoch  int
-}
 
 // BucketConfig holds configuration for a bucket.
 type BucketConfig struct {
@@ -48,9 +33,6 @@ type BucketConfig struct {
 
 // Config holds distributed backend configuration.
 type Config struct {
-	// DataDir is the root directory for distributed node storage
-	DataDir string
-
 	// Reed-Solomon configuration
 	DataShards   int
 	ParityShards int
@@ -59,35 +41,27 @@ type Config struct {
 	PartitionCount    int
 	ReplicationFactor int
 
-	// QUIC server base port (each node uses BasePort + nodeNum)
-	QuicBasePort int
-
-	// Nodes configuration (from cluster.toml)
-	Nodes []NodeConfig
+	// StorageNodes are the ids of the nodes the hash ring places shards on.
+	StorageNodes []int
 
 	// Buckets configuration (from cluster.toml)
 	Buckets []BucketConfig
 
-	// ShardClient overrides how storage nodes are reached. Nil falls back
-	// to pooled QUIC connections against per-node addresses.
-	ShardClient ShardClient
+	// Storage reaches the storage nodes holding shards. Required.
+	Storage *storage.Client
 
-	// StateClient reaches the state replicas holding global state. Required.
-	StateClient *state.Client
+	// State reaches the state replicas holding global state. Required.
+	State *state.Client
 }
 
 // Backend implements the distributed storage backend with Reed-Solomon erasure coding.
 type Backend struct {
-	config        *Config
 	rsDataShard   int
 	rsParityShard int
 	hashRing      *consistent.Consistent
-	dataDir       string
-	globalState   *state.Client // global state held by the state replicas
-	shards        ShardClient   // transport for shard operations against storage nodes
-	quicBasePort  int
-	nodeAddrs     map[int]string // node ID -> "host:port"
-	buckets       []BucketConfig // bucket configurations
+	globalState   *state.Client   // global state held by the state replicas
+	shards        *storage.Client // shard operations against storage nodes
+	buckets       []BucketConfig  // bucket configurations
 }
 
 // ObjectToShardNodes maps an object to its shard locations.
@@ -130,15 +104,21 @@ func (w *bytesBufferWriter) Write(p []byte) (n int, err error) {
 	return len(p), nil
 }
 
-// New creates a new distributed backend.
-func New(config any) (backend.Backend, error) {
-	cfg, ok := config.(*Config)
-	if !ok {
-		return nil, errors.New("invalid configuration type for distributed backend")
+// New creates a new distributed backend. Both clients and a non-empty
+// storage node set are required: the backend owns neither transport and
+// cannot place a shard without a ring to place it on.
+func New(cfg *Config) (*Backend, error) {
+	if cfg == nil {
+		return nil, errors.New("distributed backend: config is required")
 	}
-
-	if cfg.StateClient == nil {
-		return nil, errors.New("StateClient is required for distributed backend")
+	if cfg.State == nil {
+		return nil, errors.New("distributed backend: State client is required")
+	}
+	if cfg.Storage == nil {
+		return nil, errors.New("distributed backend: Storage client is required")
+	}
+	if len(cfg.StorageNodes) == 0 {
+		return nil, errors.New("distributed backend: at least one storage node is required")
 	}
 
 	// Set defaults
@@ -158,15 +138,6 @@ func New(config any) (backend.Backend, error) {
 	if replicationFactor == 0 {
 		replicationFactor = 100
 	}
-	quicBasePort := cfg.QuicBasePort
-	if quicBasePort == 0 {
-		quicBasePort = 9991
-	}
-
-	dataDir := cfg.DataDir
-	if dataDir == "" {
-		dataDir = filepath.Join("s3", "tests", "data", "distributed", "nodes")
-	}
 
 	// Create hash ring
 	ringCfg := consistent.Config{
@@ -177,73 +148,25 @@ func New(config any) (backend.Backend, error) {
 	}
 	hashRing := consistent.New(nil, ringCfg)
 
-	// Add nodes to hash ring using config node IDs
-	// This ensures hash ring node names match config node IDs (e.g., node-1, node-2, node-3)
-	// Node directories are created by QUIC servers, not by the S3 server.
-	if len(cfg.Nodes) > 0 {
-		for _, node := range cfg.Nodes {
-			hashRing.Add(myMember(fmt.Sprintf("node-%d", node.ID)))
-		}
-	} else {
-		// Fallback for tests without config: use 0-indexed nodes
-		for i := 0; i < partitionCount; i++ {
-			hashRing.Add(myMember(fmt.Sprintf("node-%d", i)))
-		}
+	// Ring member names carry the node id, so placement resolves straight to
+	// the id the storage client addresses.
+	for _, id := range cfg.StorageNodes {
+		hashRing.Add(myMember(fmt.Sprintf("node-%d", id)))
 	}
 
-	// Build node address map from config
-	nodeAddrs := make(map[int]string)
-	for _, node := range cfg.Nodes {
-		nodeAddrs[node.ID] = fmt.Sprintf("%s:%d", node.Host, node.Port)
-	}
-
-	b := &Backend{
-		config:        cfg,
+	return &Backend{
 		rsDataShard:   dataShards,
 		rsParityShard: parityShards,
 		hashRing:      hashRing,
-		dataDir:       dataDir,
-		globalState:   cfg.StateClient,
-		quicBasePort:  quicBasePort,
-		nodeAddrs:     nodeAddrs,
+		globalState:   cfg.State,
+		shards:        cfg.Storage,
 		buckets:       cfg.Buckets,
-	}
-	b.shards = cfg.ShardClient
-	if b.shards == nil {
-		b.shards = &quicShardClient{addr: b.getNodeAddr}
-	}
-	return b, nil
+	}, nil
 }
 
 // Type returns the backend type identifier.
 func (b *Backend) Type() string {
 	return "distributed"
-}
-
-// Close cleans up resources. The state client holds no resources of its own:
-// its streams belong to the rpc client the caller built it from.
-func (b *Backend) Close() error {
-	return nil
-}
-
-// getNodeAddr returns the QUIC address for a node
-// It uses the nodeAddrs map from config if available, otherwise falls back to computed address.
-func (b *Backend) getNodeAddr(nodeNum int) string {
-	if addr, ok := b.nodeAddrs[nodeNum]; ok {
-		return addr
-	}
-	// Fallback to computed address for backward compatibility
-	return fmt.Sprintf("127.0.0.1:%d", b.quicBasePort+nodeNum)
-}
-
-// DataDir returns the data directory (for testing).
-func (b *Backend) DataDir() string {
-	return b.dataDir
-}
-
-// SetDataDir sets the data directory (for testing).
-func (b *Backend) SetDataDir(dir string) {
-	b.dataDir = dir
 }
 
 // RsDataShard returns the number of data shards (for testing).

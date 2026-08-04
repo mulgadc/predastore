@@ -441,14 +441,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		}
 	}
 
-	// Close backend (stops accepting new storage operations)
-	if s.backend != nil {
-		slog.Info("Closing storage backend...")
-		if err := s.backend.Close(); err != nil {
-			slog.Warn("Error closing storage backend", "error", err)
-		}
-	}
-
 	// Shutdown DB servers in parallel with timeout
 	// Each Raft node has its own 5s timeout, but we also impose an overall limit
 	if len(s.dbServers) > 0 {

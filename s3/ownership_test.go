@@ -139,7 +139,6 @@ func (b *stubBackend) AbortMultipartUpload(_ context.Context, _, _, _ string) er
 	return errors.New("stubBackend.AbortMultipartUpload called unexpectedly")
 }
 func (b *stubBackend) Type() string { return "stub" }
-func (b *stubBackend) Close() error { return nil }
 
 const (
 	acctOwner = "000000000001"
