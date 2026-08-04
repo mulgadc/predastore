@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,24 +29,14 @@ type RaftNode struct {
 
 // NewRaftNode creates and initializes a new Raft node.
 func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
-	node := &RaftNode{config: config}
-
-	// With an injected stream layer, addressing and encryption are the
-	// transport's concern; the legacy TCP path resolves its own addresses
-	// and fails closed without TLS material.
-	var thisNode *DBNodeConfig
+	// Fail closed: the raft transport carries committed log entries (object
+	// metadata, IAM state) and the stream layer is what encrypts them. There
+	// is no self-hosted fallback.
 	if config.StreamLayer == nil {
-		thisNode = config.GetThisNode()
-		if thisNode == nil {
-			return nil, fmt.Errorf("node ID %d not found in cluster config", config.NodeID)
-		}
-
-		// Fail closed: the Raft transport carries committed log entries (object
-		// metadata, IAM state). There is no plaintext fallback. Mirrors quicd.
-		if config.TLSCert == "" || config.TLSKey == "" {
-			return nil, fmt.Errorf("s3db raft: TLS cert and key are required; refusing to start without transport encryption")
-		}
+		return nil, fmt.Errorf("s3db raft: a stream layer is required; refusing to start without one")
 	}
+
+	node := &RaftNode{config: config}
 
 	// Create data directories
 	dataDir := config.DataDir
@@ -86,43 +75,8 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 	raftConfig.LeaderLeaseTimeout = config.LeaderLeaseTimeout
 
 	// Setup Raft transport
-	if config.StreamLayer != nil {
-		slog.Info("Setting up Raft transport over rpc stream layer", "advertiseAddr", config.StreamLayer.Addr())
-		node.transport = raft.NewNetworkTransport(config.StreamLayer, 3, 10*time.Second, os.Stderr)
-	} else {
-		// bindAddr is the address to listen on (can be 0.0.0.0)
-		// advertiseAddr is the address advertised to other nodes (must be reachable)
-		bindAddr := thisNode.RaftAddr()
-		advertiseAddr := thisNode.RaftAdvertiseAddr()
-
-		tcpAddr, err := net.ResolveTCPAddr("tcp", advertiseAddr)
-		if err != nil {
-			if cerr := node.badgerDB.Close(); cerr != nil {
-				slog.Debug("Failed to close badger during cleanup", "error", cerr)
-			}
-			return nil, fmt.Errorf("failed to resolve TCP address: %w", err)
-		}
-
-		slog.Info("Setting up Raft transport", "bindAddr", bindAddr, "advertiseAddr", advertiseAddr)
-		rawListener, err := net.Listen("tcp", bindAddr)
-		if err != nil {
-			if cerr := node.badgerDB.Close(); cerr != nil {
-				slog.Debug("Failed to close badger during cleanup", "error", cerr)
-			}
-			return nil, fmt.Errorf("failed to listen on raft bind %s: %w", bindAddr, err)
-		}
-		streamLayer, err := newTLSStreamLayer(rawListener, tcpAddr, config.TLSCert, config.TLSKey)
-		if err != nil {
-			if cerr := rawListener.Close(); cerr != nil {
-				slog.Debug("Failed to close raft listener during cleanup", "error", cerr)
-			}
-			if cerr := node.badgerDB.Close(); cerr != nil {
-				slog.Debug("Failed to close badger during cleanup", "error", cerr)
-			}
-			return nil, fmt.Errorf("failed to create raft TLS stream layer: %w", err)
-		}
-		node.transport = raft.NewNetworkTransport(streamLayer, 3, 10*time.Second, os.Stderr)
-	}
+	slog.Info("Setting up Raft transport over rpc stream layer", "advertiseAddr", config.StreamLayer.Addr())
+	node.transport = raft.NewNetworkTransport(config.StreamLayer, 3, 10*time.Second, os.Stderr)
 
 	// Setup log store and stable store (BoltDB)
 	boltDBPath := filepath.Join(dataDir, "raft.db")
@@ -170,25 +124,14 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 
 // bootstrap initializes the cluster with all configured nodes.
 func (n *RaftNode) bootstrap() error {
-	var servers []raft.Server
-	if len(n.config.Peers) > 0 {
-		// Stream-layer mode: peers carry node-identifying addresses that
-		// the layer's dial function resolves.
-		servers = make([]raft.Server, 0, len(n.config.Peers))
-		for _, peer := range n.config.Peers {
-			servers = append(servers, raft.Server{
-				ID:      raft.ServerID(strconv.FormatUint(peer.ID, 10)),
-				Address: raft.ServerAddress(peer.Address),
-			})
-		}
-	} else {
-		servers = make([]raft.Server, 0, len(n.config.Nodes))
-		for _, node := range n.config.Nodes {
-			servers = append(servers, raft.Server{
-				ID:      raft.ServerID(strconv.FormatUint(node.ID, 10)),
-				Address: raft.ServerAddress(node.RaftAdvertiseAddr()),
-			})
-		}
+	// Peers carry node-identifying addresses that the stream layer's dial
+	// function resolves.
+	servers := make([]raft.Server, 0, len(n.config.Peers))
+	for _, peer := range n.config.Peers {
+		servers = append(servers, raft.Server{
+			ID:      raft.ServerID(strconv.FormatUint(peer.ID, 10)),
+			Address: raft.ServerAddress(peer.Address),
+		})
 	}
 
 	config := raft.Configuration{Servers: servers}
