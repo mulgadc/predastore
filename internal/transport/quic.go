@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/internal/tlsconfig"
-	"github.com/mulgadc/predastore/quic/quicconf"
 	"github.com/quic-go/quic-go"
 )
 
@@ -379,16 +378,32 @@ func (qt *QUICTransport) Close() error {
 	return nil
 }
 
+// QUIC flow-control window sizes, shared by the listen and dial configs so the
+// two sides of a connection cannot drift apart.
+//
+// Sizing targets a worst case of ~30 concurrent streams per connection
+// (AWS CLI default 10 concurrent parts × 3 shards) carrying 4 MiB shards, so
+// the connection window covers every in-flight shard and no sender blocks on
+// flow control. The per-stream window is set above shard size to avoid
+// stream-level throttling. Initial windows are raised above the quic-go
+// 512 KiB defaults to skip slow-start.
+const (
+	initialStreamReceiveWindow     uint64 = 2 * 1024 * 1024
+	maxStreamReceiveWindow         uint64 = 8 * 1024 * 1024
+	initialConnectionReceiveWindow uint64 = 16 * 1024 * 1024
+	maxConnectionReceiveWindow     uint64 = 128 * 1024 * 1024
+)
+
 func listenQUICConfig() *quic.Config {
 	return &quic.Config{
 		KeepAlivePeriod:                15 * time.Second,
 		MaxIdleTimeout:                 60 * time.Second,
 		MaxIncomingStreams:             1000,
 		MaxIncomingUniStreams:          1000,
-		InitialStreamReceiveWindow:     quicconf.InitialStreamReceiveWindow,
-		MaxStreamReceiveWindow:         quicconf.MaxStreamReceiveWindow,
-		InitialConnectionReceiveWindow: quicconf.InitialConnectionReceiveWindow,
-		MaxConnectionReceiveWindow:     quicconf.MaxConnectionReceiveWindow,
+		InitialStreamReceiveWindow:     initialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         maxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: initialConnectionReceiveWindow,
+		MaxConnectionReceiveWindow:     maxConnectionReceiveWindow,
 	}
 }
 
@@ -397,10 +412,10 @@ func dialQUICConfig() *quic.Config {
 		HandshakeIdleTimeout:           5 * time.Second,
 		KeepAlivePeriod:                15 * time.Second,
 		MaxIdleTimeout:                 60 * time.Second,
-		InitialStreamReceiveWindow:     quicconf.InitialStreamReceiveWindow,
-		MaxStreamReceiveWindow:         quicconf.MaxStreamReceiveWindow,
-		InitialConnectionReceiveWindow: quicconf.InitialConnectionReceiveWindow,
-		MaxConnectionReceiveWindow:     quicconf.MaxConnectionReceiveWindow,
+		InitialStreamReceiveWindow:     initialStreamReceiveWindow,
+		MaxStreamReceiveWindow:         maxStreamReceiveWindow,
+		InitialConnectionReceiveWindow: initialConnectionReceiveWindow,
+		MaxConnectionReceiveWindow:     maxConnectionReceiveWindow,
 	}
 }
 
