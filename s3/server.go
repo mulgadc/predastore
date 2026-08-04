@@ -7,18 +7,14 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"runtime/pprof"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/masterkey"
-	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3db"
 )
 
@@ -46,11 +42,12 @@ type Server struct {
 	masterKey         *masterkey.Key // Loaded master key handle (AEAD + fingerprint, no raw bytes).
 
 	// Runtime state
-	config    *Config
-	server    *HTTP2Server
-	backend   backend.Backend
-	credProv  CredentialProvider
-	dbServers []*s3db.Server
+	config          *Config
+	server          *HTTP2Server
+	backend         backend.Backend
+	preparedBackend backend.Backend // externally wired backend; skips backend launch
+	credProv        CredentialProvider
+	dbServers       []*s3db.Server
 
 	// Profiling
 	pprofEnabled    bool
@@ -61,7 +58,9 @@ type Server struct {
 	mu       sync.Mutex
 	running  bool
 	shutdown chan struct{}
-	dbFailed chan error // signals when an embedded DB goroutine crashes
+	// serveErr carries a fatal error from the async listener so the caller
+	// can shut down instead of running on with a dead gateway.
+	serveErr chan error
 }
 
 // Option configures a Server.
@@ -75,7 +74,7 @@ func NewServer(opts ...Option) (*Server, error) {
 		backendType: BackendDistributed,
 		nodeID:      -1, // Dev mode by default
 		shutdown:    make(chan struct{}),
-		dbFailed:    make(chan error, 1),
+		serveErr:    make(chan error, 1),
 	}
 
 	// Apply options
@@ -147,24 +146,23 @@ func WithBackend(backendType BackendType) Option {
 	}
 }
 
+// WithPreparedBackend supplies an externally wired storage backend. The
+// server then only runs the S3 HTTPS frontend on top of it: no DB or QUIC
+// servers are launched, and the caller owns the backend's supporting
+// runtime (rpc server, raft nodes, shard stores). Used by cluster mode,
+// where cmd/s3d assembles the topology.
+func WithPreparedBackend(be backend.Backend) Option {
+	return func(s *Server) error {
+		s.preparedBackend = be
+		return nil
+	}
+}
+
 // WithNodeID sets the node ID for distributed mode.
 // Use -1 (default) for dev mode which runs all nodes locally.
 // Use a specific ID >= 1 to run only that node (for production deployments).
 // Node IDs are 1-indexed; any other value is rejected so a typo in the caller
 // (e.g. NODE=garbage parsed to 0) does not silently downgrade to dev mode.
-func WithNodeID(nodeID int) Option {
-	return func(s *Server) error {
-		if nodeID != -1 && nodeID < 1 {
-			return fmt.Errorf("invalid node ID %d: must be -1 (dev mode) or >= 1 (production)", nodeID)
-		}
-		s.nodeID = nodeID
-		return nil
-	}
-}
-
-// WithEncryptionKeyFile sets the path to the 32-byte AES-256 master key file
-// used to seal/open shard fragments at rest. Required — the server refuses
-// to start if no key path is configured.
 func WithEncryptionKeyFile(path string) Option {
 	return func(s *Server) error {
 		s.encryptionKeyPath = path
@@ -210,8 +208,6 @@ func (s *Server) init() error {
 	// Create and load configuration
 	s.config = &Config{
 		ConfigPath: s.configPath,
-		Port:       s.port,
-		Host:       s.host,
 		Debug:      s.debug,
 		BasePath:   s.basePath,
 	}
@@ -257,15 +253,12 @@ func (s *Server) init() error {
 		slog.Info("Debug logging enabled")
 	}
 
-	// Initialize the appropriate backend
-	switch s.backendType {
-	case BackendDistributed:
-		if err := s.initDistributedBackend(); err != nil {
-			return err
-		}
-	default:
-		return fmt.Errorf("unknown backend type: %s", s.backendType)
+	// The backend arrives fully wired from the process that owns the cluster
+	// nodes; the gateway never launches storage or state itself.
+	if s.preparedBackend == nil {
+		return fmt.Errorf("no backend provided: build the cluster runtime and pass WithPreparedBackend")
 	}
+	s.backend = s.preparedBackend
 
 	// Initialize credential provider
 	credProv, err := s.initCredentialProvider()
@@ -283,423 +276,6 @@ func (s *Server) init() error {
 }
 
 // initDistributedBackend initializes the distributed storage backend with DB and QUIC servers.
-func (s *Server) initDistributedBackend() error {
-	// Launch DB servers first (required for distributed state)
-	hasDBNodes := len(s.config.DB) > 0
-
-	if hasDBNodes {
-		s.dbServers = s.launchDBServers()
-	} else {
-		s.dbServers = s.launchDefaultDB()
-	}
-
-	// Wait for leader election
-	if len(s.dbServers) > 0 {
-		s.waitForDBLeader()
-	}
-
-	// Create the distributed backend
-	be, err := s.createDistributedBackend()
-	if err != nil {
-		return err
-	}
-	s.backend = be
-
-	// Launch QUIC servers for shard storage
-	s.launchQUICServers()
-
-	return nil
-}
-
-// launchDBServers starts the distributed database servers from config.
-func (s *Server) launchDBServers() []*s3db.Server {
-	var servers []*s3db.Server
-
-	// Convert config to s3db types, applying base-dir to paths
-	dbNodes := make([]s3db.DBNodeConfig, len(s.config.DB))
-	for i, n := range s.config.DB {
-		// Apply base-dir to relative paths
-		nodePath := checkBaseDir(s.basePath, n.Path)
-
-		dbNodes[i] = s3db.DBNodeConfig{
-			ID:              n.ID,
-			Host:            n.Host,
-			Port:            n.Port,
-			RaftPort:        n.RaftPort,
-			Path:            nodePath,
-			AccessKeyID:     n.AccessKeyID,
-			SecretAccessKey: n.SecretAccessKey,
-			Leader:          n.Leader,
-		}
-	}
-
-	// Build credentials map
-	credentials := make(map[string]string)
-	for _, n := range s.config.DB {
-		if n.AccessKeyID != "" && n.SecretAccessKey != "" {
-			credentials[n.AccessKeyID] = n.SecretAccessKey
-		}
-	}
-	for _, auth := range s.config.Auth {
-		if auth.AccessKeyID != "" && auth.SecretAccessKey != "" {
-			credentials[auth.AccessKeyID] = auth.SecretAccessKey
-		}
-	}
-
-	if len(credentials) == 0 {
-		slog.Error("No s3db credentials configured; refusing to launch database servers (set credentials on [[db]] or [[auth]])")
-		return nil
-	}
-
-	// Determine which nodes to launch
-	var nodesToLaunch []s3db.DBNodeConfig
-	if s.nodeID > 0 {
-		for _, n := range dbNodes {
-			if n.ID == uint64(s.nodeID) {
-				nodesToLaunch = append(nodesToLaunch, n)
-				break
-			}
-		}
-		if len(nodesToLaunch) == 0 {
-			slog.Error("Database node not found", "id", s.nodeID)
-			return nil
-		}
-	} else if allDBHostsSame(dbNodes) {
-		nodesToLaunch = dbNodes
-		slog.Info("Dev mode: launching all database nodes locally")
-	} else {
-		slog.Error("Distributed mode requires -node flag when DB nodes have different hosts")
-		return nil
-	}
-
-	// Check bootstrap status
-	bootstrap := true
-	for _, n := range nodesToLaunch {
-		if _, err := os.Stat(filepath.Join(n.Path, "raft")); err == nil {
-			bootstrap = false
-			break
-		}
-	}
-
-	// Launch each node
-	for _, node := range nodesToLaunch {
-		clusterCfg := s3db.DefaultClusterConfig()
-		clusterCfg.NodeID = node.ID
-		clusterCfg.Nodes = dbNodes
-		clusterCfg.DataDir = node.Path
-		clusterCfg.Bootstrap = bootstrap && node.Leader
-
-		if err := os.MkdirAll(node.Path, 0750); err != nil {
-			slog.Error("Failed to create DB node directory", "path", node.Path, "error", err)
-			continue
-		}
-
-		serverCfg := &s3db.ServerConfig{
-			Addr:          node.HTTPAddr(),
-			TLSCert:       s.tlsCert,
-			TLSKey:        s.tlsKey,
-			Credentials:   credentials,
-			Region:        s.config.Region,
-			Service:       "s3db",
-			ClusterConfig: clusterCfg,
-		}
-
-		server, err := s3db.NewServer(serverCfg)
-		if err != nil {
-			slog.Error("Failed to create database server", "nodeID", node.ID, "error", err)
-			continue
-		}
-
-		servers = append(servers, server)
-
-		go func(srv *s3db.Server, nodeID uint64, addr string) {
-			slog.Info("Starting database server", "nodeID", nodeID, "addr", addr)
-			if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				slog.Error("Database server failed, initiating shutdown", "nodeID", nodeID, "error", err)
-				select {
-				case s.dbFailed <- fmt.Errorf("database server (node %d) failed: %w", nodeID, err):
-				default:
-					slog.Warn("dbFailed already signalled, additional DB failure not queued", "nodeID", nodeID, "error", err)
-				}
-			}
-		}(server, node.ID, node.HTTPAddr())
-	}
-
-	return servers
-}
-
-// launchDefaultDB creates a default embedded database when no [[db]] is configured.
-func (s *Server) launchDefaultDB() []*s3db.Server {
-	slog.Info("No [[db]] configuration found, launching default embedded database")
-
-	defaultPort := 6660
-	defaultPath := filepath.Join(s.basePath, "db")
-	if defaultPath == "" {
-		defaultPath = "data/db"
-	}
-
-	var accessKeyID, secretAccessKey string
-	if len(s.config.Auth) > 0 {
-		accessKeyID = s.config.Auth[0].AccessKeyID
-		secretAccessKey = s.config.Auth[0].SecretAccessKey
-	} else {
-		accessKeyID = "predastore"
-		secretAccessKey = "predastore"
-	}
-
-	dbNode := s3db.DBNodeConfig{
-		ID:              1,
-		Host:            "127.0.0.1",
-		Port:            defaultPort,
-		RaftPort:        defaultPort + 1000,
-		Path:            defaultPath,
-		AccessKeyID:     accessKeyID,
-		SecretAccessKey: secretAccessKey,
-		Leader:          true,
-	}
-
-	if err := os.MkdirAll(defaultPath, 0750); err != nil {
-		slog.Error("Failed to create default DB directory", "path", defaultPath, "error", err)
-		return nil
-	}
-
-	clusterCfg := s3db.DefaultClusterConfig()
-	clusterCfg.NodeID = 1
-	clusterCfg.Nodes = []s3db.DBNodeConfig{dbNode}
-	clusterCfg.DataDir = defaultPath
-	clusterCfg.Bootstrap = true
-
-	serverCfg := &s3db.ServerConfig{
-		Addr:          dbNode.HTTPAddr(),
-		TLSCert:       s.tlsCert,
-		TLSKey:        s.tlsKey,
-		Credentials:   map[string]string{accessKeyID: secretAccessKey},
-		Region:        s.config.Region,
-		Service:       "s3db",
-		ClusterConfig: clusterCfg,
-	}
-
-	server, err := s3db.NewServer(serverCfg)
-	if err != nil {
-		slog.Error("Failed to create default database server", "error", err)
-		return nil
-	}
-
-	go func() {
-		slog.Info("Starting default embedded database", "addr", dbNode.HTTPAddr())
-		if err := server.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("Default database server failed, initiating shutdown", "error", err)
-			select {
-			case s.dbFailed <- fmt.Errorf("default database server failed: %w", err):
-			default:
-				slog.Warn("dbFailed already signalled, additional DB failure not queued", "error", err)
-			}
-		}
-	}()
-
-	return []*s3db.Server{server}
-}
-
-// waitForDBLeader waits for leader election in the DB cluster.
-func (s *Server) waitForDBLeader() {
-	if len(s.dbServers) == 0 {
-		return
-	}
-
-	slog.Info("Waiting for database leader election...")
-	timeout := 30 * time.Second
-
-	for _, srv := range s.dbServers {
-		if err := srv.WaitForLeader(timeout); err != nil {
-			slog.Warn("Timeout waiting for leader on node", "error", err)
-		} else {
-			slog.Info("Database leader elected", "leader", srv.Node().LeaderID())
-			return
-		}
-	}
-
-	slog.Warn("No leader elected within timeout, continuing anyway")
-}
-
-// createDistributedBackend creates a distributed storage backend.
-func (s *Server) createDistributedBackend() (backend.Backend, error) {
-	nodes := make([]distributed.NodeConfig, len(s.config.Nodes))
-	for i, n := range s.config.Nodes {
-		n.Path = checkBaseDir(s.basePath, n.Path)
-		n.DBPath = checkBaseDir(s.basePath, n.DBPath)
-
-		nodes[i] = distributed.NodeConfig{
-			ID:     n.ID,
-			Host:   n.Host,
-			Port:   n.Port,
-			Path:   n.Path,
-			DB:     n.DB,
-			DBPort: n.DBPort,
-			DBPath: n.DBPath,
-			Leader: n.Leader,
-			Epoch:  n.Epoch,
-		}
-	}
-
-	buckets := make([]distributed.BucketConfig, len(s.config.Buckets))
-	for i, b := range s.config.Buckets {
-		buckets[i] = distributed.BucketConfig{
-			Name:      b.Name,
-			Region:    b.Region,
-			Type:      b.Type,
-			Public:    b.Public,
-			AccountID: b.AccountID,
-		}
-	}
-
-	// Determine data directories
-	badgerDir := s.config.BadgerDir
-	if badgerDir == "" {
-		badgerDir = filepath.Join(s.basePath, "db")
-	} else if !filepath.IsAbs(badgerDir) && s.basePath != "" {
-		badgerDir = filepath.Join(s.basePath, badgerDir)
-	}
-
-	dataDir := filepath.Join(s.basePath, "store")
-
-	// Build database client configuration
-	var dbClientConfig *distributed.DBClientConfig
-	if len(s.config.DB) > 0 {
-		dbNodes := make([]string, len(s.config.DB))
-		for i, n := range s.config.DB {
-			dbNodes[i] = fmt.Sprintf("%s:%d", n.Host, n.Port)
-		}
-
-		var accessKeyID, secretAccessKey string
-		if s.config.DB[0].AccessKeyID != "" {
-			accessKeyID = s.config.DB[0].AccessKeyID
-			secretAccessKey = s.config.DB[0].SecretAccessKey
-		} else if len(s.config.Auth) > 0 {
-			accessKeyID = s.config.Auth[0].AccessKeyID
-			secretAccessKey = s.config.Auth[0].SecretAccessKey
-		}
-
-		dbClientConfig = &distributed.DBClientConfig{
-			Nodes:           dbNodes,
-			AccessKeyID:     accessKeyID,
-			SecretAccessKey: secretAccessKey,
-			Region:          s.config.Region,
-		}
-	} else if len(s.dbServers) > 0 {
-		dbClientConfig = &distributed.DBClientConfig{
-			Nodes:  []string{"127.0.0.1:6660"},
-			Region: s.config.Region,
-		}
-		if len(s.config.Auth) > 0 {
-			dbClientConfig.AccessKeyID = s.config.Auth[0].AccessKeyID
-			dbClientConfig.SecretAccessKey = s.config.Auth[0].SecretAccessKey
-		} else {
-			dbClientConfig.AccessKeyID = "predastore"
-			dbClientConfig.SecretAccessKey = "predastore"
-		}
-	}
-
-	cfg := &distributed.Config{
-		DataDir:           dataDir,
-		BadgerDir:         badgerDir,
-		DataShards:        s.config.RS.Data,
-		ParityShards:      s.config.RS.Parity,
-		PartitionCount:    len(s.config.Nodes),
-		ReplicationFactor: 100,
-		QuicBasePort:      9991,
-		Nodes:             nodes,
-		Buckets:           buckets,
-		DBClient:          dbClientConfig,
-	}
-
-	be, err := distributed.New(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create distributed backend: %w", err)
-	}
-
-	slog.Info("Initialized distributed backend",
-		"nodes", len(nodes),
-		"buckets", len(buckets),
-		"dataShards", s.config.RS.Data,
-		"parityShards", s.config.RS.Parity,
-		"badgerDir", badgerDir,
-		"dataDir", dataDir,
-	)
-	return be, nil
-}
-
-// launchQUICServers starts QUIC servers for shard storage.
-func (s *Server) launchQUICServers() {
-	if len(s.config.Nodes) == 0 {
-		slog.Warn("No nodes configured, skipping QUIC server launch")
-		return
-	}
-
-	if s.nodeID > 0 {
-		// Launch specific node
-		for _, n := range s.config.Nodes {
-			if n.ID == s.nodeID {
-				// Apply base-dir to relative paths
-				nodePath := checkBaseDir(s.basePath, n.Path)
-
-				quicAddr := fmt.Sprintf("%s:%d", n.Host, n.Port)
-				slog.Info("Launching QUIC server for node", "nodeID", s.nodeID, "path", nodePath, "addr", quicAddr)
-
-				if err := os.MkdirAll(nodePath, 0750); err != nil {
-					slog.Error("Failed to create node directory", "path", nodePath, "error", err)
-					return
-				}
-
-				quicserver.New(nodePath, quicAddr,
-					quicserver.WithMasterKey(s.masterKey),
-					quicserver.WithTLSCertFiles(s.tlsCert, s.tlsKey),
-					quicserver.WithCompactionInterval(s.compactionInterval()),
-				)
-				return
-			}
-		}
-		slog.Error("Node ID not found in configuration", "nodeID", s.nodeID)
-		return
-	}
-
-	// Dev mode: launch all nodes locally
-	if allHostsSame(s.config.Nodes) {
-		slog.Info("Dev mode: all nodes have same host, launching all QUIC servers as goroutines")
-		for _, n := range s.config.Nodes {
-			// Apply base-dir to relative paths
-			nodePath := checkBaseDir(s.basePath, n.Path)
-
-			quicAddr := fmt.Sprintf("%s:%d", n.Host, n.Port)
-			slog.Info("Launching QUIC server", "nodeID", n.ID, "path", nodePath, "addr", quicAddr)
-
-			if err := os.MkdirAll(nodePath, 0750); err != nil {
-				slog.Error("Failed to create node directory", "path", nodePath, "error", err)
-				continue
-			}
-
-			quicserver.New(nodePath, quicAddr,
-				quicserver.WithMasterKey(s.masterKey),
-				quicserver.WithTLSCertFiles(s.tlsCert, s.tlsKey),
-				quicserver.WithCompactionInterval(s.compactionInterval()),
-			)
-		}
-	} else {
-		slog.Error("Distributed mode requires -node flag when nodes have different hosts")
-	}
-}
-
-// compactionInterval converts the configured interval (in seconds) to a
-// duration. A non-positive value yields zero, leaving the store default.
-func (s *Server) compactionInterval() time.Duration {
-	return time.Duration(s.config.Compaction.IntervalSeconds) * time.Second
-}
-
-// initCredentialProvider creates the appropriate CredentialProvider based on config.
-// If [iam] is configured, uses NATS KV with config fallback (ChainProvider).
-// Otherwise, uses config-only (ConfigProvider).
-// Returns an error if [iam] is explicitly configured but NATS connection or crypto
-// setup fails. Missing KV buckets are handled gracefully via lazy initialization
-// (the spinifex daemon may create them after predastore starts).
 func (s *Server) initCredentialProvider() (CredentialProvider, error) {
 	configProv := NewConfigProvider(s.config.Auth)
 
@@ -757,8 +333,14 @@ func (s *Server) ListenAndServeAsync() error {
 
 	go func() {
 		slog.Info(">>> USING HTTP/2 SERVER (net/http + chi) <<<", "addr", addr)
-		if err := s.server.ListenAndServe(addr, s.tlsCert, s.tlsKey); err != nil {
-			slog.Error("Server error", "error", err)
+		err := s.server.ListenAndServe(addr, s.tlsCert, s.tlsKey)
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return
+		}
+		slog.Error("Server error", "error", err)
+		select {
+		case s.serveErr <- err:
+		default:
 		}
 	}()
 
@@ -924,47 +506,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // WaitForShutdownSignal blocks until SIGINT/SIGTERM is received or the
 // embedded database crashes. Returns an error if shutdown was triggered by a
 // DB failure, nil for normal signal-based shutdown.
-func (s *Server) WaitForShutdownSignal() error {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	select {
-	case <-sigChan:
-		return nil
-	case err := <-s.dbFailed:
-		slog.Error("Embedded database crashed, shutting down server", "error", err)
-		return err
-	}
-}
+// ServeError reports a fatal listener failure. A gateway that cannot bind
+// must take the process down rather than leave the cluster running headless.
+func (s *Server) ServeError() <-chan error { return s.serveErr }
 
 // Helper functions
 
-func allDBHostsSame(nodes []s3db.DBNodeConfig) bool {
-	if len(nodes) == 0 {
-		return true
-	}
-	firstHost := nodes[0].Host
-	for _, n := range nodes[1:] {
-		if n.Host != firstHost {
-			return false
-		}
-	}
-	return true
-}
-
-func allHostsSame(nodes []Nodes) bool {
-	if len(nodes) == 0 {
-		return true
-	}
-	firstHost := nodes[0].Host
-	for _, n := range nodes[1:] {
-		if n.Host != firstHost {
-			return false
-		}
-	}
-	return true
-}
-
-// Base directory checks.
 func checkBaseDir(baseDir, path string) (newpath string) {
 	if path == "" {
 		return ""

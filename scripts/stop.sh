@@ -25,8 +25,23 @@ NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 
+# A cluster launched against a different PREDA_DIR has no pidfile here, so it
+# survives this script silently and keeps holding its data directory. Report
+# those rather than kill them: a cluster outside this root may not be ours.
+report_stray() {
+    local stray
+    stray=$(pgrep -af '/bin/s3d -config' 2>/dev/null | grep -Fv "$BASE_DIR" || true)
+    [ -n "$stray" ] || return 0
+    log_warn "s3d processes outside $BASE_DIR are still running:"
+    while IFS= read -r line; do
+        log_warn "  $line"
+    done <<< "$stray"
+    log_warn "Set PREDA_DIR to their root and re-run, or stop them by hand."
+}
+
 if [ ! -d "$BASE_DIR" ]; then
     log_info "Nothing to stop — $BASE_DIR does not exist"
+    report_stray
     exit 0
 fi
 
@@ -57,10 +72,13 @@ for cluster_dir in "$BASE_DIR"/*/; do
     config="$CONFIG_DIR/${cluster}.toml"
     [ -f "$config" ] || continue
 
-    ips=$(grep -E '^\s*host\s*=' "$config" | \
+    # An absent or all-wildcard address list is normal, not an error: the
+    # pipeline must not abort the script under `set -e`.
+    ips=$(grep -E '^\s*public_addr\s*=' "$config" | \
         sed 's/.*=\s*"\(.*\)".*/\1/' | \
+        cut -d: -f1 | \
         grep -v '0\.0\.0\.0' | \
-        sort -u)
+        sort -u || true)
 
     for ip in $ips; do
         sudo ip addr del "${ip}/24" dev lo 2>/dev/null || true
@@ -72,3 +90,5 @@ if [ "$stopped" -eq 0 ]; then
 else
     log_info "Stopped $stopped process(es)"
 fi
+
+report_stray

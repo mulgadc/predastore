@@ -3,6 +3,8 @@ package s3db
 import (
 	"fmt"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
 // DBNodeConfig represents a single database node in the cluster.
@@ -18,12 +20,27 @@ type DBNodeConfig struct {
 	Leader          bool   `toml:"leader"` // Initial bootstrap leader hint
 }
 
+// RaftPeer identifies one voting member when raft runs over an injected
+// stream layer: the advertise address is node-identifying, and the stream
+// layer's dial function resolves it to a transport.
+type RaftPeer struct {
+	ID      uint64
+	Address string
+}
+
 // ClusterConfig represents the full cluster configuration.
 type ClusterConfig struct {
 	NodeID    uint64         // This node's ID
 	Nodes     []DBNodeConfig // All nodes in cluster
 	DataDir   string         // Base data directory
 	Bootstrap bool           // Whether to bootstrap a new cluster
+
+	// StreamLayer, when set, carries raft traffic instead of the built-in
+	// TCP+TLS transport; Peers then lists the voting members bootstrap
+	// uses. Encryption is the transport's concern in this mode, so TLSCert
+	// and TLSKey are not required.
+	StreamLayer raft.StreamLayer
+	Peers       []RaftPeer
 
 	// TLS material for the Raft transport. Populated programmatically by
 	// s3db.NewServer from ServerConfig.TLS{Cert,Key} — not from cluster.toml.

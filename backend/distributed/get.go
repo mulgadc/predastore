@@ -12,7 +12,6 @@ import (
 
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
@@ -129,16 +128,8 @@ func (b *Backend) readRangeFromSingleShard(ctx context.Context, bucket, key stri
 		endInShard = actualShardSize - 1
 	}
 
-	// Request the specific range from the shard via QUIC
+	// Request the specific range from the shard
 	nodeNum := int(shards.DataShardNodes[shardIdx])
-	addr := b.getNodeAddr(nodeNum)
-
-	// Use pooled connection to avoid TLS handshake overhead
-	client, err := quicclient.DialPooled(ctx, addr)
-	if err != nil {
-		return nil, fmt.Errorf("dial node %d: %w", nodeNum, err)
-	}
-	// Don't close - connection stays in pool
 
 	// Request the shard with range
 	objectRequest := quicserver.ObjectRequest{
@@ -149,7 +140,7 @@ func (b *Backend) readRangeFromSingleShard(ctx context.Context, bucket, key stri
 		RangeEnd:   endInShard,
 	}
 
-	reader, err := client.GetRange(ctx, objectRequest)
+	reader, err := b.shards.GetShardRange(ctx, nodeNum, objectRequest)
 	if err != nil {
 		return nil, fmt.Errorf("get range from node %d: %w", nodeNum, err)
 	}
