@@ -5,23 +5,15 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"os"
-	"sync"
 
-	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/quic/quicclient"
-	"github.com/mulgadc/predastore/quic/quicserver"
 	"github.com/mulgadc/predastore/s3/chunked"
 	s3db "github.com/mulgadc/predastore/s3db"
-	"golang.org/x/sync/errgroup"
 )
-
-const frameSize = 64 * 1024
 
 // arnObjectPrefix is the ARN prefix for object keys
 // Format: arn:aws:s3:::<bucket>/<key>.
@@ -58,131 +50,60 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 		ParityShardNodes: make([]uint32, b.rsParityShard),
 	}
 
-	totalShards := b.rsDataShard + b.rsParityShard
-	shardSize := (frameSize + totalShards - 1) / totalShards
+	// Write object to a temporary file for RS splitting and QUIC distribution
+	tmpFile, err := os.CreateTemp("", "distributed-put-*")
+	if err != nil {
+		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
 
-	// Get shard placement set using objectHash.
-	placementSet, err := b.hashRing.GetClosestN(objectHash[:], totalShards)
+	// Copy body to temp file, handling chunked encoding if needed
+	if req.Body != nil {
+		reader := req.Body
+		if req.IsChunked && req.ContentEncoding == "aws-chunked" {
+			reader = chunked.NewDecoder(req.Body, req.DecodedLength)
+		}
+		_, err = io.Copy(tmpFile, reader)
+		if err != nil {
+			slog.Error("distributed.PutObject: copy to temp file failed", "error", err)
+			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+		}
+	}
+	if closeErr := tmpFile.Close(); closeErr != nil {
+		slog.Debug("Failed to close temp file", "path", tmpFile.Name(), "error", closeErr)
+	}
+
+	var size int64
+	var poolNearFull bool
+	size, poolNearFull, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
+	if err != nil {
+		slog.Error("distributed.PutObject: shard distribution failed", "error", err)
+		return nil, mapPutErr(err)
+	}
+
+	objectToShardNodes.Size = size
+
+	// Get hash ring placement using objectHash for consistency with storage and retrieval
+	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 
-	// Record which nodes have data shards.
+	// Record which nodes have data shards
 	for i := 0; i < b.rsDataShard; i++ {
-		objectToShardNodes.DataShardNodes[i], err = NodeToUint32(placementSet[i].String())
+		objectToShardNodes.DataShardNodes[i], err = NodeToUint32(hashRingShards[i].String())
 		if err != nil {
 			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 		}
 	}
 
-	rs, err := reedsolomon.New(b.rsDataShard, b.rsParityShard)
-	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
-	}
-
-	// Record which nodes have parity shards.
+	// Record which nodes have parity shards
 	for i := 0; i < b.rsParityShard; i++ {
-		objectToShardNodes.ParityShardNodes[i], err = NodeToUint32(placementSet[b.rsDataShard+i].String())
+		objectToShardNodes.ParityShardNodes[i], err = NodeToUint32(hashRingShards[b.rsDataShard+i].String())
 		if err != nil {
 			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 		}
-	}
-
-	// Handle aws-chunked encoding if present.
-	body := req.Body
-	if req.IsChunked && req.ContentEncoding == "aws-chunked" {
-		body = chunked.NewDecoder(req.Body, req.DecodedLength)
-	}
-
-	free := make(chan []byte, 2)
-	for range 2 {
-		free <- make([]byte, shardSize*totalShards)
-	}
-
-	g, ctx := errgroup.WithContext(ctx)
-
-	collect := func(r io.Reader) <-chan []byte {
-		out := make(chan []byte)
-		g.Go(func() error {
-			defer close(out)
-			for {
-				var buf []byte
-				select {
-				case buf = <-free:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-
-				n, err := io.ReadFull(r, buf[:frameSize])
-				switch {
-				case err == io.EOF:
-					return nil
-				case err == io.ErrUnexpectedEOF:
-					// Send partial frame, then exit.
-				case err != nil:
-					return fmt.Errorf("collect frame: %w", err)
-				}
-
-				select {
-				case out <- buf[:n]:
-				case <-ctx.Done():
-					return ctx.Err()
-				}
-
-				if err == io.ErrUnexpectedEOF {
-					return nil
-				}
-			}
-		})
-		return out
-	}
-
-	shard := func(in <-chan []byte) <-chan [][]byte {
-		out := make(chan [][]byte)
-		g.Go(func() error {
-			defer close(out)
-			for frame := range in {
-				shards, err := rs.Split(frame)
-				if err != nil {
-					return fmt.Errorf("split frame: %w", err)
-				}
-
-				err = rs.Encode(shards)
-				if err != nil {
-					return fmt.Errorf("encode parity: %w", err)
-				}
-
-				out <- shards
-			}
-			return nil
-		})
-		return out
-	}
-
-	put := func(in <-chan []byte) <-chan 
-
-	var wg sync.WaitGroup
-	for idx, node := range placementSet {
-		id, err := NodeToUint32(node.String())
-		if err != nil {
-			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
-		}
-
-		putReq := quicserver.PutRequest{
-			ObjectHash: objectHash,
-			ShardIndex: uint32(idx), //nolint:gosec // G115: idx bounded by rsDataShard+rsParityShard.
-			ShardSize:  len(shardData),
-		}
-
-		r, w := io.Pipe()
-
-		wg.Go(func() {
-			res, err := b.shards.PutShard(ctx, int(id), putReq, r)
-			if err != nil {
-				slog.Error("put shar failed", "node", id, "error", err)
-				return
-			}
-		})
 	}
 
 	// Encode object metadata

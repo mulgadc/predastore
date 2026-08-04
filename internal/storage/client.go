@@ -46,8 +46,8 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	return &Client{rpc: cfg.Client, resolve: cfg.Resolve}, nil
 }
 
-// Open starts a shard stream against the node.
-func (c *Client) Open(ctx context.Context, nodeID int, op rpc.Opcode, h *wire.ShardRequest) (transport.Stream, error) {
+// open starts a shard stream against the node.
+func (c *Client) open(ctx context.Context, nodeID int, op rpc.Opcode, h *wire.ShardRequest) (transport.Stream, error) {
 	addr, err := c.resolve(nodeID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage node %d: %w", nodeID, err)
@@ -75,7 +75,7 @@ func readEnvelope(br *bufio.Reader) (*wire.ShardResponse, error) {
 
 // PutShard streams a shard to the node and returns the commit result.
 func (c *Client) PutShard(ctx context.Context, nodeID int, req quicserver.PutRequest, body io.Reader) (*quicserver.PutResponse, error) {
-	stream, err := c.Open(ctx, nodeID, wire.OpShardPut, &wire.ShardRequest{
+	stream, err := c.open(ctx, nodeID, wire.OpShardPut, &wire.ShardRequest{
 		Bucket:     req.Bucket,
 		Object:     req.Object,
 		ObjectHash: req.ObjectHash,
@@ -116,7 +116,7 @@ func (c *Client) PutShard(ctx context.Context, nodeID int, req quicserver.PutReq
 
 // DeleteShard marks a shard deleted on the node.
 func (c *Client) DeleteShard(ctx context.Context, nodeID int, req quicserver.DeleteRequest) (*quicserver.DeleteResponse, error) {
-	stream, err := c.Open(ctx, nodeID, wire.OpShardDelete, &wire.ShardRequest{
+	stream, err := c.open(ctx, nodeID, wire.OpShardDelete, &wire.ShardRequest{
 		Bucket:     req.Bucket,
 		Object:     req.Object,
 		ObjectHash: req.ObjectHash,
@@ -153,7 +153,7 @@ func (c *Client) GetShardRange(ctx context.Context, nodeID int, req quicserver.O
 }
 
 func (c *Client) get(ctx context.Context, nodeID int, req quicserver.ObjectRequest) (io.ReadCloser, error) {
-	stream, err := c.Open(ctx, nodeID, wire.OpShardGet, &wire.ShardRequest{
+	stream, err := c.open(ctx, nodeID, wire.OpShardGet, &wire.ShardRequest{
 		Bucket:     req.Bucket,
 		Object:     req.Object,
 		ShardIndex: req.ShardIndex,
