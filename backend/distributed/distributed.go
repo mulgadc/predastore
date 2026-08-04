@@ -19,7 +19,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/quic/quicserver"
+	"github.com/mulgadc/predastore/internal/storage"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
 
@@ -376,11 +376,11 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				return
 			}
 
-			putReq := quicserver.PutRequest{
+			putReq := storage.PutRequest{
 				Bucket:     bucket,
 				Object:     objectPath,
 				ObjectHash: objectHash,
-				ShardSize:  len(shardData),
+				ShardSize:  int64(len(shardData)),
 				ShardIndex: uint32(idx), //nolint:gosec // G115: idx bounded by rsDataShard (small uint).
 			}
 
@@ -441,11 +441,11 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 				return
 			}
 
-			putReq := quicserver.PutRequest{
+			putReq := storage.PutRequest{
 				Bucket:     bucket,
 				Object:     objectPath,
 				ObjectHash: objectHash,
-				ShardSize:  shardSize,
+				ShardSize:  int64(shardSize),
 				ShardIndex: uint32(hashRingIdx), //nolint:gosec // G115: hashRingIdx bounded by rsDataShard + rsParityShard (small uint).
 			}
 
@@ -542,7 +542,7 @@ func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShar
 	for i := range totalNodes {
 		nodeNum := int(totalNodes[i])
 
-		objectRequest := quicserver.ObjectRequest{
+		objectRequest := storage.GetRequest{
 			Bucket:     bucket,
 			Object:     object,
 			RangeStart: -1, // -1 means full shard (no range)

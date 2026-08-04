@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/quic/quicserver"
+	"github.com/mulgadc/predastore/internal/storage"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
 
@@ -117,7 +117,7 @@ func (b *Backend) deleteObjectViaQUIC(ctx context.Context, bucket, key string, o
 		go func(ns nodeShard) {
 			defer wg.Done()
 
-			delReq := quicserver.DeleteRequest{
+			delReq := storage.DeleteRequest{
 				Bucket:     bucket,
 				Object:     key,
 				ObjectHash: objectHash,

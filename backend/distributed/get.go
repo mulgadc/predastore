@@ -12,7 +12,7 @@ import (
 
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/quic/quicserver"
+	"github.com/mulgadc/predastore/internal/storage"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
 
@@ -132,7 +132,7 @@ func (b *Backend) readRangeFromSingleShard(ctx context.Context, bucket, key stri
 	nodeNum := int(shards.DataShardNodes[shardIdx])
 
 	// Request the shard with range
-	objectRequest := quicserver.ObjectRequest{
+	objectRequest := storage.GetRequest{
 		Bucket:     bucket,
 		Object:     key,
 		ShardIndex: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by rsDataShard (small uint).

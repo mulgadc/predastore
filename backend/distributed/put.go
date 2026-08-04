@@ -10,7 +10,7 @@ import (
 	"os"
 
 	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/quic/quicclient"
+	"github.com/mulgadc/predastore/internal/storage"
 	"github.com/mulgadc/predastore/s3/chunked"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
@@ -23,7 +23,7 @@ const arnObjectPrefixPut = "arn:aws:s3:::"
 // to the client. A pool-full shard write must surface as 507, not the
 // generic 500 other failures get.
 func mapPutErr(err error) *backend.S3Error {
-	if errors.Is(err, quicclient.ErrInsufficientStorage) {
+	if errors.Is(err, storage.ErrStoreFull) {
 		return backend.ErrInsufficientStorageError
 	}
 	return backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
