@@ -12,7 +12,6 @@ import (
 
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/internal/wire"
 	"github.com/mulgadc/predastore/quic/quicclient"
 	"github.com/mulgadc/predastore/quic/quicserver"
 )
@@ -47,7 +46,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 }
 
 // open starts a shard stream against the node.
-func (c *Client) open(ctx context.Context, nodeID int, op rpc.Opcode, h *wire.ShardRequest) (transport.Stream, error) {
+func (c *Client) open(ctx context.Context, nodeID int, op rpc.Opcode, h *ShardRequest) (transport.Stream, error) {
 	addr, err := c.resolve(nodeID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve storage node %d: %w", nodeID, err)
@@ -61,12 +60,12 @@ func (c *Client) open(ctx context.Context, nodeID int, op rpc.Opcode, h *wire.Sh
 
 // readEnvelope consumes the newline-terminated response envelope, leaving
 // any body bytes in the reader.
-func readEnvelope(br *bufio.Reader) (*wire.ShardResponse, error) {
+func readEnvelope(br *bufio.Reader) (*ShardResponse, error) {
 	line, err := br.ReadBytes('\n')
 	if err != nil {
 		return nil, fmt.Errorf("read response envelope: %w", err)
 	}
-	var resp wire.ShardResponse
+	var resp ShardResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
 		return nil, fmt.Errorf("decode response envelope: %w", err)
 	}
@@ -75,7 +74,7 @@ func readEnvelope(br *bufio.Reader) (*wire.ShardResponse, error) {
 
 // PutShard streams a shard to the node and returns the commit result.
 func (c *Client) PutShard(ctx context.Context, nodeID int, req quicserver.PutRequest, body io.Reader) (*quicserver.PutResponse, error) {
-	stream, err := c.open(ctx, nodeID, wire.OpShardPut, &wire.ShardRequest{
+	stream, err := c.open(ctx, nodeID, OpShardPut, &ShardRequest{
 		Bucket:     req.Bucket,
 		Object:     req.Object,
 		ObjectHash: req.ObjectHash,
@@ -104,7 +103,7 @@ func (c *Client) PutShard(ctx context.Context, nodeID int, req quicserver.PutReq
 	}
 	switch resp.Err {
 	case "":
-	case wire.ErrCodeStoreFull:
+	case ErrCodeStoreFull:
 		// Same sentinel the legacy quic client returns, so capacity
 		// backoff logic upstream is transport-agnostic.
 		return nil, fmt.Errorf("put shard to node %d: %w", nodeID, quicclient.ErrInsufficientStorage)
@@ -116,7 +115,7 @@ func (c *Client) PutShard(ctx context.Context, nodeID int, req quicserver.PutReq
 
 // DeleteShard marks a shard deleted on the node.
 func (c *Client) DeleteShard(ctx context.Context, nodeID int, req quicserver.DeleteRequest) (*quicserver.DeleteResponse, error) {
-	stream, err := c.open(ctx, nodeID, wire.OpShardDelete, &wire.ShardRequest{
+	stream, err := c.open(ctx, nodeID, OpShardDelete, &ShardRequest{
 		Bucket:     req.Bucket,
 		Object:     req.Object,
 		ObjectHash: req.ObjectHash,
@@ -153,7 +152,7 @@ func (c *Client) GetShardRange(ctx context.Context, nodeID int, req quicserver.O
 }
 
 func (c *Client) get(ctx context.Context, nodeID int, req quicserver.ObjectRequest) (io.ReadCloser, error) {
-	stream, err := c.open(ctx, nodeID, wire.OpShardGet, &wire.ShardRequest{
+	stream, err := c.open(ctx, nodeID, OpShardGet, &ShardRequest{
 		Bucket:     req.Bucket,
 		Object:     req.Object,
 		ShardIndex: req.ShardIndex,
@@ -176,7 +175,7 @@ func (c *Client) get(ctx context.Context, nodeID int, req quicserver.ObjectReque
 	}
 	switch resp.Err {
 	case "":
-	case wire.ErrCodeNotFound:
+	case ErrCodeNotFound:
 		stream.CancelRead(0)
 		return nil, fmt.Errorf("get shard from node %d: %w", nodeID, ErrShardNotFound)
 	default:

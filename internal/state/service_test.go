@@ -12,7 +12,6 @@ import (
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/internal/wire"
 	"github.com/mulgadc/predastore/s3db"
 )
 
@@ -27,7 +26,7 @@ func startStateProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers 
 	})
 
 	dial := func(ctx context.Context, address raft.ServerAddress) (transport.Stream, error) {
-		target, err := wire.ParseRaftAddress(string(address))
+		target, err := state.ParseRaftAddress(string(address))
 		if err != nil {
 			return nil, err
 		}
@@ -35,10 +34,10 @@ func startStateProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers 
 		if err != nil {
 			return nil, err
 		}
-		return rpc.OpenStream(ctx, client, addr, wire.OpRaftDial, &wire.RaftDial{})
+		return rpc.OpenStream(ctx, client, addr, state.OpRaftDial, &state.RaftDial{})
 	}
 
-	layer := s3db.NewRPCStreamLayer(wire.RaftAddress(id), dial)
+	layer := s3db.NewRPCStreamLayer(state.RaftAddress(id), dial)
 	t.Cleanup(func() { layer.Close() })
 
 	cfg := s3db.DefaultClusterConfig()
@@ -94,9 +93,9 @@ func TestStateServiceOverRPC(t *testing.T) {
 		3: "state-svc-proc3",
 	}
 	peers := []s3db.RaftPeer{
-		{ID: 1, Address: wire.RaftAddress(1)},
-		{ID: 2, Address: wire.RaftAddress(2)},
-		{ID: 3, Address: wire.RaftAddress(3)},
+		{ID: 1, Address: state.RaftAddress(1)},
+		{ID: 2, Address: state.RaftAddress(2)},
+		{ID: 3, Address: state.RaftAddress(3)},
 	}
 
 	nodes := make(map[uint64]*s3db.RaftNode, len(pipeNames))

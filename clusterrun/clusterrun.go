@@ -23,7 +23,6 @@ import (
 	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/storage"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/internal/wire"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/predastore/s3"
 	"github.com/mulgadc/predastore/s3db"
@@ -108,7 +107,7 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 	// Raft dials peers through the same client; its advertise addresses are
 	// node keys, which the topology resolves to whichever transport applies.
 	raftDial := func(ctx context.Context, address raft.ServerAddress) (transport.Stream, error) {
-		target, err := wire.ParseRaftAddress(string(address))
+		target, err := state.ParseRaftAddress(string(address))
 		if err != nil {
 			return nil, err
 		}
@@ -116,7 +115,7 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 		if err != nil {
 			return nil, err
 		}
-		return rpc.OpenStream(ctx, rt.client, addr, wire.OpRaftDial, &wire.RaftDial{})
+		return rpc.OpenStream(ctx, rt.client, addr, state.OpRaftDial, &state.RaftDial{})
 	}
 
 	replicas := topo.NodesByRole(cluster.RoleStateReplica)
@@ -203,7 +202,7 @@ func (rt *Runtime) addNode(
 
 	switch n.Role {
 	case cluster.RoleStateReplica:
-		layer := s3db.NewRPCStreamLayer(wire.RaftAddress(id), raftDial)
+		layer := s3db.NewRPCStreamLayer(state.RaftAddress(id), raftDial)
 		ccfg := s3db.DefaultClusterConfig()
 		ccfg.NodeID = id
 		ccfg.DataDir = dataDir

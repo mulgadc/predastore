@@ -3,7 +3,7 @@ package clusterrun
 import (
 	"fmt"
 
-	"github.com/mulgadc/predastore/internal/wire"
+	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/s3db"
 )
 
@@ -14,7 +14,7 @@ func RaftPeers(replicaIDs []int) []s3db.RaftPeer {
 	peers := make([]s3db.RaftPeer, len(replicaIDs))
 	for i, id := range replicaIDs {
 		u := uint64(id) //nolint:gosec // G115: node ids are small positives from a validated topology.
-		peers[i] = s3db.RaftPeer{ID: u, Address: wire.RaftAddress(u)}
+		peers[i] = s3db.RaftPeer{ID: u, Address: state.RaftAddress(u)}
 	}
 	return peers
 }

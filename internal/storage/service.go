@@ -13,7 +13,6 @@ import (
 
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/internal/wire"
 	"github.com/mulgadc/predastore/s3db"
 	"github.com/mulgadc/predastore/store"
 )
@@ -44,21 +43,21 @@ func (s *Service) Run(ctx context.Context) error {
 
 // Register installs the storage service handlers on the mux.
 func (s *Service) Register(mux *rpc.Mux) {
-	rpc.RegisterHandler(mux, wire.OpShardGet, s.handleGet)
-	rpc.RegisterHandler(mux, wire.OpShardPut, s.handlePut)
-	rpc.RegisterHandler(mux, wire.OpShardDelete, s.handleDelete)
+	rpc.RegisterHandler(mux, OpShardGet, s.handleGet)
+	rpc.RegisterHandler(mux, OpShardPut, s.handlePut)
+	rpc.RegisterHandler(mux, OpShardDelete, s.handleDelete)
 }
 
 // respondShard writes the newline-terminated JSON envelope; get responses
 // stream the shard bytes after it.
-func respondShard(stream transport.Stream, resp *wire.ShardResponse) error {
+func respondShard(stream transport.Stream, resp *ShardResponse) error {
 	return json.NewEncoder(stream).Encode(resp)
 }
 
-func (s *Service) handlePut(ctx context.Context, h wire.ShardRequest, stream transport.Stream) error {
+func (s *Service) handlePut(ctx context.Context, h ShardRequest, stream transport.Stream) error {
 	st := s.store
 	if h.ShardSize <= 0 {
-		return respondShard(stream, &wire.ShardResponse{Err: "no shard size specified"})
+		return respondShard(stream, &ShardResponse{Err: "no shard size specified"})
 	}
 
 	writer, err := st.Append(h.ObjectHash, h.ShardIndex, h.ShardSize)
@@ -69,30 +68,30 @@ func (s *Service) handlePut(ctx context.Context, h wire.ShardRequest, stream tra
 			return fmt.Errorf("drain body after append error: %w", derr)
 		}
 		if errors.Is(err, store.ErrStoreFull) {
-			return respondShard(stream, &wire.ShardResponse{Err: wire.ErrCodeStoreFull})
+			return respondShard(stream, &ShardResponse{Err: ErrCodeStoreFull})
 		}
-		return respondShard(stream, &wire.ShardResponse{Err: fmt.Sprintf("append: %v", err)})
+		return respondShard(stream, &ShardResponse{Err: fmt.Sprintf("append: %v", err)})
 	}
 
 	if _, err := writer.ReadFrom(io.LimitReader(stream, h.ShardSize)); err != nil {
-		return respondShard(stream, &wire.ShardResponse{Err: fmt.Sprintf("write: %v", err)})
+		return respondShard(stream, &ShardResponse{Err: fmt.Sprintf("write: %v", err)})
 	}
 	if err := writer.Close(); err != nil {
-		return respondShard(stream, &wire.ShardResponse{Err: fmt.Sprintf("commit: %v", err)})
+		return respondShard(stream, &ShardResponse{Err: fmt.Sprintf("commit: %v", err)})
 	}
 
 	// Surface nearfull pressure on success too, so callers can back off
 	// before a write is ever outright rejected.
-	return respondShard(stream, &wire.ShardResponse{ShardSize: h.ShardSize, PoolNearFull: st.NearFull()})
+	return respondShard(stream, &ShardResponse{ShardSize: h.ShardSize, PoolNearFull: st.NearFull()})
 }
 
-func (s *Service) handleGet(ctx context.Context, h wire.ShardRequest, stream transport.Stream) error {
+func (s *Service) handleGet(ctx context.Context, h ShardRequest, stream transport.Stream) error {
 	st := s.store
 
 	objectHash := s3db.GenObjectHash(h.Bucket, h.Object)
 	reader, err := st.Lookup(objectHash, h.ShardIndex)
 	if err != nil {
-		return respondShard(stream, &wire.ShardResponse{Err: wire.ErrCodeNotFound})
+		return respondShard(stream, &ShardResponse{Err: ErrCodeNotFound})
 	}
 	defer reader.Close()
 
@@ -109,11 +108,11 @@ func (s *Service) handleGet(ctx context.Context, h wire.ShardRequest, stream tra
 		rangeEnd = totalSize - 1
 	}
 	if rangeStart > rangeEnd || rangeStart >= totalSize {
-		return respondShard(stream, &wire.ShardResponse{Err: "invalid range"})
+		return respondShard(stream, &ShardResponse{Err: "invalid range"})
 	}
 	responseSize := rangeEnd - rangeStart + 1
 
-	if err := respondShard(stream, &wire.ShardResponse{BodyLen: responseSize}); err != nil {
+	if err := respondShard(stream, &ShardResponse{BodyLen: responseSize}); err != nil {
 		return fmt.Errorf("write envelope: %w", err)
 	}
 	if _, err := stream.ReadFrom(io.NewSectionReader(reader, rangeStart, responseSize)); err != nil {
@@ -122,11 +121,11 @@ func (s *Service) handleGet(ctx context.Context, h wire.ShardRequest, stream tra
 	return nil
 }
 
-func (s *Service) handleDelete(ctx context.Context, h wire.ShardRequest, stream transport.Stream) error {
+func (s *Service) handleDelete(ctx context.Context, h ShardRequest, stream transport.Stream) error {
 	st := s.store
 	deleted, err := st.Delete(h.ObjectHash, h.ShardIndex)
 	if err != nil {
-		return respondShard(stream, &wire.ShardResponse{Err: err.Error()})
+		return respondShard(stream, &ShardResponse{Err: err.Error()})
 	}
-	return respondShard(stream, &wire.ShardResponse{Deleted: deleted})
+	return respondShard(stream, &ShardResponse{Deleted: deleted})
 }

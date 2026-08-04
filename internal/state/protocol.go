@@ -1,8 +1,4 @@
-// Package wire defines the intra-cluster rpc protocol: opcode allocation,
-// stream header types, and response envelopes. Headers carry no routing: the
-// address a stream was opened on identifies the target node, so a process's
-// nodes share one socket without the protocol knowing about it.
-package wire
+package state
 
 import (
 	"encoding/json"
@@ -13,22 +9,19 @@ import (
 	"github.com/mulgadc/predastore/internal/rpc"
 )
 
-// Opcode allocation, by service.
+// Opcodes are allocated per service in non-overlapping ranges so a stream's
+// opcode identifies the service that answers it. State owns 0x0001 and 0x1xxx;
+// storage owns 0x2xxx.
 const (
 	// OpRaftDial opens a raft connection to a state replica; the stream
 	// carries the hashicorp/raft wire protocol for its lifetime.
 	OpRaftDial rpc.Opcode = 0x0001
 
-	// State service: global-state reads and writes against a replica.
+	// Global-state reads and writes against a replica.
 	OpStateGet    rpc.Opcode = 0x1001
 	OpStatePut    rpc.Opcode = 0x1002
 	OpStateDelete rpc.Opcode = 0x1003
 	OpStateScan   rpc.Opcode = 0x1004
-
-	// Storage service: erasure-coded shard operations against a store.
-	OpShardGet    rpc.Opcode = 0x2001
-	OpShardPut    rpc.Opcode = 0x2002
-	OpShardDelete rpc.Opcode = 0x2003
 )
 
 // Response error codes with protocol meaning; anything else in Err is an
@@ -36,7 +29,6 @@ const (
 const (
 	ErrCodeNotFound  = "not-found"
 	ErrCodeNotLeader = "not-leader"
-	ErrCodeStoreFull = "store-full"
 )
 
 // raftAddrPrefix builds the node-identifying raft advertise address space
@@ -53,7 +45,7 @@ func RaftAddress(nodeID uint64) string {
 func ParseRaftAddress(addr string) (uint64, error) {
 	id, err := strconv.ParseUint(strings.TrimPrefix(addr, raftAddrPrefix), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("wire: bad raft address %q: %w", addr, err)
+		return 0, fmt.Errorf("state: bad raft address %q: %w", addr, err)
 	}
 	return id, nil
 }
@@ -105,36 +97,4 @@ type StateResponse struct {
 type ScanItem struct {
 	Key   string `json:"key"`
 	Value []byte `json:"value"`
-}
-
-// ShardRequest is the header for every storage service operation. Put shard
-// data travels in the stream body after the header.
-type ShardRequest struct {
-	Bucket     string   `json:"bucket"`
-	Object     string   `json:"object"`
-	ObjectHash [32]byte `json:"object_hash"`
-	ShardIndex uint32   `json:"shard_index"`
-	// ShardSize is the body length for puts.
-	ShardSize int64 `json:"shard_size,omitempty"`
-	// RangeStart and RangeEnd bound gets; -1 means unset.
-	RangeStart int64 `json:"range_start"`
-	RangeEnd   int64 `json:"range_end"`
-}
-
-func (h *ShardRequest) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
-func (h *ShardRequest) Unmarshal(b []byte) error          { return json.Unmarshal(b, h) }
-
-// ShardResponse is the JSON envelope answering every shard stream. It is
-// newline-terminated; get responses stream BodyLen shard bytes after it.
-type ShardResponse struct {
-	Err string `json:"err,omitempty"`
-	// ShardSize echoes the committed byte count for puts.
-	ShardSize int64 `json:"shard_size,omitempty"`
-	// PoolNearFull reports nearfull free-space pressure at commit time so
-	// callers can back off before writes are rejected outright.
-	PoolNearFull bool `json:"pool_near_full,omitempty"`
-	// Deleted reports whether a delete removed an existing shard.
-	Deleted bool `json:"deleted,omitempty"`
-	// BodyLen is the number of shard bytes following the envelope.
-	BodyLen int64 `json:"body_len,omitempty"`
 }

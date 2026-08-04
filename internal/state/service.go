@@ -13,7 +13,6 @@ import (
 	"github.com/dgraph-io/badger/v4"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/internal/wire"
 	"github.com/mulgadc/predastore/s3db"
 )
 
@@ -42,37 +41,37 @@ func (s *Service) Run(ctx context.Context) error {
 
 // Register installs the state service handlers on the mux.
 func (s *Service) Register(mux *rpc.Mux) {
-	rpc.RegisterHandler(mux, wire.OpRaftDial, s.handleRaftDial)
-	rpc.RegisterHandler(mux, wire.OpStateGet, s.handleGet)
-	rpc.RegisterHandler(mux, wire.OpStatePut, s.handlePut)
-	rpc.RegisterHandler(mux, wire.OpStateDelete, s.handleDelete)
-	rpc.RegisterHandler(mux, wire.OpStateScan, s.handleScan)
+	rpc.RegisterHandler(mux, OpRaftDial, s.handleRaftDial)
+	rpc.RegisterHandler(mux, OpStateGet, s.handleGet)
+	rpc.RegisterHandler(mux, OpStatePut, s.handlePut)
+	rpc.RegisterHandler(mux, OpStateDelete, s.handleDelete)
+	rpc.RegisterHandler(mux, OpStateScan, s.handleScan)
 }
 
 // handleRaftDial hands the stream to the target replica's raft transport and
 // holds it for the connection's lifetime.
-func (s *Service) handleRaftDial(ctx context.Context, h wire.RaftDial, stream transport.Stream) error {
+func (s *Service) handleRaftDial(ctx context.Context, h RaftDial, stream transport.Stream) error {
 	return s.layer.Deliver(ctx, stream)
 }
 
 // respond writes the closing JSON envelope; the rpc server closes the stream
 // once the handler returns.
-func respond(stream transport.Stream, resp *wire.StateResponse) error {
+func respond(stream transport.Stream, resp *StateResponse) error {
 	return json.NewEncoder(stream).Encode(resp)
 }
 
-func (s *Service) handleGet(ctx context.Context, h wire.StateRequest, stream transport.Stream) error {
+func (s *Service) handleGet(ctx context.Context, h StateRequest, stream transport.Stream) error {
 	value, err := s.node.Get(h.Table, h.Key)
 	switch {
 	case errors.Is(err, badger.ErrKeyNotFound):
-		return respond(stream, &wire.StateResponse{Err: wire.ErrCodeNotFound})
+		return respond(stream, &StateResponse{Err: ErrCodeNotFound})
 	case err != nil:
-		return respond(stream, &wire.StateResponse{Err: err.Error()})
+		return respond(stream, &StateResponse{Err: err.Error()})
 	}
-	return respond(stream, &wire.StateResponse{Value: value})
+	return respond(stream, &StateResponse{Value: value})
 }
 
-func (s *Service) handlePut(ctx context.Context, h wire.StateRequest, stream transport.Stream) error {
+func (s *Service) handlePut(ctx context.Context, h StateRequest, stream transport.Stream) error {
 	// The value is the stream body; the client half-closes after writing.
 	value, err := io.ReadAll(stream)
 	if err != nil {
@@ -81,36 +80,36 @@ func (s *Service) handlePut(ctx context.Context, h wire.StateRequest, stream tra
 	return respond(stream, writeResult(s.node, s.node.Put(h.Table, h.Key, value)))
 }
 
-func (s *Service) handleDelete(ctx context.Context, h wire.StateRequest, stream transport.Stream) error {
+func (s *Service) handleDelete(ctx context.Context, h StateRequest, stream transport.Stream) error {
 	return respond(stream, writeResult(s.node, s.node.Delete(h.Table, h.Key)))
 }
 
 // writeResult maps a consensus write outcome onto the response envelope,
 // pointing the client at the leader when this replica cannot commit.
-func writeResult(node *s3db.RaftNode, err error) *wire.StateResponse {
+func writeResult(node *s3db.RaftNode, err error) *StateResponse {
 	switch {
 	case errors.Is(err, s3db.ErrNotLeader):
-		return &wire.StateResponse{Err: wire.ErrCodeNotLeader, Leader: node.LeaderAddr()}
+		return &StateResponse{Err: ErrCodeNotLeader, Leader: node.LeaderAddr()}
 	case err != nil:
-		return &wire.StateResponse{Err: err.Error()}
+		return &StateResponse{Err: err.Error()}
 	}
-	return &wire.StateResponse{}
+	return &StateResponse{}
 }
 
-func (s *Service) handleScan(ctx context.Context, h wire.StateRequest, stream transport.Stream) error {
+func (s *Service) handleScan(ctx context.Context, h StateRequest, stream transport.Stream) error {
 	// errScanLimit stops iteration once the limit is reached without
 	// surfacing an error to the client.
 	errScanLimit := errors.New("scan limit reached")
-	var items []wire.ScanItem
+	var items []ScanItem
 	err := s.node.Scan(h.Table, h.Key, func(key string, value []byte) error {
 		if h.Limit > 0 && len(items) >= h.Limit {
 			return errScanLimit
 		}
-		items = append(items, wire.ScanItem{Key: key, Value: value})
+		items = append(items, ScanItem{Key: key, Value: value})
 		return nil
 	})
 	if err != nil && !errors.Is(err, errScanLimit) {
-		return respond(stream, &wire.StateResponse{Err: err.Error()})
+		return respond(stream, &StateResponse{Err: err.Error()})
 	}
-	return respond(stream, &wire.StateResponse{Items: items})
+	return respond(stream, &StateResponse{Items: items})
 }

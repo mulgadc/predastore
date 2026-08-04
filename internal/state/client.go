@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/internal/rpc"
-	"github.com/mulgadc/predastore/internal/wire"
 	"github.com/mulgadc/predastore/s3db"
 )
 
@@ -70,7 +69,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 // call performs one request round trip against a replica: header, optional
 // body, half-close, then the response envelope.
-func (c *Client) call(target uint64, op rpc.Opcode, req *wire.StateRequest, body []byte) (*wire.StateResponse, error) {
+func (c *Client) call(target uint64, op rpc.Opcode, req *StateRequest, body []byte) (*StateResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -98,7 +97,7 @@ func (c *Client) call(target uint64, op rpc.Opcode, req *wire.StateRequest, body
 	stop := context.AfterFunc(ctx, func() { stream.CancelRead(0) })
 	defer stop()
 
-	var resp wire.StateResponse
+	var resp StateResponse
 	if err := json.NewDecoder(stream).Decode(&resp); err != nil {
 		stream.CancelRead(0)
 		return nil, fmt.Errorf("decode response from replica %d: %w", target, err)
@@ -136,7 +135,7 @@ func (c *Client) Get(table, key string) ([]byte, error) {
 	var lastErr error
 	notFound := false
 	for _, id := range c.readOrder() {
-		resp, err := c.call(id, wire.OpStateGet, &wire.StateRequest{Table: table, Key: key}, nil)
+		resp, err := c.call(id, OpStateGet, &StateRequest{Table: table, Key: key}, nil)
 		if err != nil {
 			lastErr = err
 			continue
@@ -144,7 +143,7 @@ func (c *Client) Get(table, key string) ([]byte, error) {
 		switch resp.Err {
 		case "":
 			return resp.Value, nil
-		case wire.ErrCodeNotFound:
+		case ErrCodeNotFound:
 			notFound = true
 		default:
 			lastErr = fmt.Errorf("replica %d: %s", id, resp.Err)
@@ -164,7 +163,7 @@ func (c *Client) Get(table, key string) ([]byte, error) {
 func (c *Client) Scan(table, prefix string, limit int) ([]s3db.ScanItem, error) {
 	var lastErr error
 	for _, id := range c.readOrder() {
-		resp, err := c.call(id, wire.OpStateScan, &wire.StateRequest{Table: table, Key: prefix, Limit: limit}, nil)
+		resp, err := c.call(id, OpStateScan, &StateRequest{Table: table, Key: prefix, Limit: limit}, nil)
 		if err != nil {
 			lastErr = err
 			continue
@@ -184,17 +183,17 @@ func (c *Client) Scan(table, prefix string, limit int) ([]s3db.ScanItem, error) 
 
 // Put stores a key-value pair through the leader.
 func (c *Client) Put(table, key string, value []byte) error {
-	return c.write(wire.OpStatePut, &wire.StateRequest{Table: table, Key: key}, value)
+	return c.write(OpStatePut, &StateRequest{Table: table, Key: key}, value)
 }
 
 // Delete removes a key through the leader.
 func (c *Client) Delete(table, key string) error {
-	return c.write(wire.OpStateDelete, &wire.StateRequest{Table: table, Key: key}, nil)
+	return c.write(OpStateDelete, &StateRequest{Table: table, Key: key}, nil)
 }
 
 // write drives a consensus write to the leader, following not-leader
 // redirects and rotating through replicas while an election settles.
-func (c *Client) write(op rpc.Opcode, req *wire.StateRequest, body []byte) error {
+func (c *Client) write(op rpc.Opcode, req *StateRequest, body []byte) error {
 	candidates := c.readOrder()
 	next := 0
 	target := candidates[next]
@@ -209,9 +208,9 @@ func (c *Client) write(op rpc.Opcode, req *wire.StateRequest, body []byte) error
 		case resp.Err == "":
 			c.cacheLeader(target)
 			return nil
-		case resp.Err == wire.ErrCodeNotLeader:
+		case resp.Err == ErrCodeNotLeader:
 			lastErr = s3db.ErrNotLeader
-			if id, perr := wire.ParseRaftAddress(resp.Leader); perr == nil {
+			if id, perr := ParseRaftAddress(resp.Leader); perr == nil {
 				// The replica knows the leader: go straight there.
 				target = id
 				continue

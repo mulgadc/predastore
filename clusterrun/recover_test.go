@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/mulgadc/predastore/clusterrun"
-	"github.com/mulgadc/predastore/internal/wire"
+	"github.com/mulgadc/predastore/internal/state"
 )
 
 // TestRaftPeersUseWireAddresses pins the recovered configuration to the same
@@ -19,7 +19,7 @@ func TestRaftPeersUseWireAddresses(t *testing.T) {
 		if peers[i].ID != id {
 			t.Errorf("peer %d id = %d, want %d", i, peers[i].ID, id)
 		}
-		if want := wire.RaftAddress(id); peers[i].Address != want {
+		if want := state.RaftAddress(id); peers[i].Address != want {
 			t.Errorf("peer %d address = %q, want %q", i, peers[i].Address, want)
 		}
 	}
