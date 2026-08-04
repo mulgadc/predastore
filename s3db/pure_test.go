@@ -3,29 +3,10 @@ package s3db
 import (
 	"crypto/sha256"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestDBNodeConfig_HTTPAddr(t *testing.T) {
-	tests := []struct {
-		name string
-		node DBNodeConfig
-		want string
-	}{
-		{"localhost", DBNodeConfig{Host: "localhost", Port: 6660}, "localhost:6660"},
-		{"ip address", DBNodeConfig{Host: "192.168.1.1", Port: 8080}, "192.168.1.1:8080"},
-		{"wildcard", DBNodeConfig{Host: "0.0.0.0", Port: 443}, "0.0.0.0:443"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, tt.node.HTTPAddr())
-		})
-	}
-}
 
 func TestDBNodeConfig_RaftAddr(t *testing.T) {
 	tests := []struct {
@@ -92,38 +73,6 @@ func TestDBNodeConfig_RaftAdvertiseAddr(t *testing.T) {
 	}
 }
 
-func TestEscapePathSegment(t *testing.T) {
-	tests := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{"alphanumeric", "hello123", "hello123"},
-		{"plus sign encoded", "a+b", "a%2Bb"},
-		{"spaces encoded", "hello world", "hello%20world"},
-		{"slashes encoded", "path/to/file", "path%2Fto%2Ffile"},
-		{"empty string", "", ""},
-		{"equals not encoded by PathEscape", "key=value&foo", "key=value&foo"},
-		{"percent encoded", "100%done", "100%25done"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, escapePathSegment(tt.input))
-		})
-	}
-}
-
-func TestDefaultClientConfig(t *testing.T) {
-	cfg := DefaultClientConfig()
-	require.NotNil(t, cfg)
-	assert.Equal(t, "us-east-1", cfg.Region)
-	assert.Equal(t, "s3", cfg.Service)
-	assert.Equal(t, 10*time.Second, cfg.Timeout)
-	assert.Equal(t, 3, cfg.MaxRetries)
-	assert.Nil(t, cfg.RootCAs)
-}
-
 func TestGenObjectHash(t *testing.T) {
 	t.Run("deterministic", func(t *testing.T) {
 		h1 := GenObjectHash("bucket", "key")
@@ -166,50 +115,4 @@ func TestClusterConfig_GetNode(t *testing.T) {
 		node := cfg.GetNode(99)
 		assert.Nil(t, node)
 	})
-}
-
-func TestNewClient(t *testing.T) {
-	t.Run("with nil config uses defaults", func(t *testing.T) {
-		client := NewClient(nil)
-		require.NotNil(t, client)
-	})
-
-	t.Run("with config", func(t *testing.T) {
-		client := NewClient(&ClientConfig{
-			Nodes:           []string{"localhost:6660"},
-			AccessKeyID:     "AKID",
-			SecretAccessKey: "SECRET",
-		})
-		require.NotNil(t, client)
-	})
-
-	t.Run("empty region/service uses defaults", func(t *testing.T) {
-		client := NewClient(&ClientConfig{})
-		require.NotNil(t, client)
-	})
-}
-
-func TestClient_AddRemoveNode(t *testing.T) {
-	client := NewClient(&ClientConfig{
-		Nodes: []string{"node1:6660"},
-	})
-
-	// Add new node
-	client.AddNode("node2:6660")
-	client.AddNode("node2:6660") // Duplicate - should be no-op
-
-	// Remove node
-	client.RemoveNode("node1:6660")
-	client.RemoveNode("nonexistent:6660") // Should not panic
-}
-
-func TestDefaultServerConfig(t *testing.T) {
-	cfg := DefaultServerConfig()
-	require.NotNil(t, cfg)
-	assert.Equal(t, "0.0.0.0:6660", cfg.Addr)
-	assert.Equal(t, 30*time.Second, cfg.ReadTimeout)
-	assert.Equal(t, 30*time.Second, cfg.WriteTimeout)
-	assert.Equal(t, 120*time.Second, cfg.IdleTimeout)
-	assert.Equal(t, "certs/server.pem", cfg.TLSCert)
-	assert.Equal(t, "certs/server.key", cfg.TLSKey)
 }

@@ -42,9 +42,9 @@ type ClusterConfig struct {
 	StreamLayer raft.StreamLayer
 	Peers       []RaftPeer
 
-	// TLS material for the Raft transport. Populated programmatically by
-	// s3db.NewServer from ServerConfig.TLS{Cert,Key} — not from cluster.toml.
-	// NewRaftNode refuses to start if either is empty.
+	// TLS material for the legacy TCP Raft transport, set programmatically by
+	// the caller — not from cluster.toml. NewRaftNode refuses to start if
+	// either is empty and no StreamLayer is injected.
 	TLSCert string
 	TLSKey  string
 
@@ -88,16 +88,11 @@ func (c *ClusterConfig) GetThisNode() *DBNodeConfig {
 	return c.GetNode(c.NodeID)
 }
 
-// HTTPAddr returns the HTTP address for a node.
-func (n *DBNodeConfig) HTTPAddr() string {
-	return fmt.Sprintf("%s:%d", n.Host, n.Port)
-}
-
 // RaftAddr returns the Raft transport bind address for a node.
 func (n *DBNodeConfig) RaftAddr() string {
 	port := n.RaftPort
 	if port == 0 {
-		port = n.Port + 1000 // Default: HTTP port + 1000
+		port = n.Port + 1000 // Default: base port + 1000
 	}
 	return fmt.Sprintf("%s:%d", n.Host, port)
 }

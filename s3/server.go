@@ -10,12 +10,10 @@ import (
 	"path/filepath"
 	"runtime/pprof"
 	"sync"
-	"time"
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/masterkey"
-	"github.com/mulgadc/predastore/s3db"
 )
 
 // BackendType specifies the storage backend type.
@@ -47,7 +45,6 @@ type Server struct {
 	backend         backend.Backend
 	preparedBackend backend.Backend // externally wired backend; skips backend launch
 	credProv        CredentialProvider
-	dbServers       []*s3db.Server
 
 	// Profiling
 	pprofEnabled    bool
@@ -438,41 +435,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.server != nil {
 		if err := s.server.Shutdown(ctx); err != nil {
 			slog.Error("Error shutting down HTTP server", "error", err)
-		}
-	}
-
-	// Shutdown DB servers in parallel with timeout
-	// Each Raft node has its own 5s timeout, but we also impose an overall limit
-	if len(s.dbServers) > 0 {
-		slog.Info("Shutting down DB servers...", "count", len(s.dbServers))
-
-		var wg sync.WaitGroup
-		for i, srv := range s.dbServers {
-			wg.Add(1)
-			go func(idx int, server *s3db.Server) {
-				defer wg.Done()
-				slog.Info("Shutting down DB server", "index", idx)
-				if err := server.Shutdown(); err != nil {
-					slog.Warn("Error shutting down DB server", "index", idx, "error", err)
-				}
-				slog.Info("DB server shutdown complete", "index", idx)
-			}(i, srv)
-		}
-
-		// Wait for all servers with overall timeout
-		done := make(chan struct{})
-		go func() {
-			wg.Wait()
-			close(done)
-		}()
-
-		select {
-		case <-done:
-			slog.Info("All DB servers shut down successfully")
-		case <-time.After(15 * time.Second):
-			slog.Warn("DB server shutdown timed out after 15s, continuing...")
-		case <-ctx.Done():
-			slog.Warn("Shutdown context cancelled, continuing...")
 		}
 	}
 
