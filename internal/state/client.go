@@ -3,18 +3,34 @@ package state
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/mulgadc/predastore/internal/rpc"
-	"github.com/mulgadc/predastore/s3db"
 )
 
+// ErrNotFound is returned by reads when no replica holds the key.
+var ErrNotFound = errors.New("state key not found")
+
+// ErrNotLeader is returned by writes no replica would accept as leader, which
+// usually means an election is still settling.
+var ErrNotLeader = errors.New("state replica is not the leader")
+
+// Item is one key-value pair returned by a scan.
+type Item struct {
+	Key   string
+	Value []byte
+}
+
 // Client reads and writes global state over rpc streams, hiding the wire
-// protocol from callers. Reads try the cached leader then every replica;
-// writes follow not-leader redirects and cache the leader they land on.
+// protocol from callers: it owns table scoping and key encoding, and takes
+// keys as strings that may hold arbitrary bytes.
+//
+// Reads try the cached leader then every replica; writes follow not-leader
+// redirects and cache the leader they land on.
 type Client struct {
 	rpc        *rpc.Client
 	resolve    func(nodeID uint64) (net.Addr, error)
@@ -156,7 +172,7 @@ func (c *Client) Get(table, key string) ([]byte, error) {
 		}
 	}
 	if notFound {
-		return nil, s3db.ErrKeyNotFound
+		return nil, fmt.Errorf("get %s/%q: %w", table, key, ErrNotFound)
 	}
 	if lastErr != nil {
 		return nil, lastErr
@@ -164,9 +180,22 @@ func (c *Client) Get(table, key string) ([]byte, error) {
 	return nil, fmt.Errorf("get %s/%q: no replica answered", table, key)
 }
 
-// Scan lists up to limit keys with the prefix, preferring the leader for
-// freshness but accepting any replica.
-func (c *Client) Scan(table, prefix string, limit int) ([]s3db.ScanItem, error) {
+// Exists reports whether the key is present.
+func (c *Client) Exists(table, key string) (bool, error) {
+	_, err := c.Get(table, key)
+	if errors.Is(err, ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Scan lists up to limit key-value pairs with the prefix, preferring the
+// leader for freshness but accepting any replica. A limit of zero or less
+// returns every match.
+func (c *Client) Scan(table, prefix string, limit int) ([]Item, error) {
 	var lastErr error
 	for _, id := range c.readOrder() {
 		resp, err := c.call(id, OpStateScan, request(table, prefix, limit), nil)
@@ -178,13 +207,26 @@ func (c *Client) Scan(table, prefix string, limit int) ([]s3db.ScanItem, error) 
 			lastErr = fmt.Errorf("replica %d: %s", id, resp.Err)
 			continue
 		}
-		items := make([]s3db.ScanItem, len(resp.Items))
+		items := make([]Item, len(resp.Items))
 		for i, it := range resp.Items {
-			items[i] = s3db.ScanItem{Key: string(it.Key), Value: it.Value}
+			items[i] = Item{Key: string(it.Key), Value: it.Value}
 		}
 		return items, nil
 	}
 	return nil, lastErr
+}
+
+// ListKeys returns every key with the prefix.
+func (c *Client) ListKeys(table, prefix string) ([]string, error) {
+	items, err := c.Scan(table, prefix, 0)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]string, len(items))
+	for i, item := range items {
+		keys[i] = item.Key
+	}
+	return keys, nil
 }
 
 // Put stores a key-value pair through the leader.
@@ -215,7 +257,7 @@ func (c *Client) write(op rpc.Opcode, req *StateRequest, body []byte) error {
 			c.cacheLeader(target)
 			return nil
 		case resp.Err == ErrCodeNotLeader:
-			lastErr = s3db.ErrNotLeader
+			lastErr = ErrNotLeader
 			if id, perr := ParseRaftAddress(resp.Leader); perr == nil {
 				// The replica knows the leader: go straight there.
 				target = id

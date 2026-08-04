@@ -5,12 +5,10 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
-	"strings"
 	"time"
 
-	"github.com/dgraph-io/badger/v4"
 	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/s3db"
+	"github.com/mulgadc/predastore/internal/state"
 )
 
 // Compile-time check that *Backend satisfies backend.Backend.
@@ -65,7 +63,7 @@ func (b *Backend) CreateBucket(ctx context.Context, req *backend.CreateBucketReq
 	}
 
 	// Store in s3db
-	if err := b.globalState.Set(TableBuckets, []byte(req.Bucket), buf.Bytes()); err != nil {
+	if err := b.globalState.Put(TableBuckets, req.Bucket, buf.Bytes()); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, "failed to store bucket: "+err.Error(), 500)
 	}
 
@@ -94,23 +92,19 @@ func (b *Backend) DeleteBucket(ctx context.Context, req *backend.DeleteBucketReq
 		return backend.ErrAccessDeniedError.WithResource(req.Bucket)
 	}
 
-	// Check if bucket is empty (scan for any objects with this bucket prefix)
+	// Check if bucket is empty; one object is enough to reject the delete.
 	arnPrefix := arnObjectPrefix + req.Bucket + "/"
-	hasObjects := false
-	err = b.globalState.Scan(TableObjects, []byte(arnPrefix), func(key, value []byte) error {
-		hasObjects = true
-		return nil // Stop scanning after finding first object
-	})
+	objects, err := b.globalState.Scan(TableObjects, arnPrefix, 1)
 	if err != nil {
 		return backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 
-	if hasObjects {
+	if len(objects) > 0 {
 		return backend.ErrBucketNotEmptyError.WithResource(req.Bucket)
 	}
 
-	// Delete bucket from s3db
-	if err := b.globalState.Delete(TableBuckets, []byte(req.Bucket)); err != nil {
+	// Delete bucket from global state
+	if err := b.globalState.Delete(TableBuckets, req.Bucket); err != nil {
 		return backend.NewS3Error(backend.ErrInternalError, "failed to delete bucket: "+err.Error(), 500)
 	}
 
@@ -132,11 +126,10 @@ func (b *Backend) HeadBucket(ctx context.Context, req *backend.HeadBucketRequest
 		}
 	}
 
-	// Then check s3db for dynamically created buckets
-	data, err := b.globalState.Get(TableBuckets, []byte(req.Bucket))
+	// Then check global state for dynamically created buckets
+	data, err := b.globalState.Get(TableBuckets, req.Bucket)
 	if err != nil {
-		// Check if it's a "not found" type error
-		if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "KeyNotFound") {
+		if errors.Is(err, state.ErrNotFound) {
 			return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
 		}
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
@@ -162,15 +155,15 @@ func (b *Backend) HeadBucket(ctx context.Context, req *backend.HeadBucketRequest
 
 // bucketExists checks if a bucket exists and returns the owner ID.
 func (b *Backend) bucketExists(bucket string) (exists bool, ownerID string, err error) {
-	// Check s3db first (authoritative source with owner info)
-	data, err := b.globalState.Get(TableBuckets, []byte(bucket))
+	// Check global state first (authoritative source with owner info)
+	data, err := b.globalState.Get(TableBuckets, bucket)
 	if err != nil {
-		if !strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "KeyNotFound") {
+		if !errors.Is(err, state.ErrNotFound) {
 			return false, "", err
 		}
-		// Not found in s3db, check local config as fallback
+		// Not found in global state, check local config as fallback
 	} else if len(data) > 0 {
-		// Found in s3db - decode to get owner
+		// Found in global state - decode to get owner
 		var metadata backend.BucketMetadata
 		r := bytes.NewReader(data)
 		dec := gob.NewDecoder(r)
@@ -211,15 +204,15 @@ func (b *Backend) removeBucketFromCache(name string) {
 	b.buckets = newBuckets
 }
 
-// GetBucketMetadata retrieves bucket metadata from s3db.
+// GetBucketMetadata retrieves bucket metadata from global state.
 func (b *Backend) GetBucketMetadata(bucket string) (*backend.BucketMetadata, error) {
-	data, err := b.globalState.Get(TableBuckets, []byte(bucket))
+	data, err := b.globalState.Get(TableBuckets, bucket)
 	if err != nil {
-		// Typed sentinels rather than substring matching — a transient backend
+		// A typed sentinel rather than substring matching — a transient backend
 		// error whose message coincidentally contained "not found" would
 		// otherwise be silently converted into NoSuchBucket and short-circuit
 		// the bucket-ownership check via the config fallback.
-		if errors.Is(err, badger.ErrKeyNotFound) || errors.Is(err, s3db.ErrKeyNotFound) {
+		if errors.Is(err, state.ErrNotFound) {
 			return nil, backend.ErrNoSuchBucketError.WithResource(bucket)
 		}
 		return nil, err

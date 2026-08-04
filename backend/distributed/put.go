@@ -114,14 +114,14 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	}
 
 	// Store object hash -> shard metadata (for retrieval)
-	if err := b.globalState.Set(TableObjects, objectHash[:], buf.Bytes()); err != nil {
+	if err := b.globalState.Put(TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 
 	// Store ARN key -> object hash (for listing)
 	// Format: arn:aws:s3:::<bucket>/<key>
-	arnKey := []byte(arnObjectPrefixPut + req.Bucket + "/" + req.Key)
-	if err := b.globalState.Set(TableObjects, arnKey, objectHash[:]); err != nil {
+	arnKey := arnObjectPrefixPut + req.Bucket + "/" + req.Key
+	if err := b.globalState.Put(TableObjects, arnKey, objectHash[:]); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 
@@ -138,7 +138,7 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 	objectToShardNodes := ObjectToShardNodes{}
 
 	// Check if existing
-	data, err := b.globalState.Get(TableObjects, objectHash[:])
+	data, err := b.globalState.Get(TableObjects, string(objectHash[:]))
 
 	if err != nil {
 		// Key not found or other error - treat as new object
@@ -194,8 +194,7 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 		return err
 	}
 
-	// Store object metadata using GlobalState
-	return b.globalState.Set(TableObjects, objectHash[:], buf.Bytes())
+	return b.globalState.Put(TableObjects, string(objectHash[:]), buf.Bytes())
 }
 
 // GetFromPath retrieves an object and writes to the provided writer (used for testing).

@@ -153,8 +153,8 @@ func TestStateServiceOverRPC(t *testing.T) {
 		t.Fatalf("Get = %q, want v3", v)
 	}
 
-	if _, err := cli.Get("objects", "missing"); !errors.Is(err, s3db.ErrKeyNotFound) {
-		t.Fatalf("Get missing: got %v, want ErrKeyNotFound", err)
+	if _, err := cli.Get("objects", "missing"); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("Get missing: got %v, want ErrNotFound", err)
 	}
 
 	items, err := cli.Scan("objects", "obj/", 3)
@@ -173,7 +173,7 @@ func TestStateServiceOverRPC(t *testing.T) {
 	deadline := time.Now().Add(15 * time.Second)
 	for {
 		_, err := cli.Get("objects", "obj/0")
-		if errors.Is(err, s3db.ErrKeyNotFound) {
+		if errors.Is(err, state.ErrNotFound) {
 			break
 		}
 		if time.Now().After(deadline) {

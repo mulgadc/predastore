@@ -23,19 +23,23 @@ const (
 func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.ListBucketsResponse, error) {
 	bucketMap := make(map[string]backend.BucketInfo)
 
-	// Scan s3db for dynamically created buckets
-	err := b.globalState.Scan(TableBuckets, nil, func(key, value []byte) error {
+	// Scan global state for dynamically created buckets
+	items, err := b.globalState.Scan(TableBuckets, "", 0)
+	if err != nil {
+		return nil, backend.NewS3Error(backend.ErrInternalError, "failed to list buckets: "+err.Error(), 500)
+	}
+
+	for _, item := range items {
 		var metadata backend.BucketMetadata
-		r := bytes.NewReader(value)
-		dec := gob.NewDecoder(r)
+		dec := gob.NewDecoder(bytes.NewReader(item.Value))
 		if err := dec.Decode(&metadata); err != nil {
-			slog.Warn("Skipping corrupt bucket entry during scan", "key", string(key), "error", err)
-			return nil
+			slog.Warn("Skipping corrupt bucket entry during scan", "key", item.Key, "error", err)
+			continue
 		}
 
 		// Filter by account
 		if accountID != "" && metadata.AccountID != accountID {
-			return nil
+			continue
 		}
 
 		bucketMap[metadata.Name] = backend.BucketInfo{
@@ -43,12 +47,6 @@ func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.L
 			Region:       metadata.Region,
 			CreationDate: metadata.CreationDate,
 		}
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "failed to list buckets: "+err.Error(), 500)
 	}
 
 	// Convert to slice
@@ -96,16 +94,19 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 	commonPrefixes := make([]string, 0)
 	prefixSet := make(map[string]bool) // To dedupe common prefixes
 
-	err = b.globalState.Scan(TableObjects, []byte(scanPrefix), func(key, value []byte) error {
-		keyStr := string(key)
+	items, err := b.globalState.Scan(TableObjects, scanPrefix, 0)
+	if err != nil {
+		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+	}
 
+	for _, item := range items {
 		// Extract the object key from ARN
 		// arn:aws:s3:::<bucket>/<key> -> <key>
 		arnBucketPrefix := arnObjectPrefix + req.Bucket + "/"
-		if !strings.HasPrefix(keyStr, arnBucketPrefix) {
-			return nil
+		if !strings.HasPrefix(item.Key, arnBucketPrefix) {
+			continue
 		}
-		objectKey := strings.TrimPrefix(keyStr, arnBucketPrefix)
+		objectKey := strings.TrimPrefix(item.Key, arnBucketPrefix)
 
 		// Handle delimiter for common prefixes (directory-like listing)
 		if req.Delimiter != "" {
@@ -122,20 +123,19 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 					prefixSet[prefix] = true
 					commonPrefixes = append(commonPrefixes, prefix)
 				}
-				return nil // Don't add as content
+				continue // Don't add as content
 			}
 		}
 
 		// Look up object metadata using the objectHash (value) to get size
 		var objectSize int64
 
-		if len(value) == 32 {
+		if len(item.Value) == 32 {
 			// value is the objectHash, look up the full metadata
-			metaData, err := b.globalState.Get(TableObjects, value)
+			metaData, err := b.globalState.Get(TableObjects, string(item.Value))
 			if err == nil && len(metaData) > 0 {
 				var objMeta ObjectToShardNodes
-				r := bytes.NewReader(metaData)
-				dec := gob.NewDecoder(r)
+				dec := gob.NewDecoder(bytes.NewReader(metaData))
 				if err := dec.Decode(&objMeta); err == nil {
 					objectSize = objMeta.Size
 				}
@@ -149,12 +149,6 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 			Size:         objectSize,
 			StorageClass: "STANDARD",
 		})
-
-		return nil
-	})
-
-	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 
 	maxKeys := req.MaxKeys

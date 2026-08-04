@@ -47,7 +47,7 @@ func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectReq
 	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
 
 	// Check if object exists and get shard node info
-	data, err := b.globalState.Get(TableObjects, objectHash[:])
+	data, err := b.globalState.Get(TableObjects, string(objectHash[:]))
 	if err != nil {
 		return backend.ErrNoSuchKeyError.WithResource(req.Key)
 	}
@@ -77,18 +77,18 @@ func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectReq
 
 	var deletedBuf bytes.Buffer
 	if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err == nil {
-		deletedKey := []byte(deletedObjectPrefix + req.Bucket + "/" + req.Key)
-		_ = b.globalState.Set(TableObjects, deletedKey, deletedBuf.Bytes()) // Best effort
+		deletedKey := deletedObjectPrefix + req.Bucket + "/" + req.Key
+		_ = b.globalState.Put(TableObjects, deletedKey, deletedBuf.Bytes()) // Best effort
 	}
 
 	// Delete the object hash metadata from global state
-	err = b.globalState.Delete(TableObjects, objectHash[:])
+	err = b.globalState.Delete(TableObjects, string(objectHash[:]))
 	if err != nil {
 		return backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 
 	// Delete the ARN key from global state (for listing)
-	arnKey := []byte(arnObjectPrefixDel + req.Bucket + "/" + req.Key)
+	arnKey := arnObjectPrefixDel + req.Bucket + "/" + req.Key
 	_ = b.globalState.Delete(TableObjects, arnKey) // Best effort
 
 	return nil
