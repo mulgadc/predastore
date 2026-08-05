@@ -22,63 +22,41 @@
 
 # Predastore: Distributed, S3-compatible object storage
 
-Predastore developed by [Mulga Defense Corporation](https://mulgadc.com/) is a distributed, S3-compatible object storage system with Reed-Solomon erasure coding, built for bare-metal, edge, and on-premise deployments. It is the storage backend for [Spinifex](https://github.com/mulgadc/spinifex) — an AWS-compatible infrastructure stack for private clouds.
+Predastore is a distributed object-storage system implementing commonly used
+Amazon S3 APIs. It combines Raft metadata, Reed–Solomon erasure coding, QUIC
+transport and append-only storage segments.
 
-Predastore runs as a distributed cluster with erasure-coded shards, Raft-consensus metadata, and QUIC-based inter-node transport. For development, all nodes run in a single process on loopback.
-
-## Architecture
-
-<p align="center">
-  <img src=".github/assets/platform.svg" alt="Predastore: S3 applications and tooling on top, authenticated S3 services backed by Raft metadata and erasure-coded storage, distributed across encrypted storage nodes over QUIC." width="900">
-</p>
-
-**S3D** serves the S3 HTTP API with AWS Signature V4 authentication. The **s3db cluster** provides strongly consistent metadata via Raft (HashiCorp Raft + BoltDB + BadgerDB). **QUIC shard nodes** store erasure-coded object data in append-only segment files, with each shard occupying a contiguous extent indexed by a per-node BadgerDB. Inter-node communication uses persistent QUIC connections with pooled, multiplexed streams — eliminating per-request TLS handshakes.
-
-See [DESIGN.md](docs/DESIGN.md) for the full architecture reference, including the data model, QUIC protocol format, Raft consensus details, hash ring placement, and failure handling.
-
-## Key Design Decisions
-
-- **Reed-Solomon erasure coding** — objects are split into data + parity shards (configurable, e.g. RS(3,2) tolerates loss of any 2 nodes). No full replication overhead.
-- **Raft consensus for metadata** — bucket and object metadata is strongly consistent across the cluster. Reads can go to any node; writes go through the leader.
-- **QUIC transport** — node-to-node shard I/O uses QUIC over UDP with connection pooling. A single long-lived connection per node pair carries multiplexed streams, so shard writes cost only a stream ID allocation, not a TLS handshake.
-- **Append-only segments** — each shard node writes data to large append-only segment files. A shard occupies a contiguous extent within one segment, pre-allocated to enable lock-free writing to disk. A per-node BadgerDB index maps shard keys to extents.
-- **AES-256-GCM encryption at rest** — every 8 KiB fragment is sealed under a per-fragment GCM nonce with AAD binding it to its `(objectHash, shardIndex, shardNum, fragNum)` position, so tamper, replay, and cross-shard splice attempts fail to authenticate. GCM is the sole on-disk integrity authority (no separate CRC). A 32-byte cluster master key is loaded from a `0600` file path supplied via `-encryption-key-file` / `ENCRYPTION_KEY_FILE`.
-- **Consistent hash ring** — shard placement is deterministic via a hash ring with virtual nodes. Adding nodes bumps a ring epoch; old objects stay on the old epoch, new writes use the new one.
-- **Single binary** — `./bin/s3d` runs one cluster node (S3 API server + Raft database + QUIC shard node). A cluster is N `s3d` processes pointed at the same config; `./scripts/start.sh` launches all of them locally on loopback aliases for development.
-
-## S3 API Compatibility
-
-Predastore implements key S3 operations compatible with AWS CLI, SDKs, and existing S3 tools:
-
-| Category | Operations |
-|----------|------------|
-| **Buckets** | CreateBucket, DeleteBucket, ListBuckets, HeadBucket |
-| **Objects** | PutObject, GetObject, DeleteObject, HeadObject, ListObjects/V2 |
-| **Multipart** | InitiateMultipartUpload, UploadPart, CompleteMultipartUpload |
-| **Auth** | AWS Signature V4 |
+Predastore can run independently and provides the default object-storage
+backend for Spinifex.
 
 ## Quick Start
 
 ### Build
 
 ```bash
-make build              # builds ./bin/s3d (also generates dev TLS certs)
+make build
 ```
 
-### Run a Dev Cluster
-
-The `./scripts/` directory contains helpers for running a multi-node cluster locally on loopback IP aliases.
+### Run a Development Cluster
 
 ```bash
-./scripts/start.sh 3node        # launch a 3-node cluster
-./scripts/start.sh -w 5node     # launch a 5-node cluster, wait until ready
-./scripts/stop.sh               # stop all running clusters
-./scripts/clean.sh              # stop and wipe cluster data
-./scripts/bench.sh 3node        # run warp benchmark against a cluster
-./scripts/bench.sh disk         # run raw-disk fio benchmark
+./scripts/start.sh 3node
 ```
 
-Cluster runtime data (logs, PID files, segment files, BadgerDB indexes) lives under `$PREDA_DIR` (default `/tmp/predastore/<clustername>/`). The start script sets up loopback IP aliases (requires `sudo`) and generates TLS certs on first run.
+Other supplied configurations can be started with:
+
+```bash
+./scripts/start.sh -w 5node
+```
+
+Stop, reset or benchmark the cluster with:
+
+```bash
+./scripts/stop.sh
+./scripts/clean.sh
+./scripts/bench.sh 3node
+./scripts/bench.sh disk
+```
 
 ### Run a Single Node
 
@@ -98,38 +76,14 @@ Cluster runtime data (logs, PID files, segment files, BadgerDB indexes) lives un
 
 The encryption key file must be exactly 32 raw bytes (no base64, no header) with mode `0600`. Generate one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key must be supplied to every node in a cluster; rotating it is not currently supported (see Roadmap → envelope encryption).
 
-### Configuration
+## S3 API support
 
-Cluster configurations live under `config/` as TOML files, one per topology:
-
-```
-config/
-  3node.toml    # 3 db + 3 storage nodes
-  5node.toml    # 5 db + 5 storage nodes
-  7node.toml    # 7 db + 7 storage nodes
-```
-
-Each config defines `[[db]]` and `[[storage]]` sections specifying node IDs, hosts, ports, and Reed-Solomon parameters.
-
-TLS certificates are generated on first build:
-
-```bash
-make certs              # Generate certs/server.{pem,key}
-```
-
-### Standalone TLS Trust
-
-When predastore is deployed by Spinifex, the cluster CA is installed into the host trust store automatically as part of node bootstrap — no manual action is required. Standalone operators must install the cluster CA into the host trust store before launching `s3d`, otherwise nodes cannot dial each other:
-
-```bash
-# Debian / Ubuntu
-sudo cp cluster-ca.pem /usr/local/share/ca-certificates/predastore-cluster-ca.crt
-sudo update-ca-certificates
-
-# RHEL / Fedora / Amazon Linux
-sudo cp cluster-ca.pem /etc/pki/ca-trust/source/anchors/predastore-cluster-ca.pem
-sudo update-ca-trust
-```
+| Area | Operations |
+| --- | --- |
+| Buckets | `CreateBucket`, `DeleteBucket`, `ListBuckets`, `HeadBucket` |
+| Objects | `PutObject`, `GetObject`, `DeleteObject`, `HeadObject`, `ListObjects`, `ListObjectsV2` |
+| Multipart | `InitiateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload` |
+| Authentication | AWS Signature Version 4 |
 
 ### AWS CLI Examples
 
@@ -145,6 +99,61 @@ aws --endpoint-url https://10.11.12.1:8443/ s3 ls s3://my-bucket/
 
 # Download a file
 aws --endpoint-url https://10.11.12.1:8443/ s3 cp s3://my-bucket/file.txt ./downloaded.txt
+```
+
+## Architecture
+
+<p align="center">
+  <img src=".github/assets/platform.svg" alt="Predastore: S3 applications and tooling on top, authenticated S3 services backed by Raft metadata and erasure-coded storage, distributed across encrypted storage nodes over QUIC." width="900">
+</p>
+
+Predastore consists of three primary layers:
+
+- `s3d` exposes the S3 HTTP interface and Signature Version 4 authentication.
+- `s3db` maintains strongly consistent metadata with HashiCorp Raft and local
+  embedded databases.
+- Storage nodes exchange erasure-coded shards over QUIC and store them in
+  append-only segment files.
+
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the complete design.
+
+## Capabilities
+
+- Reed–Solomon erasure coding
+- Raft-based metadata
+- QUIC storage transport
+- Append-only segment storage
+- AES-256-GCM encryption at rest
+- Consistent-hash placement
+- Multipart uploads
+- Single-binary deployment
+
+## Configuration
+
+Example cluster configurations are supplied in:
+
+- `config/3node.toml`
+- `config/5node.toml`
+- `config/7node.toml`
+
+Generate local development certificates with:
+
+```bash
+make certs
+```
+
+### Standalone TLS Trust
+
+When predastore is deployed by Spinifex, the cluster CA is installed into the host trust store automatically as part of node bootstrap — no manual action is required. Standalone operators must install the cluster CA into the host trust store before launching `s3d`, otherwise nodes cannot dial each other:
+
+```bash
+# Debian / Ubuntu
+sudo cp cluster-ca.pem /usr/local/share/ca-certificates/predastore-cluster-ca.crt
+sudo update-ca-certificates
+
+# RHEL / Fedora / Amazon Linux
+sudo cp cluster-ca.pem /etc/pki/ca-trust/source/anchors/predastore-cluster-ca.pem
+sudo update-ca-trust
 ```
 
 ## Storage Backend
@@ -168,7 +177,9 @@ See [DESIGN.md](docs/DESIGN.md) for full configuration reference, including data
 
 ## Spinifex Integration
 
-Predastore is the default S3 storage provider for [Spinifex](https://github.com/mulgadc/spinifex). When running as part of the Spinifex stack, Predastore integrates via NATS messaging and provides storage for:
+Predastore is the default S3 storage provider for [Spinifex](https://github.com/mulgadc/spinifex). It can
+store user-created S3 objects, EC2 machine images, EBS snapshot data written
+through Viperblock, and service artefacts.
 
 - **EC2 AMI images** — machine images for VM launches
 - **EBS volume snapshots** — via [Viperblock](https://github.com/mulgadc/viperblock), which uses Predastore as its S3-compatible backend
@@ -220,6 +231,14 @@ sudo sysctl -w net.core.wmem_max=7500000
 - [ ] Bucket versioning
 - [ ] Lifecycle policies
 
+Roadmap items describe direction and are not commitments to a release date.
+
+## Trademarks
+
+Amazon Web Services, AWS and Amazon S3 are trademarks of Amazon.com, Inc. or
+its affiliates. Predastore is not affiliated with or endorsed by Amazon Web
+Services.
+
 ## License
 
-Predastore is licensed under the GNU Affero General Public License v3.0 (AGPLv3). See [LICENSE](LICENSE) for the full text.
+Predastore is licensed under the [GNU Affero General Public License v3.0 (AGPLv3)](LICENSE) license.
