@@ -9,12 +9,13 @@
 </p>
 
 <p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#s3-api-support">S3 API support</a> ·
   <a href="#architecture">Architecture</a> ·
-  <a href="#key-design-decisions">Key Design Decisions</a> ·
-  <a href="#s3-api-compatibility">S3 API Compatibility</a> ·
-  <a href="#quickstart">Quickstart</a> ·
-  <a href="#storage-backend">Storage Backend</a> ·
-  <a href="#spinifex-integration">Spinifex Integration</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#spinifex-integration">Spinifex integration</a> ·
+  <a href="#development">Development</a> ·
+  <a href="#roadmap">Roadmap</a> ·
   <a href="https://docs.mulgadc.com">Docs</a>
 </p>
 
