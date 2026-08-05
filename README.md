@@ -28,27 +28,9 @@ Predastore runs as a distributed cluster with erasure-coded shards, Raft-consens
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     S3 Client (AWS CLI/SDK)                     │
-└──────────────────────────────┬──────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Predastore S3D (HTTP/TLS)                     │
-│         Auth (SigV4)  ·  Routing  ·  Backend Abstraction        │
-└────────┬───────────────────────────────────┬────────────────────┘
-         │                                   │
-         ▼                                   ▼
-┌─────────────────────┐       ┌──────────────────────────────────┐
-│  s3db Cluster       │       │  QUIC Shard Nodes                │
-│  (Raft Consensus)   │       │  ┌────────┐┌────────┐┌────────┐  │
-│                     │       │  │ Node 0 ││ Node 1 ││ Node 2 │  │
-│  BoltDB (Raft log)  │       │  │ Store  ││ Store  ││ Store  │  │
-│  BadgerDB (FSM)     │       │  │(seg+ix)││(seg+ix)││(seg+ix)│  │
-└─────────────────────┘       │  └────────┘└────────┘└────────┘  │
-                              └──────────────────────────────────┘
-```
+<p align="center">
+  <img src=".github/assets/platform.svg" alt="Predastore: S3 applications and tooling on top, authenticated S3 services backed by Raft metadata and erasure-coded storage, distributed across encrypted storage nodes over QUIC." width="900">
+</p>
 
 **S3D** serves the S3 HTTP API with AWS Signature V4 authentication. The **s3db cluster** provides strongly consistent metadata via Raft (HashiCorp Raft + BoltDB + BadgerDB). **QUIC shard nodes** store erasure-coded object data in append-only segment files, with each shard occupying a contiguous extent indexed by a per-node BadgerDB. Inter-node communication uses persistent QUIC connections with pooled, multiplexed streams — eliminating per-request TLS handshakes.
 
