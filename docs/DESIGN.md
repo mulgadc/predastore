@@ -71,10 +71,7 @@ Predastore is a distributed, S3-compatible, erasure-coded object store designed 
 
 See `s3/tests/config/cluster.toml` for a complete example configuration.
 
-`quicd` (the standalone shard-node binary) accepts the same
-`-encryption-key-file` / `ENCRYPTION_KEY_FILE` and refuses to start without
-it. Every node in a cluster MUST be given the same master key file —
-fragments sealed under one master cannot be opened under another.
+`quicd` (the standalone shard-node binary) accepts the same `-encryption-key-file` / `ENCRYPTION_KEY_FILE` and refuses to start without it. Every node in a cluster MUST be given the same master key file — fragments sealed under one master cannot be opened under another.
 
 ---
 
@@ -143,10 +140,7 @@ Object (arbitrary size, RS-encoded as a whole)
       └── Fragments (fixed 8 KB payload + 32 B header, stored in segment files)
 ```
 
-An object is Reed-Solomon encoded end-to-end into `K` data shards and `M` parity shards
-without any intermediate chunking. Each shard is streamed to one node, where it is
-stored as a contiguous **extent** of fixed-size fragments inside an append-only
-segment file.
+An object is Reed-Solomon encoded end-to-end into `K` data shards and `M` parity shards without any intermediate chunking. Each shard is streamed to one node, where it is stored as a contiguous **extent** of fixed-size fragments inside an append-only segment file.
 
 ### Size Reference
 
@@ -159,10 +153,7 @@ segment file.
 | Shard | `⌈object_size / K⌉` | Per-node RS slice, variable size; occupies a contiguous extent |
 | Segment file | up to 4 GiB | Append-only container; rolls when full. Holds extents from multiple shards |
 
-Each shard is allocated a contiguous extent of fragments within a single segment.
-Multiple shards may share a segment but their extents are disjoint and never
-interleave. When a segment fills, its `flagFull` bit is set in the header and the
-store rolls forward to the next segment number.
+Each shard is allocated a contiguous extent of fragments within a single segment. Multiple shards may share a segment but their extents are disjoint and never interleave. When a segment fills, its `flagFull` bit is set in the header and the store rolls forward to the next segment number.
 
 ---
 
@@ -409,9 +400,7 @@ The s3db service provides a REST API with AWS Signature V4 authentication:
 
 # 6. Local Shard Storage
 
-Each QUIC shard node stores data locally in append-only segment files and maintains
-its own Badger index mapping shard identifiers to the on-disk extent that holds
-the shard's fragments. The implementation lives in the `store/` package.
+Each QUIC shard node stores data locally in append-only segment files and maintains its own Badger index mapping shard identifiers to the on-disk extent that holds the shard's fragments. The implementation lives in the `store/` package.
 
 ## Local Badger (Per-QUIC-Node)
 
@@ -428,14 +417,11 @@ The extent record is:
 | `PSize` | 8 B | Physical size on disk (fragment-aligned, includes per-fragment headers) |
 | `LSize` | 8 B | Logical (user) size of the shard |
 
-**Commit rule**: a Badger entry for a shard exists if and only if all of that
-shard's fragments are fsync-durable on disk. The absence of a Badger entry means
-the shard is unreadable, regardless of what bytes happen to be on disk.
+**Commit rule**: a Badger entry for a shard exists if and only if all of that shard's fragments are fsync-durable on disk. The absence of a Badger entry means the shard is unreadable, regardless of what bytes happen to be on disk.
 
 ## Segment File On-Disk Layout
 
-Segments are append-only files containing a 14 B header followed by a sequence of
-fixed-size fragments:
+Segments are append-only files containing a 14 B header followed by a sequence of fixed-size fragments:
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -455,20 +441,11 @@ fixed-size fragments:
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Every fragment on disk is exactly `fragHeaderSize + fragBodySize + fragTagSize
-= 32 + 8192 + 16 = 8240` bytes. Bodies are zero-padded to `fragBodySize`
-before encryption; GCM is a stream cipher so the ciphertext is the same length
-as the plaintext (8192 B), and the authentication tag follows.
+Every fragment on disk is exactly `fragHeaderSize + fragBodySize + fragTagSize = 32 + 8192 + 16 = 8240` bytes. Bodies are zero-padded to `fragBodySize` before encryption; GCM is a stream cipher so the ciphertext is the same length as the plaintext (8192 B), and the authentication tag follows.
 
-The magic `'S','3','S','E'` (segment version `1`) identifies the
-encryption-at-rest format. The previous pre-encryption magic (`'S','3','S','F'`)
-is rejected outright by `openSegment` — there is no in-place migration, the
-operator must start with a fresh data dir.
+The magic `'S','3','S','E'` (segment version `1`) identifies the encryption-at-rest format. The previous pre-encryption magic (`'S','3','S','F'`) is rejected outright by `openSegment` — there is no in-place migration, the operator must start with a fresh data dir.
 
-A segment grows up to `maxSegSize` (4 GiB). When full, `flagFull` is set in the
-header and the store rolls forward to a new segment number. Within a segment,
-each shard occupies a contiguous extent of fragments; extents from different
-shards are disjoint.
+A segment grows up to `maxSegSize` (4 GiB). When full, `flagFull` is set in the header and the store rolls forward to a new segment number. Within a segment, each shard occupies a contiguous extent of fragments; extents from different shards are disjoint.
 
 ### Fragment Header (32 B)
 
@@ -493,17 +470,11 @@ shards are disjoint.
 | `Flags` | 4 B | Bit flags; `flagEndOfShard` marks the final fragment of a shard |
 | `Reserved` | 4 B | Formerly CRC32 — see "Encryption-at-Rest" below; not reclaimed for a different field while the current segment magic is in use |
 
-The fragment header is plaintext on disk — readers need `FragNum` and
-`ShardNum` *before* decryption to reconstruct the AAD and nonce. The header
-fields are protected by GCM authentication, not by encryption: any tamper
-that changes `FragNum`, `ShardNum`, or `Size` makes the reconstructed AAD
-differ from what was bound at seal time and the tag check fails.
+The fragment header is plaintext on disk — readers need `FragNum` and `ShardNum` *before* decryption to reconstruct the AAD and nonce. The header fields are protected by GCM authentication, not by encryption: any tamper that changes `FragNum`, `ShardNum`, or `Size` makes the reconstructed AAD differ from what was bound at seal time and the tag check fails.
 
 ### Encryption-at-Rest
 
-Every fragment is sealed independently under AES-256-GCM. The 12-byte GCM
-nonce and 52-byte AAD are deterministic and reconstructable at read time
-from the on-disk header + per-data-dir state:
+Every fragment is sealed independently under AES-256-GCM. The 12-byte GCM nonce and 52-byte AAD are deterministic and reconstructable at read time from the on-disk header + per-data-dir state:
 
 ```
 nonce[0:8]   = BE(fragNum)    // from fragment header
@@ -517,67 +488,38 @@ aad[44:52]   = BE(fragNum)    // from fragment header
 
 Properties:
 
-- **Confidentiality.** Disk-level access yields only ciphertext + tag;
-  plaintext is never written to disk.
-- **Authenticated integrity.** GCM is the sole integrity authority — there is
-  no separate CRC. A failed tag check returns `ErrIntegrity`; "disk
-  corruption", "tamper", and "wrong master key" all surface as one error.
-- **Position binding.** AAD binds each fragment to its
-  `(objectHash, shardIndex, shardNum, fragNum)` slot, so swapping fragments
-  between shards or rewriting the on-disk header to claim a different slot
-  fails the tag.
-- **Cross-data-dir defence.** `storeID` enters the nonce, not the AAD —
-  splicing a fragment from data dir A into data dir B's segment yields a
-  different nonce at read time and the tag fails.
-- **Mandatory.** `store.Open` errors without `WithAEAD`; the operator-layer
-  daemons (`s3d`, `quicd`) refuse to start without `-encryption-key-file`.
-  There is no unencrypted code path.
+- **Confidentiality.** Disk-level access yields only ciphertext + tag; plaintext is never written to disk.
+- **Authenticated integrity.** GCM is the sole integrity authority — there is no separate CRC. A failed tag check returns `ErrIntegrity`; "disk corruption", "tamper", and "wrong master key" all surface as one error.
+- **Position binding.** AAD binds each fragment to its `(objectHash, shardIndex, shardNum, fragNum)` slot, so swapping fragments between shards or rewriting the on-disk header to claim a different slot fails the tag.
+- **Cross-data-dir defence.** `storeID` enters the nonce, not the AAD — splicing a fragment from data dir A into data dir B's segment yields a different nonce at read time and the tag fails.
+- **Mandatory.** `store.Open` errors without `WithAEAD`; the operator-layer daemons (`s3d`, `quicd`) refuse to start without `-encryption-key-file`. There is no unencrypted code path.
 
-The master key is loaded once at daemon startup by the `internal/keyfile`
-package (raw 32 bytes, mode `0600` — group/other-readable rejected outright),
-turned into a `cipher.AEAD`, and handed to `store.Open` via `WithAEAD`. The
-store never sees the raw key bytes.
+The master key is loaded once at daemon startup by the `internal/keyfile` package (raw 32 bytes, mode `0600` — group/other-readable rejected outright), turned into a `cipher.AEAD`, and handed to `store.Open` via `WithAEAD`. The store never sees the raw key bytes.
 
 ## Extent Reservation
 
-A shard of logical size `S` requires `⌈S / fragBodySize⌉` fragments occupying a
-contiguous extent of `n × totalFragSize` bytes within a segment.
+A shard of logical size `S` requires `⌈S / fragBodySize⌉` fragments occupying a contiguous extent of `n × totalFragSize` bytes within a segment.
 
 **Reservation protocol** (executed under a short `store.mutex` critical section):
 
 1. Compute the fragment count from the body length on the QUIC request header.
-2. Get the current segment. If full, mark it via `markFull()` and roll to the
-   next segment number (up to 100 attempts).
-3. `Truncate(off + extentSize)` the segment file to reserve the extent up front.
-   Pre-allocating ensures every subsequent `WriteAt` lands within file bounds
-   without extending the file concurrently.
+2. Get the current segment. If full, mark it via `markFull()` and roll to the next segment number (up to 100 attempts).
+3. `Truncate(off + extentSize)` the segment file to reserve the extent up front. Pre-allocating ensures every subsequent `WriteAt` lands within file bounds without extending the file concurrently.
 4. Increment the segment's atomic `refs` counter.
 5. Allocate monotonic `fragNum`/`shardNum` values for the writer.
-6. Build and return a `shardWriter` bound to the reserved extent. Release the
-   lock.
+6. Build and return a `shardWriter` bound to the reserved extent. Release the lock.
 
-The reservation is the only shared-state critical section on the write path. No
-data I/O happens while holding `store.mutex` — only the `Truncate` syscall, which
-extends the file's size metadata without writing any blocks.
+The reservation is the only shared-state critical section on the write path. No data I/O happens while holding `store.mutex` — only the `Truncate` syscall, which extends the file's size metadata without writing any blocks.
 
 ## Lock-Free Fragment Writes
 
-Once a reservation is issued, the writer goroutine owns a disjoint byte range
-within the segment file. Fragment offsets are deterministic:
+Once a reservation is issued, the writer goroutine owns a disjoint byte range within the segment file. Fragment offsets are deterministic:
 
 ```
 fileOffset(extent, frag) = extent.Off + frag * totalFragSize
 ```
 
-The writer assembles fragments (header + zero-padded body + GCM tag) into an
-in-memory window buffer, seals each body in place under the shared
-`cipher.AEAD`, and issues `(*os.File).WriteAt(buf, fileOffset)` for the whole
-window in one syscall. Multiple writer goroutines may issue concurrent
-`WriteAt` calls against the same segment file because their reserved extents
-are disjoint. POSIX `pwrite` guarantees atomicity for non-overlapping regions,
-and Go's `WriteAt` is explicitly safe for concurrent use. The AEAD itself is
-constructed once at `Store.Open` and shared — the stdlib's GCM is safe for
-concurrent `Seal` / `Open`.
+The writer assembles fragments (header + zero-padded body + GCM tag) into an in-memory window buffer, seals each body in place under the shared `cipher.AEAD`, and issues `(*os.File).WriteAt(buf, fileOffset)` for the whole window in one syscall. Multiple writer goroutines may issue concurrent `WriteAt` calls against the same segment file because their reserved extents are disjoint. POSIX `pwrite` guarantees atomicity for non-overlapping regions, and Go's `WriteAt` is explicitly safe for concurrent use. The AEAD itself is constructed once at `Store.Open` and shared — the stdlib's GCM is safe for concurrent `Seal` / `Open`.
 
 ## Commit Sequence
 
@@ -585,47 +527,33 @@ concurrent `Seal` / `Open`.
 
 1. **Final flush** of any remaining buffered fragments via `WriteAt`.
 2. **Fsync** the segment file.
-3. **Commit** by writing the Badger index entry: `<object hash || shard index>`
-   → encoded extent.
+3. **Commit** by writing the Badger index entry: `<object hash || shard index>` → encoded extent.
 4. **Decrement** the segment's `refs` counter atomically.
 
-Step 3 is the linearisation point for readers: a shard is readable if and only
-if its Badger entry is present. Steps 1-2 may produce fragments on disk that are
-never followed by a commit (aborted writes, crashes); those fragments are dead
-space reclaimable by the compactor.
+Step 3 is the linearisation point for readers: a shard is readable if and only if its Badger entry is present. Steps 1-2 may produce fragments on disk that are never followed by a commit (aborted writes, crashes); those fragments are dead space reclaimable by the compactor.
 
 ## Reference Counting & Segment Lifetime
 
-Each cached segment carries an atomic `refs` counter tracking the number of
-in-flight readers and writers that hold the segment open. The counter is:
+Each cached segment carries an atomic `refs` counter tracking the number of in-flight readers and writers that hold the segment open. The counter is:
 
-- Incremented under `store.mutex` when a reservation succeeds (writers) or when
-  `Lookup` returns a reader.
+- Incremented under `store.mutex` when a reservation succeeds (writers) or when `Lookup` returns a reader.
 - Decremented when the writer closes (after step 3 above) or the reader closes.
 
-`Store.Close()` waits for all `refs` to drain (spinning with `runtime.Gosched`)
-before closing segment file descriptors and the index.
+`Store.Close()` waits for all `refs` to drain (spinning with `runtime.Gosched`) before closing segment file descriptors and the index.
 
 ## Abort Semantics
 
-A reservation is aborted when the server-side writer fails mid-shard (network
-error, client disconnect, disk error). On abort:
+A reservation is aborted when the server-side writer fails mid-shard (network error, client disconnect, disk error). On abort:
 
 - The writer skips step 3 (Badger commit). The shard becomes unreadable.
-- The writer still performs step 4 (`refs` decrement) so the segment ref count
-  drains correctly.
-- Any fragments already written to disk sit as dead space until the compactor
-  reclaims them.
+- The writer still performs step 4 (`refs` decrement) so the segment ref count drains correctly.
+- Any fragments already written to disk sit as dead space until the compactor reclaims them.
 
-There is no distinct on-disk or in-Badger `failed` state. The absence of a
-Badger entry is the authoritative signal that a shard is unreadable; the read
-path treats "Badger miss" identically to "shard never existed" and falls back to
-parity.
+There is no distinct on-disk or in-Badger `failed` state. The absence of a Badger entry is the authoritative signal that a shard is unreadable; the read path treats "Badger miss" identically to "shard never existed" and falls back to parity.
 
 ## Persistent State
 
-The Store persists monotonic counters and the per-data-dir crypto identity
-in `state.json`:
+The Store persists monotonic counters and the per-data-dir crypto identity in `state.json`:
 
 | Field | Purpose |
 |-------|---------|
@@ -635,59 +563,27 @@ in `state.json`:
 | `fragNumHighWater` | Durably-reserved upper bound on `fragNum`; `Append` extends it (and fsyncs) only when an allocation would cross it |
 | `storeID` | 4 random bytes generated on first `Open` and held for the lifetime of the data dir; bound into the GCM nonce |
 
-`state.json` is written atomically and durably: write `state.json.tmp`,
-fsync the file, rename to `state.json`, fsync the parent directory. The
-first save (after `storeID` generation, before any fragment can be sealed)
-MUST complete before `Open` returns — otherwise a crash + restart could
-generate a different `storeID` and orphan data written under the old one.
+`state.json` is written atomically and durably: write `state.json.tmp`, fsync the file, rename to `state.json`, fsync the parent directory. The first save (after `storeID` generation, before any fragment can be sealed) MUST complete before `Open` returns — otherwise a crash + restart could generate a different `storeID` and orphan data written under the old one.
 
-`fragNum` uniqueness across crashes is preserved by **batched high-water
-reservation**, the standard pattern for crash-safe monotonic-counter
-allocators. On `Open`, the store advances `fragNumHighWater` by
-`fragNumReservation` (= 1 048 576) and fsyncs `state.json`. `Append` then
-hands out `fragNum` values freely below the high-water without touching
-disk; only an allocation that would cross the high-water triggers another
-fsync. On crash recovery, `Open` resumes `fragNum = fragNumHighWater` —
-the unflushed reservation window from before the crash is sacrificed to
-guarantee nonce uniqueness. At most `fragNumReservation` fragNums are
-"wasted" per crash; against the 2⁶⁴ budget this is negligible.
+`fragNum` uniqueness across crashes is preserved by **batched high-water reservation**, the standard pattern for crash-safe monotonic-counter allocators. On `Open`, the store advances `fragNumHighWater` by `fragNumReservation` (= 1 048 576) and fsyncs `state.json`. `Append` then hands out `fragNum` values freely below the high-water without touching disk; only an allocation that would cross the high-water triggers another fsync. On crash recovery, `Open` resumes `fragNum = fragNumHighWater` — the unflushed reservation window from before the crash is sacrificed to guarantee nonce uniqueness. At most `fragNumReservation` fragNums are "wasted" per crash; against the 2⁶⁴ budget this is negligible.
 
 ## Background Compaction & Cold Storage
 
-Closed, fully-written segments are candidates for background compaction. The
-compactor:
+Closed, fully-written segments are candidates for background compaction. The compactor:
 
-- Scans full segments for extents not referenced by any live Badger entry (dead
-  extents from aborted reservations or deleted shards).
-- Rewrites live extents into a new compacted segment, updates Badger entries to
-  point at the new location, and removes the old segment.
-- Optionally migrates aged, rarely-accessed shards to long-term cold storage. On
-  a subsequent GET, the shard is rehydrated from cold storage into a local
-  segment and served; rehydration may complete asynchronously with the GET
-  response.
+- Scans full segments for extents not referenced by any live Badger entry (dead extents from aborted reservations or deleted shards).
+- Rewrites live extents into a new compacted segment, updates Badger entries to point at the new location, and removes the old segment.
+- Optionally migrates aged, rarely-accessed shards to long-term cold storage. On a subsequent GET, the shard is rehydrated from cold storage into a local segment and served; rehydration may complete asynchronously with the GET response.
 
-Compaction is not on the critical write path and is not required for
-correctness of PUT or GET operations.
+Compaction is not on the critical write path and is not required for correctness of PUT or GET operations.
 
 ## Local KV Rebuild
 
-If the local Badger index is lost, fragments alone are **not** sufficient to
-rebuild it. The AAD that authenticates each fragment is keyed on
-`(objectHash, shardIndex)` — both of which live only in the lost Badger
-key, not on disk. A scan-and-decrypt rebuild would need an exhaustive search
-over every known shard-key candidate per fragment, which is intractable.
+If the local Badger index is lost, fragments alone are **not** sufficient to rebuild it. The AAD that authenticates each fragment is keyed on `(objectHash, shardIndex)` — both of which live only in the lost Badger key, not on disk. A scan-and-decrypt rebuild would need an exhaustive search over every known shard-key candidate per fragment, which is intractable.
 
-The supported recovery path for a lost local index is **read-repair from
-peers**: the hash ring identifies which shards this node should hold;
-missing shards are reconstructed by fetching `K` valid shards from peers
-and RS-decoding (see §11). The on-disk fragments from the lost index
-become dead space reclaimable by compaction.
+The supported recovery path for a lost local index is **read-repair from peers**: the hash ring identifies which shards this node should hold; missing shards are reconstructed by fetching `K` valid shards from peers and RS-decoding (see §11). The on-disk fragments from the lost index become dead space reclaimable by compaction.
 
-This is a deliberate trade-off introduced with the encryption-at-rest
-format: the per-fragment AAD binding that defends against fragment
-shuffling also makes "rebuild from segments alone" infeasible without
-storing the shard key in plaintext on disk, which would weaken the
-position-binding guarantee.
+This is a deliberate trade-off introduced with the encryption-at-rest format: the per-fragment AAD binding that defends against fragment shuffling also makes "rebuild from segments alone" infeasible without storing the shard key in plaintext on disk, which would weaken the position-binding guarantee.
 
 ---
 
@@ -708,21 +604,15 @@ Defines RS(3,2): 3 data shards, 2 parity shards. Can tolerate loss of any 2 node
 ### Encoding Workflow
 
 1. Read the complete object body into memory on the S3D process.
-2. RS encode the object as a whole into `K` data shards + `M` parity shards using
-   `reedsolomon.NewStream(K, M)` followed by `enc.Split(body, dataWriters, fileSize)`.
-   Each shard is approximately `⌈object_size / K⌉` bytes.
-3. Ship each shard to its assigned node over QUIC (see §9). The node stores the shard
-   as a contiguous extent of 8 KiB fragments inside a segment file, sealing each
-   fragment under AES-256-GCM (see §6).
+2. RS encode the object as a whole into `K` data shards + `M` parity shards using `reedsolomon.NewStream(K, M)` followed by `enc.Split(body, dataWriters, fileSize)`. Each shard is approximately `⌈object_size / K⌉` bytes.
+3. Ship each shard to its assigned node over QUIC (see §9). The node stores the shard as a contiguous extent of 8 KiB fragments inside a segment file, sealing each fragment under AES-256-GCM (see §6).
 
-No intermediate chunking or segmentation occurs. Compression is not performed on the
-write path; it is optionally applied to closed segments by the background compactor.
+No intermediate chunking or segmentation occurs. Compression is not performed on the write path; it is optionally applied to closed segments by the background compactor.
 
 ### Decoding
 
 - Request data shards in parallel from their assigned nodes.
-- If a data shard is missing (Badger miss) or any fragment fails GCM
-  authentication (`ErrIntegrity`), fetch a parity shard instead.
+- If a data shard is missing (Badger miss) or any fragment fails GCM authentication (`ErrIntegrity`), fetch a parity shard instead.
 - Once `K` valid shards have been collected, RS decode to reconstruct the object.
 - Fewer than `K` valid shards → GET fails.
 
@@ -997,18 +887,10 @@ s.Close()        // Close write side (sends FIN)
 
 ### Write-Path Concurrency Invariants
 
-- `store.mutex` is held only during reservation and is released before any data
-  I/O begins. It covers extent allocation, segment rotation, segment-file
-  `Truncate`, `fragNum`/`shardNum` assignment, and `state.json` persistence.
-- Fragment writes to disk are lock-free. Multiple concurrent writer goroutines
-  may issue `WriteAt` against the same segment file provided their reserved
-  extents are disjoint.
-- A shard is observable to readers only after its Badger entry has been
-  committed. Fragments fsynced to disk without a corresponding Badger put are
-  invisible to GET and are reclaimable by compaction.
-- Segment file descriptors are kept open in a per-store cache and are closed
-  only on `Store.Close()`, after waiting for all outstanding writer/reader
-  references to drain.
+- `store.mutex` is held only during reservation and is released before any data I/O begins. It covers extent allocation, segment rotation, segment-file `Truncate`, `fragNum`/`shardNum` assignment, and `state.json` persistence.
+- Fragment writes to disk are lock-free. Multiple concurrent writer goroutines may issue `WriteAt` against the same segment file provided their reserved extents are disjoint.
+- A shard is observable to readers only after its Badger entry has been committed. Fragments fsynced to disk without a corresponding Badger put are invisible to GET and are reclaimable by compaction.
+- Segment file descriptors are kept open in a per-store cache and are closed only on `Store.Close()`, after waiting for all outstanding writer/reader references to drain.
 
 ## GET Object
 
@@ -1096,9 +978,7 @@ s.Close()        // Close write side (sends FIN)
 
 ## Read-Path Failure Modes
 
-A GET fetches shards in parallel from their placement nodes. Each node either returns
-a valid shard or fails; failures degrade to parity fetches until `K` valid shards are
-collected.
+A GET fetches shards in parallel from their placement nodes. Each node either returns a valid shard or fails; failures degrade to parity fetches until `K` valid shards are collected.
 
 | Failure | Detection | Response |
 |---------|-----------|----------|
@@ -1107,26 +987,17 @@ collected.
 | Node timeout | QUIC request deadline exceeded | S3D fetches parity |
 | Fewer than `K` valid shards | Aggregate check after all fetches | GET returns 500/503 to the client |
 
-A shard that was written to disk but never committed to Badger is indistinguishable
-from one that was never attempted — both surface as "absent." The read path does not
-distinguish between them, and the commit invariant (§6) ensures readers cannot
-observe partial writes.
+A shard that was written to disk but never committed to Badger is indistinguishable from one that was never attempted — both surface as "absent." The read path does not distinguish between them, and the commit invariant (§6) ensures readers cannot observe partial writes.
 
 ## Background Repair
 
-A node-local healing process periodically reconciles local state against the hash
-ring:
+A node-local healing process periodically reconciles local state against the hash ring:
 
 1. Query s3db for the set of shards the hash ring places on this node.
 2. For each expected shard, look up the local Badger index.
-3. If absent, reconstruct the shard by fetching `K` valid shards from peers and RS
-   decoding, then write the result as a new reservation locally.
+3. If absent, reconstruct the shard by fetching `K` valid shards from peers and RS decoding, then write the result as a new reservation locally.
 
-The healer uses pull-based reconciliation against the metadata plane, so it repairs
-both shards that failed mid-write and shards that never arrived (e.g. the node was
-offline during the original PUT). A per-node in-memory recent-failures queue may
-optionally drive faster repair for known-bad shards without requiring a full ring
-scan.
+The healer uses pull-based reconciliation against the metadata plane, so it repairs both shards that failed mid-write and shards that never arrived (e.g. the node was offline during the original PUT). A per-node in-memory recent-failures queue may optionally drive faster repair for known-bad shards without requiring a full ring scan.
 
 ---
 
@@ -1154,10 +1025,8 @@ scan.
 
 All communication uses TLS:
 - s3db server uses HTTPS with configurable certificates
-- The Raft transport (`raft_port`) is TLS-wrapped using the same cert/key
-  pair; peers verify the server cert against the OS trust store
-- The QUIC RPC transport between s3d and shard nodes verifies the server
-  cert against the OS trust store (no `InsecureSkipVerify`)
+- The Raft transport (`raft_port`) is TLS-wrapped using the same cert/key pair; peers verify the server cert against the OS trust store
+- The QUIC RPC transport between s3d and shard nodes verifies the server cert against the OS trust store (no `InsecureSkipVerify`)
 - Certificate paths: `-tls-cert` and `-tls-key` flags
 
 ## Authentication
@@ -1169,29 +1038,13 @@ All communication uses TLS:
 
 ## Encryption at Rest
 
-Every shard fragment is sealed under AES-256-GCM before it touches disk —
-see §6 ("Encryption-at-Rest") for the on-disk format, AAD, and nonce
-construction. Operationally:
+Every shard fragment is sealed under AES-256-GCM before it touches disk — see §6 ("Encryption-at-Rest") for the on-disk format, AAD, and nonce construction. Operationally:
 
-- **Master key.** One 32-byte AES-256 key per cluster, loaded from a file
-  path supplied via `-encryption-key-file` / `ENCRYPTION_KEY_FILE`. The
-  loader is fail-closed on permissions: any group/other-readable mode
-  (`mode & 0077 != 0`) is rejected with no override — `chmod 600` is
-  mandatory. The same key MUST be configured on every node; rotation is
-  out of scope for the current implementation.
-- **No plaintext on disk.** Both `s3d` and `quicd` refuse to start without
-  a key path; `store.Open` errors without `WithAEAD`. There is no
-  unencrypted code path to fall back to.
-- **Logging.** The raw key is never logged. Operators identify a key by
-  its fingerprint (`hex(sha256(key)[:8])`, 16 hex chars), logged once at
-  `Server.init` and at QUIC server startup.
-- **In scope.** Confidentiality and integrity against an attacker reading
-  or modifying segment files; detection of fragment shuffling within or
-  across shards / data dirs on the same master key.
-- **Out of scope.** Compromise of a node host with the live master key in
-  memory; per-bucket / per-tenant keys; KMS integration; key rotation;
-  migration of existing unencrypted data (clusters must start fresh against
-  the new segment magic); encryption of the s3db (BadgerDB) index.
+- **Master key.** One 32-byte AES-256 key per cluster, loaded from a file path supplied via `-encryption-key-file` / `ENCRYPTION_KEY_FILE`. The loader is fail-closed on permissions: any group/other-readable mode (`mode & 0077 != 0`) is rejected with no override — `chmod 600` is mandatory. The same key MUST be configured on every node; rotation is out of scope for the current implementation.
+- **No plaintext on disk.** Both `s3d` and `quicd` refuse to start without a key path; `store.Open` errors without `WithAEAD`. There is no unencrypted code path to fall back to.
+- **Logging.** The raw key is never logged. Operators identify a key by its fingerprint (`hex(sha256(key)[:8])`, 16 hex chars), logged once at `Server.init` and at QUIC server startup.
+- **In scope.** Confidentiality and integrity against an attacker reading or modifying segment files; detection of fragment shuffling within or across shards / data dirs on the same master key.
+- **Out of scope.** Compromise of a node host with the live master key in memory; per-bucket / per-tenant keys; KMS integration; key rotation; migration of existing unencrypted data (clusters must start fresh against the new segment magic); encryption of the s3db (BadgerDB) index.
 
 ---
 
@@ -1283,12 +1136,7 @@ Each database node uses two ports:
 | `port` | HTTPS REST API for client requests | 6660 |
 | `raft_port` | TLS-wrapped TCP for Raft consensus (leader election, log replication) | `port + 1000` (e.g., 7660) |
 
-The Raft transport is TLS-protected using the same `-tls-cert` / `-tls-key`
-pair as the HTTPS S3 API and s3db REST listener. Peers verify the server
-cert against the OS trust store (cluster CA installed via
-`update-ca-certificates`); s3db refuses to start without a cert/key pair —
-there is no plaintext fallback. Mutual TLS (peer client-cert auth) is
-deferred to a follow-up bead.
+The Raft transport is TLS-protected using the same `-tls-cert` / `-tls-key` pair as the HTTPS S3 API and s3db REST listener. Peers verify the server cert against the OS trust store (cluster CA installed via `update-ca-certificates`); s3db refuses to start without a cert/key pair — there is no plaintext fallback. Mutual TLS (peer client-cert auth) is deferred to a follow-up bead.
 
 ### Bind vs Advertise Address
 
@@ -1423,6 +1271,4 @@ err := state.Scan("objects", []byte("arn:aws:s3:::mybucket/"), func(key, value [
 
 ---
 
-This file covers the engineering rationale and architecture of Predastore. For
-gaps between this design and the current codebase, and for longer-horizon work,
-see [TODO.md](./TODO.md).
+This file covers the engineering rationale and architecture of Predastore. For gaps between this design and the current codebase, and for longer-horizon work, see [TODO.md](./TODO.md).

@@ -23,12 +23,9 @@
 
 # Predastore: Distributed, S3-compatible object storage
 
-Predastore is a distributed object-storage system implementing commonly used
-Amazon S3 APIs. It combines Raft metadata, Reed–Solomon erasure coding, QUIC
-transport and append-only storage segments.
+Predastore is a distributed object-storage system implementing commonly used Amazon S3 APIs. It combines Raft metadata, Reed–Solomon erasure coding, QUIC transport and append-only storage segments.
 
-Predastore can run independently and provides the default object-storage
-backend for Spinifex.
+Predastore can run independently and provides the default object-storage backend for Spinifex.
 
 ## Quick Start
 
@@ -111,10 +108,8 @@ aws --endpoint-url https://10.11.12.1:8443/ s3 cp s3://my-bucket/file.txt ./down
 Predastore consists of three primary layers:
 
 - `s3d` exposes the S3 HTTP interface and Signature Version 4 authentication.
-- `s3db` maintains strongly consistent metadata with HashiCorp Raft and local
-  embedded databases.
-- Storage nodes exchange erasure-coded shards over QUIC and store them in
-  append-only segment files.
+- `s3db` maintains strongly consistent metadata with HashiCorp Raft and local embedded databases.
+- Storage nodes exchange erasure-coded shards over QUIC and store them in append-only segment files.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the complete design.
 
@@ -178,9 +173,7 @@ See [DESIGN.md](docs/DESIGN.md) for full configuration reference, including data
 
 ## Spinifex Integration
 
-Predastore is the default S3 storage provider for [Spinifex](https://github.com/mulgadc/spinifex). It can
-store user-created S3 objects, EC2 machine images, EBS snapshot data written
-through Viperblock, and service artefacts.
+Predastore is the default S3 storage provider for [Spinifex](https://github.com/mulgadc/spinifex). It can store user-created S3 objects, EC2 machine images, EBS snapshot data written through Viperblock, and service artefacts.
 
 - **EC2 AMI images** — machine images for VM launches
 - **EBS volume snapshots** — via [Viperblock](https://github.com/mulgadc/viperblock), which uses Predastore as its S3-compatible backend
@@ -236,9 +229,7 @@ Roadmap items describe direction and are not commitments to a release date.
 
 ## Trademarks
 
-Amazon Web Services, AWS and Amazon S3 are trademarks of Amazon.com, Inc. or
-its affiliates. Predastore is not affiliated with or endorsed by Amazon Web
-Services.
+Amazon Web Services, AWS and Amazon S3 are trademarks of Amazon.com, Inc. or its affiliates. Predastore is not affiliated with or endorsed by Amazon Web Services.
 
 ## License
 
