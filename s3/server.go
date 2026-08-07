@@ -16,14 +16,6 @@ import (
 	"github.com/mulgadc/predastore/pkg/masterkey"
 )
 
-// BackendType specifies the storage backend type.
-type BackendType string
-
-const (
-	// BackendDistributed uses distributed storage with erasure coding.
-	BackendDistributed BackendType = "distributed"
-)
-
 // Server encapsulates the S3-compatible server with all its components.
 type Server struct {
 	// Configuration
@@ -34,8 +26,6 @@ type Server struct {
 	tlsKey            string
 	basePath          string
 	debug             bool
-	backendType       BackendType
-	nodeID            int            // For distributed mode: specific node to run (-1 = dev mode)
 	encryptionKeyPath string         // Path to the 32-byte AES-256 master key file.
 	masterKey         *masterkey.Key // Loaded master key handle (AEAD + fingerprint, no raw bytes).
 
@@ -52,9 +42,8 @@ type Server struct {
 	pprofOutputPath string
 
 	// Lifecycle
-	mu       sync.Mutex
-	running  bool
-	shutdown chan struct{}
+	mu      sync.Mutex
+	running bool
 	// serveErr carries a fatal error from the async listener so the caller
 	// can shut down instead of running on with a dead gateway.
 	serveErr chan error
@@ -66,12 +55,9 @@ type Option func(*Server) error
 // NewServer creates a new S3 server with the given options.
 func NewServer(opts ...Option) (*Server, error) {
 	s := &Server{
-		host:        "0.0.0.0",
-		port:        8443,
-		backendType: BackendDistributed,
-		nodeID:      -1, // Dev mode by default
-		shutdown:    make(chan struct{}),
-		serveErr:    make(chan error, 1),
+		host:     "0.0.0.0",
+		port:     8443,
+		serveErr: make(chan error, 1),
 	}
 
 	// Apply options
@@ -131,18 +117,6 @@ func WithDebug(enabled bool) Option {
 	}
 }
 
-// WithBackend sets the storage backend type.
-// If empty string is passed, the default (BackendDistributed) is used.
-func WithBackend(backendType BackendType) Option {
-	return func(s *Server) error {
-		// Only override if a non-empty value is provided
-		if backendType != "" {
-			s.backendType = backendType
-		}
-		return nil
-	}
-}
-
 // WithPreparedBackend supplies an externally wired storage backend. The
 // server then only runs the S3 HTTPS frontend on top of it: no DB or QUIC
 // servers are launched, and the caller owns the backend's supporting
@@ -155,11 +129,9 @@ func WithPreparedBackend(be backend.Backend) Option {
 	}
 }
 
-// WithNodeID sets the node ID for distributed mode.
-// Use -1 (default) for dev mode which runs all nodes locally.
-// Use a specific ID >= 1 to run only that node (for production deployments).
-// Node IDs are 1-indexed; any other value is rejected so a typo in the caller
-// (e.g. NODE=garbage parsed to 0) does not silently downgrade to dev mode.
+// WithEncryptionKeyFile sets the path to the 32-byte AES-256 master key file
+// used for encryption at rest. The path is supplied via CLI/env only, never
+// TOML, so no plaintext secret path lives in the config file.
 func WithEncryptionKeyFile(path string) Option {
 	return func(s *Server) error {
 		s.encryptionKeyPath = path
@@ -265,7 +237,7 @@ func (s *Server) init() error {
 	s.credProv = credProv
 
 	// Setup HTTP routes with the backend using HTTP/2 server
-	slog.Info("Server init", "backendType", s.backendType)
+	slog.Info("Server init")
 	s.server = NewHTTP2ServerWithBackend(s.config, s.backend, s.credProv)
 	slog.Info("HTTP/2 server initialized - using net/http for connection multiplexing")
 
@@ -301,7 +273,7 @@ func (s *Server) ListenAndServe() error {
 	s.mu.Unlock()
 
 	addr := fmt.Sprintf("%s:%d", s.host, s.port)
-	slog.Info("Starting S3 server", "host", s.host, "port", s.port, "backend", s.backendType)
+	slog.Info("Starting S3 server", "host", s.host, "port", s.port)
 
 	if s.tlsCert == "" || s.tlsKey == "" {
 		return fmt.Errorf("TLS is required - set tlsCert and tlsKey")
@@ -322,7 +294,7 @@ func (s *Server) ListenAndServeAsync() error {
 	s.mu.Unlock()
 
 	addr := fmt.Sprintf("%s:%d", s.host, s.port)
-	slog.Info("Starting S3 server (async)", "host", s.host, "port", s.port, "backend", s.backendType)
+	slog.Info("Starting S3 server (async)", "host", s.host, "port", s.port)
 
 	if s.tlsCert == "" || s.tlsKey == "" {
 		return fmt.Errorf("TLS is required - set tlsCert and tlsKey")
@@ -451,7 +423,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	s.running = false
-	close(s.shutdown)
 
 	slog.Info("S3 server shutdown complete")
 	return nil
@@ -463,22 +434,3 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // ServeError reports a fatal listener failure. A gateway that cannot bind
 // must take the process down rather than leave the cluster running headless.
 func (s *Server) ServeError() <-chan error { return s.serveErr }
-
-// Helper functions
-
-func checkBaseDir(baseDir, path string) (newpath string) {
-	if path == "" {
-		return ""
-	}
-
-	// Append base-dir if not Absolute Path in config
-	if !filepath.IsAbs(path) && baseDir != "" {
-		newpath = filepath.Join(baseDir, path)
-	} else {
-		newpath = path
-	}
-
-	slog.Info("checkBaseDir", "baseDir", baseDir, "path", path, "newpath", newpath)
-
-	return newpath
-}

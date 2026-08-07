@@ -51,6 +51,18 @@ type Runtime struct {
 	raftNodes []*s3db.RaftNode
 }
 
+// raftPeers maps state replica node ids to the raft members they become. The
+// address is the node key the stream layer resolves through the topology, so
+// it stays valid however the replica is reached.
+func raftPeers(replicaIDs []int) []s3db.RaftPeer {
+	peers := make([]s3db.RaftPeer, len(replicaIDs))
+	for i, id := range replicaIDs {
+		u := uint64(id) //nolint:gosec // G115: node ids are small positives from a validated topology.
+		peers[i] = s3db.RaftPeer{ID: u, Address: state.RaftAddress(u)}
+	}
+	return peers
+}
+
 // AllNodeIDs returns every node id in the topology: the selection for a
 // process that runs the whole cluster over the in-process pipe.
 func AllNodeIDs(cfg *s3.Config) []int {
@@ -123,7 +135,7 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 	for i, n := range replicas {
 		replicaIDs[i] = n.ID
 	}
-	peers := RaftPeers(replicaIDs)
+	peers := raftPeers(replicaIDs)
 	replicaNodeIDs := make([]uint64, len(peers))
 	for i, p := range peers {
 		replicaNodeIDs[i] = p.ID
