@@ -24,6 +24,43 @@ All benchmarks can be run via the top-level dispatcher:
 
 ## Usage
 
+### PUT/multipart/GET end-to-end performance
+
+The benchmark used for front-door storage changes is self-contained and works
+in colocated mode on macOS and Linux:
+
+    make e2e-performance
+
+The Makefile installs the pinned Warp release under `bin/tools` when missing,
+builds Predastore, starts RS(1,0) and RS(3,1) topologies one at a time, and
+runs two layers of validation:
+
+1. AWS CLI single PUT and forced multipart upload followed by GET, `diff -q`,
+   and SHA-256 comparison of the local source/download files.
+2. Isolated Warp `put`, `multipart-put`, `multipart`, and `get` workloads.
+
+The default `PERF_PRESET=smoke` is intentionally laptop-sized. Record a stable
+comparison run with:
+
+    make e2e-performance PERF_PRESET=compare
+
+Results are written below `scripts/bench/results/e2e-performance/` and include
+the exact config, commit/dirty state, tool versions, correctness hashes, server
+logs, Warp logs, and Warp `.json.zst` data. Warp uses unique disposable buckets
+with `--noclear` because Predastore does not implement Warp's batch cleanup
+route; the entire per-run Predastore data directory is removed afterward.
+
+Compare matching artifacts from two runs with:
+
+    make e2e-performance-compare \
+        PERF_BEFORE=scripts/bench/results/e2e-performance/<before> \
+        PERF_AFTER=scripts/bench/results/e2e-performance/<after>
+
+Useful overrides include `PERF_CONFIGS=4node`, `PERF_DURATION=30s`,
+`PERF_CONCURRENT=4`, `PERF_PUT_SIZE=16MiB`, `PERF_PART_SIZE=8MiB`, and
+`PERF_PARTS=8`. Set `PERF_KEEP_WORK=1` to retain the disposable cluster data
+for diagnosis.
+
 Raw disk ceiling:
 
     ./scripts/bench/bench-disk.sh

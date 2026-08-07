@@ -1,6 +1,12 @@
 GO_PROJECT_NAME := s3d
 SHELL := /bin/bash
 
+TOOLS_DIR ?= $(CURDIR)/bin/tools
+WARP_VERSION ?= v1.5.0
+WARP ?= $(TOOLS_DIR)/warp
+PERF_PRESET ?= smoke
+PERF_CONFIGS ?= 1node 4node
+
 # Quiet-mode filters (active when QUIET=1, set by preflight via recursive make)
 # Note: grep pipelines use PIPESTATUS[0] so the exit status of `go test`
 # propagates through the filter — otherwise a test failure is swallowed by
@@ -106,6 +112,28 @@ fix:
 govulncheck:
 	go tool govulncheck ./...
 
+# Install the exact Warp release used by e2e performance comparisons. Keeping
+# the binary repository-local avoids silently comparing runs from two driver
+# versions when a developer has another Warp on PATH.
+warp-install:
+	@if [ ! -x "$(WARP)" ]; then \
+		echo -e "\n....Installing warp $(WARP_VERSION)"; \
+		mkdir -p "$(TOOLS_DIR)"; \
+		GOBIN="$(TOOLS_DIR)" go install github.com/minio/warp@$(WARP_VERSION); \
+	fi
+
+# Local, self-contained correctness and performance run. PERF_PRESET=smoke is
+# suitable for a laptop; PERF_PRESET=compare records longer comparison data.
+e2e-performance: build certs warp-install
+	@PERF_PRESET="$(PERF_PRESET)" PERF_CONFIGS="$(PERF_CONFIGS)" WARP="$(WARP)" \
+		./scripts/bench/e2e-performance.sh
+
+# Usage: make e2e-performance-compare PERF_BEFORE=/path/to/before PERF_AFTER=/path/to/after
+e2e-performance-compare: warp-install
+	@test -n "$(PERF_BEFORE)" || { echo "PERF_BEFORE is required" >&2; exit 2; }
+	@test -n "$(PERF_AFTER)" || { echo "PERF_AFTER is required" >&2; exit 2; }
+	@WARP="$(WARP)" ./scripts/bench/compare-performance.sh "$(PERF_BEFORE)" "$(PERF_AFTER)"
+
 # NilAway — advisory nil-panic analysis. Not in preflight: it has a known
 # false-positive rate, so findings are triaged by hand rather than gating commits.
 nilaway:
@@ -113,4 +141,4 @@ nilaway:
 
 .PHONY: certs build go_build go_build_docker preflight test test-cover test-race test-integration diff-coverage \
 	docker_s3d docker_compose_up docker_compose_down docker docker_clean docker_test \
-	clean lint fix govulncheck nilaway
+	clean lint fix govulncheck nilaway warp-install e2e-performance e2e-performance-compare

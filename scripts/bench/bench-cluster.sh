@@ -23,7 +23,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_DIR="$SCRIPT_DIR/../.."
 CONFIG_DIR="$REPO_DIR/config"
 SCRIPTS_DIR="$SCRIPT_DIR/.."
@@ -77,14 +77,14 @@ trap cleanup EXIT INT TERM
 # Emits each host's public IP. An empty result is normal for a config with no
 # routable hosts, so the pipeline must not abort under `set -e`.
 parse_host_ips() {
-    grep -E '^\s*public_addr\s*=' "$CONFIG_FILE" | \
-        sed 's/.*=\s*"\(.*\)".*/\1/' | \
+    grep -E '^[[:space:]]*public_addr[[:space:]]*=' "$CONFIG_FILE" | \
+        sed 's/.*=[[:space:]]*"\([^"]*\)".*/\1/' | \
         cut -d: -f1 | \
         grep -v '0\.0\.0\.0' | \
         sort -u || true
 }
 
-REGION=$(grep -E '^\s*region\s*=' "$CONFIG_FILE" | head -1 | sed 's/.*=\s*"\(.*\)".*/\1/')
+REGION=$(grep -E '^[[:space:]]*region[[:space:]]*=' "$CONFIG_FILE" | head -1 | sed 's/.*=[[:space:]]*"\([^"]*\)".*/\1/')
 ACCESS_KEY=$(awk '/^\[\[auth\]\]/{a=1} a && /access_key_id/{gsub(/.*= *"/,""); gsub(/".*/,""); print; exit}' "$CONFIG_FILE")
 SECRET_KEY=$(awk '/^\[\[auth\]\]/{a=1} a && /secret_access_key/{gsub(/.*= *"/,""); gsub(/".*/,""); print; exit}' "$CONFIG_FILE")
 

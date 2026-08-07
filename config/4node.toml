@@ -1,0 +1,59 @@
+# Four-shard benchmark topology: RS(3,1).
+# With scripts/start.sh's default colocated mode all nodes use the in-process
+# transport. Split mode is available on hosts configured for loopback aliases.
+
+version = "1.0"
+region = "ap-southeast-2"
+
+[rs]
+data = 3
+parity = 1
+
+[[host]]
+id = 1
+bind_addr = "127.0.0.1:6660"
+public_addr = "127.0.0.1:6660"
+data_dir = "data/host-1"
+
+[[node]]
+id = 1
+host_id = 1
+role = "shard-storage"
+
+[[node]]
+id = 2
+host_id = 1
+role = "shard-storage"
+
+[[node]]
+id = 3
+host_id = 1
+role = "shard-storage"
+
+[[node]]
+id = 4
+host_id = 1
+role = "shard-storage"
+
+[[node]]
+id = 5
+host_id = 1
+role = "state-replica"
+
+[[node]]
+id = 6
+host_id = 1
+role = "state-replica"
+
+[[node]]
+id = 7
+host_id = 1
+role = "state-replica"
+
+[[auth]]
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+account_id = "123456789012"
+policy = [
+  { bucket = "*", actions = ["s3:*"] },
+]

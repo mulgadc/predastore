@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_DIR="$SCRIPT_DIR/.."
 CONFIG_DIR="$REPO_DIR/config"
 
@@ -30,7 +30,7 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 # those rather than kill them: a cluster outside this root may not be ours.
 report_stray() {
     local stray
-    stray=$(pgrep -af '/bin/s3d -config' 2>/dev/null | grep -Fv "$BASE_DIR" || true)
+    stray=$(ps ax -o pid= -o command= 2>/dev/null | grep '/bin/s3d -config' | grep -Fv grep | grep -Fv "$BASE_DIR" || true)
     [ -n "$stray" ] || return 0
     log_warn "s3d processes outside $BASE_DIR are still running:"
     while IFS= read -r line; do
@@ -59,6 +59,12 @@ for pid_dir in "$BASE_DIR"/*/pids; do
         if kill -0 "$pid" 2>/dev/null; then
             log_info "Stopping $cluster/$node (PID: $pid)"
             kill "$pid" 2>/dev/null || true
+            # Wait briefly so the subsequent stray-process report does not
+            # flag a process that is already handling SIGTERM.
+            for _ in {1..50}; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 0.1
+            done
             stopped=$((stopped + 1))
         fi
         rm -f "$pidfile"
@@ -74,15 +80,17 @@ for cluster_dir in "$BASE_DIR"/*/; do
 
     # An absent or all-wildcard address list is normal, not an error: the
     # pipeline must not abort the script under `set -e`.
-    ips=$(grep -E '^\s*public_addr\s*=' "$config" | \
-        sed 's/.*=\s*"\(.*\)".*/\1/' | \
+    ips=$(grep -E '^[[:space:]]*public_addr[[:space:]]*=' "$config" | \
+        sed 's/.*=[[:space:]]*"\([^"]*\)".*/\1/' | \
         cut -d: -f1 | \
         grep -v '0\.0\.0\.0' | \
         sort -u || true)
 
-    for ip in $ips; do
-        sudo ip addr del "${ip}/24" dev lo 2>/dev/null || true
-    done
+    if command -v ip >/dev/null 2>&1; then
+        for ip in $ips; do
+            sudo ip addr del "${ip}/24" dev lo 2>/dev/null || true
+        done
+    fi
 done
 
 if [ "$stopped" -eq 0 ]; then

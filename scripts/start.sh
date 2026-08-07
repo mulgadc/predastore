@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_DIR="$SCRIPT_DIR/.."
 CONFIG_DIR="$REPO_DIR/config"
 S3D_BINARY="$REPO_DIR/bin/s3d"
@@ -73,7 +73,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
     exit 1
 fi
 
-if ! grep -qE '^\s*\[\[host\]\]' "$CONFIG_FILE"; then
+if ! grep -qE '^[[:space:]]*\[\[host\]\]' "$CONFIG_FILE"; then
     log_error "$CONFIG_FILE has no [[host]] topology"
     exit 1
 fi
@@ -111,8 +111,8 @@ mkdir -p "$ROOT" "$LOGS" "$PIDS"
 # Emits each host's public IP. An empty result is normal for a config with no
 # routable hosts, so the pipeline must not abort under `set -e`.
 parse_host_ips() {
-    grep -E '^\s*public_addr\s*=' "$CONFIG_FILE" | \
-        sed 's/.*=\s*"\(.*\)".*/\1/' | \
+    grep -E '^[[:space:]]*public_addr[[:space:]]*=' "$CONFIG_FILE" | \
+        sed 's/.*=[[:space:]]*"\([^"]*\)".*/\1/' | \
         cut -d: -f1 | \
         grep -v '0\.0\.0\.0' | \
         sort -u || true
