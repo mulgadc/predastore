@@ -98,9 +98,10 @@ func TestPutObjectWithTempFile(t *testing.T) {
 
 	// PUT the object via the production PutObject path (uses temp file internally)
 	putReq := &s3backend.PutObjectRequest{
-		Bucket: bucket,
-		Key:    objectKey,
-		Body:   bytes.NewReader(orig),
+		Bucket:        bucket,
+		Key:           objectKey,
+		Body:          bytes.NewReader(orig),
+		ContentLength: int64(len(orig)),
 	}
 	putResp, err := backend.PutObject(ctx, putReq)
 	require.NoError(t, err, "PutObject should succeed")

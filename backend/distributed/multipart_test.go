@@ -152,11 +152,12 @@ func createUploadWithParts(t *testing.T, be *Backend, bucket, key string, partDa
 	parts := make([]backend.CompletedPart, len(partData))
 	for i, data := range partData {
 		resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-			Bucket:     bucket,
-			Key:        key,
-			UploadID:   createResp.UploadID,
-			PartNumber: i + 1,
-			Body:       bytes.NewReader(data),
+			Bucket:        bucket,
+			Key:           key,
+			UploadID:      createResp.UploadID,
+			PartNumber:    i + 1,
+			Body:          bytes.NewReader(data),
+			ContentLength: int64(len(data)),
 		})
 		require.NoError(t, err)
 		parts[i] = backend.CompletedPart{PartNumber: i + 1, ETag: resp.ETag}
@@ -250,11 +251,12 @@ func TestDistributed_UploadPart(t *testing.T) {
 		expectedETag := fmt.Sprintf("\"%x\"", expectedMD5)
 
 		req := &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "test-object.bin",
-			UploadID:   uploadID,
-			PartNumber: 1,
-			Body:       bytes.NewReader(partData),
+			Bucket:        "test-bucket",
+			Key:           "test-object.bin",
+			UploadID:      uploadID,
+			PartNumber:    1,
+			Body:          bytes.NewReader(partData),
+			ContentLength: int64(len(partData)),
 		}
 
 		resp, err := be.UploadPart(ctx, req)
@@ -270,11 +272,12 @@ func TestDistributed_UploadPart(t *testing.T) {
 		partData := []byte("small part data")
 
 		req := &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "test-object.bin",
-			UploadID:   uploadID,
-			PartNumber: 2,
-			Body:       bytes.NewReader(partData),
+			Bucket:        "test-bucket",
+			Key:           "test-object.bin",
+			UploadID:      uploadID,
+			PartNumber:    2,
+			Body:          bytes.NewReader(partData),
+			ContentLength: int64(len(partData)),
 		}
 
 		resp, err := be.UploadPart(ctx, req)
@@ -285,11 +288,12 @@ func TestDistributed_UploadPart(t *testing.T) {
 
 	t.Run("invalid upload ID", func(t *testing.T) {
 		req := &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "test-object.bin",
-			UploadID:   "non-existent-upload-id",
-			PartNumber: 1,
-			Body:       bytes.NewReader([]byte("data")),
+			Bucket:        "test-bucket",
+			Key:           "test-object.bin",
+			UploadID:      "non-existent-upload-id",
+			PartNumber:    1,
+			Body:          bytes.NewReader([]byte("data")),
+			ContentLength: 4,
 		}
 
 		resp, err := be.UploadPart(ctx, req)
@@ -299,11 +303,12 @@ func TestDistributed_UploadPart(t *testing.T) {
 
 	t.Run("invalid part number zero", func(t *testing.T) {
 		req := &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "test-object.bin",
-			UploadID:   uploadID,
-			PartNumber: 0,
-			Body:       bytes.NewReader([]byte("data")),
+			Bucket:        "test-bucket",
+			Key:           "test-object.bin",
+			UploadID:      uploadID,
+			PartNumber:    0,
+			Body:          bytes.NewReader([]byte("data")),
+			ContentLength: 4,
 		}
 
 		resp, err := be.UploadPart(ctx, req)
@@ -313,11 +318,12 @@ func TestDistributed_UploadPart(t *testing.T) {
 
 	t.Run("invalid part number too large", func(t *testing.T) {
 		req := &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "test-object.bin",
-			UploadID:   uploadID,
-			PartNumber: 10001,
-			Body:       bytes.NewReader([]byte("data")),
+			Bucket:        "test-bucket",
+			Key:           "test-object.bin",
+			UploadID:      uploadID,
+			PartNumber:    10001,
+			Body:          bytes.NewReader([]byte("data")),
+			ContentLength: 4,
 		}
 
 		resp, err := be.UploadPart(ctx, req)
@@ -327,11 +333,12 @@ func TestDistributed_UploadPart(t *testing.T) {
 
 	t.Run("mismatched bucket", func(t *testing.T) {
 		req := &backend.UploadPartRequest{
-			Bucket:     "wrong-bucket",
-			Key:        "test-object.bin",
-			UploadID:   uploadID,
-			PartNumber: 3,
-			Body:       bytes.NewReader([]byte("data")),
+			Bucket:        "wrong-bucket",
+			Key:           "test-object.bin",
+			UploadID:      uploadID,
+			PartNumber:    3,
+			Body:          bytes.NewReader([]byte("data")),
+			ContentLength: 4,
 		}
 
 		resp, err := be.UploadPart(ctx, req)
@@ -363,20 +370,22 @@ func TestDistributed_CompleteMultipartUpload(t *testing.T) {
 		part2Data := []byte("last part data - can be small")
 
 		part1Resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "complete-test.bin",
-			UploadID:   uploadID,
-			PartNumber: 1,
-			Body:       bytes.NewReader(part1Data),
+			Bucket:        "test-bucket",
+			Key:           "complete-test.bin",
+			UploadID:      uploadID,
+			PartNumber:    1,
+			Body:          bytes.NewReader(part1Data),
+			ContentLength: int64(len(part1Data)),
 		})
 		require.NoError(t, err)
 
 		part2Resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "complete-test.bin",
-			UploadID:   uploadID,
-			PartNumber: 2,
-			Body:       bytes.NewReader(part2Data),
+			Bucket:        "test-bucket",
+			Key:           "complete-test.bin",
+			UploadID:      uploadID,
+			PartNumber:    2,
+			Body:          bytes.NewReader(part2Data),
+			ContentLength: int64(len(part2Data)),
 		})
 		require.NoError(t, err)
 
@@ -446,20 +455,22 @@ func TestDistributed_CompleteMultipartUpload(t *testing.T) {
 		part2Data := make([]byte, multipart.MinPartSize)
 
 		part1Resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "order-test.bin",
-			UploadID:   uploadID,
-			PartNumber: 1,
-			Body:       bytes.NewReader(part1Data),
+			Bucket:        "test-bucket",
+			Key:           "order-test.bin",
+			UploadID:      uploadID,
+			PartNumber:    1,
+			Body:          bytes.NewReader(part1Data),
+			ContentLength: int64(len(part1Data)),
 		})
 		require.NoError(t, err)
 
 		part2Resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "order-test.bin",
-			UploadID:   uploadID,
-			PartNumber: 2,
-			Body:       bytes.NewReader(part2Data),
+			Bucket:        "test-bucket",
+			Key:           "order-test.bin",
+			UploadID:      uploadID,
+			PartNumber:    2,
+			Body:          bytes.NewReader(part2Data),
+			ContentLength: int64(len(part2Data)),
 		})
 		require.NoError(t, err)
 
@@ -491,20 +502,22 @@ func TestDistributed_CompleteMultipartUpload(t *testing.T) {
 		part2Data := []byte("last part")
 
 		part1Resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "small-part-test.bin",
-			UploadID:   uploadID,
-			PartNumber: 1,
-			Body:       bytes.NewReader(part1Data),
+			Bucket:        "test-bucket",
+			Key:           "small-part-test.bin",
+			UploadID:      uploadID,
+			PartNumber:    1,
+			Body:          bytes.NewReader(part1Data),
+			ContentLength: int64(len(part1Data)),
 		})
 		require.NoError(t, err)
 
 		part2Resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "small-part-test.bin",
-			UploadID:   uploadID,
-			PartNumber: 2,
-			Body:       bytes.NewReader(part2Data),
+			Bucket:        "test-bucket",
+			Key:           "small-part-test.bin",
+			UploadID:      uploadID,
+			PartNumber:    2,
+			Body:          bytes.NewReader(part2Data),
+			ContentLength: int64(len(part2Data)),
 		})
 		require.NoError(t, err)
 
@@ -542,11 +555,12 @@ func TestDistributed_AbortMultipartUpload(t *testing.T) {
 		// Upload a part
 		partData := make([]byte, multipart.MinPartSize)
 		_, err = be.UploadPart(ctx, &backend.UploadPartRequest{
-			Bucket:     "test-bucket",
-			Key:        "abort-test.bin",
-			UploadID:   uploadID,
-			PartNumber: 1,
-			Body:       bytes.NewReader(partData),
+			Bucket:        "test-bucket",
+			Key:           "abort-test.bin",
+			UploadID:      uploadID,
+			PartNumber:    1,
+			Body:          bytes.NewReader(partData),
+			ContentLength: int64(len(partData)),
 		})
 		require.NoError(t, err)
 
@@ -616,31 +630,34 @@ func TestDistributed_MultipartUpload_FullWorkflow(t *testing.T) {
 
 	// Step 2: Upload parts (can be done in any order)
 	part2Resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-		Bucket:     bucket,
-		Key:        key,
-		UploadID:   uploadID,
-		PartNumber: 2,
-		Body:       bytes.NewReader(part2Data),
+		Bucket:        bucket,
+		Key:           key,
+		UploadID:      uploadID,
+		PartNumber:    2,
+		Body:          bytes.NewReader(part2Data),
+		ContentLength: int64(len(part2Data)),
 	})
 	require.NoError(t, err)
 	t.Logf("Uploaded part 2: %s", part2Resp.ETag)
 
 	part1Resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-		Bucket:     bucket,
-		Key:        key,
-		UploadID:   uploadID,
-		PartNumber: 1,
-		Body:       bytes.NewReader(part1Data),
+		Bucket:        bucket,
+		Key:           key,
+		UploadID:      uploadID,
+		PartNumber:    1,
+		Body:          bytes.NewReader(part1Data),
+		ContentLength: int64(len(part1Data)),
 	})
 	require.NoError(t, err)
 	t.Logf("Uploaded part 1: %s", part1Resp.ETag)
 
 	part3Resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-		Bucket:     bucket,
-		Key:        key,
-		UploadID:   uploadID,
-		PartNumber: 3,
-		Body:       bytes.NewReader(part3Data),
+		Bucket:        bucket,
+		Key:           key,
+		UploadID:      uploadID,
+		PartNumber:    3,
+		Body:          bytes.NewReader(part3Data),
+		ContentLength: int64(len(part3Data)),
 	})
 	require.NoError(t, err)
 	t.Logf("Uploaded part 3: %s", part3Resp.ETag)
@@ -731,11 +748,12 @@ func TestDistributed_MultipartUpload_LargeNumberOfParts(t *testing.T) {
 		}
 
 		resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-			Bucket:     bucket,
-			Key:        key,
-			UploadID:   uploadID,
-			PartNumber: i + 1,
-			Body:       bytes.NewReader(partData),
+			Bucket:        bucket,
+			Key:           key,
+			UploadID:      uploadID,
+			PartNumber:    i + 1,
+			Body:          bytes.NewReader(partData),
+			ContentLength: int64(len(partData)),
 		})
 		require.NoError(t, err, "Failed to upload part %d", i+1)
 
@@ -804,11 +822,12 @@ func TestDistributed_MultipartUpload_PartOverwrite(t *testing.T) {
 	}
 
 	_, err = be.UploadPart(ctx, &backend.UploadPartRequest{
-		Bucket:     bucket,
-		Key:        key,
-		UploadID:   uploadID,
-		PartNumber: 1,
-		Body:       bytes.NewReader(part1DataV1),
+		Bucket:        bucket,
+		Key:           key,
+		UploadID:      uploadID,
+		PartNumber:    1,
+		Body:          bytes.NewReader(part1DataV1),
+		ContentLength: int64(len(part1DataV1)),
 	})
 	require.NoError(t, err)
 
@@ -819,22 +838,24 @@ func TestDistributed_MultipartUpload_PartOverwrite(t *testing.T) {
 	}
 
 	part1RespV2, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-		Bucket:     bucket,
-		Key:        key,
-		UploadID:   uploadID,
-		PartNumber: 1,
-		Body:       bytes.NewReader(part1DataV2),
+		Bucket:        bucket,
+		Key:           key,
+		UploadID:      uploadID,
+		PartNumber:    1,
+		Body:          bytes.NewReader(part1DataV2),
+		ContentLength: int64(len(part1DataV2)),
 	})
 	require.NoError(t, err)
 
 	// Upload part 2
 	part2Data := []byte("part 2 data")
 	part2Resp, err := be.UploadPart(ctx, &backend.UploadPartRequest{
-		Bucket:     bucket,
-		Key:        key,
-		UploadID:   uploadID,
-		PartNumber: 2,
-		Body:       bytes.NewReader(part2Data),
+		Bucket:        bucket,
+		Key:           key,
+		UploadID:      uploadID,
+		PartNumber:    2,
+		Body:          bytes.NewReader(part2Data),
+		ContentLength: int64(len(part2Data)),
 	})
 	require.NoError(t, err)
 
@@ -941,11 +962,12 @@ func TestDistributed_MultipartUpload_ConcurrentParts_Contention(t *testing.T) {
 
 			start := time.Now()
 			resp, perr := be.UploadPart(partCtx, &backend.UploadPartRequest{
-				Bucket:     bucket,
-				Key:        key,
-				UploadID:   uploadID,
-				PartNumber: pn,
-				Body:       bytes.NewReader(data),
+				Bucket:        bucket,
+				Key:           key,
+				UploadID:      uploadID,
+				PartNumber:    pn,
+				Body:          bytes.NewReader(data),
+				ContentLength: int64(len(data)),
 			})
 			elapsed := time.Since(start)
 			if perr != nil {

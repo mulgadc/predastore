@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/backend/multipart"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
@@ -75,12 +76,7 @@ func (s *HTTP2Server) setupRoutes() {
 	// Middleware
 	r.Use(otelsetup.HTTPMiddleware("predastore"))
 	r.Use(s3SpanMiddleware)
-	// chi's access log duplicates the APM transaction from HTTPMiddleware and
-	// is a synchronous per-request write on the hot path; only enable it for
-	// explicit debug sessions.
-	if s.config.Debug {
-		r.Use(middleware.Logger)
-	}
+	r.Use(s3AccessLogMiddleware)
 	r.Use(middleware.Recoverer)
 	// AWS S3 accepts bucket-scoped URLs with or without a trailing slash
 	// (e.g. PUT /bucket/ == PUT /bucket for CreateBucket) without redirecting.
@@ -622,18 +618,24 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 	// Check for multipart part upload
 	if partNum := r.URL.Query().Get("partNumber"); partNum != "" {
 		uploadID := r.URL.Query().Get("uploadId")
-		partNumber, _ := strconv.Atoi(partNum)
-		decodedLen, _ := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
+		partNumber, err := strconv.Atoi(partNum)
+		if err != nil {
+			s.handleError(w, r, backend.NewS3Error(backend.ErrInvalidPart, "Part number must be an integer", http.StatusBadRequest))
+			return
+		}
+		body, err := decodeObjectBody(w, r, multipart.MaxPartSize)
+		if err != nil {
+			s.handleError(w, r, err)
+			return
+		}
 
 		resp, err := s.backend.UploadPart(ctx, &backend.UploadPartRequest{
-			Bucket:          bucket,
-			Key:             key,
-			UploadID:        uploadID,
-			PartNumber:      partNumber,
-			Body:            r.Body,
-			ContentEncoding: r.Header.Get("Content-Encoding"),
-			IsChunked:       r.Header.Get("Content-Encoding") == "aws-chunked",
-			DecodedLength:   decodedLen,
+			Bucket:        bucket,
+			Key:           key,
+			UploadID:      uploadID,
+			PartNumber:    partNumber,
+			Body:          body.Reader,
+			ContentLength: body.Length,
 		})
 		if err != nil {
 			s.handleError(w, r, err)
@@ -646,16 +648,18 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Regular put object
-	decodedLen, _ := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
+	// Regular put object.
+	body, err := decodeObjectBody(w, r, multipart.MaxObjectSize)
+	if err != nil {
+		s.handleError(w, r, err)
+		return
+	}
 
 	resp, err := s.backend.PutObject(ctx, &backend.PutObjectRequest{
-		Bucket:          bucket,
-		Key:             key,
-		Body:            r.Body,
-		ContentEncoding: r.Header.Get("Content-Encoding"),
-		IsChunked:       r.Header.Get("Content-Encoding") == "aws-chunked",
-		DecodedLength:   decodedLen,
+		Bucket:        bucket,
+		Key:           key,
+		Body:          body.Reader,
+		ContentLength: body.Length,
 	})
 	if err != nil {
 		s.handleError(w, r, err)

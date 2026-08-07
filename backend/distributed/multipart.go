@@ -3,22 +3,22 @@ package distributed
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/gob"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/multipart"
-	"github.com/mulgadc/predastore/s3/chunked"
+	"github.com/mulgadc/predastore/quic/quicserver"
 	s3db "github.com/mulgadc/predastore/s3db"
+	"golang.org/x/sync/errgroup"
 )
 
 // multipartUploadKey generates the key for storing upload metadata.
@@ -137,23 +137,12 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 		return nil, backend.NewS3Error(backend.ErrInvalidPart, "Bucket or key does not match upload", 400)
 	}
 
-	// Setup reader - handle chunked encoding if needed
-	reader := req.Body
-	if req.IsChunked && req.ContentEncoding == "aws-chunked" {
-		reader = chunked.NewDecoder(req.Body, req.DecodedLength)
+	// Validate part size before reading or allocating. The S3 ingress passes the
+	// exact decoded length, so ETag hashing and storage share one read.
+	if req.ContentLength < 0 {
+		return nil, backend.NewS3Error(backend.ErrInvalidRequest, "Part content length must be non-negative", 400)
 	}
-
-	// Read all data and calculate ETag
-	etag, data, err := multipart.CalculatePartETagFromReader(reader)
-	if err != nil {
-		slog.Error("Failed to read part data", "uploadID", req.UploadID, "part", req.PartNumber, "error", err)
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to read part data", 500)
-	}
-
-	partSize := int64(len(data))
-
-	// Validate part size (note: we can't know if it's the last part here, so we allow small parts)
-	if partSize > multipart.MaxPartSize {
+	if req.ContentLength > multipart.MaxPartSize {
 		return nil, backend.NewS3Error(backend.ErrEntityTooLarge, "Part exceeds maximum size", 400)
 	}
 
@@ -162,27 +151,14 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 	partKey := partObjectKey(req.Bucket, req.Key, req.UploadID, req.PartNumber)
 	objectHash := s3db.GenObjectHash(req.Bucket, partKey)
 
-	// Use deterministic temp file path based on upload info (like filesystem backend does)
-	// This ensures consistent hash ring placement for retries
-	tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("multipart-%s-%05d.tmp", req.UploadID, req.PartNumber))
-	tmpFile, err := os.Create(tmpPath)
-	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to create temp file", 500)
-	}
-	defer os.Remove(tmpPath)
-	defer tmpFile.Close()
-
-	if _, err := tmpFile.Write(data); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to write temp file", 500)
-	}
-	if closeErr := tmpFile.Close(); closeErr != nil {
-		slog.Debug("Failed to close temp file", "path", tmpPath, "error", closeErr)
-	}
-
-	if _, _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpPath, objectHash); err != nil {
+	hash := md5.New() // S3 multipart ETags require MD5 for compatibility.
+	reader := io.TeeReader(req.Body, hash)
+	if _, err = b.putObjectViaQUIC(ctx, req.Bucket, partKey, reader, req.ContentLength, objectHash); err != nil {
 		slog.Error("Failed to store part", "uploadID", req.UploadID, "part", req.PartNumber, "error", err)
 		return nil, mapPutErr(err)
 	}
+	etag := fmt.Sprintf("\"%x\"", hash.Sum(nil))
+	partSize := req.ContentLength
 
 	// Create part metadata
 	partMeta := multipart.PartMetadata{
@@ -315,89 +291,50 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 		storedMap[p.PartNumber] = p
 	}
 
-	// Assemble parts into final object
-	// Create a temp file to hold the assembled data
-	tmpFile, err := os.CreateTemp("", "multipart-complete-*")
-	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to create temp file", 500)
-	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
-
 	partETags := make([]string, len(req.Parts))
-
-	// Retrieve all parts in parallel for faster completion
-	const maxParallelPartFetches = 10
-	type partResult struct {
-		index int
-		data  []byte
-		err   error
-	}
-
-	partDataSlice := make([][]byte, len(req.Parts))
-	resultChan := make(chan partResult, len(req.Parts))
-	semaphore := make(chan struct{}, maxParallelPartFetches)
-
-	var wg sync.WaitGroup
+	var finalSize int64
 	for i, part := range req.Parts {
 		stored := storedMap[part.PartNumber]
 		partETags[i] = multipart.NormalizeETag(stored.ETag)
-
-		wg.Add(1)
-		go func(idx int, partNum int) {
-			defer wg.Done()
-			semaphore <- struct{}{}        // Acquire semaphore
-			defer func() { <-semaphore }() // Release semaphore
-
-			data, err := b.getPartData(ctx, req.Bucket, req.Key, req.UploadID, partNum)
-			resultChan <- partResult{index: idx, data: data, err: err}
-		}(i, part.PartNumber)
-	}
-
-	// Wait for all goroutines to finish and close the channel
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	// Collect results
-	for result := range resultChan {
-		if result.err != nil {
-			slog.Error("Failed to retrieve part data", "uploadID", req.UploadID, "index", result.index, "error", result.err)
-			return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to retrieve part data", 500)
+		if stored.Size < 0 || stored.Size > multipart.MaxObjectSize-finalSize {
+			return nil, backend.NewS3Error(backend.ErrEntityTooLarge, "Completed object exceeds maximum size", 400)
 		}
-		partDataSlice[result.index] = result.data
+		finalSize += stored.Size
 	}
 
-	// Write all parts to temp file in order
-	for _, data := range partDataSlice {
-		if _, err := tmpFile.Write(data); err != nil {
-			return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to write assembled data", 500)
-		}
-	}
-
-	if closeErr := tmpFile.Close(); closeErr != nil {
-		slog.Debug("Failed to close temp file", "path", tmpFile.Name(), "error", closeErr)
-	}
-
-	// Store the final object using PutObject mechanism
 	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
-
-	if _, _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash); err != nil {
+	pipeReader, pipeWriter := io.Pipe()
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() (producerErr error) {
+		defer func() { _ = pipeWriter.CloseWithError(producerErr) }()
+		for _, part := range req.Parts {
+			data, err := b.getPartData(groupCtx, req.Bucket, req.Key, req.UploadID, part.PartNumber)
+			if err != nil {
+				return fmt.Errorf("retrieve multipart part %d: %w", part.PartNumber, err)
+			}
+			if _, err := pipeWriter.Write(data); err != nil {
+				return fmt.Errorf("stream multipart part %d: %w", part.PartNumber, err)
+			}
+		}
+		return nil
+	})
+	group.Go(func() (storeErr error) {
+		defer func() { _ = pipeReader.CloseWithError(storeErr) }()
+		_, storeErr = b.putObjectViaQUIC(groupCtx, req.Bucket, req.Key, pipeReader, finalSize, objectHash)
+		if storeErr != nil {
+			return fmt.Errorf("store completed multipart object: %w", storeErr)
+		}
+		return nil
+	})
+	if err := group.Wait(); err != nil {
 		slog.Error("Failed to store final object", "uploadID", req.UploadID, "error", err)
 		return nil, mapPutErr(err)
-	}
-
-	// Get final object size
-	finalInfo, err := os.Stat(tmpFile.Name())
-	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to get final object size", 500)
 	}
 
 	// Store object metadata (same as regular PutObject)
 	objectToShardNodes := ObjectToShardNodes{
 		Object: objectHash,
-		Size:   finalInfo.Size(),
+		Size:   finalSize,
 	}
 
 	// Use objectHash for hash ring placement - must match what putObjectViaQUIC uses
@@ -475,6 +412,33 @@ func (b *Backend) getPartData(ctx context.Context, bucket, key, uploadID string,
 
 	// Construct the part object key for shard retrieval
 	partKey := partObjectKey(bucket, key, uploadID, partNumber)
+	if shardNodes.Size == 0 {
+		return []byte{}, nil
+	}
+	if b.rsDataShard == 1 && b.rsParityShard == 0 {
+		if len(shardNodes.DataShardNodes) != 1 {
+			return nil, fmt.Errorf("part %d has %d data nodes, want 1", partNumber, len(shardNodes.DataShardNodes))
+		}
+		reader, err := b.shards.GetShard(ctx, int(shardNodes.DataShardNodes[0]), quicserver.ObjectRequest{
+			Bucket:     bucket,
+			Object:     partKey,
+			RangeStart: -1,
+			RangeEnd:   -1,
+			ShardIndex: 0,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("get part %d shard: %w", partNumber, err)
+		}
+		defer reader.Close()
+		partData, err := io.ReadAll(io.LimitReader(reader, shardNodes.Size))
+		if err != nil {
+			return nil, fmt.Errorf("read part %d shard: %w", partNumber, err)
+		}
+		if int64(len(partData)) != shardNodes.Size {
+			return nil, fmt.Errorf("read part %d shard: got %d bytes, want %d", partNumber, len(partData), shardNodes.Size)
+		}
+		return partData, nil
+	}
 
 	// Use the existing reconstructObject from get.go
 	buf, err := b.reconstructObject(ctx, bucket, partKey, shardNodes, enc, shardNodes.Size)

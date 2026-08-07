@@ -102,9 +102,10 @@ func TestPutObjectFullPoolReturns507EndToEnd(t *testing.T) {
 
 	ctx := context.Background()
 	putReq := &s3backend.PutObjectRequest{
-		Bucket: bucket,
-		Key:    "full-pool-object",
-		Body:   bytes.NewReader(bytes.Repeat([]byte{0x1}, 4096)),
+		Bucket:        bucket,
+		Key:           "full-pool-object",
+		Body:          bytes.NewReader(bytes.Repeat([]byte{0x1}, 4096)),
+		ContentLength: 4096,
 	}
 
 	_, err = backend.PutObject(ctx, putReq)

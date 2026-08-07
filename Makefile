@@ -122,10 +122,12 @@ warp-install:
 		GOBIN="$(TOOLS_DIR)" go install github.com/minio/warp@$(WARP_VERSION); \
 	fi
 
-# Local, self-contained correctness and performance run. PERF_PRESET=smoke is
-# suitable for a laptop; PERF_PRESET=compare records longer comparison data.
+# Local, self-contained correctness and performance run. The default smoke
+# preset records every request for 30 seconds per workload; PERF_PRESET=compare
+# uses two-minute samples for before/after decisions.
 e2e-performance: build certs warp-install
 	@PERF_PRESET="$(PERF_PRESET)" PERF_CONFIGS="$(PERF_CONFIGS)" WARP="$(WARP)" \
+		WARP_VERSION="$(WARP_VERSION)" \
 		./scripts/bench/e2e-performance.sh
 
 # Usage: make e2e-performance-compare PERF_BEFORE=/path/to/before PERF_AFTER=/path/to/after

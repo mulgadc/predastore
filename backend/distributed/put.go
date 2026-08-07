@@ -5,13 +5,14 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/quic/quicclient"
-	"github.com/mulgadc/predastore/s3/chunked"
 	s3db "github.com/mulgadc/predastore/s3db"
 )
 
@@ -25,6 +26,13 @@ const arnObjectPrefixPut = "arn:aws:s3:::"
 func mapPutErr(err error) *backend.S3Error {
 	if errors.Is(err, quicclient.ErrInsufficientStorage) {
 		return backend.ErrInsufficientStorageError
+	}
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return backend.NewS3Error(backend.ErrEntityTooLarge, err.Error(), http.StatusBadRequest)
+	}
+	if errors.Is(err, errObjectBodyShort) || errors.Is(err, errObjectBodyLong) {
+		return backend.NewS3Error(backend.ErrInvalidRequest, err.Error(), http.StatusBadRequest)
 	}
 	return backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 }
@@ -50,39 +58,13 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 		ParityShardNodes: make([]uint32, b.rsParityShard),
 	}
 
-	// Write object to a temporary file for RS splitting and QUIC distribution
-	tmpFile, err := os.CreateTemp("", "distributed-put-*")
-	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
-	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
-
-	// Copy body to temp file, handling chunked encoding if needed
-	if req.Body != nil {
-		reader := req.Body
-		if req.IsChunked && req.ContentEncoding == "aws-chunked" {
-			reader = chunked.NewDecoder(req.Body, req.DecodedLength)
-		}
-		_, err = io.Copy(tmpFile, reader)
-		if err != nil {
-			slog.Error("distributed.PutObject: copy to temp file failed", "error", err)
-			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
-		}
-	}
-	if closeErr := tmpFile.Close(); closeErr != nil {
-		slog.Debug("Failed to close temp file", "path", tmpFile.Name(), "error", closeErr)
-	}
-
-	var size int64
-	var poolNearFull bool
-	size, poolNearFull, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
+	poolNearFull, err := b.putObjectViaQUIC(ctx, req.Bucket, req.Key, req.Body, req.ContentLength, objectHash)
 	if err != nil {
 		slog.Error("distributed.PutObject: shard distribution failed", "error", err)
 		return nil, mapPutErr(err)
 	}
 
-	objectToShardNodes.Size = size
+	objectToShardNodes.Size = req.ContentLength
 
 	// Get hash ring placement using objectHash for consistency with storage and retrieval
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
@@ -157,13 +139,23 @@ func (b *Backend) PutObjectFromPath(ctx context.Context, bucket, objectPath stri
 		}
 	}
 
-	var size int64
-	size, _, err = b.putObjectViaQUIC(ctx, bucket, objectPath, objectHash)
+	f, err := os.Open(objectPath)
+	if err != nil {
+		return fmt.Errorf("open object %s: %w", objectPath, err)
+	}
+	defer f.Close()
+
+	stat, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat object %s: %w", objectPath, err)
+	}
+
+	_, err = b.putObjectViaQUIC(ctx, bucket, objectPath, f, stat.Size(), objectHash)
 	if err != nil {
 		return err
 	}
 
-	objectToShardNodes.Size = size
+	objectToShardNodes.Size = stat.Size()
 
 	// Get hash ring placement using objectHash for consistency with putObjectViaQUIC
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)

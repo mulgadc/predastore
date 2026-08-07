@@ -96,9 +96,10 @@ func putTestObject(t *testing.T, be *Backend, bucket, key string, size int) []by
 
 	ctx := context.Background()
 	_, err = be.PutObject(ctx, &backend.PutObjectRequest{
-		Bucket: bucket,
-		Key:    key,
-		Body:   bytes.NewReader(data),
+		Bucket:        bucket,
+		Key:           key,
+		Body:          bytes.NewReader(data),
+		ContentLength: int64(len(data)),
 	})
 	require.NoError(t, err)
 

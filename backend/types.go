@@ -44,14 +44,11 @@ type GetObjectResponse struct {
 
 // PutObjectRequest contains parameters for PutObject operation.
 type PutObjectRequest struct {
-	Bucket          string
-	Key             string
-	Body            io.Reader
-	ContentLength   int64
-	ContentType     string
-	ContentEncoding string
-	IsChunked       bool
-	DecodedLength   int64 // For aws-chunked encoding
+	Bucket        string
+	Key           string
+	Body          io.Reader // decoded object bytes; transport framing is removed by S3 ingress
+	ContentLength int64     // exact decoded object size
+	ContentType   string
 }
 
 // PutObjectResponse contains the result of PutObject operation.
@@ -118,15 +115,12 @@ type CreateMultipartUploadResponse struct {
 
 // UploadPartRequest contains parameters for UploadPart operation.
 type UploadPartRequest struct {
-	Bucket          string
-	Key             string
-	UploadID        string
-	PartNumber      int
-	Body            io.Reader
-	ContentLength   int64
-	ContentEncoding string
-	IsChunked       bool
-	DecodedLength   int64
+	Bucket        string
+	Key           string
+	UploadID      string
+	PartNumber    int
+	Body          io.Reader // decoded part bytes; transport framing is removed by S3 ingress
+	ContentLength int64     // exact decoded part size
 }
 
 // UploadPartResponse contains the result of UploadPart operation.

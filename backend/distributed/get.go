@@ -224,6 +224,41 @@ func (b *Backend) handleRangeWithFullReconstruction(ctx context.Context, req *ba
 
 // getFullObject retrieves the complete object using Reed-Solomon decoding.
 func (b *Backend) getFullObject(ctx context.Context, req *backend.GetObjectRequest, shards ObjectToShardNodes, size int64) (*backend.GetObjectResponse, error) {
+	if size == 0 {
+		return &backend.GetObjectResponse{
+			Body:        io.NopCloser(bytes.NewReader(nil)),
+			ContentType: "application/octet-stream",
+			Size:        0,
+			ETag:        generateDistributedETag(req.Bucket, req.Key),
+			StatusCode:  200,
+		}, nil
+	}
+	if b.rsDataShard == 1 && b.rsParityShard == 0 {
+		if len(shards.DataShardNodes) != 1 {
+			return nil, fmt.Errorf("single-shard object has %d data nodes, want 1", len(shards.DataShardNodes))
+		}
+		reader, err := b.shards.GetShard(ctx, int(shards.DataShardNodes[0]), quicserver.ObjectRequest{
+			Bucket:     req.Bucket,
+			Object:     req.Key,
+			RangeStart: -1,
+			RangeEnd:   -1,
+			ShardIndex: 0,
+		})
+		if err != nil {
+			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+		}
+		return &backend.GetObjectResponse{
+			Body: &limitedReadCloser{
+				Reader: io.LimitReader(reader, size),
+				Closer: reader,
+			},
+			ContentType: "application/octet-stream",
+			Size:        size,
+			ETag:        generateDistributedETag(req.Bucket, req.Key),
+			StatusCode:  200,
+		}, nil
+	}
+
 	// Create RS decoder
 	enc, err := reedsolomon.NewStream(b.rsDataShard, b.rsParityShard)
 	if err != nil {
@@ -231,7 +266,7 @@ func (b *Backend) getFullObject(ctx context.Context, req *backend.GetObjectReque
 	}
 
 	// First try with data shards only
-	shardReaders, err := b.shardReaders(req.Bucket, req.Key, shards, false)
+	shardReaders, err := b.shardReaders(ctx, req.Bucket, req.Key, shards, false)
 	if err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
@@ -285,7 +320,7 @@ func (b *Backend) HeadObject(ctx context.Context, bucket, key string) (*backend.
 // reconstructObject attempts to rebuild an object using parity shards.
 func (b *Backend) reconstructObject(ctx context.Context, bucket, key string, shards ObjectToShardNodes, enc reedsolomon.StreamEncoder, size int64) (*bytes.Buffer, error) {
 	// Get all shard readers including parity
-	shardReaders, err := b.shardReaders(bucket, key, shards, true)
+	shardReaders, err := b.shardReaders(ctx, bucket, key, shards, true)
 	if err != nil {
 		return nil, err
 	}
@@ -328,7 +363,7 @@ func (b *Backend) reconstructObject(ctx context.Context, bucket, key string, sha
 	}
 
 	// Re-read shards with reconstructed data
-	shardReaders, err = b.shardReaders(bucket, key, shards, true)
+	shardReaders, err = b.shardReaders(ctx, bucket, key, shards, true)
 	if err != nil {
 		return nil, err
 	}
@@ -359,4 +394,9 @@ func (b *Backend) reconstructObject(ctx context.Context, bucket, key string, sha
 func generateDistributedETag(bucket, key string) string {
 	hash := s3db.GenObjectHash(bucket, key)
 	return hex.EncodeToString(hash[:16])
+}
+
+type limitedReadCloser struct {
+	io.Reader
+	io.Closer
 }

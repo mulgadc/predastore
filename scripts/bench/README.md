@@ -37,18 +37,24 @@ runs two layers of validation:
 
 1. AWS CLI single PUT and forced multipart upload followed by GET, `diff -q`,
    and SHA-256 comparison of the local source/download files.
-2. Isolated Warp `put`, `multipart-put`, `multipart`, and `get` workloads.
+2. Isolated Warp single-part `put`, `multipart-put`, and full-object `get`
+   workloads. GET fixtures are uploaded through multipart first. Warp's
+   `multipart` workload is intentionally excluded because it benchmarks the
+   separate `GetObject?partNumber=N` API, which Predastore does not implement.
 
-The default `PERF_PRESET=smoke` is intentionally laptop-sized. Record a stable
-comparison run with:
+The default `PERF_PRESET=smoke` records every request for 30 seconds per
+workload and remains laptop-sized. Record a stable two-minute comparison run
+with:
 
     make e2e-performance PERF_PRESET=compare
 
 Results are written below `scripts/bench/results/e2e-performance/` and include
-the exact config, commit/dirty state, tool versions, correctness hashes, server
-logs, Warp logs, and Warp `.json.zst` data. Warp uses unique disposable buckets
-with `--noclear` because Predastore does not implement Warp's batch cleanup
-route; the entire per-run Predastore data directory is removed afterward.
+the exact config, commit/dirty state, host details, correctness hashes, raw
+per-request Warp data, verbose millisecond latency reports, and microsecond
+server latency percentiles. `colo.log` also retains a structured access record
+for every S3 request. Warp uses unique disposable buckets with `--noclear`
+because Predastore does not implement Warp's batch cleanup route; the entire
+per-run Predastore data directory is removed afterward.
 
 Compare matching artifacts from two runs with:
 
@@ -58,8 +64,8 @@ Compare matching artifacts from two runs with:
 
 Useful overrides include `PERF_CONFIGS=4node`, `PERF_DURATION=30s`,
 `PERF_CONCURRENT=4`, `PERF_PUT_SIZE=16MiB`, `PERF_PART_SIZE=8MiB`, and
-`PERF_PARTS=8`. Set `PERF_KEEP_WORK=1` to retain the disposable cluster data
-for diagnosis.
+`PERF_PARTS=8`, and `PERF_GET_SIZE=64MiB`. Set `PERF_KEEP_WORK=1` to retain the
+disposable cluster data for diagnosis.
 
 Raw disk ceiling:
 

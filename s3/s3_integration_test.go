@@ -341,11 +341,6 @@ func runIntegrationSuite(t *testing.T, client *awss3.Client, nodeDataDir string)
 	})
 
 	t.Run("ZeroByteRoundTrip", func(t *testing.T) {
-		// The store-level 0-byte short-circuit (Stage 1) is correct, but the
-		// distributed backend's Reed-Solomon sharding rejects empty bodies
-		// before reaching the store. Tracked by mulga-bm-13; un-skip when fixed.
-		t.Skip("blocked on mulga-bm-13: distributed PutObject rejects 0-byte bodies")
-
 		const key = "empty.bin"
 
 		_, err := client.PutObject(ctx, &awss3.PutObjectInput{

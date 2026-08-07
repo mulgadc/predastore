@@ -26,6 +26,7 @@ const (
 	ErrBucketAlreadyOwnedByYou S3ErrorCode = "BucketAlreadyOwnedByYou"
 	ErrInvalidBucketName       S3ErrorCode = "InvalidBucketName"
 	ErrMissingParameter        S3ErrorCode = "MissingParameter"
+	ErrInvalidRequest          S3ErrorCode = "InvalidRequest"
 	ErrChecksumMismatch        S3ErrorCode = "XAmzContentChecksumMismatch"
 	ErrInsufficientStorage     S3ErrorCode = "InsufficientStorage"
 )
