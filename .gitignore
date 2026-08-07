@@ -33,3 +33,6 @@ clusters/*/logs/
 
 # Bench results
 scripts/bench/results
+
+# rapid property-test replay artifacts, written on failure
+**/testdata/rapid/
