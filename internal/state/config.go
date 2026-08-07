@@ -1,9 +1,7 @@
-package s3db
+package state
 
 import (
 	"time"
-
-	"github.com/hashicorp/raft"
 )
 
 // RaftPeer identifies one voting member. The advertise address is
@@ -23,7 +21,7 @@ type ClusterConfig struct {
 	// StreamLayer carries all raft traffic; Peers lists the voting members
 	// bootstrap uses. Addressing and encryption are the transport's concern,
 	// so neither is configured here.
-	StreamLayer raft.StreamLayer
+	StreamLayer *RPCStreamLayer
 	Peers       []RaftPeer
 
 	// Raft tuning

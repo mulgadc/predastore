@@ -1,4 +1,4 @@
-package s3db
+package state
 
 import (
 	"bytes"
@@ -48,7 +48,7 @@ func TestFSM_Restore_ExceedsSingleTransaction(t *testing.T) {
 
 	// Guard the premise: this payload genuinely cannot fit in one transaction,
 	// so the test would still fail if the old single-Update Restore came back.
-	err := db.Badger.Update(func(txn *badger.Txn) error {
+	err := db.Update(func(txn *badger.Txn) error {
 		for k, v := range data {
 			if err := txn.Set([]byte(k), v); err != nil {
 				return err
@@ -59,10 +59,10 @@ func TestFSM_Restore_ExceedsSingleTransaction(t *testing.T) {
 	require.ErrorIs(t, err, badger.ErrTxnTooBig,
 		"premise broken: payload now fits one txn, so this test no longer exercises the bug")
 
-	require.NoError(t, NewFSM(db.Badger).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
+	require.NoError(t, NewFSM(db).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
 
 	for k, want := range data {
-		got, err := db.Get([]byte(k))
+		got, err := dbGet(db, []byte(k))
 		require.NoError(t, err, "key %s missing after restore", k)
 		assert.Equal(t, want, got)
 	}
@@ -74,19 +74,19 @@ func TestFSM_Restore_ExceedsSingleTransaction(t *testing.T) {
 // own guard.
 func TestFSM_Restore_ClearsPriorState(t *testing.T) {
 	db := newTestDB(t)
-	require.NoError(t, db.Set([]byte("stale/key"), []byte("must not survive")))
+	dbSet(t, db, []byte("stale/key"), []byte("must not survive"))
 
 	sink := &mockSnapshotSink{}
 	require.NoError(t, (&FSMSnapshot{data: map[string][]byte{
 		"fresh/key": []byte("from snapshot"),
 	}}).Persist(sink))
 
-	require.NoError(t, NewFSM(db.Badger).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
+	require.NoError(t, NewFSM(db).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
 
-	got, err := db.Get([]byte("fresh/key"))
+	got, err := dbGet(db, []byte("fresh/key"))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("from snapshot"), got)
 
-	_, err = db.Get([]byte("stale/key"))
+	_, err = dbGet(db, []byte("stale/key"))
 	assert.Error(t, err, "state absent from the snapshot must not survive a restore")
 }

@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/mulgadc/predastore/s3db"
 )
 
 const indexFilename = "db"
@@ -32,7 +31,7 @@ const fragNumReservation = 1 << 20 // 1 048 576
 // extents. All public methods are safe for concurrent use.
 type Store struct {
 	dir   string
-	index *s3db.S3DB
+	index *indexDB
 
 	// Unbounded: entries accumulate as the store touches old segments. Fine at
 	// single-data-dir scale; thousands of distinct segments would want an LRU.
@@ -196,7 +195,7 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("save state: %w", err)
 	}
 
-	store.index, err = s3db.New(filepath.Join(dir, indexFilename))
+	store.index, err = newIndexDB(filepath.Join(dir, indexFilename))
 	if err != nil {
 		return nil, fmt.Errorf("open disk index: %w", err)
 	}

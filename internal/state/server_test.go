@@ -14,7 +14,6 @@ import (
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/s3db"
 )
 
 // procTopo maps node ids to the pipe endpoint their process listens on. It
@@ -39,7 +38,7 @@ func (p procTopo) ListenAddrs(nodeID int) ([]net.Addr, error) {
 
 // startStateProc simulates one process hosting a state replica behind the
 // production wire protocol: raft dial and state ops on one mux.
-func startStateProc(t *testing.T, id uint64, topo procTopo, peers []s3db.RaftPeer) *s3db.RaftNode {
+func startStateProc(t *testing.T, id uint64, topo procTopo, peers []state.RaftPeer) *state.Server {
 	t.Helper()
 
 	pipeTr := transport.NewPipeTransport()
@@ -56,25 +55,24 @@ func startStateProc(t *testing.T, id uint64, topo procTopo, peers []s3db.RaftPee
 		return rpc.OpenStream(ctx, client, int(target), state.OpRaftDial, &state.RaftDial{})
 	}
 
-	layer := s3db.NewRPCStreamLayer(state.RaftAddress(id), dial)
+	layer := state.NewRPCStreamLayer(state.RaftAddress(id), dial)
 	t.Cleanup(func() { layer.Close() })
 
-	cfg := s3db.DefaultClusterConfig()
+	cfg := state.DefaultClusterConfig()
 	cfg.NodeID = id
 	cfg.DataDir = t.TempDir()
 	cfg.Bootstrap = true
 	cfg.StreamLayer = layer
 	cfg.Peers = peers
 
-	node, err := s3db.NewRaftNode(cfg)
+	node, err := state.NewServer(cfg)
 	if err != nil {
-		t.Fatalf("NewRaftNode(%d): %v", id, err)
+		t.Fatalf("NewServer(%d): %v", id, err)
 	}
 	t.Cleanup(func() { node.Close() })
 
-	svc := state.NewService(id, node, layer)
 	mux := rpc.NewMux()
-	svc.Register(mux)
+	node.Register(mux)
 
 	srv, err := rpc.NewServer(rpc.ServerConfig{
 		Mux:          mux,
@@ -84,7 +82,7 @@ func startStateProc(t *testing.T, id uint64, topo procTopo, peers []s3db.RaftPee
 		DrainTimeout: 50 * time.Millisecond,
 	})
 	if err != nil {
-		t.Fatalf("NewServer: %v", err)
+		t.Fatalf("rpc.NewServer: %v", err)
 	}
 	srvCtx, srvCancel := context.WithCancel(context.Background())
 	srvDone := make(chan struct{})
@@ -110,13 +108,13 @@ func startStateCluster(t *testing.T, prefix string) *state.Client {
 		2: prefix + "-proc2",
 		3: prefix + "-proc3",
 	}
-	peers := []s3db.RaftPeer{
+	peers := []state.RaftPeer{
 		{ID: 1, Address: state.RaftAddress(1)},
 		{ID: 2, Address: state.RaftAddress(2)},
 		{ID: 3, Address: state.RaftAddress(3)},
 	}
 
-	nodes := make(map[int]*s3db.RaftNode, len(topo))
+	nodes := make(map[int]*state.Server, len(topo))
 	for id := range topo {
 		nodes[id] = startStateProc(t, uint64(id), topo, peers)
 	}

@@ -15,7 +15,6 @@ import (
 	"github.com/mulgadc/predastore/internal/storage"
 	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/s3db"
 	"github.com/mulgadc/predastore/store"
 )
 
@@ -103,7 +102,7 @@ func TestStorageShardRoundTrip(t *testing.T) {
 	putResp, err := cli.PutShard(ctx, 7, storage.PutRequest{
 		Bucket:     bucket,
 		Object:     object,
-		ObjectHash: s3db.GenObjectHash(bucket, object),
+		ObjectHash: storage.GenObjectHash(bucket, object),
 		ShardSize:  int64(len(shard)),
 		ShardIndex: 0,
 	}, bytes.NewReader(shard))
@@ -149,7 +148,7 @@ func TestStorageShardRoundTrip(t *testing.T) {
 	// Delete, then the shard is gone.
 	delResp, err := cli.DeleteShard(ctx, 7, storage.DeleteRequest{
 		Bucket: bucket, Object: object,
-		ObjectHash: s3db.GenObjectHash(bucket, object), ShardIndex: 0,
+		ObjectHash: storage.GenObjectHash(bucket, object), ShardIndex: 0,
 	})
 	if err != nil {
 		t.Fatalf("DeleteShard: %v", err)

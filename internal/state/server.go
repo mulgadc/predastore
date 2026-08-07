@@ -1,4 +1,4 @@
-package s3db
+package state
 
 import (
 	"encoding/json"
@@ -15,11 +15,16 @@ import (
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 )
 
-// RaftNode wraps Raft consensus with Badger storage.
-type RaftNode struct {
+// Server is one state replica: the raft node itself, its FSM and badger
+// store, and the rpc handlers fronting them (see handlers.go). A process
+// running several replicas builds one Server per node, each on its own rpc
+// server, so a Server never learns that it has siblings.
+type Server struct {
+	id        uint64
 	config    *ClusterConfig
 	raft      *raft.Raft
 	fsm       *FSM
+	layer     *RPCStreamLayer
 	transport *raft.NetworkTransport
 	logStore  raft.LogStore
 	stable    raft.StableStore
@@ -27,16 +32,16 @@ type RaftNode struct {
 	badgerDB  *badger.DB
 }
 
-// NewRaftNode creates and initializes a new Raft node.
-func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
+// NewServer creates and initializes a state replica from its cluster config.
+func NewServer(config *ClusterConfig) (*Server, error) {
 	// Fail closed: the raft transport carries committed log entries (object
 	// metadata, IAM state) and the stream layer is what encrypts them. There
 	// is no self-hosted fallback.
 	if config.StreamLayer == nil {
-		return nil, fmt.Errorf("s3db raft: a stream layer is required; refusing to start without one")
+		return nil, fmt.Errorf("state: a stream layer is required; refusing to start without one")
 	}
 
-	node := &RaftNode{config: config}
+	node := &Server{id: config.NodeID, config: config, layer: config.StreamLayer}
 
 	// Create data directories
 	dataDir := config.DataDir
@@ -123,7 +128,7 @@ func NewRaftNode(config *ClusterConfig) (*RaftNode, error) {
 }
 
 // bootstrap initializes the cluster with all configured nodes.
-func (n *RaftNode) bootstrap() error {
+func (n *Server) bootstrap() error {
 	// Peers carry node-identifying addresses that the stream layer's dial
 	// function resolves.
 	servers := make([]raft.Server, 0, len(n.config.Peers))
@@ -146,7 +151,7 @@ func (n *RaftNode) bootstrap() error {
 }
 
 // Put stores a key-value pair through Raft consensus.
-func (n *RaftNode) Put(table, key string, value []byte) error {
+func (n *Server) Put(table, key string, value []byte) error {
 	if n.raft.State() != raft.Leader {
 		return ErrNotLeader
 	}
@@ -179,7 +184,7 @@ func (n *RaftNode) Put(table, key string, value []byte) error {
 }
 
 // Delete removes a key through Raft consensus.
-func (n *RaftNode) Delete(table, key string) error {
+func (n *Server) Delete(table, key string) error {
 	if n.raft.State() != raft.Leader {
 		return ErrNotLeader
 	}
@@ -213,34 +218,34 @@ func (n *RaftNode) Delete(table, key string) error {
 // Get reads a value from the local store
 // Note: This may return stale data on followers. For strong consistency,
 // use GetConsistent which forwards reads to the leader.
-func (n *RaftNode) Get(table, key string) ([]byte, error) {
+func (n *Server) Get(table, key string) ([]byte, error) {
 	return n.fsm.Get(table, key)
 }
 
 // Scan iterates over keys with prefix in the given table.
-func (n *RaftNode) Scan(table, prefix string, fn func(key string, value []byte) error) error {
+func (n *Server) Scan(table, prefix string, fn func(key string, value []byte) error) error {
 	return n.fsm.Scan(table, prefix, fn)
 }
 
 // IsLeader returns true if this node is the current Raft leader.
-func (n *RaftNode) IsLeader() bool {
+func (n *Server) IsLeader() bool {
 	return n.raft.State() == raft.Leader
 }
 
 // LeaderAddr returns the address of the current leader.
-func (n *RaftNode) LeaderAddr() string {
+func (n *Server) LeaderAddr() string {
 	addr, _ := n.raft.LeaderWithID()
 	return string(addr)
 }
 
 // LeaderID returns the ID of the current leader.
-func (n *RaftNode) LeaderID() string {
+func (n *Server) LeaderID() string {
 	_, id := n.raft.LeaderWithID()
 	return string(id)
 }
 
 // WaitForLeader blocks until a leader is elected or timeout.
-func (n *RaftNode) WaitForLeader(timeout time.Duration) error {
+func (n *Server) WaitForLeader(timeout time.Duration) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -260,7 +265,7 @@ func (n *RaftNode) WaitForLeader(timeout time.Duration) error {
 }
 
 // Stats returns Raft statistics.
-func (n *RaftNode) Stats() map[string]string {
+func (n *Server) Stats() map[string]string {
 	return n.raft.Stats()
 }
 
@@ -270,23 +275,23 @@ func (n *RaftNode) Stats() map[string]string {
 // 2. Attempt graceful Raft shutdown with 5s timeout
 // 3. Close BoltDB log store
 // 4. Close Badger FSM storage.
-func (n *RaftNode) Close() error {
-	slog.Info("RaftNode: starting shutdown")
+func (n *Server) Close() error {
+	slog.Info("state: starting shutdown")
 
 	// Close transport first to stop all network activity.
 	// This prevents election loops when other nodes have already stopped,
 	// and causes immediate connection errors instead of timeouts.
 	if n.transport != nil {
-		slog.Info("RaftNode: closing transport")
+		slog.Info("state: closing transport")
 		if err := n.transport.Close(); err != nil {
-			slog.Warn("RaftNode: failed to close transport", "error", err)
+			slog.Warn("state: failed to close transport", "error", err)
 		}
 	}
 
 	// Shutdown Raft with a timeout to avoid blocking forever
 	// when we can't reach quorum (other nodes already stopped)
 	if n.raft != nil {
-		slog.Info("RaftNode: initiating raft shutdown")
+		slog.Info("state: initiating raft shutdown")
 		future := n.raft.Shutdown()
 
 		// Wait for shutdown with timeout
@@ -298,37 +303,37 @@ func (n *RaftNode) Close() error {
 		select {
 		case err := <-done:
 			if err != nil {
-				slog.Warn("RaftNode: raft shutdown returned error", "error", err)
+				slog.Warn("state: raft shutdown returned error", "error", err)
 			} else {
-				slog.Info("RaftNode: raft shutdown completed gracefully")
+				slog.Info("state: raft shutdown completed gracefully")
 			}
 		case <-time.After(5 * time.Second):
-			slog.Warn("RaftNode: raft shutdown timed out after 5s, forcing close")
+			slog.Warn("state: raft shutdown timed out after 5s, forcing close")
 		}
 	}
 
 	// Close BoltDB log store
 	if store, ok := n.logStore.(*raftboltdb.BoltStore); ok {
-		slog.Info("RaftNode: closing BoltDB log store")
+		slog.Info("state: closing BoltDB log store")
 		if err := store.Close(); err != nil {
-			slog.Warn("RaftNode: failed to close BoltDB log store", "error", err)
+			slog.Warn("state: failed to close BoltDB log store", "error", err)
 		}
 	}
 
 	// Close Badger FSM storage
 	if n.badgerDB != nil {
-		slog.Info("RaftNode: closing Badger DB")
+		slog.Info("state: closing Badger DB")
 		if err := n.badgerDB.Close(); err != nil {
-			slog.Warn("RaftNode: failed to close Badger DB", "error", err)
+			slog.Warn("state: failed to close Badger DB", "error", err)
 		}
 	}
 
-	slog.Info("RaftNode: shutdown complete")
+	slog.Info("state: shutdown complete")
 	return nil
 }
 
 // Join adds a new node to the cluster (must be called on leader).
-func (n *RaftNode) Join(nodeID string, addr string) error {
+func (n *Server) Join(nodeID string, addr string) error {
 	if n.raft.State() != raft.Leader {
 		return ErrNotLeader
 	}
@@ -363,7 +368,7 @@ func (n *RaftNode) Join(nodeID string, addr string) error {
 }
 
 // Leave removes this node from the cluster.
-func (n *RaftNode) Leave() error {
+func (n *Server) Leave() error {
 	if n.raft.State() == raft.Leader {
 		// Transfer leadership first
 		future := n.raft.LeadershipTransfer()
@@ -374,8 +379,3 @@ func (n *RaftNode) Leave() error {
 
 	return nil
 }
-
-// Errors.
-var (
-	ErrNotLeader = fmt.Errorf("not the leader")
-)

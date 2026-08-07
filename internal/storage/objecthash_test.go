@@ -1,4 +1,4 @@
-package s3db
+package storage
 
 import (
 	"crypto/sha256"

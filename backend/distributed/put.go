@@ -12,7 +12,6 @@ import (
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/internal/storage"
 	"github.com/mulgadc/predastore/s3/chunked"
-	s3db "github.com/mulgadc/predastore/s3db"
 )
 
 // arnObjectPrefix is the ARN prefix for object keys
@@ -42,7 +41,7 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 		return nil, err
 	}
 
-	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
+	objectHash := storage.GenObjectHash(req.Bucket, req.Key)
 
 	objectToShardNodes := ObjectToShardNodes{
 		Object:           objectHash,

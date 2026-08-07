@@ -1,4 +1,4 @@
-package s3db
+package store
 
 import (
 	"fmt"
@@ -8,12 +8,12 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestS3DB(t *testing.T) {
+func TestIndexDB(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	t.Log("tmpDir", tmpDir)
 
-	db, err := New(tmpDir)
+	db, err := newIndexDB(tmpDir)
 
 	assert.NoError(t, err)
 	assert.NotNil(t, db)
@@ -33,10 +33,10 @@ func TestS3DB(t *testing.T) {
 	assert.Equal(t, []byte("test"), value)
 }
 
-func TestS3DB_BucketsByAccountID(t *testing.T) {
+func TestIndexDB_BucketsByAccountID(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	db, err := New(tmpDir)
+	db, err := newIndexDB(tmpDir)
 	assert.NoError(t, err)
 	assert.NotNil(t, db)
 	defer db.Close()
@@ -101,12 +101,12 @@ func TestS3DB_BucketsByAccountID(t *testing.T) {
 	assert.Len(t, keys3, expectedCount3, "Expected %d buckets for account 555555555555, got %d", expectedCount3, len(keys3))
 }
 
-func TestS3DB_ObjectsByPrefix(t *testing.T) {
+func TestIndexDB_ObjectsByPrefix(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	t.Log("tmpDir", tmpDir)
 
-	db, err := New(tmpDir)
+	db, err := newIndexDB(tmpDir)
 	assert.NoError(t, err)
 	assert.NotNil(t, db)
 	defer db.Close()
@@ -245,12 +245,12 @@ func TestS3DB_ObjectsByPrefix(t *testing.T) {
 		"Expected %d total objects in bucket, got %d", totalObjects, len(allKeys))
 }
 
-func TestS3DB_MultipleBucketsMultiplePrefixes(t *testing.T) {
+func TestIndexDB_MultipleBucketsMultiplePrefixes(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	t.Log("tmpDir", tmpDir)
 
-	db, err := New(tmpDir)
+	db, err := newIndexDB(tmpDir)
 	assert.NoError(t, err)
 	assert.NotNil(t, db)
 	defer db.Close()

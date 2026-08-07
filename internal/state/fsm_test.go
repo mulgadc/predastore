@@ -1,110 +1,55 @@
-package s3db
+package state
 
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"io"
-	"os"
 	"testing"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-var errTest = errors.New("test error")
-
-func newTestDB(t *testing.T) *S3DB {
+// newTestDB opens a badger store the FSM can be pointed at directly, standing
+// in for the one the raft node opens under its data dir.
+func newTestDB(t *testing.T) *badger.DB {
 	t.Helper()
-	tmpDir := t.TempDir()
-	db, err := New(tmpDir)
+	db, err := badger.Open(badger.DefaultOptions(t.TempDir()).WithLoggingLevel(badger.WARNING))
 	require.NoError(t, err)
 	t.Cleanup(func() { db.Close() })
 	return db
 }
 
-func TestS3DB_Exists(t *testing.T) {
-	db := newTestDB(t)
-
-	t.Run("key not found", func(t *testing.T) {
-		exists, err := db.Exists([]byte("nonexistent"))
-		require.NoError(t, err)
-		assert.False(t, exists)
-	})
-
-	t.Run("key exists", func(t *testing.T) {
-		require.NoError(t, db.Set([]byte("mykey"), []byte("myvalue")))
-
-		exists, err := db.Exists([]byte("mykey"))
-		require.NoError(t, err)
-		assert.True(t, exists)
-	})
+// dbSet writes a raw key, bypassing raft: the FSM's own read path is what is
+// under test, not the consensus write path.
+func dbSet(t *testing.T, db *badger.DB, key, value []byte) {
+	t.Helper()
+	require.NoError(t, db.Update(func(txn *badger.Txn) error {
+		return txn.Set(key, value)
+	}))
 }
 
-func TestS3DB_Delete(t *testing.T) {
-	db := newTestDB(t)
-
-	require.NoError(t, db.Set([]byte("delkey"), []byte("delval")))
-
-	// Verify it exists
-	val, err := db.Get([]byte("delkey"))
-	require.NoError(t, err)
-	assert.Equal(t, []byte("delval"), val)
-
-	// Delete it
-	require.NoError(t, db.Delete([]byte("delkey")))
-
-	// Verify it's gone
-	_, err = db.Get([]byte("delkey"))
-	assert.Error(t, err)
+// dbGet reads a raw key back.
+func dbGet(db *badger.DB, key []byte) ([]byte, error) {
+	var value []byte
+	err := db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(key)
+		if err != nil {
+			return err
+		}
+		value, err = item.ValueCopy(nil)
+		return err
+	})
+	return value, err
 }
-
-func TestS3DB_Scan(t *testing.T) {
-	db := newTestDB(t)
-
-	// Insert test data
-	require.NoError(t, db.Set([]byte("prefix/a"), []byte("va")))
-	require.NoError(t, db.Set([]byte("prefix/b"), []byte("vb")))
-	require.NoError(t, db.Set([]byte("prefix/c"), []byte("vc")))
-	require.NoError(t, db.Set([]byte("other/x"), []byte("vx")))
-
-	t.Run("scan with prefix", func(t *testing.T) {
-		var keys []string
-		err := db.Scan([]byte("prefix/"), func(key, value []byte) error {
-			keys = append(keys, string(key))
-			return nil
-		})
-		require.NoError(t, err)
-		assert.Len(t, keys, 3)
-	})
-
-	t.Run("scan all", func(t *testing.T) {
-		var count int
-		err := db.Scan(nil, func(key, value []byte) error {
-			count++
-			return nil
-		})
-		require.NoError(t, err)
-		assert.Equal(t, 4, count)
-	})
-
-	t.Run("scan with callback error", func(t *testing.T) {
-		err := db.Scan([]byte("prefix/"), func(key, value []byte) error {
-			return errTest
-		})
-		assert.ErrorIs(t, err, errTest)
-	})
-}
-
-// FSM Snapshot/Restore tests
 
 func TestFSM_Snapshot(t *testing.T) {
 	db := newTestDB(t)
-	fsm := NewFSM(db.Badger)
+	fsm := NewFSM(db)
 
-	// Add some data via FSM
-	require.NoError(t, db.Set([]byte("t/key1"), []byte("val1")))
-	require.NoError(t, db.Set([]byte("t/key2"), []byte("val2")))
+	dbSet(t, db, []byte("t/key1"), []byte("val1"))
+	dbSet(t, db, []byte("t/key2"), []byte("val2"))
 
 	snap, err := fsm.Snapshot()
 	require.NoError(t, err)
@@ -119,7 +64,7 @@ func TestFSM_Snapshot(t *testing.T) {
 
 func TestFSM_Snapshot_Empty(t *testing.T) {
 	db := newTestDB(t)
-	fsm := NewFSM(db.Badger)
+	fsm := NewFSM(db)
 
 	snap, err := fsm.Snapshot()
 	require.NoError(t, err)
@@ -131,10 +76,10 @@ func TestFSM_Snapshot_Empty(t *testing.T) {
 
 func TestFSM_Restore(t *testing.T) {
 	db := newTestDB(t)
-	fsm := NewFSM(db.Badger)
+	fsm := NewFSM(db)
 
 	// Add pre-existing data
-	require.NoError(t, db.Set([]byte("old/key"), []byte("old-val")))
+	dbSet(t, db, []byte("old/key"), []byte("old-val"))
 
 	// Build the snapshot stream in the on-wire frame format via Persist.
 	snap := &FSMSnapshot{data: map[string][]byte{
@@ -148,15 +93,15 @@ func TestFSM_Restore(t *testing.T) {
 	require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(sink.buf))))
 
 	// Old data should be gone
-	_, err := db.Get([]byte("old/key"))
+	_, err := dbGet(db, []byte("old/key"))
 	assert.Error(t, err)
 
 	// New data should be present
-	val, err := db.Get([]byte("new/key1"))
+	val, err := dbGet(db, []byte("new/key1"))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("new-val1"), val)
 
-	val, err = db.Get([]byte("new/key2"))
+	val, err = dbGet(db, []byte("new/key2"))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("new-val2"), val)
 }
@@ -177,9 +122,9 @@ func TestFSMSnapshot_Persist(t *testing.T) {
 
 	// The stream must round-trip byte-exact through Restore.
 	db := newTestDB(t)
-	require.NoError(t, NewFSM(db.Badger).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
+	require.NoError(t, NewFSM(db).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
 	for k, v := range snap.data {
-		got, err := db.Get([]byte(k))
+		got, err := dbGet(db, []byte(k))
 		require.NoError(t, err)
 		assert.Equal(t, v, got)
 	}
@@ -200,9 +145,9 @@ func TestFSM_SnapshotRestore_BinaryKeyRoundTrip(t *testing.T) {
 	val := []byte("shard-metadata")
 
 	src := newTestDB(t)
-	require.NoError(t, src.Set(binKey, val))
+	dbSet(t, src, binKey, val)
 
-	snap, err := NewFSM(src.Badger).Snapshot()
+	snap, err := NewFSM(src).Snapshot()
 	require.NoError(t, err)
 	sink := &mockSnapshotSink{}
 	require.NoError(t, snap.(*FSMSnapshot).Persist(sink))
@@ -215,8 +160,8 @@ func TestFSM_SnapshotRestore_BinaryKeyRoundTrip(t *testing.T) {
 
 	// Restore into a fresh store and confirm the exact key resolves.
 	dst := newTestDB(t)
-	require.NoError(t, NewFSM(dst.Badger).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
-	got, err := dst.Get(binKey)
+	require.NoError(t, NewFSM(dst).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
+	got, err := dbGet(dst, binKey)
 	require.NoError(t, err)
 	assert.Equal(t, val, got)
 }
@@ -231,9 +176,9 @@ func TestFSM_Restore_LegacyJSON(t *testing.T) {
 	require.NoError(t, err)
 
 	db := newTestDB(t)
-	require.NoError(t, NewFSM(db.Badger).Restore(io.NopCloser(bytes.NewReader(legacy))))
+	require.NoError(t, NewFSM(db).Restore(io.NopCloser(bytes.NewReader(legacy))))
 
-	got, err := db.Get([]byte("objects/legacy-key"))
+	got, err := dbGet(db, []byte("objects/legacy-key"))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("legacy-val"), got)
 }
@@ -267,24 +212,4 @@ func (m *mockSnapshotSink) Cancel() error {
 
 func (m *mockSnapshotSink) ID() string {
 	return "mock-snap"
-}
-
-func TestS3DB_Close(t *testing.T) {
-	tmpDir := t.TempDir()
-	db, err := New(tmpDir)
-	require.NoError(t, err)
-
-	err = db.Close()
-	assert.NoError(t, err)
-}
-
-// s3db.New error path.
-func TestS3DB_New_BadDir(t *testing.T) {
-	db, err := New("/nonexistent/path/that/should/fail")
-	if err == nil {
-		db.Close()
-		os.RemoveAll("/nonexistent/path/that/should/fail")
-	}
-	// BadgerDB may or may not fail on this path depending on permissions
-	// Just verify it doesn't panic
 }

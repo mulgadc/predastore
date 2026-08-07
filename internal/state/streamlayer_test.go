@@ -1,10 +1,9 @@
-package s3db_test
+package state_test
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
 	"testing"
@@ -12,8 +11,8 @@ import (
 
 	"github.com/hashicorp/raft"
 	"github.com/mulgadc/predastore/internal/rpc"
+	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/s3db"
 )
 
 const opRaftDialTest rpc.Opcode = 100
@@ -35,36 +34,16 @@ func (h *raftDialHeader) Unmarshal(b []byte) error {
 	return json.Unmarshal(b, h)
 }
 
-// procTopo maps node ids to the pipe endpoint their process listens on. It
-// stands in for the cluster topology the rpc layer resolves node ids through.
-type procTopo map[int]string
-
-func (p procTopo) NodeAddr(nodeID int) (net.Addr, error) {
-	name, ok := p[nodeID]
-	if !ok {
-		return nil, fmt.Errorf("unknown node %d", nodeID)
-	}
-	return transport.ResolveAddr(string(transport.NetworkPipe), name)
-}
-
-func (p procTopo) ListenAddrs(nodeID int) ([]net.Addr, error) {
-	addr, err := p.NodeAddr(nodeID)
-	if err != nil {
-		return nil, err
-	}
-	return []net.Addr{addr}, nil
-}
-
 // raftTestProc simulates one process hosting one raft node: an rpc server on
 // its own pipe endpoint routing raft dials to the node's stream layer.
 type raftTestProc struct {
-	node  *s3db.RaftNode
-	layer *s3db.RPCStreamLayer
+	node  *state.Server
+	layer *state.RPCStreamLayer
 }
 
 // startRaftProc wires a raft node over the rpc stream layer. topo maps every
 // node id to its process's pipe endpoint.
-func startRaftProc(t *testing.T, id uint64, topo procTopo, peers []s3db.RaftPeer) *raftTestProc {
+func startRaftProc(t *testing.T, id uint64, topo procTopo, peers []state.RaftPeer) *raftTestProc {
 	t.Helper()
 
 	pipeTr := transport.NewPipeTransport()
@@ -83,7 +62,7 @@ func startRaftProc(t *testing.T, id uint64, topo procTopo, peers []s3db.RaftPeer
 		return rpc.OpenStream(ctx, client, int(target), opRaftDialTest, &raftDialHeader{Target: target})
 	}
 
-	layer := s3db.NewRPCStreamLayer(fmt.Sprintf("node-%d", id), dial)
+	layer := state.NewRPCStreamLayer(fmt.Sprintf("node-%d", id), dial)
 	t.Cleanup(func() { layer.Close() })
 
 	mux := rpc.NewMux()
@@ -103,7 +82,7 @@ func startRaftProc(t *testing.T, id uint64, topo procTopo, peers []s3db.RaftPeer
 		DrainTimeout: 50 * time.Millisecond,
 	})
 	if err != nil {
-		t.Fatalf("NewServer: %v", err)
+		t.Fatalf("rpc.NewServer: %v", err)
 	}
 	srvCtx, srvCancel := context.WithCancel(context.Background())
 	srvDone := make(chan struct{})
@@ -116,16 +95,16 @@ func startRaftProc(t *testing.T, id uint64, topo procTopo, peers []s3db.RaftPeer
 		<-srvDone
 	})
 
-	cfg := s3db.DefaultClusterConfig()
+	cfg := state.DefaultClusterConfig()
 	cfg.NodeID = id
 	cfg.DataDir = t.TempDir()
 	cfg.Bootstrap = true
 	cfg.StreamLayer = layer
 	cfg.Peers = peers
 
-	node, err := s3db.NewRaftNode(cfg)
+	node, err := state.NewServer(cfg)
 	if err != nil {
-		t.Fatalf("NewRaftNode(%d): %v", id, err)
+		t.Fatalf("NewServer(%d): %v", id, err)
 	}
 	t.Cleanup(func() { node.Close() })
 
@@ -140,7 +119,7 @@ func TestRaftClusterOverRPCStreamLayer(t *testing.T) {
 		2: "raft-sl-proc2",
 		3: "raft-sl-proc3",
 	}
-	peers := []s3db.RaftPeer{
+	peers := []state.RaftPeer{
 		{ID: 1, Address: "node-1"},
 		{ID: 2, Address: "node-2"},
 		{ID: 3, Address: "node-3"},
@@ -155,7 +134,7 @@ func TestRaftClusterOverRPCStreamLayer(t *testing.T) {
 	if err := procs[1].node.WaitForLeader(15 * time.Second); err != nil {
 		t.Fatalf("WaitForLeader: %v", err)
 	}
-	var leader *s3db.RaftNode
+	var leader *state.Server
 	for _, p := range procs {
 		if p.node.IsLeader() {
 			leader = p.node

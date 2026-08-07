@@ -18,8 +18,8 @@ import (
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/multipart"
 	"github.com/mulgadc/predastore/internal/state"
+	"github.com/mulgadc/predastore/internal/storage"
 	"github.com/mulgadc/predastore/s3/chunked"
-	s3db "github.com/mulgadc/predastore/s3db"
 )
 
 // multipartUploadKey generates the key for storing upload metadata.
@@ -161,7 +161,7 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 	// Store the part data using the existing PutObject mechanism
 	// Use a deterministic path based on uploadID and partNumber for consistent hash ring placement
 	partKey := partObjectKey(req.Bucket, req.Key, req.UploadID, req.PartNumber)
-	objectHash := s3db.GenObjectHash(req.Bucket, partKey)
+	objectHash := storage.GenObjectHash(req.Bucket, partKey)
 
 	// Use deterministic temp file path based on upload info (like filesystem backend does)
 	// This ensures consistent hash ring placement for retries
@@ -381,7 +381,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	}
 
 	// Store the final object using PutObject mechanism
-	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
+	objectHash := storage.GenObjectHash(req.Bucket, req.Key)
 
 	if _, _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash); err != nil {
 		slog.Error("Failed to store final object", "uploadID", req.UploadID, "error", err)

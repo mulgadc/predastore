@@ -14,8 +14,9 @@ import (
 // ErrNotFound is returned by reads when no replica holds the key.
 var ErrNotFound = errors.New("state key not found")
 
-// ErrNotLeader is returned by writes no replica would accept as leader, which
-// usually means an election is still settling.
+// ErrNotLeader is returned by a Server write this replica cannot commit, and
+// by client writes no replica would accept as leader, which usually means an
+// election is still settling.
 var ErrNotLeader = errors.New("state replica is not the leader")
 
 // Item is one key-value pair returned by a scan.

@@ -62,7 +62,7 @@ func (b *Backend) CreateBucket(ctx context.Context, req *backend.CreateBucketReq
 		return nil, backend.NewS3Error(backend.ErrInternalError, "failed to encode bucket metadata: "+err.Error(), 500)
 	}
 
-	// Store in s3db
+	// Store in global state
 	if err := b.globalState.Put(TableBuckets, req.Bucket, buf.Bytes()); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, "failed to store bucket: "+err.Error(), 500)
 	}

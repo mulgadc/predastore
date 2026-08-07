@@ -13,7 +13,6 @@ import (
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/internal/storage"
-	s3db "github.com/mulgadc/predastore/s3db"
 )
 
 // GetObject retrieves an object using Reed-Solomon decoding.
@@ -296,7 +295,7 @@ func (b *Backend) reconstructObject(ctx context.Context, bucket, key string, sha
 
 	for i := range reconstruction {
 		if shardReaders[i] == nil {
-			objHash := s3db.GenObjectHash(bucket, key)
+			objHash := storage.GenObjectHash(bucket, key)
 			filename := fmt.Sprintf("%s.%d", hex.EncodeToString(objHash[:]), i)
 			outfn := filepath.Join(os.TempDir(), filename)
 
@@ -357,6 +356,6 @@ func (b *Backend) reconstructObject(ctx context.Context, bucket, key string, sha
 
 // generateDistributedETag creates an ETag for a distributed object.
 func generateDistributedETag(bucket, key string) string {
-	hash := s3db.GenObjectHash(bucket, key)
+	hash := storage.GenObjectHash(bucket, key)
 	return hex.EncodeToString(hash[:16])
 }

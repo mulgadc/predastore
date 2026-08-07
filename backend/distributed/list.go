@@ -19,7 +19,7 @@ const (
 	arnObjectPrefix = "arn:aws:s3:::"
 )
 
-// ListBuckets returns a list of buckets from s3db filtered by account.
+// ListBuckets returns a list of buckets from global state filtered by account.
 func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.ListBucketsResponse, error) {
 	bucketMap := make(map[string]backend.BucketInfo)
 
@@ -76,7 +76,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
 	}
 
-	// Check if bucket exists (in config or s3db)
+	// Check if bucket exists (in config or global state)
 	_, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket})
 	if err != nil {
 		return nil, err

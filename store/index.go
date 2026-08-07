@@ -1,38 +1,39 @@
-package s3db
+package store
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 
 	"github.com/dgraph-io/badger/v4"
 )
 
-type S3DB struct {
+// indexDB is the badger handle behind the store's on-disk index, mapping
+// shard keys to extents.
+type indexDB struct {
 	Badger *badger.DB
 }
 
-// DB functions.
-func New(dir string) (s3db *S3DB, err error) {
-	s3db = &S3DB{}
-	s3db.Badger, err = badger.Open(badger.DefaultOptions(dir).WithLoggingLevel(badger.WARNING))
+// newIndexDB opens the index in dir.
+func newIndexDB(dir string) (idx *indexDB, err error) {
+	idx = &indexDB{}
+	idx.Badger, err = badger.Open(badger.DefaultOptions(dir).WithLoggingLevel(badger.WARNING))
 	if err != nil {
 		return nil, err
 	}
-	return s3db, nil
+	return idx, nil
 }
 
-func (s3db *S3DB) Close() (err error) {
-	err = s3db.Badger.Close()
+func (idx *indexDB) Close() (err error) {
+	err = idx.Badger.Close()
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s3db *S3DB) Exists(key []byte) (bool, error) {
+func (idx *indexDB) Exists(key []byte) (bool, error) {
 	var exists bool
-	err := s3db.Badger.View(
+	err := idx.Badger.View(
 		func(tx *badger.Txn) error {
 			if val, err := tx.Get(key); err != nil {
 				return err
@@ -47,10 +48,10 @@ func (s3db *S3DB) Exists(key []byte) (bool, error) {
 	return exists, err
 }
 
-func (s3db *S3DB) Get(key []byte) ([]byte, error) {
+func (idx *indexDB) Get(key []byte) ([]byte, error) {
 	var value []byte
 
-	return value, s3db.Badger.View(
+	return value, idx.Badger.View(
 		func(tx *badger.Txn) error {
 			item, err := tx.Get(key)
 			if err != nil {
@@ -65,23 +66,23 @@ func (s3db *S3DB) Get(key []byte) ([]byte, error) {
 		})
 }
 
-func (s3db *S3DB) Set(key, value []byte) error {
-	return s3db.Badger.Update(
+func (idx *indexDB) Set(key, value []byte) error {
+	return idx.Badger.Update(
 		func(txn *badger.Txn) error {
 			return txn.Set(key, value)
 		})
 }
 
-func (s3db *S3DB) Delete(key []byte) error {
-	return s3db.Badger.Update(
+func (idx *indexDB) Delete(key []byte) error {
+	return idx.Badger.Update(
 		func(txn *badger.Txn) error {
 			return txn.Delete(key)
 		})
 }
 
-func (s3db *S3DB) ListKeys(prefix []byte) ([][]byte, error) {
+func (idx *indexDB) ListKeys(prefix []byte) ([][]byte, error) {
 	var keys [][]byte
-	err := s3db.Badger.View(
+	err := idx.Badger.View(
 		func(tx *badger.Txn) error {
 			opts := badger.DefaultIteratorOptions
 			opts.Prefix = prefix
@@ -101,8 +102,8 @@ func (s3db *S3DB) ListKeys(prefix []byte) ([][]byte, error) {
 }
 
 // Scan iterates over keys with the given prefix and calls the callback for each key-value pair.
-func (s3db *S3DB) Scan(prefix []byte, fn func(key, value []byte) error) error {
-	return s3db.Badger.View(func(tx *badger.Txn) error {
+func (idx *indexDB) Scan(prefix []byte, fn func(key, value []byte) error) error {
+	return idx.Badger.View(func(tx *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.Prefix = prefix
 		it := tx.NewIterator(opts)
@@ -123,9 +124,4 @@ func (s3db *S3DB) Scan(prefix []byte, fn func(key, value []byte) error) error {
 		}
 		return nil
 	})
-}
-
-func GenObjectHash(bucket string, object string) [32]byte {
-	objectKey := fmt.Sprintf("%s/%s", bucket, object)
-	return sha256.Sum256([]byte(objectKey))
 }

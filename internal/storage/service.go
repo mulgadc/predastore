@@ -13,7 +13,6 @@ import (
 
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/s3db"
 	"github.com/mulgadc/predastore/store"
 )
 
@@ -88,7 +87,7 @@ func (s *Service) handlePut(ctx context.Context, h ShardRequest, stream transpor
 func (s *Service) handleGet(ctx context.Context, h ShardRequest, stream transport.Stream) error {
 	st := s.store
 
-	objectHash := s3db.GenObjectHash(h.Bucket, h.Object)
+	objectHash := GenObjectHash(h.Bucket, h.Object)
 	reader, err := st.Lookup(objectHash, h.ShardIndex)
 	if err != nil {
 		return respondShard(stream, &ShardResponse{Err: ErrCodeNotFound})

@@ -24,7 +24,6 @@ import (
 	"github.com/mulgadc/predastore/internal/transport"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/predastore/s3"
-	"github.com/mulgadc/predastore/s3db"
 	"github.com/mulgadc/predastore/store"
 	"golang.org/x/sync/errgroup"
 )
@@ -51,18 +50,18 @@ type Runtime struct {
 	client   *rpc.Client
 	trs      []transport.Transport
 	basePath string
-	// raftNodes back WaitReady; consensus is what the S3 frontend waits on.
-	raftNodes []*s3db.RaftNode
+	// replicas back WaitReady; consensus is what the S3 frontend waits on.
+	replicas []*state.Server
 }
 
 // raftPeers maps state replica node ids to the raft members they become. The
 // address is the node key the stream layer resolves through the topology, so
 // it stays valid however the replica is reached.
-func raftPeers(replicaIDs []int) []s3db.RaftPeer {
-	peers := make([]s3db.RaftPeer, len(replicaIDs))
+func raftPeers(replicaIDs []int) []state.RaftPeer {
+	peers := make([]state.RaftPeer, len(replicaIDs))
 	for i, id := range replicaIDs {
 		u := uint64(id) //nolint:gosec // G115: node ids are small positives from a validated topology.
-		peers[i] = s3db.RaftPeer{ID: u, Address: state.RaftAddress(u)}
+		peers[i] = state.RaftPeer{ID: u, Address: state.RaftAddress(u)}
 	}
 	return peers
 }
@@ -189,7 +188,7 @@ func (rt *Runtime) addNode(
 	topo *topology.Topology,
 	n topology.Node,
 	raftDial func(context.Context, raft.ServerAddress) (transport.Stream, error),
-	peers []s3db.RaftPeer,
+	peers []state.RaftPeer,
 	storeOpts []store.Option,
 ) error {
 	id := uint64(n.ID) //nolint:gosec // G115: validated positive node ids.
@@ -206,8 +205,8 @@ func (rt *Runtime) addNode(
 
 	switch n.Role {
 	case topology.RoleStateReplica:
-		layer := s3db.NewRPCStreamLayer(state.RaftAddress(id), raftDial)
-		ccfg := s3db.DefaultClusterConfig()
+		layer := state.NewRPCStreamLayer(state.RaftAddress(id), raftDial)
+		ccfg := state.DefaultClusterConfig()
 		ccfg.NodeID = id
 		ccfg.DataDir = dataDir
 		// Bootstrapping with an identical peer set is idempotent across
@@ -215,14 +214,13 @@ func (rt *Runtime) addNode(
 		ccfg.Bootstrap = true
 		ccfg.StreamLayer = layer
 		ccfg.Peers = peers
-		raftNode, err := s3db.NewRaftNode(ccfg)
+		replica, err := state.NewServer(ccfg)
 		if err != nil {
 			return fmt.Errorf("start state replica %d: %w", n.ID, err)
 		}
-		stateSvc := state.NewService(id, raftNode, layer)
-		stateSvc.Register(mux)
-		svc = stateSvc
-		rt.raftNodes = append(rt.raftNodes, raftNode)
+		replica.Register(mux)
+		svc = replica
+		rt.replicas = append(rt.replicas, replica)
 
 	case topology.RoleShardStorage:
 		// The store expects its directory to exist.
@@ -325,10 +323,10 @@ func (rt *Runtime) Run(ctx context.Context) error {
 // rather than fails: the state client retries, so callers may proceed on a
 // timeout with a warning.
 func (rt *Runtime) WaitReady(timeout time.Duration) error {
-	if len(rt.raftNodes) == 0 {
+	if len(rt.replicas) == 0 {
 		return nil
 	}
-	return rt.raftNodes[0].WaitForLeader(timeout)
+	return rt.replicas[0].WaitForLeader(timeout)
 }
 
 // Close releases the process-wide resources the nodes share. Node state is

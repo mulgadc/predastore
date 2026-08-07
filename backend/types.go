@@ -198,7 +198,7 @@ type HeadBucketResponse struct {
 	Name   string
 }
 
-// BucketMetadata contains complete bucket metadata stored in s3db.
+// BucketMetadata contains complete bucket metadata stored in global state.
 type BucketMetadata struct {
 	Name         string    `json:"name"`
 	Region       string    `json:"region"`

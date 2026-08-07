@@ -19,7 +19,6 @@ import (
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/storage"
-	s3db "github.com/mulgadc/predastore/s3db"
 )
 
 // BucketConfig holds configuration for a bucket.
@@ -365,14 +364,14 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 
 // openInput retrieves shard location metadata for an object.
 func (b *Backend) openInput(bucket string, object string) (ObjectToShardNodes, int64, error) {
-	key := s3db.GenObjectHash(bucket, object)
+	key := storage.GenObjectHash(bucket, object)
 
 	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}
 
-	objectHash := s3db.GenObjectHash(bucket, object)
+	objectHash := storage.GenObjectHash(bucket, object)
 
 	data, err := b.globalState.Get(TableObjects, string(objectHash[:]))
 	if err != nil {

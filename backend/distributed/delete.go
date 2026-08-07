@@ -10,7 +10,6 @@ import (
 
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/internal/storage"
-	s3db "github.com/mulgadc/predastore/s3db"
 )
 
 // arnObjectPrefixDel is the ARN prefix for object keys.
@@ -44,7 +43,7 @@ func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectReq
 		return err
 	}
 
-	objectHash := s3db.GenObjectHash(req.Bucket, req.Key)
+	objectHash := storage.GenObjectHash(req.Bucket, req.Key)
 
 	// Check if object exists and get shard node info
 	data, err := b.globalState.Get(TableObjects, string(objectHash[:]))
