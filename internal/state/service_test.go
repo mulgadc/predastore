@@ -17,14 +17,35 @@ import (
 	"github.com/mulgadc/predastore/s3db"
 )
 
+// procTopo maps node ids to the pipe endpoint their process listens on. It
+// stands in for the cluster topology the rpc layer resolves node ids through.
+type procTopo map[int]string
+
+func (p procTopo) NodeAddr(nodeID int) (net.Addr, error) {
+	name, ok := p[nodeID]
+	if !ok {
+		return nil, fmt.Errorf("unknown node %d", nodeID)
+	}
+	return transport.ResolveAddr(string(transport.NetworkPipe), name)
+}
+
+func (p procTopo) ListenAddrs(nodeID int) ([]net.Addr, error) {
+	addr, err := p.NodeAddr(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return []net.Addr{addr}, nil
+}
+
 // startStateProc simulates one process hosting a state replica behind the
 // production wire protocol: raft dial and state ops on one mux.
-func startStateProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers []s3db.RaftPeer) *s3db.RaftNode {
+func startStateProc(t *testing.T, id uint64, topo procTopo, peers []s3db.RaftPeer) *s3db.RaftNode {
 	t.Helper()
 
 	pipeTr := transport.NewPipeTransport()
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{pipeTr},
+		Topology:   topo,
 	})
 
 	dial := func(ctx context.Context, address raft.ServerAddress) (transport.Stream, error) {
@@ -32,11 +53,7 @@ func startStateProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers 
 		if err != nil {
 			return nil, err
 		}
-		addr, err := transport.ResolveAddr(string(transport.NetworkPipe), pipeNames[target])
-		if err != nil {
-			return nil, err
-		}
-		return rpc.OpenStream(ctx, client, addr, state.OpRaftDial, &state.RaftDial{})
+		return rpc.OpenStream(ctx, client, int(target), state.OpRaftDial, &state.RaftDial{})
 	}
 
 	layer := s3db.NewRPCStreamLayer(state.RaftAddress(id), dial)
@@ -59,13 +76,10 @@ func startStateProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers 
 	mux := rpc.NewMux()
 	svc.Register(mux)
 
-	srvAddr, err := transport.ResolveAddr(string(transport.NetworkPipe), pipeNames[id])
-	if err != nil {
-		t.Fatalf("ResolveAddr: %v", err)
-	}
 	srv, err := rpc.NewServer(rpc.ServerConfig{
 		Mux:          mux,
-		Addrs:        []net.Addr{srvAddr},
+		NodeID:       int(id),
+		Topology:     topo,
 		Transports:   []transport.Transport{pipeTr},
 		DrainTimeout: 50 * time.Millisecond,
 	})
@@ -91,7 +105,7 @@ func startStateProc(t *testing.T, id uint64, pipeNames map[uint64]string, peers 
 func startStateCluster(t *testing.T, prefix string) *state.Client {
 	t.Helper()
 
-	pipeNames := map[uint64]string{
+	topo := procTopo{
 		1: prefix + "-proc1",
 		2: prefix + "-proc2",
 		3: prefix + "-proc3",
@@ -102,9 +116,9 @@ func startStateCluster(t *testing.T, prefix string) *state.Client {
 		{ID: 3, Address: state.RaftAddress(3)},
 	}
 
-	nodes := make(map[uint64]*s3db.RaftNode, len(pipeNames))
-	for id := range pipeNames {
-		nodes[id] = startStateProc(t, id, pipeNames, peers)
+	nodes := make(map[int]*s3db.RaftNode, len(topo))
+	for id := range topo {
+		nodes[id] = startStateProc(t, uint64(id), topo, peers)
 	}
 	if err := nodes[1].WaitForLeader(15 * time.Second); err != nil {
 		t.Fatalf("WaitForLeader: %v", err)
@@ -113,16 +127,10 @@ func startStateCluster(t *testing.T, prefix string) *state.Client {
 	// The client is its own "process": it reaches every replica over rpc.
 	rpcClient := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{transport.NewPipeTransport()},
+		Topology:   topo,
 	})
 	cli, err := state.NewClient(state.ClientConfig{
-		Client: rpcClient,
-		Resolve: func(nodeID uint64) (net.Addr, error) {
-			name, ok := pipeNames[nodeID]
-			if !ok {
-				return nil, fmt.Errorf("unknown node %d", nodeID)
-			}
-			return transport.ResolveAddr(string(transport.NetworkPipe), name)
-		},
+		Client:   rpcClient,
 		Replicas: []uint64{1, 2, 3},
 	})
 	if err != nil {

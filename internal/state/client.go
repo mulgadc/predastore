@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"sync"
 	"time"
 
@@ -33,7 +32,6 @@ type Item struct {
 // redirects and cache the leader they land on.
 type Client struct {
 	rpc        *rpc.Client
-	resolve    func(nodeID uint64) (net.Addr, error)
 	replicas   []uint64
 	timeout    time.Duration
 	maxRetries int
@@ -44,11 +42,9 @@ type Client struct {
 
 // ClientConfig configures a Client.
 type ClientConfig struct {
-	// Client carries the streams; its transports decide pipe vs network
-	// per address.
+	// Client carries the streams; it owns the mapping from node id to
+	// address, so this client only ever names replicas by id.
 	Client *rpc.Client
-	// Resolve maps a replica node id to the address to dial.
-	Resolve func(nodeID uint64) (net.Addr, error)
 	// Replicas lists the state replica node ids.
 	Replicas []uint64
 	// Timeout bounds each attempt. Default 10s.
@@ -62,9 +58,6 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.Client == nil {
 		return nil, fmt.Errorf("state client: missing rpc client")
 	}
-	if cfg.Resolve == nil {
-		return nil, fmt.Errorf("state client: missing resolver")
-	}
 	if len(cfg.Replicas) == 0 {
 		return nil, fmt.Errorf("state client: no state replicas")
 	}
@@ -76,7 +69,6 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	}
 	return &Client{
 		rpc:        cfg.Client,
-		resolve:    cfg.Resolve,
 		replicas:   cfg.Replicas,
 		timeout:    cfg.Timeout,
 		maxRetries: cfg.MaxRetries,
@@ -89,11 +81,10 @@ func (c *Client) call(target uint64, op rpc.Opcode, req *StateRequest, body []by
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
-	addr, err := c.resolve(target)
-	if err != nil {
-		return nil, fmt.Errorf("resolve replica %d: %w", target, err)
-	}
-	stream, err := rpc.OpenStream(ctx, c.rpc, addr, op, req)
+	// Replica ids are uint64 here because raft interops in uint64; the rpc
+	// layer addresses nodes as ints, so the conversion lands at this boundary.
+	nodeID := int(target) //nolint:gosec // G115: node ids are small positives from a validated topology.
+	stream, err := rpc.OpenStream(ctx, c.rpc, nodeID, op, req)
 	if err != nil {
 		return nil, fmt.Errorf("open stream to replica %d: %w", target, err)
 	}

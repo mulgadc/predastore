@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/internal/cluster"
+	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/predastore/s3"
 )
@@ -44,14 +44,14 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := &s3.Config{
 		RS: s3.RS{Data: 2, Parity: 1},
-		Hosts: []cluster.Host{
+		Hosts: []topology.Host{
 			{ID: 1, BindAddr: "127.0.0.1:16660", PublicAddr: "127.0.0.1:16660", DataDir: dataDir},
 		},
-		ClusterNodes: []cluster.Node{
-			{ID: 1, HostID: 1, Role: cluster.RoleShardStorage},
-			{ID: 2, HostID: 1, Role: cluster.RoleShardStorage},
-			{ID: 3, HostID: 1, Role: cluster.RoleShardStorage},
-			{ID: 4, HostID: 1, Role: cluster.RoleStateReplica},
+		ClusterNodes: []topology.Node{
+			{ID: 1, HostID: 1, Role: topology.RoleShardStorage},
+			{ID: 2, HostID: 1, Role: topology.RoleShardStorage},
+			{ID: 3, HostID: 1, Role: topology.RoleShardStorage},
+			{ID: 4, HostID: 1, Role: topology.RoleStateReplica},
 		},
 	}
 
@@ -157,13 +157,13 @@ func TestRelativeDataDirUsesBasePath(t *testing.T) {
 	cfg := &s3.Config{
 		BasePath: base,
 		RS:       s3.RS{Data: 2, Parity: 1},
-		Hosts: []cluster.Host{
+		Hosts: []topology.Host{
 			{ID: 1, BindAddr: "127.0.0.1:16661", PublicAddr: "127.0.0.1:16661", DataDir: "data/host-1"},
 		},
-		ClusterNodes: []cluster.Node{
-			{ID: 1, HostID: 1, Role: cluster.RoleShardStorage},
-			{ID: 2, HostID: 1, Role: cluster.RoleShardStorage},
-			{ID: 3, HostID: 1, Role: cluster.RoleStateReplica},
+		ClusterNodes: []topology.Node{
+			{ID: 1, HostID: 1, Role: topology.RoleShardStorage},
+			{ID: 2, HostID: 1, Role: topology.RoleShardStorage},
+			{ID: 3, HostID: 1, Role: topology.RoleStateReplica},
 		},
 	}
 

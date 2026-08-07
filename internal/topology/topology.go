@@ -1,8 +1,8 @@
-// Package cluster models the two-level topology of a predastore cluster:
+// Package topology models the two-level shape of a predastore cluster:
 // hosts, which are processes owning a socket and a data directory, and
 // nodes, which are logical roles pinned to a host. It resolves node ids to
 // dialable transport addresses given the set of nodes running locally.
-package cluster
+package topology
 
 import (
 	"fmt"
@@ -50,48 +50,48 @@ type Node struct {
 // and roles known. An empty topology is invalid; callers gate on presence.
 func Validate(hosts []Host, nodes []Node) error {
 	if len(hosts) == 0 {
-		return fmt.Errorf("cluster: no hosts defined")
+		return fmt.Errorf("topology: no hosts defined")
 	}
 	if len(nodes) == 0 {
-		return fmt.Errorf("cluster: no nodes defined")
+		return fmt.Errorf("topology: no nodes defined")
 	}
 
 	hostIDs := make(map[int]bool, len(hosts))
 	for _, h := range hosts {
 		if h.ID <= 0 {
-			return fmt.Errorf("cluster: host id %d must be positive", h.ID)
+			return fmt.Errorf("topology: host id %d must be positive", h.ID)
 		}
 		if hostIDs[h.ID] {
-			return fmt.Errorf("cluster: duplicate host id %d", h.ID)
+			return fmt.Errorf("topology: duplicate host id %d", h.ID)
 		}
 		hostIDs[h.ID] = true
 		if h.BindAddr == "" {
-			return fmt.Errorf("cluster: host %d missing bind_addr", h.ID)
+			return fmt.Errorf("topology: host %d missing bind_addr", h.ID)
 		}
 		if h.PublicAddr == "" {
-			return fmt.Errorf("cluster: host %d missing public_addr", h.ID)
+			return fmt.Errorf("topology: host %d missing public_addr", h.ID)
 		}
 		if h.DataDir == "" {
-			return fmt.Errorf("cluster: host %d missing data_dir", h.ID)
+			return fmt.Errorf("topology: host %d missing data_dir", h.ID)
 		}
 	}
 
 	nodeIDs := make(map[int]bool, len(nodes))
 	for _, n := range nodes {
 		if n.ID <= 0 {
-			return fmt.Errorf("cluster: node id %d must be positive", n.ID)
+			return fmt.Errorf("topology: node id %d must be positive", n.ID)
 		}
 		if nodeIDs[n.ID] {
-			return fmt.Errorf("cluster: duplicate node id %d", n.ID)
+			return fmt.Errorf("topology: duplicate node id %d", n.ID)
 		}
 		nodeIDs[n.ID] = true
 		if !hostIDs[n.HostID] {
-			return fmt.Errorf("cluster: node %d references unknown host %d", n.ID, n.HostID)
+			return fmt.Errorf("topology: node %d references unknown host %d", n.ID, n.HostID)
 		}
 		switch n.Role {
 		case RoleShardStorage, RoleStateReplica:
 		default:
-			return fmt.Errorf("cluster: node %d has unknown role %q", n.ID, n.Role)
+			return fmt.Errorf("topology: node %d has unknown role %q", n.ID, n.Role)
 		}
 	}
 
@@ -126,7 +126,7 @@ func NewTopology(hosts []Host, nodes []Node, localNodeIDs []int) (*Topology, err
 		return nil, err
 	}
 	if len(localNodeIDs) == 0 {
-		return nil, fmt.Errorf("cluster: no local nodes selected")
+		return nil, fmt.Errorf("topology: no local nodes selected")
 	}
 
 	t := &Topology{
@@ -146,10 +146,10 @@ func NewTopology(hosts []Host, nodes []Node, localNodeIDs []int) (*Topology, err
 	for _, id := range localNodeIDs {
 		n, ok := t.nodes[id]
 		if !ok {
-			return nil, fmt.Errorf("cluster: local node %d not in topology", id)
+			return nil, fmt.Errorf("topology: local node %d not in topology", id)
 		}
 		if t.local[id] {
-			return nil, fmt.Errorf("cluster: local node %d selected twice", id)
+			return nil, fmt.Errorf("topology: local node %d selected twice", id)
 		}
 		if hostID == 0 {
 			hostID = n.HostID
@@ -161,7 +161,7 @@ func NewTopology(hosts []Host, nodes []Node, localNodeIDs []int) (*Topology, err
 	// Spanning hosts is only coherent when nothing is reachable over the
 	// network, since otherwise there is no single socket to bind.
 	if spansHosts && t.NeedsNetwork() {
-		return nil, fmt.Errorf("cluster: local nodes span hosts but some node runs elsewhere; a process with remote peers runs one host")
+		return nil, fmt.Errorf("topology: local nodes span hosts but some node runs elsewhere; a process with remote peers runs one host")
 	}
 	t.host = t.hosts[hostID]
 
@@ -193,7 +193,7 @@ func (t *Topology) Host(hostID int) (Host, bool) {
 func (t *Topology) NodeAddr(nodeID int) (net.Addr, error) {
 	n, ok := t.nodes[nodeID]
 	if !ok {
-		return nil, fmt.Errorf("cluster: unknown node %d", nodeID)
+		return nil, fmt.Errorf("topology: unknown node %d", nodeID)
 	}
 	if t.local[n.ID] {
 		return transport.ResolveAddr(string(transport.NetworkPipe), NodeKey(n.ID))
@@ -207,7 +207,7 @@ func (t *Topology) NodeAddr(nodeID int) (net.Addr, error) {
 // A process whose peers are all local never opens a network socket.
 func (t *Topology) ListenAddrs(nodeID int) ([]net.Addr, error) {
 	if !t.local[nodeID] {
-		return nil, fmt.Errorf("cluster: node %d does not run in this process", nodeID)
+		return nil, fmt.Errorf("topology: node %d does not run in this process", nodeID)
 	}
 	pipeAddr, err := transport.ResolveAddr(string(transport.NetworkPipe), NodeKey(nodeID))
 	if err != nil {

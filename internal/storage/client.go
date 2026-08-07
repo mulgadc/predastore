@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/transport"
@@ -68,35 +67,25 @@ type DeleteResponse struct {
 // Client performs shard operations against storage nodes over rpc streams,
 // addressed by node id.
 type Client struct {
-	rpc     *rpc.Client
-	resolve func(nodeID int) (net.Addr, error)
+	rpc *rpc.Client
 }
 
 type ClientConfig struct {
-	// Client carries the streams; its transports decide pipe vs network
-	// per address.
+	// Client carries the streams; it owns the mapping from node id to
+	// address, so this client only ever names nodes by id.
 	Client *rpc.Client
-	// Resolve maps a storage node id to the address to dial.
-	Resolve func(nodeID int) (net.Addr, error)
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.Client == nil {
 		return nil, fmt.Errorf("storage client: missing rpc client")
 	}
-	if cfg.Resolve == nil {
-		return nil, fmt.Errorf("storage client: missing resolver")
-	}
-	return &Client{rpc: cfg.Client, resolve: cfg.Resolve}, nil
+	return &Client{rpc: cfg.Client}, nil
 }
 
 // open starts a shard stream against the node.
 func (c *Client) open(ctx context.Context, nodeID int, op rpc.Opcode, h *ShardRequest) (transport.Stream, error) {
-	addr, err := c.resolve(nodeID)
-	if err != nil {
-		return nil, fmt.Errorf("resolve storage node %d: %w", nodeID, err)
-	}
-	stream, err := rpc.OpenStream(ctx, c.rpc, addr, op, h)
+	stream, err := rpc.OpenStream(ctx, c.rpc, nodeID, op, h)
 	if err != nil {
 		return nil, fmt.Errorf("open stream to storage node %d: %w", nodeID, err)
 	}

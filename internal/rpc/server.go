@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"slices"
 	"sync"
 	"time"
@@ -40,13 +39,16 @@ func RegisterHandler[T any, PT interface {
 	}
 }
 
-// ServerConfig describes one node's rpc endpoint. Addrs are every address the
-// node answers on: an in-process pipe address always, plus a network address
-// when peers run outside this process. Transports are the process-wide set,
-// shared with every other node's server.
+// ServerConfig describes one node's rpc endpoint. The node answers on every
+// address the topology gives it: an in-process pipe address always, plus a
+// network address when peers run outside this process. Transports are the
+// process-wide set, shared with every other node's server.
 type ServerConfig struct {
-	Mux          *Mux
-	Addrs        []net.Addr
+	Mux *Mux
+	// NodeID is the node this server answers for.
+	NodeID int
+	// Topology supplies that node's listen addresses. Required.
+	Topology     Topology
 	Transports   []transport.Transport
 	DrainTimeout time.Duration
 }
@@ -61,13 +63,20 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.DrainTimeout == 0 {
 		cfg.DrainTimeout = defaultDrainTimeout
 	}
+	if cfg.Topology == nil {
+		return nil, fmt.Errorf("server has no topology")
+	}
+	addrs, err := cfg.Topology.ListenAddrs(cfg.NodeID)
+	if err != nil {
+		return nil, fmt.Errorf("listen addresses for node %d: %w", cfg.NodeID, err)
+	}
 
 	trs := make(map[string]transport.Transport, len(cfg.Transports))
 	for _, tr := range cfg.Transports {
 		trs[tr.Network()] = tr
 	}
 
-	lns := make([]transport.Listener, 0, len(cfg.Addrs))
+	lns := make([]transport.Listener, 0, len(addrs))
 	// Release the addresses already bound on any failure; leaving them held
 	// would fail a retry of this same config with "address already in use".
 	bail := func(err error) error {
@@ -76,7 +85,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		}
 		return err
 	}
-	for _, addr := range cfg.Addrs {
+	for _, addr := range addrs {
 		tr, ok := trs[addr.Network()]
 		if !ok {
 			return nil, bail(fmt.Errorf("no %s transport available", addr.Network()))

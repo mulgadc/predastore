@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/internal/cluster"
+	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/pelletier/go-toml/v2"
 )
 
@@ -44,7 +44,7 @@ func (s3 *Config) ReadConfig() (err error) {
 	// Cluster topology, when present, must be internally consistent before
 	// anything derives placement or addresses from it.
 	if len(s3.Hosts) > 0 || len(s3.ClusterNodes) > 0 {
-		if err := cluster.Validate(s3.Hosts, s3.ClusterNodes); err != nil {
+		if err := topology.Validate(s3.Hosts, s3.ClusterNodes); err != nil {
 			return err
 		}
 	}

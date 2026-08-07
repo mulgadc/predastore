@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/mulgadc/predastore/internal/cluster"
+	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -57,8 +57,8 @@ func TestReadConfig_ClusterTopology(t *testing.T) {
 	assert.Len(t, s3.Hosts, 3, "Should have 3 hosts")
 	assert.Len(t, s3.ClusterNodes, 6, "Should have 6 cluster nodes")
 	assert.Equal(t, "10.11.12.1:6660", s3.Hosts[0].PublicAddr)
-	assert.Equal(t, cluster.RoleShardStorage, s3.ClusterNodes[0].Role)
-	assert.Equal(t, cluster.RoleStateReplica, s3.ClusterNodes[1].Role)
+	assert.Equal(t, topology.RoleShardStorage, s3.ClusterNodes[0].Role)
+	assert.Equal(t, topology.RoleStateReplica, s3.ClusterNodes[1].Role)
 	assert.Len(t, s3.Auth, 1, "Should have 1 auth entry")
 }
 

@@ -19,6 +19,27 @@ const (
 	opEcho rpc.Opcode = 1
 )
 
+// nodeTopo stands in for the real topology: a fixed map from node id to the
+// one address that node answers on. Tests pick the addresses so they can mix
+// pipe and QUIC endpoints without a cluster config.
+type nodeTopo map[int]net.Addr
+
+func (t nodeTopo) NodeAddr(nodeID int) (net.Addr, error) {
+	addr, ok := t[nodeID]
+	if !ok {
+		return nil, fmt.Errorf("unknown node %d", nodeID)
+	}
+	return addr, nil
+}
+
+func (t nodeTopo) ListenAddrs(nodeID int) ([]net.Addr, error) {
+	addr, err := t.NodeAddr(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return []net.Addr{addr}, nil
+}
+
 // echoHeader is a minimal Header implementation: the payload is the prefix
 // string itself.
 type echoHeader struct {
@@ -50,22 +71,26 @@ func echoMux() *rpc.Mux {
 	return mux
 }
 
-// mustResolve builds an address for the given network, failing the test if
-// the network is unknown.
-func mustResolve(t *testing.T, network, addr string) net.Addr {
+// pipeTopo maps one node id to a named pipe endpoint.
+func pipeTopo(t *testing.T, nodeID int, name string) nodeTopo {
 	t.Helper()
-	a, err := transport.ResolveAddr(network, addr)
+	addr, err := transport.ResolveAddr(string(transport.NetworkPipe), name)
 	if err != nil {
 		t.Fatalf("ResolveAddr: %v", err)
 	}
-	return a
+	return nodeTopo{nodeID: addr}
 }
 
-// runServer starts an rpc server over the given transports and registers
-// cleanup that stops it and verifies a clean drain.
-func runServer(t *testing.T, mux *rpc.Mux, addr net.Addr, trs ...transport.Transport) {
+// runServer starts an rpc server for one node over the given transports and
+// registers cleanup that stops it and verifies a clean drain.
+func runServer(t *testing.T, mux *rpc.Mux, nodeID int, topo rpc.Topology, trs ...transport.Transport) {
 	t.Helper()
-	srv, err := rpc.NewServer(rpc.ServerConfig{Mux: mux, Addrs: []net.Addr{addr}, Transports: trs})
+	srv, err := rpc.NewServer(rpc.ServerConfig{
+		Mux:        mux,
+		NodeID:     nodeID,
+		Topology:   topo,
+		Transports: trs,
+	})
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -86,8 +111,8 @@ func runServer(t *testing.T, mux *rpc.Mux, addr net.Addr, trs ...transport.Trans
 }
 
 // echo performs one full request round trip on a fresh stream.
-func echo(ctx context.Context, c *rpc.Client, addr net.Addr, prefix, body string) (string, error) {
-	stream, err := rpc.OpenStream(ctx, c, addr, opEcho, &echoHeader{Prefix: prefix})
+func echo(ctx context.Context, c *rpc.Client, nodeID int, prefix, body string) (string, error) {
+	stream, err := rpc.OpenStream(ctx, c, nodeID, opEcho, &echoHeader{Prefix: prefix})
 	if err != nil {
 		return "", err
 	}
@@ -107,22 +132,18 @@ func echo(ctx context.Context, c *rpc.Client, addr net.Addr, prefix, body string
 }
 
 func TestRPCEchoOverPipe(t *testing.T) {
-	pipeTr := transport.NewPipeTransport()
-	srvAddr := mustResolve(t, string(transport.NetworkPipe), "rpc-echo-server")
-	runServer(t, echoMux(), srvAddr, pipeTr)
+	topo := pipeTopo(t, 1, "rpc-echo-server")
+	runServer(t, echoMux(), 1, topo, transport.NewPipeTransport())
 
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{transport.NewPipeTransport()},
+		Topology:   topo,
 	})
-	addr, err := transport.ResolveAddr(string(transport.NetworkPipe), "rpc-echo-server")
-	if err != nil {
-		t.Fatalf("ResolveAddr: %v", err)
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	got, err := echo(ctx, client, addr, "pre:", "body")
+	got, err := echo(ctx, client, 1, "pre:", "body")
 	if err != nil {
 		t.Fatalf("echo: %v", err)
 	}
@@ -131,7 +152,7 @@ func TestRPCEchoOverPipe(t *testing.T) {
 	}
 
 	// A second request reuses the cached connection.
-	got, err = echo(ctx, client, addr, "again:", "more")
+	got, err = echo(ctx, client, 1, "again:", "more")
 	if err != nil {
 		t.Fatalf("echo reuse: %v", err)
 	}
@@ -147,19 +168,20 @@ func TestRPCEchoOverQUIC(t *testing.T) {
 		TLSCert: certPath,
 		TLSKey:  keyPath,
 	})
-	addr := transport.NewQUICAddr(bind, "node-1")
-	runServer(t, echoMux(), addr, server)
+	topo := nodeTopo{1: transport.NewQUICAddr(bind, "node-1")}
+	runServer(t, echoMux(), 1, topo, server)
 
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{
 			transport.NewQUICTransport(transport.QUICTransportConfig{RootCAs: pool}),
 		},
+		Topology: topo,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	got, err := echo(ctx, client, addr, "q:", "uic")
+	got, err := echo(ctx, client, 1, "q:", "uic")
 	if err != nil {
 		t.Fatalf("echo: %v", err)
 	}
@@ -169,22 +191,18 @@ func TestRPCEchoOverQUIC(t *testing.T) {
 }
 
 func TestRPCUnknownOpcode(t *testing.T) {
-	pipeTr := transport.NewPipeTransport()
-	srvAddr := mustResolve(t, string(transport.NetworkPipe), "rpc-unknown-op")
-	runServer(t, echoMux(), srvAddr, pipeTr)
+	topo := pipeTopo(t, 1, "rpc-unknown-op")
+	runServer(t, echoMux(), 1, topo, transport.NewPipeTransport())
 
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{transport.NewPipeTransport()},
+		Topology:   topo,
 	})
-	addr, err := transport.ResolveAddr(string(transport.NetworkPipe), "rpc-unknown-op")
-	if err != nil {
-		t.Fatalf("ResolveAddr: %v", err)
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	stream, err := rpc.OpenStream(ctx, client, addr, rpc.Opcode(999), &echoHeader{})
+	stream, err := rpc.OpenStream(ctx, client, 1, rpc.Opcode(999), &echoHeader{})
 	if err != nil {
 		t.Fatalf("OpenStream: %v", err)
 	}
@@ -197,33 +215,49 @@ func TestRPCUnknownOpcode(t *testing.T) {
 }
 
 func TestRPCNoTransportForNetwork(t *testing.T) {
-	client := rpc.NewClient(rpc.ClientConfig{})
-	addr, err := transport.ResolveAddr(string(transport.NetworkPipe), "nowhere")
-	if err != nil {
-		t.Fatalf("ResolveAddr: %v", err)
-	}
-	if _, err := rpc.OpenStream(context.Background(), client, addr, opEcho, &echoHeader{}); err == nil {
+	client := rpc.NewClient(rpc.ClientConfig{Topology: pipeTopo(t, 1, "nowhere")})
+	if _, err := rpc.OpenStream(context.Background(), client, 1, opEcho, &echoHeader{}); err == nil {
 		t.Fatal("OpenStream without a matching transport succeeded")
 	}
 
 	// The client must not deadlock after the failed attempt.
-	if _, err := rpc.OpenStream(context.Background(), client, addr, opEcho, &echoHeader{}); err == nil {
+	if _, err := rpc.OpenStream(context.Background(), client, 1, opEcho, &echoHeader{}); err == nil {
 		t.Fatal("second OpenStream succeeded")
 	}
 }
 
+// TestRPCUnaddressableNode covers the two ways a node id fails to become an
+// address: no topology at all, and a topology that does not know the node.
+func TestRPCUnaddressableNode(t *testing.T) {
+	trs := []transport.Transport{transport.NewPipeTransport()}
+
+	noTopo := rpc.NewClient(rpc.ClientConfig{Transports: trs})
+	if _, err := rpc.OpenStream(context.Background(), noTopo, 1, opEcho, &echoHeader{}); err == nil {
+		t.Fatal("OpenStream on a client with no topology succeeded")
+	}
+
+	client := rpc.NewClient(rpc.ClientConfig{
+		Transports: trs,
+		Topology:   pipeTopo(t, 1, "rpc-unaddressable"),
+	})
+	if _, err := rpc.OpenStream(context.Background(), client, 2, opEcho, &echoHeader{}); err == nil {
+		t.Fatal("OpenStream to a node outside the topology succeeded")
+	}
+
+	// A server cannot bind a node the topology does not place either.
+	if _, err := rpc.NewServer(rpc.ServerConfig{Mux: echoMux(), NodeID: 2, Transports: trs}); err == nil {
+		t.Fatal("NewServer with no topology succeeded")
+	}
+}
+
 func TestRPCConcurrentStreams(t *testing.T) {
-	pipeTr := transport.NewPipeTransport()
-	srvAddr := mustResolve(t, string(transport.NetworkPipe), "rpc-concurrent")
-	runServer(t, echoMux(), srvAddr, pipeTr)
+	topo := pipeTopo(t, 1, "rpc-concurrent")
+	runServer(t, echoMux(), 1, topo, transport.NewPipeTransport())
 
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{transport.NewPipeTransport()},
+		Topology:   topo,
 	})
-	addr, err := transport.ResolveAddr(string(transport.NetworkPipe), "rpc-concurrent")
-	if err != nil {
-		t.Fatalf("ResolveAddr: %v", err)
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -233,7 +267,7 @@ func TestRPCConcurrentStreams(t *testing.T) {
 	for i := range n {
 		go func() {
 			want := fmt.Sprintf("p%d:b%d", i, i)
-			got, err := echo(ctx, client, addr, fmt.Sprintf("p%d:", i), fmt.Sprintf("b%d", i))
+			got, err := echo(ctx, client, 1, fmt.Sprintf("p%d:", i), fmt.Sprintf("b%d", i))
 			if err == nil && got != want {
 				err = fmt.Errorf("got %q, want %q", got, want)
 			}
@@ -248,22 +282,19 @@ func TestRPCConcurrentStreams(t *testing.T) {
 }
 
 func TestRPCHeaderTooLarge(t *testing.T) {
+	topo := pipeTopo(t, 1, "rpc-big-header")
+	runServer(t, echoMux(), 1, topo, transport.NewPipeTransport())
+
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{transport.NewPipeTransport()},
+		Topology:   topo,
 	})
-	pipeTr := transport.NewPipeTransport()
-	srvAddr := mustResolve(t, string(transport.NetworkPipe), "rpc-big-header")
-	runServer(t, echoMux(), srvAddr, pipeTr)
-	addr, err := transport.ResolveAddr(string(transport.NetworkPipe), "rpc-big-header")
-	if err != nil {
-		t.Fatalf("ResolveAddr: %v", err)
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	big := &echoHeader{Prefix: string(make([]byte, 2*1024*1024))}
-	if _, err := rpc.OpenStream(ctx, client, addr, opEcho, big); !errors.Is(err, rpc.ErrHeaderTooLarge) {
+	if _, err := rpc.OpenStream(ctx, client, 1, opEcho, big); !errors.Is(err, rpc.ErrHeaderTooLarge) {
 		t.Fatalf("got %v, want ErrHeaderTooLarge", err)
 	}
 }
@@ -280,37 +311,44 @@ func TestRPCNodesShareOneSocket(t *testing.T) {
 	})
 	t.Cleanup(func() { server.Close() })
 
-	// Each node answers with its own prefix, so a misrouted request is
-	// visible in the response rather than merely absent.
-	for _, node := range []string{"node-1", "node-2"} {
+	// Both nodes share the socket and differ only by their address's node key.
+	topo := nodeTopo{
+		1: transport.NewQUICAddr(bind, "node-1"),
+		2: transport.NewQUICAddr(bind, "node-2"),
+	}
+
+	// Each node answers with its own id, so a misrouted request is visible in
+	// the response rather than merely absent.
+	for _, id := range []int{1, 2} {
 		mux := rpc.NewMux()
 		rpc.RegisterHandler(mux, opEcho, func(_ context.Context, h echoHeader, stream transport.Stream) error {
 			body, err := io.ReadAll(stream)
 			if err != nil {
 				return err
 			}
-			_, err = stream.Write([]byte(node + "/" + h.Prefix + string(body)))
+			_, err = fmt.Fprintf(stream, "node-%d/%s%s", id, h.Prefix, body)
 			return err
 		})
-		runServer(t, mux, transport.NewQUICAddr(bind, node), server)
+		runServer(t, mux, id, topo, server)
 	}
 
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{
 			transport.NewQUICTransport(transport.QUICTransportConfig{RootCAs: pool}),
 		},
+		Topology: topo,
 	})
 	t.Cleanup(func() { client.Close() })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	for _, node := range []string{"node-1", "node-2"} {
-		got, err := echo(ctx, client, transport.NewQUICAddr(bind, node), "p:", "body")
+	for _, id := range []int{1, 2} {
+		got, err := echo(ctx, client, id, "p:", "body")
 		if err != nil {
-			t.Fatalf("echo %s: %v", node, err)
+			t.Fatalf("echo node-%d: %v", id, err)
 		}
-		if want := node + "/p:body"; got != want {
+		if want := fmt.Sprintf("node-%d/p:body", id); got != want {
 			t.Fatalf("got %q, want %q", got, want)
 		}
 	}

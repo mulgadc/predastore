@@ -10,7 +10,6 @@ package clusterrun
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -18,10 +17,10 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/backend/distributed"
-	"github.com/mulgadc/predastore/internal/cluster"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/storage"
+	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/predastore/s3"
@@ -29,6 +28,11 @@ import (
 	"github.com/mulgadc/predastore/store"
 	"golang.org/x/sync/errgroup"
 )
+
+// The topology is what rpc translates node ids through. The assertion lives
+// here, where the two are wired together, so internal/topology stays free of
+// any dependency on rpc.
+var _ rpc.Topology = (*topology.Topology)(nil)
 
 // node is one storage or state replica running in this process: a service
 // serving its rpc endpoint, and the server carrying it.
@@ -91,7 +95,7 @@ func NodeIDsForHost(cfg *s3.Config, hostID int) []int {
 // service and rpc server; whether a peer is reached over the pipe or the
 // network follows from its address, so nothing below here branches on it.
 func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterkey.Key) (*Runtime, error) {
-	topo, err := cluster.NewTopology(cfg.Hosts, cfg.ClusterNodes, localIDs)
+	topo, err := topology.NewTopology(cfg.Hosts, cfg.ClusterNodes, localIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -112,25 +116,23 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 
 	rt := &Runtime{
 		trs:      trs,
-		client:   rpc.NewClient(rpc.ClientConfig{Transports: trs}),
+		client:   rpc.NewClient(rpc.ClientConfig{Transports: trs, Topology: topo}),
 		basePath: cfg.BasePath,
 	}
 
 	// Raft dials peers through the same client; its advertise addresses are
-	// node keys, which the topology resolves to whichever transport applies.
+	// node keys, so dialing one is parsing out the node id and opening a
+	// stream to it.
 	raftDial := func(ctx context.Context, address raft.ServerAddress) (transport.Stream, error) {
 		target, err := state.ParseRaftAddress(string(address))
 		if err != nil {
 			return nil, err
 		}
-		addr, err := topo.NodeAddr(int(target)) //nolint:gosec // G115: node ids are small positives from validated topology.
-		if err != nil {
-			return nil, err
-		}
-		return rpc.OpenStream(ctx, rt.client, addr, state.OpRaftDial, &state.RaftDial{})
+		nodeID := int(target) //nolint:gosec // G115: node ids are small positives from a validated topology.
+		return rpc.OpenStream(ctx, rt.client, nodeID, state.OpRaftDial, &state.RaftDial{})
 	}
 
-	replicas := topo.NodesByRole(cluster.RoleStateReplica)
+	replicas := topo.NodesByRole(topology.RoleStateReplica)
 	replicaIDs := make([]int, len(replicas))
 	for i, n := range replicas {
 		replicaIDs[i] = n.ID
@@ -157,20 +159,14 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 	}
 
 	stateClient, err := state.NewClient(state.ClientConfig{
-		Client: rt.client,
-		Resolve: func(nodeID uint64) (net.Addr, error) {
-			return topo.NodeAddr(int(nodeID)) //nolint:gosec // G115: validated positive node ids.
-		},
+		Client:   rt.client,
 		Replicas: replicaNodeIDs,
 	})
 	if err != nil {
 		rt.Close()
 		return nil, err
 	}
-	shardClient, err := storage.NewClient(storage.ClientConfig{
-		Client:  rt.client,
-		Resolve: topo.NodeAddr,
-	})
+	shardClient, err := storage.NewClient(storage.ClientConfig{Client: rt.client})
 	if err != nil {
 		rt.Close()
 		return nil, err
@@ -190,8 +186,8 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 // server is constructed but not started: handlers must be registered on every
 // node before any of them accepts, or early peer traffic finds no handler.
 func (rt *Runtime) addNode(
-	topo *cluster.Topology,
-	n cluster.Node,
+	topo *topology.Topology,
+	n topology.Node,
 	raftDial func(context.Context, raft.ServerAddress) (transport.Stream, error),
 	peers []s3db.RaftPeer,
 	storeOpts []store.Option,
@@ -204,16 +200,12 @@ func (rt *Runtime) addNode(
 	if !filepath.IsAbs(dataDir) && rt.basePath != "" {
 		dataDir = filepath.Join(rt.basePath, dataDir)
 	}
-	addrs, err := topo.ListenAddrs(n.ID)
-	if err != nil {
-		return err
-	}
 
 	mux := rpc.NewMux()
 	var svc interface{ Run(context.Context) error }
 
 	switch n.Role {
-	case cluster.RoleStateReplica:
+	case topology.RoleStateReplica:
 		layer := s3db.NewRPCStreamLayer(state.RaftAddress(id), raftDial)
 		ccfg := s3db.DefaultClusterConfig()
 		ccfg.NodeID = id
@@ -232,7 +224,7 @@ func (rt *Runtime) addNode(
 		svc = stateSvc
 		rt.raftNodes = append(rt.raftNodes, raftNode)
 
-	case cluster.RoleShardStorage:
+	case topology.RoleShardStorage:
 		// The store expects its directory to exist.
 		if err := os.MkdirAll(dataDir, 0750); err != nil {
 			return fmt.Errorf("create shard store directory %s: %w", dataDir, err)
@@ -251,7 +243,8 @@ func (rt *Runtime) addNode(
 
 	srv, err := rpc.NewServer(rpc.ServerConfig{
 		Mux:        mux,
-		Addrs:      addrs,
+		NodeID:     n.ID,
+		Topology:   topo,
 		Transports: rt.trs,
 	})
 	if err != nil {
@@ -266,11 +259,11 @@ func (rt *Runtime) addNode(
 // injected clients make addressing the transports' concern.
 func (rt *Runtime) buildBackend(
 	cfg *s3.Config,
-	topo *cluster.Topology,
+	topo *topology.Topology,
 	stateClient *state.Client,
 	shardClient *storage.Client,
 ) (backend.Backend, error) {
-	storageNodes := topo.NodesByRole(cluster.RoleShardStorage)
+	storageNodes := topo.NodesByRole(topology.RoleShardStorage)
 	beNodes := make([]int, len(storageNodes))
 	for i, n := range storageNodes {
 		beNodes[i] = n.ID

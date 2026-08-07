@@ -21,7 +21,10 @@ var ErrClientClosed = errors.New("client closed")
 func poolKey(addr net.Addr) string { return addr.Network() + "|" + addr.String() }
 
 type ClientConfig struct {
-	Transports  []transport.Transport
+	Transports []transport.Transport
+	// Topology resolves the node ids OpenStream is given. Required: a client
+	// without one cannot address anything.
+	Topology    Topology
 	DialTimeout time.Duration
 }
 
@@ -53,15 +56,18 @@ func NewClient(cfg ClientConfig) *Client {
 	}
 }
 
+// OpenStream opens a stream to a node, addressed by id. Whether that node is
+// reached over the in-process pipe or the network follows from the address the
+// topology returns, which no caller sees.
 func OpenStream[T Header](
 	ctx context.Context,
 	c *Client,
-	addr net.Addr,
+	nodeID int,
 	op Opcode,
 	header T,
 ) (transport.Stream, error) {
 	// Dial connection.
-	conn, err := c.dial(ctx, addr)
+	conn, addr, err := c.dial(ctx, nodeID)
 	if err != nil {
 		return nil, fmt.Errorf("dial connection: %w", err)
 	}
@@ -105,16 +111,26 @@ func OpenStream[T Header](
 	return stream, nil
 }
 
-func (c *Client) dial(ctx context.Context, addr net.Addr) (transport.Conn, error) {
+// dial resolves the node through the topology and returns a pooled connection
+// to it, along with the address it resolved to so callers can evict it.
+func (c *Client) dial(ctx context.Context, nodeID int) (transport.Conn, net.Addr, error) {
+	if c.cfg.Topology == nil {
+		return nil, nil, fmt.Errorf("client has no topology")
+	}
+	addr, err := c.cfg.Topology.NodeAddr(nodeID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve node %d: %w", nodeID, err)
+	}
+
 	key := poolKey(addr)
 	c.mu.RLock()
 	conn, closed := c.pool[key], c.closed
 	c.mu.RUnlock()
 	if closed {
-		return nil, ErrClientClosed
+		return nil, nil, ErrClientClosed
 	}
 	if conn != nil && conn.Context().Err() == nil {
-		return conn, nil
+		return conn, addr, nil
 	}
 
 	ch := c.sf.DoChan(key, func() (any, error) {
@@ -156,15 +172,15 @@ func (c *Client) dial(ctx context.Context, addr net.Addr) (transport.Conn, error
 		// A failed dial carries no connection, so the assertion below only
 		// holds once the error is out of the way.
 		if res.Err != nil {
-			return nil, res.Err
+			return nil, nil, res.Err
 		}
 		conn, ok := res.Val.(transport.Conn)
 		if !ok {
 			panic("singleflight did not return a valid Conn")
 		}
-		return conn, nil
+		return conn, addr, nil
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
 }
 

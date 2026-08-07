@@ -19,10 +19,32 @@ import (
 	"github.com/mulgadc/predastore/store"
 )
 
+// procTopo maps node ids to the pipe endpoint their process listens on. It
+// stands in for the cluster topology the rpc layer resolves node ids through.
+type procTopo map[int]string
+
+func (p procTopo) NodeAddr(nodeID int) (net.Addr, error) {
+	name, ok := p[nodeID]
+	if !ok {
+		return nil, fmt.Errorf("unknown node %d", nodeID)
+	}
+	return transport.ResolveAddr(string(transport.NetworkPipe), name)
+}
+
+func (p procTopo) ListenAddrs(nodeID int) ([]net.Addr, error) {
+	addr, err := p.NodeAddr(nodeID)
+	if err != nil {
+		return nil, err
+	}
+	return []net.Addr{addr}, nil
+}
+
 // startStorageProc hosts one storage node behind an rpc server on a pipe
 // endpoint and returns a client reaching it.
 func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client {
 	t.Helper()
+
+	topo := procTopo{nodeID: pipeName}
 
 	st, err := store.Open(t.TempDir(), store.WithAEAD(storetest.TestAEAD()))
 	if err != nil {
@@ -35,13 +57,10 @@ func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client
 	svc.Register(mux)
 
 	pipeTr := transport.NewPipeTransport()
-	srvAddr, err := transport.ResolveAddr(string(transport.NetworkPipe), pipeName)
-	if err != nil {
-		t.Fatalf("ResolveAddr: %v", err)
-	}
 	srv, err := rpc.NewServer(rpc.ServerConfig{
 		Mux:          mux,
-		Addrs:        []net.Addr{srvAddr},
+		NodeID:       nodeID,
+		Topology:     topo,
 		Transports:   []transport.Transport{pipeTr},
 		DrainTimeout: 50 * time.Millisecond,
 	})
@@ -61,16 +80,9 @@ func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client
 
 	rpcClient := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{pipeTr},
+		Topology:   topo,
 	})
-	cli, err := storage.NewClient(storage.ClientConfig{
-		Client: rpcClient,
-		Resolve: func(id int) (net.Addr, error) {
-			if id != nodeID {
-				return nil, fmt.Errorf("unknown storage node %d", id)
-			}
-			return transport.ResolveAddr(string(transport.NetworkPipe), pipeName)
-		},
-	})
+	cli, err := storage.NewClient(storage.ClientConfig{Client: rpcClient})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
