@@ -152,7 +152,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 		},
 	}
 
-	server := NewHTTP2ServerWithBackend(s3Config, nil, NewConfigProvider(s3Config.Auth))
+	server := NewHTTP2Server(s3Config, Clients{}, NewConfigProvider(s3Config.Auth))
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -207,7 +207,7 @@ func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
 			}},
 		}},
 	}
-	server := NewHTTP2ServerWithBackend(s3Config, nil, NewConfigProvider(s3Config.Auth))
+	server := NewHTTP2Server(s3Config, Clients{}, NewConfigProvider(s3Config.Auth))
 
 	rewriteSignedHeaders := func(req *http.Request, list string) {
 		ah := req.Header.Get("Authorization")

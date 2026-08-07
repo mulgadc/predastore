@@ -4,7 +4,7 @@
 //
 // It is public because s3d is not the only entrypoint: embedders that host
 // predastore in their own process (spinifex's service supervisor) need the
-// same assembly before handing the backend to s3.WithPreparedBackend.
+// same assembly before handing the clients to s3.WithClients.
 package clusterrun
 
 import (
@@ -15,8 +15,6 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
-	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/backend/distributed"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/storage"
@@ -43,8 +41,9 @@ type node struct {
 
 // Runtime is everything this process runs besides the S3 frontend.
 type Runtime struct {
-	// Backend is the fully wired storage backend for the S3 frontend.
-	Backend backend.Backend
+	// Clients are the wired cluster connections the S3 frontend works
+	// through; it builds its own placement from the same config.
+	Clients s3.Clients
 
 	nodes    []node
 	client   *rpc.Client
@@ -171,12 +170,7 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 		return nil, err
 	}
 
-	be, err := rt.buildBackend(cfg, topo, stateClient, shardClient)
-	if err != nil {
-		rt.Close()
-		return nil, err
-	}
-	rt.Backend = be
+	rt.Clients = s3.Clients{State: stateClient, Storage: shardClient}
 
 	return rt, nil
 }
@@ -251,44 +245,6 @@ func (rt *Runtime) addNode(
 
 	rt.nodes = append(rt.nodes, node{id: n.ID, svc: svc, srv: srv})
 	return nil
-}
-
-// buildBackend wires the hash ring over the cluster's storage nodes; the
-// injected clients make addressing the transports' concern.
-func (rt *Runtime) buildBackend(
-	cfg *s3.Config,
-	topo *topology.Topology,
-	stateClient *state.Client,
-	shardClient *storage.Client,
-) (backend.Backend, error) {
-	storageNodes := topo.NodesByRole(topology.RoleShardStorage)
-	beNodes := make([]int, len(storageNodes))
-	for i, n := range storageNodes {
-		beNodes[i] = n.ID
-	}
-	beBuckets := make([]distributed.BucketConfig, len(cfg.Buckets))
-	for i, b := range cfg.Buckets {
-		beBuckets[i] = distributed.BucketConfig{
-			Name:      b.Name,
-			Region:    b.Region,
-			Type:      b.Type,
-			Public:    b.Public,
-			AccountID: b.AccountID,
-		}
-	}
-
-	be, err := distributed.New(&distributed.Config{
-		DataShards:   cfg.RS.Data,
-		ParityShards: cfg.RS.Parity,
-		StorageNodes: beNodes,
-		Buckets:      beBuckets,
-		State:        stateClient,
-		Storage:      shardClient,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create distributed backend: %w", err)
-	}
-	return be, nil
 }
 
 // Run serves every node until ctx is cancelled, then drains. Each node's rpc

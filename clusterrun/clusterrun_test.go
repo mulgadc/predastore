@@ -4,17 +4,68 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/xml"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/mulgadc/predastore/internal/gateway/model"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/predastore/s3"
 )
+
+const (
+	testRegion    = "ap-southeast-2"
+	testAccessKey = "AKIAIOSFODNN7EXAMPLE"
+	testSecretKey = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+	testAccountID = "123456789012"
+)
+
+// signedRequest builds an S3 request signed the way a client would sign it, so
+// it passes the gateway's own auth middleware rather than bypassing it.
+func signedRequest(t *testing.T, method, target string, body []byte) *http.Request {
+	t.Helper()
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	req := httptest.NewRequest(method, target, rdr)
+	signInPlace(t, req, body)
+	return req
+}
+
+// signInPlace signs an already-built request, for the cases that need a header
+// set before signing.
+func signInPlace(t *testing.T, req *http.Request, body []byte) {
+	t.Helper()
+	sum := sha256.Sum256(body)
+	payloadHash := hex.EncodeToString(sum[:])
+	// The server recovers the signed payload hash from this header; the SDK doesn't set it.
+	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
+
+	signer := v4.NewSigner(func(so *v4.SignerOptions) { so.DisableURIPathEscaping = true })
+	if err := signer.SignHTTP(context.Background(),
+		aws.Credentials{AccessKeyID: testAccessKey, SecretAccessKey: testSecretKey},
+		req, payloadHash, "s3", testRegion, time.Now().UTC()); err != nil {
+		t.Fatalf("sign request: %v", err)
+	}
+}
+
+// serve runs one request through the gateway and returns the recorder.
+func serve(t *testing.T, h http.Handler, req *http.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr
+}
 
 // testMasterKey writes a fresh 32-byte key to disk and loads it the way the
 // entrypoint does.
@@ -37,13 +88,19 @@ func testMasterKey(t *testing.T) *masterkey.Key {
 
 // TestClusterRuntimeObjectRoundTrip runs a whole cluster — three storage
 // nodes and one state replica — in one process over pipe streams, with no
-// network sockets and no certs, and drives S3 object operations through the
-// prepared backend. Each node has its own service and rpc server, so this
-// also covers several servers coexisting on the shared pipe registry.
+// network sockets and no certs, and drives S3 operations through the gateway's
+// own handlers. Each node has its own service and rpc server, so this also
+// covers several servers coexisting on the shared pipe registry.
 func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := &s3.Config{
-		RS: s3.RS{Data: 2, Parity: 1},
+		Region: testRegion,
+		RS:     s3.RS{Data: 2, Parity: 1},
+		Auth: []s3.AuthEntry{{
+			AccessKeyID:     testAccessKey,
+			SecretAccessKey: testSecretKey,
+			AccountID:       testAccountID,
+		}},
 		Hosts: []topology.Host{
 			{ID: 1, BindAddr: "127.0.0.1:16660", PublicAddr: "127.0.0.1:16660", DataDir: dataDir},
 		},
@@ -79,73 +136,57 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 		t.Fatalf("WaitReady: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	be := rt.Backend
+	gw := s3.NewHTTP2Server(cfg, rt.Clients, s3.NewConfigProvider(cfg.Auth)).GetHandler()
 
-	if _, err := be.CreateBucket(ctx, &model.CreateBucketRequest{
-		Bucket:    "it-bucket",
-		Region:    "ap-southeast-2",
-		OwnerID:   "AKIAIOSFODNN7EXAMPLE",
-		AccountID: "123456789012",
-	}); err != nil {
-		t.Fatalf("CreateBucket: %v", err)
+	if rr := serve(t, gw, signedRequest(t, http.MethodPut, "/it-bucket", nil)); rr.Code != http.StatusOK {
+		t.Fatalf("CreateBucket: status %d, body %s", rr.Code, rr.Body.String())
 	}
 
 	payload := make([]byte, 1<<20)
 	if _, err := rand.Read(payload); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
-	if _, err := be.PutObject(ctx, &model.PutObjectRequest{
-		Bucket:        "it-bucket",
-		Key:           "dir/blob.bin",
-		Body:          bytes.NewReader(payload),
-		ContentLength: int64(len(payload)),
-		ContentType:   "application/octet-stream",
-	}); err != nil {
-		t.Fatalf("PutObject: %v", err)
+	if rr := serve(t, gw, signedRequest(t, http.MethodPut, "/it-bucket/dir/blob.bin", payload)); rr.Code != http.StatusOK {
+		t.Fatalf("PutObject: status %d, body %s", rr.Code, rr.Body.String())
 	}
 
-	resp, err := be.GetObject(ctx, &model.GetObjectRequest{
-		Bucket: "it-bucket", Key: "dir/blob.bin", RangeStart: -1, RangeEnd: -1,
-	})
-	if err != nil {
-		t.Fatalf("GetObject: %v", err)
+	rr := serve(t, gw, signedRequest(t, http.MethodGet, "/it-bucket/dir/blob.bin", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GetObject: status %d, body %s", rr.Code, rr.Body.String())
 	}
-	got, err := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		t.Fatalf("read object: %v", err)
-	}
-	if !bytes.Equal(got, payload) {
-		t.Fatalf("object mismatch: got %d bytes, want %d", len(got), len(payload))
+	if !bytes.Equal(rr.Body.Bytes(), payload) {
+		t.Fatalf("object mismatch: got %d bytes, want %d", rr.Body.Len(), len(payload))
 	}
 
 	// Range read exercises the single-shard fast path over rpc.
-	resp, err = be.GetObject(ctx, &model.GetObjectRequest{
-		Bucket: "it-bucket", Key: "dir/blob.bin", RangeStart: 100, RangeEnd: 1123,
-	})
-	if err != nil {
-		t.Fatalf("GetObject range: %v", err)
+	rangeReq := httptest.NewRequest(http.MethodGet, "/it-bucket/dir/blob.bin", nil)
+	rangeReq.Header.Set("Range", "bytes=100-1123")
+	signInPlace(t, rangeReq, nil)
+	rr = serve(t, gw, rangeReq)
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("GetObject range: status %d, body %s", rr.Code, rr.Body.String())
 	}
-	got, err = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if err != nil {
-		t.Fatalf("read range: %v", err)
-	}
-	if !bytes.Equal(got, payload[100:1124]) {
-		t.Fatalf("range mismatch: got %d bytes", len(got))
+	if !bytes.Equal(rr.Body.Bytes(), payload[100:1124]) {
+		t.Fatalf("range mismatch: got %d bytes", rr.Body.Len())
 	}
 
-	if err := be.DeleteObject(ctx, &model.DeleteObjectRequest{
-		Bucket: "it-bucket", Key: "dir/blob.bin",
-	}); err != nil {
-		t.Fatalf("DeleteObject: %v", err)
+	rr = serve(t, gw, signedRequest(t, http.MethodGet, "/it-bucket", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("ListObjects: status %d, body %s", rr.Code, rr.Body.String())
 	}
-	if _, err := be.GetObject(ctx, &model.GetObjectRequest{
-		Bucket: "it-bucket", Key: "dir/blob.bin", RangeStart: -1, RangeEnd: -1,
-	}); err == nil {
-		t.Fatal("GetObject after delete succeeded")
+	var listing s3.ListObjectsV2
+	if err := xml.Unmarshal(rr.Body.Bytes(), &listing); err != nil {
+		t.Fatalf("decode listing: %v", err)
+	}
+	if listing.Contents == nil || len(*listing.Contents) != 1 || (*listing.Contents)[0].Key != "dir/blob.bin" {
+		t.Fatalf("listing did not report the object: %s", rr.Body.String())
+	}
+
+	if rr := serve(t, gw, signedRequest(t, http.MethodDelete, "/it-bucket/dir/blob.bin", nil)); rr.Code != http.StatusNoContent {
+		t.Fatalf("DeleteObject: status %d, body %s", rr.Code, rr.Body.String())
+	}
+	if rr := serve(t, gw, signedRequest(t, http.MethodGet, "/it-bucket/dir/blob.bin", nil)); rr.Code != http.StatusNotFound {
+		t.Fatalf("GetObject after delete: status %d", rr.Code)
 	}
 }
 

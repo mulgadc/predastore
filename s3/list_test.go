@@ -12,7 +12,7 @@ import (
 func TestListBucketsNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
+	server := NewHTTP2Server(config, Clients{}, NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
@@ -24,7 +24,7 @@ func TestListBucketsNoAuth(t *testing.T) {
 func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
+	server := NewHTTP2Server(config, Clients{}, NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	rr := httptest.NewRecorder()
@@ -41,7 +41,7 @@ func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
 func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
+	server := NewHTTP2Server(config, Clients{}, NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")

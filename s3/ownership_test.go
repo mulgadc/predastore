@@ -1,16 +1,20 @@
 package s3
 
 import (
-	"context"
+	"bytes"
+	"encoding/gob"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mulgadc/predastore/internal/gateway/model"
+	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- bucketAccessAllowed unit tests ---
@@ -70,75 +74,70 @@ func (p *stubCredProvider) LookupCredentials(accessKeyID string) (*CredentialRes
 
 func (p *stubCredProvider) Close() {}
 
-// stubBackend implements backend.Backend with only GetBucketMetadata exercised.
-// Other methods return ErrInternalError so any unexpected route invocation is
-// obvious in test failures. metadataErr, when non-nil, makes GetBucketMetadata
-// return that error verbatim (used to exercise the infra-error branch of
-// resolveBucketMetadata).
-type stubBackend struct {
-	buckets     map[string]*model.BucketMetadata
-	metadataErr error
+// fakeState is an in-memory stand-in for the state client: enough for the
+// middleware's bucket lookups without standing up a raft cluster. When err is
+// set every read fails with it, which is how the infra-error branch of
+// resolveBucketMetadata is exercised.
+type fakeState struct {
+	rows map[string][]byte
+	err  error
 }
 
-func (b *stubBackend) GetBucketMetadata(bucket string) (*model.BucketMetadata, error) {
-	if b.metadataErr != nil {
-		return nil, b.metadataErr
+func (f *fakeState) Get(key string) ([]byte, error) {
+	if f.err != nil {
+		return nil, f.err
 	}
-	if m, ok := b.buckets[bucket]; ok {
-		return m, nil
+	v, ok := f.rows[key]
+	if !ok {
+		return nil, state.ErrNotFound
 	}
-	return nil, model.ErrNoSuchBucketError.WithResource(bucket)
+	return v, nil
 }
 
-func (b *stubBackend) GetObject(_ context.Context, _ *model.GetObjectRequest) (*model.GetObjectResponse, error) {
-	return nil, errors.New("stubBackend.GetObject called unexpectedly")
+func (f *fakeState) Put(key string, value []byte) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.rows[key] = value
+	return nil
 }
-func (b *stubBackend) HeadObject(_ context.Context, _, _ string) (*model.HeadObjectResponse, error) {
-	return nil, errors.New("stubBackend.HeadObject called unexpectedly")
+
+func (f *fakeState) Delete(key string) error {
+	if f.err != nil {
+		return f.err
+	}
+	delete(f.rows, key)
+	return nil
 }
-func (b *stubBackend) PutObject(_ context.Context, _ *model.PutObjectRequest) (*model.PutObjectResponse, error) {
-	return nil, errors.New("stubBackend.PutObject called unexpectedly")
-}
-func (b *stubBackend) DeleteObject(_ context.Context, _ *model.DeleteObjectRequest) error {
-	return errors.New("stubBackend.DeleteObject called unexpectedly")
-}
-func (b *stubBackend) CreateBucket(_ context.Context, _ *model.CreateBucketRequest) (*model.CreateBucketResponse, error) {
-	return nil, errors.New("stubBackend.CreateBucket called unexpectedly")
-}
-func (b *stubBackend) DeleteBucket(_ context.Context, _ *model.DeleteBucketRequest) error {
-	return errors.New("stubBackend.DeleteBucket called unexpectedly")
-}
-func (b *stubBackend) HeadBucket(_ context.Context, _ *model.HeadBucketRequest) (*model.HeadBucketResponse, error) {
-	return nil, errors.New("stubBackend.HeadBucket called unexpectedly")
-}
-func (b *stubBackend) ListBuckets(_ context.Context, accountID string) (*model.ListBucketsResponse, error) {
-	out := &model.ListBucketsResponse{Owner: model.OwnerInfo{ID: accountID}}
-	for _, m := range b.buckets {
-		if m.AccountID == accountID {
-			out.Buckets = append(out.Buckets, model.BucketInfo{Name: m.Name, Region: m.Region})
+
+func (f *fakeState) Scan(prefix string, limit int) ([]state.Item, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	items := make([]state.Item, 0, len(f.rows))
+	for k, v := range f.rows {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		items = append(items, state.Item{Key: k, Value: v})
+		if limit > 0 && len(items) == limit {
+			break
 		}
 	}
-	return out, nil
+	return items, nil
 }
-func (b *stubBackend) ListObjects(_ context.Context, req *model.ListObjectsRequest) (*model.ListObjectsResponse, error) {
-	if _, ok := b.buckets[req.Bucket]; !ok {
-		return nil, model.ErrNoSuchBucketError.WithResource(req.Bucket)
+
+// newFakeState seeds the bucket table the way CreateBucket would.
+func newFakeState(t *testing.T, buckets ...model.BucketMetadata) *fakeState {
+	t.Helper()
+	f := &fakeState{rows: make(map[string][]byte)}
+	for _, b := range buckets {
+		var buf bytes.Buffer
+		require.NoError(t, gob.NewEncoder(&buf).Encode(&b))
+		f.rows[tableKey(model.TableBuckets, b.Name)] = buf.Bytes()
 	}
-	return &model.ListObjectsResponse{Name: req.Bucket}, nil
+	return f
 }
-func (b *stubBackend) CreateMultipartUpload(_ context.Context, _ *model.CreateMultipartUploadRequest) (*model.CreateMultipartUploadResponse, error) {
-	return nil, errors.New("stubBackend.CreateMultipartUpload called unexpectedly")
-}
-func (b *stubBackend) UploadPart(_ context.Context, _ *model.UploadPartRequest) (*model.UploadPartResponse, error) {
-	return nil, errors.New("stubBackend.UploadPart called unexpectedly")
-}
-func (b *stubBackend) CompleteMultipartUpload(_ context.Context, _ *model.CompleteMultipartUploadRequest) (*model.CompleteMultipartUploadResponse, error) {
-	return nil, errors.New("stubBackend.CompleteMultipartUpload called unexpectedly")
-}
-func (b *stubBackend) AbortMultipartUpload(_ context.Context, _, _, _ string) error {
-	return errors.New("stubBackend.AbortMultipartUpload called unexpectedly")
-}
-func (b *stubBackend) Type() string { return "stub" }
 
 const (
 	acctOwner = "000000000001"
@@ -174,17 +173,18 @@ func ownershipServer(t *testing.T) *HTTP2Server {
 			AccountID: acctSys,
 		}},
 	}
-	be := &stubBackend{buckets: map[string]*model.BucketMetadata{
-		"owner-bucket":  {Name: "owner-bucket", Region: "ap-southeast-2", AccountID: acctOwner},
-		"public-bucket": {Name: "public-bucket", Region: "ap-southeast-2", AccountID: acctOwner, Public: true},
-	}}
 	credProv := &stubCredProvider{creds: map[string]*CredentialResult{
 		keyOwner:  {SecretAccessKey: secret, AccountID: acctOwner, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
 		keyOther:  {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
 		keyConfig: {SecretAccessKey: secret, AccountID: acctSys, SkipPolicyCheck: true},
 		keyNoIAM:  {SecretAccessKey: secret, AccountID: acctOwner /* no policies */},
 	}}
-	return NewHTTP2ServerWithBackend(cfg, be, credProv)
+	server := NewHTTP2Server(cfg, Clients{}, credProv)
+	server.globalState = newFakeState(t,
+		model.BucketMetadata{Name: "owner-bucket", Region: "ap-southeast-2", AccountID: acctOwner},
+		model.BucketMetadata{Name: "public-bucket", Region: "ap-southeast-2", AccountID: acctOwner, Public: true},
+	)
+	return server
 }
 
 func signedReq(t *testing.T, method, path, accessKey string) *http.Request {
@@ -344,20 +344,17 @@ func TestOwnership_CrossAccountDeniedOnBucketSubresources(t *testing.T) {
 	}
 }
 
-// A non-NoSuchBucket backend error must surface as 500 InternalError without
+// A non-NoSuchBucket state error must surface as 500 InternalError without
 // invoking the route handler — a regression that swallowed the error and
 // returned (nil, nil) would silently allow cross-account access via the
 // "unknown bucket — let the handler return NoSuchBucket" branch.
 func TestOwnership_BackendErrorReturnsInternalError(t *testing.T) {
-	cfg := &Config{Region: "ap-southeast-2"} // no config buckets — force backend lookup
-	be := &stubBackend{
-		buckets:     map[string]*model.BucketMetadata{},
-		metadataErr: errors.New("backend infrastructure failure"),
-	}
+	cfg := &Config{Region: "ap-southeast-2"} // no config buckets — force the state lookup
 	credProv := &stubCredProvider{creds: map[string]*CredentialResult{
 		keyOther: {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
 	}}
-	server := NewHTTP2ServerWithBackend(cfg, be, credProv)
+	server := NewHTTP2Server(cfg, Clients{}, credProv)
+	server.globalState = &fakeState{rows: map[string][]byte{}, err: errors.New("state infrastructure failure")}
 
 	req := signedReq(t, http.MethodGet, "/some-bucket", keyOther)
 	status, nextCalled, body := runMiddleware(t, server, req)

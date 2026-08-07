@@ -3,23 +3,18 @@ package s3
 import (
 	"context"
 	"crypto/tls"
-	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"strconv"
-	"strings"
 	"time"
 
+	"github.com/buraksezer/consistent"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/google/uuid"
-	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/internal/gateway/model"
+	"github.com/mulgadc/predastore/internal/state"
+	"github.com/mulgadc/predastore/internal/storage"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
@@ -31,37 +26,78 @@ import (
 // independent of the region they are configured for or the endpoint they target.
 const globalSigningRegion = "us-east-1"
 
-// HTTP2Server is an HTTP/2 compatible S3 server using net/http.
+// Clients are the cluster connections the gateway does its work through. It
+// owns neither transport: the process that runs the nodes builds both and
+// hands them over.
+type Clients struct {
+	// State reaches the replicas holding bucket, object and upload metadata.
+	State *state.Client
+	// Storage reaches the nodes holding shards.
+	Storage *storage.Client
+}
+
+// HTTP2Server is an HTTP/2 compatible S3 server using net/http. It is the S3
+// implementation, not a front end onto one: each handler erasure codes,
+// places and records its own operation.
 type HTTP2Server struct {
 	config    *Config
-	backend   backend.Backend
 	router    chi.Router
 	server    *http.Server
 	credProv  CredentialProvider
 	throttler *ratelimit.Throttler
+
+	rsDataShard   int
+	rsParityShard int
+	hashRing      *consistent.Consistent // shard placement across the storage nodes
+	globalState   stateStore             // bucket, object and upload metadata
+	shards        *storage.Client        // shard reads and writes
+	buckets       []S3_Buckets           // config-defined buckets, plus those created since startup
 }
 
-// NewHTTP2ServerWithBackend creates a new HTTP/2 server with an existing backend.
-func NewHTTP2ServerWithBackend(config *Config, be backend.Backend, credProv CredentialProvider) *HTTP2Server {
+// NewHTTP2Server creates the S3 gateway over the given cluster clients. Shard
+// counts and the ring's membership come from the config, so the gateway places
+// shards exactly where the cluster it was configured against expects them.
+func NewHTTP2Server(config *Config, clients Clients, credProv CredentialProvider) *HTTP2Server {
+	dataShards := config.RS.Data
+	if dataShards == 0 {
+		dataShards = defaultDataShards
+	}
+	parityShards := config.RS.Parity
+	if parityShards == 0 {
+		parityShards = defaultParityShards
+	}
+
 	s := &HTTP2Server{
-		config:   config,
-		backend:  be,
-		router:   chi.NewRouter(),
-		credProv: credProv,
+		config:        config,
+		router:        chi.NewRouter(),
+		credProv:      credProv,
+		rsDataShard:   dataShards,
+		rsParityShard: parityShards,
+		hashRing:      newHashRing(config.storageNodeIDs()),
+		shards:        clients.Storage,
+		buckets:       append([]S3_Buckets(nil), config.Buckets...),
+	}
+	// Assigned through the nil check so a typed-nil client cannot masquerade as
+	// a live one behind the interface.
+	if clients.State != nil {
+		s.globalState = clients.State
 	}
 
 	if config.RateLimit.Enabled {
 		s.throttler = ratelimit.New(config.RateLimit)
 	}
 
+	s.setupMiddleware()
 	s.setupRoutes()
 	return s
 }
 
-func (s *HTTP2Server) setupRoutes() {
+// setupMiddleware installs the chain every request passes through before it
+// reaches a handler. chi requires all middleware to be registered before the
+// first route, so this runs ahead of setupRoutes.
+func (s *HTTP2Server) setupMiddleware() {
 	r := s.router
 
-	// Configure logging
 	var logLevel slog.Level
 	if s.config.Debug {
 		logLevel = slog.LevelDebug
@@ -73,7 +109,6 @@ func (s *HTTP2Server) setupRoutes() {
 
 	otelsetup.SetDefaultJSONLogger(logLevel)
 
-	// Middleware
 	r.Use(otelsetup.HTTPMiddleware("predastore"))
 	r.Use(s3SpanMiddleware)
 	// chi's access log duplicates the APM transaction from HTTPMiddleware and
@@ -111,22 +146,6 @@ func (s *HTTP2Server) setupRoutes() {
 			},
 		))
 	}
-
-	// Routes
-	r.Get("/", s.listBuckets)
-
-	// Bucket operations (without key)
-	r.Put("/{bucket}", s.createBucket)
-	r.Head("/{bucket}", s.headBucket)
-	r.Delete("/{bucket}", s.deleteBucket)
-	r.Get("/{bucket}", s.listObjects)
-
-	// Object operations (with key)
-	r.Head("/{bucket}/*", s.headObject)
-	r.Get("/{bucket}/*", s.getObject)
-	r.Put("/{bucket}/*", s.putObject)
-	r.Post("/{bucket}/*", s.postObject)
-	r.Delete("/{bucket}/*", s.deleteObject)
 }
 
 // sigV4AuthMiddleware authenticates and authorizes incoming S3 requests:
@@ -239,526 +258,6 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// respondSigV4Error maps a parse/verify sentinel or a credential lookup
-// error to the matching S3 error response.
-func (s *HTTP2Server) respondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string, err, lookupErr error) {
-	if lookupErr != nil {
-		if errors.Is(lookupErr, ErrKeyNotFound) {
-			slog.WarnContext(r.Context(), "Unknown access key", "accessKeyID", claimedKey, "remoteAddr", r.RemoteAddr)
-			s.writeS3Error(w, r, http.StatusForbidden, "InvalidAccessKeyId",
-				"The AWS Access Key Id you provided does not exist in our records")
-			return
-		}
-		slog.ErrorContext(r.Context(), "Credential lookup infrastructure error",
-			"accessKeyID", claimedKey, "error", lookupErr, "remoteAddr", r.RemoteAddr)
-		s.writeS3Error(w, r, http.StatusInternalServerError, "InternalError",
-			"An internal error occurred while validating credentials")
-		return
-	}
-
-	switch {
-	case errors.Is(err, sigv4.ErrMissingAuthentication):
-		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing Authorization header")
-	case errors.Is(err, sigv4.ErrUnsignedHeader):
-		s.writeS3Error(w, r, http.StatusBadRequest, "AuthorizationHeaderMalformed", err.Error())
-	case errors.Is(err, sigv4.ErrUnsupportedAlgorithm):
-		s.writeS3Error(w, r, http.StatusBadRequest, "AuthorizationHeaderMalformed", "Invalid Authorization header format")
-	case errors.Is(err, sigv4.ErrMalformedAuthorization):
-		s.writeS3Error(w, r, http.StatusBadRequest, "AuthorizationHeaderMalformed", err.Error())
-	case errors.Is(err, sigv4.ErrMalformedPresignedURL):
-		s.writeS3Error(w, r, http.StatusBadRequest, "AuthorizationQueryParametersError", err.Error())
-	case errors.Is(err, sigv4.ErrRequestTimeInvalid):
-		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing required header: X-Amz-Date")
-	case errors.Is(err, sigv4.ErrMissingContentSHA256):
-		s.writeS3Error(w, r, http.StatusBadRequest, "InvalidRequest", "Missing required header: X-Amz-Content-Sha256")
-	case errors.Is(err, sigv4.ErrRequestTimeTooSkewed):
-		slog.DebugContext(r.Context(), "Request timestamp outside allowed skew", "timestamp", r.Header.Get("X-Amz-Date"))
-		s.writeS3Error(w, r, http.StatusForbidden, "RequestTimeTooSkewed",
-			"The difference between the request time and the current time is too large")
-	case errors.Is(err, sigv4.ErrPresignedURLExpired):
-		slog.DebugContext(r.Context(), "Presigned URL expired or not yet valid", "timestamp", r.URL.Query().Get("X-Amz-Date"))
-		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Request has expired")
-	case errors.Is(err, sigv4.ErrSignatureMismatch):
-		slog.WarnContext(r.Context(), "SigV4 signature mismatch",
-			"accessKeyID", claimedKey,
-			"method", r.Method,
-			"path", r.URL.Path,
-			"host", r.Host,
-			"amzDate", r.Header.Get("X-Amz-Date"),
-			"payloadHashHeader", r.Header.Get("X-Amz-Content-Sha256"),
-			"contentLength", r.Header.Get("Content-Length"),
-			"userAgent", r.Header.Get("User-Agent"),
-			"proto", r.Proto,
-			"remoteAddr", r.RemoteAddr,
-		)
-		s.writeS3Error(w, r, http.StatusForbidden, "SignatureDoesNotMatch",
-			"The request signature we calculated does not match the signature you provided. Check your key and signing method.")
-	default:
-		slog.WarnContext(r.Context(), "Unexpected SigV4 verification error", "error", err, "accessKeyID", claimedKey)
-		s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", err.Error())
-	}
-}
-
-// writeS3Error writes an S3 error response.
-func (s *HTTP2Server) writeS3Error(w http.ResponseWriter, r *http.Request, statusCode int, code, message string) {
-	s3error := S3Error{
-		Code:      code,
-		Message:   message,
-		RequestId: uuid.NewString(),
-		HostId:    r.Host,
-	}
-	otelsetup.SetRequestErrorCode(r.Context(), code)
-
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(statusCode)
-	if err := xml.NewEncoder(w).Encode(s3error); err != nil {
-		slog.DebugContext(r.Context(), "failed to encode XML error response", "error", err)
-	}
-}
-
-// writeXML writes an XML response.
-func (s *HTTP2Server) writeXML(w http.ResponseWriter, statusCode int, v any) error {
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(statusCode)
-	return xml.NewEncoder(w).Encode(v)
-}
-
-// handleError converts backend errors to S3 error responses.
-func (s *HTTP2Server) handleError(w http.ResponseWriter, r *http.Request, err error) {
-	statusCode := http.StatusInternalServerError
-	var s3error S3Error
-
-	if backendErr, ok := model.IsS3Error(err); ok {
-		statusCode = backendErr.StatusCode
-		s3error.Code = string(backendErr.Code)
-		s3error.Message = backendErr.Message
-	} else {
-		switch {
-		case strings.Contains(err.Error(), "NoSuchBucket") || strings.Contains(err.Error(), "Bucket not found"):
-			statusCode = http.StatusNotFound
-			s3error.Code = "NoSuchBucket"
-			s3error.Message = "The specified bucket does not exist"
-		case strings.Contains(err.Error(), "AccessDenied"):
-			statusCode = http.StatusForbidden
-			s3error.Code = "AccessDenied"
-			s3error.Message = "Access Denied"
-		case strings.Contains(err.Error(), "NoSuchKey") || strings.Contains(err.Error(), "not found") || errors.Is(err, os.ErrNotExist):
-			statusCode = http.StatusNotFound
-			s3error.Code = "NoSuchKey"
-			s3error.Message = "The specified key does not exist"
-		default:
-			s3error.Code = "InternalError"
-			s3error.Message = err.Error()
-		}
-	}
-
-	s3error.RequestId = uuid.NewString()
-	s3error.HostId = r.Host
-	otelsetup.SetRequestErrorCode(r.Context(), s3error.Code)
-
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(statusCode)
-	if err := xml.NewEncoder(w).Encode(s3error); err != nil {
-		slog.DebugContext(r.Context(), "failed to encode XML error response", "error", err)
-	}
-}
-
-// Route handlers
-
-func (s *HTTP2Server) listBuckets(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	accountID := ""
-	if v := ctx.Value(ContextKeyAccountID); v != nil {
-		accountID, _ = v.(string)
-	}
-
-	resp, err := s.backend.ListBuckets(ctx, accountID)
-	if err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-
-	result := ListBuckets{
-		Owner: BucketOwner{
-			ID:          resp.Owner.ID,
-			DisplayName: resp.Owner.DisplayName,
-		},
-	}
-	for _, b := range resp.Buckets {
-		result.Buckets = append(result.Buckets, ListBucket{
-			Name:         b.Name,
-			CreationDate: b.CreationDate,
-		})
-	}
-
-	if err := s.writeXML(w, http.StatusOK, result); err != nil {
-		slog.DebugContext(ctx, "failed to write XML response", "error", err)
-	}
-}
-
-func (s *HTTP2Server) createBucket(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-
-	// PUT /{bucket}?policy — bucket policies are not supported
-	if r.URL.Query().Has("policy") {
-		s.writeS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "Bucket policy is not implemented")
-		return
-	}
-
-	ownerID := ""
-	if v := ctx.Value(ContextKeyAccessKeyID); v != nil {
-		ownerID, _ = v.(string)
-	}
-	accountID := ""
-	if v := ctx.Value(ContextKeyAccountID); v != nil {
-		accountID, _ = v.(string)
-	}
-
-	region := s.config.Region
-	if r.ContentLength > 0 {
-		var config CreateBucketConfiguration
-		body, _ := io.ReadAll(r.Body)
-		if xml.Unmarshal(body, &config) == nil && config.LocationConstraint != "" {
-			region = config.LocationConstraint
-		}
-	}
-
-	_, err := s.backend.CreateBucket(ctx, &model.CreateBucketRequest{
-		Bucket:           bucket,
-		Region:           region,
-		OwnerID:          ownerID,
-		AccountID:        accountID,
-		OwnerDisplayName: ownerID,
-	})
-	if err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-
-	w.Header().Set("Location", fmt.Sprintf("http://%s.s3.%s.amazonaws.com/", bucket, region))
-	w.WriteHeader(http.StatusOK)
-}
-
-func (s *HTTP2Server) headBucket(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-
-	resp, err := s.backend.HeadBucket(ctx, &model.HeadBucketRequest{Bucket: bucket})
-	if err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-
-	w.Header().Set("X-Amz-Bucket-Region", resp.Region)
-	w.WriteHeader(http.StatusOK)
-}
-
-func (s *HTTP2Server) deleteBucket(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-
-	// DELETE /{bucket}?policy — no-op, bucket policies are not supported
-	if r.URL.Query().Has("policy") {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	ownerID := ""
-	if v := ctx.Value(ContextKeyAccessKeyID); v != nil {
-		ownerID, _ = v.(string)
-	}
-
-	err := s.backend.DeleteBucket(ctx, &model.DeleteBucketRequest{
-		Bucket:  bucket,
-		OwnerID: ownerID,
-	})
-	if err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *HTTP2Server) listObjects(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-	query := r.URL.Query()
-
-	// Return proper errors for unsupported bucket sub-resource operations
-	// that Terraform and other tools may call.
-	slog.DebugContext(ctx, "listObjects called", "bucket", bucket, "query", r.URL.RawQuery)
-	if query.Has("policy") {
-		slog.DebugContext(ctx, "returning NoSuchBucketPolicy for ?policy request", "bucket", bucket)
-		s.writeS3Error(w, r, http.StatusNotFound, "NoSuchBucketPolicy", "The bucket policy does not exist")
-		return
-	}
-	if query.Has("acl") {
-		s.writeS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "ACL is not implemented")
-		return
-	}
-	if query.Has("versioning") {
-		s.writeS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "Versioning is not implemented")
-		return
-	}
-
-	resp, err := s.backend.ListObjects(ctx, &model.ListObjectsRequest{
-		Bucket:    bucket,
-		Prefix:    query.Get("prefix"),
-		Delimiter: query.Get("delimiter"),
-	})
-	if err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-
-	contents := make([]ListObjectsV2_Contents, 0, len(resp.Contents))
-	for _, obj := range resp.Contents {
-		contents = append(contents, ListObjectsV2_Contents{
-			Key:          obj.Key,
-			LastModified: obj.LastModified,
-			ETag:         obj.ETag,
-			Size:         obj.Size,
-			StorageClass: obj.StorageClass,
-		})
-	}
-
-	prefixes := make([]ListObjectsV2_Dir, 0, len(resp.CommonPrefixes))
-	for _, p := range resp.CommonPrefixes {
-		prefixes = append(prefixes, ListObjectsV2_Dir{Prefix: p})
-	}
-
-	result := ListObjectsV2{
-		Name:           resp.Name,
-		Prefix:         resp.Prefix,
-		KeyCount:       resp.KeyCount,
-		MaxKeys:        resp.MaxKeys,
-		IsTruncated:    resp.IsTruncated,
-		Contents:       &contents,
-		CommonPrefixes: &prefixes,
-	}
-
-	if err := s.writeXML(w, http.StatusOK, result); err != nil {
-		slog.DebugContext(ctx, "failed to write XML response", "error", err)
-	}
-}
-
-func (s *HTTP2Server) headObject(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
-
-	resp, err := s.backend.HeadObject(ctx, bucket, key)
-	if err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-
-	w.Header().Set("Content-Type", resp.ContentType)
-	w.Header().Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
-	w.Header().Set("ETag", resp.ETag)
-	w.Header().Set("Last-Modified", resp.LastModified.Format("Mon, 02 Jan 2006 15:04:05 GMT"))
-	w.WriteHeader(http.StatusOK)
-}
-
-func (s *HTTP2Server) getObject(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
-
-	req := &model.GetObjectRequest{
-		Bucket:     bucket,
-		Key:        key,
-		RangeStart: -1,
-		RangeEnd:   -1,
-	}
-
-	// Parse Range header
-	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
-		if strings.HasPrefix(rangeHeader, "bytes=") {
-			rangeSpec := rangeHeader[6:]
-			if idx := strings.Index(rangeSpec, "-"); idx >= 0 {
-				if idx > 0 {
-					start, _ := strconv.ParseInt(rangeSpec[:idx], 10, 64)
-					req.RangeStart = start
-				}
-				if idx < len(rangeSpec)-1 {
-					end, _ := strconv.ParseInt(rangeSpec[idx+1:], 10, 64)
-					req.RangeEnd = end
-				}
-			}
-		}
-	}
-
-	resp, err := s.backend.GetObject(ctx, req)
-	if err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	w.Header().Set("Content-Type", resp.ContentType)
-	w.Header().Set("Content-Length", strconv.FormatInt(resp.Size, 10))
-	w.Header().Set("ETag", resp.ETag)
-	w.Header().Set("Last-Modified", resp.LastModified.Format("Mon, 02 Jan 2006 15:04:05 GMT"))
-
-	if resp.StatusCode == http.StatusPartialContent {
-		w.Header().Set("Content-Range", resp.ContentRange)
-		w.WriteHeader(http.StatusPartialContent)
-	} else {
-		w.WriteHeader(http.StatusOK)
-	}
-
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		slog.DebugContext(ctx, "failed to copy response body", "error", err)
-	}
-}
-
-func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
-
-	// Check for multipart part upload
-	if partNum := r.URL.Query().Get("partNumber"); partNum != "" {
-		uploadID := r.URL.Query().Get("uploadId")
-		partNumber, _ := strconv.Atoi(partNum)
-		decodedLen, _ := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
-
-		resp, err := s.backend.UploadPart(ctx, &model.UploadPartRequest{
-			Bucket:          bucket,
-			Key:             key,
-			UploadID:        uploadID,
-			PartNumber:      partNumber,
-			Body:            r.Body,
-			ContentEncoding: r.Header.Get("Content-Encoding"),
-			IsChunked:       r.Header.Get("Content-Encoding") == "aws-chunked",
-			DecodedLength:   decodedLen,
-		})
-		if err != nil {
-			s.handleError(w, r, err)
-			return
-		}
-
-		w.Header().Set("ETag", resp.ETag)
-		w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// Regular put object
-	decodedLen, _ := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
-
-	resp, err := s.backend.PutObject(ctx, &model.PutObjectRequest{
-		Bucket:          bucket,
-		Key:             key,
-		Body:            r.Body,
-		ContentEncoding: r.Header.Get("Content-Encoding"),
-		IsChunked:       r.Header.Get("Content-Encoding") == "aws-chunked",
-		DecodedLength:   decodedLen,
-	})
-	if err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-
-	// Nearfull writes still succeed; the header lets clients back off before
-	// hitting the hard 507 rejection.
-	if resp.PoolNearFull {
-		w.Header().Set("X-Predastore-Pool-Pressure", "nearfull")
-	}
-	w.Header().Set("ETag", resp.ETag)
-	w.WriteHeader(http.StatusOK)
-}
-
-func (s *HTTP2Server) postObject(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
-
-	uploadID := r.URL.Query().Get("uploadId")
-	if uploadID == "" {
-		// Create multipart upload
-		resp, err := s.backend.CreateMultipartUpload(ctx, &model.CreateMultipartUploadRequest{
-			Bucket: bucket,
-			Key:    key,
-		})
-		if err != nil {
-			s.handleError(w, r, err)
-			return
-		}
-
-		w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
-		if err := s.writeXML(w, http.StatusOK, InitiateMultipartUploadResult{
-			Bucket:   resp.Bucket,
-			Key:      resp.Key,
-			UploadId: resp.UploadID,
-		}); err != nil {
-			slog.DebugContext(ctx, "failed to write XML response", "error", err)
-		}
-		return
-	}
-
-	// Complete multipart upload
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-
-	var completeReq CompleteMultipartUpload
-	if err := xml.Unmarshal(body, &completeReq); err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-
-	parts := make([]model.CompletedPart, len(completeReq.Parts))
-	for i, p := range completeReq.Parts {
-		parts[i] = model.CompletedPart{
-			PartNumber: p.PartNumber,
-			ETag:       p.ETag,
-		}
-	}
-
-	resp, err := s.backend.CompleteMultipartUpload(ctx, &model.CompleteMultipartUploadRequest{
-		Bucket:   bucket,
-		Key:      key,
-		UploadID: uploadID,
-		Parts:    parts,
-	})
-	if err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-
-	if err := s.writeXML(w, http.StatusOK, CompleteMultipartUploadResult{
-		Location: fmt.Sprintf("https://%s%s", r.Host, resp.Location),
-		Bucket:   resp.Bucket,
-		Key:      resp.Key,
-		ETag:     resp.ETag,
-	}); err != nil {
-		slog.DebugContext(ctx, "failed to write XML response", "error", err)
-	}
-}
-
-func (s *HTTP2Server) deleteObject(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
-
-	err := s.backend.DeleteObject(ctx, &model.DeleteObjectRequest{
-		Bucket: bucket,
-		Key:    key,
-	})
-	if err != nil {
-		s.handleError(w, r, err)
-		return
-	}
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
 // ListenAndServe starts the HTTP/2 server with TLS.
 func (s *HTTP2Server) ListenAndServe(addr, certFile, keyFile string) error {
 	// Load TLS certificates
@@ -830,31 +329,4 @@ func (s *HTTP2Server) GetRouter() chi.Router {
 // GetHandler returns the HTTP handler for testing with httptest.
 func (s *HTTP2Server) GetHandler() http.Handler {
 	return s.router
-}
-
-// resolveBucketMetadata returns metadata for the named bucket. Config-defined
-// buckets (static, known at startup) are checked first to avoid a synchronous
-// backend round-trip on every authenticated request. Returns nil with no error
-// when the bucket is unknown anywhere — the route handler is responsible for
-// returning NoSuchBucket so existence is reported consistently.
-func (s *HTTP2Server) resolveBucketMetadata(bucket string) (*model.BucketMetadata, error) {
-	if b, err := s.config.BucketConfig(bucket); err == nil {
-		return &model.BucketMetadata{
-			Name:      b.Name,
-			Region:    b.Region,
-			AccountID: b.AccountID,
-			Public:    b.Public,
-		}, nil
-	}
-	if s.backend == nil {
-		return nil, nil
-	}
-	meta, err := s.backend.GetBucketMetadata(bucket)
-	if err == nil {
-		return meta, nil
-	}
-	if backendErr, ok := model.IsS3Error(err); ok && backendErr.Code == model.ErrNoSuchBucket {
-		return nil, nil
-	}
-	return nil, err
 }

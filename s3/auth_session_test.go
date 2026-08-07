@@ -510,10 +510,11 @@ func sessionMiddlewareServer(t *testing.T, p *NATSIAMProvider) *HTTP2Server {
 			Public: false, AccountID: testSessionAccount,
 		}},
 	}
-	be := &stubBackend{buckets: map[string]*model.BucketMetadata{
-		"session-bucket": {Name: "session-bucket", Region: "ap-southeast-2", AccountID: testSessionAccount},
-	}}
-	return NewHTTP2ServerWithBackend(cfg, be, p)
+	server := NewHTTP2Server(cfg, Clients{}, p)
+	server.globalState = newFakeState(t,
+		model.BucketMetadata{Name: "session-bucket", Region: "ap-southeast-2", AccountID: testSessionAccount},
+	)
+	return server
 }
 
 func TestSigV4Middleware_SessionCredential(t *testing.T) {

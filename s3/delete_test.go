@@ -11,7 +11,7 @@ import (
 func TestDeleteObjectNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
+	server := NewHTTP2Server(config, Clients{}, NewConfigProvider(config.Auth))
 
 	// Send a delete request
 	req := httptest.NewRequest(http.MethodDelete, "/local/unknownfile.txt", nil)
@@ -25,7 +25,7 @@ func TestDeleteObjectNoAuth(t *testing.T) {
 func TestDeleteObjectBadAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
+	server := NewHTTP2Server(config, Clients{}, NewConfigProvider(config.Auth))
 
 	// Send a delete request
 	req := httptest.NewRequest(http.MethodDelete, "/local/unknownfile.txt", nil)

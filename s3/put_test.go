@@ -12,7 +12,7 @@ import (
 func TestPutObjectPublicBucketNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
+	server := NewHTTP2Server(config, Clients{}, NewConfigProvider(config.Auth))
 
 	testContent := []byte("This is a test file created during unit testing")
 	req := httptest.NewRequest(http.MethodPut, "/test-bucket01/test_upload.txt", bytes.NewReader(testContent))
@@ -26,7 +26,7 @@ func TestPutObjectPublicBucketNoAuth(t *testing.T) {
 func TestPutObjectPrivateBucketNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
+	server := NewHTTP2Server(config, Clients{}, NewConfigProvider(config.Auth))
 
 	testContent := []byte("This is a test file created during unit testing")
 	req := httptest.NewRequest(http.MethodPut, "/private/test_upload.txt", bytes.NewReader(testContent))

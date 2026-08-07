@@ -11,7 +11,6 @@ import (
 	"runtime/pprof"
 	"sync"
 
-	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 )
@@ -30,11 +29,10 @@ type Server struct {
 	masterKey         *masterkey.Key // Loaded master key handle (AEAD + fingerprint, no raw bytes).
 
 	// Runtime state
-	config          *Config
-	server          *HTTP2Server
-	backend         backend.Backend
-	preparedBackend backend.Backend // externally wired backend; skips backend launch
-	credProv        CredentialProvider
+	config   *Config
+	server   *HTTP2Server
+	clients  Clients // cluster clients, wired by the process that runs the nodes
+	credProv CredentialProvider
 
 	// Profiling
 	pprofEnabled    bool
@@ -117,14 +115,14 @@ func WithDebug(enabled bool) Option {
 	}
 }
 
-// WithPreparedBackend supplies an externally wired storage backend. The
-// server then only runs the S3 HTTPS frontend on top of it: no DB or QUIC
-// servers are launched, and the caller owns the backend's supporting
-// runtime (rpc server, raft nodes, shard stores). Used by cluster mode,
-// where cmd/s3d assembles the topology.
-func WithPreparedBackend(be backend.Backend) Option {
+// WithClients supplies the cluster clients the gateway works through. The
+// server then only runs the S3 HTTPS frontend: no state or storage nodes are
+// launched, and the caller owns their supporting runtime (rpc server, raft
+// nodes, shard stores). Used by cluster mode, where cmd/s3d assembles the
+// topology.
+func WithClients(clients Clients) Option {
 	return func(s *Server) error {
-		s.preparedBackend = be
+		s.clients = clients
 		return nil
 	}
 }
@@ -207,7 +205,7 @@ func (s *Server) init() error {
 	s.masterKey = key
 	slog.Info("master key loaded", "fingerprint", key.Fingerprint)
 
-	// Set log level early so debug logs during backend initialization are visible
+	// Set log level early so debug logs during initialization are visible
 	var logLevel slog.Level
 	if s.config.Debug {
 		logLevel = slog.LevelDebug
@@ -222,12 +220,11 @@ func (s *Server) init() error {
 		slog.Info("Debug logging enabled")
 	}
 
-	// The backend arrives fully wired from the process that owns the cluster
+	// The clients arrive fully wired from the process that owns the cluster
 	// nodes; the gateway never launches storage or state itself.
-	if s.preparedBackend == nil {
-		return fmt.Errorf("no backend provided: build the cluster runtime and pass WithPreparedBackend")
+	if s.clients.State == nil || s.clients.Storage == nil {
+		return fmt.Errorf("no cluster clients provided: build the cluster runtime and pass WithClients")
 	}
-	s.backend = s.preparedBackend
 
 	// Initialize credential provider
 	credProv, err := s.initCredentialProvider()
@@ -236,15 +233,16 @@ func (s *Server) init() error {
 	}
 	s.credProv = credProv
 
-	// Setup HTTP routes with the backend using HTTP/2 server
+	// Setup HTTP routes using the HTTP/2 server
 	slog.Info("Server init")
-	s.server = NewHTTP2ServerWithBackend(s.config, s.backend, s.credProv)
+	s.server = NewHTTP2Server(s.config, s.clients, s.credProv)
 	slog.Info("HTTP/2 server initialized - using net/http for connection multiplexing")
 
 	return nil
 }
 
-// initDistributedBackend initializes the distributed storage backend with DB and QUIC servers.
+// initCredentialProvider resolves the auth chain: NATS-backed IAM when it is
+// configured, with the config-defined accounts always as the fallback.
 func (s *Server) initCredentialProvider() (CredentialProvider, error) {
 	configProv := NewConfigProvider(s.config.Auth)
 

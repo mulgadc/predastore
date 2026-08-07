@@ -17,7 +17,7 @@ import (
 func setupHandleErrorServer(t *testing.T) *HTTP2Server {
 	t.Helper()
 	config := &Config{Region: "us-east-1"}
-	return NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(nil))
+	return NewHTTP2Server(config, Clients{}, NewConfigProvider(nil))
 }
 
 func TestHandleError_BackendS3Error(t *testing.T) {

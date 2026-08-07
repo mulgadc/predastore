@@ -12,7 +12,7 @@ import (
 func TestGetObjectNoBucketPermissions(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2ServerWithBackend(config, nil, NewConfigProvider(config.Auth))
+	server := NewHTTP2Server(config, Clients{}, NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/private/note.txt", nil)
 	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")

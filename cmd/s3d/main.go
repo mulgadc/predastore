@@ -97,7 +97,7 @@ func run() error {
 		s3.WithBasePath(*basePath),
 		s3.WithDebug(*debug),
 		s3.WithEncryptionKeyFile(*encryptionKeyFile),
-		s3.WithPreparedBackend(rt.Backend),
+		s3.WithClients(rt.Clients),
 	)
 	if err != nil {
 		rt.Close()
