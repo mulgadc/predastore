@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/clusterrun"
+	"github.com/mulgadc/predastore/internal/gateway"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/masterkey"
-	"github.com/mulgadc/predastore/s3"
 	"golang.org/x/sync/errgroup"
 
 	_ "github.com/mulgadc/predastore/internal/fipsboot"
@@ -71,7 +71,7 @@ func run() error {
 		}()
 	}
 
-	cfg := &s3.Config{ConfigPath: *config, BasePath: *basePath}
+	cfg := &gateway.Config{ConfigPath: *config, BasePath: *basePath}
 	if err := cfg.ReadConfig(); err != nil {
 		return fmt.Errorf("read config: %w", err)
 	}
@@ -90,14 +90,14 @@ func run() error {
 		return fmt.Errorf("build cluster runtime: %w", err)
 	}
 
-	server, err := s3.NewServer(
-		s3.WithConfigPath(*config),
-		s3.WithAddress(*host, *port),
-		s3.WithTLS(*tlsCert, *tlsKey),
-		s3.WithBasePath(*basePath),
-		s3.WithDebug(*debug),
-		s3.WithEncryptionKeyFile(*encryptionKeyFile),
-		s3.WithClients(rt.Clients),
+	server, err := gateway.NewServer(
+		gateway.WithConfigPath(*config),
+		gateway.WithAddress(*host, *port),
+		gateway.WithTLS(*tlsCert, *tlsKey),
+		gateway.WithBasePath(*basePath),
+		gateway.WithDebug(*debug),
+		gateway.WithEncryptionKeyFile(*encryptionKeyFile),
+		gateway.WithClients(rt.Clients),
 	)
 	if err != nil {
 		rt.Close()
@@ -120,7 +120,7 @@ func run() error {
 
 // serveS3 runs the gateway until the context is cancelled, then shuts it down
 // within a bounded grace period.
-func serveS3(ctx context.Context, server *s3.Server) error {
+func serveS3(ctx context.Context, server *gateway.Server) error {
 	if err := server.ListenAndServeAsync(); err != nil {
 		return fmt.Errorf("start s3 gateway: %w", err)
 	}
@@ -164,7 +164,7 @@ func applyEnvOverrides(config, tlsKey, tlsCert *string, port *int, nodes, encryp
 
 // parseNodeIDs resolves the -nodes selection; empty selects every node in the
 // topology, running the whole cluster in one process.
-func parseNodeIDs(selection string, cfg *s3.Config) ([]int, error) {
+func parseNodeIDs(selection string, cfg *gateway.Config) ([]int, error) {
 	if selection == "" {
 		return clusterrun.AllNodeIDs(cfg), nil
 	}

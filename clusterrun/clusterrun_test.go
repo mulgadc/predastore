@@ -17,9 +17,11 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/mulgadc/predastore/internal/gateway"
+	"github.com/mulgadc/predastore/internal/gateway/auth"
+	"github.com/mulgadc/predastore/internal/gateway/handlers"
 	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/pkg/masterkey"
-	"github.com/mulgadc/predastore/s3"
 )
 
 const (
@@ -93,10 +95,10 @@ func testMasterKey(t *testing.T) *masterkey.Key {
 // covers several servers coexisting on the shared pipe registry.
 func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 	dataDir := t.TempDir()
-	cfg := &s3.Config{
+	cfg := &gateway.Config{
 		Region: testRegion,
-		RS:     s3.RS{Data: 2, Parity: 1},
-		Auth: []s3.AuthEntry{{
+		RS:     gateway.RS{Data: 2, Parity: 1},
+		Auth: []auth.Entry{{
 			AccessKeyID:     testAccessKey,
 			SecretAccessKey: testSecretKey,
 			AccountID:       testAccountID,
@@ -136,7 +138,7 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 		t.Fatalf("WaitReady: %v", err)
 	}
 
-	gw := s3.NewHTTP2Server(cfg, rt.Clients, s3.NewConfigProvider(cfg.Auth)).GetHandler()
+	gw := gateway.NewHTTP2Server(cfg, rt.Clients, auth.NewConfigProvider(cfg.Auth)).GetHandler()
 
 	if rr := serve(t, gw, signedRequest(t, http.MethodPut, "/it-bucket", nil)); rr.Code != http.StatusOK {
 		t.Fatalf("CreateBucket: status %d, body %s", rr.Code, rr.Body.String())
@@ -174,7 +176,7 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("ListObjects: status %d, body %s", rr.Code, rr.Body.String())
 	}
-	var listing s3.ListObjectsV2
+	var listing handlers.ListObjectsV2
 	if err := xml.Unmarshal(rr.Body.Bytes(), &listing); err != nil {
 		t.Fatalf("decode listing: %v", err)
 	}
@@ -195,9 +197,9 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 // Getting this wrong writes cluster state into the repo.
 func TestRelativeDataDirUsesBasePath(t *testing.T) {
 	base := t.TempDir()
-	cfg := &s3.Config{
+	cfg := &gateway.Config{
 		BasePath: base,
-		RS:       s3.RS{Data: 2, Parity: 1},
+		RS:       gateway.RS{Data: 2, Parity: 1},
 		Hosts: []topology.Host{
 			{ID: 1, BindAddr: "127.0.0.1:16661", PublicAddr: "127.0.0.1:16661", DataDir: "data/host-1"},
 		},

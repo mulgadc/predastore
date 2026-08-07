@@ -4,7 +4,7 @@
 //
 // It is public because s3d is not the only entrypoint: embedders that host
 // predastore in their own process (spinifex's service supervisor) need the
-// same assembly before handing the clients to s3.WithClients.
+// same assembly before handing the clients to gateway.WithClients.
 package clusterrun
 
 import (
@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
+	"github.com/mulgadc/predastore/internal/gateway"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/storage"
@@ -22,7 +23,6 @@ import (
 	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 	"github.com/mulgadc/predastore/pkg/masterkey"
-	"github.com/mulgadc/predastore/s3"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -43,7 +43,7 @@ type node struct {
 type Runtime struct {
 	// Clients are the wired cluster connections the S3 frontend works
 	// through; it builds its own placement from the same config.
-	Clients s3.Clients
+	Clients gateway.Clients
 
 	nodes    []node
 	client   *rpc.Client
@@ -67,7 +67,7 @@ func raftPeers(replicaIDs []int) []state.RaftPeer {
 
 // AllNodeIDs returns every node id in the topology: the selection for a
 // process that runs the whole cluster over the in-process pipe.
-func AllNodeIDs(cfg *s3.Config) []int {
+func AllNodeIDs(cfg *gateway.Config) []int {
 	ids := make([]int, len(cfg.ClusterNodes))
 	for i, n := range cfg.ClusterNodes {
 		ids[i] = n.ID
@@ -79,7 +79,7 @@ func AllNodeIDs(cfg *s3.Config) []int {
 // for the process that owns that host's socket and data directory. Callers
 // select nodes by host rather than by id because the host is the unit an
 // operator places, and everything per-node derives from it.
-func NodeIDsForHost(cfg *s3.Config, hostID int) []int {
+func NodeIDsForHost(cfg *gateway.Config, hostID int) []int {
 	var ids []int
 	for _, n := range cfg.ClusterNodes {
 		if n.HostID == hostID {
@@ -92,7 +92,7 @@ func NodeIDsForHost(cfg *s3.Config, hostID int) []int {
 // Build assembles the process for the selected nodes. Every node gets its own
 // service and rpc server; whether a peer is reached over the pipe or the
 // network follows from its address, so nothing below here branches on it.
-func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterkey.Key) (*Runtime, error) {
+func Build(cfg *gateway.Config, localIDs []int, tlsCert, tlsKey string, key *masterkey.Key) (*Runtime, error) {
 	topo, err := topology.NewTopology(cfg.Hosts, cfg.ClusterNodes, localIDs)
 	if err != nil {
 		return nil, err
@@ -170,7 +170,7 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 		return nil, err
 	}
 
-	rt.Clients = s3.Clients{State: stateClient, Storage: shardClient}
+	rt.Clients = gateway.Clients{State: stateClient, Storage: shardClient}
 
 	return rt, nil
 }
