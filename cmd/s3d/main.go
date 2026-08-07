@@ -1,6 +1,7 @@
-// Command s3d runs a predastore process: the cluster nodes selected by -nodes
-// and the S3 gateway in front of them. It is a thin entrypoint — flags,
-// environment, telemetry and a signal context, then predastore.Run.
+// Command s3d runs one host of a predastore cluster: the nodes the config
+// pins to the host named by -host, and the S3 gateway in front of them. It is
+// a thin entrypoint — flags, environment, telemetry and a signal context, then
+// predastore.Run.
 package main
 
 import (
@@ -12,7 +13,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -37,16 +37,19 @@ func run() error {
 	basePath := flag.String("base-path", "", "Base path for the S3 directory when undefined in the config file")
 	debug := flag.Bool("debug", false, "Enable verbose debug logs")
 	port := flag.Int("port", 443, "S3 gateway port")
-	host := flag.String("host", "0.0.0.0", "S3 gateway host")
-	nodes := flag.String("nodes", "", "Comma-separated node IDs to run in this process (empty = every node in the topology)")
+	host := flag.Int("host", 0, "ID of the [[host]] this process runs (required)")
 	encryptionKeyFile := flag.String("encryption-key-file", "", "Path to 32-byte AES-256 master key for encryption at rest (required)")
 
 	flag.Parse()
-	applyEnvOverrides(configPath, tlsKey, tlsCert, port, nodes, encryptionKeyFile)
+	applyEnvOverrides(configPath, tlsKey, tlsCert, port, host, encryptionKeyFile)
 
 	if *configPath == "" {
 		flag.Usage()
 		return errors.New("missing required flag: -config")
+	}
+	if *host <= 0 {
+		flag.Usage()
+		return errors.New("missing required flag: -host (or HOST)")
 	}
 	if *encryptionKeyFile == "" {
 		flag.Usage()
@@ -82,34 +85,29 @@ func run() error {
 		cfg.BasePath = *basePath
 	}
 
-	localIDs, err := parseNodeIDs(*nodes, cfg)
-	if err != nil {
-		return fmt.Errorf("invalid -nodes selection: %w", err)
-	}
 	key, err := masterkey.Load(*encryptionKeyFile)
 	if err != nil {
 		return fmt.Errorf("load master key: %w", err)
 	}
 
-	node, err := predastore.New(predastore.Options{
-		Config:       cfg,
-		LocalNodeIDs: localIDs,
-		Host:         *host,
-		Port:         *port,
-		TLSCert:      *tlsCert,
-		TLSKey:       *tlsKey,
-		MasterKey:    key,
-		Debug:        *debug,
+	h, err := predastore.New(predastore.Options{
+		Config:    cfg,
+		HostID:    *host,
+		Port:      *port,
+		TLSCert:   *tlsCert,
+		TLSKey:    *tlsKey,
+		MasterKey: key,
+		Debug:     *debug,
 	})
 	if err != nil {
-		return fmt.Errorf("build predastore node: %w", err)
+		return fmt.Errorf("build predastore host: %w", err)
 	}
 
-	return node.Run(ctx)
+	return h.Run(ctx)
 }
 
 // applyEnvOverrides lets the launcher configure s3d without rewriting flags.
-func applyEnvOverrides(config, tlsKey, tlsCert *string, port *int, nodes, encryptionKeyFile *string) {
+func applyEnvOverrides(config, tlsKey, tlsCert *string, port, host *int, encryptionKeyFile *string) {
 	if v := os.Getenv("CONFIG"); v != "" {
 		*config = v
 	}
@@ -124,28 +122,12 @@ func applyEnvOverrides(config, tlsKey, tlsCert *string, port *int, nodes, encryp
 			*port = p
 		}
 	}
-	if v := os.Getenv("NODES"); v != "" {
-		*nodes = v
+	if v := os.Getenv("HOST"); v != "" {
+		if id, err := strconv.Atoi(v); err == nil {
+			*host = id
+		}
 	}
 	if v := os.Getenv("ENCRYPTION_KEY_FILE"); v != "" {
 		*encryptionKeyFile = v
 	}
-}
-
-// parseNodeIDs resolves the -nodes selection; empty selects every node in the
-// topology, running the whole cluster in one process.
-func parseNodeIDs(selection string, cfg *predastore.Config) ([]int, error) {
-	if selection == "" {
-		return cfg.AllNodeIDs(), nil
-	}
-	parts := strings.Split(selection, ",")
-	ids := make([]int, 0, len(parts))
-	for _, p := range parts {
-		id, err := strconv.Atoi(strings.TrimSpace(p))
-		if err != nil {
-			return nil, fmt.Errorf("bad node id %q: %w", p, err)
-		}
-		ids = append(ids, id)
-	}
-	return ids, nil
 }

@@ -16,45 +16,31 @@ import (
 	"github.com/pelletier/go-toml/v2"
 )
 
-// The TOML file is this package's contract with operators, so this package
-// declares it rather than borrowing structs from the internals. Every type
-// below is mirrored onto an internal one by the converters at the bottom of
-// this file: an operator can name and build the whole surface, and the
-// internals stay free to change shape.
+// The TOML file is this package's contract with operators, so every type it
+// names is declared or re-exported here. The topology tables are aliases
+// rather than copies: the shape an operator writes under [[host]] and [[node]]
+// is the shape placement is derived from, and a mirror would only be something
+// to keep in sync. They are named for the file because Host is already this
+// package's running process.
 
 // Role is the function a node performs in the cluster, as written under
 // [[node]].
-type Role string
+type Role = topology.Role
 
 const (
 	// RoleShardStorage stores erasure-coded object shards.
-	RoleShardStorage Role = "shard-storage"
+	RoleShardStorage = topology.RoleShardStorage
 	// RoleStateReplica participates in Raft consensus over global state.
-	RoleStateReplica Role = "state-replica"
+	RoleStateReplica = topology.RoleStateReplica
 )
 
-// Host is one predastore process: the endpoint that owns a socket and a data
-// directory. Nodes pinned to it run inside that process.
-type Host struct {
-	ID int `toml:"id"`
-	// BindAddr is the local listen address; 0.0.0.0 binds all interfaces.
-	BindAddr string `toml:"bind_addr"`
-	// PublicAddr is the address other hosts dial, split from BindAddr for NAT
-	// and multi-homed machines.
-	PublicAddr string `toml:"public_addr"`
-	// DataDir is the on-disk root; nodes derive their subdirectories from node
-	// id and role. A relative path resolves against BasePath.
-	DataDir string `toml:"data_dir"`
-}
+// HostConfig is one predastore process, as written under [[host]]: the
+// endpoint that owns a socket and a data directory. Nodes pinned to it run
+// inside that process.
+type HostConfig = topology.Host
 
-// NodeConfig is a logical role pinned to a host, as written under [[node]]. It
-// is named for the file rather than for the cluster because Node is already
-// this package's running process.
-type NodeConfig struct {
-	ID     int  `toml:"id"`
-	HostID int  `toml:"host_id"`
-	Role   Role `toml:"role"`
-}
+// NodeConfig is a logical role pinned to a host, as written under [[node]].
+type NodeConfig = topology.Node
 
 // RS fixes the erasure code. The counts must match what the cluster was
 // written with, so they are configuration rather than a per-request choice.
@@ -124,7 +110,7 @@ type Config struct {
 	// Hosts are processes owning a socket and a data directory; Nodes are
 	// roles pinned to those hosts. Everything per-node derives from the host
 	// base and the node id.
-	Hosts []Host       `toml:"host"`
+	Hosts []HostConfig `toml:"host"`
 	Nodes []NodeConfig `toml:"node"`
 
 	Compaction Compaction `toml:"compaction"`
@@ -173,7 +159,7 @@ func LoadConfig(path string) (*Config, error) {
 	// The topology, when present, must be internally consistent before
 	// anything derives placement or addresses from it.
 	if len(cfg.Hosts) > 0 || len(cfg.Nodes) > 0 {
-		if err := topology.Validate(cfg.topologyHosts(), cfg.topologyNodes()); err != nil {
+		if err := topology.Validate(cfg.Hosts, cfg.Nodes); err != nil {
 			return nil, err
 		}
 	}
@@ -199,30 +185,6 @@ func LoadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// AllNodeIDs returns every node id in the topology: the selection for a
-// process that runs the whole cluster over the in-process pipe.
-func (c *Config) AllNodeIDs() []int {
-	ids := make([]int, len(c.Nodes))
-	for i, n := range c.Nodes {
-		ids[i] = n.ID
-	}
-	return ids
-}
-
-// NodeIDsForHost returns the ids of the nodes pinned to hostID: the selection
-// for the process that owns that host's socket and data directory. Callers
-// select nodes by host rather than by id because the host is the unit an
-// operator places, and everything per-node derives from it.
-func (c *Config) NodeIDsForHost(hostID int) []int {
-	var ids []int
-	for _, n := range c.Nodes {
-		if n.HostID == hostID {
-			ids = append(ids, n.ID)
-		}
-	}
-	return ids
-}
-
 // basePath resolves BasePath to an absolute directory, since relative bucket
 // and data paths are resolved against it long after the working directory
 // stops being meaningful.
@@ -235,27 +197,6 @@ func (c *Config) basePath() (string, error) {
 		return "", fmt.Errorf("resolve base path: %w", err)
 	}
 	return filepath.Join(dir, c.BasePath), nil
-}
-
-func (c *Config) topologyHosts() []topology.Host {
-	hosts := make([]topology.Host, len(c.Hosts))
-	for i, h := range c.Hosts {
-		hosts[i] = topology.Host{
-			ID:         h.ID,
-			BindAddr:   h.BindAddr,
-			PublicAddr: h.PublicAddr,
-			DataDir:    h.DataDir,
-		}
-	}
-	return hosts
-}
-
-func (c *Config) topologyNodes() []topology.Node {
-	nodes := make([]topology.Node, len(c.Nodes))
-	for i, n := range c.Nodes {
-		nodes[i] = topology.Node{ID: n.ID, HostID: n.HostID, Role: topology.Role(n.Role)}
-	}
-	return nodes
 }
 
 // storageNodeIDs are the shard-storage nodes the gateway places shards across.

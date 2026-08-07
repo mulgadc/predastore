@@ -171,12 +171,13 @@ func waitForListener(t *testing.T, addr string, pool *x509.CertPool) {
 	t.Fatalf("gateway never listened on %s", addr)
 }
 
-// TestNodeObjectRoundTrip boots a whole cluster — three storage nodes and one
-// state replica — in one process through the public facade, and drives real
-// signed S3 traffic over its HTTPS listener. Nodes talk over pipe streams, so
-// no inter-node socket opens; each has its own service and rpc server, which
-// also covers several servers coexisting on the shared pipe registry.
-func TestNodeObjectRoundTrip(t *testing.T) {
+// TestHostObjectRoundTrip boots a whole cluster — three storage nodes and one
+// state replica, all pinned to one host — through the public facade, and
+// drives real signed S3 traffic over its HTTPS listener. Nodes talk over pipe
+// streams, so no inter-node socket opens; each has its own service and rpc
+// server, which also covers several servers coexisting on the shared pipe
+// registry.
+func TestHostObjectRoundTrip(t *testing.T) {
 	base := testport.Block(t, 2)
 	s3Addr := fmt.Sprintf("127.0.0.1:%d", base)
 	certPath, keyPath, pool := testcerts.Generate(t)
@@ -186,9 +187,9 @@ func TestNodeObjectRoundTrip(t *testing.T) {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 
-	node, err := New(Options{
+	h, err := New(Options{
 		Config:    cfg,
-		Host:      "127.0.0.1",
+		HostID:    1,
 		Port:      base,
 		TLSCert:   certPath,
 		TLSKey:    keyPath,
@@ -201,7 +202,7 @@ func TestNodeObjectRoundTrip(t *testing.T) {
 	// Serve for the duration of the test, then drain the way a signal would.
 	runCtx, stopRun := context.WithCancel(context.Background())
 	runDone := make(chan error, 1)
-	go func() { runDone <- node.Run(runCtx) }()
+	go func() { runDone <- h.Run(runCtx) }()
 	t.Cleanup(func() {
 		stopRun()
 		select {
@@ -210,7 +211,7 @@ func TestNodeObjectRoundTrip(t *testing.T) {
 				t.Errorf("Run returned %v, want a clean shutdown", err)
 			}
 		case <-time.After(30 * time.Second):
-			t.Error("node did not drain")
+			t.Error("host did not drain")
 		}
 	})
 
@@ -282,7 +283,7 @@ func TestRelativeDataDirUsesBasePath(t *testing.T) {
 		BasePath: base,
 		Region:   testRegion,
 		RS:       RS{Data: 2, Parity: 1},
-		Hosts: []Host{
+		Hosts: []HostConfig{
 			{ID: 1, BindAddr: "127.0.0.1:16661", PublicAddr: "127.0.0.1:16661", DataDir: filepath.Join("data", "host-1")},
 		},
 		Nodes: []NodeConfig{
@@ -292,11 +293,11 @@ func TestRelativeDataDirUsesBasePath(t *testing.T) {
 		},
 	}
 
-	node, err := New(Options{Config: cfg, MasterKey: testMasterKey(t)})
+	h, err := New(Options{Config: cfg, HostID: 1, MasterKey: testMasterKey(t)})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer node.close()
+	defer h.close()
 
 	if _, err := os.Stat(filepath.Join(base, "data", "host-1", "node-1")); err != nil {
 		t.Fatalf("shard store not under base path: %v", err)

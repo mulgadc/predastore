@@ -54,23 +54,21 @@ func TestValidate(t *testing.T) {
 }
 
 func TestNewTopologyRejectsBadSelection(t *testing.T) {
-	if _, err := NewTopology(testHosts(), testNodes(), nil); err == nil {
-		t.Fatal("empty local selection accepted")
+	if _, err := NewTopology(testHosts(), testNodes(), 0); err == nil {
+		t.Fatal("unset local host accepted")
 	}
-	if _, err := NewTopology(testHosts(), testNodes(), []int{99}); err == nil {
-		t.Fatal("unknown local node accepted")
+	if _, err := NewTopology(testHosts(), testNodes(), 99); err == nil {
+		t.Fatal("unknown local host accepted")
 	}
-	if _, err := NewTopology(testHosts(), testNodes(), []int{1, 1}); err == nil {
-		t.Fatal("duplicate local node accepted")
-	}
-	// Local nodes may not span hosts while some node runs elsewhere.
-	if _, err := NewTopology(testHosts(), testNodes(), []int{1, 3}); err == nil {
-		t.Fatal("empty pipe name accepted")
+	// A host carrying no nodes has nothing to serve.
+	empty := append(testHosts(), Host{ID: 3, BindAddr: "0.0.0.0:6660", PublicAddr: "10.11.12.3:6660", DataDir: "/var/lib/predastore"})
+	if _, err := NewTopology(empty, testNodes(), 3); err == nil {
+		t.Fatal("local host with no nodes accepted")
 	}
 }
 
 func TestTopologyNodeAddr(t *testing.T) {
-	topo, err := NewTopology(testHosts(), testNodes(), []int{1, 2})
+	topo, err := NewTopology(testHosts(), testNodes(), 1)
 	if err != nil {
 		t.Fatalf("NewTopology: %v", err)
 	}
@@ -103,7 +101,7 @@ func TestTopologyNodeAddr(t *testing.T) {
 }
 
 func TestTopologySelectors(t *testing.T) {
-	topo, err := NewTopology(testHosts(), testNodes(), []int{2, 1})
+	topo, err := NewTopology(testHosts(), testNodes(), 1)
 	if err != nil {
 		t.Fatalf("NewTopology: %v", err)
 	}
@@ -142,13 +140,21 @@ func TestTopologySelectors(t *testing.T) {
 	}
 }
 
+// TestTopologyAllLocal covers the single-process cluster: every node pinned to
+// one host, which is the only way to get one now that node selection follows
+// the host rather than being named directly.
 func TestTopologyAllLocal(t *testing.T) {
-	topo, err := NewTopology(testHosts(), testNodes(), []int{1, 2, 3, 4})
+	hosts := testHosts()[:1]
+	nodes := testNodes()
+	for i := range nodes {
+		nodes[i].HostID = 1
+	}
+
+	topo, err := NewTopology(hosts, nodes, 1)
 	if err != nil {
 		t.Fatalf("NewTopology: %v", err)
 	}
-	// Peers all run locally: the process opens no network socket, and nodes
-	// may span hosts because there is no socket to disambiguate.
+	// Peers all run locally, so the process opens no network socket.
 	if topo.NeedsNetwork() {
 		t.Fatal("NeedsNetwork = true with every node local")
 	}
@@ -159,7 +165,6 @@ func TestTopologyAllLocal(t *testing.T) {
 	if len(addrs) != 1 || addrs[0].Network() != "pipe" {
 		t.Fatalf("single-process node listens on %v, want one pipe address", addrs)
 	}
-	// Data directories still come from each node's own host.
 	if got := topo.DataDir(3); got != "/var/lib/predastore/node-3" {
 		t.Fatalf("DataDir(3) = %s", got)
 	}

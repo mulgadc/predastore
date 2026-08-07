@@ -8,18 +8,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestLoadConfig(t *testing.T) {
-	cfg, err := LoadConfig(filepath.Join("config", "7node.toml"))
-
-	require.NoError(t, err, "Should read config without error")
-	assert.Equal(t, "1.0", cfg.Version, "Config version should match")
-	assert.Equal(t, "ap-southeast-2", cfg.Region, "Region should match")
-	assert.Equal(t, 4, cfg.RS.Data, "RS data shards should match")
-	assert.Equal(t, 3, cfg.RS.Parity, "RS parity shards should match")
-	assert.Empty(t, cfg.Buckets, "Should have no buckets")
-	assert.Len(t, cfg.Auth, 1, "Should have 1 auth entry")
-}
-
 func TestLoadConfig_InvalidBucketNamesAreDropped(t *testing.T) {
 	cfg, err := LoadConfig(filepath.Join("testdata", "invalid.toml"))
 
@@ -49,6 +37,11 @@ func TestLoadConfig_ClusterTopology(t *testing.T) {
 	cfg, err := LoadConfig(filepath.Join("testdata", "cluster_topology.toml"))
 
 	require.NoError(t, err, "Should read config without error")
+	assert.Equal(t, "1.0", cfg.Version, "Config version should match")
+	assert.Equal(t, "ap-southeast-2", cfg.Region, "Region should match")
+	assert.Equal(t, 2, cfg.RS.Data, "RS data shards should match")
+	assert.Equal(t, 1, cfg.RS.Parity, "RS parity shards should match")
+	assert.Empty(t, cfg.Buckets, "Should have no buckets")
 	assert.Len(t, cfg.Hosts, 3, "Should have 3 hosts")
 	assert.Len(t, cfg.Nodes, 6, "Should have 6 cluster nodes")
 	assert.Equal(t, "10.11.12.1:6660", cfg.Hosts[0].PublicAddr)
@@ -72,16 +65,4 @@ func TestLoadConfig_MissingFile(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "read ")
-}
-
-// TestNodeSelection covers the two selections a launcher makes: the whole
-// topology for a single-process cluster, or one host's nodes for a member of a
-// distributed one.
-func TestNodeSelection(t *testing.T) {
-	cfg, err := LoadConfig(filepath.Join("testdata", "cluster_topology.toml"))
-	require.NoError(t, err)
-
-	assert.Equal(t, []int{1, 2, 3, 4, 5, 6}, cfg.AllNodeIDs())
-	assert.Equal(t, []int{1, 2}, cfg.NodeIDsForHost(1))
-	assert.Nil(t, cfg.NodeIDsForHost(99), "an unknown host owns no nodes")
 }

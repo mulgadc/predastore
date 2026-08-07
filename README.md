@@ -76,36 +76,54 @@ The `./scripts/` directory contains helpers for running a multi-node cluster loc
 
 Cluster runtime data (logs, PID files, segment files, BadgerDB indexes) lives under `$PREDA_DIR` (default `/tmp/predastore/<clustername>/`). The start script sets up loopback IP aliases (requires `sudo`) and generates TLS certs on first run.
 
-### Run a Single Node
+> **These scripts do not currently work.** They still pass the removed `-nodes` flag and read the removed `config/` profiles. They are being held until the inter-node network layout settles; see bead `mulga-ne5gx`.
 
-`./bin/s3d` is a single-node process — for running one node of a cluster directly (e.g. on a dedicated host in production, or for inspecting one node in isolation):
+### Run a Host
+
+`./bin/s3d` runs one host of a cluster: the nodes the config pins to it, plus the S3 gateway in front of them. `--host` names the `[[host]]` to run, and everything else about the process — which nodes, which addresses, which data directory — follows from that entry:
 
 ```bash
 ./bin/s3d \
-  --config config/3node.toml \
-  --node 1 \
-  --host 10.11.12.1 \
+  --config cluster.toml \
+  --host 1 \
   --port 8443 \
-  --base-path /tmp/predastore/3node \
-  --tls-key /tmp/predastore/3node/server.key \
-  --tls-cert /tmp/predastore/3node/server.pem \
-  --encryption-key-file /tmp/predastore/3node/master.key
+  --base-path /tmp/predastore/dev \
+  --tls-key /tmp/predastore/dev/server.key \
+  --tls-cert /tmp/predastore/dev/server.pem \
+  --encryption-key-file /tmp/predastore/dev/master.key
 ```
 
-The encryption key file must be exactly 32 raw bytes (no base64, no header) with mode `0600`. Generate one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key must be supplied to every node in a cluster; rotating it is not currently supported (see Roadmap → envelope encryption).
+A cluster whose `[[node]]` entries all name the same host runs entirely in one process over the in-process pipe, with no inter-node socket and no certificates beyond the S3 gateway's. That is a property of the config, not a launch mode.
+
+The encryption key file must be exactly 32 raw bytes (no base64, no header) with mode `0600`. Generate one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key must be supplied to every host in a cluster; rotating it is not currently supported (see Roadmap → envelope encryption).
 
 ### Configuration
 
-Cluster configurations live under `config/` as TOML files, one per topology:
+A cluster configuration is a TOML file describing two levels: `[[host]]` entries, which are the s3d processes owning a socket and a data directory, and `[[node]]` entries, which are logical roles pinned to a host. Everything per-node — pipe name, ALPN key, data subdirectory — derives from the host base and the node id. The same file also carries the Reed-Solomon parameters, the config-defined buckets and the S3 credentials.
 
-```
-config/
-  3node.toml    # 3 db + 3 storage nodes
-  5node.toml    # 5 db + 5 storage nodes
-  7node.toml    # 7 db + 7 storage nodes
+```toml
+version = "1.0"
+region  = "ap-southeast-2"
+
+[rs]
+data   = 2    # data shards
+parity = 1    # parity shards; data + parity = the shard-storage node count
+
+# One host = one s3d process, launched with `-host <id>`.
+[[host]]
+id          = 1
+bind_addr   = "10.11.12.1:6660"   # inter-node listen address; 0.0.0.0 binds all interfaces
+public_addr = "10.11.12.1:6660"   # what other hosts dial; split from bind_addr for NAT
+data_dir    = "data/host-1"       # on-disk root; relative paths resolve against base_path
+
+# A role pinned to a host. role is "shard-storage" or "state-replica".
+[[node]]
+id      = 1
+host_id = 1
+role    = "shard-storage"
 ```
 
-Each config defines `[[db]]` and `[[storage]]` sections specifying node IDs, hosts, ports, and Reed-Solomon parameters.
+Pin every `[[node]]` to the same `[[host]]` and the cluster runs in one process over the in-process pipe. Spread them across hosts and each process is launched separately with its own `-host` id.
 
 TLS certificates are generated on first build:
 

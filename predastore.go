@@ -4,16 +4,17 @@
 // the on-disk configuration, Options and New to build a process, and Run to
 // serve it until the context is cancelled.
 //
-// One process runs any subset of the cluster's nodes. Nodes selected here talk
-// over an in-process pipe; nodes running elsewhere are reached over QUIC. The
-// selection is the only difference between a single-process deployment and a
-// node of a distributed one.
+// One process runs one host: the cluster nodes pinned to it in the
+// configuration. Those nodes talk over an in-process pipe; nodes on other
+// hosts are reached over QUIC. A cluster whose nodes all sit on one host is
+// therefore a single-process deployment, with no code path of its own.
 package predastore
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"time"
@@ -41,20 +42,19 @@ var _ rpc.Topology = (*topology.Topology)(nil)
 const leaderWait = 30 * time.Second
 
 // Options is everything a predastore process needs that does not come from the
-// configuration file: which nodes to run, where to serve S3, and the key that
+// configuration file: which host to run, where to serve S3, and the key that
 // protects data at rest.
 type Options struct {
 	// Config is the parsed configuration file. Required.
 	Config *Config
 
-	// LocalNodeIDs are the cluster nodes this process runs. Empty selects
-	// every node in the topology, which runs the whole cluster in one process
-	// over the pipe transport and opens no network socket.
-	LocalNodeIDs []int
+	// HostID is the [[host]] this process runs. It selects the nodes pinned to
+	// that host and the address they are reached on. Required.
+	HostID int
 
-	// Host and Port are the S3 listen address. Zero values default to
-	// 0.0.0.0:8443.
-	Host string
+	// Port is the S3 listen port; zero defaults to 8443. The address it binds
+	// is the host's own, so a process serves S3 where it serves everything
+	// else.
 	Port int
 
 	// TLSCert and TLSKey serve the S3 gateway, and the inter-node QUIC socket
@@ -74,19 +74,19 @@ type Options struct {
 	PprofPath string
 }
 
-// localNode is one storage or state replica running in this process: a service
+// node is one storage or state replica running in this process: a service
 // serving its rpc endpoint, and the server carrying it.
-type localNode struct {
+type node struct {
 	id  int
 	svc interface{ Run(context.Context) error }
 	srv *rpc.Server
 }
 
-// Node is a predastore process: the cluster nodes it runs and the S3 gateway
-// in front of them. New builds it, Run serves it, and cancelling Run's context
-// is the only way to stop it.
-type Node struct {
-	nodes   []localNode
+// Host is a predastore process: the cluster nodes pinned to it and the S3
+// gateway in front of them. New builds it, Run serves it, and cancelling Run's
+// context is the only way to stop it.
+type Host struct {
+	nodes   []node
 	gateway *gateway.Server
 
 	client *rpc.Client
@@ -95,12 +95,12 @@ type Node struct {
 	replicas []*state.Server
 }
 
-// New assembles the process for the selected nodes. Every node gets its own
+// New assembles the process for one host. Every node pinned to it gets its own
 // service and rpc server; whether a peer is reached over the pipe or the
 // network follows from its address, so nothing below here branches on it.
 //
 // Nothing listens until Run is called.
-func New(opts Options) (*Node, error) {
+func New(opts Options) (*Host, error) {
 	if opts.Config == nil {
 		return nil, fmt.Errorf("predastore: Options.Config is required")
 	}
@@ -109,17 +109,13 @@ func New(opts Options) (*Node, error) {
 	}
 
 	cfg := opts.Config
-	localIDs := opts.LocalNodeIDs
-	if len(localIDs) == 0 {
-		localIDs = cfg.AllNodeIDs()
-	}
 
 	basePath, err := cfg.basePath()
 	if err != nil {
 		return nil, err
 	}
 
-	topo, err := topology.NewTopology(cfg.topologyHosts(), cfg.topologyNodes(), localIDs)
+	topo, err := topology.NewTopology(cfg.Hosts, cfg.Nodes, opts.HostID)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +134,7 @@ func New(opts Options) (*Node, error) {
 		}))
 	}
 
-	n := &Node{
+	h := &Host{
 		trs:    trs,
 		client: rpc.NewClient(rpc.ClientConfig{Transports: trs, Topology: topo}),
 	}
@@ -152,7 +148,7 @@ func New(opts Options) (*Node, error) {
 			return nil, err
 		}
 		nodeID := int(target) //nolint:gosec // G115: node ids are small positives from a validated topology.
-		return rpc.OpenStream(ctx, n.client, nodeID, state.OpRaftDial, &state.RaftDial{})
+		return rpc.OpenStream(ctx, h.client, nodeID, state.OpRaftDial, &state.RaftDial{})
 	}
 
 	peers := raftPeers(topo.NodesByRole(topology.RoleStateReplica))
@@ -170,26 +166,26 @@ func New(opts Options) (*Node, error) {
 	}
 
 	for _, local := range topo.LocalNodes() {
-		if err := n.addNode(topo, local, basePath, raftDial, peers, storeOpts); err != nil {
-			n.close()
+		if err := h.addNode(topo, local, basePath, raftDial, peers, storeOpts); err != nil {
+			h.close()
 			return nil, err
 		}
 	}
 
-	stateClient, err := state.NewClient(state.ClientConfig{Client: n.client, Replicas: replicaIDs})
+	stateClient, err := state.NewClient(state.ClientConfig{Client: h.client, Replicas: replicaIDs})
 	if err != nil {
-		n.close()
+		h.close()
 		return nil, err
 	}
-	shardClient, err := storage.NewClient(storage.ClientConfig{Client: n.client})
+	shardClient, err := storage.NewClient(storage.ClientConfig{Client: h.client})
 	if err != nil {
-		n.close()
+		h.close()
 		return nil, err
 	}
 
-	n.gateway, err = gateway.NewServer(gateway.ServerConfig{
+	h.gateway, err = gateway.NewServer(gateway.ServerConfig{
 		Config:          cfg.gatewayConfig(basePath, opts.Debug),
-		Host:            opts.Host,
+		Host:            gatewayHost(topo.LocalHost()),
 		Port:            opts.Port,
 		TLSCert:         opts.TLSCert,
 		TLSKey:          opts.TLSKey,
@@ -199,11 +195,21 @@ func New(opts Options) (*Node, error) {
 		PprofOutputPath: opts.PprofPath,
 	})
 	if err != nil {
-		n.close()
+		h.close()
 		return nil, fmt.Errorf("create s3 gateway: %w", err)
 	}
 
-	return n, nil
+	return h, nil
+}
+
+// gatewayHost is the address the S3 frontend binds: the host's own, so one
+// process serves S3 and inter-node traffic on the same interface. BindAddr
+// carries the inter-node port, which the gateway does not share.
+func gatewayHost(local topology.Host) string {
+	if addr, _, err := net.SplitHostPort(local.BindAddr); err == nil {
+		return addr
+	}
+	return local.BindAddr
 }
 
 // raftPeers maps state replicas to the raft members they become. The address
@@ -221,7 +227,7 @@ func raftPeers(replicas []topology.Node) []state.RaftPeer {
 // addNode builds one node's service and the rpc server that carries it. The
 // server is constructed but not started: handlers must be registered on every
 // node before any of them accepts, or early peer traffic finds no handler.
-func (n *Node) addNode(
+func (h *Host) addNode(
 	topo *topology.Topology,
 	local topology.Node,
 	basePath string,
@@ -257,7 +263,7 @@ func (n *Node) addNode(
 		}
 		replica.Register(mux)
 		svc = replica
-		n.replicas = append(n.replicas, replica)
+		h.replicas = append(h.replicas, replica)
 
 	case topology.RoleShardStorage:
 		// The store expects its directory to exist.
@@ -280,13 +286,13 @@ func (n *Node) addNode(
 		Mux:        mux,
 		NodeID:     local.ID,
 		Topology:   topo,
-		Transports: n.trs,
+		Transports: h.trs,
 	})
 	if err != nil {
 		return fmt.Errorf("serve node %d: %w", local.ID, err)
 	}
 
-	n.nodes = append(n.nodes, localNode{id: local.ID, svc: svc, srv: srv})
+	h.nodes = append(h.nodes, node{id: local.ID, svc: svc, srv: srv})
 	return nil
 }
 
@@ -294,11 +300,11 @@ func (n *Node) addNode(
 // then drains everything it started. Every node's rpc server, every node's
 // service and the S3 gateway share one context, so a single signal stops the
 // lot; there is nothing else to stop it with.
-func (n *Node) Run(ctx context.Context) error {
-	defer n.close()
+func (h *Host) Run(ctx context.Context) error {
+	defer h.close()
 
 	g, gctx := errgroup.WithContext(ctx)
-	for _, local := range n.nodes {
+	for _, local := range h.nodes {
 		g.Go(func() error {
 			if err := local.srv.Run(gctx); err != nil {
 				return fmt.Errorf("node %d rpc server: %w", local.id, err)
@@ -317,10 +323,10 @@ func (n *Node) Run(ctx context.Context) error {
 		// Serving before consensus settles would fail writes that would have
 		// succeeded a moment later. The wait is bounded and advisory: a slow
 		// election degrades rather than aborts.
-		if err := n.waitForLeader(gctx); err != nil {
+		if err := h.waitForLeader(gctx); err != nil {
 			slog.Warn("No leader elected within timeout, serving anyway", "error", err)
 		}
-		return n.gateway.Run(gctx)
+		return h.gateway.Run(gctx)
 	})
 
 	return g.Wait()
@@ -330,13 +336,13 @@ func (n *Node) Run(ctx context.Context) error {
 // ctx is cancelled. Election needs the rpc servers running, so this is only
 // meaningful once Run has started them. A cluster with no local replica has
 // nothing to wait on here and proceeds immediately.
-func (n *Node) waitForLeader(ctx context.Context) error {
-	if len(n.replicas) == 0 {
+func (h *Host) waitForLeader(ctx context.Context) error {
+	if len(h.replicas) == 0 {
 		return nil
 	}
 
 	done := make(chan error, 1)
-	go func() { done <- n.replicas[0].WaitForLeader(leaderWait) }()
+	go func() { done <- h.replicas[0].WaitForLeader(leaderWait) }()
 	select {
 	case err := <-done:
 		return err
@@ -345,13 +351,13 @@ func (n *Node) waitForLeader(ctx context.Context) error {
 	}
 }
 
-// close releases the process-wide resources the nodes share. Node state is
+// close releases the process-wide resources the nodes share. Per-node state is
 // closed by each service's Run as it returns.
-func (n *Node) close() {
-	if n.client != nil {
-		n.client.Close()
+func (h *Host) close() {
+	if h.client != nil {
+		h.client.Close()
 	}
-	for _, tr := range n.trs {
+	for _, tr := range h.trs {
 		if c, ok := tr.(interface{ Close() error }); ok {
 			_ = c.Close()
 		}

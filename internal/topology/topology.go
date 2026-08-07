@@ -1,10 +1,12 @@
 // Package topology models the two-level shape of a predastore cluster:
 // hosts, which are processes owning a socket and a data directory, and
 // nodes, which are logical roles pinned to a host. It resolves node ids to
-// dialable transport addresses given the set of nodes running locally.
+// dialable transport addresses given the host running locally.
 //
-// These are pure domain types. The on-disk format belongs to the root package,
-// which converts its own tagged structs into these.
+// Host, Node and Role carry the toml tags for the [[host]] and [[node]]
+// tables, and the root package re-exports them as HostConfig, NodeConfig and
+// Role. The shape an operator writes and the shape placement is derived from
+// are one thing, so there is nothing to keep in sync.
 package topology
 
 import (
@@ -16,7 +18,8 @@ import (
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
-// Role is the function a node performs within the cluster.
+// Role is the function a node performs within the cluster, as written under
+// [[node]].
 type Role string
 
 const (
@@ -26,27 +29,29 @@ const (
 	RoleStateReplica Role = "state-replica"
 )
 
-// Host is one s3d process: the endpoint that owns a socket and a data
-// directory. Nodes pinned to it run inside that process as goroutines.
+// Host is one s3d process, as written under [[host]]: the endpoint that owns
+// a socket and a data directory. Nodes pinned to it run inside that process
+// as goroutines.
 type Host struct {
-	ID int
+	ID int `toml:"id"`
 	// BindAddr is the local listen address; 0.0.0.0 binds all interfaces.
-	BindAddr string
+	BindAddr string `toml:"bind_addr"`
 	// PublicAddr is the address other hosts dial, split from BindAddr for
 	// NAT and multi-homed machines.
-	PublicAddr string
+	PublicAddr string `toml:"public_addr"`
 	// DataDir is the on-disk root; nodes derive their subdirectories from
-	// node id and role.
-	DataDir string
+	// node id and role. A relative path resolves against the config's
+	// BasePath.
+	DataDir string `toml:"data_dir"`
 }
 
-// Node is a logical role pinned to a host. Nodes sharing a host are
-// colocated and talk over the in-process pipe; nodes on different hosts
-// talk over the network.
+// Node is a logical role pinned to a host, as written under [[node]]. Nodes
+// sharing a host are colocated and talk over the in-process pipe; nodes on
+// different hosts talk over the network.
 type Node struct {
-	ID     int
-	HostID int
-	Role   Role
+	ID     int  `toml:"id"`
+	HostID int  `toml:"host_id"`
+	Role   Role `toml:"role"`
 }
 
 // Validate checks the topology as a whole: ids unique, placements resolvable,
@@ -109,33 +114,28 @@ func NodeKey(nodeID int) string {
 }
 
 // Topology resolves node ids to dialable addresses for one process. Nodes
-// launched in this process resolve to their in-process pipe endpoint; all
+// pinned to the local host resolve to their in-process pipe endpoint; all
 // others resolve to their host's public address, keyed by node.
 type Topology struct {
 	hosts map[int]Host
 	nodes map[int]Node
 	local map[int]bool
-	// host is the host this process runs; every local node belongs to it.
+	// host is the host this process runs; every local node is pinned to it.
 	host Host
 }
 
-// NewTopology validates the topology and the local node selection.
-//
-// A process that has remote peers binds one host's socket, so its local nodes
-// must all be pinned to that host. A process running the entire cluster binds
-// nothing, so its nodes may span hosts: that is the single-process mode.
-func NewTopology(hosts []Host, nodes []Node, localNodeIDs []int) (*Topology, error) {
+// NewTopology validates the topology and selects the host this process runs.
+// A process is one host, so the nodes it runs follow from the selection rather
+// than being named individually.
+func NewTopology(hosts []Host, nodes []Node, hostID int) (*Topology, error) {
 	if err := Validate(hosts, nodes); err != nil {
 		return nil, err
-	}
-	if len(localNodeIDs) == 0 {
-		return nil, fmt.Errorf("topology: no local nodes selected")
 	}
 
 	t := &Topology{
 		hosts: make(map[int]Host, len(hosts)),
 		nodes: make(map[int]Node, len(nodes)),
-		local: make(map[int]bool, len(localNodeIDs)),
+		local: make(map[int]bool, len(nodes)),
 	}
 	for _, h := range hosts {
 		t.hosts[h.ID] = h
@@ -144,35 +144,27 @@ func NewTopology(hosts []Host, nodes []Node, localNodeIDs []int) (*Topology, err
 		t.nodes[n.ID] = n
 	}
 
-	hostID := 0
-	spansHosts := false
-	for _, id := range localNodeIDs {
-		n, ok := t.nodes[id]
-		if !ok {
-			return nil, fmt.Errorf("topology: local node %d not in topology", id)
-		}
-		if t.local[id] {
-			return nil, fmt.Errorf("topology: local node %d selected twice", id)
-		}
-		if hostID == 0 {
-			hostID = n.HostID
-		} else if n.HostID != hostID {
-			spansHosts = true
-		}
-		t.local[id] = true
+	host, ok := t.hosts[hostID]
+	if !ok {
+		return nil, fmt.Errorf("topology: local host %d not in topology", hostID)
 	}
-	// Spanning hosts is only coherent when nothing is reachable over the
-	// network, since otherwise there is no single socket to bind.
-	if spansHosts && t.NeedsNetwork() {
-		return nil, fmt.Errorf("topology: local nodes span hosts but some node runs elsewhere; a process with remote peers runs one host")
+	for _, n := range t.nodes {
+		if n.HostID == hostID {
+			t.local[n.ID] = true
+		}
 	}
-	t.host = t.hosts[hostID]
+	// A host with no nodes has nothing to serve, which is a misconfiguration
+	// rather than an idle process.
+	if len(t.local) == 0 {
+		return nil, fmt.Errorf("topology: local host %d has no nodes", hostID)
+	}
+	t.host = host
 
 	return t, nil
 }
 
-// LocalHost is the host whose socket this process binds. It is meaningful
-// only when NeedsNetwork reports true.
+// LocalHost is the host this process runs: the socket it binds when any peer
+// is remote, and the address its S3 gateway serves from.
 func (t *Topology) LocalHost() Host { return t.host }
 
 // IsLocal reports whether the node runs in this process.
