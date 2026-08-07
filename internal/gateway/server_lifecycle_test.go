@@ -6,27 +6,38 @@ import (
 
 	"github.com/mulgadc/predastore/internal/gateway/auth"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func newLifecycleServer(t *testing.T) *HTTP2Server {
-	t.Helper()
-	config := &Config{Region: "us-east-1"}
-	return NewHTTP2Server(config, Clients{}, auth.NewConfigProvider(nil))
+// TestServer_Run_RequiresTLS asserts the gateway refuses to serve in the clear
+// rather than falling back to plaintext HTTP.
+func TestServer_Run_RequiresTLS(t *testing.T) {
+	s := newGateway(&Config{Region: "us-east-1"}, nil, nil, auth.NewConfigProvider(nil))
+
+	err := s.Run(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "TLS is required")
 }
 
-func TestHTTP2Server_Shutdown_NilServer(t *testing.T) {
-	server := newLifecycleServer(t)
-	// server.server is nil (no ListenAndServe called)
-	err := server.Shutdown(context.Background())
-	assert.NoError(t, err)
+// TestServer_Run_BadCertificate asserts a broken TLS pair fails Run rather than
+// leaving a half-started listener behind.
+func TestServer_Run_BadCertificate(t *testing.T) {
+	s := newGateway(&Config{Region: "us-east-1"}, nil, nil, auth.NewConfigProvider(nil))
+	s.cfg = ServerConfig{
+		Host:    "127.0.0.1",
+		Port:    0,
+		TLSCert: "testdata/invalid.toml",
+		TLSKey:  "testdata/invalid.toml",
+	}
+
+	err := s.Run(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "TLS certificate")
 }
 
-func TestHTTP2Server_GetRouter(t *testing.T) {
-	server := newLifecycleServer(t)
-	assert.NotNil(t, server.GetRouter())
-}
-
-func TestHTTP2Server_GetHandler(t *testing.T) {
-	server := newLifecycleServer(t)
-	assert.NotNil(t, server.GetHandler())
+// TestNewHandler builds the routing surface without a listener: the seam
+// httptest-driven handler tests use.
+func TestNewHandler(t *testing.T) {
+	h := NewHandler(&Config{Region: "us-east-1"}, Clients{}, auth.NewConfigProvider(nil))
+	assert.NotNil(t, h)
 }

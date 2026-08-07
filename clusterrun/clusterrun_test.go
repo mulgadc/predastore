@@ -138,7 +138,7 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 		t.Fatalf("WaitReady: %v", err)
 	}
 
-	gw := gateway.NewHTTP2Server(cfg, rt.Clients, auth.NewConfigProvider(cfg.Auth)).GetHandler()
+	gw := gateway.NewHandler(cfg, rt.Clients, auth.NewConfigProvider(cfg.Auth))
 
 	if rr := serve(t, gw, signedRequest(t, http.MethodPut, "/it-bucket", nil)); rr.Code != http.StatusOK {
 		t.Fatalf("CreateBucket: status %d, body %s", rr.Code, rr.Body.String())

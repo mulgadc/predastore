@@ -163,7 +163,7 @@ var allowAllPolicy = iampolicy.PolicyDocument{
 	}},
 }
 
-func ownershipServer(t *testing.T) *HTTP2Server {
+func ownershipServer(t *testing.T) *Server {
 	t.Helper()
 	cfg := &Config{
 		Region: "ap-southeast-2",
@@ -196,7 +196,7 @@ func signedReq(t *testing.T, method, path, accessKey string) *http.Request {
 
 // runMiddleware drives only the auth+ownership middleware so backend route
 // failures (which we don't mock fully) do not contaminate status assertions.
-func runMiddleware(t *testing.T, server *HTTP2Server, req *http.Request) (status int, nextCalled bool, body string) {
+func runMiddleware(t *testing.T, server *Server, req *http.Request) (status int, nextCalled bool, body string) {
 	t.Helper()
 	rr := httptest.NewRecorder()
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -369,7 +369,7 @@ func TestOwnership_ListAllMyBucketsScopedByAccount(t *testing.T) {
 	server := ownershipServer(t)
 	req := signedReq(t, http.MethodGet, "/", keyOther)
 	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
+	server.router.ServeHTTP(rr, req)
 	assert.Equal(t, http.StatusOK, rr.Code)
 	body, _ := io.ReadAll(rr.Body)
 	// The other account owns no buckets; XML body should contain no <Bucket> entry.

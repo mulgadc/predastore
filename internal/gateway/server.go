@@ -2,257 +2,231 @@ package gateway
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime/pprof"
-	"sync"
+	"strconv"
+	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/mulgadc/predastore/internal/gateway/auth"
+	"github.com/mulgadc/predastore/internal/gateway/handlers"
+	"github.com/mulgadc/predastore/internal/gateway/placement"
+	"github.com/mulgadc/predastore/internal/state"
+	"github.com/mulgadc/predastore/internal/storage"
+	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/masterkey"
+	"github.com/mulgadc/predastore/ratelimit"
 )
 
-// Server encapsulates the S3-compatible server with all its components.
+const (
+	defaultHost = "0.0.0.0"
+	defaultPort = 8443
+
+	// defaultPprofOutput is where a CPU profile lands when none is configured.
+	defaultPprofOutput = "/tmp/predastore-cpu.prof"
+
+	// shutdownGrace bounds how long Run waits for in-flight requests to finish
+	// after the context is cancelled.
+	shutdownGrace = 10 * time.Second
+)
+
+// Clients are the cluster connections the gateway does its work through. It
+// owns neither transport: the process that runs the nodes builds both and
+// hands them over.
+type Clients struct {
+	// State reaches the replicas holding bucket, object and upload metadata.
+	State *state.Client
+	// Storage reaches the nodes holding shards.
+	Storage *storage.Client
+}
+
+// store returns the metadata store behind the state client. Resolved through
+// the nil check so a typed-nil client cannot masquerade as a live one behind
+// the interface.
+func (c Clients) store() handlers.Store {
+	if c.State == nil {
+		return nil
+	}
+	return c.State
+}
+
+// ServerConfig is the process-supplied half of the gateway's configuration:
+// everything that arrives by CLI flag, environment variable or wiring rather
+// than from the TOML file. The caller builds it and hands it to NewServer.
+type ServerConfig struct {
+	// ConfigPath is the TOML configuration file; empty means no file is read.
+	ConfigPath string
+
+	// Host and Port are the S3 listen address. Zero values default to
+	// 0.0.0.0:8443.
+	Host string
+	Port int
+
+	// TLSCert and TLSKey are required: the gateway only serves HTTPS.
+	TLSCert string
+	TLSKey  string
+
+	// BasePath is the base directory relative bucket and data paths resolve
+	// against.
+	BasePath string
+
+	// Debug forces debug logging on regardless of the TOML setting.
+	Debug bool
+
+	// EncryptionKeyFile is the 32-byte AES-256 master key for encryption at
+	// rest. Required, and supplied via CLI/env only, never TOML, so no
+	// plaintext secret path lives in the config file.
+	EncryptionKeyFile string
+
+	// Clients are the cluster connections the gateway works through. The
+	// server only runs the S3 HTTPS frontend: no state or storage nodes are
+	// launched, and the caller owns their supporting runtime.
+	Clients Clients
+
+	// PprofEnabled writes a CPU profile for the lifetime of Run, saved to
+	// PprofOutputPath (default /tmp/predastore-cpu.prof) as Run returns.
+	PprofEnabled    bool
+	PprofOutputPath string
+}
+
+// Server is predastore's S3 gateway: the HTTPS listener, the SigV4 + IAM
+// middleware chain and the route table. It is the S3 implementation, not a
+// front end onto one — the handlers it routes to erasure code, place and
+// record their own operations.
 type Server struct {
-	// Configuration
-	configPath        string
-	host              string
-	port              int
-	tlsCert           string
-	tlsKey            string
-	basePath          string
-	debug             bool
-	encryptionKeyPath string         // Path to the 32-byte AES-256 master key file.
-	masterKey         *masterkey.Key // Loaded master key handle (AEAD + fingerprint, no raw bytes).
+	cfg       ServerConfig
+	config    *Config
+	masterKey *masterkey.Key // AEAD + fingerprint, no raw bytes.
 
-	// Runtime state
-	config   *Config
-	server   *HTTP2Server
-	clients  Clients // cluster clients, wired by the process that runs the nodes
-	credProv auth.CredentialProvider
+	router    chi.Router
+	credProv  auth.CredentialProvider
+	throttler *ratelimit.Throttler
 
-	// Profiling
-	pprofEnabled    bool
-	pprofFile       *os.File
-	pprofOutputPath string
+	// Handler dependencies, shared by the route table and the auth middleware.
+	handlerCfg handlers.Config
+	state      handlers.Store        // bucket, object and upload metadata
+	buckets    *handlers.BucketCache // config-defined buckets, plus those created since startup
 
-	// Lifecycle
-	mu      sync.Mutex
-	running bool
-	// serveErr carries a fatal error from the async listener so the caller
-	// can shut down instead of running on with a dead gateway.
-	serveErr chan error
+	// pprofFile is the temp file the CPU profile streams into while Run is
+	// serving; it is copied to the output path on the way out.
+	pprofFile *os.File
 }
 
-// Option configures a Server.
-type Option func(*Server) error
-
-// NewServer creates a new S3 server with the given options.
-func NewServer(opts ...Option) (*Server, error) {
-	s := &Server{
-		host:     "0.0.0.0",
-		port:     8443,
-		serveErr: make(chan error, 1),
+// NewServer builds the S3 gateway. It reads the TOML config, loads the master
+// key, resolves the credential chain and assembles the route table; nothing
+// listens until Run is called.
+func NewServer(cfg ServerConfig) (*Server, error) {
+	if cfg.Host == "" {
+		cfg.Host = defaultHost
 	}
+	if cfg.Port == 0 {
+		cfg.Port = defaultPort
+	}
+	resolvePprof(&cfg)
 
-	// Apply options
-	for _, opt := range opts {
-		if err := opt(s); err != nil {
-			return nil, fmt.Errorf("failed to apply option: %w", err)
+	config := &Config{
+		ConfigPath: cfg.ConfigPath,
+		Debug:      cfg.Debug,
+		BasePath:   cfg.BasePath,
+	}
+	if cfg.ConfigPath != "" {
+		if err := config.ReadConfig(); err != nil {
+			return nil, fmt.Errorf("failed to read config: %w", err)
 		}
 	}
 
-	// Initialize the server
-	if err := s.init(); err != nil {
-		return nil, fmt.Errorf("failed to initialize server: %w", err)
+	// CLI/env flags override config file settings, so HIVE_PREDASTORE_DEBUG
+	// still wins over a config file with debug=false.
+	if cfg.Debug {
+		config.Debug = true
 	}
 
-	return s, nil
-}
-
-// WithConfigPath sets the path to the TOML configuration file.
-func WithConfigPath(path string) Option {
-	return func(s *Server) error {
-		s.configPath = path
-		return nil
+	// The master key is mandatory, and checked before anything expensive so a
+	// misconfigured launch fails immediately.
+	if cfg.EncryptionKeyFile == "" {
+		return nil, fmt.Errorf("encryption key file is required (use -encryption-key-file or ENCRYPTION_KEY_FILE)")
 	}
-}
-
-// WithAddress sets the server host and port.
-func WithAddress(host string, port int) Option {
-	return func(s *Server) error {
-		s.host = host
-		s.port = port
-		return nil
-	}
-}
-
-// WithTLS sets the TLS certificate and key paths.
-func WithTLS(certPath, keyPath string) Option {
-	return func(s *Server) error {
-		s.tlsCert = certPath
-		s.tlsKey = keyPath
-		return nil
-	}
-}
-
-// WithBasePath sets the base directory for data storage.
-func WithBasePath(path string) Option {
-	return func(s *Server) error {
-		s.basePath = path
-		return nil
-	}
-}
-
-// WithDebug enables debug logging.
-func WithDebug(enabled bool) Option {
-	return func(s *Server) error {
-		s.debug = enabled
-		return nil
-	}
-}
-
-// WithClients supplies the cluster clients the gateway works through. The
-// server then only runs the S3 HTTPS frontend: no state or storage nodes are
-// launched, and the caller owns their supporting runtime (rpc server, raft
-// nodes, shard stores). Used by cluster mode, where cmd/s3d assembles the
-// topology.
-func WithClients(clients Clients) Option {
-	return func(s *Server) error {
-		s.clients = clients
-		return nil
-	}
-}
-
-// WithEncryptionKeyFile sets the path to the 32-byte AES-256 master key file
-// used for encryption at rest. The path is supplied via CLI/env only, never
-// TOML, so no plaintext secret path lives in the config file.
-func WithEncryptionKeyFile(path string) Option {
-	return func(s *Server) error {
-		s.encryptionKeyPath = path
-		return nil
-	}
-}
-
-// WithPprof enables CPU profiling.
-// The profile is written to a temp file during operation and saved to outputPath on shutdown.
-// If outputPath is empty, it defaults to /tmp/predastore-cpu.prof.
-func WithPprof(enabled bool, outputPath string) Option {
-	return func(s *Server) error {
-		s.pprofEnabled = enabled
-		if outputPath == "" {
-			outputPath = "/tmp/predastore-cpu.prof"
-		}
-		s.pprofOutputPath = outputPath
-		return nil
-	}
-}
-
-// init initializes the server components.
-func (s *Server) init() error {
-	// Check environment variable for pprof if not already enabled
-	if !s.pprofEnabled && os.Getenv("PPROF_ENABLED") == "1" {
-		s.pprofEnabled = true
-		if s.pprofOutputPath == "" {
-			s.pprofOutputPath = os.Getenv("PPROF_OUTPUT")
-			if s.pprofOutputPath == "" {
-				s.pprofOutputPath = "/tmp/predastore-cpu.prof"
-			}
-		}
-	}
-
-	// Start CPU profiling if enabled
-	if s.pprofEnabled {
-		if err := s.startProfiling(); err != nil {
-			slog.Error("Failed to start CPU profiling", "error", err)
-			// Don't fail server start, just log the error
-		}
-	}
-
-	// Create and load configuration
-	s.config = &Config{
-		ConfigPath: s.configPath,
-		Debug:      s.debug,
-		BasePath:   s.basePath,
-	}
-
-	// Read configuration file if provided
-	if s.configPath != "" {
-		if err := s.config.ReadConfig(); err != nil {
-			return fmt.Errorf("failed to read config: %w", err)
-		}
-	}
-
-	// CLI/env flags override config file settings
-	// This ensures HIVE_PREDASTORE_DEBUG=true works even if config file has debug=false
-	if s.debug {
-		s.config.Debug = true
-	}
-
-	// Master key is mandatory. The key path itself is delivered via CLI/env
-	// only (not TOML) to avoid plaintext-secret-in-config and to keep s3d's
-	// config surface decoupled from quicd's. See encryption-at-rest plan.
-	if s.encryptionKeyPath == "" {
-		return fmt.Errorf("encryption key file is required (use -encryption-key-file or ENCRYPTION_KEY_FILE)")
-	}
-	key, err := masterkey.Load(s.encryptionKeyPath)
+	key, err := masterkey.Load(cfg.EncryptionKeyFile)
 	if err != nil {
-		return fmt.Errorf("load master key: %w", err)
+		return nil, fmt.Errorf("load master key: %w", err)
 	}
-	s.masterKey = key
 	slog.Info("master key loaded", "fingerprint", key.Fingerprint)
 
-	// Set log level early so debug logs during initialization are visible
-	var logLevel slog.Level
-	if s.config.Debug {
-		logLevel = slog.LevelDebug
-	} else if s.config.DisableLogging {
-		logLevel = slog.LevelError
-	} else {
-		logLevel = slog.LevelInfo
-	}
-	otelsetup.SetDefaultJSONLogger(logLevel)
-
-	if s.config.Debug {
+	// Set the log level early so debug logs during the rest of init are visible.
+	otelsetup.SetDefaultJSONLogger(logLevel(config))
+	if config.Debug {
 		slog.Info("Debug logging enabled")
 	}
 
 	// The clients arrive fully wired from the process that owns the cluster
 	// nodes; the gateway never launches storage or state itself.
-	if s.clients.State == nil || s.clients.Storage == nil {
-		return fmt.Errorf("no cluster clients provided: build the cluster runtime and pass WithClients")
+	if cfg.Clients.State == nil || cfg.Clients.Storage == nil {
+		return nil, fmt.Errorf("no cluster clients provided: build the cluster runtime and set ServerConfig.Clients")
 	}
 
-	// Initialize credential provider
-	credProv, err := s.initCredentialProvider()
+	credProv, err := newCredentialProvider(config)
 	if err != nil {
-		return fmt.Errorf("failed to initialize credential provider: %w", err)
+		return nil, fmt.Errorf("failed to initialize credential provider: %w", err)
 	}
-	s.credProv = credProv
 
-	// Setup HTTP routes using the HTTP/2 server
-	slog.Info("Server init")
-	s.server = NewHTTP2Server(s.config, s.clients, s.credProv)
+	s := newGateway(config, cfg.Clients.store(), cfg.Clients.Storage, credProv)
+	s.cfg = cfg
+	s.masterKey = key
 	slog.Info("HTTP/2 server initialized - using net/http for connection multiplexing")
 
-	return nil
+	return s, nil
 }
 
-// initCredentialProvider resolves the auth chain: NATS-backed IAM when it is
-// configured, with the config-defined accounts always as the fallback.
-func (s *Server) initCredentialProvider() (auth.CredentialProvider, error) {
-	configProv := auth.NewConfigProvider(s.config.Auth)
+// NewHandler builds the S3 request handler over the given cluster clients,
+// without a listener or a master key. Production goes through NewServer; this
+// is the seam tests drive with httptest.
+func NewHandler(config *Config, clients Clients, credProv auth.CredentialProvider) http.Handler {
+	return newGateway(config, clients.store(), clients.Storage, credProv).router
+}
 
-	if s.config.IAM == nil {
+// newGateway builds the routing half of the server over an arbitrary state
+// store. It is the seam tests use to stand a map in for a raft cluster;
+// production always arrives here through NewServer with a *state.Client.
+func newGateway(config *Config, store handlers.Store, shards *storage.Client, credProv auth.CredentialProvider) *Server {
+	cfg := config.handlerConfig()
+
+	s := &Server{
+		config:     config,
+		router:     chi.NewRouter(),
+		credProv:   credProv,
+		handlerCfg: cfg,
+		state:      store,
+		buckets:    handlers.NewBucketCache(cfg.Buckets),
+	}
+
+	if config.RateLimit.Enabled {
+		s.throttler = ratelimit.New(config.RateLimit)
+	}
+
+	s.setupMiddleware()
+	s.setupRoutes(shards, placement.NewRing(config.storageNodeIDs()))
+	return s
+}
+
+// newCredentialProvider resolves the auth chain: NATS-backed IAM when it is
+// configured, with the config-defined accounts always as the fallback.
+func newCredentialProvider(config *Config) (auth.CredentialProvider, error) {
+	configProv := auth.NewConfigProvider(config.Auth)
+
+	if config.IAM == nil {
 		slog.Info("IAM not configured, using config-only auth")
 		return configProv, nil
 	}
 
-	natsProv, err := auth.NewNATSIAMProvider(s.config.IAM)
+	natsProv, err := auth.NewNATSIAMProvider(config.IAM)
 	if err != nil {
 		return nil, fmt.Errorf("IAM configured but NATS provider failed to initialize: %w", err)
 	}
@@ -261,63 +235,129 @@ func (s *Server) initCredentialProvider() (auth.CredentialProvider, error) {
 	return auth.NewChainProvider(natsProv, configProv), nil
 }
 
-// ListenAndServe starts the server and blocks until shutdown.
-func (s *Server) ListenAndServe() error {
-	s.mu.Lock()
-	if s.running {
-		s.mu.Unlock()
-		return fmt.Errorf("server already running")
+// logLevel maps the config's logging switches onto a slog level.
+func logLevel(config *Config) slog.Level {
+	switch {
+	case config.Debug:
+		return slog.LevelDebug
+	case config.DisableLogging:
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
 	}
-	s.running = true
-	s.mu.Unlock()
-
-	addr := fmt.Sprintf("%s:%d", s.host, s.port)
-	slog.Info("Starting S3 server", "host", s.host, "port", s.port)
-
-	if s.tlsCert == "" || s.tlsKey == "" {
-		return fmt.Errorf("TLS is required - set tlsCert and tlsKey")
-	}
-
-	slog.Info(">>> USING HTTP/2 SERVER (net/http + chi) <<<", "addr", addr)
-	return s.server.ListenAndServe(addr, s.tlsCert, s.tlsKey)
 }
 
-// ListenAndServeAsync starts the server in a goroutine.
-func (s *Server) ListenAndServeAsync() error {
-	s.mu.Lock()
-	if s.running {
-		s.mu.Unlock()
-		return fmt.Errorf("server already running")
-	}
-	s.running = true
-	s.mu.Unlock()
-
-	addr := fmt.Sprintf("%s:%d", s.host, s.port)
-	slog.Info("Starting S3 server (async)", "host", s.host, "port", s.port)
-
-	if s.tlsCert == "" || s.tlsKey == "" {
-		return fmt.Errorf("TLS is required - set tlsCert and tlsKey")
+// Run serves S3 over TLS until ctx is cancelled or the listener fails, then
+// drains in-flight requests within the grace period and releases everything it
+// started. It is the server's whole lifecycle: there is nothing to stop it
+// with but the context.
+func (s *Server) Run(ctx context.Context) error {
+	if s.cfg.TLSCert == "" || s.cfg.TLSKey == "" {
+		return errors.New("TLS is required - set ServerConfig.TLSCert and ServerConfig.TLSKey")
 	}
 
+	// Teardown runs LIFO, so registration order here is the reverse of the
+	// order things are released in: the listener drains first, then the
+	// credential provider and the throttler that fronted it, and profiling
+	// last so it covers the whole shutdown.
+	if s.cfg.PprofEnabled {
+		if err := s.startProfiling(); err != nil {
+			// A missing profile is not worth refusing to serve over.
+			slog.Error("Failed to start CPU profiling", "error", err)
+		}
+		defer func() {
+			if err := s.stopProfiling(); err != nil {
+				slog.Error("Error stopping CPU profile", "error", err)
+			}
+		}()
+	}
+	if s.throttler != nil {
+		defer s.throttler.Stop()
+	}
+	if s.credProv != nil {
+		defer s.credProv.Close()
+	}
+
+	cert, err := tls.LoadX509KeyPair(s.cfg.TLSCert, s.cfg.TLSKey)
+	if err != nil {
+		return fmt.Errorf("failed to load TLS certificate: %w", err)
+	}
+
+	// NextProtos advertises HTTP/2 over ALPN, with HTTP/1.1 as the fallback.
+	tlsCfg := &tls.Config{
+		Certificates:     []tls.Certificate{cert},
+		NextProtos:       []string{"h2", "http/1.1"},
+		MinVersion:       tls.VersionTLS13,
+		CurvePreferences: tlsconfig.Curves,
+	}
+
+	addr := net.JoinHostPort(s.cfg.Host, strconv.Itoa(s.cfg.Port))
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           s.router,
+		TLSConfig:         tlsCfg,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
+
+	// Buffered so the send never blocks, and closed after it so the drain below
+	// can wait for Serve to return whether or not the select already took the
+	// value. No goroutine outlives Run.
+	serveErr := make(chan error, 1)
 	go func() {
-		slog.Info(">>> USING HTTP/2 SERVER (net/http + chi) <<<", "addr", addr)
-		err := s.server.ListenAndServe(addr, s.tlsCert, s.tlsKey)
-		if err == nil || errors.Is(err, http.ErrServerClosed) {
-			return
-		}
-		slog.Error("Server error", "error", err)
-		select {
-		case s.serveErr <- err:
-		default:
-		}
+		serveErr <- httpSrv.Serve(tls.NewListener(ln, tlsCfg))
+		close(serveErr)
 	}()
 
-	return nil
+	defer func() {
+		drainCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		if err := httpSrv.Shutdown(drainCtx); err != nil {
+			slog.Error("S3 gateway did not drain within grace period", "error", err)
+		}
+		<-serveErr
+	}()
+
+	slog.Info("Starting S3 gateway", "addr", addr, "http2", true)
+
+	select {
+	case <-ctx.Done():
+		slog.Info("Shutting down S3 gateway...")
+		return nil
+	case err := <-serveErr:
+		// A gateway that cannot bind must take the process down rather than
+		// leave the cluster running headless.
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("s3 gateway: %w", err)
+	}
 }
 
-// startProfiling starts CPU profiling to a temp file.
+// resolvePprof fills in the profiling settings the environment supplies, so a
+// launcher can turn profiling on without the caller plumbing a flag through.
+func resolvePprof(cfg *ServerConfig) {
+	if !cfg.PprofEnabled && os.Getenv("PPROF_ENABLED") == "1" {
+		cfg.PprofEnabled = true
+		if cfg.PprofOutputPath == "" {
+			cfg.PprofOutputPath = os.Getenv("PPROF_OUTPUT")
+		}
+	}
+	if cfg.PprofEnabled && cfg.PprofOutputPath == "" {
+		cfg.PprofOutputPath = defaultPprofOutput
+	}
+}
+
+// startProfiling starts CPU profiling into a temp file.
 func (s *Server) startProfiling() error {
-	// Create temp file for profiling
 	tmpFile, err := os.CreateTemp("", "predastore-cpu-*.prof.tmp")
 	if err != nil {
 		return fmt.Errorf("failed to create temp profile file: %w", err)
@@ -331,10 +371,11 @@ func (s *Server) startProfiling() error {
 		if removeErr := os.Remove(tmpFile.Name()); removeErr != nil {
 			slog.Debug("Failed to remove temp profile file", "error", removeErr)
 		}
+		s.pprofFile = nil
 		return fmt.Errorf("failed to start CPU profile: %w", err)
 	}
 
-	slog.Info("CPU profiling started", "tempFile", tmpFile.Name(), "outputPath", s.pprofOutputPath)
+	slog.Info("CPU profiling started", "tempFile", tmpFile.Name(), "outputPath", s.cfg.PprofOutputPath)
 	return nil
 }
 
@@ -349,19 +390,18 @@ func (s *Server) stopProfiling() error {
 	if err := s.pprofFile.Close(); err != nil {
 		slog.Warn("Failed to close pprof file", "error", err)
 	}
+	s.pprofFile = nil
 
-	// Copy temp file to output path
-	if err := copyFile(tempPath, s.pprofOutputPath); err != nil {
+	if err := copyFile(tempPath, s.cfg.PprofOutputPath); err != nil {
 		slog.Error("Failed to save CPU profile", "error", err, "tempPath", tempPath)
 		return err
 	}
 
-	// Remove temp file
 	if err := os.Remove(tempPath); err != nil {
 		slog.Debug("Failed to remove temp profile file", "path", tempPath, "error", err)
 	}
 
-	slog.Info("CPU profile saved", "path", s.pprofOutputPath)
+	slog.Info("CPU profile saved", "path", s.cfg.PprofOutputPath)
 	return nil
 }
 
@@ -389,47 +429,3 @@ func copyFile(src, dst string) error {
 	}
 	return dstFile.Sync()
 }
-
-// Shutdown gracefully shuts down the server.
-func (s *Server) Shutdown(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if !s.running {
-		return nil
-	}
-
-	slog.Info("Shutting down S3 server...")
-
-	// Shutdown HTTP server first (stop accepting new requests)
-	slog.Info("Shutting down HTTP server...")
-	if s.server != nil {
-		if err := s.server.Shutdown(ctx); err != nil {
-			slog.Error("Error shutting down HTTP server", "error", err)
-		}
-	}
-
-	// Close credential provider (NATS connections, watchers)
-	if s.credProv != nil {
-		s.credProv.Close()
-	}
-
-	// Stop profiling and save profile
-	if s.pprofEnabled {
-		if err := s.stopProfiling(); err != nil {
-			slog.Error("Error stopping CPU profile", "error", err)
-		}
-	}
-
-	s.running = false
-
-	slog.Info("S3 server shutdown complete")
-	return nil
-}
-
-// WaitForShutdownSignal blocks until SIGINT/SIGTERM is received or the
-// embedded database crashes. Returns an error if shutdown was triggered by a
-// DB failure, nil for normal signal-based shutdown.
-// ServeError reports a fatal listener failure. A gateway that cannot bind
-// must take the process down rather than leave the cluster running headless.
-func (s *Server) ServeError() <-chan error { return s.serveErr }

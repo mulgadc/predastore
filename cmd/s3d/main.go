@@ -90,15 +90,17 @@ func run() error {
 		return fmt.Errorf("build cluster runtime: %w", err)
 	}
 
-	server, err := gateway.NewServer(
-		gateway.WithConfigPath(*config),
-		gateway.WithAddress(*host, *port),
-		gateway.WithTLS(*tlsCert, *tlsKey),
-		gateway.WithBasePath(*basePath),
-		gateway.WithDebug(*debug),
-		gateway.WithEncryptionKeyFile(*encryptionKeyFile),
-		gateway.WithClients(rt.Clients),
-	)
+	server, err := gateway.NewServer(gateway.ServerConfig{
+		ConfigPath:        *config,
+		Host:              *host,
+		Port:              *port,
+		TLSCert:           *tlsCert,
+		TLSKey:            *tlsKey,
+		BasePath:          *basePath,
+		Debug:             *debug,
+		EncryptionKeyFile: *encryptionKeyFile,
+		Clients:           rt.Clients,
+	})
 	if err != nil {
 		rt.Close()
 		return fmt.Errorf("create server: %w", err)
@@ -113,29 +115,9 @@ func run() error {
 		if err := rt.WaitReady(30 * time.Second); err != nil {
 			slog.Warn("No leader elected within timeout, serving anyway", "error", err)
 		}
-		return serveS3(gctx, server)
+		return server.Run(gctx)
 	})
 	return g.Wait()
-}
-
-// serveS3 runs the gateway until the context is cancelled, then shuts it down
-// within a bounded grace period.
-func serveS3(ctx context.Context, server *gateway.Server) error {
-	if err := server.ListenAndServeAsync(); err != nil {
-		return fmt.Errorf("start s3 gateway: %w", err)
-	}
-	select {
-	case <-ctx.Done():
-	case err := <-server.ServeError():
-		return fmt.Errorf("s3 gateway: %w", err)
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shut down s3 gateway: %w", err)
-	}
-	return nil
 }
 
 // applyEnvOverrides lets the launcher configure s3d without rewriting flags.

@@ -54,8 +54,8 @@ type Config struct {
 	// IAM authentication via NATS KV (optional, enables multi-account S3 access)
 	IAM *auth.IAMConfig `toml:"iam"`
 
-	// The gateway's listen address comes from WithAddress, not the config:
-	// a `host` key here would collide with the [[host]] topology table, which
+	// The gateway's listen address comes from ServerConfig, not this file: a
+	// `host` key here would collide with the [[host]] topology table, which
 	// TOML rejects outright.
 
 	Debug          bool   `toml:"debug"`

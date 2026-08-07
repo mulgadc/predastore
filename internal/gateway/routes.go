@@ -26,7 +26,7 @@ func byQuery(param string, with, without http.Handler) http.Handler {
 // over the dependencies it needs. It runs after the middleware chain is
 // installed, since chi requires all middleware to be registered before the
 // first route.
-func (s *HTTP2Server) setupRoutes(shards *storage.Client, ring *placement.Ring) {
+func (s *Server) setupRoutes(shards *storage.Client, ring *placement.Ring) {
 	r := s.router
 	st, cache, cfg := s.state, s.buckets, s.handlerCfg
 

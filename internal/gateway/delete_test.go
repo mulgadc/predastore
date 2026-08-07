@@ -12,13 +12,13 @@ import (
 func TestDeleteObjectNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2Server(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
 
 	// Send a delete request
 	req := httptest.NewRequest(http.MethodDelete, "/local/unknownfile.txt", nil)
 
 	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
+	server.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 }
@@ -26,7 +26,7 @@ func TestDeleteObjectNoAuth(t *testing.T) {
 func TestDeleteObjectBadAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2Server(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
 
 	// Send a delete request
 	req := httptest.NewRequest(http.MethodDelete, "/local/unknownfile.txt", nil)
@@ -35,7 +35,7 @@ func TestDeleteObjectBadAuth(t *testing.T) {
 	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")
 
 	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
+	server.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 }

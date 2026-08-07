@@ -56,7 +56,7 @@ func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client
 	}
 	t.Cleanup(func() { st.Close() })
 
-	svc := storage.NewService(uint64(nodeID), st)
+	svc := storage.NewServer(uint64(nodeID), st)
 	mux := rpc.NewMux()
 	svc.Register(mux)
 

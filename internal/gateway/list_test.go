@@ -14,11 +14,11 @@ import (
 func TestListBucketsNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2Server(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
+	server.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 }
@@ -26,11 +26,11 @@ func TestListBucketsNoAuth(t *testing.T) {
 func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2Server(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
+	server.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 
@@ -43,13 +43,13 @@ func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
 func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2Server(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")
 
 	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
+	server.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 

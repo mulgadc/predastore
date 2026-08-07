@@ -14,13 +14,13 @@ import (
 func TestGetObjectNoBucketPermissions(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHTTP2Server(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
 
 	req := httptest.NewRequest(http.MethodGet, "/private/note.txt", nil)
 	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")
 
 	rr := httptest.NewRecorder()
-	server.GetHandler().ServeHTTP(rr, req)
+	server.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 

@@ -16,32 +16,32 @@ import (
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
-// Service serves shard rpc requests for one storage node. A process running
-// several nodes builds one Service per node, each on its own rpc server, so
-// the service itself never learns that it has siblings.
-type Service struct {
+// Server serves shard rpc requests for one storage node. A process running
+// several nodes builds one Server per node, each carried by its own rpc
+// server, so the shard service never learns that it has siblings.
+type Server struct {
 	id    uint64
 	store *engine.Store
 }
 
-// NewService builds the service for one node's shard store.
-func NewService(id uint64, st *engine.Store) *Service {
-	return &Service{id: id, store: st}
+// NewServer builds the shard service for one node's store.
+func NewServer(id uint64, st *engine.Store) *Server {
+	return &Server{id: id, store: st}
 }
 
-// ID is the node this service serves.
-func (s *Service) ID() uint64 { return s.id }
+// ID is the node this server serves.
+func (s *Server) ID() uint64 { return s.id }
 
 // Run holds the node open until ctx is cancelled, then closes its store. The
 // rpc server draining is the caller's concern; by the time Run returns no
 // handler is still touching the store.
-func (s *Service) Run(ctx context.Context) error {
+func (s *Server) Run(ctx context.Context) error {
 	<-ctx.Done()
 	return s.store.Close()
 }
 
 // Register installs the storage service handlers on the mux.
-func (s *Service) Register(mux *rpc.Mux) {
+func (s *Server) Register(mux *rpc.Mux) {
 	rpc.RegisterHandler(mux, OpShardGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpShardPut, s.handlePut)
 	rpc.RegisterHandler(mux, OpShardDelete, s.handleDelete)
@@ -53,7 +53,7 @@ func respondShard(stream transport.Stream, resp *ShardResponse) error {
 	return json.NewEncoder(stream).Encode(resp)
 }
 
-func (s *Service) handlePut(ctx context.Context, h ShardRequest, stream transport.Stream) error {
+func (s *Server) handlePut(ctx context.Context, h ShardRequest, stream transport.Stream) error {
 	st := s.store
 	if h.ShardSize <= 0 {
 		return respondShard(stream, &ShardResponse{Err: "no shard size specified"})
@@ -84,7 +84,7 @@ func (s *Service) handlePut(ctx context.Context, h ShardRequest, stream transpor
 	return respondShard(stream, &ShardResponse{ShardSize: h.ShardSize, PoolNearFull: st.NearFull()})
 }
 
-func (s *Service) handleGet(ctx context.Context, h ShardRequest, stream transport.Stream) error {
+func (s *Server) handleGet(ctx context.Context, h ShardRequest, stream transport.Stream) error {
 	st := s.store
 
 	reader, err := st.Lookup(h.ObjectHash, h.ShardIndex)
@@ -119,7 +119,7 @@ func (s *Service) handleGet(ctx context.Context, h ShardRequest, stream transpor
 	return nil
 }
 
-func (s *Service) handleDelete(ctx context.Context, h ShardRequest, stream transport.Stream) error {
+func (s *Server) handleDelete(ctx context.Context, h ShardRequest, stream transport.Stream) error {
 	st := s.store
 	deleted, err := st.Delete(h.ObjectHash, h.ShardIndex)
 	if err != nil {

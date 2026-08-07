@@ -2,22 +2,14 @@ package gateway
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
-	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/mulgadc/predastore/internal/gateway/auth"
 	"github.com/mulgadc/predastore/internal/gateway/handlers"
-	"github.com/mulgadc/predastore/internal/gateway/placement"
-	"github.com/mulgadc/predastore/internal/state"
-	"github.com/mulgadc/predastore/internal/storage"
-	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/mulgadc/predastore/pkg/sigv4"
@@ -28,85 +20,13 @@ import (
 // independent of the region they are configured for or the endpoint they target.
 const globalSigningRegion = "us-east-1"
 
-// Clients are the cluster connections the gateway does its work through. It
-// owns neither transport: the process that runs the nodes builds both and
-// hands them over.
-type Clients struct {
-	// State reaches the replicas holding bucket, object and upload metadata.
-	State *state.Client
-	// Storage reaches the nodes holding shards.
-	Storage *storage.Client
-}
-
-// HTTP2Server is an HTTP/2 compatible S3 server using net/http. It is the S3
-// implementation, not a front end onto one: the handlers it routes to erasure
-// code, place and record their own operations.
-type HTTP2Server struct {
-	config    *Config
-	router    chi.Router
-	server    *http.Server
-	credProv  auth.CredentialProvider
-	throttler *ratelimit.Throttler
-
-	// Handler dependencies, shared by the route table and the auth middleware.
-	handlerCfg handlers.Config
-	state      handlers.Store        // bucket, object and upload metadata
-	buckets    *handlers.BucketCache // config-defined buckets, plus those created since startup
-}
-
-// NewHTTP2Server creates the S3 gateway over the given cluster clients. Shard
-// counts and the ring's membership come from the config, so the gateway places
-// shards exactly where the cluster it was configured against expects them.
-func NewHTTP2Server(config *Config, clients Clients, credProv auth.CredentialProvider) *HTTP2Server {
-	// Assigned through the nil check so a typed-nil client cannot masquerade as
-	// a live one behind the interface.
-	var store handlers.Store
-	if clients.State != nil {
-		store = clients.State
-	}
-	return newGateway(config, store, clients.Storage, credProv)
-}
-
-// newGateway builds the gateway over an arbitrary state store. It is the seam
-// tests use to stand a map in for a raft cluster; production always arrives
-// here through NewHTTP2Server with a *state.Client.
-func newGateway(config *Config, store handlers.Store, shards *storage.Client, credProv auth.CredentialProvider) *HTTP2Server {
-	cfg := config.handlerConfig()
-
-	s := &HTTP2Server{
-		config:     config,
-		router:     chi.NewRouter(),
-		credProv:   credProv,
-		handlerCfg: cfg,
-		state:      store,
-		buckets:    handlers.NewBucketCache(cfg.Buckets),
-	}
-
-	if config.RateLimit.Enabled {
-		s.throttler = ratelimit.New(config.RateLimit)
-	}
-
-	s.setupMiddleware()
-	s.setupRoutes(shards, placement.NewRing(config.storageNodeIDs()))
-	return s
-}
-
 // setupMiddleware installs the chain every request passes through before it
 // reaches a handler. chi requires all middleware to be registered before the
 // first route, so this runs ahead of setupRoutes.
-func (s *HTTP2Server) setupMiddleware() {
+func (s *Server) setupMiddleware() {
 	r := s.router
 
-	var logLevel slog.Level
-	if s.config.Debug {
-		logLevel = slog.LevelDebug
-	} else if s.config.DisableLogging {
-		logLevel = slog.LevelError
-	} else {
-		logLevel = slog.LevelInfo
-	}
-
-	otelsetup.SetDefaultJSONLogger(logLevel)
+	otelsetup.SetDefaultJSONLogger(logLevel(s.config))
 
 	r.Use(otelsetup.HTTPMiddleware("predastore"))
 	r.Use(s3SpanMiddleware)
@@ -150,7 +70,7 @@ func (s *HTTP2Server) setupMiddleware() {
 // sigV4AuthMiddleware authenticates and authorizes incoming S3 requests:
 // public-bucket short-circuit, SigV4 verify, IAM policy eval, and
 // cross-account bucket-ownership check.
-func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
+func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		method := r.Method
@@ -255,77 +175,4 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		ctx = context.WithValue(ctx, auth.ContextKeyAccountID, credResult.AccountID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
-}
-
-// ListenAndServe starts the HTTP/2 server with TLS.
-func (s *HTTP2Server) ListenAndServe(addr, certFile, keyFile string) error {
-	// Load TLS certificates
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return fmt.Errorf("failed to load TLS certificate: %w", err)
-	}
-
-	// Configure TLS with HTTP/2 support
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		// NextProtos enables ALPN for HTTP/2 negotiation
-		// "h2" = HTTP/2, "http/1.1" = HTTP/1.1 fallback
-		NextProtos:       []string{"h2", "http/1.1"},
-		MinVersion:       tls.VersionTLS13,
-		CurvePreferences: tlsconfig.Curves,
-	}
-
-	s.server = &http.Server{
-		Addr:      addr,
-		Handler:   s.router,
-		TLSConfig: tlsConfig,
-		// Timeouts
-		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,
-		// Max header size
-		MaxHeaderBytes: 1 << 20, // 1MB
-	}
-
-	slog.Info("Starting HTTP/2 S3 server", "addr", addr, "http2", true)
-
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return err
-	}
-
-	tlsListener := tls.NewListener(ln, tlsConfig)
-	return s.server.Serve(tlsListener)
-}
-
-// ListenAndServeAsync starts the server in a goroutine.
-func (s *HTTP2Server) ListenAndServeAsync(addr, certFile, keyFile string) error {
-	go func() {
-		if err := s.ListenAndServe(addr, certFile, keyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("HTTP/2 server error", "error", err)
-		}
-	}()
-	return nil
-}
-
-// Shutdown gracefully shuts down the server.
-func (s *HTTP2Server) Shutdown(ctx context.Context) error {
-	if s.throttler != nil {
-		s.throttler.Stop()
-	}
-	if s.server != nil {
-		return s.server.Shutdown(ctx)
-	}
-	return nil
-}
-
-// GetRouter returns the chi router for testing.
-func (s *HTTP2Server) GetRouter() chi.Router {
-	return s.router
-}
-
-// GetHandler returns the HTTP handler for testing with httptest.
-func (s *HTTP2Server) GetHandler() http.Handler {
-	return s.router
 }

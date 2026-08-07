@@ -4,7 +4,7 @@
 //
 // It is public because s3d is not the only entrypoint: embedders that host
 // predastore in their own process (spinifex's service supervisor) need the
-// same assembly before handing the clients to gateway.WithClients.
+// same assembly before handing the clients to the gateway.
 package clusterrun
 
 import (
@@ -225,7 +225,7 @@ func (rt *Runtime) addNode(
 		if err != nil {
 			return fmt.Errorf("open shard store for node %d: %w", n.ID, err)
 		}
-		storageSvc := storage.NewService(id, st)
+		storageSvc := storage.NewServer(id, st)
 		storageSvc.Register(mux)
 		svc = storageSvc
 

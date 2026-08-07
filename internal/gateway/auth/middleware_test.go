@@ -39,7 +39,7 @@ func sessionGateway(p auth.CredentialProvider) http.Handler {
 			Public: false, AccountID: auth.TestSessionAccount,
 		}},
 	}
-	return gateway.NewHTTP2Server(cfg, gateway.Clients{}, p).GetHandler()
+	return gateway.NewHandler(cfg, gateway.Clients{}, p)
 }
 
 // signSession signs a body-less request with the AWS SDK's SigV4 signer, as a
