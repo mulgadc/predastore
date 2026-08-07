@@ -4,12 +4,22 @@ import (
 	"errors"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 var (
 	validBucketNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`)
 	ipAddrPatternRe   = regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`)
 )
+
+// IsValidKeyName validates an object key name.
+// https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-guidelines
+func IsValidKeyName(key string) error {
+	if !utf8.ValidString(key) {
+		return errors.New("key must be a valid UTF-8 string")
+	}
+	return nil
+}
 
 // IsValidBucketName validates a bucket name according to S3 naming rules
 // https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
@@ -22,9 +32,8 @@ func IsValidBucketName(bucket string) error {
 		return errors.New("bucket must be < 63 characters")
 	}
 
-	// AWS bucket naming rules
-	// Bucket names must begin and end with a letter or number.
-	// Bucket names can consist only of lowercase letters, numbers, periods (.), and hyphens (-).
+	// Bucket names must begin and end with a letter or number, and consist only
+	// of lowercase letters, numbers, periods (.), and hyphens (-).
 	if !validBucketNameRe.MatchString(bucket) {
 		return errors.New("bucket name must consist of lowercase letters, numbers, periods (.), and hyphens (-) and must begin and end with a letter or number")
 	}
@@ -49,32 +58,32 @@ func IsValidBucketName(bucket string) error {
 		return errors.New("bucket names must not start with the prefix sthree-")
 	}
 
-	// Bucket names must not start with the prefix amzn-s3-demo-
+	// Bucket names must not start with the prefix amzn-s3-demo-.
 	if strings.HasPrefix(bucket, "amzn-s3-demo-") {
 		return errors.New("bucket names must not start with the prefix amzn-s3-demo-")
 	}
 
-	// Bucket names must not end with the suffix -s3alias.
+	// The -s3alias suffix is reserved for access point alias names.
 	if strings.HasSuffix(bucket, "-s3alias") {
 		return errors.New("bucket names must not end with the suffix -s3alias")
 	}
 
-	// Bucket names must not end with the suffix --ol-s3.
+	// The --ol-s3 suffix is reserved for Object Lambda Access Point alias names.
 	if strings.HasSuffix(bucket, "--ol-s3") {
 		return errors.New("bucket names must not end with the suffix --ol-s3")
 	}
 
-	// Bucket names must not end with the suffix .mrap.
+	// The .mrap suffix is reserved for Multi-Region Access Point names.
 	if strings.HasSuffix(bucket, ".mrap") {
 		return errors.New("bucket names must not end with the suffix .mrap")
 	}
 
-	// Bucket names must not end with the suffix --x-s3.
+	// The --x-s3 suffix is reserved for directory buckets.
 	if strings.HasSuffix(bucket, "--x-s3") {
 		return errors.New("bucket names must not end with the suffix --x-s3")
 	}
 
-	// Bucket names must not end with the suffix --table-s3.
+	// The --table-s3 suffix is reserved for S3 Tables buckets.
 	if strings.HasSuffix(bucket, "--table-s3") {
 		return errors.New("bucket names must not end with the suffix --table-s3")
 	}

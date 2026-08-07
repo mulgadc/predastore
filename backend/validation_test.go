@@ -6,6 +6,33 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestIsValidKeyName(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     []byte
+		wantErr string
+	}{
+		{"valid ASCII", []byte("Hello, World!"), ""},
+		{"valid UTF-8", []byte("Hello, 世界!"), ""},
+		{"invalid sequence", []byte{0xC0, 0x80}, "valid UTF-8"},
+		{"truncated sequence", []byte{0xE2, 0x82}, "valid UTF-8"},
+		{"invalid continuation byte", []byte{0xE2, 0x28, 0xA1}, "valid UTF-8"},
+		{"mixed valid and invalid", []byte{'a', 0xFF, 'b'}, "valid UTF-8"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := IsValidKeyName(string(tt.key))
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestIsValidBucketName(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -18,6 +45,8 @@ func TestIsValidBucketName(t *testing.T) {
 		{"valid with numbers", "bucket123", ""},
 		{"valid minimum length", "abc", ""},
 		{"valid 63 chars", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ""},
+		{"valid alphanumeric with hyphens and dot", "my-bucket-with-alpha-0123456789.bucket-name-with-hyphens", ""},
+		{"valid multiple periods", "my-bucket-with-multiple.periods.here.and.there", ""},
 
 		// Length violations
 		{"too short empty", "", "> 3 characters"},
@@ -33,6 +62,8 @@ func TestIsValidBucketName(t *testing.T) {
 		{"starts with dot", ".bucket", "lowercase letters"},
 		{"ends with dot", "bucket.", "lowercase letters"},
 		{"special chars", "my@bucket", "lowercase letters"},
+		{"asterisk", "my-bucket*", "lowercase letters"},
+		{"emoji", "my-bucket-👩‍💻-♗", "lowercase letters"},
 
 		// Adjacent periods
 		{"adjacent periods", "my..bucket", "two adjacent periods"},
