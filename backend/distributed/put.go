@@ -75,7 +75,7 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 
 	var size int64
 	var poolNearFull bool
-	size, poolNearFull, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash)
+	size, poolNearFull, err = b.putObjectViaQUIC(ctx, tmpFile.Name(), objectHash)
 	if err != nil {
 		slog.Error("distributed.PutObject: shard distribution failed", "error", err)
 		return nil, mapPutErr(err)
@@ -113,14 +113,14 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	}
 
 	// Store object hash -> shard metadata (for retrieval)
-	if err := b.globalState.Put(TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
+	if err := b.statePut(TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 
 	// Store ARN key -> object hash (for listing)
 	// Format: arn:aws:s3:::<bucket>/<key>
 	arnKey := arnObjectPrefixPut + req.Bucket + "/" + req.Key
-	if err := b.globalState.Put(TableObjects, arnKey, objectHash[:]); err != nil {
+	if err := b.statePut(TableObjects, arnKey, objectHash[:]); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 

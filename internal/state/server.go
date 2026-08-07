@@ -151,14 +151,13 @@ func (n *Server) bootstrap() error {
 }
 
 // Put stores a key-value pair through Raft consensus.
-func (n *Server) Put(table, key string, value []byte) error {
+func (n *Server) Put(key string, value []byte) error {
 	if n.raft.State() != raft.Leader {
 		return ErrNotLeader
 	}
 
 	cmd := Command{
 		Type:  CommandPut,
-		Table: table,
 		Key:   []byte(key),
 		Value: value,
 	}
@@ -184,15 +183,14 @@ func (n *Server) Put(table, key string, value []byte) error {
 }
 
 // Delete removes a key through Raft consensus.
-func (n *Server) Delete(table, key string) error {
+func (n *Server) Delete(key string) error {
 	if n.raft.State() != raft.Leader {
 		return ErrNotLeader
 	}
 
 	cmd := Command{
-		Type:  CommandDelete,
-		Table: table,
-		Key:   []byte(key),
+		Type: CommandDelete,
+		Key:  []byte(key),
 	}
 
 	data, err := json.Marshal(cmd)
@@ -218,13 +216,13 @@ func (n *Server) Delete(table, key string) error {
 // Get reads a value from the local store
 // Note: This may return stale data on followers. For strong consistency,
 // use GetConsistent which forwards reads to the leader.
-func (n *Server) Get(table, key string) ([]byte, error) {
-	return n.fsm.Get(table, key)
+func (n *Server) Get(key string) ([]byte, error) {
+	return n.fsm.Get(key)
 }
 
-// Scan iterates over keys with prefix in the given table.
-func (n *Server) Scan(table, prefix string, fn func(key string, value []byte) error) error {
-	return n.fsm.Scan(table, prefix, fn)
+// Scan iterates over every key with the given prefix.
+func (n *Server) Scan(prefix string, fn func(key string, value []byte) error) error {
+	return n.fsm.Scan(prefix, fn)
 }
 
 // IsLeader returns true if this node is the current Raft leader.

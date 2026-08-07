@@ -93,16 +93,16 @@ func TestStorageShardRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	const bucket, object = "bkt", "obj/a"
+	// The hash is the client's to compute and opaque to the node; a caller
+	// derives it from S3 names, but the wire only ever sees the 32 bytes.
+	objectHash := storage.GenObjectHash("bkt", "obj/a")
 	shard := make([]byte, 256*1024)
 	if _, err := rand.Read(shard); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
 
 	putResp, err := cli.PutShard(ctx, 7, storage.PutRequest{
-		Bucket:     bucket,
-		Object:     object,
-		ObjectHash: storage.GenObjectHash(bucket, object),
+		ObjectHash: objectHash,
 		ShardSize:  int64(len(shard)),
 		ShardIndex: 0,
 	}, bytes.NewReader(shard))
@@ -115,7 +115,7 @@ func TestStorageShardRoundTrip(t *testing.T) {
 
 	// Full read.
 	rc, err := cli.GetShard(ctx, 7, storage.GetRequest{
-		Bucket: bucket, Object: object, ShardIndex: 0, RangeStart: -1, RangeEnd: -1,
+		ObjectHash: objectHash, ShardIndex: 0, RangeStart: -1, RangeEnd: -1,
 	})
 	if err != nil {
 		t.Fatalf("GetShard: %v", err)
@@ -131,7 +131,7 @@ func TestStorageShardRoundTrip(t *testing.T) {
 
 	// Range read, including an explicit zero start.
 	rc, err = cli.GetShardRange(ctx, 7, storage.GetRequest{
-		Bucket: bucket, Object: object, ShardIndex: 0, RangeStart: 0, RangeEnd: 1023,
+		ObjectHash: objectHash, ShardIndex: 0, RangeStart: 0, RangeEnd: 1023,
 	})
 	if err != nil {
 		t.Fatalf("GetShardRange: %v", err)
@@ -147,8 +147,7 @@ func TestStorageShardRoundTrip(t *testing.T) {
 
 	// Delete, then the shard is gone.
 	delResp, err := cli.DeleteShard(ctx, 7, storage.DeleteRequest{
-		Bucket: bucket, Object: object,
-		ObjectHash: storage.GenObjectHash(bucket, object), ShardIndex: 0,
+		ObjectHash: objectHash, ShardIndex: 0,
 	})
 	if err != nil {
 		t.Fatalf("DeleteShard: %v", err)
@@ -157,7 +156,7 @@ func TestStorageShardRoundTrip(t *testing.T) {
 		t.Fatal("DeleteShard reported nothing deleted")
 	}
 	if _, err := cli.GetShard(ctx, 7, storage.GetRequest{
-		Bucket: bucket, Object: object, ShardIndex: 0, RangeStart: -1, RangeEnd: -1,
+		ObjectHash: objectHash, ShardIndex: 0, RangeStart: -1, RangeEnd: -1,
 	}); !errors.Is(err, storage.ErrShardNotFound) {
 		t.Fatalf("GetShard after delete: got %v, want ErrShardNotFound", err)
 	}
@@ -169,7 +168,7 @@ func TestStorageGetMissingShard(t *testing.T) {
 	defer cancel()
 
 	if _, err := cli.GetShard(ctx, 1, storage.GetRequest{
-		Bucket: "none", Object: "missing", ShardIndex: 0, RangeStart: -1, RangeEnd: -1,
+		ObjectHash: storage.GenObjectHash("none", "missing"), ShardIndex: 0, RangeStart: -1, RangeEnd: -1,
 	}); !errors.Is(err, storage.ErrShardNotFound) {
 		t.Fatalf("got %v, want ErrShardNotFound", err)
 	}
@@ -181,7 +180,7 @@ func TestStorageUnknownTargetNode(t *testing.T) {
 	defer cancel()
 
 	if _, err := cli.DeleteShard(ctx, 99, storage.DeleteRequest{
-		Bucket: "b", Object: "o", ShardIndex: 0,
+		ObjectHash: storage.GenObjectHash("b", "o"), ShardIndex: 0,
 	}); err == nil {
 		t.Fatal("delete against unknown node succeeded")
 	}

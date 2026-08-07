@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,16 +143,16 @@ func startStateCluster(t *testing.T, prefix string) *state.Client {
 func TestStateServiceOverRPC(t *testing.T) {
 	cli := startStateCluster(t, "state-svc")
 
-	// Writes land regardless of which replica is dialed first: the client
-	// follows not-leader redirects.
+	// Keys are opaque to the replicas: the "objects/" namespace here is what a
+	// gateway composes, not something the protocol knows about.
 	for i := range 5 {
-		key := fmt.Sprintf("obj/%d", i)
-		if err := cli.Put("objects", key, fmt.Appendf(nil, "v%d", i)); err != nil {
+		key := fmt.Sprintf("objects/obj/%d", i)
+		if err := cli.Put(key, fmt.Appendf(nil, "v%d", i)); err != nil {
 			t.Fatalf("Put %s: %v", key, err)
 		}
 	}
 
-	v, err := cli.Get("objects", "obj/3")
+	v, err := cli.Get("objects/obj/3")
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -159,26 +160,33 @@ func TestStateServiceOverRPC(t *testing.T) {
 		t.Fatalf("Get = %q, want v3", v)
 	}
 
-	if _, err := cli.Get("objects", "missing"); !errors.Is(err, state.ErrNotFound) {
+	if _, err := cli.Get("objects/missing"); !errors.Is(err, state.ErrNotFound) {
 		t.Fatalf("Get missing: got %v, want ErrNotFound", err)
 	}
 
-	items, err := cli.Scan("objects", "obj/", 3)
+	items, err := cli.Scan("objects/obj/", 3)
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
 	if len(items) != 3 {
 		t.Fatalf("Scan returned %d items, want 3 (limit)", len(items))
 	}
+	// Scan hands back the stored key verbatim; stripping any namespace is the
+	// caller's job.
+	for _, item := range items {
+		if !strings.HasPrefix(item.Key, "objects/obj/") {
+			t.Fatalf("Scan returned key %q, want it stored verbatim", item.Key)
+		}
+	}
 
-	if err := cli.Delete("objects", "obj/0"); err != nil {
+	if err := cli.Delete("objects/obj/0"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	// Deletion is applied per replica; poll until no replica still serves
 	// the key.
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		_, err := cli.Get("objects", "obj/0")
+		_, err := cli.Get("objects/obj/0")
 		if errors.Is(err, state.ErrNotFound) {
 			break
 		}
@@ -199,7 +207,7 @@ func TestStateBinaryKeysRoundTrip(t *testing.T) {
 	// A raw sha256 stands in for the object metadata keys the backend writes.
 	hash := sha256.Sum256([]byte("bucket/object"))
 
-	prefix := "bin\x00\xff/"
+	prefix := "objects/bin\x00\xff/"
 	want := map[string][]byte{
 		prefix + string([]byte{0x00, 0xff, 0x41, 0x80, 0xfe, 0x42}) + "é世🙂": []byte("mixed"),
 		prefix + string(hash[:]): []byte("object-metadata"),
@@ -210,13 +218,13 @@ func TestStateBinaryKeysRoundTrip(t *testing.T) {
 	}
 
 	for k, v := range want {
-		if err := cli.Put("objects", k, v); err != nil {
+		if err := cli.Put(k, v); err != nil {
 			t.Fatalf("Put %q: %v", k, err)
 		}
 	}
 
 	for k, v := range want {
-		got, err := cli.Get("objects", k)
+		got, err := cli.Get(k)
 		if err != nil {
 			t.Fatalf("Get %q: %v", k, err)
 		}
@@ -225,7 +233,7 @@ func TestStateBinaryKeysRoundTrip(t *testing.T) {
 		}
 	}
 
-	items, err := cli.Scan("objects", prefix, 0)
+	items, err := cli.Scan(prefix, 0)
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}

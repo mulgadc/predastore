@@ -87,8 +87,7 @@ func (s *Service) handlePut(ctx context.Context, h ShardRequest, stream transpor
 func (s *Service) handleGet(ctx context.Context, h ShardRequest, stream transport.Stream) error {
 	st := s.store
 
-	objectHash := GenObjectHash(h.Bucket, h.Object)
-	reader, err := st.Lookup(objectHash, h.ShardIndex)
+	reader, err := st.Lookup(h.ObjectHash, h.ShardIndex)
 	if err != nil {
 		return respondShard(stream, &ShardResponse{Err: ErrCodeNotFound})
 	}

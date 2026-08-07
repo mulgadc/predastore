@@ -76,7 +76,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.Create
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to encode upload metadata", 500)
 	}
 
-	if err := b.globalState.Put(TableMultipart, multipartUploadKey(uploadID), buf.Bytes()); err != nil {
+	if err := b.statePut(TableMultipart, multipartUploadKey(uploadID), buf.Bytes()); err != nil {
 		slog.Error("Failed to store multipart upload metadata", "uploadID", uploadID, "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to create multipart upload", 500)
 	}
@@ -92,7 +92,7 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.Create
 
 // getUploadMetadata retrieves and validates upload metadata.
 func (b *Backend) getUploadMetadata(uploadID string) (*multipart.UploadMetadata, error) {
-	data, err := b.globalState.Get(TableMultipart, multipartUploadKey(uploadID))
+	data, err := b.stateGet(TableMultipart, multipartUploadKey(uploadID))
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			return nil, backend.ErrNoSuchUploadError.WithResource(uploadID)
@@ -180,7 +180,7 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 		slog.Debug("Failed to close temp file", "path", tmpPath, "error", closeErr)
 	}
 
-	if _, _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpPath, objectHash); err != nil {
+	if _, _, err = b.putObjectViaQUIC(ctx, tmpPath, objectHash); err != nil {
 		slog.Error("Failed to store part", "uploadID", req.UploadID, "part", req.PartNumber, "error", err)
 		return nil, mapPutErr(err)
 	}
@@ -200,7 +200,7 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to encode part metadata", 500)
 	}
 
-	if err := b.globalState.Put(TableParts, multipartPartKey(req.UploadID, req.PartNumber), partBuf.Bytes()); err != nil {
+	if err := b.statePut(TableParts, multipartPartKey(req.UploadID, req.PartNumber), partBuf.Bytes()); err != nil {
 		slog.Error("Failed to store part metadata", "uploadID", req.UploadID, "part", req.PartNumber, "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store part metadata", 500)
 	}
@@ -235,7 +235,7 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to encode shard metadata", 500)
 	}
 
-	if err := b.globalState.Put(TableObjects, partShardKey, shardBuf.Bytes()); err != nil {
+	if err := b.statePut(TableObjects, partShardKey, shardBuf.Bytes()); err != nil {
 		slog.Error("Failed to store part shard metadata", "uploadID", req.UploadID, "part", req.PartNumber, "error", err)
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store part shard metadata", 500)
 	}
@@ -250,7 +250,7 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 
 // getStoredParts retrieves all stored parts for an upload.
 func (b *Backend) getStoredParts(uploadID string) ([]multipart.PartMetadata, error) {
-	items, err := b.globalState.Scan(TableParts, multipartPartsPrefix(uploadID), 0)
+	items, err := b.stateScan(TableParts, multipartPartsPrefix(uploadID), 0)
 	if err != nil {
 		return nil, err
 	}
@@ -383,7 +383,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	// Store the final object using PutObject mechanism
 	objectHash := storage.GenObjectHash(req.Bucket, req.Key)
 
-	if _, _, err = b.putObjectViaQUIC(ctx, req.Bucket, tmpFile.Name(), objectHash); err != nil {
+	if _, _, err = b.putObjectViaQUIC(ctx, tmpFile.Name(), objectHash); err != nil {
 		slog.Error("Failed to store final object", "uploadID", req.UploadID, "error", err)
 		return nil, mapPutErr(err)
 	}
@@ -422,13 +422,13 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to encode shard metadata", 500)
 	}
 
-	if err := b.globalState.Put(TableObjects, string(objectHash[:]), shardBuf.Bytes()); err != nil {
+	if err := b.statePut(TableObjects, string(objectHash[:]), shardBuf.Bytes()); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store object metadata", 500)
 	}
 
 	// Store ARN key -> object hash mapping
 	arnKey := arnObjectPrefixPut + req.Bucket + "/" + req.Key
-	if err := b.globalState.Put(TableObjects, arnKey, objectHash[:]); err != nil {
+	if err := b.statePut(TableObjects, arnKey, objectHash[:]); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store ARN mapping", 500)
 	}
 
@@ -456,7 +456,7 @@ func (b *Backend) getPartData(ctx context.Context, bucket, key, uploadID string,
 	// Look up shard location using the key format from UploadPart
 	partShardKey := fmt.Sprintf("part:%s:%05d", uploadID, partNumber)
 
-	data, err := b.globalState.Get(TableObjects, partShardKey)
+	data, err := b.stateGet(TableObjects, partShardKey)
 	if err != nil {
 		return nil, fmt.Errorf("part not found: uploadID=%s part=%d", uploadID, partNumber)
 	}
@@ -477,7 +477,7 @@ func (b *Backend) getPartData(ctx context.Context, bucket, key, uploadID string,
 	partKey := partObjectKey(bucket, key, uploadID, partNumber)
 
 	// Use the existing reconstructObject from get.go
-	buf, err := b.reconstructObject(ctx, bucket, partKey, shardNodes, enc, shardNodes.Size)
+	buf, err := b.reconstructObject(ctx, storage.GenObjectHash(bucket, partKey), shardNodes, enc, shardNodes.Size)
 	if err != nil {
 		return nil, err
 	}
@@ -495,7 +495,7 @@ func (b *Backend) cleanupMultipartUpload(ctx context.Context, bucket, key, uploa
 		// Drop the physical part shards before removing the shard-location map. A missing
 		// or corrupt map, or a per-node delete failure, is logged and skipped — cleanup is
 		// best-effort and must not fail the complete/abort request.
-		if data, err := b.globalState.Get(TableObjects, partShardKey); err != nil {
+		if data, err := b.stateGet(TableObjects, partShardKey); err != nil {
 			slog.Warn("cleanup: part shard map missing, skipping shard delete", "uploadID", uploadID, "part", part.PartNumber)
 		} else {
 			var nodes ObjectToShardNodes
@@ -509,17 +509,17 @@ func (b *Backend) cleanupMultipartUpload(ctx context.Context, bucket, key, uploa
 			}
 		}
 
-		if err := b.globalState.Delete(TableParts, multipartPartKey(uploadID, part.PartNumber)); err != nil {
+		if err := b.stateDelete(TableParts, multipartPartKey(uploadID, part.PartNumber)); err != nil {
 			slog.Warn("Failed to delete part metadata", "uploadID", uploadID, "part", part.PartNumber, "error", err)
 		}
 
-		if err := b.globalState.Delete(TableObjects, partShardKey); err != nil {
+		if err := b.stateDelete(TableObjects, partShardKey); err != nil {
 			slog.Warn("Failed to delete part shard metadata", "uploadID", uploadID, "part", part.PartNumber, "error", err)
 		}
 	}
 
 	// Delete upload metadata
-	if err := b.globalState.Delete(TableMultipart, multipartUploadKey(uploadID)); err != nil {
+	if err := b.stateDelete(TableMultipart, multipartUploadKey(uploadID)); err != nil {
 		return err
 	}
 

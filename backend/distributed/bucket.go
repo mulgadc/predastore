@@ -63,7 +63,7 @@ func (b *Backend) CreateBucket(ctx context.Context, req *backend.CreateBucketReq
 	}
 
 	// Store in global state
-	if err := b.globalState.Put(TableBuckets, req.Bucket, buf.Bytes()); err != nil {
+	if err := b.statePut(TableBuckets, req.Bucket, buf.Bytes()); err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, "failed to store bucket: "+err.Error(), 500)
 	}
 
@@ -94,7 +94,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, req *backend.DeleteBucketReq
 
 	// Check if bucket is empty; one object is enough to reject the delete.
 	arnPrefix := arnObjectPrefix + req.Bucket + "/"
-	objects, err := b.globalState.Scan(TableObjects, arnPrefix, 1)
+	objects, err := b.stateScan(TableObjects, arnPrefix, 1)
 	if err != nil {
 		return backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
@@ -104,7 +104,7 @@ func (b *Backend) DeleteBucket(ctx context.Context, req *backend.DeleteBucketReq
 	}
 
 	// Delete bucket from global state
-	if err := b.globalState.Delete(TableBuckets, req.Bucket); err != nil {
+	if err := b.stateDelete(TableBuckets, req.Bucket); err != nil {
 		return backend.NewS3Error(backend.ErrInternalError, "failed to delete bucket: "+err.Error(), 500)
 	}
 
@@ -127,7 +127,7 @@ func (b *Backend) HeadBucket(ctx context.Context, req *backend.HeadBucketRequest
 	}
 
 	// Then check global state for dynamically created buckets
-	data, err := b.globalState.Get(TableBuckets, req.Bucket)
+	data, err := b.stateGet(TableBuckets, req.Bucket)
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
 			return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
@@ -156,7 +156,7 @@ func (b *Backend) HeadBucket(ctx context.Context, req *backend.HeadBucketRequest
 // bucketExists checks if a bucket exists and returns the owner ID.
 func (b *Backend) bucketExists(bucket string) (exists bool, ownerID string, err error) {
 	// Check global state first (authoritative source with owner info)
-	data, err := b.globalState.Get(TableBuckets, bucket)
+	data, err := b.stateGet(TableBuckets, bucket)
 	if err != nil {
 		if !errors.Is(err, state.ErrNotFound) {
 			return false, "", err
@@ -206,7 +206,7 @@ func (b *Backend) removeBucketFromCache(name string) {
 
 // GetBucketMetadata retrieves bucket metadata from global state.
 func (b *Backend) GetBucketMetadata(bucket string) (*backend.BucketMetadata, error) {
-	data, err := b.globalState.Get(TableBuckets, bucket)
+	data, err := b.stateGet(TableBuckets, bucket)
 	if err != nil {
 		// A typed sentinel rather than substring matching — a transient backend
 		// error whose message coincidentally contained "not found" would

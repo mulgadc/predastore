@@ -71,7 +71,6 @@ func (h *RaftDial) Unmarshal(b []byte) error          { return json.Unmarshal(b,
 // travel in the stream body after the header; Key doubles as the prefix for
 // scans.
 type StateRequest struct {
-	Table string `json:"table"`
 	// Key is bytes rather than a string because object metadata is keyed by a
 	// raw sha256: JSON rewrites every byte of a string that is not valid UTF-8
 	// to U+FFFD, so a string key would not survive the wire.

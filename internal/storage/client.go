@@ -23,8 +23,6 @@ var ErrStoreFull = errors.New("store full")
 // PutRequest identifies the shard a put commits. The shard bytes travel
 // separately, as the body reader passed alongside it.
 type PutRequest struct {
-	Bucket     string
-	Object     string
 	ObjectHash [32]byte
 	ShardIndex uint32
 	// ShardSize is the number of body bytes to commit.
@@ -39,11 +37,9 @@ type PutResponse struct {
 	PoolNearFull bool
 }
 
-// GetRequest identifies the shard a get reads. The node derives the object
-// hash from Bucket and Object, so callers do not supply it.
+// GetRequest identifies the shard a get reads.
 type GetRequest struct {
-	Bucket     string
-	Object     string
+	ObjectHash [32]byte
 	ShardIndex uint32
 	// RangeStart and RangeEnd bound the read; -1 in either means unset and
 	// reads the whole shard.
@@ -53,8 +49,6 @@ type GetRequest struct {
 
 // DeleteRequest identifies the shard a delete removes.
 type DeleteRequest struct {
-	Bucket     string
-	Object     string
 	ObjectHash [32]byte
 	ShardIndex uint32
 }
@@ -109,8 +103,6 @@ func readEnvelope(br *bufio.Reader) (*ShardResponse, error) {
 // PutShard streams a shard to the node and returns the commit result.
 func (c *Client) PutShard(ctx context.Context, nodeID int, req PutRequest, body io.Reader) (*PutResponse, error) {
 	stream, err := c.open(ctx, nodeID, OpShardPut, &ShardRequest{
-		Bucket:     req.Bucket,
-		Object:     req.Object,
 		ObjectHash: req.ObjectHash,
 		ShardIndex: req.ShardIndex,
 		ShardSize:  req.ShardSize,
@@ -150,8 +142,6 @@ func (c *Client) PutShard(ctx context.Context, nodeID int, req PutRequest, body 
 // DeleteShard marks a shard deleted on the node.
 func (c *Client) DeleteShard(ctx context.Context, nodeID int, req DeleteRequest) (*DeleteResponse, error) {
 	stream, err := c.open(ctx, nodeID, OpShardDelete, &ShardRequest{
-		Bucket:     req.Bucket,
-		Object:     req.Object,
 		ObjectHash: req.ObjectHash,
 		ShardIndex: req.ShardIndex,
 		RangeStart: -1,
@@ -187,8 +177,7 @@ func (c *Client) GetShardRange(ctx context.Context, nodeID int, req GetRequest) 
 
 func (c *Client) get(ctx context.Context, nodeID int, req GetRequest) (io.ReadCloser, error) {
 	stream, err := c.open(ctx, nodeID, OpShardGet, &ShardRequest{
-		Bucket:     req.Bucket,
-		Object:     req.Object,
+		ObjectHash: req.ObjectHash,
 		ShardIndex: req.ShardIndex,
 		RangeStart: req.RangeStart,
 		RangeEnd:   req.RangeEnd,

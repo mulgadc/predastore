@@ -24,7 +24,7 @@ func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.L
 	bucketMap := make(map[string]backend.BucketInfo)
 
 	// Scan global state for dynamically created buckets
-	items, err := b.globalState.Scan(TableBuckets, "", 0)
+	items, err := b.stateScan(TableBuckets, "", 0)
 	if err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, "failed to list buckets: "+err.Error(), 500)
 	}
@@ -94,7 +94,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 	commonPrefixes := make([]string, 0)
 	prefixSet := make(map[string]bool) // To dedupe common prefixes
 
-	items, err := b.globalState.Scan(TableObjects, scanPrefix, 0)
+	items, err := b.stateScan(TableObjects, scanPrefix, 0)
 	if err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
@@ -132,7 +132,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 
 		if len(item.Value) == 32 {
 			// value is the objectHash, look up the full metadata
-			metaData, err := b.globalState.Get(TableObjects, string(item.Value))
+			metaData, err := b.stateGet(TableObjects, string(item.Value))
 			if err == nil && len(metaData) > 0 {
 				var objMeta ObjectToShardNodes
 				dec := gob.NewDecoder(bytes.NewReader(metaData))

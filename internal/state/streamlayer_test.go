@@ -145,7 +145,7 @@ func TestRaftClusterOverRPCStreamLayer(t *testing.T) {
 		t.Fatal("no proc reports leadership")
 	}
 
-	if err := leader.Put("objects", "k1", []byte("v1")); err != nil {
+	if err := leader.Put("objects/k1", []byte("v1")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 
@@ -153,7 +153,7 @@ func TestRaftClusterOverRPCStreamLayer(t *testing.T) {
 	for id, p := range procs {
 		deadline := time.Now().Add(15 * time.Second)
 		for {
-			v, err := p.node.Get("objects", "k1")
+			v, err := p.node.Get("objects/k1")
 			if err == nil && string(v) == "v1" {
 				break
 			}

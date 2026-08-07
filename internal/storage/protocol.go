@@ -32,10 +32,10 @@ func appendJSON(buf []byte, v any) ([]byte, error) {
 }
 
 // ShardRequest is the header for every storage service operation. Put shard
-// data travels in the stream body after the header.
+// data travels in the stream body after the header. ObjectHash is the client's
+// to compute; a storage node only ever treats it as 32 opaque bytes naming a
+// shard set.
 type ShardRequest struct {
-	Bucket     string   `json:"bucket"`
-	Object     string   `json:"object"`
 	ObjectHash [32]byte `json:"object_hash"`
 	ShardIndex uint32   `json:"shard_index"`
 	// ShardSize is the body length for puts.

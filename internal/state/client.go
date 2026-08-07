@@ -26,8 +26,9 @@ type Item struct {
 }
 
 // Client reads and writes global state over rpc streams, hiding the wire
-// protocol from callers: it owns table scoping and key encoding, and takes
-// keys as strings that may hold arbitrary bytes.
+// protocol from callers. The replicas are a plain key-value store: keys are
+// opaque, taken as strings that may hold arbitrary bytes, and any namespacing
+// belongs to the caller.
 //
 // Reads try the cached leader then every replica; writes follow not-leader
 // redirects and cache the leader they land on.
@@ -137,19 +138,19 @@ func (c *Client) cacheLeader(id uint64) {
 	c.mu.Unlock()
 }
 
-// request builds a wire header for a table-scoped key. Callers hand keys over
-// as strings; the wire carries them as bytes so binary keys survive JSON.
-func request(table, key string, limit int) *StateRequest {
-	return &StateRequest{Table: table, Key: []byte(key), Limit: limit}
+// request builds a wire header for a key. Callers hand keys over as strings;
+// the wire carries them as bytes so binary keys survive JSON.
+func request(key string, limit int) *StateRequest {
+	return &StateRequest{Key: []byte(key), Limit: limit}
 }
 
 // Get retrieves a value. A replica that has not applied the key yet answers
 // not-found, so every replica is consulted before giving up.
-func (c *Client) Get(table, key string) ([]byte, error) {
+func (c *Client) Get(key string) ([]byte, error) {
 	var lastErr error
 	notFound := false
 	for _, id := range c.readOrder() {
-		resp, err := c.call(id, OpStateGet, request(table, key, 0), nil)
+		resp, err := c.call(id, OpStateGet, request(key, 0), nil)
 		if err != nil {
 			lastErr = err
 			continue
@@ -164,17 +165,17 @@ func (c *Client) Get(table, key string) ([]byte, error) {
 		}
 	}
 	if notFound {
-		return nil, fmt.Errorf("get %s/%q: %w", table, key, ErrNotFound)
+		return nil, fmt.Errorf("get %q: %w", key, ErrNotFound)
 	}
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, fmt.Errorf("get %s/%q: no replica answered", table, key)
+	return nil, fmt.Errorf("get %q: no replica answered", key)
 }
 
 // Exists reports whether the key is present.
-func (c *Client) Exists(table, key string) (bool, error) {
-	_, err := c.Get(table, key)
+func (c *Client) Exists(key string) (bool, error) {
+	_, err := c.Get(key)
 	if errors.Is(err, ErrNotFound) {
 		return false, nil
 	}
@@ -186,11 +187,11 @@ func (c *Client) Exists(table, key string) (bool, error) {
 
 // Scan lists up to limit key-value pairs with the prefix, preferring the
 // leader for freshness but accepting any replica. A limit of zero or less
-// returns every match.
-func (c *Client) Scan(table, prefix string, limit int) ([]Item, error) {
+// returns every match. Keys come back exactly as stored.
+func (c *Client) Scan(prefix string, limit int) ([]Item, error) {
 	var lastErr error
 	for _, id := range c.readOrder() {
-		resp, err := c.call(id, OpStateScan, request(table, prefix, limit), nil)
+		resp, err := c.call(id, OpStateScan, request(prefix, limit), nil)
 		if err != nil {
 			lastErr = err
 			continue
@@ -209,8 +210,8 @@ func (c *Client) Scan(table, prefix string, limit int) ([]Item, error) {
 }
 
 // ListKeys returns every key with the prefix.
-func (c *Client) ListKeys(table, prefix string) ([]string, error) {
-	items, err := c.Scan(table, prefix, 0)
+func (c *Client) ListKeys(prefix string) ([]string, error) {
+	items, err := c.Scan(prefix, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -222,13 +223,13 @@ func (c *Client) ListKeys(table, prefix string) ([]string, error) {
 }
 
 // Put stores a key-value pair through the leader.
-func (c *Client) Put(table, key string, value []byte) error {
-	return c.write(OpStatePut, request(table, key, 0), value)
+func (c *Client) Put(key string, value []byte) error {
+	return c.write(OpStatePut, request(key, 0), value)
 }
 
 // Delete removes a key through the leader.
-func (c *Client) Delete(table, key string) error {
-	return c.write(OpStateDelete, request(table, key, 0), nil)
+func (c *Client) Delete(key string) error {
+	return c.write(OpStateDelete, request(key, 0), nil)
 }
 
 // write drives a consensus write to the leader, following not-leader
@@ -267,5 +268,5 @@ func (c *Client) write(op rpc.Opcode, req *StateRequest, body []byte) error {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
-	return fmt.Errorf("write %s/%q failed after %d attempts: %w", req.Table, req.Key, attempts, lastErr)
+	return fmt.Errorf("write %q failed after %d attempts: %w", req.Key, attempts, lastErr)
 }

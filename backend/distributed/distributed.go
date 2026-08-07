@@ -186,7 +186,7 @@ func (b *Backend) HashRing() *consistent.Consistent {
 // putObjectViaQUIC splits a file into RS shards and sends each to the
 // appropriate node via QUIC. poolNearFull is set if any shard's target node
 // reported pressure.
-func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPath string, objectHash [32]byte) (size int64, poolNearFull bool, err error) {
+func (b *Backend) putObjectViaQUIC(ctx context.Context, objectPath string, objectHash [32]byte) (size int64, poolNearFull bool, err error) {
 	enc, err := reedsolomon.NewStream(b.rsDataShard, b.rsParityShard)
 	if err != nil {
 		return 0, false, err
@@ -245,8 +245,6 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 			}
 
 			putReq := storage.PutRequest{
-				Bucket:     bucket,
-				Object:     objectPath,
 				ObjectHash: objectHash,
 				ShardSize:  int64(len(shardData)),
 				ShardIndex: uint32(idx), //nolint:gosec // G115: idx bounded by rsDataShard (small uint).
@@ -310,8 +308,6 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 			}
 
 			putReq := storage.PutRequest{
-				Bucket:     bucket,
-				Object:     objectPath,
 				ObjectHash: objectHash,
 				ShardSize:  int64(shardSize),
 				ShardIndex: uint32(hashRingIdx), //nolint:gosec // G115: hashRingIdx bounded by rsDataShard + rsParityShard (small uint).
@@ -364,16 +360,14 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, bucket string, objectPat
 
 // openInput retrieves shard location metadata for an object.
 func (b *Backend) openInput(bucket string, object string) (ObjectToShardNodes, int64, error) {
-	key := storage.GenObjectHash(bucket, object)
+	objectHash := storage.GenObjectHash(bucket, object)
 
-	hashRingShards, err := b.hashRing.GetClosestN(key[:], b.rsDataShard+b.rsParityShard)
+	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}
 
-	objectHash := storage.GenObjectHash(bucket, object)
-
-	data, err := b.globalState.Get(TableObjects, string(objectHash[:]))
+	data, err := b.stateGet(TableObjects, string(objectHash[:]))
 	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}
@@ -396,7 +390,7 @@ func (b *Backend) openInput(bucket string, object string) (ObjectToShardNodes, i
 // shardReaders creates readers for each shard via QUIC.
 // Data is buffered into memory before connections are closed to avoid
 // "connection closed" errors when the caller reads from the returned readers.
-func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShardNodes, parity bool) ([]io.Reader, error) {
+func (b *Backend) shardReaders(objectHash [32]byte, shards ObjectToShardNodes, parity bool) ([]io.Reader, error) {
 	shardReaders := make([]io.Reader, len(shards.DataShardNodes)+len(shards.ParityShardNodes))
 
 	totalNodes := make([]uint32, 0)
@@ -410,8 +404,7 @@ func (b *Backend) shardReaders(bucket string, object string, shards ObjectToShar
 		nodeNum := int(totalNodes[i])
 
 		objectRequest := storage.GetRequest{
-			Bucket:     bucket,
-			Object:     object,
+			ObjectHash: objectHash,
 			RangeStart: -1, // -1 means full shard (no range)
 			RangeEnd:   -1,
 			ShardIndex: uint32(i), // Include shard index for unique lookup

@@ -78,7 +78,8 @@ func (b *Backend) handleRangeRequest(ctx context.Context, req *backend.GetObject
 
 	// Optimization: if range is within a single shard, fetch just that shard portion
 	if startShardIdx == endShardIdx {
-		data, err := b.readRangeFromSingleShard(ctx, req.Bucket, req.Key, shards, startShardIdx, start, end, shardSize, totalSize)
+		objectHash := storage.GenObjectHash(req.Bucket, req.Key)
+		data, err := b.readRangeFromSingleShard(ctx, objectHash, shards, startShardIdx, start, end, shardSize, totalSize)
 		if err != nil {
 			slog.Warn("Single shard range read failed, falling back to full reconstruction", "err", err)
 			// Fall back to full reconstruction
@@ -102,7 +103,7 @@ func (b *Backend) handleRangeRequest(ctx context.Context, req *backend.GetObject
 
 // readRangeFromSingleShard reads a byte range from a specific data shard.
 // This is the optimized path when the range falls entirely within one shard.
-func (b *Backend) readRangeFromSingleShard(ctx context.Context, bucket, key string, shards ObjectToShardNodes, shardIdx int, globalStart, globalEnd, shardSize, totalSize int64) ([]byte, error) {
+func (b *Backend) readRangeFromSingleShard(ctx context.Context, objectHash [32]byte, shards ObjectToShardNodes, shardIdx int, globalStart, globalEnd, shardSize, totalSize int64) ([]byte, error) {
 	if shardIdx >= len(shards.DataShardNodes) {
 		return nil, fmt.Errorf("shard index %d out of range", shardIdx)
 	}
@@ -132,8 +133,7 @@ func (b *Backend) readRangeFromSingleShard(ctx context.Context, bucket, key stri
 
 	// Request the shard with range
 	objectRequest := storage.GetRequest{
-		Bucket:     bucket,
-		Object:     key,
+		ObjectHash: objectHash,
 		ShardIndex: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by rsDataShard (small uint).
 		RangeStart: offsetInShard,
 		RangeEnd:   endInShard,
@@ -229,8 +229,10 @@ func (b *Backend) getFullObject(ctx context.Context, req *backend.GetObjectReque
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
 
+	objectHash := storage.GenObjectHash(req.Bucket, req.Key)
+
 	// First try with data shards only
-	shardReaders, err := b.shardReaders(req.Bucket, req.Key, shards, false)
+	shardReaders, err := b.shardReaders(objectHash, shards, false)
 	if err != nil {
 		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
 	}
@@ -245,7 +247,7 @@ func (b *Backend) getFullObject(ctx context.Context, req *backend.GetObjectReque
 
 		// Try with parity shards for reconstruction
 		out.Reset()
-		reconstructed, err := b.reconstructObject(ctx, req.Bucket, req.Key, shards, enc, size)
+		reconstructed, err := b.reconstructObject(ctx, objectHash, shards, enc, size)
 		if err != nil {
 			return nil, backend.NewS3Error(backend.ErrInternalError,
 				fmt.Sprintf("reconstruction failed: %v", err), 500)
@@ -282,9 +284,9 @@ func (b *Backend) HeadObject(ctx context.Context, bucket, key string) (*backend.
 }
 
 // reconstructObject attempts to rebuild an object using parity shards.
-func (b *Backend) reconstructObject(ctx context.Context, bucket, key string, shards ObjectToShardNodes, enc reedsolomon.StreamEncoder, size int64) (*bytes.Buffer, error) {
+func (b *Backend) reconstructObject(ctx context.Context, objectHash [32]byte, shards ObjectToShardNodes, enc reedsolomon.StreamEncoder, size int64) (*bytes.Buffer, error) {
 	// Get all shard readers including parity
-	shardReaders, err := b.shardReaders(bucket, key, shards, true)
+	shardReaders, err := b.shardReaders(objectHash, shards, true)
 	if err != nil {
 		return nil, err
 	}
@@ -295,8 +297,7 @@ func (b *Backend) reconstructObject(ctx context.Context, bucket, key string, sha
 
 	for i := range reconstruction {
 		if shardReaders[i] == nil {
-			objHash := storage.GenObjectHash(bucket, key)
-			filename := fmt.Sprintf("%s.%d", hex.EncodeToString(objHash[:]), i)
+			filename := fmt.Sprintf("%s.%d", hex.EncodeToString(objectHash[:]), i)
 			outfn := filepath.Join(os.TempDir(), filename)
 
 			files[i], err = os.Create(outfn)
@@ -327,7 +328,7 @@ func (b *Backend) reconstructObject(ctx context.Context, bucket, key string, sha
 	}
 
 	// Re-read shards with reconstructed data
-	shardReaders, err = b.shardReaders(bucket, key, shards, true)
+	shardReaders, err = b.shardReaders(objectHash, shards, true)
 	if err != nil {
 		return nil, err
 	}

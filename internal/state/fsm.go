@@ -24,7 +24,6 @@ const (
 // Command represents a database operation that goes through Raft.
 type Command struct {
 	Type  CommandType `json:"type"`
-	Table string      `json:"table"`
 	Key   []byte      `json:"key"` // []byte for safe JSON base64 encoding of binary keys
 	Value []byte      `json:"value,omitempty"`
 }
@@ -53,27 +52,25 @@ func (f *FSM) Apply(log *raft.Log) any {
 
 	switch cmd.Type {
 	case CommandPut:
-		return f.applyPut(cmd.Table, string(cmd.Key), cmd.Value)
+		return f.applyPut(string(cmd.Key), cmd.Value)
 	case CommandDelete:
-		return f.applyDelete(cmd.Table, string(cmd.Key))
+		return f.applyDelete(string(cmd.Key))
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
 }
 
 // applyPut stores a key-value pair.
-func (f *FSM) applyPut(table, key string, value []byte) error {
-	fullKey := makeKey(table, key)
+func (f *FSM) applyPut(key string, value []byte) error {
 	return f.db.Update(func(txn *badger.Txn) error {
-		return txn.Set(fullKey, value)
+		return txn.Set([]byte(key), value)
 	})
 }
 
 // applyDelete removes a key.
-func (f *FSM) applyDelete(table, key string) error {
-	fullKey := makeKey(table, key)
+func (f *FSM) applyDelete(key string) error {
 	return f.db.Update(func(txn *badger.Txn) error {
-		return txn.Delete(fullKey)
+		return txn.Delete([]byte(key))
 	})
 }
 
@@ -222,14 +219,13 @@ func readSnapshot(r *bufio.Reader) ([]snapshotEntry, error) {
 }
 
 // Get reads a value from the local store (can be stale on non-leader).
-func (f *FSM) Get(table, key string) ([]byte, error) {
+func (f *FSM) Get(key string) ([]byte, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	fullKey := makeKey(table, key)
 	var value []byte
 	err := f.db.View(func(txn *badger.Txn) error {
-		item, err := txn.Get(fullKey)
+		item, err := txn.Get([]byte(key))
 		if err != nil {
 			return err
 		}
@@ -239,24 +235,21 @@ func (f *FSM) Get(table, key string) ([]byte, error) {
 	return value, err
 }
 
-// Scan iterates over keys with the given table and prefix.
-func (f *FSM) Scan(table, prefix string, fn func(key string, value []byte) error) error {
+// Scan iterates over every key with the given prefix, passing each stored key
+// through verbatim. Namespacing keys is the caller's business.
+func (f *FSM) Scan(prefix string, fn func(key string, value []byte) error) error {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	fullPrefix := makeKey(table, prefix)
 	return f.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
-		opts.Prefix = fullPrefix
+		opts.Prefix = []byte(prefix)
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		tablePrefix := table + "/"
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
-			fullKey := string(item.Key())
-			// Strip table prefix to get the actual key
-			key := fullKey[len(tablePrefix):]
+			key := string(item.Key())
 
 			value, err := item.ValueCopy(nil)
 			if err != nil {
@@ -319,8 +312,3 @@ func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
 
 // Release is called when the snapshot is no longer needed.
 func (s *FSMSnapshot) Release() {}
-
-// makeKey creates a composite key from table and key.
-func makeKey(table, key string) []byte {
-	return []byte(table + "/" + key)
-}
