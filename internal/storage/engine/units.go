@@ -1,4 +1,4 @@
-package store
+package engine
 
 // Size units exposed for tests that configure WithMaxSegSize.
 const (

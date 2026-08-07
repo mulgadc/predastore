@@ -1,4 +1,4 @@
-package store_test
+package engine_test
 
 import (
 	"bytes"
@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/storage/engine"
 	"github.com/mulgadc/predastore/internal/storetest"
-	"github.com/mulgadc/predastore/store"
 )
 
-func readAll(t *testing.T, st *store.Store, oh [32]byte, idx uint32) ([]byte, error) {
+func readAll(t *testing.T, st *engine.Store, oh [32]byte, idx uint32) ([]byte, error) {
 	t.Helper()
 	r, err := st.Lookup(oh, idx)
 	if err != nil {
@@ -25,17 +25,17 @@ func readAll(t *testing.T, st *store.Store, oh [32]byte, idx uint32) ([]byte, er
 	return io.ReadAll(r)
 }
 
-func openStore(t *testing.T, opts ...store.Option) (*store.Store, string) {
+func openStore(t *testing.T, opts ...engine.Option) (*engine.Store, string) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := store.Open(dir, append(opts, store.WithAEAD(storetest.TestAEAD()))...)
+	st, err := engine.Open(dir, append(opts, engine.WithAEAD(storetest.TestAEAD()))...)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	return st, dir
 }
 
-func write(t *testing.T, st *store.Store, oh [32]byte, idx uint32, body []byte) {
+func write(t *testing.T, st *engine.Store, oh [32]byte, idx uint32, body []byte) {
 	t.Helper()
 	w, err := st.Append(oh, idx, int64(len(body)))
 	if err != nil {
@@ -67,14 +67,14 @@ func dirBytes(t *testing.T, dir string) int64 {
 }
 
 func TestCompactionDropsDrainedSegmentAndShrinks(t *testing.T) {
-	st, dir := openStore(t, store.WithMaxSegSize(20*store.KiB))
+	st, dir := openStore(t, engine.WithMaxSegSize(20*engine.KiB))
 	defer st.Close()
 
 	oh := [32]byte{0x1}
-	body := bytes.Repeat([]byte{0xaa}, 12*store.KiB) // one ~12 KiB shard fills a 20 KiB segment
-	write(t, st, oh, 0, body)                        // segment 0
-	write(t, st, oh, 1, body)                        // rolls to segment 1
-	write(t, st, oh, 2, body)                        // rolls to segment 2 (active)
+	body := bytes.Repeat([]byte{0xaa}, 12*engine.KiB) // one ~12 KiB shard fills a 20 KiB segment
+	write(t, st, oh, 0, body)                         // segment 0
+	write(t, st, oh, 1, body)                         // rolls to segment 1
+	write(t, st, oh, 2, body)                         // rolls to segment 2 (active)
 
 	seg0 := filepath.Join(dir, fmt.Sprintf("%016d.seg", 0))
 	idx0 := filepath.Join(dir, fmt.Sprintf("%016d.idx", 0))
@@ -136,11 +136,11 @@ func persistedSegNum(t *testing.T, dir string) uint64 {
 // below the live data. Graceful Close would mask this by flushing on the way
 // out, so the check is on state.json directly, not a reopen.
 func TestCompactionPersistsSegNumBeforeDrop(t *testing.T) {
-	st, dir := openStore(t, store.WithMaxSegSize(20*store.KiB))
+	st, dir := openStore(t, engine.WithMaxSegSize(20*engine.KiB))
 	defer st.Close()
 
 	oh := [32]byte{0x4}
-	body := bytes.Repeat([]byte{0xaa}, 12*store.KiB)
+	body := bytes.Repeat([]byte{0xaa}, 12*engine.KiB)
 	write(t, st, oh, 0, body) // segment 0
 	write(t, st, oh, 1, body) // rolls to segment 1
 	write(t, st, oh, 2, body) // rolls to segment 2 (active)
@@ -173,11 +173,11 @@ func TestCompactionPersistsSegNumBeforeDrop(t *testing.T) {
 // A relocation racing an overwrite must never resurrect the old bytes: the CAS
 // aborts when the slot moved, so the final read is always the newest write.
 func TestConcurrentOverwriteDuringCompaction(t *testing.T) {
-	st, _ := openStore(t, store.WithMaxSegSize(40*store.KiB))
+	st, _ := openStore(t, engine.WithMaxSegSize(40*engine.KiB))
 	defer st.Close()
 
 	oh := [32]byte{0x2}
-	filler := bytes.Repeat([]byte{0xbb}, 12*store.KiB)
+	filler := bytes.Repeat([]byte{0xbb}, 12*engine.KiB)
 	write(t, st, oh, 0, filler) // segment 0
 	write(t, st, oh, 1, filler) // segment 0
 	write(t, st, oh, 2, filler) // rolls; segment 0 now drainable once a shard dies
@@ -186,7 +186,7 @@ func TestConcurrentOverwriteDuringCompaction(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 
-	final := bytes.Repeat([]byte{0xff}, 16*store.KiB)
+	final := bytes.Repeat([]byte{0xff}, 16*engine.KiB)
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -214,7 +214,7 @@ func TestConcurrentOverwriteDuringCompaction(t *testing.T) {
 }
 
 func TestCompactorLifecycleStartsAndStops(t *testing.T) {
-	st, _ := openStore(t, store.WithCompaction(time.Hour))
+	st, _ := openStore(t, engine.WithCompaction(time.Hour))
 
 	done := make(chan error, 1)
 	go func() { done <- st.Close() }()
@@ -240,7 +240,7 @@ func TestNoCompactorWithoutOption(t *testing.T) {
 // cycle loses nothing.
 func TestCompactionFaultLeavesLiveDataReadable(t *testing.T) {
 	var armed bool
-	restore := store.SetOpenFile(func(path string, create bool) (store.File, error) {
+	restore := engine.SetOpenFile(func(path string, create bool) (engine.File, error) {
 		flags := os.O_RDWR
 		if create {
 			flags |= os.O_CREATE
@@ -256,9 +256,9 @@ func TestCompactionFaultLeavesLiveDataReadable(t *testing.T) {
 	dir := t.TempDir()
 
 	oh := [32]byte{0x3}
-	body := bytes.Repeat([]byte{0xcc}, 12*store.KiB)
+	body := bytes.Repeat([]byte{0xcc}, 12*engine.KiB)
 
-	st, err := store.Open(dir, store.WithMaxSegSize(40*store.KiB), store.WithAEAD(storetest.TestAEAD()))
+	st, err := engine.Open(dir, engine.WithMaxSegSize(40*engine.KiB), engine.WithAEAD(storetest.TestAEAD()))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestCompactionFaultLeavesLiveDataReadable(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	st2, err := store.Open(dir, store.WithMaxSegSize(40*store.KiB), store.WithAEAD(storetest.TestAEAD()))
+	st2, err := engine.Open(dir, engine.WithMaxSegSize(40*engine.KiB), engine.WithAEAD(storetest.TestAEAD()))
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}

@@ -5,7 +5,7 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/mulgadc/predastore/store"
+	"github.com/mulgadc/predastore/internal/storage/engine"
 )
 
 var fs = make(map[string]*RefStore)
@@ -37,14 +37,14 @@ func Open(dir string) *RefStore {
 	return st
 }
 
-func (st *RefStore) Lookup(objectHash [32]byte, shardIndex uint32) (r store.Reader, err error) {
+func (st *RefStore) Lookup(objectHash [32]byte, shardIndex uint32) (r engine.Reader, err error) {
 	if st.closed {
-		return nil, store.ErrClosedStore
+		return nil, engine.ErrClosedStore
 	}
 
-	shard, ok := st.state[[36]byte(store.MakeShardKey(objectHash, shardIndex))]
+	shard, ok := st.state[[36]byte(engine.MakeShardKey(objectHash, shardIndex))]
 	if !ok {
-		return nil, store.ErrKeyNotFound
+		return nil, engine.ErrKeyNotFound
 	}
 
 	return &refReader{
@@ -53,15 +53,15 @@ func (st *RefStore) Lookup(objectHash [32]byte, shardIndex uint32) (r store.Read
 	}, nil
 }
 
-func (st *RefStore) Append(objectHash [32]byte, shardIndex uint32, size int64) (w store.Writer, err error) {
+func (st *RefStore) Append(objectHash [32]byte, shardIndex uint32, size int64) (w engine.Writer, err error) {
 	if st.closed {
-		return nil, store.ErrClosedStore
+		return nil, engine.ErrClosedStore
 	}
 
 	return &refWriter{
 		Buffer: new(bytes.Buffer),
 		st:     st,
-		key:    [36]byte(store.MakeShardKey(objectHash, shardIndex)),
+		key:    [36]byte(engine.MakeShardKey(objectHash, shardIndex)),
 		size:   size,
 		closed: false,
 	}, nil
@@ -69,10 +69,10 @@ func (st *RefStore) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 
 func (st *RefStore) Delete(objectHash [32]byte, shardIndex uint32) (bool, error) {
 	if st.closed {
-		return false, store.ErrClosedStore
+		return false, engine.ErrClosedStore
 	}
 
-	key := [36]byte(store.MakeShardKey(objectHash, shardIndex))
+	key := [36]byte(engine.MakeShardKey(objectHash, shardIndex))
 	_, existed := st.state[key]
 	delete(st.state, key)
 
@@ -96,7 +96,7 @@ func (st *RefStore) Keys() [][36]byte {
 
 func (st *RefStore) Close() error {
 	if st.closed {
-		return store.ErrClosedStore
+		return engine.ErrClosedStore
 	}
 
 	st.closed = true
@@ -114,7 +114,7 @@ type refReader struct {
 
 func (r *refReader) Close() error {
 	if r.closed {
-		return store.ErrClosedReader
+		return engine.ErrClosedReader
 	}
 
 	r.closed = true
@@ -133,7 +133,7 @@ type refWriter struct {
 
 func (w *refWriter) Close() error {
 	if w.closed {
-		return store.ErrClosedWriter
+		return engine.ErrClosedWriter
 	}
 
 	w.closed = true

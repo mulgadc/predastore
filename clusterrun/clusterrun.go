@@ -18,11 +18,11 @@ import (
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/storage"
+	"github.com/mulgadc/predastore/internal/storage/engine"
 	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/predastore/s3"
-	"github.com/mulgadc/predastore/store"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -144,9 +144,9 @@ func Build(cfg *s3.Config, localIDs []int, tlsCert, tlsKey string, key *masterke
 	// Compaction is always enabled: without it, overwrite and delete churn
 	// never reclaims dead shards and the store fills. A zero interval falls
 	// back to the store's default.
-	storeOpts := []store.Option{
-		store.WithAEAD(key.AEAD),
-		store.WithCompaction(time.Duration(cfg.Compaction.IntervalSeconds) * time.Second),
+	storeOpts := []engine.Option{
+		engine.WithAEAD(key.AEAD),
+		engine.WithCompaction(time.Duration(cfg.Compaction.IntervalSeconds) * time.Second),
 	}
 
 	for _, n := range topo.LocalNodes() {
@@ -183,7 +183,7 @@ func (rt *Runtime) addNode(
 	n topology.Node,
 	raftDial func(context.Context, raft.ServerAddress) (transport.Stream, error),
 	peers []state.RaftPeer,
-	storeOpts []store.Option,
+	storeOpts []engine.Option,
 ) error {
 	id := uint64(n.ID) //nolint:gosec // G115: validated positive node ids.
 
@@ -221,7 +221,7 @@ func (rt *Runtime) addNode(
 		if err := os.MkdirAll(dataDir, 0750); err != nil {
 			return fmt.Errorf("create shard store directory %s: %w", dataDir, err)
 		}
-		st, err := store.Open(dataDir, storeOpts...)
+		st, err := engine.Open(dataDir, storeOpts...)
 		if err != nil {
 			return fmt.Errorf("open shard store for node %d: %w", n.ID, err)
 		}

@@ -14,9 +14,9 @@ import (
 
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/storage"
+	"github.com/mulgadc/predastore/internal/storage/engine"
 	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/store"
 )
 
 // testHash names a shard set. Callers derive the name however they like; the
@@ -50,9 +50,9 @@ func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client
 
 	topo := procTopo{nodeID: pipeName}
 
-	st, err := store.Open(t.TempDir(), store.WithAEAD(storetest.TestAEAD()))
+	st, err := engine.Open(t.TempDir(), engine.WithAEAD(storetest.TestAEAD()))
 	if err != nil {
-		t.Fatalf("store.Open: %v", err)
+		t.Fatalf("engine.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
 

@@ -1,4 +1,4 @@
-package store_test
+package engine_test
 
 import (
 	"errors"
@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/mulgadc/predastore/internal/storage/engine"
 	"github.com/mulgadc/predastore/internal/storetest"
-	"github.com/mulgadc/predastore/store"
 	"pgregory.net/rapid"
 )
 
@@ -123,7 +123,7 @@ func (sm *faultSM) CorruptByte(t *rapid.T) {
 // relaxed: divergent error returns are tolerated, but the strict no-corruption
 // invariant remains — when both stores succeed, sizes and bytes must match.
 func TestStoreFaults(t *testing.T) {
-	defer store.SetOpenFile(func(path string, create bool) (store.File, error) {
+	defer engine.SetOpenFile(func(path string, create bool) (engine.File, error) {
 		flags := os.O_RDWR
 		if create {
 			flags |= os.O_CREATE
@@ -146,10 +146,10 @@ func TestStoreFaults(t *testing.T) {
 		}
 
 		refSt := storetest.Open(dir)
-		realSt, err := store.Open(
+		realSt, err := engine.Open(
 			dir,
-			store.WithMaxSegSize(rapid.Uint64Range(16*store.KiB, 1*store.MiB).Draw(rt, "maxSegSize")),
-			store.WithAEAD(aead),
+			engine.WithMaxSegSize(rapid.Uint64Range(16*engine.KiB, 1*engine.MiB).Draw(rt, "maxSegSize")),
+			engine.WithAEAD(aead),
 		)
 		if err != nil {
 			rt.Fatalf("open: %v", err)

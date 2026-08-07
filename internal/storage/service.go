@@ -12,8 +12,8 @@ import (
 	"io"
 
 	"github.com/mulgadc/predastore/internal/rpc"
+	"github.com/mulgadc/predastore/internal/storage/engine"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/store"
 )
 
 // Service serves shard rpc requests for one storage node. A process running
@@ -21,11 +21,11 @@ import (
 // the service itself never learns that it has siblings.
 type Service struct {
 	id    uint64
-	store *store.Store
+	store *engine.Store
 }
 
 // NewService builds the service for one node's shard store.
-func NewService(id uint64, st *store.Store) *Service {
+func NewService(id uint64, st *engine.Store) *Service {
 	return &Service{id: id, store: st}
 }
 
@@ -66,7 +66,7 @@ func (s *Service) handlePut(ctx context.Context, h ShardRequest, stream transpor
 		if _, derr := io.Copy(io.Discard, io.LimitReader(stream, h.ShardSize)); derr != nil {
 			return fmt.Errorf("drain body after append error: %w", derr)
 		}
-		if errors.Is(err, store.ErrStoreFull) {
+		if errors.Is(err, engine.ErrStoreFull) {
 			return respondShard(stream, &ShardResponse{Err: ErrCodeStoreFull})
 		}
 		return respondShard(stream, &ShardResponse{Err: fmt.Sprintf("append: %v", err)})

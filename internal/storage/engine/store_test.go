@@ -1,11 +1,11 @@
-package store_test
+package engine_test
 
 import (
 	"os"
 	"testing"
 
+	"github.com/mulgadc/predastore/internal/storage/engine"
 	"github.com/mulgadc/predastore/internal/storetest"
-	"github.com/mulgadc/predastore/store"
 	"pgregory.net/rapid"
 )
 
@@ -22,10 +22,10 @@ func TestStore(t *testing.T) {
 		}
 
 		refSt := storetest.Open(dir)
-		realSt, err := store.Open(
+		realSt, err := engine.Open(
 			dir,
-			store.WithMaxSegSize(rapid.Uint64Range(16*store.KiB, 1*store.MiB).Draw(rt, "maxSegSize")),
-			store.WithAEAD(aead),
+			engine.WithMaxSegSize(rapid.Uint64Range(16*engine.KiB, 1*engine.MiB).Draw(rt, "maxSegSize")),
+			engine.WithAEAD(aead),
 		)
 		if err != nil {
 			rt.Fatalf("open: %v", err)

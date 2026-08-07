@@ -1,4 +1,4 @@
-package store
+package engine
 
 import (
 	"bytes"
@@ -67,7 +67,7 @@ func readShard(t *testing.T, st *Store, oh [32]byte, idx uint32) []byte {
 
 func extentOf(t *testing.T, st *Store, oh [32]byte, idx uint32) extent {
 	t.Helper()
-	raw, err := st.index.Get(MakeShardKey(oh, idx))
+	raw, err := st.indexGet(MakeShardKey(oh, idx))
 	if err != nil {
 		t.Fatalf("index get: %v", err)
 	}
@@ -229,7 +229,7 @@ func TestCandidateSelectionNeverSelectsActiveSegment(t *testing.T) {
 func tombstones(t *testing.T, st *Store) map[slot]int64 {
 	t.Helper()
 	found := map[slot]int64{}
-	err := st.index.Scan([]byte{tombstonePrefix}, func(k, v []byte) error {
+	err := st.indexScan([]byte{tombstonePrefix}, func(k, v []byte) error {
 		// Shard keys whose hash starts with tombstonePrefix share this scan, so
 		// width-check before decoding a slot out of one.
 		if len(k) != tombstoneKeySize {
@@ -324,7 +324,7 @@ func TestTombstoneLandsAtCommitNotAppend(t *testing.T) {
 	}
 
 	// Committing is what supersedes the old extent — and it also releases the
-	// segment ref Append took, which store.Close waits on.
+	// segment ref Append took, which Store.Close waits on.
 	if err := w.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}

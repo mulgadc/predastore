@@ -1,4 +1,4 @@
-package store_test
+package engine_test
 
 import (
 	"bytes"
@@ -7,20 +7,20 @@ import (
 	"errors"
 	"io"
 
+	"github.com/mulgadc/predastore/internal/storage/engine"
 	"github.com/mulgadc/predastore/internal/storetest"
-	"github.com/mulgadc/predastore/store"
 	"pgregory.net/rapid"
 )
 
 const (
-	pbtFragBodySize = 8 * store.KiB
-	pbtMaxShardSize = 64 * store.KiB
+	pbtFragBodySize = 8 * engine.KiB
+	pbtMaxShardSize = 64 * engine.KiB
 )
 
 // readBody randomizes between io.ReadAll and WriteTo so both reader paths
 // get exercised under property tests. tag is included in the rapid Draw
 // label so failure traces show which call site produced the choice.
-func readBody(t *rapid.T, tag string, refR, realR store.Reader) (refBody, realBody []byte, refErr, realErr error) {
+func readBody(t *rapid.T, tag string, refR, realR engine.Reader) (refBody, realBody []byte, refErr, realErr error) {
 	if rapid.Bool().Draw(t, tag+"/useWriteTo") {
 		var refBuf, realBuf bytes.Buffer
 		_, refErr = refR.WriteTo(&refBuf)
@@ -41,13 +41,13 @@ func readBody(t *rapid.T, tag string, refR, realR store.Reader) (refBody, realBo
 // has triggered.
 type baseSM struct {
 	Ref    *storetest.RefStore
-	Real   *store.Store
+	Real   *engine.Store
 	Strict func() bool
 	Dir    string
 	AEAD   cipher.AEAD
 }
 
-func newBaseSM(dir string, refSt *storetest.RefStore, realSt *store.Store, aead cipher.AEAD, strict func() bool) *baseSM {
+func newBaseSM(dir string, refSt *storetest.RefStore, realSt *engine.Store, aead cipher.AEAD, strict func() bool) *baseSM {
 	if strict == nil {
 		strict = func() bool { return true }
 	}
@@ -66,7 +66,7 @@ func (sm *baseSM) drawKey(t *rapid.T, tag string) [36]byte {
 		return rapid.SampledFrom(sm.Ref.Keys()).Draw(t, tag+"/existingKey")
 	}
 
-	return [36]byte(store.MakeShardKey(
+	return [36]byte(engine.MakeShardKey(
 		[32]byte(rapid.SliceOfN(rapid.Byte(), 32, 32).Draw(t, tag+"/objectHash")),
 		rapid.Uint32().Draw(t, tag+"/shardIndex"),
 	))
@@ -88,7 +88,7 @@ func (sm *baseSM) Open(t *rapid.T) {
 		t.Skip("already open")
 	}
 
-	realSt, err := store.Open(sm.Dir, store.WithAEAD(sm.AEAD))
+	realSt, err := engine.Open(sm.Dir, engine.WithAEAD(sm.AEAD))
 	if err != nil {
 		if sm.Strict() {
 			t.Fatalf("open: real=%v", err)

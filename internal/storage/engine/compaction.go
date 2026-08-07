@@ -1,4 +1,4 @@
-package store
+package engine
 
 import (
 	"bytes"
@@ -162,7 +162,7 @@ func (store *Store) compactOnce() error {
 // so a persistently bad segment stays visible rather than silently dropped.
 func (store *Store) candidateSegments() ([]uint64, int, error) {
 	dead := make(map[uint64]int64)
-	err := store.index.Scan([]byte{tombstonePrefix}, func(k, v []byte) error {
+	err := store.indexScan([]byte{tombstonePrefix}, func(k, v []byte) error {
 		// Shard keys carry no namespace prefix, so roughly one object hash in
 		// 256 starts with tombstonePrefix and lands in this scan. Reading a
 		// segment number out of the middle of a hash invents one, so match on
@@ -232,7 +232,7 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 
 	for _, e := range entries {
 		key := e.Key[:]
-		raw, err := store.index.Get(key)
+		raw, err := store.indexGet(key)
 		if errors.Is(err, badger.ErrKeyNotFound) {
 			continue
 		}
@@ -261,7 +261,7 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 	// or kernel panic between the two could revert the index to a segment that is
 	// already gone. Skip it when nothing moved: an empty drop repoints nothing.
 	if stats.extents > 0 {
-		if err := store.index.Badger.Sync(); err != nil {
+		if err := store.index.Sync(); err != nil {
 			return stats, fmt.Errorf("sync index before drop %d: %w", num, err)
 		}
 	}
@@ -331,7 +331,7 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 
 	// Swap onto the new slot only if the key still holds the one we copied from.
 	for {
-		err := store.index.Badger.Update(func(txn *badger.Txn) error {
+		err := store.index.Update(func(txn *badger.Txn) error {
 			var stale bool
 			item, err := txn.Get(key)
 			switch {
@@ -396,7 +396,7 @@ func (store *Store) deleteTombstones(segNum uint64) error {
 	binary.BigEndian.PutUint64(prefix[1:9], segNum)
 
 	var keys [][]byte
-	if err := store.index.Scan(prefix, func(k, _ []byte) error {
+	if err := store.indexScan(prefix, func(k, _ []byte) error {
 		// This scan feeds deletes, so a shard key colliding with the tombstone
 		// namespace would cost live data rather than accuracy. Width-check it.
 		if len(k) != tombstoneKeySize {
@@ -409,7 +409,7 @@ func (store *Store) deleteTombstones(segNum uint64) error {
 	}
 
 	for _, k := range keys {
-		if err := store.index.Delete(k); err != nil {
+		if err := store.indexDelete(k); err != nil {
 			return fmt.Errorf("delete tombstone: %w", err)
 		}
 	}

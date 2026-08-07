@@ -1,9 +1,9 @@
-// Package store implements segment-based shard storage with authenticated
+// Package engine implements segment-based shard storage with authenticated
 // at-rest encryption. Shards are written as contiguous extents of fixed-size
 // fragments within append-only segment files. Segments roll when they reach
 // maxSegSize. Each fragment is sealed under AES-256-GCM (master key per
 // cluster, storeID per data dir) — see docs/DESIGN.md §6.
-package store
+package engine
 
 import (
 	"crypto/cipher"
@@ -30,8 +30,10 @@ const fragNumReservation = 1 << 20 // 1 048 576
 // Store manages segment files and an index mapping shard keys to on-disk
 // extents. All public methods are safe for concurrent use.
 type Store struct {
-	dir   string
-	index *indexDB
+	dir string
+
+	// The on-disk index: shard key -> extent, plus the tombstone namespace.
+	index *badger.DB
 
 	// Unbounded: entries accumulate as the store touches old segments. Fine at
 	// single-data-dir scale; thousands of distinct segments would want an LRU.
@@ -195,7 +197,7 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("save state: %w", err)
 	}
 
-	store.index, err = newIndexDB(filepath.Join(dir, indexFilename))
+	store.index, err = openIndex(filepath.Join(dir, indexFilename))
 	if err != nil {
 		return nil, fmt.Errorf("open disk index: %w", err)
 	}
@@ -228,7 +230,7 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (Reader, erro
 	}
 
 	key := MakeShardKey(objectHash, shardIndex)
-	data, err := store.index.Get(key)
+	data, err := store.indexGet(key)
 	if err != nil {
 		if errors.Is(err, badger.ErrKeyNotFound) {
 			return nil, ErrKeyNotFound
@@ -401,7 +403,7 @@ func (store *Store) commitExtent(objectHash [32]byte, shardIndex uint32, ext ext
 	key := MakeShardKey(objectHash, shardIndex)
 
 	for {
-		err := store.index.Badger.Update(func(txn *badger.Txn) error {
+		err := store.index.Update(func(txn *badger.Txn) error {
 			old, err := readExtent(txn, key)
 			switch {
 			// A first write supersedes nothing.
@@ -463,7 +465,7 @@ func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) (bool, error)
 
 	key := MakeShardKey(objectHash, shardIndex)
 	deleted := false
-	err := store.index.Badger.Update(func(txn *badger.Txn) error {
+	err := store.index.Update(func(txn *badger.Txn) error {
 		ext, err := readExtent(txn, key)
 		if errors.Is(err, badger.ErrKeyNotFound) {
 			return nil
