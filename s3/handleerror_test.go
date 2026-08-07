@@ -9,7 +9,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -25,7 +25,7 @@ func TestHandleError_BackendS3Error(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
 	rr := httptest.NewRecorder()
 
-	s3Err := backend.NewS3Error(backend.ErrNoSuchBucket, "Bucket not found", 404)
+	s3Err := model.NewS3Error(model.ErrNoSuchBucket, "Bucket not found", 404)
 	server.handleError(rr, req, s3Err)
 
 	assert.Equal(t, http.StatusNotFound, rr.Code)
@@ -36,13 +36,13 @@ func TestHandleError_BackendS3Error(t *testing.T) {
 	assert.Equal(t, "NoSuchBucket", s3error.Code)
 }
 
-// The 507 must reach the HTTP client verbatim, like any other *backend.S3Error.
+// The 507 must reach the HTTP client verbatim, like any other *model.S3Error.
 func TestHandleError_InsufficientStorage(t *testing.T) {
 	server := setupHandleErrorServer(t)
 	req := httptest.NewRequest(http.MethodPut, "/bucket/key", nil)
 	rr := httptest.NewRecorder()
 
-	server.handleError(rr, req, backend.ErrInsufficientStorageError)
+	server.handleError(rr, req, model.ErrInsufficientStorageError)
 
 	assert.Equal(t, http.StatusInsufficientStorage, rr.Code)
 

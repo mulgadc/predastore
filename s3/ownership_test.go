@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/stretchr/testify/assert"
 )
@@ -16,15 +16,15 @@ import (
 // --- bucketAccessAllowed unit tests ---
 
 func TestBucketAccessAllowed(t *testing.T) {
-	owned := &backend.BucketMetadata{Name: "owner-bucket", AccountID: "000000000001"}
-	publicBucket := &backend.BucketMetadata{Name: "public-bucket", AccountID: "000000000001", Public: true}
-	configBucket := &backend.BucketMetadata{Name: "predastore", AccountID: "000000000000"}
+	owned := &model.BucketMetadata{Name: "owner-bucket", AccountID: "000000000001"}
+	publicBucket := &model.BucketMetadata{Name: "public-bucket", AccountID: "000000000001", Public: true}
+	configBucket := &model.BucketMetadata{Name: "predastore", AccountID: "000000000000"}
 
 	tests := []struct {
 		name            string
 		method          string
 		caller          string
-		meta            *backend.BucketMetadata
+		meta            *model.BucketMetadata
 		skipPolicyCheck bool
 		want            bool
 	}{
@@ -43,7 +43,7 @@ func TestBucketAccessAllowed(t *testing.T) {
 		{"skip policy check service account", http.MethodPut, "", owned, true, true},
 		{"skip policy check on config bucket", http.MethodDelete, "", configBucket, true, true},
 		{"nil metadata fails closed", http.MethodGet, "000000000001", nil, false, false},
-		{"empty owner account never matches", http.MethodGet, "", &backend.BucketMetadata{AccountID: ""}, false, false},
+		{"empty owner account never matches", http.MethodGet, "", &model.BucketMetadata{AccountID: ""}, false, false},
 	}
 
 	for _, tt := range tests {
@@ -76,63 +76,63 @@ func (p *stubCredProvider) Close() {}
 // return that error verbatim (used to exercise the infra-error branch of
 // resolveBucketMetadata).
 type stubBackend struct {
-	buckets     map[string]*backend.BucketMetadata
+	buckets     map[string]*model.BucketMetadata
 	metadataErr error
 }
 
-func (b *stubBackend) GetBucketMetadata(bucket string) (*backend.BucketMetadata, error) {
+func (b *stubBackend) GetBucketMetadata(bucket string) (*model.BucketMetadata, error) {
 	if b.metadataErr != nil {
 		return nil, b.metadataErr
 	}
 	if m, ok := b.buckets[bucket]; ok {
 		return m, nil
 	}
-	return nil, backend.ErrNoSuchBucketError.WithResource(bucket)
+	return nil, model.ErrNoSuchBucketError.WithResource(bucket)
 }
 
-func (b *stubBackend) GetObject(_ context.Context, _ *backend.GetObjectRequest) (*backend.GetObjectResponse, error) {
+func (b *stubBackend) GetObject(_ context.Context, _ *model.GetObjectRequest) (*model.GetObjectResponse, error) {
 	return nil, errors.New("stubBackend.GetObject called unexpectedly")
 }
-func (b *stubBackend) HeadObject(_ context.Context, _, _ string) (*backend.HeadObjectResponse, error) {
+func (b *stubBackend) HeadObject(_ context.Context, _, _ string) (*model.HeadObjectResponse, error) {
 	return nil, errors.New("stubBackend.HeadObject called unexpectedly")
 }
-func (b *stubBackend) PutObject(_ context.Context, _ *backend.PutObjectRequest) (*backend.PutObjectResponse, error) {
+func (b *stubBackend) PutObject(_ context.Context, _ *model.PutObjectRequest) (*model.PutObjectResponse, error) {
 	return nil, errors.New("stubBackend.PutObject called unexpectedly")
 }
-func (b *stubBackend) DeleteObject(_ context.Context, _ *backend.DeleteObjectRequest) error {
+func (b *stubBackend) DeleteObject(_ context.Context, _ *model.DeleteObjectRequest) error {
 	return errors.New("stubBackend.DeleteObject called unexpectedly")
 }
-func (b *stubBackend) CreateBucket(_ context.Context, _ *backend.CreateBucketRequest) (*backend.CreateBucketResponse, error) {
+func (b *stubBackend) CreateBucket(_ context.Context, _ *model.CreateBucketRequest) (*model.CreateBucketResponse, error) {
 	return nil, errors.New("stubBackend.CreateBucket called unexpectedly")
 }
-func (b *stubBackend) DeleteBucket(_ context.Context, _ *backend.DeleteBucketRequest) error {
+func (b *stubBackend) DeleteBucket(_ context.Context, _ *model.DeleteBucketRequest) error {
 	return errors.New("stubBackend.DeleteBucket called unexpectedly")
 }
-func (b *stubBackend) HeadBucket(_ context.Context, _ *backend.HeadBucketRequest) (*backend.HeadBucketResponse, error) {
+func (b *stubBackend) HeadBucket(_ context.Context, _ *model.HeadBucketRequest) (*model.HeadBucketResponse, error) {
 	return nil, errors.New("stubBackend.HeadBucket called unexpectedly")
 }
-func (b *stubBackend) ListBuckets(_ context.Context, accountID string) (*backend.ListBucketsResponse, error) {
-	out := &backend.ListBucketsResponse{Owner: backend.OwnerInfo{ID: accountID}}
+func (b *stubBackend) ListBuckets(_ context.Context, accountID string) (*model.ListBucketsResponse, error) {
+	out := &model.ListBucketsResponse{Owner: model.OwnerInfo{ID: accountID}}
 	for _, m := range b.buckets {
 		if m.AccountID == accountID {
-			out.Buckets = append(out.Buckets, backend.BucketInfo{Name: m.Name, Region: m.Region})
+			out.Buckets = append(out.Buckets, model.BucketInfo{Name: m.Name, Region: m.Region})
 		}
 	}
 	return out, nil
 }
-func (b *stubBackend) ListObjects(_ context.Context, req *backend.ListObjectsRequest) (*backend.ListObjectsResponse, error) {
+func (b *stubBackend) ListObjects(_ context.Context, req *model.ListObjectsRequest) (*model.ListObjectsResponse, error) {
 	if _, ok := b.buckets[req.Bucket]; !ok {
-		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
+		return nil, model.ErrNoSuchBucketError.WithResource(req.Bucket)
 	}
-	return &backend.ListObjectsResponse{Name: req.Bucket}, nil
+	return &model.ListObjectsResponse{Name: req.Bucket}, nil
 }
-func (b *stubBackend) CreateMultipartUpload(_ context.Context, _ *backend.CreateMultipartUploadRequest) (*backend.CreateMultipartUploadResponse, error) {
+func (b *stubBackend) CreateMultipartUpload(_ context.Context, _ *model.CreateMultipartUploadRequest) (*model.CreateMultipartUploadResponse, error) {
 	return nil, errors.New("stubBackend.CreateMultipartUpload called unexpectedly")
 }
-func (b *stubBackend) UploadPart(_ context.Context, _ *backend.UploadPartRequest) (*backend.UploadPartResponse, error) {
+func (b *stubBackend) UploadPart(_ context.Context, _ *model.UploadPartRequest) (*model.UploadPartResponse, error) {
 	return nil, errors.New("stubBackend.UploadPart called unexpectedly")
 }
-func (b *stubBackend) CompleteMultipartUpload(_ context.Context, _ *backend.CompleteMultipartUploadRequest) (*backend.CompleteMultipartUploadResponse, error) {
+func (b *stubBackend) CompleteMultipartUpload(_ context.Context, _ *model.CompleteMultipartUploadRequest) (*model.CompleteMultipartUploadResponse, error) {
 	return nil, errors.New("stubBackend.CompleteMultipartUpload called unexpectedly")
 }
 func (b *stubBackend) AbortMultipartUpload(_ context.Context, _, _, _ string) error {
@@ -174,7 +174,7 @@ func ownershipServer(t *testing.T) *HTTP2Server {
 			AccountID: acctSys,
 		}},
 	}
-	be := &stubBackend{buckets: map[string]*backend.BucketMetadata{
+	be := &stubBackend{buckets: map[string]*model.BucketMetadata{
 		"owner-bucket":  {Name: "owner-bucket", Region: "ap-southeast-2", AccountID: acctOwner},
 		"public-bucket": {Name: "public-bucket", Region: "ap-southeast-2", AccountID: acctOwner, Public: true},
 	}}
@@ -351,7 +351,7 @@ func TestOwnership_CrossAccountDeniedOnBucketSubresources(t *testing.T) {
 func TestOwnership_BackendErrorReturnsInternalError(t *testing.T) {
 	cfg := &Config{Region: "ap-southeast-2"} // no config buckets — force backend lookup
 	be := &stubBackend{
-		buckets:     map[string]*backend.BucketMetadata{},
+		buckets:     map[string]*model.BucketMetadata{},
 		metadataErr: errors.New("backend infrastructure failure"),
 	}
 	credProv := &stubCredProvider{creds: map[string]*CredentialResult{

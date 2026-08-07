@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/storage"
 )
 
@@ -31,30 +31,30 @@ type DeletedObjectInfo struct {
 }
 
 // DeleteObject removes an object from the distributed storage.
-func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectRequest) error {
+func (b *Backend) DeleteObject(ctx context.Context, req *model.DeleteObjectRequest) error {
 	if req.Bucket == "" {
-		return backend.ErrNoSuchBucketError.WithResource(req.Bucket)
+		return model.ErrNoSuchBucketError.WithResource(req.Bucket)
 	}
 	if req.Key == "" {
-		return backend.ErrNoSuchKeyError.WithResource(req.Key)
+		return model.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
-	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+	if _, err := b.HeadBucket(ctx, &model.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
 		return err
 	}
 
-	objectHash := storage.GenObjectHash(req.Bucket, req.Key)
+	objectHash := model.ObjectHash(req.Bucket, req.Key)
 
 	// Check if object exists and get shard node info
-	data, err := b.stateGet(TableObjects, string(objectHash[:]))
+	data, err := b.stateGet(model.TableObjects, string(objectHash[:]))
 	if err != nil {
-		return backend.ErrNoSuchKeyError.WithResource(req.Key)
+		return model.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
 	// Decode existing metadata to get shard locations
 	var objectToShardNodes ObjectToShardNodes
 	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&objectToShardNodes); err != nil {
-		return backend.NewS3Error(backend.ErrInternalError, "corrupt metadata", 500)
+		return model.NewS3Error(model.ErrInternalError, "corrupt metadata", 500)
 	}
 
 	if err := b.deleteObjectViaQUIC(ctx, req.Bucket, req.Key, objectHash, objectToShardNodes); err != nil {
@@ -77,18 +77,18 @@ func (b *Backend) DeleteObject(ctx context.Context, req *backend.DeleteObjectReq
 	var deletedBuf bytes.Buffer
 	if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err == nil {
 		deletedKey := deletedObjectPrefix + req.Bucket + "/" + req.Key
-		_ = b.statePut(TableObjects, deletedKey, deletedBuf.Bytes()) // Best effort
+		_ = b.statePut(model.TableObjects, deletedKey, deletedBuf.Bytes()) // Best effort
 	}
 
 	// Delete the object hash metadata from global state
-	err = b.stateDelete(TableObjects, string(objectHash[:]))
+	err = b.stateDelete(model.TableObjects, string(objectHash[:]))
 	if err != nil {
-		return backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+		return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 
 	// Delete the ARN key from global state (for listing)
 	arnKey := arnObjectPrefixDel + req.Bucket + "/" + req.Key
-	_ = b.stateDelete(TableObjects, arnKey) // Best effort
+	_ = b.stateDelete(model.TableObjects, arnKey) // Best effort
 
 	return nil
 }

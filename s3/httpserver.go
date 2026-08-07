@@ -19,6 +19,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
@@ -327,7 +328,7 @@ func (s *HTTP2Server) handleError(w http.ResponseWriter, r *http.Request, err er
 	statusCode := http.StatusInternalServerError
 	var s3error S3Error
 
-	if backendErr, ok := backend.IsS3Error(err); ok {
+	if backendErr, ok := model.IsS3Error(err); ok {
 		statusCode = backendErr.StatusCode
 		s3error.Code = string(backendErr.Code)
 		s3error.Message = backendErr.Message
@@ -423,7 +424,7 @@ func (s *HTTP2Server) createBucket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	_, err := s.backend.CreateBucket(ctx, &backend.CreateBucketRequest{
+	_, err := s.backend.CreateBucket(ctx, &model.CreateBucketRequest{
 		Bucket:           bucket,
 		Region:           region,
 		OwnerID:          ownerID,
@@ -443,7 +444,7 @@ func (s *HTTP2Server) headBucket(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	bucket := chi.URLParam(r, "bucket")
 
-	resp, err := s.backend.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: bucket})
+	resp, err := s.backend.HeadBucket(ctx, &model.HeadBucketRequest{Bucket: bucket})
 	if err != nil {
 		s.handleError(w, r, err)
 		return
@@ -468,7 +469,7 @@ func (s *HTTP2Server) deleteBucket(w http.ResponseWriter, r *http.Request) {
 		ownerID, _ = v.(string)
 	}
 
-	err := s.backend.DeleteBucket(ctx, &backend.DeleteBucketRequest{
+	err := s.backend.DeleteBucket(ctx, &model.DeleteBucketRequest{
 		Bucket:  bucket,
 		OwnerID: ownerID,
 	})
@@ -502,7 +503,7 @@ func (s *HTTP2Server) listObjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := s.backend.ListObjects(ctx, &backend.ListObjectsRequest{
+	resp, err := s.backend.ListObjects(ctx, &model.ListObjectsRequest{
 		Bucket:    bucket,
 		Prefix:    query.Get("prefix"),
 		Delimiter: query.Get("delimiter"),
@@ -566,7 +567,7 @@ func (s *HTTP2Server) getObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := chi.URLParam(r, "*")
 
-	req := &backend.GetObjectRequest{
+	req := &model.GetObjectRequest{
 		Bucket:     bucket,
 		Key:        key,
 		RangeStart: -1,
@@ -625,7 +626,7 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 		partNumber, _ := strconv.Atoi(partNum)
 		decodedLen, _ := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
 
-		resp, err := s.backend.UploadPart(ctx, &backend.UploadPartRequest{
+		resp, err := s.backend.UploadPart(ctx, &model.UploadPartRequest{
 			Bucket:          bucket,
 			Key:             key,
 			UploadID:        uploadID,
@@ -649,7 +650,7 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 	// Regular put object
 	decodedLen, _ := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
 
-	resp, err := s.backend.PutObject(ctx, &backend.PutObjectRequest{
+	resp, err := s.backend.PutObject(ctx, &model.PutObjectRequest{
 		Bucket:          bucket,
 		Key:             key,
 		Body:            r.Body,
@@ -679,7 +680,7 @@ func (s *HTTP2Server) postObject(w http.ResponseWriter, r *http.Request) {
 	uploadID := r.URL.Query().Get("uploadId")
 	if uploadID == "" {
 		// Create multipart upload
-		resp, err := s.backend.CreateMultipartUpload(ctx, &backend.CreateMultipartUploadRequest{
+		resp, err := s.backend.CreateMultipartUpload(ctx, &model.CreateMultipartUploadRequest{
 			Bucket: bucket,
 			Key:    key,
 		})
@@ -712,15 +713,15 @@ func (s *HTTP2Server) postObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parts := make([]backend.CompletedPart, len(completeReq.Parts))
+	parts := make([]model.CompletedPart, len(completeReq.Parts))
 	for i, p := range completeReq.Parts {
-		parts[i] = backend.CompletedPart{
+		parts[i] = model.CompletedPart{
 			PartNumber: p.PartNumber,
 			ETag:       p.ETag,
 		}
 	}
 
-	resp, err := s.backend.CompleteMultipartUpload(ctx, &backend.CompleteMultipartUploadRequest{
+	resp, err := s.backend.CompleteMultipartUpload(ctx, &model.CompleteMultipartUploadRequest{
 		Bucket:   bucket,
 		Key:      key,
 		UploadID: uploadID,
@@ -746,7 +747,7 @@ func (s *HTTP2Server) deleteObject(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
 	key := chi.URLParam(r, "*")
 
-	err := s.backend.DeleteObject(ctx, &backend.DeleteObjectRequest{
+	err := s.backend.DeleteObject(ctx, &model.DeleteObjectRequest{
 		Bucket: bucket,
 		Key:    key,
 	})
@@ -836,9 +837,9 @@ func (s *HTTP2Server) GetHandler() http.Handler {
 // backend round-trip on every authenticated request. Returns nil with no error
 // when the bucket is unknown anywhere — the route handler is responsible for
 // returning NoSuchBucket so existence is reported consistently.
-func (s *HTTP2Server) resolveBucketMetadata(bucket string) (*backend.BucketMetadata, error) {
+func (s *HTTP2Server) resolveBucketMetadata(bucket string) (*model.BucketMetadata, error) {
 	if b, err := s.config.BucketConfig(bucket); err == nil {
-		return &backend.BucketMetadata{
+		return &model.BucketMetadata{
 			Name:      b.Name,
 			Region:    b.Region,
 			AccountID: b.AccountID,
@@ -852,7 +853,7 @@ func (s *HTTP2Server) resolveBucketMetadata(bucket string) (*backend.BucketMetad
 	if err == nil {
 		return meta, nil
 	}
-	if backendErr, ok := backend.IsS3Error(err); ok && backendErr.Code == backend.ErrNoSuchBucket {
+	if backendErr, ok := model.IsS3Error(err); ok && backendErr.Code == model.ErrNoSuchBucket {
 		return nil, nil
 	}
 	return nil, err

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/mulgadc/predastore/s3"
@@ -83,7 +83,7 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 	defer cancel()
 	be := rt.Backend
 
-	if _, err := be.CreateBucket(ctx, &backend.CreateBucketRequest{
+	if _, err := be.CreateBucket(ctx, &model.CreateBucketRequest{
 		Bucket:    "it-bucket",
 		Region:    "ap-southeast-2",
 		OwnerID:   "AKIAIOSFODNN7EXAMPLE",
@@ -96,7 +96,7 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 	if _, err := rand.Read(payload); err != nil {
 		t.Fatalf("rand: %v", err)
 	}
-	if _, err := be.PutObject(ctx, &backend.PutObjectRequest{
+	if _, err := be.PutObject(ctx, &model.PutObjectRequest{
 		Bucket:        "it-bucket",
 		Key:           "dir/blob.bin",
 		Body:          bytes.NewReader(payload),
@@ -106,7 +106,7 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 		t.Fatalf("PutObject: %v", err)
 	}
 
-	resp, err := be.GetObject(ctx, &backend.GetObjectRequest{
+	resp, err := be.GetObject(ctx, &model.GetObjectRequest{
 		Bucket: "it-bucket", Key: "dir/blob.bin", RangeStart: -1, RangeEnd: -1,
 	})
 	if err != nil {
@@ -122,7 +122,7 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 	}
 
 	// Range read exercises the single-shard fast path over rpc.
-	resp, err = be.GetObject(ctx, &backend.GetObjectRequest{
+	resp, err = be.GetObject(ctx, &model.GetObjectRequest{
 		Bucket: "it-bucket", Key: "dir/blob.bin", RangeStart: 100, RangeEnd: 1123,
 	})
 	if err != nil {
@@ -137,12 +137,12 @@ func TestClusterRuntimeObjectRoundTrip(t *testing.T) {
 		t.Fatalf("range mismatch: got %d bytes", len(got))
 	}
 
-	if err := be.DeleteObject(ctx, &backend.DeleteObjectRequest{
+	if err := be.DeleteObject(ctx, &model.DeleteObjectRequest{
 		Bucket: "it-bucket", Key: "dir/blob.bin",
 	}); err != nil {
 		t.Fatalf("DeleteObject: %v", err)
 	}
-	if _, err := be.GetObject(ctx, &backend.GetObjectRequest{
+	if _, err := be.GetObject(ctx, &model.GetObjectRequest{
 		Bucket: "it-bucket", Key: "dir/blob.bin", RangeStart: -1, RangeEnd: -1,
 	}); err == nil {
 		t.Fatal("GetObject after delete succeeded")

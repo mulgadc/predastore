@@ -15,10 +15,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/klauspost/reedsolomon"
-	"github.com/mulgadc/predastore/backend"
-	"github.com/mulgadc/predastore/backend/multipart"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/state"
-	"github.com/mulgadc/predastore/internal/storage"
 	"github.com/mulgadc/predastore/s3/chunked"
 )
 
@@ -44,15 +42,15 @@ func partObjectKey(bucket, key, uploadID string, partNumber int) string {
 }
 
 // CreateMultipartUpload initiates a multipart upload.
-func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.CreateMultipartUploadRequest) (*backend.CreateMultipartUploadResponse, error) {
+func (b *Backend) CreateMultipartUpload(ctx context.Context, req *model.CreateMultipartUploadRequest) (*model.CreateMultipartUploadResponse, error) {
 	if req.Bucket == "" {
-		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
+		return nil, model.ErrNoSuchBucketError.WithResource(req.Bucket)
 	}
 	if req.Key == "" {
-		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
+		return nil, model.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
-	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+	if _, err := b.HeadBucket(ctx, &model.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
 		return nil, err
 	}
 
@@ -60,30 +58,30 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.Create
 	uploadID := uuid.New().String()
 
 	// Create upload metadata
-	metadata := multipart.UploadMetadata{
+	metadata := model.UploadMetadata{
 		UploadID:    uploadID,
 		Bucket:      req.Bucket,
 		Key:         req.Key,
 		ContentType: req.ContentType,
 		CreatedAt:   time.Now(),
-		Parts:       []multipart.PartMetadata{},
+		Parts:       []model.PartMetadata{},
 	}
 
 	// Encode and store metadata
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	if err := enc.Encode(metadata); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to encode upload metadata", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to encode upload metadata", 500)
 	}
 
-	if err := b.statePut(TableMultipart, multipartUploadKey(uploadID), buf.Bytes()); err != nil {
+	if err := b.statePut(model.TableMultipart, multipartUploadKey(uploadID), buf.Bytes()); err != nil {
 		slog.Error("Failed to store multipart upload metadata", "uploadID", uploadID, "error", err)
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to create multipart upload", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to create multipart upload", 500)
 	}
 
 	slog.Debug("Multipart upload created", "bucket", req.Bucket, "key", req.Key, "uploadID", uploadID)
 
-	return &backend.CreateMultipartUploadResponse{
+	return &model.CreateMultipartUploadResponse{
 		Bucket:   req.Bucket,
 		Key:      req.Key,
 		UploadID: uploadID,
@@ -91,39 +89,39 @@ func (b *Backend) CreateMultipartUpload(ctx context.Context, req *backend.Create
 }
 
 // getUploadMetadata retrieves and validates upload metadata.
-func (b *Backend) getUploadMetadata(uploadID string) (*multipart.UploadMetadata, error) {
-	data, err := b.stateGet(TableMultipart, multipartUploadKey(uploadID))
+func (b *Backend) getUploadMetadata(uploadID string) (*model.UploadMetadata, error) {
+	data, err := b.stateGet(model.TableMultipart, multipartUploadKey(uploadID))
 	if err != nil {
 		if errors.Is(err, state.ErrNotFound) {
-			return nil, backend.ErrNoSuchUploadError.WithResource(uploadID)
+			return nil, model.ErrNoSuchUploadError.WithResource(uploadID)
 		}
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to retrieve upload metadata", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to retrieve upload metadata", 500)
 	}
 
-	var metadata multipart.UploadMetadata
+	var metadata model.UploadMetadata
 	dec := gob.NewDecoder(bytes.NewReader(data))
 	if err := dec.Decode(&metadata); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to decode upload metadata", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to decode upload metadata", 500)
 	}
 
 	return &metadata, nil
 }
 
 // UploadPart uploads a part in a multipart upload.
-func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest) (*backend.UploadPartResponse, error) {
+func (b *Backend) UploadPart(ctx context.Context, req *model.UploadPartRequest) (*model.UploadPartResponse, error) {
 	if req.Bucket == "" {
-		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
+		return nil, model.ErrNoSuchBucketError.WithResource(req.Bucket)
 	}
 	if req.Key == "" {
-		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
+		return nil, model.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
-	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+	if _, err := b.HeadBucket(ctx, &model.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
 		return nil, err
 	}
 
 	// Validate part number
-	if err := multipart.ValidatePartNumber(req.PartNumber); err != nil {
+	if err := model.ValidatePartNumber(req.PartNumber); err != nil {
 		return nil, err
 	}
 
@@ -135,7 +133,7 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 
 	// Verify bucket and key match
 	if uploadMetadata.Bucket != req.Bucket || uploadMetadata.Key != req.Key {
-		return nil, backend.NewS3Error(backend.ErrInvalidPart, "Bucket or key does not match upload", 400)
+		return nil, model.NewS3Error(model.ErrInvalidPart, "Bucket or key does not match upload", 400)
 	}
 
 	// Setup reader - handle chunked encoding if needed
@@ -145,36 +143,36 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 	}
 
 	// Read all data and calculate ETag
-	etag, data, err := multipart.CalculatePartETagFromReader(reader)
+	etag, data, err := model.CalculatePartETagFromReader(reader)
 	if err != nil {
 		slog.Error("Failed to read part data", "uploadID", req.UploadID, "part", req.PartNumber, "error", err)
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to read part data", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to read part data", 500)
 	}
 
 	partSize := int64(len(data))
 
 	// Validate part size (note: we can't know if it's the last part here, so we allow small parts)
-	if partSize > multipart.MaxPartSize {
-		return nil, backend.NewS3Error(backend.ErrEntityTooLarge, "Part exceeds maximum size", 400)
+	if partSize > model.MaxPartSize {
+		return nil, model.NewS3Error(model.ErrEntityTooLarge, "Part exceeds maximum size", 400)
 	}
 
 	// Store the part data using the existing PutObject mechanism
 	// Use a deterministic path based on uploadID and partNumber for consistent hash ring placement
 	partKey := partObjectKey(req.Bucket, req.Key, req.UploadID, req.PartNumber)
-	objectHash := storage.GenObjectHash(req.Bucket, partKey)
+	objectHash := model.ObjectHash(req.Bucket, partKey)
 
 	// Use deterministic temp file path based on upload info (like filesystem backend does)
 	// This ensures consistent hash ring placement for retries
 	tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("multipart-%s-%05d.tmp", req.UploadID, req.PartNumber))
 	tmpFile, err := os.Create(tmpPath)
 	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to create temp file", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to create temp file", 500)
 	}
 	defer os.Remove(tmpPath)
 	defer tmpFile.Close()
 
 	if _, err := tmpFile.Write(data); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to write temp file", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to write temp file", 500)
 	}
 	if closeErr := tmpFile.Close(); closeErr != nil {
 		slog.Debug("Failed to close temp file", "path", tmpPath, "error", closeErr)
@@ -186,7 +184,7 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 	}
 
 	// Create part metadata
-	partMeta := multipart.PartMetadata{
+	partMeta := model.PartMetadata{
 		PartNumber:   req.PartNumber,
 		Size:         partSize,
 		ETag:         etag,
@@ -197,12 +195,12 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 	var partBuf bytes.Buffer
 	partEnc := gob.NewEncoder(&partBuf)
 	if err := partEnc.Encode(partMeta); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to encode part metadata", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to encode part metadata", 500)
 	}
 
-	if err := b.statePut(TableParts, multipartPartKey(req.UploadID, req.PartNumber), partBuf.Bytes()); err != nil {
+	if err := b.statePut(model.TableParts, multipartPartKey(req.UploadID, req.PartNumber), partBuf.Bytes()); err != nil {
 		slog.Error("Failed to store part metadata", "uploadID", req.UploadID, "part", req.PartNumber, "error", err)
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store part metadata", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to store part metadata", 500)
 	}
 
 	// Store the shard location mapping for this part
@@ -216,7 +214,7 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 	// This ensures the same nodes are used for storage and retrieval
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to get shard placement", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to get shard placement", 500)
 	}
 
 	partObjectToShardNodes.DataShardNodes = make([]uint32, b.rsDataShard)
@@ -232,32 +230,32 @@ func (b *Backend) UploadPart(ctx context.Context, req *backend.UploadPartRequest
 	var shardBuf bytes.Buffer
 	shardEnc := gob.NewEncoder(&shardBuf)
 	if err := shardEnc.Encode(partObjectToShardNodes); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to encode shard metadata", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500)
 	}
 
-	if err := b.statePut(TableObjects, partShardKey, shardBuf.Bytes()); err != nil {
+	if err := b.statePut(model.TableObjects, partShardKey, shardBuf.Bytes()); err != nil {
 		slog.Error("Failed to store part shard metadata", "uploadID", req.UploadID, "part", req.PartNumber, "error", err)
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store part shard metadata", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to store part shard metadata", 500)
 	}
 
 	slog.Debug("Part uploaded", "uploadID", req.UploadID, "partNumber", req.PartNumber, "size", partSize, "etag", etag)
 
-	return &backend.UploadPartResponse{
+	return &model.UploadPartResponse{
 		ETag:       etag,
 		PartNumber: req.PartNumber,
 	}, nil
 }
 
 // getStoredParts retrieves all stored parts for an upload.
-func (b *Backend) getStoredParts(uploadID string) ([]multipart.PartMetadata, error) {
-	items, err := b.stateScan(TableParts, multipartPartsPrefix(uploadID), 0)
+func (b *Backend) getStoredParts(uploadID string) ([]model.PartMetadata, error) {
+	items, err := b.stateScan(model.TableParts, multipartPartsPrefix(uploadID), 0)
 	if err != nil {
 		return nil, err
 	}
 
-	parts := make([]multipart.PartMetadata, 0, len(items))
+	parts := make([]model.PartMetadata, 0, len(items))
 	for _, item := range items {
-		var part multipart.PartMetadata
+		var part model.PartMetadata
 		dec := gob.NewDecoder(bytes.NewReader(item.Value))
 		if err := dec.Decode(&part); err != nil {
 			return nil, err
@@ -274,15 +272,15 @@ func (b *Backend) getStoredParts(uploadID string) ([]multipart.PartMetadata, err
 }
 
 // CompleteMultipartUpload completes a multipart upload by assembling all parts.
-func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.CompleteMultipartUploadRequest) (*backend.CompleteMultipartUploadResponse, error) {
+func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *model.CompleteMultipartUploadRequest) (*model.CompleteMultipartUploadResponse, error) {
 	if req.Bucket == "" {
-		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
+		return nil, model.ErrNoSuchBucketError.WithResource(req.Bucket)
 	}
 	if req.Key == "" {
-		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
+		return nil, model.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
-	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+	if _, err := b.HeadBucket(ctx, &model.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
 		return nil, err
 	}
 
@@ -294,23 +292,23 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 
 	// Verify bucket and key match
 	if uploadMetadata.Bucket != req.Bucket || uploadMetadata.Key != req.Key {
-		return nil, backend.NewS3Error(backend.ErrInvalidPart, "Bucket or key does not match upload", 400)
+		return nil, model.NewS3Error(model.ErrInvalidPart, "Bucket or key does not match upload", 400)
 	}
 
 	// Get all stored parts
 	storedParts, err := b.getStoredParts(req.UploadID)
 	if err != nil {
 		slog.Error("Failed to get stored parts", "uploadID", req.UploadID, "error", err)
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to retrieve parts", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to retrieve parts", 500)
 	}
 
 	// Validate parts
-	if err := multipart.ValidatePartsForCompletion(req.Parts, storedParts); err != nil {
+	if err := model.ValidatePartsForCompletion(req.Parts, storedParts); err != nil {
 		return nil, err
 	}
 
 	// Create a map for quick part lookup
-	storedMap := make(map[int]multipart.PartMetadata, len(storedParts))
+	storedMap := make(map[int]model.PartMetadata, len(storedParts))
 	for _, p := range storedParts {
 		storedMap[p.PartNumber] = p
 	}
@@ -319,7 +317,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	// Create a temp file to hold the assembled data
 	tmpFile, err := os.CreateTemp("", "multipart-complete-*")
 	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to create temp file", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to create temp file", 500)
 	}
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
@@ -341,7 +339,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	var wg sync.WaitGroup
 	for i, part := range req.Parts {
 		stored := storedMap[part.PartNumber]
-		partETags[i] = multipart.NormalizeETag(stored.ETag)
+		partETags[i] = model.NormalizeETag(stored.ETag)
 
 		wg.Add(1)
 		go func(idx int, partNum int) {
@@ -364,7 +362,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	for result := range resultChan {
 		if result.err != nil {
 			slog.Error("Failed to retrieve part data", "uploadID", req.UploadID, "index", result.index, "error", result.err)
-			return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to retrieve part data", 500)
+			return nil, model.NewS3Error(model.ErrInternalError, "Failed to retrieve part data", 500)
 		}
 		partDataSlice[result.index] = result.data
 	}
@@ -372,7 +370,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	// Write all parts to temp file in order
 	for _, data := range partDataSlice {
 		if _, err := tmpFile.Write(data); err != nil {
-			return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to write assembled data", 500)
+			return nil, model.NewS3Error(model.ErrInternalError, "Failed to write assembled data", 500)
 		}
 	}
 
@@ -381,7 +379,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	}
 
 	// Store the final object using PutObject mechanism
-	objectHash := storage.GenObjectHash(req.Bucket, req.Key)
+	objectHash := model.ObjectHash(req.Bucket, req.Key)
 
 	if _, _, err = b.putObjectViaQUIC(ctx, tmpFile.Name(), objectHash); err != nil {
 		slog.Error("Failed to store final object", "uploadID", req.UploadID, "error", err)
@@ -391,7 +389,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	// Get final object size
 	finalInfo, err := os.Stat(tmpFile.Name())
 	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to get final object size", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to get final object size", 500)
 	}
 
 	// Store object metadata (same as regular PutObject)
@@ -403,7 +401,7 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	// Use objectHash for hash ring placement - must match what putObjectViaQUIC uses
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to get shard placement", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to get shard placement", 500)
 	}
 
 	objectToShardNodes.DataShardNodes = make([]uint32, b.rsDataShard)
@@ -419,17 +417,17 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	var shardBuf bytes.Buffer
 	shardEnc := gob.NewEncoder(&shardBuf)
 	if err := shardEnc.Encode(objectToShardNodes); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to encode shard metadata", 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500)
 	}
 
-	if err := b.statePut(TableObjects, string(objectHash[:]), shardBuf.Bytes()); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store object metadata", 500)
+	if err := b.statePut(model.TableObjects, string(objectHash[:]), shardBuf.Bytes()); err != nil {
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to store object metadata", 500)
 	}
 
 	// Store ARN key -> object hash mapping
 	arnKey := arnObjectPrefixPut + req.Bucket + "/" + req.Key
-	if err := b.statePut(TableObjects, arnKey, objectHash[:]); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "Failed to store ARN mapping", 500)
+	if err := b.statePut(model.TableObjects, arnKey, objectHash[:]); err != nil {
+		return nil, model.NewS3Error(model.ErrInternalError, "Failed to store ARN mapping", 500)
 	}
 
 	// Clean up: delete parts and upload metadata
@@ -439,11 +437,11 @@ func (b *Backend) CompleteMultipartUpload(ctx context.Context, req *backend.Comp
 	}
 
 	// Calculate multipart ETag
-	finalETag := multipart.CalculateMultipartETag(partETags, len(req.Parts))
+	finalETag := model.CalculateMultipartETag(partETags, len(req.Parts))
 
 	slog.Debug("Multipart upload completed", "bucket", req.Bucket, "key", req.Key, "uploadID", req.UploadID, "parts", len(req.Parts))
 
-	return &backend.CompleteMultipartUploadResponse{
+	return &model.CompleteMultipartUploadResponse{
 		Location: fmt.Sprintf("/%s/%s", req.Bucket, req.Key),
 		Bucket:   req.Bucket,
 		Key:      req.Key,
@@ -456,7 +454,7 @@ func (b *Backend) getPartData(ctx context.Context, bucket, key, uploadID string,
 	// Look up shard location using the key format from UploadPart
 	partShardKey := fmt.Sprintf("part:%s:%05d", uploadID, partNumber)
 
-	data, err := b.stateGet(TableObjects, partShardKey)
+	data, err := b.stateGet(model.TableObjects, partShardKey)
 	if err != nil {
 		return nil, fmt.Errorf("part not found: uploadID=%s part=%d", uploadID, partNumber)
 	}
@@ -477,7 +475,7 @@ func (b *Backend) getPartData(ctx context.Context, bucket, key, uploadID string,
 	partKey := partObjectKey(bucket, key, uploadID, partNumber)
 
 	// Use the existing reconstructObject from get.go
-	buf, err := b.reconstructObject(ctx, storage.GenObjectHash(bucket, partKey), shardNodes, enc, shardNodes.Size)
+	buf, err := b.reconstructObject(ctx, model.ObjectHash(bucket, partKey), shardNodes, enc, shardNodes.Size)
 	if err != nil {
 		return nil, err
 	}
@@ -488,14 +486,14 @@ func (b *Backend) getPartData(ctx context.Context, bucket, key, uploadID string,
 // cleanupMultipartUpload removes all part shards (via QUIC), part/upload metadata,
 // and the shard-location map for an upload. Shard deletes are best-effort: a per-node
 // failure is logged and skipped, never failing the complete/abort request.
-func (b *Backend) cleanupMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts []backend.CompletedPart) error {
+func (b *Backend) cleanupMultipartUpload(ctx context.Context, bucket, key, uploadID string, parts []model.CompletedPart) error {
 	for _, part := range parts {
 		partShardKey := fmt.Sprintf("part:%s:%05d", uploadID, part.PartNumber)
 
 		// Drop the physical part shards before removing the shard-location map. A missing
 		// or corrupt map, or a per-node delete failure, is logged and skipped — cleanup is
 		// best-effort and must not fail the complete/abort request.
-		if data, err := b.stateGet(TableObjects, partShardKey); err != nil {
+		if data, err := b.stateGet(model.TableObjects, partShardKey); err != nil {
 			slog.Warn("cleanup: part shard map missing, skipping shard delete", "uploadID", uploadID, "part", part.PartNumber)
 		} else {
 			var nodes ObjectToShardNodes
@@ -509,17 +507,17 @@ func (b *Backend) cleanupMultipartUpload(ctx context.Context, bucket, key, uploa
 			}
 		}
 
-		if err := b.stateDelete(TableParts, multipartPartKey(uploadID, part.PartNumber)); err != nil {
+		if err := b.stateDelete(model.TableParts, multipartPartKey(uploadID, part.PartNumber)); err != nil {
 			slog.Warn("Failed to delete part metadata", "uploadID", uploadID, "part", part.PartNumber, "error", err)
 		}
 
-		if err := b.stateDelete(TableObjects, partShardKey); err != nil {
+		if err := b.stateDelete(model.TableObjects, partShardKey); err != nil {
 			slog.Warn("Failed to delete part shard metadata", "uploadID", uploadID, "part", part.PartNumber, "error", err)
 		}
 	}
 
 	// Delete upload metadata
-	if err := b.stateDelete(TableMultipart, multipartUploadKey(uploadID)); err != nil {
+	if err := b.stateDelete(model.TableMultipart, multipartUploadKey(uploadID)); err != nil {
 		return err
 	}
 
@@ -529,13 +527,13 @@ func (b *Backend) cleanupMultipartUpload(ctx context.Context, bucket, key, uploa
 // AbortMultipartUpload aborts a multipart upload and cleans up all parts.
 func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadID string) error {
 	if bucket == "" {
-		return backend.ErrNoSuchBucketError.WithResource(bucket)
+		return model.ErrNoSuchBucketError.WithResource(bucket)
 	}
 	if key == "" {
-		return backend.ErrNoSuchKeyError.WithResource(key)
+		return model.ErrNoSuchKeyError.WithResource(key)
 	}
 
-	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: bucket}); err != nil {
+	if _, err := b.HeadBucket(ctx, &model.HeadBucketRequest{Bucket: bucket}); err != nil {
 		return err
 	}
 
@@ -547,20 +545,20 @@ func (b *Backend) AbortMultipartUpload(ctx context.Context, bucket, key, uploadI
 
 	// Verify bucket and key match
 	if uploadMetadata.Bucket != bucket || uploadMetadata.Key != key {
-		return backend.NewS3Error(backend.ErrInvalidPart, "Bucket or key does not match upload", 400)
+		return model.NewS3Error(model.ErrInvalidPart, "Bucket or key does not match upload", 400)
 	}
 
 	// Get all stored parts
 	storedParts, err := b.getStoredParts(uploadID)
 	if err != nil {
 		slog.Warn("Failed to get stored parts for cleanup", "uploadID", uploadID, "error", err)
-		storedParts = []multipart.PartMetadata{}
+		storedParts = []model.PartMetadata{}
 	}
 
 	// Convert to CompletedPart for cleanup
-	parts := make([]backend.CompletedPart, len(storedParts))
+	parts := make([]model.CompletedPart, len(storedParts))
 	for i, p := range storedParts {
-		parts[i] = backend.CompletedPart{
+		parts[i] = model.CompletedPart{
 			PartNumber: p.PartNumber,
 			ETag:       p.ETag,
 		}

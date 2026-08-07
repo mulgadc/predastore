@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,10 @@ import (
 	"github.com/mulgadc/predastore/internal/transport"
 	"github.com/mulgadc/predastore/store"
 )
+
+// testHash names a shard set. Callers derive the name however they like; the
+// node only ever sees 32 opaque bytes.
+func testHash(name string) [32]byte { return sha256.Sum256([]byte(name)) }
 
 // procTopo maps node ids to the pipe endpoint their process listens on. It
 // stands in for the cluster topology the rpc layer resolves node ids through.
@@ -93,9 +98,7 @@ func TestStorageShardRoundTrip(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// The hash is the client's to compute and opaque to the node; a caller
-	// derives it from S3 names, but the wire only ever sees the 32 bytes.
-	objectHash := storage.GenObjectHash("bkt", "obj/a")
+	objectHash := testHash("shard-set-a")
 	shard := make([]byte, 256*1024)
 	if _, err := rand.Read(shard); err != nil {
 		t.Fatalf("rand: %v", err)
@@ -168,7 +171,7 @@ func TestStorageGetMissingShard(t *testing.T) {
 	defer cancel()
 
 	if _, err := cli.GetShard(ctx, 1, storage.GetRequest{
-		ObjectHash: storage.GenObjectHash("none", "missing"), ShardIndex: 0, RangeStart: -1, RangeEnd: -1,
+		ObjectHash: testHash("absent-shard-set"), ShardIndex: 0, RangeStart: -1, RangeEnd: -1,
 	}); !errors.Is(err, storage.ErrShardNotFound) {
 		t.Fatalf("got %v, want ErrShardNotFound", err)
 	}
@@ -180,7 +183,7 @@ func TestStorageUnknownTargetNode(t *testing.T) {
 	defer cancel()
 
 	if _, err := cli.DeleteShard(ctx, 99, storage.DeleteRequest{
-		ObjectHash: storage.GenObjectHash("b", "o"), ShardIndex: 0,
+		ObjectHash: testHash("shard-set-b"), ShardIndex: 0,
 	}); err == nil {
 		t.Fatal("delete against unknown node succeeded")
 	}

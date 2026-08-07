@@ -1,4 +1,4 @@
-package multipart
+package model
 
 import (
 	"bytes"
@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/mulgadc/predastore/backend"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -106,10 +105,10 @@ func TestValidatePartsForCompletion(t *testing.T) {
 	}
 
 	// Helper to create requested parts
-	createRequestedParts := func(partNumbers []int) []backend.CompletedPart {
-		parts := make([]backend.CompletedPart, len(partNumbers))
+	createRequestedParts := func(partNumbers []int) []CompletedPart {
+		parts := make([]CompletedPart, len(partNumbers))
 		for i, num := range partNumbers {
-			parts[i] = backend.CompletedPart{
+			parts[i] = CompletedPart{
 				PartNumber: num,
 				ETag:       fmt.Sprintf("etag-%d", num),
 			}

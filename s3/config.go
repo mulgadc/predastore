@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -61,7 +61,7 @@ func (s3 *Config) ReadConfig() (err error) {
 		}
 
 		// Check if the bucket name is valid
-		err := backend.IsValidBucketName(b.Name)
+		err := model.IsValidBucketName(b.Name)
 		if err != nil {
 			slog.Warn("Invalid bucket name", "bucket", b.Name, "error", err)
 			continue

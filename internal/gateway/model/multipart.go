@@ -1,7 +1,4 @@
-// Package multipart provides shared multipart upload functionality for S3-compatible backends.
-// It handles common validation, ETag calculation, and part tracking logic that can be used
-// by both filesystem and distributed backends.
-package multipart
+package model
 
 import (
 	"crypto/md5"
@@ -10,8 +7,6 @@ import (
 	"io"
 	"strings"
 	"time"
-
-	"github.com/mulgadc/predastore/backend"
 )
 
 // S3 API Limits for multipart uploads
@@ -57,8 +52,8 @@ type PartMetadata struct {
 // ValidatePartNumber validates that a part number is within S3 API limits.
 func ValidatePartNumber(partNumber int) error {
 	if partNumber < MinPartNumber || partNumber > MaxPartNumber {
-		return backend.NewS3Error(
-			backend.ErrInvalidPart,
+		return NewS3Error(
+			ErrInvalidPart,
 			fmt.Sprintf("Part number must be between %d and %d, got %d", MinPartNumber, MaxPartNumber, partNumber),
 			400,
 		)
@@ -69,15 +64,15 @@ func ValidatePartNumber(partNumber int) error {
 // ValidatePartSize validates part size for non-last parts.
 func ValidatePartSize(size int64, isLastPart bool) error {
 	if size > MaxPartSize {
-		return backend.NewS3Error(
-			backend.ErrEntityTooLarge,
+		return NewS3Error(
+			ErrEntityTooLarge,
 			fmt.Sprintf("Part size %d exceeds maximum %d bytes", size, MaxPartSize),
 			400,
 		)
 	}
 	if !isLastPart && size < MinPartSize {
-		return backend.NewS3Error(
-			backend.ErrEntityTooSmall,
+		return NewS3Error(
+			ErrEntityTooSmall,
 			fmt.Sprintf("Part size %d is below minimum %d bytes for non-last parts", size, MinPartSize),
 			400,
 		)
@@ -88,15 +83,15 @@ func ValidatePartSize(size int64, isLastPart bool) error {
 // ValidatePartsCount validates the number of parts.
 func ValidatePartsCount(count int) error {
 	if count < 1 {
-		return backend.NewS3Error(
-			backend.ErrInvalidPart,
+		return NewS3Error(
+			ErrInvalidPart,
 			"At least one part is required",
 			400,
 		)
 	}
 	if count > MaxPartsCount {
-		return backend.NewS3Error(
-			backend.ErrInvalidPart,
+		return NewS3Error(
+			ErrInvalidPart,
 			fmt.Sprintf("Number of parts %d exceeds maximum %d", count, MaxPartsCount),
 			400,
 		)
@@ -106,7 +101,7 @@ func ValidatePartsCount(count int) error {
 
 // ValidatePartsForCompletion validates parts array for CompleteMultipartUpload
 // Parts must be in ascending order by part number and all referenced parts must exist.
-func ValidatePartsForCompletion(requestedParts []backend.CompletedPart, storedParts []PartMetadata) error {
+func ValidatePartsForCompletion(requestedParts []CompletedPart, storedParts []PartMetadata) error {
 	if err := ValidatePartsCount(len(requestedParts)); err != nil {
 		return err
 	}
@@ -128,8 +123,8 @@ func ValidatePartsForCompletion(requestedParts []backend.CompletedPart, storedPa
 
 		// Parts must be in ascending order
 		if i > 0 && part.PartNumber <= prevPartNumber {
-			return backend.NewS3Error(
-				backend.ErrInvalidPart,
+			return NewS3Error(
+				ErrInvalidPart,
 				fmt.Sprintf("Parts must be in ascending order: part %d follows part %d", part.PartNumber, prevPartNumber),
 				400,
 			)
@@ -139,8 +134,8 @@ func ValidatePartsForCompletion(requestedParts []backend.CompletedPart, storedPa
 		// Part must exist
 		stored, exists := storedMap[part.PartNumber]
 		if !exists {
-			return backend.NewS3Error(
-				backend.ErrInvalidPart,
+			return NewS3Error(
+				ErrInvalidPart,
 				fmt.Sprintf("Part %d does not exist", part.PartNumber),
 				400,
 			)
@@ -149,8 +144,8 @@ func ValidatePartsForCompletion(requestedParts []backend.CompletedPart, storedPa
 		// Validate part size (all except last must be >= MinPartSize)
 		isLastPart := i == len(requestedParts)-1
 		if err := ValidatePartSize(stored.Size, isLastPart); err != nil {
-			return backend.NewS3Error(
-				backend.ErrEntityTooSmall,
+			return NewS3Error(
+				ErrEntityTooSmall,
 				fmt.Sprintf("Part %d is too small (%d bytes)", part.PartNumber, stored.Size),
 				400,
 			)
@@ -161,8 +156,8 @@ func ValidatePartsForCompletion(requestedParts []backend.CompletedPart, storedPa
 
 	// Validate total size
 	if totalSize > MaxObjectSize {
-		return backend.NewS3Error(
-			backend.ErrEntityTooLarge,
+		return NewS3Error(
+			ErrEntityTooLarge,
 			fmt.Sprintf("Total object size %d exceeds maximum %d bytes", totalSize, MaxObjectSize),
 			400,
 		)

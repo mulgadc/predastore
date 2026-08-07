@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/storage"
 	"github.com/mulgadc/predastore/s3/chunked"
 )
@@ -21,27 +21,27 @@ const arnObjectPrefixPut = "arn:aws:s3:::"
 // mapPutErr translates a putObjectViaQUIC error into the S3 error returned
 // to the client. A pool-full shard write must surface as 507, not the
 // generic 500 other failures get.
-func mapPutErr(err error) *backend.S3Error {
+func mapPutErr(err error) *model.S3Error {
 	if errors.Is(err, storage.ErrStoreFull) {
-		return backend.ErrInsufficientStorageError
+		return model.ErrInsufficientStorageError
 	}
-	return backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+	return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 }
 
 // PutObject stores an object using Reed-Solomon encoding across multiple nodes.
-func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) (*backend.PutObjectResponse, error) {
+func (b *Backend) PutObject(ctx context.Context, req *model.PutObjectRequest) (*model.PutObjectResponse, error) {
 	if req.Bucket == "" {
-		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
+		return nil, model.ErrNoSuchBucketError.WithResource(req.Bucket)
 	}
 	if req.Key == "" {
-		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
+		return nil, model.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
-	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+	if _, err := b.HeadBucket(ctx, &model.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
 		return nil, err
 	}
 
-	objectHash := storage.GenObjectHash(req.Bucket, req.Key)
+	objectHash := model.ObjectHash(req.Bucket, req.Key)
 
 	objectToShardNodes := ObjectToShardNodes{
 		Object:           objectHash,
@@ -52,7 +52,7 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	// Write object to a temporary file for RS splitting and QUIC distribution
 	tmpFile, err := os.CreateTemp("", "distributed-put-*")
 	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 	defer os.Remove(tmpFile.Name())
 	defer tmpFile.Close()
@@ -66,7 +66,7 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 		_, err = io.Copy(tmpFile, reader)
 		if err != nil {
 			slog.Error("distributed.PutObject: copy to temp file failed", "error", err)
-			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+			return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 		}
 	}
 	if closeErr := tmpFile.Close(); closeErr != nil {
@@ -86,14 +86,14 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	// Get hash ring placement using objectHash for consistency with storage and retrieval
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 
 	// Record which nodes have data shards
 	for i := 0; i < b.rsDataShard; i++ {
 		objectToShardNodes.DataShardNodes[i], err = NodeToUint32(hashRingShards[i].String())
 		if err != nil {
-			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+			return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 		}
 	}
 
@@ -101,7 +101,7 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	for i := 0; i < b.rsParityShard; i++ {
 		objectToShardNodes.ParityShardNodes[i], err = NodeToUint32(hashRingShards[b.rsDataShard+i].String())
 		if err != nil {
-			return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+			return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 		}
 	}
 
@@ -109,22 +109,22 @@ func (b *Backend) PutObject(ctx context.Context, req *backend.PutObjectRequest) 
 	var buf bytes.Buffer
 	enc := gob.NewEncoder(&buf)
 	if err := enc.Encode(objectToShardNodes); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 
 	// Store object hash -> shard metadata (for retrieval)
-	if err := b.statePut(TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+	if err := b.statePut(model.TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
+		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 
 	// Store ARN key -> object hash (for listing)
 	// Format: arn:aws:s3:::<bucket>/<key>
 	arnKey := arnObjectPrefixPut + req.Bucket + "/" + req.Key
-	if err := b.statePut(TableObjects, arnKey, objectHash[:]); err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+	if err := b.statePut(model.TableObjects, arnKey, objectHash[:]); err != nil {
+		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 
-	return &backend.PutObjectResponse{
+	return &model.PutObjectResponse{
 		ETag:         generateDistributedETag(req.Bucket, req.Key),
 		PoolNearFull: poolNearFull,
 	}, nil

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 )
 
 // ARN key format constants.
@@ -20,17 +20,17 @@ const (
 )
 
 // ListBuckets returns a list of buckets from global state filtered by account.
-func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.ListBucketsResponse, error) {
-	bucketMap := make(map[string]backend.BucketInfo)
+func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*model.ListBucketsResponse, error) {
+	bucketMap := make(map[string]model.BucketInfo)
 
 	// Scan global state for dynamically created buckets
-	items, err := b.stateScan(TableBuckets, "", 0)
+	items, err := b.stateScan(model.TableBuckets, "", 0)
 	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, "failed to list buckets: "+err.Error(), 500)
+		return nil, model.NewS3Error(model.ErrInternalError, "failed to list buckets: "+err.Error(), 500)
 	}
 
 	for _, item := range items {
-		var metadata backend.BucketMetadata
+		var metadata model.BucketMetadata
 		dec := gob.NewDecoder(bytes.NewReader(item.Value))
 		if err := dec.Decode(&metadata); err != nil {
 			slog.Warn("Skipping corrupt bucket entry during scan", "key", item.Key, "error", err)
@@ -42,7 +42,7 @@ func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.L
 			continue
 		}
 
-		bucketMap[metadata.Name] = backend.BucketInfo{
+		bucketMap[metadata.Name] = model.BucketInfo{
 			Name:         metadata.Name,
 			Region:       metadata.Region,
 			CreationDate: metadata.CreationDate,
@@ -50,7 +50,7 @@ func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.L
 	}
 
 	// Convert to slice
-	buckets := make([]backend.BucketInfo, 0, len(bucketMap))
+	buckets := make([]model.BucketInfo, 0, len(bucketMap))
 	for _, info := range bucketMap {
 		buckets = append(buckets, info)
 	}
@@ -60,8 +60,8 @@ func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.L
 		displayName = accountID
 	}
 
-	return &backend.ListBucketsResponse{
-		Owner: backend.OwnerInfo{
+	return &model.ListBucketsResponse{
+		Owner: model.OwnerInfo{
 			ID:          accountID,
 			DisplayName: displayName,
 		},
@@ -71,13 +71,13 @@ func (b *Backend) ListBuckets(ctx context.Context, accountID string) (*backend.L
 
 // ListObjects returns a list of objects in a bucket by scanning global state
 // Objects are stored with ARN key format: arn:aws:s3:::<bucket>/<key>.
-func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsRequest) (*backend.ListObjectsResponse, error) {
+func (b *Backend) ListObjects(ctx context.Context, req *model.ListObjectsRequest) (*model.ListObjectsResponse, error) {
 	if req.Bucket == "" {
-		return nil, backend.ErrNoSuchBucketError.WithResource(req.Bucket)
+		return nil, model.ErrNoSuchBucketError.WithResource(req.Bucket)
 	}
 
 	// Check if bucket exists (in config or global state)
-	_, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket})
+	_, err := b.HeadBucket(ctx, &model.HeadBucketRequest{Bucket: req.Bucket})
 	if err != nil {
 		return nil, err
 	}
@@ -90,13 +90,13 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 	}
 
 	// Scan global state for matching keys
-	contents := make([]backend.ObjectInfo, 0)
+	contents := make([]model.ObjectInfo, 0)
 	commonPrefixes := make([]string, 0)
 	prefixSet := make(map[string]bool) // To dedupe common prefixes
 
-	items, err := b.stateScan(TableObjects, scanPrefix, 0)
+	items, err := b.stateScan(model.TableObjects, scanPrefix, 0)
 	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 
 	for _, item := range items {
@@ -132,7 +132,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 
 		if len(item.Value) == 32 {
 			// value is the objectHash, look up the full metadata
-			metaData, err := b.stateGet(TableObjects, string(item.Value))
+			metaData, err := b.stateGet(model.TableObjects, string(item.Value))
 			if err == nil && len(metaData) > 0 {
 				var objMeta ObjectToShardNodes
 				dec := gob.NewDecoder(bytes.NewReader(metaData))
@@ -143,7 +143,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 		}
 
 		// Add as content
-		contents = append(contents, backend.ObjectInfo{
+		contents = append(contents, model.ObjectInfo{
 			Key:          objectKey,
 			LastModified: time.Now(), // TODO: Store actual modification time
 			Size:         objectSize,
@@ -156,7 +156,7 @@ func (b *Backend) ListObjects(ctx context.Context, req *backend.ListObjectsReque
 		maxKeys = 1000
 	}
 
-	return &backend.ListObjectsResponse{
+	return &model.ListObjectsResponse{
 		Name:           req.Bucket,
 		Prefix:         req.Prefix,
 		MaxKeys:        maxKeys,

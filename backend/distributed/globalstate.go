@@ -6,16 +6,6 @@ import (
 	"github.com/mulgadc/predastore/internal/state"
 )
 
-// Table names for global state. The state replicas are a plain key-value
-// store, so this taxonomy is the gateway's alone: it composes a table into
-// every key it stores and strips it back off every key it scans.
-const (
-	TableObjects   = "objects"   // Object metadata (hash -> shard locations)
-	TableBuckets   = "buckets"   // Bucket metadata
-	TableMultipart = "multipart" // Multipart upload metadata (uploadID -> metadata)
-	TableParts     = "parts"     // Part metadata (uploadID:partNumber -> part info)
-)
-
 // tablePrefix is what a table contributes to the front of a stored key.
 func tablePrefix(table string) string { return table + "/" }
 

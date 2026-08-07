@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 )
 
 // bucketAccessAllowed enforces the S3 default-deny ownership invariant on top
@@ -13,7 +13,7 @@ import (
 // SkipPolicyCheck callers (config-defined service accounts) bypass entirely.
 // Cross-account writes require a resource-based grant (bucket policy / ACL)
 // which is not yet wired up here.
-func bucketAccessAllowed(method, callerAccountID string, meta *backend.BucketMetadata, skipPolicyCheck bool) bool {
+func bucketAccessAllowed(method, callerAccountID string, meta *model.BucketMetadata, skipPolicyCheck bool) bool {
 	if skipPolicyCheck {
 		return true
 	}

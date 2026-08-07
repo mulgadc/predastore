@@ -1,4 +1,8 @@
-package backend
+// Package model holds the S3 semantics the gateway speaks: the request and
+// response DTOs, the error taxonomy, name validation, the multipart helpers and
+// the global-state table names. It is pure data and pure functions — nothing
+// here talks to storage, state or the network.
+package model
 
 import (
 	"io"

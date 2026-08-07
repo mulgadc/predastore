@@ -17,6 +17,7 @@ import (
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash/v2"
 	"github.com/klauspost/reedsolomon"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/storage"
 )
@@ -360,14 +361,14 @@ func (b *Backend) putObjectViaQUIC(ctx context.Context, objectPath string, objec
 
 // openInput retrieves shard location metadata for an object.
 func (b *Backend) openInput(bucket string, object string) (ObjectToShardNodes, int64, error) {
-	objectHash := storage.GenObjectHash(bucket, object)
+	objectHash := model.ObjectHash(bucket, object)
 
 	hashRingShards, err := b.hashRing.GetClosestN(objectHash[:], b.rsDataShard+b.rsParityShard)
 	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}
 
-	data, err := b.stateGet(TableObjects, string(objectHash[:]))
+	data, err := b.stateGet(model.TableObjects, string(objectHash[:]))
 	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}

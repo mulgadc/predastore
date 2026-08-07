@@ -11,21 +11,21 @@ import (
 	"path/filepath"
 
 	"github.com/klauspost/reedsolomon"
-	"github.com/mulgadc/predastore/backend"
+	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/storage"
 )
 
 // GetObject retrieves an object using Reed-Solomon decoding.
 // Supports byte-range requests for efficient partial reads.
-func (b *Backend) GetObject(ctx context.Context, req *backend.GetObjectRequest) (*backend.GetObjectResponse, error) {
-	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
+func (b *Backend) GetObject(ctx context.Context, req *model.GetObjectRequest) (*model.GetObjectResponse, error) {
+	if _, err := b.HeadBucket(ctx, &model.HeadBucketRequest{Bucket: req.Bucket}); err != nil {
 		return nil, err
 	}
 
 	// Query which nodes have our object shards
 	shards, size, err := b.openInput(req.Bucket, req.Key)
 	if err != nil {
-		return nil, backend.ErrNoSuchKeyError.WithResource(req.Key)
+		return nil, model.ErrNoSuchKeyError.WithResource(req.Key)
 	}
 
 	// Check if this is a range request
@@ -44,7 +44,7 @@ func (b *Backend) GetObject(ctx context.Context, req *backend.GetObjectRequest) 
 // - shardSize = ceil(originalSize / dataShards)
 // - shardIndex = offset / shardSize
 // - offsetWithinShard = offset % shardSize.
-func (b *Backend) handleRangeRequest(ctx context.Context, req *backend.GetObjectRequest, shards ObjectToShardNodes, totalSize int64) (*backend.GetObjectResponse, error) {
+func (b *Backend) handleRangeRequest(ctx context.Context, req *model.GetObjectRequest, shards ObjectToShardNodes, totalSize int64) (*model.GetObjectResponse, error) {
 	// Normalize range values
 	start := req.RangeStart
 	end := req.RangeEnd
@@ -58,7 +58,7 @@ func (b *Backend) handleRangeRequest(ctx context.Context, req *backend.GetObject
 
 	// Validate range
 	if start > end || start >= totalSize {
-		return nil, backend.ErrInvalidRangeError
+		return nil, model.ErrInvalidRangeError
 	}
 
 	// Calculate shard size (how data is split across data shards)
@@ -78,7 +78,7 @@ func (b *Backend) handleRangeRequest(ctx context.Context, req *backend.GetObject
 
 	// Optimization: if range is within a single shard, fetch just that shard portion
 	if startShardIdx == endShardIdx {
-		objectHash := storage.GenObjectHash(req.Bucket, req.Key)
+		objectHash := model.ObjectHash(req.Bucket, req.Key)
 		data, err := b.readRangeFromSingleShard(ctx, objectHash, shards, startShardIdx, start, end, shardSize, totalSize)
 		if err != nil {
 			slog.Warn("Single shard range read failed, falling back to full reconstruction", "err", err)
@@ -87,7 +87,7 @@ func (b *Backend) handleRangeRequest(ctx context.Context, req *backend.GetObject
 		}
 
 		contentRange := fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize)
-		return &backend.GetObjectResponse{
+		return &model.GetObjectResponse{
 			Body:         io.NopCloser(bytes.NewReader(data)),
 			ContentType:  "application/octet-stream",
 			ContentRange: contentRange,
@@ -157,7 +157,7 @@ func (b *Backend) readRangeFromSingleShard(ctx context.Context, objectHash [32]b
 // handleRangeWithFullReconstruction handles range requests by reconstructing
 // the full object and then extracting the requested range.
 // This is the fallback path when range spans multiple shards or single-shard read fails.
-func (b *Backend) handleRangeWithFullReconstruction(ctx context.Context, req *backend.GetObjectRequest, shards ObjectToShardNodes, totalSize, start, end int64) (*backend.GetObjectResponse, error) {
+func (b *Backend) handleRangeWithFullReconstruction(ctx context.Context, req *model.GetObjectRequest, shards ObjectToShardNodes, totalSize, start, end int64) (*model.GetObjectResponse, error) {
 	slog.Info("handleRangeWithFullReconstruction called",
 		"bucket", req.Bucket,
 		"key", req.Key,
@@ -167,7 +167,7 @@ func (b *Backend) handleRangeWithFullReconstruction(ctx context.Context, req *ba
 	)
 
 	// Reconstruct full object
-	fullReq := &backend.GetObjectRequest{
+	fullReq := &model.GetObjectRequest{
 		Bucket:     req.Bucket,
 		Key:        req.Key,
 		RangeStart: -1,
@@ -185,7 +185,7 @@ func (b *Backend) handleRangeWithFullReconstruction(ctx context.Context, req *ba
 	fullData, err := io.ReadAll(fullResp.Body)
 	if err != nil {
 		slog.Error("Failed to read full content", "err", err)
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 
 	slog.Info("Full object reconstructed",
@@ -200,7 +200,7 @@ func (b *Backend) handleRangeWithFullReconstruction(ctx context.Context, req *ba
 	}
 	if start >= int64(len(fullData)) {
 		slog.Error("Start position beyond data", "start", start, "dataLen", len(fullData))
-		return nil, backend.ErrInvalidRangeError
+		return nil, model.ErrInvalidRangeError
 	}
 
 	rangeData := fullData[start : end+1]
@@ -211,7 +211,7 @@ func (b *Backend) handleRangeWithFullReconstruction(ctx context.Context, req *ba
 		"contentRange", contentRange,
 	)
 
-	return &backend.GetObjectResponse{
+	return &model.GetObjectResponse{
 		Body:         io.NopCloser(bytes.NewReader(rangeData)),
 		ContentType:  "application/octet-stream",
 		ContentRange: contentRange,
@@ -222,19 +222,19 @@ func (b *Backend) handleRangeWithFullReconstruction(ctx context.Context, req *ba
 }
 
 // getFullObject retrieves the complete object using Reed-Solomon decoding.
-func (b *Backend) getFullObject(ctx context.Context, req *backend.GetObjectRequest, shards ObjectToShardNodes, size int64) (*backend.GetObjectResponse, error) {
+func (b *Backend) getFullObject(ctx context.Context, req *model.GetObjectRequest, shards ObjectToShardNodes, size int64) (*model.GetObjectResponse, error) {
 	// Create RS decoder
 	enc, err := reedsolomon.NewStream(b.rsDataShard, b.rsParityShard)
 	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 
-	objectHash := storage.GenObjectHash(req.Bucket, req.Key)
+	objectHash := model.ObjectHash(req.Bucket, req.Key)
 
 	// First try with data shards only
 	shardReaders, err := b.shardReaders(objectHash, shards, false)
 	if err != nil {
-		return nil, backend.NewS3Error(backend.ErrInternalError, err.Error(), 500)
+		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 
 	// Buffer to hold the reconstructed object
@@ -249,14 +249,14 @@ func (b *Backend) getFullObject(ctx context.Context, req *backend.GetObjectReque
 		out.Reset()
 		reconstructed, err := b.reconstructObject(ctx, objectHash, shards, enc, size)
 		if err != nil {
-			return nil, backend.NewS3Error(backend.ErrInternalError,
+			return nil, model.NewS3Error(model.ErrInternalError,
 				fmt.Sprintf("reconstruction failed: %v", err), 500)
 		}
 		out = *reconstructed
 	}
 
 	// Create response with io.ReadCloser wrapper
-	return &backend.GetObjectResponse{
+	return &model.GetObjectResponse{
 		Body:        io.NopCloser(bytes.NewReader(out.Bytes())),
 		ContentType: "application/octet-stream",
 		Size:        int64(out.Len()),
@@ -266,17 +266,17 @@ func (b *Backend) getFullObject(ctx context.Context, req *backend.GetObjectReque
 }
 
 // HeadObject returns object metadata.
-func (b *Backend) HeadObject(ctx context.Context, bucket, key string) (*backend.HeadObjectResponse, error) {
-	if _, err := b.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: bucket}); err != nil {
+func (b *Backend) HeadObject(ctx context.Context, bucket, key string) (*model.HeadObjectResponse, error) {
+	if _, err := b.HeadBucket(ctx, &model.HeadBucketRequest{Bucket: bucket}); err != nil {
 		return nil, err
 	}
 
 	_, size, err := b.openInput(bucket, key)
 	if err != nil {
-		return nil, backend.ErrNoSuchKeyError.WithResource(key)
+		return nil, model.ErrNoSuchKeyError.WithResource(key)
 	}
 
-	return &backend.HeadObjectResponse{
+	return &model.HeadObjectResponse{
 		ContentType:   "application/octet-stream",
 		ContentLength: size,
 		ETag:          generateDistributedETag(bucket, key),
@@ -357,6 +357,6 @@ func (b *Backend) reconstructObject(ctx context.Context, objectHash [32]byte, sh
 
 // generateDistributedETag creates an ETag for a distributed object.
 func generateDistributedETag(bucket, key string) string {
-	hash := storage.GenObjectHash(bucket, key)
+	hash := model.ObjectHash(bucket, key)
 	return hex.EncodeToString(hash[:16])
 }
