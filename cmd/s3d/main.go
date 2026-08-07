@@ -1,3 +1,6 @@
+// Command s3d runs a predastore process: the cluster nodes selected by -nodes
+// and the S3 gateway in front of them. It is a thin entrypoint — flags,
+// environment, telemetry and a signal context, then predastore.Run.
 package main
 
 import (
@@ -13,11 +16,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mulgadc/predastore/clusterrun"
-	"github.com/mulgadc/predastore/internal/gateway"
+	"github.com/mulgadc/predastore"
 	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/masterkey"
-	"golang.org/x/sync/errgroup"
 
 	_ "github.com/mulgadc/predastore/internal/fipsboot"
 )
@@ -30,7 +31,7 @@ func main() {
 }
 
 func run() error {
-	config := flag.String("config", "", "S3 server configuration file (required)")
+	configPath := flag.String("config", "", "S3 server configuration file (required)")
 	tlsKey := flag.String("tls-key", "certs/server.key", "Path to TLS key")
 	tlsCert := flag.String("tls-cert", "certs/server.pem", "Path to TLS cert")
 	basePath := flag.String("base-path", "", "Base path for the S3 directory when undefined in the config file")
@@ -41,9 +42,9 @@ func run() error {
 	encryptionKeyFile := flag.String("encryption-key-file", "", "Path to 32-byte AES-256 master key for encryption at rest (required)")
 
 	flag.Parse()
-	applyEnvOverrides(config, tlsKey, tlsCert, port, nodes, encryptionKeyFile)
+	applyEnvOverrides(configPath, tlsKey, tlsCert, port, nodes, encryptionKeyFile)
 
-	if *config == "" {
+	if *configPath == "" {
 		flag.Usage()
 		return errors.New("missing required flag: -config")
 	}
@@ -71,9 +72,14 @@ func run() error {
 		}()
 	}
 
-	cfg := &gateway.Config{ConfigPath: *config, BasePath: *basePath}
-	if err := cfg.ReadConfig(); err != nil {
+	cfg, err := predastore.LoadConfig(*configPath)
+	if err != nil {
 		return fmt.Errorf("read config: %w", err)
+	}
+	// The flag is the fallback the config file overrides, not the other way
+	// round, so a config that pins its own base path stays portable.
+	if cfg.BasePath == "" {
+		cfg.BasePath = *basePath
 	}
 
 	localIDs, err := parseNodeIDs(*nodes, cfg)
@@ -85,39 +91,21 @@ func run() error {
 		return fmt.Errorf("load master key: %w", err)
 	}
 
-	rt, err := clusterrun.Build(cfg, localIDs, *tlsCert, *tlsKey, key)
-	if err != nil {
-		return fmt.Errorf("build cluster runtime: %w", err)
-	}
-
-	server, err := gateway.NewServer(gateway.ServerConfig{
-		ConfigPath:        *config,
-		Host:              *host,
-		Port:              *port,
-		TLSCert:           *tlsCert,
-		TLSKey:            *tlsKey,
-		BasePath:          *basePath,
-		Debug:             *debug,
-		EncryptionKeyFile: *encryptionKeyFile,
-		Clients:           rt.Clients,
+	node, err := predastore.New(predastore.Options{
+		Config:       cfg,
+		LocalNodeIDs: localIDs,
+		Host:         *host,
+		Port:         *port,
+		TLSCert:      *tlsCert,
+		TLSKey:       *tlsKey,
+		MasterKey:    key,
+		Debug:        *debug,
 	})
 	if err != nil {
-		rt.Close()
-		return fmt.Errorf("create server: %w", err)
+		return fmt.Errorf("build predastore node: %w", err)
 	}
 
-	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return rt.Run(gctx) })
-	g.Go(func() error {
-		// Serving before consensus settles would fail writes that would have
-		// succeeded a moment later; a timeout degrades rather than aborts,
-		// since the state client retries.
-		if err := rt.WaitReady(30 * time.Second); err != nil {
-			slog.Warn("No leader elected within timeout, serving anyway", "error", err)
-		}
-		return server.Run(gctx)
-	})
-	return g.Wait()
+	return node.Run(ctx)
 }
 
 // applyEnvOverrides lets the launcher configure s3d without rewriting flags.
@@ -146,9 +134,9 @@ func applyEnvOverrides(config, tlsKey, tlsCert *string, port *int, nodes, encryp
 
 // parseNodeIDs resolves the -nodes selection; empty selects every node in the
 // topology, running the whole cluster in one process.
-func parseNodeIDs(selection string, cfg *gateway.Config) ([]int, error) {
+func parseNodeIDs(selection string, cfg *predastore.Config) ([]int, error) {
 	if selection == "" {
-		return clusterrun.AllNodeIDs(cfg), nil
+		return cfg.AllNodeIDs(), nil
 	}
 	parts := strings.Split(selection, ",")
 	ids := make([]int, 0, len(parts))

@@ -54,8 +54,7 @@ func signTestReq(t *testing.T, req *http.Request, body []byte,
 // auth middleware (no real backend needed). Avoids reading any TOML file.
 func newAuthTestConfig() *Config {
 	return &Config{
-		Version: "1.0",
-		Region:  "ap-southeast-2",
+		Region: "ap-southeast-2",
 		Buckets: []handlers.BucketConfig{
 			{Name: "test-bucket01", Region: "ap-southeast-2", Type: "distributed", Public: true},
 			{Name: "private", Region: "ap-southeast-2", Type: "distributed", Public: false},

@@ -26,8 +26,8 @@ func TestServer_Run_BadCertificate(t *testing.T) {
 	s.cfg = ServerConfig{
 		Host:    "127.0.0.1",
 		Port:    0,
-		TLSCert: "testdata/invalid.toml",
-		TLSKey:  "testdata/invalid.toml",
+		TLSCert: "testdata/test-bucket01/test.txt",
+		TLSKey:  "testdata/test-bucket01/test.txt",
 	}
 
 	err := s.Run(context.Background())

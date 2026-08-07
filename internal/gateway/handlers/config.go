@@ -32,15 +32,16 @@ type Config struct {
 // TotalShards is the number of nodes an object is spread across.
 func (c Config) TotalShards() int { return c.DataShards + c.ParityShards }
 
-// BucketConfig is a bucket declared in the TOML config rather than created
-// through the API.
+// BucketConfig is a bucket declared in the configuration rather than created
+// through the API. Pathname, when set, is already absolute: the root package
+// resolves it while parsing.
 type BucketConfig struct {
-	Name      string `toml:"name"`
-	Region    string `toml:"region"`
-	Type      string `toml:"type"`
-	Pathname  string `toml:"pathname"`
-	Public    bool   `toml:"public"`
-	AccountID string `toml:"account_id"`
+	Name      string
+	Region    string
+	Type      string
+	Pathname  string
+	Public    bool
+	AccountID string
 }
 
 // Find returns the named config-defined bucket.

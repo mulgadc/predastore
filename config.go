@@ -1,0 +1,345 @@
+package predastore
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+
+	"github.com/mulgadc/predastore/internal/gateway"
+	"github.com/mulgadc/predastore/internal/gateway/auth"
+	"github.com/mulgadc/predastore/internal/gateway/handlers"
+	"github.com/mulgadc/predastore/internal/gateway/model"
+	"github.com/mulgadc/predastore/internal/topology"
+	"github.com/mulgadc/predastore/ratelimit"
+	"github.com/pelletier/go-toml/v2"
+)
+
+// The TOML file is this package's contract with operators, so this package
+// declares it rather than borrowing structs from the internals. Every type
+// below is mirrored onto an internal one by the converters at the bottom of
+// this file: an operator can name and build the whole surface, and the
+// internals stay free to change shape.
+
+// Role is the function a node performs in the cluster, as written under
+// [[node]].
+type Role string
+
+const (
+	// RoleShardStorage stores erasure-coded object shards.
+	RoleShardStorage Role = "shard-storage"
+	// RoleStateReplica participates in Raft consensus over global state.
+	RoleStateReplica Role = "state-replica"
+)
+
+// Host is one predastore process: the endpoint that owns a socket and a data
+// directory. Nodes pinned to it run inside that process.
+type Host struct {
+	ID int `toml:"id"`
+	// BindAddr is the local listen address; 0.0.0.0 binds all interfaces.
+	BindAddr string `toml:"bind_addr"`
+	// PublicAddr is the address other hosts dial, split from BindAddr for NAT
+	// and multi-homed machines.
+	PublicAddr string `toml:"public_addr"`
+	// DataDir is the on-disk root; nodes derive their subdirectories from node
+	// id and role. A relative path resolves against BasePath.
+	DataDir string `toml:"data_dir"`
+}
+
+// NodeConfig is a logical role pinned to a host, as written under [[node]]. It
+// is named for the file rather than for the cluster because Node is already
+// this package's running process.
+type NodeConfig struct {
+	ID     int  `toml:"id"`
+	HostID int  `toml:"host_id"`
+	Role   Role `toml:"role"`
+}
+
+// RS fixes the erasure code. The counts must match what the cluster was
+// written with, so they are configuration rather than a per-request choice.
+type RS struct {
+	Data   int `toml:"data"`
+	Parity int `toml:"parity"`
+}
+
+// Compaction tunes the shard store's background compactor. A zero interval
+// falls back to the store's default; compaction itself is never off, because
+// without it overwrite and delete churn never reclaims dead shards.
+type Compaction struct {
+	IntervalSeconds int `toml:"interval_seconds"`
+}
+
+// Bucket is a bucket declared in the config rather than created through the
+// API.
+type Bucket struct {
+	Name   string `toml:"name"`
+	Region string `toml:"region"`
+	Type   string `toml:"type"`
+	// Pathname is an on-disk directory backing the bucket; a relative path
+	// resolves against BasePath.
+	Pathname  string `toml:"pathname"`
+	Public    bool   `toml:"public"`
+	AccountID string `toml:"account_id"`
+}
+
+// AuthEntry is one config-defined service account, as it appears under
+// [[auth]].
+type AuthEntry struct {
+	AccessKeyID     string       `toml:"access_key_id"`
+	SecretAccessKey string       `toml:"secret_access_key"`
+	AccountID       string       `toml:"account_id"`
+	Policy          []PolicyRule `toml:"policy"`
+}
+
+// PolicyRule grants a config-defined account a set of actions on a bucket.
+type PolicyRule struct {
+	// Bucket is a bucket name or "*".
+	Bucket string `toml:"bucket"`
+	// Actions are S3 action names such as "s3:GetObject", or "s3:*".
+	Actions []string `toml:"actions"`
+}
+
+// IAMConfig enables IAM authentication backed by NATS KV, layered over the
+// config-defined accounts.
+type IAMConfig struct {
+	NATSUrl          string `toml:"nats_url"`
+	NATSToken        string `toml:"nats_token"`
+	MasterKeyPath    string `toml:"master_key_path"`
+	AccessKeysBucket string `toml:"access_keys_bucket"`
+}
+
+// Config is predastore's on-disk configuration: the cluster topology, the
+// erasure code, the config-defined buckets and the S3 credentials.
+//
+// The S3 listen address is not here. A `host` key would collide with the
+// [[host]] topology table, which TOML rejects outright, so the gateway's
+// address comes from Options instead.
+type Config struct {
+	Version string `toml:"version"`
+	Region  string `toml:"region"`
+
+	RS RS `toml:"rs"`
+
+	// Hosts are processes owning a socket and a data directory; Nodes are
+	// roles pinned to those hosts. Everything per-node derives from the host
+	// base and the node id.
+	Hosts []Host       `toml:"host"`
+	Nodes []NodeConfig `toml:"node"`
+
+	Compaction Compaction `toml:"compaction"`
+
+	Buckets []Bucket `toml:"buckets"`
+
+	// TODO: Move to IAM
+	Auth                  []AuthEntry `toml:"auth"`
+	AllowAnonymousListing bool        `toml:"allow_anonymous_listing"`
+	AllowAnonymousAccess  bool        `toml:"allow_anonymous_access"`
+
+	IAM *IAMConfig `toml:"iam"`
+
+	Debug bool `toml:"debug"`
+	// BasePath is the directory relative bucket and data paths resolve
+	// against. Empty means the working directory.
+	BasePath       string `toml:"base_path"`
+	DisableLogging bool   `toml:"disable_logging"`
+
+	RateLimit ratelimit.Config `toml:"ratelimit"`
+}
+
+// LoadConfig reads and validates a TOML configuration file. It touches no
+// filesystem beyond the file itself: paths are resolved and directories
+// created by New, so a caller may still override BasePath in between.
+func LoadConfig(path string) (*Config, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", path, err)
+	}
+
+	cfg := &Config{}
+	if err := toml.Unmarshal(raw, cfg); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+
+	// Every config-defined service account must have an account_id so that
+	// buckets it creates land with a real owner ID — otherwise the ownership
+	// check would compare callerAccountID against "".
+	for i, a := range cfg.Auth {
+		if a.AccountID == "" {
+			return nil, fmt.Errorf("auth entry %d (access_key_id=%q) missing account_id", i, a.AccessKeyID)
+		}
+	}
+
+	// The topology, when present, must be internally consistent before
+	// anything derives placement or addresses from it.
+	if len(cfg.Hosts) > 0 || len(cfg.Nodes) > 0 {
+		if err := topology.Validate(cfg.topologyHosts(), cfg.topologyNodes()); err != nil {
+			return nil, err
+		}
+	}
+
+	buckets := make([]Bucket, 0, len(cfg.Buckets))
+	for _, b := range cfg.Buckets {
+		// account_id is a hard requirement (the bucket-ownership check has
+		// nothing to compare against without it) — validated before the name
+		// so a malformed name cannot mask a missing owner.
+		if b.AccountID == "" {
+			return nil, fmt.Errorf("bucket %q missing account_id", b.Name)
+		}
+		// A bad name is dropped rather than fatal: the rest of the config is
+		// still serviceable and the operator gets a warning.
+		if err := model.IsValidBucketName(b.Name); err != nil {
+			slog.Warn("Invalid bucket name", "bucket", b.Name, "error", err)
+			continue
+		}
+		buckets = append(buckets, b)
+	}
+	cfg.Buckets = buckets
+
+	return cfg, nil
+}
+
+// AllNodeIDs returns every node id in the topology: the selection for a
+// process that runs the whole cluster over the in-process pipe.
+func (c *Config) AllNodeIDs() []int {
+	ids := make([]int, len(c.Nodes))
+	for i, n := range c.Nodes {
+		ids[i] = n.ID
+	}
+	return ids
+}
+
+// NodeIDsForHost returns the ids of the nodes pinned to hostID: the selection
+// for the process that owns that host's socket and data directory. Callers
+// select nodes by host rather than by id because the host is the unit an
+// operator places, and everything per-node derives from it.
+func (c *Config) NodeIDsForHost(hostID int) []int {
+	var ids []int
+	for _, n := range c.Nodes {
+		if n.HostID == hostID {
+			ids = append(ids, n.ID)
+		}
+	}
+	return ids
+}
+
+// basePath resolves BasePath to an absolute directory, since relative bucket
+// and data paths are resolved against it long after the working directory
+// stops being meaningful.
+func (c *Config) basePath() (string, error) {
+	if filepath.IsAbs(c.BasePath) {
+		return c.BasePath, nil
+	}
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("resolve base path: %w", err)
+	}
+	return filepath.Join(dir, c.BasePath), nil
+}
+
+func (c *Config) topologyHosts() []topology.Host {
+	hosts := make([]topology.Host, len(c.Hosts))
+	for i, h := range c.Hosts {
+		hosts[i] = topology.Host{
+			ID:         h.ID,
+			BindAddr:   h.BindAddr,
+			PublicAddr: h.PublicAddr,
+			DataDir:    h.DataDir,
+		}
+	}
+	return hosts
+}
+
+func (c *Config) topologyNodes() []topology.Node {
+	nodes := make([]topology.Node, len(c.Nodes))
+	for i, n := range c.Nodes {
+		nodes[i] = topology.Node{ID: n.ID, HostID: n.HostID, Role: topology.Role(n.Role)}
+	}
+	return nodes
+}
+
+// storageNodeIDs are the shard-storage nodes the gateway places shards across.
+func (c *Config) storageNodeIDs() []int {
+	var ids []int
+	for _, n := range c.Nodes {
+		if n.Role == RoleShardStorage {
+			ids = append(ids, n.ID)
+		}
+	}
+	return ids
+}
+
+// bucketConfigs converts the config-defined buckets, resolving relative
+// pathnames against basePath and creating the directories they name. A
+// directory that cannot be created is a warning, not a failure: only buckets
+// that are actually served from disk need one.
+func (c *Config) bucketConfigs(basePath string) []handlers.BucketConfig {
+	buckets := make([]handlers.BucketConfig, 0, len(c.Buckets))
+	for _, b := range c.Buckets {
+		out := handlers.BucketConfig{
+			Name:      b.Name,
+			Region:    b.Region,
+			Type:      b.Type,
+			Pathname:  b.Pathname,
+			Public:    b.Public,
+			AccountID: b.AccountID,
+		}
+		if out.Pathname != "" {
+			if !filepath.IsAbs(out.Pathname) {
+				out.Pathname = filepath.Join(basePath, out.Pathname)
+			}
+			if _, err := os.Stat(out.Pathname); errors.Is(err, os.ErrNotExist) {
+				if mkErr := os.MkdirAll(out.Pathname, 0750); mkErr != nil {
+					slog.Warn("Failed to create bucket directory", "path", out.Pathname, "error", mkErr)
+				}
+			}
+		}
+		buckets = append(buckets, out)
+	}
+	return buckets
+}
+
+func (c *Config) authEntries() []auth.Entry {
+	entries := make([]auth.Entry, len(c.Auth))
+	for i, a := range c.Auth {
+		rules := make([]auth.PolicyRule, len(a.Policy))
+		for j, p := range a.Policy {
+			rules[j] = auth.PolicyRule{Bucket: p.Bucket, Actions: p.Actions}
+		}
+		entries[i] = auth.Entry{
+			AccessKeyID:     a.AccessKeyID,
+			SecretAccessKey: a.SecretAccessKey,
+			AccountID:       a.AccountID,
+			Policy:          rules,
+		}
+	}
+	return entries
+}
+
+func (c *Config) iamConfig() *auth.IAMConfig {
+	if c.IAM == nil {
+		return nil
+	}
+	return &auth.IAMConfig{
+		NATSUrl:          c.IAM.NATSUrl,
+		NATSToken:        c.IAM.NATSToken,
+		MasterKeyPath:    c.IAM.MasterKeyPath,
+		AccessKeysBucket: c.IAM.AccessKeysBucket,
+	}
+}
+
+// gatewayConfig is the slice of the file the S3 frontend reads, with the
+// process-level debug override already folded in.
+func (c *Config) gatewayConfig(basePath string, debug bool) *gateway.Config {
+	return &gateway.Config{
+		Region:         c.Region,
+		RS:             gateway.RS{Data: c.RS.Data, Parity: c.RS.Parity},
+		Buckets:        c.bucketConfigs(basePath),
+		Auth:           c.authEntries(),
+		IAM:            c.iamConfig(),
+		Debug:          c.Debug || debug,
+		DisableLogging: c.DisableLogging,
+		RateLimit:      c.RateLimit,
+		StorageNodeIDs: c.storageNodeIDs(),
+	}
+}

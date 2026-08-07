@@ -2,6 +2,9 @@
 // hosts, which are processes owning a socket and a data directory, and
 // nodes, which are logical roles pinned to a host. It resolves node ids to
 // dialable transport addresses given the set of nodes running locally.
+//
+// These are pure domain types. The on-disk format belongs to the root package,
+// which converts its own tagged structs into these.
 package topology
 
 import (
@@ -26,24 +29,24 @@ const (
 // Host is one s3d process: the endpoint that owns a socket and a data
 // directory. Nodes pinned to it run inside that process as goroutines.
 type Host struct {
-	ID int `toml:"id"`
+	ID int
 	// BindAddr is the local listen address; 0.0.0.0 binds all interfaces.
-	BindAddr string `toml:"bind_addr"`
+	BindAddr string
 	// PublicAddr is the address other hosts dial, split from BindAddr for
 	// NAT and multi-homed machines.
-	PublicAddr string `toml:"public_addr"`
+	PublicAddr string
 	// DataDir is the on-disk root; nodes derive their subdirectories from
 	// node id and role.
-	DataDir string `toml:"data_dir"`
+	DataDir string
 }
 
 // Node is a logical role pinned to a host. Nodes sharing a host are
 // colocated and talk over the in-process pipe; nodes on different hosts
 // talk over the network.
 type Node struct {
-	ID     int  `toml:"id"`
-	HostID int  `toml:"host_id"`
-	Role   Role `toml:"role"`
+	ID     int
+	HostID int
+	Role   Role
 }
 
 // Validate checks the topology as a whole: ids unique, placements resolvable,

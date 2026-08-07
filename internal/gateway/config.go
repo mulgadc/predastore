@@ -2,99 +2,10 @@ package gateway
 
 import (
 	"errors"
-	"fmt"
-	"log/slog"
-	"os"
 	"path/filepath"
 
 	"github.com/mulgadc/predastore/internal/gateway/handlers"
-	"github.com/mulgadc/predastore/internal/gateway/model"
-	"github.com/mulgadc/predastore/internal/topology"
-	"github.com/pelletier/go-toml/v2"
 )
-
-func (s3 *Config) ReadConfig() (err error) {
-	if !filepath.IsAbs(s3.BasePath) {
-		dir, err := os.Getwd()
-		if err != nil {
-			slog.Warn("Error getting working directory", "error", err)
-			return err
-		}
-		s3.BasePath = filepath.Join(dir, s3.BasePath)
-	}
-
-	config, err := os.ReadFile(s3.ConfigPath)
-
-	if err != nil {
-		errorMsg := fmt.Sprintf("Error reading %s %s", s3.ConfigPath, err)
-		slog.Warn("Error reading config file", "error", errorMsg)
-		return errors.New(errorMsg)
-	}
-
-	err = toml.Unmarshal(config, &s3)
-
-	// Every config-defined service account must have an account_id so that
-	// buckets it creates land with a real owner ID — otherwise the ownership
-	// check would compare callerAccountID against "".
-	for i, a := range s3.Auth {
-		if a.AccountID == "" {
-			return fmt.Errorf("auth entry %d (access_key_id=%q) missing account_id", i, a.AccessKeyID)
-		}
-	}
-
-	// Cluster topology, when present, must be internally consistent before
-	// anything derives placement or addresses from it.
-	if len(s3.Hosts) > 0 || len(s3.ClusterNodes) > 0 {
-		if err := topology.Validate(s3.Hosts, s3.ClusterNodes); err != nil {
-			return err
-		}
-	}
-
-	var validBuckets = []handlers.BucketConfig{}
-
-	// Loop through the buckets, if a directory is relative, add the base path
-	for k, b := range s3.Buckets {
-		// account_id is a hard requirement (bucket-ownership check has nothing
-		// to compare against without it) — validated before bucket-name checks
-		// so a malformed name cannot mask a missing owner.
-		if b.AccountID == "" {
-			return fmt.Errorf("bucket %q missing account_id", b.Name)
-		}
-
-		// Check if the bucket name is valid
-		err := model.IsValidBucketName(b.Name)
-		if err != nil {
-			slog.Warn("Invalid bucket name", "bucket", b.Name, "error", err)
-			continue
-		}
-
-		// Create bucket directory if a pathname is configured
-		if b.Pathname != "" {
-			if !filepath.IsAbs(b.Pathname) {
-				s3.Buckets[k].Pathname = filepath.Join(s3.BasePath, b.Pathname)
-			}
-			if _, err := os.Stat(s3.Buckets[k].Pathname); os.IsNotExist(err) {
-				if mkErr := os.MkdirAll(s3.Buckets[k].Pathname, 0750); mkErr != nil {
-					slog.Warn("Failed to create bucket directory", "path", s3.Buckets[k].Pathname, "error", mkErr)
-				}
-			}
-		}
-
-		// Add to our valid buckets
-		validBuckets = append(validBuckets, s3.Buckets[k])
-	}
-
-	if err != nil {
-		errorMsg := fmt.Sprintf("Error parsing %s %s", s3.ConfigPath, err)
-		slog.Warn("Error parsing config file", "error", errorMsg)
-		return errors.New(errorMsg)
-	}
-
-	// Replace config with our valid buckets
-	s3.Buckets = validBuckets
-
-	return nil
-}
 
 // validatePublicBucketPermission checks if the request is allowed for a public bucket
 // Returns nil if the request is allowed, otherwise returns an error.

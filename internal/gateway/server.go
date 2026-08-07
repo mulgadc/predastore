@@ -59,11 +59,12 @@ func (c Clients) store() handlers.Store {
 }
 
 // ServerConfig is the process-supplied half of the gateway's configuration:
-// everything that arrives by CLI flag, environment variable or wiring rather
-// than from the TOML file. The caller builds it and hands it to NewServer.
+// everything that arrives by wiring rather than from the configuration file.
+// The caller builds it and hands it to NewServer.
 type ServerConfig struct {
-	// ConfigPath is the TOML configuration file; empty means no file is read.
-	ConfigPath string
+	// Config is the gateway's slice of the product configuration, already
+	// parsed and resolved by the caller. Required.
+	Config *Config
 
 	// Host and Port are the S3 listen address. Zero values default to
 	// 0.0.0.0:8443.
@@ -74,17 +75,10 @@ type ServerConfig struct {
 	TLSCert string
 	TLSKey  string
 
-	// BasePath is the base directory relative bucket and data paths resolve
-	// against.
-	BasePath string
-
-	// Debug forces debug logging on regardless of the TOML setting.
-	Debug bool
-
-	// EncryptionKeyFile is the 32-byte AES-256 master key for encryption at
-	// rest. Required, and supplied via CLI/env only, never TOML, so no
-	// plaintext secret path lives in the config file.
-	EncryptionKeyFile string
+	// MasterKey is the AES-256 key protecting data at rest. Required, and
+	// never sourced from the configuration file, so no plaintext secret path
+	// lives on disk beside the config.
+	MasterKey *masterkey.Key
 
 	// Clients are the cluster connections the gateway works through. The
 	// server only runs the S3 HTTPS frontend: no state or storage nodes are
@@ -120,9 +114,9 @@ type Server struct {
 	pprofFile *os.File
 }
 
-// NewServer builds the S3 gateway. It reads the TOML config, loads the master
-// key, resolves the credential chain and assembles the route table; nothing
-// listens until Run is called.
+// NewServer builds the S3 gateway: it resolves the credential chain and
+// assembles the route table over the supplied configuration and clients.
+// Nothing listens until Run is called.
 func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.Host == "" {
 		cfg.Host = defaultHost
@@ -132,33 +126,17 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	resolvePprof(&cfg)
 
-	config := &Config{
-		ConfigPath: cfg.ConfigPath,
-		Debug:      cfg.Debug,
-		BasePath:   cfg.BasePath,
+	if cfg.Config == nil {
+		return nil, fmt.Errorf("no configuration provided: set ServerConfig.Config")
 	}
-	if cfg.ConfigPath != "" {
-		if err := config.ReadConfig(); err != nil {
-			return nil, fmt.Errorf("failed to read config: %w", err)
-		}
-	}
-
-	// CLI/env flags override config file settings, so HIVE_PREDASTORE_DEBUG
-	// still wins over a config file with debug=false.
-	if cfg.Debug {
-		config.Debug = true
-	}
+	config := cfg.Config
 
 	// The master key is mandatory, and checked before anything expensive so a
 	// misconfigured launch fails immediately.
-	if cfg.EncryptionKeyFile == "" {
-		return nil, fmt.Errorf("encryption key file is required (use -encryption-key-file or ENCRYPTION_KEY_FILE)")
+	if cfg.MasterKey == nil {
+		return nil, fmt.Errorf("master key is required: set ServerConfig.MasterKey")
 	}
-	key, err := masterkey.Load(cfg.EncryptionKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("load master key: %w", err)
-	}
-	slog.Info("master key loaded", "fingerprint", key.Fingerprint)
+	slog.Info("master key loaded", "fingerprint", cfg.MasterKey.Fingerprint)
 
 	// Set the log level early so debug logs during the rest of init are visible.
 	otelsetup.SetDefaultJSONLogger(logLevel(config))
@@ -179,7 +157,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	s := newGateway(config, cfg.Clients.store(), cfg.Clients.Storage, credProv)
 	s.cfg = cfg
-	s.masterKey = key
+	s.masterKey = cfg.MasterKey
 	slog.Info("HTTP/2 server initialized - using net/http for connection multiplexing")
 
 	return s, nil
@@ -212,7 +190,7 @@ func newGateway(config *Config, store handlers.Store, shards *storage.Client, cr
 	}
 
 	s.setupMiddleware()
-	s.setupRoutes(shards, placement.NewRing(config.storageNodeIDs()))
+	s.setupRoutes(shards, placement.NewRing(config.StorageNodeIDs))
 	return s
 }
 

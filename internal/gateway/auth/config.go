@@ -2,13 +2,13 @@ package auth
 
 import "context"
 
-// Entry is one config-defined service account, as it appears under [[auth]] in
-// the TOML config.
+// Entry is one config-defined service account. The root package parses the
+// on-disk form and converts it to this.
 type Entry struct {
-	AccessKeyID     string       `toml:"access_key_id"`
-	SecretAccessKey string       `toml:"secret_access_key"`
-	AccountID       string       `toml:"account_id"`
-	Policy          []PolicyRule `toml:"policy"`
+	AccessKeyID     string
+	SecretAccessKey string
+	AccountID       string
+	Policy          []PolicyRule
 }
 
 // Action						Meaning
@@ -21,16 +21,16 @@ type Entry struct {
 
 // PolicyRule grants a config-defined account a set of actions on a bucket.
 type PolicyRule struct {
-	Bucket  string   `toml:"bucket"`  // Can be "*" or bucket name
-	Actions []string `toml:"actions"` // Like "s3:GetObject", "s3:PutObject", or "s3:*"
+	Bucket  string   // Can be "*" or bucket name
+	Actions []string // Like "s3:GetObject", "s3:PutObject", or "s3:*"
 }
 
 // IAMConfig configures IAM authentication via NATS KV.
 type IAMConfig struct {
-	NATSUrl          string `toml:"nats_url"`
-	NATSToken        string `toml:"nats_token"`
-	MasterKeyPath    string `toml:"master_key_path"`
-	AccessKeysBucket string `toml:"access_keys_bucket"`
+	NATSUrl          string
+	NATSToken        string
+	MasterKeyPath    string
+	AccessKeysBucket string
 }
 
 // contextKey namespaces the values the auth middleware attaches to a request.
