@@ -3,7 +3,7 @@ package auth_test
 import (
 	"testing"
 
-	"github.com/mulgadc/predastore/auth"
+	"github.com/mulgadc/predastore/pkg/auth"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

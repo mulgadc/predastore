@@ -12,7 +12,7 @@ import (
 	"github.com/mulgadc/predastore/internal/gateway/handlers"
 	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/topology"
-	"github.com/mulgadc/predastore/ratelimit"
+	"github.com/mulgadc/predastore/pkg/ratelimit"
 	"github.com/pelletier/go-toml/v2"
 )
 

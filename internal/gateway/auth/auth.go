@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	iamarn "github.com/mulgadc/predastore/auth"
+	iamarn "github.com/mulgadc/predastore/pkg/auth"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"github.com/nats-io/nats.go"

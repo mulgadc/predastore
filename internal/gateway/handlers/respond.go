@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/mulgadc/predastore/internal/gateway/auth"
 	"github.com/mulgadc/predastore/internal/gateway/model"
-	"github.com/mulgadc/predastore/otelsetup"
+	"github.com/mulgadc/predastore/pkg/otelsetup"
 	"github.com/mulgadc/predastore/pkg/sigv4"
 )
 

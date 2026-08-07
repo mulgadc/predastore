@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore"
-	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/masterkey"
+	"github.com/mulgadc/predastore/pkg/otelsetup"
 
 	_ "github.com/mulgadc/predastore/internal/fipsboot"
 )

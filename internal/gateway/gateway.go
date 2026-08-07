@@ -7,7 +7,7 @@ package gateway
 import (
 	"github.com/mulgadc/predastore/internal/gateway/auth"
 	"github.com/mulgadc/predastore/internal/gateway/handlers"
-	"github.com/mulgadc/predastore/ratelimit"
+	"github.com/mulgadc/predastore/pkg/ratelimit"
 )
 
 // RS fixes the erasure code the gateway places objects with.

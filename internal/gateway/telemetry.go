@@ -3,7 +3,7 @@ package gateway
 import (
 	"net/http"
 
-	"github.com/mulgadc/predastore/otelsetup"
+	"github.com/mulgadc/predastore/pkg/otelsetup"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )

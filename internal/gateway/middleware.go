@@ -10,10 +10,10 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/mulgadc/predastore/internal/gateway/auth"
 	"github.com/mulgadc/predastore/internal/gateway/handlers"
-	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
+	"github.com/mulgadc/predastore/pkg/otelsetup"
+	"github.com/mulgadc/predastore/pkg/ratelimit"
 	"github.com/mulgadc/predastore/pkg/sigv4"
-	"github.com/mulgadc/predastore/ratelimit"
 )
 
 // globalSigningRegion is the region clients sign S3's global operations against,

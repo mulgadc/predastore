@@ -14,7 +14,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-const httpTracerName = "github.com/mulgadc/predastore/otelsetup"
+const httpTracerName = "github.com/mulgadc/predastore/pkg/otelsetup"
 
 // statusRecorder captures the response status and body size for span and
 // metric attributes.

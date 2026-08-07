@@ -21,9 +21,9 @@ import (
 	"github.com/mulgadc/predastore/internal/state"
 	"github.com/mulgadc/predastore/internal/storage"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
-	"github.com/mulgadc/predastore/otelsetup"
 	"github.com/mulgadc/predastore/pkg/masterkey"
-	"github.com/mulgadc/predastore/ratelimit"
+	"github.com/mulgadc/predastore/pkg/otelsetup"
+	"github.com/mulgadc/predastore/pkg/ratelimit"
 )
 
 const (
