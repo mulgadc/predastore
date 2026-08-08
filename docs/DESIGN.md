@@ -42,34 +42,29 @@ Predastore is a distributed, S3-compatible, erasure-coded object store designed 
 
 ### Starting a Cluster
 
+One process runs one host, and every node the config pins to that host runs inside it. Start one process per `[[host]]`, each naming its own id:
+
 ```bash
-# Run full predastore - dev mode simulates a 3-node DB cluster and 5 QUIC shard nodes locally.
-./bin/s3d -config s3/tests/config/cluster.toml
+# Host 1, and every node pinned to it — gateway included.
+./bin/s3d -config cluster.toml -host 1 -encryption-key-file /etc/predastore/master.key
 
-# Run as a specific node (auto-launches local DB and QUIC servers for this node).
-./bin/s3d -config ./s3/tests/config/cluster.toml -node 1
-
-# Run only the database server.
-./bin/s3d -db -config ./s3/tests/config/cluster.toml -db-node 1
-
-# Run a specific QUIC shard node.
-./bin/s3d -config ./s3/tests/config/cluster.toml -node 2
+# Host 2, on another machine, reading the same config.
+./bin/s3d -config cluster.toml -host 2 -encryption-key-file /etc/predastore/master.key
 ```
+
+A config whose hosts are all one host is a single-process cluster. That is not a mode — it is the same command with fewer `[[host]]` entries.
 
 ### CLI Flags
 
 | Flag | Environment | Description |
 |------|-------------|-------------|
-| `-config` | `CONFIG` | Path to configuration file (default: config/server.toml) |
-| `-node` | `NODE` | QUIC shard node ID to run (-1 = dev mode, runs all locally) |
-| `-db` | `DB_ONLY=true` | Run only the distributed database server |
-| `-db-node` | `DB_NODE` | Database node ID to run (-1 = auto-detect or run all locally) |
-| `-port` | `PORT` | S3 API server port (default: 443) |
-| `-tls-cert` | - | Path to TLS certificate |
-| `-tls-key` | - | Path to TLS private key |
+| `-config` | `CONFIG` | Path to the configuration file (required) |
+| `-host` | `HOST` | ID of the `[[host]]` this process runs (required) |
 | `-encryption-key-file` | `ENCRYPTION_KEY_FILE` | Path to 32-byte AES-256 master key (required, mode `0600`) |
+| `-base-path` | - | Fallback for `base_path` when the config file does not set it |
+| `-debug` | - | Verbose debug logs regardless of the config file |
 
-See `s3/tests/config/cluster.toml` for a complete example configuration.
+The S3 port and the TLS keypair are configuration, not flags: the port is the gateway node's `port` and the keypair is its host's `tls_cert` / `tls_key`. See §15 for the `[[host]]` and `[[node]]` tables the config is built from.
 
 `quicd` (the standalone shard-node binary) accepts the same
 `-encryption-key-file` / `ENCRYPTION_KEY_FILE` and refuses to start without
@@ -744,31 +739,35 @@ Predastore uses a consistent hash ring with virtual nodes.
 
 Node-to-node communication uses QUIC for shard storage and retrieval. QUIC was chosen specifically to avoid TLS handshakes on every request while maintaining encryption.
 
+Every node owns one UDP socket, bound at construction from its host's `bind_addr` and its own `port`. Colocated nodes do not share a socket, so there is no ALPN accept router demultiplexing one and no two-part address naming a node within it: a QUIC address is a plain `host:port`, and the listener a node accepts on is its own. Nodes sharing a host bypass QUIC entirely and reach each other over the in-process pipe transport.
+
+Callers name peers by node id and never handle an address themselves. `rpc.Resolver` is the flat route table — `NodeID → Route{Transport, Addr}` — built once from the configuration, and it fails at construction if a route it must serve has no matching transport rather than at the dial it would have served. `rpc.ConnPool` keys connections by the same node id, so a connection dialed to a peer and one accepted from it are the same entry on either transport and a replica pair reuses one connection in both directions. An accepted connection is offered to the pool by `Donate`, which reverses the route table to name the peer behind it; a peer dialing from an ephemeral socket resolves to no node and is simply not pooled. When both ends open at once, both keep the connection the lower of the two node ids dialed and close the other, which each side computes from the same two ids.
+
 ## Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                           CLIENT SIDE                                    │
 │                                                                          │
-│  Distributed Backend                                                     │
+│  storage.Client / state.Client                                           │
 │       │                                                                  │
 │       ▼                                                                  │
-│  DialPooled("node1:9991")                                               │
+│  pool.Dial(ctx, NodeID(3))                                              │
 │       │                                                                  │
 │       ▼                                                                  │
 │  ┌─────────────────────────────────────────────────────────────────┐    │
-│  │  Connection Pool (DefaultPool)                                   │    │
+│  │  rpc.ConnPool (one per dialing node)                             │    │
 │  │  ┌─────────────────────────────────────────────────────────┐    │    │
-│  │  │  map[addr]*pooledConn                                   │    │    │
+│  │  │  map[NodeID]pooled + Resolver route table               │    │    │
 │  │  │                                                          │    │    │
-│  │  │  "node1:9991" → *Client{conn: quic.Conn} ─┐             │    │    │
-│  │  │  "node2:9991" → *Client{conn: quic.Conn}  │ REUSED!     │    │    │
-│  │  │  "node3:9991" → *Client{conn: quic.Conn}  │ (no TLS)    │    │    │
+│  │  │  NodeID(2) → pipe conn (colocated peer)  ─┐             │    │    │
+│  │  │  NodeID(3) → quic conn, dialed by us      │ REUSED!     │    │    │
+│  │  │  NodeID(4) → quic conn, accepted          │ (no TLS)    │    │    │
 │  │  └──────────────────────────────────────────┼──────────────┘    │    │
 │  └─────────────────────────────────────────────┼───────────────────┘    │
 │                                                │                         │
 │       ▼                                        │                         │
-│  client.Put(ctx, putReq, shardData)            │                         │
+│  rpc.OpenStream(ctx, cli, node, op, hdr)       │                         │
 │       │                                        │                         │
 │       ▼                                        │                         │
 │  conn.OpenStreamSync() ←───────────────────────┘                        │
@@ -794,6 +793,9 @@ Node-to-node communication uses QUIC for shard storage and retrieval. QUIC was c
 │                                                                          │
 │  listener.Accept() → quic.Conn (TLS handshake HERE, ONCE per client)   │
 │       │                                                                  │
+│       ▼                                                                  │
+│  pool.Donate(conn) → the peer is named, so the connection is reused     │
+│       │              for outbound streams too; Evict releases it        │
 │       ▼                                                                  │
 │  serveConn(conn) - runs forever for this connection                     │
 │       │                                                                  │
@@ -823,7 +825,7 @@ Node-to-node communication uses QUIC for shard storage and retrieval. QUIC was c
 
 | Step | Operation | Cost |
 |------|-----------|------|
-| 1 | `DialPooled("node:9991")` | **O(1) map lookup** - no TLS! |
+| 1 | `pool.Dial(ctx, nodeID)` | **O(1) map lookup** - no TLS! |
 | 2 | Check connection alive | `conn.Context().Err() == nil` |
 | 3 | `conn.OpenStreamSync()` | **Very fast** - just assigns stream ID |
 | 4 | Write request + data | Network I/O |
@@ -836,20 +838,24 @@ Node-to-node communication uses QUIC for shard storage and retrieval. QUIC was c
 
 1. **First connection to a node** - unavoidable
 2. **Connection died** (idle timeout, network error) - re-establishes
-3. **Pool cleanup** evicted idle connection (>2 min idle)
+3. **Connection evicted** by either side's close path
+
+A colocated peer costs no handshake at all: its route names the pipe transport.
 
 ## Connection Pool Configuration
 
 ```go
-// pool.go
+// internal/transport/quic.go — dialQUICConfig()
 &quic.Config{
-    HandshakeIdleTimeout: 5 * time.Second,
-    KeepAlivePeriod:      15 * time.Second,
-    MaxIdleTimeout:       120 * time.Second,  // Connection stays alive
+    HandshakeIdleTimeout:  5 * time.Second,
+    KeepAlivePeriod:       15 * time.Second,
+    MaxIdleTimeout:        60 * time.Second,   // Connection stays alive
+    MaxIncomingStreams:    1000,               // Matches the listen side
+    MaxIncomingUniStreams: 1000,
 }
-
-// Cleanup: every 30s, evict connections idle > 2 minutes
 ```
+
+The pool runs no idle sweeper. A connection leaves through `Evict`, called by whichever side observes it die, or through `Close` when the node shuts down.
 
 ## Stream Closing (Critical for Connection Reuse)
 
@@ -861,7 +867,7 @@ s.CancelRead(0)  // Close read side (tells peer we're done reading)
 s.Close()        // Close write side (sends FIN)
 ```
 
-**Warning**: Failing to close streams causes stream exhaustion. With ~100 concurrent stream limit, unclosed streams will block `OpenStreamSync()`.
+**Warning**: Failing to close streams causes stream exhaustion. Both the dial and the listen side cap a connection at 1000 concurrent incoming streams; unclosed streams will block `OpenStreamSync()` once that cap is reached. The caps match deliberately — a reused connection is dialed by one side and accepted by the other, so a lower dial-side cap would silently throttle it.
 
 ## Protocol Format
 
@@ -913,10 +919,14 @@ s.Close()        // Close write side (sends FIN)
 
 | File | Purpose |
 |------|---------|
-| `quic/quicclient/pool.go` | Connection pooling, reuse logic |
-| `quic/quicclient/quicclient.go` | Client operations (Put, Get, Delete) |
-| `quic/quicserver/server.go` | Server accept loop, stream handling |
-| `quic/quicproto/proto.go` | Header format, read/write helpers |
+| `internal/transport/transport.go` | `Transport`, `Listener`, `Conn`, `Stream`, the shared `Addr` |
+| `internal/transport/quic.go` | One bound UDP socket per node: dial, listen, close |
+| `internal/transport/pipe.go` | In-process transport for colocated nodes |
+| `internal/rpc/resolver.go` | `NodeID → Route{Transport, Addr}`, and `NodeAt` reversing it |
+| `internal/rpc/pool.go` | `ConnPool`: one connection per peer node, donation, tiebreak |
+| `internal/rpc/client.go` | Stream opening and the per-stream header framing |
+| `internal/rpc/server.go` | `Mux`, accept loop, connection donation, stream dispatch |
+| `internal/rpc/rpc.go` | `Opcode` and the `Header` codec contract |
 
 ---
 
@@ -1158,7 +1168,10 @@ All communication uses TLS:
   pair; peers verify the server cert against the OS trust store
 - The QUIC RPC transport between s3d and shard nodes verifies the server
   cert against the OS trust store (no `InsecureSkipVerify`)
-- Certificate paths: `-tls-cert` and `-tls-key` flags
+- Certificate paths come from the `[[host]]` table (`tls_cert` / `tls_key`),
+  shared by the S3 API and every node's QUIC socket on that host. TLS is
+  host-scoped by design: SANs carry no port, so nodes colocated on a machine
+  are indistinguishable to TLS. Per-node (mTLS) client auth is not implemented.
 
 ## Authentication
 
@@ -1197,38 +1210,29 @@ construction. Operationally:
 
 # 14. Deployment Modes
 
+One process runs one host. `-host` selects the `[[host]]` this process is, and the process runs every `[[node]]` pinned to it — the S3 gateway among them — as goroutines under a single context. There is no separate dev mode and no per-node binary: `predastore.Run(ctx, opts)` builds the nodes, serves until the context is cancelled or a node fails, then drains what it started.
+
 ## Development Mode (Single Host)
 
-When all nodes have the same host address, s3d runs everything locally:
+Put every node on one host and the whole cluster is one process. Its nodes reach each other over the in-process pipe, so it opens no network socket for rpc and needs no TLS keypair at all:
 
 ```bash
-# Launches embedded DB + all QUIC nodes as goroutines
-./bin/s3d -config ./s3/tests/config/cluster.toml
+./bin/s3d -config cluster.toml -host 1 -encryption-key-file /etc/predastore/master.key
 ```
 
 ## Production Mode (Multi-Host)
 
-For production, run separate processes on each host:
+Spread the nodes across hosts and run the same command per machine, each naming its own host id. Which transport a pair uses follows from the config: same host is a pipe, different hosts is QUIC. Nothing in the deployment names a transport.
 
 ```bash
-# Host 1: Database leader + QUIC node 0
-./bin/s3d -config cluster.toml -node 0 -db-node 1
+# Host 1: gateway + state replica
+./bin/s3d -config cluster.toml -host 1 -encryption-key-file /etc/predastore/master.key
 
-# Host 2: Database follower + QUIC node 1
-./bin/s3d -config cluster.toml -node 1 -db-node 2
+# Host 2: shard storage + state replica
+./bin/s3d -config cluster.toml -host 2 -encryption-key-file /etc/predastore/master.key
 
-# Host 3: Database follower + QUIC node 2
-./bin/s3d -config cluster.toml -node 2 -db-node 3
-```
-
-Or run database nodes separately:
-
-```bash
-# DB-only nodes (no QUIC shards)
-./bin/s3d -db -config cluster.toml -db-node 1
-
-# QUIC-only nodes (connect to DB cluster)
-./bin/s3d -config cluster.toml -node 0
+# Host 3: shard storage + state replica
+./bin/s3d -config cluster.toml -host 3 -encryption-key-file /etc/predastore/master.key
 ```
 
 ## Default Embedded Database
@@ -1306,27 +1310,63 @@ port = 6660
 
 **Important**: If `host` is `0.0.0.0` and `advertise_host` is not set, it defaults to `127.0.0.1`. For multi-machine clusters, always set `advertise_host` to the reachable IP address.
 
-## Shard Node Configuration
+## Host and Node Configuration
+
+The cluster is two tables. `[[host]]` is a machine: one s3d process, one data directory, one TLS identity. `[[node]]` is a role pinned to a host, running inside that host's process on its own port.
 
 ```toml
-[[nodes]]
-id = 0
-host = "192.168.1.20"
-port = 9990
-path = "/data/shards/node-0/"
-
-[[nodes]]
+[[host]]
 id = 1
-host = "192.168.1.21"
-port = 9991
-path = "/data/shards/node-1/"
+bind_addr = "0.0.0.0"          # local listen address, no port
+public_addr = "10.11.12.1"     # what peers dial, no port
+data_dir = "/data/predastore/host-1"
+tls_cert = "/etc/predastore/server.pem"
+tls_key  = "/etc/predastore/server.key"
 
-[[nodes]]
+[[host]]
 id = 2
-host = "192.168.1.22"
-port = 9992
-path = "/data/shards/node-2/"
+bind_addr = "0.0.0.0"
+public_addr = "10.11.12.2"
+data_dir = "/data/predastore/host-2"
+tls_cert = "/etc/predastore/server.pem"
+tls_key  = "/etc/predastore/server.key"
+
+[[node]]
+id = 1
+host_id = 1
+role = "gateway"               # S3 frontend
+port = 443                     # the S3 port
+
+[[node]]
+id = 2
+host_id = 1
+role = "state-replica"
+port = 6661
+
+[[node]]
+id = 3
+host_id = 2
+role = "shard-storage"
+port = 6662
 ```
+
+### Addresses
+
+Host addresses carry no port. A node's port comes from its own `[[node]]` entry and must be unique within its host, because a node binds its own socket rather than sharing the host's. `bind_addr` is where the host's sockets listen — `0.0.0.0` for every interface — and `public_addr` is the literal address a peer observes, which is also what an accepted connection is matched against when the pool decides whether to keep it. A hostname or a NAT between hosts resolves to nothing there and the connection is simply not pooled.
+
+### Roles
+
+| Role | Purpose |
+|------|---------|
+| `gateway` | Serves the S3 API. Its `port` is the S3 port; its rpc transports bind ephemerally, since nothing dials a gateway and it therefore listens on no rpc socket. |
+| `state-replica` | Participates in Raft consensus over global state. Dials its peers and is dialed by them, so one pooled connection serves both directions. |
+| `shard-storage` | Stores erasure-coded shards. Never dials, so it holds no pool. |
+
+The gateway is a node with a role, not a per-host special case. A host may declare at most one — two would be two S3 endpoints answering for one machine — and a host declaring none simply serves no S3 API.
+
+### TLS
+
+`tls_cert` / `tls_key` belong to the host, not the node, and serve both the S3 API and the QUIC rpc sockets of every node on it. Host granularity is what TLS can express — SANs carry no port, so two nodes on one machine are indistinguishable to TLS regardless. Both fields are optional: a cluster whose nodes all sit on one host opens no QUIC socket and needs no keypair.
 
 ## Reed-Solomon Configuration
 
@@ -1418,8 +1458,8 @@ err := state.Scan("objects", []byte("arn:aws:s3:::mybucket/"), func(key, value [
 | `bufLen` | 32 fragments | Per-shard writer/reader window: amortises `WriteAt` / `ReadAt` syscalls (≈ 256 KiB RAM per active stream) |
 | RS schemes | RS(2,1) / RS(3,2) | Erasure coding configuration |
 | Hash ring vnodes | 64–256 | Virtual nodes for distribution |
-| QUIC concurrent streams | 32–256 | Per-connection stream limit |
-| QUIC flow-control windows | see `quic/quicconf` | Receive window sizes (stream and connection) |
+| QUIC concurrent streams | 1000 | Per-connection incoming stream limit, identical on the dial and listen sides |
+| QUIC flow-control windows | see `internal/transport/quic.go` | Receive window sizes (stream and connection) |
 
 ---
 
