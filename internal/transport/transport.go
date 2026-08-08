@@ -61,7 +61,7 @@ type Listener interface {
 }
 
 // ConnErrorCode is reported to the peer when a connection is closed with a
-// reason; see the transport's ConnCode constants.
+// reason. ConnCodeShutdown is the only one a transport sends.
 type ConnErrorCode uint64
 
 type Conn interface {

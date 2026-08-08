@@ -241,11 +241,11 @@ func (l *quicListener) Addr() net.Addr { return l.addr }
 // Close stops accepting and closes whatever is still queued: nothing will
 // read those connections, and the peer is told why.
 func (l *quicListener) Close() error {
-	l.ln.Close()
+	err := l.ln.Close()
 	for {
-		conn, err := l.ln.Accept(context.Background())
-		if err != nil {
-			return nil
+		conn, acceptErr := l.ln.Accept(context.Background())
+		if acceptErr != nil {
+			return err
 		}
 		conn.CloseWithError(quic.ApplicationErrorCode(ConnCodeShutdown), "listener closed")
 	}
