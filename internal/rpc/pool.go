@@ -26,6 +26,14 @@ func WithDialTimeout(d time.Duration) PoolOption {
 	return func(p *ConnPool) { p.dialTimeout = d }
 }
 
+// pooled is a connection and which side opened it. Both ends of a pair know
+// both node ids, so the side that opened one is all the extra input the
+// simultaneous-open tiebreak needs.
+type pooled struct {
+	conn   transport.Conn
+	dialed bool
+}
+
 // ConnPool holds one connection per peer node, whichever side opened it, and
 // owns every connection it holds: nothing else closes one, and a connection
 // leaves only through Evict or Close.
@@ -39,7 +47,7 @@ type ConnPool struct {
 	sf          singleflight.Group
 
 	mu     sync.RWMutex
-	conns  map[config.NodeID]transport.Conn
+	conns  map[config.NodeID]pooled
 	closed bool
 }
 
@@ -49,7 +57,7 @@ func NewConnPool(source config.NodeID, res *Resolver, opts ...PoolOption) *ConnP
 		source:      source,
 		res:         res,
 		dialTimeout: defaultDialTimeout,
-		conns:       make(map[config.NodeID]transport.Conn),
+		conns:       make(map[config.NodeID]pooled),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -61,25 +69,13 @@ func NewConnPool(source config.NodeID, res *Resolver, opts ...PoolOption) *ConnP
 // The transport comes off the route, so dialing is a table lookup and nothing
 // else; concurrent dials to one peer collapse onto a single connection.
 func (p *ConnPool) Dial(ctx context.Context, remote config.NodeID) (transport.Conn, error) {
-	p.mu.RLock()
-	conn, closed := p.conns[remote], p.closed
-	p.mu.RUnlock()
-	if closed {
-		return nil, ErrPoolClosed
-	}
-	if conn != nil && conn.Context().Err() == nil {
-		return conn, nil
+	if conn, err := p.held(remote); conn != nil || err != nil {
+		return conn, err
 	}
 
 	ch := p.sf.DoChan(strconv.FormatUint(uint64(remote), 10), func() (any, error) {
-		p.mu.RLock()
-		conn, closed := p.conns[remote], p.closed
-		p.mu.RUnlock()
-		if closed {
-			return nil, ErrPoolClosed
-		}
-		if conn != nil && conn.Context().Err() == nil {
-			return conn, nil
+		if conn, err := p.held(remote); conn != nil || err != nil {
+			return conn, err
 		}
 
 		route, err := p.res.Route(remote)
@@ -88,23 +84,22 @@ func (p *ConnPool) Dial(ctx context.Context, remote config.NodeID) (transport.Co
 		}
 
 		dialCtx, cancelTimeout := context.WithTimeout(context.Background(), p.dialTimeout)
-		conn, err = route.Transport.Dial(dialCtx, route.Addr)
+		conn, err := route.Transport.Dial(dialCtx, route.Addr)
 		cancelTimeout()
 		if err != nil {
 			return nil, fmt.Errorf("dial node %d: %w", remote, err)
 		}
 
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		if p.closed {
+		// Losing the tiebreak leaves the peer's connection in the pool and this
+		// one owned here, so it is closed rather than returned.
+		kept, ok := p.insert(remote, conn, true)
+		if !ok {
 			conn.Close()
+		}
+		if kept == nil {
 			return nil, ErrPoolClosed
 		}
-		if stale := p.conns[remote]; stale != nil {
-			stale.Close()
-		}
-		p.conns[remote] = conn
-		return conn, nil
+		return kept, nil
 	})
 
 	select {
@@ -126,23 +121,52 @@ func (p *ConnPool) Dial(ctx context.Context, remote config.NodeID) (transport.Co
 
 // Donate offers an accepted connection to the pool, which takes ownership when
 // its remote names a node. A false return leaves the caller owning it: a peer
-// dialing from an ephemeral socket names no node, so nothing would ever ask.
+// dialing from an ephemeral socket names no node, so nothing would ever ask,
+// and a donation that loses the tiebreak is still the peer's to use inbound.
 func (p *ConnPool) Donate(c transport.Conn) bool {
 	remote, ok := p.res.NodeAt(c.RemoteAddr())
 	if !ok {
 		return false
 	}
+	_, ok = p.insert(remote, c, false)
+	return ok
+}
 
+// held is the live connection to a node, if the pool holds one.
+func (p *ConnPool) held(remote config.NodeID) (transport.Conn, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.closed {
+		return nil, ErrPoolClosed
+	}
+	if e, ok := p.conns[remote]; ok && e.conn.Context().Err() == nil {
+		return e.conn, nil
+	}
+	return nil, nil
+}
+
+// insert offers a connection to a peer's slot and reports what the pool holds
+// afterwards, plus whether that is c. When both ends open at once each keeps
+// the connection the lower node id dialed, which they compute alike; anything
+// else is last-write-wins. A displaced connection is closed, a rejected one is
+// left to its caller.
+func (p *ConnPool) insert(remote config.NodeID, c transport.Conn, dialed bool) (transport.Conn, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
-		return false
+		return nil, false
 	}
-	if stale := p.conns[remote]; stale != nil && stale != c {
-		stale.Close()
+
+	e, ok := p.conns[remote]
+	if ok && e.conn != c {
+		preferred := p.source < remote
+		if e.dialed != dialed && e.conn.Context().Err() == nil && e.dialed == preferred {
+			return e.conn, false
+		}
+		e.conn.Close()
 	}
-	p.conns[remote] = c
-	return true
+	p.conns[remote] = pooled{conn: c, dialed: dialed}
+	return c, true
 }
 
 // Evict drops a connection and closes it. It is the only way a connection
@@ -151,7 +175,7 @@ func (p *ConnPool) Donate(c transport.Conn) bool {
 func (p *ConnPool) Evict(c transport.Conn) {
 	p.mu.Lock()
 	for remote, held := range p.conns {
-		if held == c {
+		if held.conn == c {
 			delete(p.conns, remote)
 			break
 		}
@@ -170,12 +194,12 @@ func (p *ConnPool) Close() error {
 	}
 	p.closed = true
 	conns := p.conns
-	p.conns = make(map[config.NodeID]transport.Conn)
+	p.conns = make(map[config.NodeID]pooled)
 	p.mu.Unlock()
 
 	errs := make([]error, 0, len(conns))
-	for _, conn := range conns {
-		if err := conn.Close(); err != nil {
+	for _, e := range conns {
+		if err := e.conn.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
