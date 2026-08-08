@@ -412,6 +412,8 @@ func dialQUICConfig() *quic.Config {
 		HandshakeIdleTimeout:           5 * time.Second,
 		KeepAlivePeriod:                15 * time.Second,
 		MaxIdleTimeout:                 60 * time.Second,
+		MaxIncomingStreams:             1000,
+		MaxIncomingUniStreams:          1000,
 		InitialStreamReceiveWindow:     initialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         maxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: initialConnectionReceiveWindow,
