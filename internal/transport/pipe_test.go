@@ -7,19 +7,39 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// dialedPair returns a connected conn pair plus the listener, with cleanup
-// registered. Each test uses a unique name: the pipe registry is global.
-func dialedPair(t *testing.T, name string) (dial, accepted Conn, ln Listener) {
+// testPort hands out a distinct port per transport: the pipe registry is
+// process-wide, so two tests binding the same name would collide.
+var testPort atomic.Int64
+
+func nextPort() int { return int(testPort.Add(1)) }
+
+// bindPipe binds a pipe transport on the given port, with cleanup registered.
+func bindPipe(t *testing.T, port int) *PipeTransport {
+	t.Helper()
+	pt := NewPipeTransport("127.0.0.1", port)
+	t.Cleanup(func() { pt.Close() })
+	return pt
+}
+
+func testTransport(t *testing.T) *PipeTransport {
+	t.Helper()
+	return bindPipe(t, nextPort())
+}
+
+// dialedPair returns a connected conn pair plus the transports that own the
+// two ends, with cleanup registered.
+func dialedPair(t *testing.T) (lt, dt *PipeTransport, dial, accepted Conn) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 
-	lt := NewPipeTransport()
-	ln, err := lt.Listen(newPipeAddr(name))
+	lt = testTransport(t)
+	ln, err := lt.Listen()
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -36,8 +56,8 @@ func dialedPair(t *testing.T, name string) (dial, accepted Conn, ln Listener) {
 		acceptedCh <- c
 	}()
 
-	dt := NewPipeTransport()
-	dial, err = dt.Dial(ctx, ln.Addr())
+	dt = testTransport(t)
+	dial, err = dt.Dial(ctx, lt.Addr())
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
 	}
@@ -47,7 +67,7 @@ func dialedPair(t *testing.T, name string) (dial, accepted Conn, ln Listener) {
 		t.Fatalf("Accept: %v", err)
 	}
 	t.Cleanup(func() { dial.Close() })
-	return dial, accepted, ln
+	return lt, dt, dial, accepted
 }
 
 // streamPair opens a stream from dc and accepts it on ac.
@@ -79,52 +99,44 @@ func streamPair(t *testing.T, dc, ac Conn) (opened, accepted Stream) {
 	return opened, accepted
 }
 
-func TestPipeResolveAddr(t *testing.T) {
-	addr, err := ResolveAddr(string(NetworkPipe), "node-1")
-	if err != nil {
-		t.Fatalf("ResolveAddr: %v", err)
-	}
-	if addr.Network() != "pipe" || addr.String() != "node-1" {
-		t.Fatalf("got %s/%s, want pipe/node-1", addr.Network(), addr.String())
-	}
-
-	if _, err := ResolveAddr("bogus", "x"); !errors.As(err, new(UnknownNetworkError)) {
-		t.Fatalf("unknown network: got %v, want UnknownNetworkError", err)
-	}
-}
-
 func TestPipeDialNoListener(t *testing.T) {
-	pt := NewPipeTransport()
-	_, err := pt.Dial(context.Background(), newPipeAddr("dial-no-listener"))
+	pt := testTransport(t)
+	_, err := pt.Dial(context.Background(), NewAddr(NetworkPipe, "127.0.0.1:65000"))
 	if !errors.Is(err, ErrNoListener) {
 		t.Fatalf("got %v, want ErrNoListener", err)
 	}
 }
 
 func TestPipeDialNilAddr(t *testing.T) {
-	pt := NewPipeTransport()
+	pt := testTransport(t)
 	if _, err := pt.Dial(context.Background(), nil); !errors.Is(err, ErrMissingAddr) {
 		t.Fatalf("got %v, want ErrMissingAddr", err)
 	}
 }
 
-func TestPipeListenTwiceSameName(t *testing.T) {
-	a := NewPipeTransport()
-	ln, err := a.Listen(newPipeAddr("listen-twice"))
+func TestPipeListenTwiceSameAddr(t *testing.T) {
+	port := nextPort()
+	a := bindPipe(t, port)
+	ln, err := a.Listen()
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
 	defer ln.Close()
 
-	b := NewPipeTransport()
-	if _, err := b.Listen(newPipeAddr("listen-twice")); !errors.Is(err, ErrAddrAlreadyInUse) {
-		t.Fatalf("got %v, want ErrAddrAlreadyInUse", err)
+	// A second transport bound to the same name cannot take the registry entry.
+	if _, err := bindPipe(t, port).Listen(); !errors.Is(err, ErrAddrAlreadyInUse) {
+		t.Fatalf("other transport: got %v, want ErrAddrAlreadyInUse", err)
+	}
+	// Nor may one transport listen twice.
+	if _, err := a.Listen(); !errors.Is(err, ErrAddrAlreadyInUse) {
+		t.Fatalf("same transport: got %v, want ErrAddrAlreadyInUse", err)
 	}
 }
 
 func TestPipeListenerCloseUnblocksAccept(t *testing.T) {
-	pt := NewPipeTransport()
-	ln, err := pt.Listen(newPipeAddr("close-unblocks-accept"))
+	port := nextPort()
+	pt := bindPipe(t, port)
+	ln, err := pt.Listen()
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -149,14 +161,14 @@ func TestPipeListenerCloseUnblocksAccept(t *testing.T) {
 	}
 
 	// The name is free again after close.
-	if _, err := NewPipeTransport().Listen(newPipeAddr("close-unblocks-accept")); err != nil {
+	if _, err := bindPipe(t, port).Listen(); err != nil {
 		t.Fatalf("relisten after close: %v", err)
 	}
 }
 
 func TestPipeTransportCloseClosesListener(t *testing.T) {
-	pt := NewPipeTransport()
-	ln, err := pt.Listen(newPipeAddr("transport-close"))
+	pt := testTransport(t)
+	ln, err := pt.Listen()
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -167,29 +179,34 @@ func TestPipeTransportCloseClosesListener(t *testing.T) {
 	if _, err := ln.Accept(ctx); !errors.Is(err, ErrListenerClosed) {
 		t.Fatalf("Accept: got %v, want ErrListenerClosed", err)
 	}
-	if _, err := pt.Listen(newPipeAddr("transport-close-again")); !errors.Is(err, ErrTransportClosed) {
+	if _, err := pt.Listen(); !errors.Is(err, ErrTransportClosed) {
 		t.Fatalf("Listen: got %v, want ErrTransportClosed", err)
 	}
-	if _, err := pt.Dial(context.Background(), newPipeAddr("x")); !errors.Is(err, ErrTransportClosed) {
+	if _, err := pt.Dial(context.Background(), NewAddr(NetworkPipe, "127.0.0.1:65000")); !errors.Is(err, ErrTransportClosed) {
 		t.Fatalf("Dial: got %v, want ErrTransportClosed", err)
 	}
 }
 
 func TestPipeConnAddrs(t *testing.T) {
-	dial, accepted, ln := dialedPair(t, "conn-addrs")
-	if got := dial.RemoteAddr().String(); got != ln.Addr().String() {
-		t.Fatalf("dial remote = %s, want %s", got, ln.Addr())
+	lt, dt, dial, accepted := dialedPair(t)
+	if got := dial.LocalAddr().String(); got != dt.Addr().String() {
+		t.Fatalf("dial local = %s, want %s", got, dt.Addr())
 	}
-	if got := accepted.LocalAddr().String(); got != ln.Addr().String() {
-		t.Fatalf("accepted local = %s, want %s", got, ln.Addr())
+	if got := dial.RemoteAddr().String(); got != lt.Addr().String() {
+		t.Fatalf("dial remote = %s, want %s", got, lt.Addr())
 	}
-	if got := accepted.RemoteAddr().String(); got != dial.LocalAddr().String() {
-		t.Fatalf("accepted remote = %s, want %s", got, dial.LocalAddr())
+	if got := accepted.LocalAddr().String(); got != lt.Addr().String() {
+		t.Fatalf("accepted local = %s, want %s", got, lt.Addr())
+	}
+	// The accepted end must name the dialer's own bound source, so the peer
+	// is identifiable from the connection alone.
+	if got := accepted.RemoteAddr().String(); got != dt.Addr().String() {
+		t.Fatalf("accepted remote = %s, want dialer source %s", got, dt.Addr())
 	}
 }
 
 func TestPipeStreamRoundTrip(t *testing.T) {
-	dc, ac, _ := dialedPair(t, "stream-roundtrip")
+	_, _, dc, ac := dialedPair(t)
 	opened, accepted := streamPair(t, dc, ac)
 
 	// Reader must run concurrently: pipe writes rendezvous with reads.
@@ -226,7 +243,7 @@ func TestPipeStreamRoundTrip(t *testing.T) {
 }
 
 func TestPipeStreamCancelWrite(t *testing.T) {
-	dc, ac, _ := dialedPair(t, "cancel-write")
+	_, _, dc, ac := dialedPair(t)
 	opened, accepted := streamPair(t, dc, ac)
 
 	opened.CancelWrite(7)
@@ -243,7 +260,7 @@ func TestPipeStreamCancelWrite(t *testing.T) {
 }
 
 func TestPipeStreamCancelRead(t *testing.T) {
-	dc, ac, _ := dialedPair(t, "cancel-read")
+	_, _, dc, ac := dialedPair(t)
 	opened, accepted := streamPair(t, dc, ac)
 
 	opened.CancelRead(9)
@@ -266,7 +283,7 @@ func TestPipeStreamCancelRead(t *testing.T) {
 }
 
 func TestPipeStreamReadFromWriteTo(t *testing.T) {
-	dc, ac, _ := dialedPair(t, "readfrom-writeto")
+	_, _, dc, ac := dialedPair(t)
 	opened, accepted := streamPair(t, dc, ac)
 
 	src := strings.Repeat("payload!", 4096)
@@ -295,7 +312,7 @@ func TestPipeStreamReadFromWriteTo(t *testing.T) {
 }
 
 func TestPipeConnCloseUnblocksStreams(t *testing.T) {
-	dc, ac, _ := dialedPair(t, "conn-close-streams")
+	_, _, dc, ac := dialedPair(t)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -322,7 +339,7 @@ func TestPipeConnCloseUnblocksStreams(t *testing.T) {
 }
 
 func TestPipeStreamsSurviveConnClose(t *testing.T) {
-	dc, ac, _ := dialedPair(t, "streams-survive-close")
+	_, _, dc, ac := dialedPair(t)
 	opened, accepted := streamPair(t, dc, ac)
 
 	dc.Close()
@@ -342,8 +359,8 @@ func TestPipeStreamsSurviveConnClose(t *testing.T) {
 }
 
 func TestPipeDialContextCanceled(t *testing.T) {
-	pt := NewPipeTransport()
-	ln, err := pt.Listen(newPipeAddr("dial-ctx-canceled"))
+	pt := testTransport(t)
+	ln, err := pt.Listen()
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -352,20 +369,20 @@ func TestPipeDialContextCanceled(t *testing.T) {
 	// Nobody accepts, so the dial rendezvous blocks until the context fires.
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
-	dt := NewPipeTransport()
+	dt := testTransport(t)
 	if _, err := dt.Dial(ctx, ln.Addr()); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v, want context.DeadlineExceeded", err)
 	}
 }
 
 func TestPipeOpErrorsCarryAddrs(t *testing.T) {
-	pt := NewPipeTransport()
-	_, err := pt.Dial(context.Background(), newPipeAddr("operr-missing"))
+	pt := testTransport(t)
+	_, err := pt.Dial(context.Background(), NewAddr(NetworkPipe, "127.0.0.1:65000"))
 	var oe *net.OpError
 	if !errors.As(err, &oe) {
 		t.Fatalf("got %T, want *net.OpError", err)
 	}
-	if oe.Net != "pipe" || oe.Addr.String() != "operr-missing" {
+	if oe.Net != "pipe" || oe.Addr.String() != "127.0.0.1:65000" || oe.Source.String() != pt.Addr().String() {
 		t.Fatalf("OpError = %+v", oe)
 	}
 }
