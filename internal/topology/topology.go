@@ -12,10 +12,25 @@ package topology
 import (
 	"fmt"
 	"net"
-	"path/filepath"
-	"slices"
 
 	"github.com/mulgadc/predastore/internal/transport"
+)
+
+// NodeID and HostID identify the two levels of the cluster. They are distinct
+// types because almost every function here takes one or the other and they are
+// otherwise indistinguishable: passing a host id where a node id belongs is a
+// mistake the compiler should catch rather than a lookup that quietly misses.
+//
+// They are uint64 rather than int because both are serialized — to TOML in the
+// configuration, and node ids to JSON in the delete tombstones the compactor
+// reads. A fixed width keeps that encoding the same on every platform, and an
+// unsigned one makes a negative id unrepresentable rather than a validation
+// step everything downstream has to trust. The width matches what consensus
+// and the shard store already counted in, so a node id crosses those
+// boundaries without a conversion to get wrong.
+type (
+	NodeID uint64
+	HostID uint64
 )
 
 // Role is the function a node performs within the cluster, as written under
@@ -33,7 +48,7 @@ const (
 // a socket and a data directory. Nodes pinned to it run inside that process
 // as goroutines.
 type Host struct {
-	ID int `toml:"id"`
+	ID HostID `toml:"id"`
 	// BindAddr is the local listen address; 0.0.0.0 binds all interfaces.
 	BindAddr string `toml:"bind_addr"`
 	// PublicAddr is the address other hosts dial, split from BindAddr for
@@ -49,9 +64,9 @@ type Host struct {
 // sharing a host are colocated and talk over the in-process pipe; nodes on
 // different hosts talk over the network.
 type Node struct {
-	ID     int  `toml:"id"`
-	HostID int  `toml:"host_id"`
-	Role   Role `toml:"role"`
+	ID     NodeID `toml:"id"`
+	HostID HostID `toml:"host_id"`
+	Role   Role   `toml:"role"`
 }
 
 // Validate checks the topology as a whole: ids unique, placements resolvable,
@@ -64,10 +79,10 @@ func Validate(hosts []Host, nodes []Node) error {
 		return fmt.Errorf("topology: no nodes defined")
 	}
 
-	hostIDs := make(map[int]bool, len(hosts))
+	hostIDs := make(map[HostID]bool, len(hosts))
 	for _, h := range hosts {
-		if h.ID <= 0 {
-			return fmt.Errorf("topology: host id %d must be positive", h.ID)
+		if h.ID == 0 {
+			return fmt.Errorf("topology: host id must be positive")
 		}
 		if hostIDs[h.ID] {
 			return fmt.Errorf("topology: duplicate host id %d", h.ID)
@@ -84,10 +99,10 @@ func Validate(hosts []Host, nodes []Node) error {
 		}
 	}
 
-	nodeIDs := make(map[int]bool, len(nodes))
+	nodeIDs := make(map[NodeID]bool, len(nodes))
 	for _, n := range nodes {
-		if n.ID <= 0 {
-			return fmt.Errorf("topology: node id %d must be positive", n.ID)
+		if n.ID == 0 {
+			return fmt.Errorf("topology: node id must be positive")
 		}
 		if nodeIDs[n.ID] {
 			return fmt.Errorf("topology: duplicate node id %d", n.ID)
@@ -109,33 +124,35 @@ func Validate(hosts []Host, nodes []Node) error {
 // NodeKey is the name a node answers to on both transports: its pipe
 // registry entry in-process, and the ALPN key selecting it on its host's
 // shared socket. Everything per-node derives from the host base and this.
-func NodeKey(nodeID int) string {
+func NodeKey(nodeID NodeID) string {
 	return fmt.Sprintf("node-%d", nodeID)
 }
 
-// Topology resolves node ids to dialable addresses for one process. Nodes
+// Resolver turns node ids into dialable addresses for one process. Nodes
 // pinned to the local host resolve to their in-process pipe endpoint; all
-// others resolve to their host's public address, keyed by node.
-type Topology struct {
-	hosts map[int]Host
-	nodes map[int]Node
-	local map[int]bool
+// others resolve to their host's public address, keyed by node. It answers
+// nothing else about the cluster: inventory questions belong to whoever owns
+// the configuration.
+type Resolver struct {
+	hosts map[HostID]Host
+	nodes map[NodeID]Node
+	local map[NodeID]bool
 	// host is the host this process runs; every local node is pinned to it.
 	host Host
 }
 
-// NewTopology validates the topology and selects the host this process runs.
+// NewResolver validates the topology and selects the host this process runs.
 // A process is one host, so the nodes it runs follow from the selection rather
 // than being named individually.
-func NewTopology(hosts []Host, nodes []Node, hostID int) (*Topology, error) {
+func NewResolver(hosts []Host, nodes []Node, hostID HostID) (*Resolver, error) {
 	if err := Validate(hosts, nodes); err != nil {
 		return nil, err
 	}
 
-	t := &Topology{
-		hosts: make(map[int]Host, len(hosts)),
-		nodes: make(map[int]Node, len(nodes)),
-		local: make(map[int]bool, len(nodes)),
+	t := &Resolver{
+		hosts: make(map[HostID]Host, len(hosts)),
+		nodes: make(map[NodeID]Node, len(nodes)),
+		local: make(map[NodeID]bool, len(nodes)),
 	}
 	for _, h := range hosts {
 		t.hosts[h.ID] = h
@@ -163,29 +180,10 @@ func NewTopology(hosts []Host, nodes []Node, hostID int) (*Topology, error) {
 	return t, nil
 }
 
-// LocalHost is the host this process runs: the socket it binds when any peer
-// is remote, and the address its S3 gateway serves from.
-func (t *Topology) LocalHost() Host { return t.host }
-
-// IsLocal reports whether the node runs in this process.
-func (t *Topology) IsLocal(nodeID int) bool { return t.local[nodeID] }
-
-// Node returns the node's config.
-func (t *Topology) Node(nodeID int) (Node, bool) {
-	n, ok := t.nodes[nodeID]
-	return n, ok
-}
-
-// Host returns the host's config.
-func (t *Topology) Host(hostID int) (Host, bool) {
-	h, ok := t.hosts[hostID]
-	return h, ok
-}
-
 // NodeAddr resolves a node id to the address a client should dial: its
 // in-process pipe endpoint for local nodes, its host's public address keyed
 // by node otherwise. Callers never learn which they got.
-func (t *Topology) NodeAddr(nodeID int) (net.Addr, error) {
+func (t *Resolver) NodeAddr(nodeID NodeID) (net.Addr, error) {
 	n, ok := t.nodes[nodeID]
 	if !ok {
 		return nil, fmt.Errorf("topology: unknown node %d", nodeID)
@@ -200,7 +198,7 @@ func (t *Topology) NodeAddr(nodeID int) (net.Addr, error) {
 // ListenAddrs are the addresses a local node's rpc server serves: its pipe
 // endpoint always, plus this host's socket when some peer runs elsewhere.
 // A process whose peers are all local never opens a network socket.
-func (t *Topology) ListenAddrs(nodeID int) ([]net.Addr, error) {
+func (t *Resolver) ListenAddrs(nodeID NodeID) ([]net.Addr, error) {
 	if !t.local[nodeID] {
 		return nil, fmt.Errorf("topology: node %d does not run in this process", nodeID)
 	}
@@ -215,41 +213,13 @@ func (t *Topology) ListenAddrs(nodeID int) ([]net.Addr, error) {
 	return addrs, nil
 }
 
-// DataDir is where a node keeps its state, derived from its own host's base
-// directory and its node id.
-func (t *Topology) DataDir(nodeID int) string {
-	h := t.hosts[t.nodes[nodeID].HostID]
-	return filepath.Join(h.DataDir, NodeKey(nodeID))
-}
-
-// LocalNodes returns the nodes running in this process, sorted by id.
-func (t *Topology) LocalNodes() []Node {
-	return t.selectNodes(func(n Node) bool { return t.local[n.ID] })
-}
-
-// NodesByRole returns every node with the role, local or not, sorted by id.
-func (t *Topology) NodesByRole(role Role) []Node {
-	return t.selectNodes(func(n Node) bool { return n.Role == role })
-}
-
 // NeedsNetwork reports whether any node in the topology runs outside this
 // process; a process whose peers are all local opens no network socket.
-func (t *Topology) NeedsNetwork() bool {
+func (t *Resolver) NeedsNetwork() bool {
 	for id := range t.nodes {
 		if !t.local[id] {
 			return true
 		}
 	}
 	return false
-}
-
-func (t *Topology) selectNodes(keep func(Node) bool) []Node {
-	var out []Node
-	for _, n := range t.nodes {
-		if keep(n) {
-			out = append(out, n)
-		}
-	}
-	slices.SortFunc(out, func(a, b Node) int { return a.ID - b.ID })
-	return out
 }

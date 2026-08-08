@@ -12,6 +12,7 @@ import (
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/testcerts"
 	"github.com/mulgadc/predastore/internal/testport"
+	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
@@ -22,9 +23,9 @@ const (
 // nodeTopo stands in for the real topology: a fixed map from node id to the
 // one address that node answers on. Tests pick the addresses so they can mix
 // pipe and QUIC endpoints without a cluster config.
-type nodeTopo map[int]net.Addr
+type nodeTopo map[topology.NodeID]net.Addr
 
-func (t nodeTopo) NodeAddr(nodeID int) (net.Addr, error) {
+func (t nodeTopo) NodeAddr(nodeID topology.NodeID) (net.Addr, error) {
 	addr, ok := t[nodeID]
 	if !ok {
 		return nil, fmt.Errorf("unknown node %d", nodeID)
@@ -32,7 +33,7 @@ func (t nodeTopo) NodeAddr(nodeID int) (net.Addr, error) {
 	return addr, nil
 }
 
-func (t nodeTopo) ListenAddrs(nodeID int) ([]net.Addr, error) {
+func (t nodeTopo) ListenAddrs(nodeID topology.NodeID) ([]net.Addr, error) {
 	addr, err := t.NodeAddr(nodeID)
 	if err != nil {
 		return nil, err
@@ -72,7 +73,7 @@ func echoMux() *rpc.Mux {
 }
 
 // pipeTopo maps one node id to a named pipe endpoint.
-func pipeTopo(t *testing.T, nodeID int, name string) nodeTopo {
+func pipeTopo(t *testing.T, nodeID topology.NodeID, name string) nodeTopo {
 	t.Helper()
 	addr, err := transport.ResolveAddr(string(transport.NetworkPipe), name)
 	if err != nil {
@@ -83,12 +84,12 @@ func pipeTopo(t *testing.T, nodeID int, name string) nodeTopo {
 
 // runServer starts an rpc server for one node over the given transports and
 // registers cleanup that stops it and verifies a clean drain.
-func runServer(t *testing.T, mux *rpc.Mux, nodeID int, topo rpc.Topology, trs ...transport.Transport) {
+func runServer(t *testing.T, mux *rpc.Mux, nodeID topology.NodeID, topo rpc.Resolver, trs ...transport.Transport) {
 	t.Helper()
 	srv, err := rpc.NewServer(rpc.ServerConfig{
 		Mux:        mux,
 		NodeID:     nodeID,
-		Topology:   topo,
+		Resolver:   topo,
 		Transports: trs,
 	})
 	if err != nil {
@@ -111,7 +112,7 @@ func runServer(t *testing.T, mux *rpc.Mux, nodeID int, topo rpc.Topology, trs ..
 }
 
 // echo performs one full request round trip on a fresh stream.
-func echo(ctx context.Context, c *rpc.Client, nodeID int, prefix, body string) (string, error) {
+func echo(ctx context.Context, c *rpc.Client, nodeID topology.NodeID, prefix, body string) (string, error) {
 	stream, err := rpc.OpenStream(ctx, c, nodeID, opEcho, &echoHeader{Prefix: prefix})
 	if err != nil {
 		return "", err
@@ -137,7 +138,7 @@ func TestRPCEchoOverPipe(t *testing.T) {
 
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{transport.NewPipeTransport()},
-		Topology:   topo,
+		Resolver:   topo,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -175,7 +176,7 @@ func TestRPCEchoOverQUIC(t *testing.T) {
 		Transports: []transport.Transport{
 			transport.NewQUICTransport(transport.QUICTransportConfig{RootCAs: pool}),
 		},
-		Topology: topo,
+		Resolver: topo,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -196,7 +197,7 @@ func TestRPCUnknownOpcode(t *testing.T) {
 
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{transport.NewPipeTransport()},
-		Topology:   topo,
+		Resolver:   topo,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -215,7 +216,7 @@ func TestRPCUnknownOpcode(t *testing.T) {
 }
 
 func TestRPCNoTransportForNetwork(t *testing.T) {
-	client := rpc.NewClient(rpc.ClientConfig{Topology: pipeTopo(t, 1, "nowhere")})
+	client := rpc.NewClient(rpc.ClientConfig{Resolver: pipeTopo(t, 1, "nowhere")})
 	if _, err := rpc.OpenStream(context.Background(), client, 1, opEcho, &echoHeader{}); err == nil {
 		t.Fatal("OpenStream without a matching transport succeeded")
 	}
@@ -238,7 +239,7 @@ func TestRPCUnaddressableNode(t *testing.T) {
 
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: trs,
-		Topology:   pipeTopo(t, 1, "rpc-unaddressable"),
+		Resolver:   pipeTopo(t, 1, "rpc-unaddressable"),
 	})
 	if _, err := rpc.OpenStream(context.Background(), client, 2, opEcho, &echoHeader{}); err == nil {
 		t.Fatal("OpenStream to a node outside the topology succeeded")
@@ -256,7 +257,7 @@ func TestRPCConcurrentStreams(t *testing.T) {
 
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{transport.NewPipeTransport()},
-		Topology:   topo,
+		Resolver:   topo,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -287,7 +288,7 @@ func TestRPCHeaderTooLarge(t *testing.T) {
 
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{transport.NewPipeTransport()},
-		Topology:   topo,
+		Resolver:   topo,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -319,7 +320,7 @@ func TestRPCNodesShareOneSocket(t *testing.T) {
 
 	// Each node answers with its own id, so a misrouted request is visible in
 	// the response rather than merely absent.
-	for _, id := range []int{1, 2} {
+	for _, id := range []topology.NodeID{1, 2} {
 		mux := rpc.NewMux()
 		rpc.RegisterHandler(mux, opEcho, func(_ context.Context, h echoHeader, stream transport.Stream) error {
 			body, err := io.ReadAll(stream)
@@ -336,14 +337,14 @@ func TestRPCNodesShareOneSocket(t *testing.T) {
 		Transports: []transport.Transport{
 			transport.NewQUICTransport(transport.QUICTransportConfig{RootCAs: pool}),
 		},
-		Topology: topo,
+		Resolver: topo,
 	})
 	t.Cleanup(func() { client.Close() })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	for _, id := range []int{1, 2} {
+	for _, id := range []topology.NodeID{1, 2} {
 		got, err := echo(ctx, client, id, "p:", "body")
 		if err != nil {
 			t.Fatalf("echo node-%d: %v", id, err)

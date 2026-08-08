@@ -12,11 +12,12 @@ import (
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/mulgadc/predastore/internal/rpc"
+	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
 // ID is the node this replica serves.
-func (s *Server) ID() uint64 { return s.id }
+func (s *Server) ID() topology.NodeID { return s.id }
 
 // Run holds the replica open until ctx is cancelled, then shuts raft down.
 func (s *Server) Run(ctx context.Context) error {

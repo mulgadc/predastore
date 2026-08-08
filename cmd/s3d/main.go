@@ -92,7 +92,7 @@ func run() error {
 
 	h, err := predastore.New(predastore.Options{
 		Config:    cfg,
-		HostID:    *host,
+		HostID:    predastore.HostID(*host),
 		Port:      *port,
 		TLSCert:   *tlsCert,
 		TLSKey:    *tlsKey,

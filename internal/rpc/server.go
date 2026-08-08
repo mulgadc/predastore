@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 	"golang.org/x/sync/errgroup"
 )
@@ -40,15 +41,15 @@ func RegisterHandler[T any, PT interface {
 }
 
 // ServerConfig describes one node's rpc endpoint. The node answers on every
-// address the topology gives it: an in-process pipe address always, plus a
+// address the resolver gives it: an in-process pipe address always, plus a
 // network address when peers run outside this process. Transports are the
 // process-wide set, shared with every other node's server.
 type ServerConfig struct {
 	Mux *Mux
 	// NodeID is the node this server answers for.
-	NodeID int
-	// Topology supplies that node's listen addresses. Required.
-	Topology     Topology
+	NodeID topology.NodeID
+	// Resolver supplies that node's listen addresses. Required.
+	Resolver     Resolver
 	Transports   []transport.Transport
 	DrainTimeout time.Duration
 }
@@ -63,10 +64,10 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.DrainTimeout == 0 {
 		cfg.DrainTimeout = defaultDrainTimeout
 	}
-	if cfg.Topology == nil {
-		return nil, fmt.Errorf("server has no topology")
+	if cfg.Resolver == nil {
+		return nil, fmt.Errorf("server has no resolver")
 	}
-	addrs, err := cfg.Topology.ListenAddrs(cfg.NodeID)
+	addrs, err := cfg.Resolver.ListenAddrs(cfg.NodeID)
 	if err != nil {
 		return nil, fmt.Errorf("listen addresses for node %d: %w", cfg.NodeID, err)
 	}

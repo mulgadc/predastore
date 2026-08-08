@@ -31,11 +31,11 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// rpc declares the two-method view of the topology it needs rather than
+// rpc declares the two-method view of address resolution it needs rather than
 // importing topology, which keeps topology free of any dependency on rpc. This
 // package is where the two are wired together, so it is where the
 // implementation can be checked against the interface.
-var _ rpc.Topology = (*topology.Topology)(nil)
+var _ rpc.Resolver = (*topology.Resolver)(nil)
 
 // leaderWait bounds how long the gateway holds off serving while consensus
 // settles. Exceeding it is a warning, not a failure: the state client retries.
@@ -50,7 +50,7 @@ type Options struct {
 
 	// HostID is the [[host]] this process runs. It selects the nodes pinned to
 	// that host and the address they are reached on. Required.
-	HostID int
+	HostID HostID
 
 	// Port is the S3 listen port; zero defaults to 8443. The address it binds
 	// is the host's own, so a process serves S3 where it serves everything
@@ -77,7 +77,7 @@ type Options struct {
 // node is one storage or state replica running in this process: a service
 // serving its rpc endpoint, and the server carrying it.
 type node struct {
-	id  int
+	id  NodeID
 	svc interface{ Run(context.Context) error }
 	srv *rpc.Server
 }
@@ -115,16 +115,20 @@ func New(opts Options) (*Host, error) {
 		return nil, err
 	}
 
-	topo, err := topology.NewTopology(cfg.Hosts, cfg.Nodes, opts.HostID)
+	resolver, err := topology.NewResolver(cfg.Hosts, cfg.Nodes, opts.HostID)
 	if err != nil {
 		return nil, err
+	}
+	localHost, ok := cfg.localHost(opts.HostID)
+	if !ok {
+		return nil, fmt.Errorf("predastore: host %d not in topology", opts.HostID)
 	}
 
 	// One transport per network for the whole process. The pipe carries
 	// in-process traffic; the QUIC socket only comes up when some node runs
 	// elsewhere, so a single-process cluster needs no certificates.
 	trs := []transport.Transport{transport.NewPipeTransport()}
-	if topo.NeedsNetwork() {
+	if resolver.NeedsNetwork() {
 		if opts.TLSCert == "" || opts.TLSKey == "" {
 			return nil, fmt.Errorf("cluster has remote nodes: TLSCert and TLSKey are required")
 		}
@@ -136,7 +140,7 @@ func New(opts Options) (*Host, error) {
 
 	h := &Host{
 		trs:    trs,
-		client: rpc.NewClient(rpc.ClientConfig{Transports: trs, Topology: topo}),
+		client: rpc.NewClient(rpc.ClientConfig{Transports: trs, Resolver: resolver}),
 	}
 
 	// Raft dials peers through the same client; its advertise addresses are
@@ -147,12 +151,11 @@ func New(opts Options) (*Host, error) {
 		if err != nil {
 			return nil, err
 		}
-		nodeID := int(target) //nolint:gosec // G115: node ids are small positives from a validated topology.
-		return rpc.OpenStream(ctx, h.client, nodeID, state.OpRaftDial, &state.RaftDial{})
+		return rpc.OpenStream(ctx, h.client, target, state.OpRaftDial, &state.RaftDial{})
 	}
 
-	peers := raftPeers(topo.NodesByRole(topology.RoleStateReplica))
-	replicaIDs := make([]uint64, len(peers))
+	peers := raftPeers(cfg.nodesByRole(RoleStateReplica))
+	replicaIDs := make([]NodeID, len(peers))
 	for i, p := range peers {
 		replicaIDs[i] = p.ID
 	}
@@ -165,8 +168,8 @@ func New(opts Options) (*Host, error) {
 		engine.WithCompaction(time.Duration(cfg.Compaction.IntervalSeconds) * time.Second),
 	}
 
-	for _, local := range topo.LocalNodes() {
-		if err := h.addNode(topo, local, basePath, raftDial, peers, storeOpts); err != nil {
+	for _, local := range cfg.localNodes(opts.HostID) {
+		if err := h.addNode(cfg, resolver, local, basePath, raftDial, peers, storeOpts); err != nil {
 			h.close()
 			return nil, err
 		}
@@ -185,7 +188,7 @@ func New(opts Options) (*Host, error) {
 
 	h.gateway, err = gateway.NewServer(gateway.ServerConfig{
 		Config:          cfg.gatewayConfig(basePath, opts.Debug),
-		Host:            gatewayHost(topo.LocalHost()),
+		Host:            gatewayHost(localHost),
 		Port:            opts.Port,
 		TLSCert:         opts.TLSCert,
 		TLSKey:          opts.TLSKey,
@@ -218,8 +221,7 @@ func gatewayHost(local topology.Host) string {
 func raftPeers(replicas []topology.Node) []state.RaftPeer {
 	peers := make([]state.RaftPeer, len(replicas))
 	for i, n := range replicas {
-		id := uint64(n.ID) //nolint:gosec // G115: node ids are small positives from a validated topology.
-		peers[i] = state.RaftPeer{ID: id, Address: state.RaftAddress(id)}
+		peers[i] = state.RaftPeer{ID: n.ID, Address: state.RaftAddress(n.ID)}
 	}
 	return peers
 }
@@ -228,18 +230,19 @@ func raftPeers(replicas []topology.Node) []state.RaftPeer {
 // server is constructed but not started: handlers must be registered on every
 // node before any of them accepts, or early peer traffic finds no handler.
 func (h *Host) addNode(
-	topo *topology.Topology,
-	local topology.Node,
+	cfg *Config,
+	resolver *topology.Resolver,
+	local NodeConfig,
 	basePath string,
 	raftDial func(context.Context, raft.ServerAddress) (transport.Stream, error),
 	peers []state.RaftPeer,
 	storeOpts []engine.Option,
 ) error {
-	id := uint64(local.ID) //nolint:gosec // G115: validated positive node ids.
+	id := local.ID
 
 	// A relative data_dir is resolved against the base path, so a config can
 	// be shared across machines and the launcher decides where state lands.
-	dataDir := topo.DataDir(local.ID)
+	dataDir := cfg.dataDir(local.ID)
 	if !filepath.IsAbs(dataDir) {
 		dataDir = filepath.Join(basePath, dataDir)
 	}
@@ -248,7 +251,7 @@ func (h *Host) addNode(
 	var svc interface{ Run(context.Context) error }
 
 	switch local.Role {
-	case topology.RoleStateReplica:
+	case RoleStateReplica:
 		ccfg := state.DefaultClusterConfig()
 		ccfg.NodeID = id
 		ccfg.DataDir = dataDir
@@ -265,7 +268,7 @@ func (h *Host) addNode(
 		svc = replica
 		h.replicas = append(h.replicas, replica)
 
-	case topology.RoleShardStorage:
+	case RoleShardStorage:
 		// The store expects its directory to exist.
 		if err := os.MkdirAll(dataDir, 0750); err != nil {
 			return fmt.Errorf("create shard store directory %s: %w", dataDir, err)
@@ -285,7 +288,7 @@ func (h *Host) addNode(
 	srv, err := rpc.NewServer(rpc.ServerConfig{
 		Mux:        mux,
 		NodeID:     local.ID,
-		Topology:   topo,
+		Resolver:   resolver,
 		Transports: h.trs,
 	})
 	if err != nil {

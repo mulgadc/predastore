@@ -16,6 +16,7 @@ import (
 	"github.com/mulgadc/predastore/internal/storage"
 	"github.com/mulgadc/predastore/internal/storage/engine"
 	"github.com/mulgadc/predastore/internal/storetest"
+	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
@@ -25,9 +26,9 @@ func testHash(name string) [32]byte { return sha256.Sum256([]byte(name)) }
 
 // procTopo maps node ids to the pipe endpoint their process listens on. It
 // stands in for the cluster topology the rpc layer resolves node ids through.
-type procTopo map[int]string
+type procTopo map[topology.NodeID]string
 
-func (p procTopo) NodeAddr(nodeID int) (net.Addr, error) {
+func (p procTopo) NodeAddr(nodeID topology.NodeID) (net.Addr, error) {
 	name, ok := p[nodeID]
 	if !ok {
 		return nil, fmt.Errorf("unknown node %d", nodeID)
@@ -35,7 +36,7 @@ func (p procTopo) NodeAddr(nodeID int) (net.Addr, error) {
 	return transport.ResolveAddr(string(transport.NetworkPipe), name)
 }
 
-func (p procTopo) ListenAddrs(nodeID int) ([]net.Addr, error) {
+func (p procTopo) ListenAddrs(nodeID topology.NodeID) ([]net.Addr, error) {
 	addr, err := p.NodeAddr(nodeID)
 	if err != nil {
 		return nil, err
@@ -45,7 +46,7 @@ func (p procTopo) ListenAddrs(nodeID int) ([]net.Addr, error) {
 
 // startStorageProc hosts one storage node behind an rpc server on a pipe
 // endpoint and returns a client reaching it.
-func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client {
+func startStorageProc(t *testing.T, nodeID topology.NodeID, pipeName string) *storage.Client {
 	t.Helper()
 
 	topo := procTopo{nodeID: pipeName}
@@ -56,7 +57,7 @@ func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client
 	}
 	t.Cleanup(func() { st.Close() })
 
-	svc := storage.NewServer(uint64(nodeID), st)
+	svc := storage.NewServer(nodeID, st)
 	mux := rpc.NewMux()
 	svc.Register(mux)
 
@@ -64,7 +65,7 @@ func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client
 	srv, err := rpc.NewServer(rpc.ServerConfig{
 		Mux:          mux,
 		NodeID:       nodeID,
-		Topology:     topo,
+		Resolver:     topo,
 		Transports:   []transport.Transport{pipeTr},
 		DrainTimeout: 50 * time.Millisecond,
 	})
@@ -84,7 +85,7 @@ func startStorageProc(t *testing.T, nodeID int, pipeName string) *storage.Client
 
 	rpcClient := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{pipeTr},
-		Topology:   topo,
+		Resolver:   topo,
 	})
 	cli, err := storage.NewClient(storage.ClientConfig{Client: rpcClient})
 	if err != nil {

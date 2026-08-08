@@ -12,6 +12,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/state"
+	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
@@ -19,7 +20,7 @@ const opRaftDialTest rpc.Opcode = 100
 
 // raftDialHeader routes an inbound raft stream to the target node.
 type raftDialHeader struct {
-	Target uint64 `json:"target"`
+	Target topology.NodeID `json:"target"`
 }
 
 func (h *raftDialHeader) Append(buf []byte) ([]byte, error) {
@@ -43,23 +44,24 @@ type raftTestProc struct {
 
 // startRaftProc wires a raft node over the rpc stream layer. topo maps every
 // node id to its process's pipe endpoint.
-func startRaftProc(t *testing.T, id uint64, topo procTopo, peers []state.RaftPeer) *raftTestProc {
+func startRaftProc(t *testing.T, id topology.NodeID, topo procTopo, peers []state.RaftPeer) *raftTestProc {
 	t.Helper()
 
 	pipeTr := transport.NewPipeTransport()
 	client := rpc.NewClient(rpc.ClientConfig{
 		Transports: []transport.Transport{pipeTr},
-		Topology:   topo,
+		Resolver:   topo,
 	})
 
 	// Dialing a peer parses the node id out of the node-identifying raft
 	// address and frames the target in the header.
 	dial := func(ctx context.Context, address raft.ServerAddress) (transport.Stream, error) {
-		target, err := strconv.ParseUint(strings.TrimPrefix(string(address), "node-"), 10, 64)
+		parsed, err := strconv.ParseUint(strings.TrimPrefix(string(address), "node-"), 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("bad raft address %q: %w", address, err)
 		}
-		return rpc.OpenStream(ctx, client, int(target), opRaftDialTest, &raftDialHeader{Target: target})
+		target := topology.NodeID(parsed)
+		return rpc.OpenStream(ctx, client, target, opRaftDialTest, &raftDialHeader{Target: target})
 	}
 
 	layer := state.NewRPCStreamLayer(fmt.Sprintf("node-%d", id), dial)
@@ -75,8 +77,8 @@ func startRaftProc(t *testing.T, id uint64, topo procTopo, peers []state.RaftPee
 
 	srv, err := rpc.NewServer(rpc.ServerConfig{
 		Mux:        mux,
-		NodeID:     int(id),
-		Topology:   topo,
+		NodeID:     id,
+		Resolver:   topo,
 		Transports: []transport.Transport{pipeTr},
 		// Raft connections are long-lived; don't stall shutdown on them.
 		DrainTimeout: 50 * time.Millisecond,
@@ -125,9 +127,9 @@ func TestRaftClusterOverRPCStreamLayer(t *testing.T) {
 		{ID: 3, Address: "node-3"},
 	}
 
-	procs := make(map[int]*raftTestProc, len(topo))
+	procs := make(map[topology.NodeID]*raftTestProc, len(topo))
 	for id := range topo {
-		procs[id] = startRaftProc(t, uint64(id), topo, peers)
+		procs[id] = startRaftProc(t, id, topo, peers)
 	}
 
 	// A leader must emerge over the pipe transport.

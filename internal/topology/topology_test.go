@@ -53,28 +53,28 @@ func TestValidate(t *testing.T) {
 	}
 }
 
-func TestNewTopologyRejectsBadSelection(t *testing.T) {
-	if _, err := NewTopology(testHosts(), testNodes(), 0); err == nil {
+func TestNewResolverRejectsBadSelection(t *testing.T) {
+	if _, err := NewResolver(testHosts(), testNodes(), 0); err == nil {
 		t.Fatal("unset local host accepted")
 	}
-	if _, err := NewTopology(testHosts(), testNodes(), 99); err == nil {
+	if _, err := NewResolver(testHosts(), testNodes(), 99); err == nil {
 		t.Fatal("unknown local host accepted")
 	}
 	// A host carrying no nodes has nothing to serve.
 	empty := append(testHosts(), Host{ID: 3, BindAddr: "0.0.0.0:6660", PublicAddr: "10.11.12.3:6660", DataDir: "/var/lib/predastore"})
-	if _, err := NewTopology(empty, testNodes(), 3); err == nil {
+	if _, err := NewResolver(empty, testNodes(), 3); err == nil {
 		t.Fatal("local host with no nodes accepted")
 	}
 }
 
-func TestTopologyNodeAddr(t *testing.T) {
-	topo, err := NewTopology(testHosts(), testNodes(), 1)
+func TestResolverNodeAddr(t *testing.T) {
+	topo, err := NewResolver(testHosts(), testNodes(), 1)
 	if err != nil {
-		t.Fatalf("NewTopology: %v", err)
+		t.Fatalf("NewResolver: %v", err)
 	}
 
 	// Local nodes resolve to their own in-process pipe endpoint.
-	for _, id := range []int{1, 2} {
+	for _, id := range []NodeID{1, 2} {
 		addr, err := topo.NodeAddr(id)
 		if err != nil {
 			t.Fatalf("NodeAddr(%d): %v", id, err)
@@ -85,7 +85,7 @@ func TestTopologyNodeAddr(t *testing.T) {
 	}
 
 	// Remote nodes resolve to their host's public address, keyed by node.
-	for id, want := range map[int]string{3: "10.11.12.2:6660/node-3", 4: "10.11.12.2:6660/node-4"} {
+	for id, want := range map[NodeID]string{3: "10.11.12.2:6660/node-3", 4: "10.11.12.2:6660/node-4"} {
 		addr, err := topo.NodeAddr(id)
 		if err != nil {
 			t.Fatalf("NodeAddr(%d): %v", id, err)
@@ -100,27 +100,14 @@ func TestTopologyNodeAddr(t *testing.T) {
 	}
 }
 
-func TestTopologySelectors(t *testing.T) {
-	topo, err := NewTopology(testHosts(), testNodes(), 1)
+func TestResolverListenAddrs(t *testing.T) {
+	topo, err := NewResolver(testHosts(), testNodes(), 1)
 	if err != nil {
-		t.Fatalf("NewTopology: %v", err)
-	}
-
-	local := topo.LocalNodes()
-	if len(local) != 2 || local[0].ID != 1 || local[1].ID != 2 {
-		t.Fatalf("LocalNodes = %+v", local)
-	}
-
-	replicas := topo.NodesByRole(RoleStateReplica)
-	if len(replicas) != 2 || replicas[0].ID != 2 || replicas[1].ID != 4 {
-		t.Fatalf("NodesByRole(state-replica) = %+v", replicas)
+		t.Fatalf("NewResolver: %v", err)
 	}
 
 	if !topo.NeedsNetwork() {
 		t.Fatal("NeedsNetwork = false with remote nodes present")
-	}
-	if got := topo.LocalHost().BindAddr; got != "0.0.0.0:6660" {
-		t.Fatalf("LocalHost().BindAddr = %v", got)
 	}
 
 	// A local node serves its pipe endpoint and this host's socket.
@@ -134,25 +121,21 @@ func TestTopologySelectors(t *testing.T) {
 	if _, err := topo.ListenAddrs(3); err == nil {
 		t.Fatal("ListenAddrs resolved a node that runs elsewhere")
 	}
-
-	if !topo.IsLocal(1) || topo.IsLocal(3) {
-		t.Fatal("IsLocal misclassified nodes")
-	}
 }
 
-// TestTopologyAllLocal covers the single-process cluster: every node pinned to
+// TestResolverAllLocal covers the single-process cluster: every node pinned to
 // one host, which is the only way to get one now that node selection follows
 // the host rather than being named directly.
-func TestTopologyAllLocal(t *testing.T) {
+func TestResolverAllLocal(t *testing.T) {
 	hosts := testHosts()[:1]
 	nodes := testNodes()
 	for i := range nodes {
 		nodes[i].HostID = 1
 	}
 
-	topo, err := NewTopology(hosts, nodes, 1)
+	topo, err := NewResolver(hosts, nodes, 1)
 	if err != nil {
-		t.Fatalf("NewTopology: %v", err)
+		t.Fatalf("NewResolver: %v", err)
 	}
 	// Peers all run locally, so the process opens no network socket.
 	if topo.NeedsNetwork() {
@@ -164,8 +147,5 @@ func TestTopologyAllLocal(t *testing.T) {
 	}
 	if len(addrs) != 1 || addrs[0].Network() != "pipe" {
 		t.Fatalf("single-process node listens on %v, want one pipe address", addrs)
-	}
-	if got := topo.DataDir(3); got != "/var/lib/predastore/node-3" {
-		t.Fatalf("DataDir(3) = %s", got)
 	}
 }

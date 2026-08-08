@@ -17,14 +17,15 @@ import (
 	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/gateway/placement"
 	"github.com/mulgadc/predastore/internal/storage"
+	"github.com/mulgadc/predastore/internal/topology"
 )
 
 // ObjectToShardNodes maps an object to its shard locations.
 type ObjectToShardNodes struct {
 	Object           [32]byte
 	Size             int64
-	DataShardNodes   []uint32
-	ParityShardNodes []uint32
+	DataShardNodes   []topology.NodeID
+	ParityShardNodes []topology.NodeID
 }
 
 // shardWriteOutcome captures the result of writing a shard to a storage node.
@@ -67,8 +68,8 @@ func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int
 	return ObjectToShardNodes{
 		Object:           objectHash,
 		Size:             size,
-		DataShardNodes:   append([]uint32(nil), nodes[:cfg.DataShards]...),
-		ParityShardNodes: append([]uint32(nil), nodes[cfg.DataShards:]...),
+		DataShardNodes:   append([]topology.NodeID(nil), nodes[:cfg.DataShards]...),
+		ParityShardNodes: append([]topology.NodeID(nil), nodes[cfg.DataShards:]...),
 	}, nil
 }
 
@@ -138,7 +139,7 @@ func putObjectViaQUIC(ctx context.Context, shards *storage.Client, ring *placeme
 				ShardIndex: uint32(idx), //nolint:gosec // G115: idx bounded by DataShards (small uint).
 			}
 
-			resp, putErr := shards.PutShard(ctx, int(nodeNum), putReq, bytes.NewReader(shardData))
+			resp, putErr := shards.PutShard(ctx, nodeNum, putReq, bytes.NewReader(shardData))
 			if putErr != nil {
 				slog.Error("putObjectViaQUIC: put failed", "node", nodeNum, "error", putErr)
 				dataCh <- shardWriteOutcome{shardIndex: idx, err: putErr}
@@ -196,7 +197,7 @@ func putObjectViaQUIC(ctx context.Context, shards *storage.Client, ring *placeme
 				ShardIndex: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards + ParityShards (small uint).
 			}
 
-			resp, putErr := shards.PutShard(ctx, int(nodeNum), putReq, r)
+			resp, putErr := shards.PutShard(ctx, nodeNum, putReq, r)
 			if putErr != nil {
 				slog.Error("putObjectViaQUIC: put parity failed", "node", nodeNum, "error", putErr)
 				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, err: putErr}
@@ -276,7 +277,7 @@ func openInput(st Store, ring *placement.Ring, cfg Config, bucket string, object
 func shardReaders(client *storage.Client, objectHash [32]byte, shards ObjectToShardNodes, parity bool) ([]io.Reader, error) {
 	readers := make([]io.Reader, len(shards.DataShardNodes)+len(shards.ParityShardNodes))
 
-	totalNodes := make([]uint32, 0)
+	totalNodes := make([]topology.NodeID, 0)
 	totalNodes = append(totalNodes, shards.DataShardNodes...)
 
 	if parity {
@@ -284,7 +285,7 @@ func shardReaders(client *storage.Client, objectHash [32]byte, shards ObjectToSh
 	}
 
 	for i := range totalNodes {
-		nodeNum := int(totalNodes[i])
+		nodeNum := totalNodes[i]
 
 		objectRequest := storage.GetRequest{
 			ObjectHash: objectHash,
@@ -394,7 +395,7 @@ func reconstructObject(ctx context.Context, client *storage.Client, objectHash [
 func deleteObjectViaQUIC(ctx context.Context, client *storage.Client, bucket, key string, objectHash [32]byte, shards ObjectToShardNodes) error {
 	// Build (node, shardIndex) pairs so each delete carries the correct shard index.
 	type nodeShard struct {
-		node       uint32
+		node       topology.NodeID
 		shardIndex int
 	}
 	targets := make([]nodeShard, 0, len(shards.DataShardNodes)+len(shards.ParityShardNodes))
@@ -418,7 +419,7 @@ func deleteObjectViaQUIC(ctx context.Context, client *storage.Client, bucket, ke
 				ShardIndex: uint32(ns.shardIndex), //nolint:gosec // G115: shardIndex bounded by DataShards + ParityShards (small uint).
 			}
 
-			resp, err := client.DeleteShard(ctx, int(ns.node), delReq)
+			resp, err := client.DeleteShard(ctx, ns.node, delReq)
 			if err != nil {
 				slog.Error("deleteObjectViaQUIC: delete failed", "node", ns.node, "error", err)
 				errCh <- err

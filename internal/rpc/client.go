@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 	"golang.org/x/sync/singleflight"
 )
@@ -22,9 +23,9 @@ func poolKey(addr net.Addr) string { return addr.Network() + "|" + addr.String()
 
 type ClientConfig struct {
 	Transports []transport.Transport
-	// Topology resolves the node ids OpenStream is given. Required: a client
+	// Resolver resolves the node ids OpenStream is given. Required: a client
 	// without one cannot address anything.
-	Topology    Topology
+	Resolver    Resolver
 	DialTimeout time.Duration
 }
 
@@ -58,11 +59,11 @@ func NewClient(cfg ClientConfig) *Client {
 
 // OpenStream opens a stream to a node, addressed by id. Whether that node is
 // reached over the in-process pipe or the network follows from the address the
-// topology returns, which no caller sees.
+// resolver returns, which no caller sees.
 func OpenStream[T Header](
 	ctx context.Context,
 	c *Client,
-	nodeID int,
+	nodeID topology.NodeID,
 	op Opcode,
 	header T,
 ) (transport.Stream, error) {
@@ -111,13 +112,13 @@ func OpenStream[T Header](
 	return stream, nil
 }
 
-// dial resolves the node through the topology and returns a pooled connection
+// dial resolves the node through the resolver and returns a pooled connection
 // to it, along with the address it resolved to so callers can evict it.
-func (c *Client) dial(ctx context.Context, nodeID int) (transport.Conn, net.Addr, error) {
-	if c.cfg.Topology == nil {
-		return nil, nil, fmt.Errorf("client has no topology")
+func (c *Client) dial(ctx context.Context, nodeID topology.NodeID) (transport.Conn, net.Addr, error) {
+	if c.cfg.Resolver == nil {
+		return nil, nil, fmt.Errorf("client has no resolver")
 	}
-	addr, err := c.cfg.Topology.NodeAddr(nodeID)
+	addr, err := c.cfg.Resolver.NodeAddr(nodeID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve node %d: %w", nodeID, err)
 	}

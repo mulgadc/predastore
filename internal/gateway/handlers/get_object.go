@@ -193,7 +193,7 @@ func readRangeFromSingleShard(ctx context.Context, client *storage.Client, cfg C
 		endInShard = actualShardSize - 1
 	}
 
-	nodeNum := int(shards.DataShardNodes[shardIdx])
+	nodeNum := shards.DataShardNodes[shardIdx]
 	objectRequest := storage.GetRequest{
 		ObjectHash: objectHash,
 		ShardIndex: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards (small uint).

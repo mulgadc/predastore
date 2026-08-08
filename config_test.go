@@ -66,3 +66,34 @@ func TestLoadConfig_MissingFile(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "read ")
 }
+
+// TestClusterQueries covers what a launcher asks the configuration: which host
+// it is, which nodes it runs, and where their state lives. The fixture pins
+// nodes 1-2 to host 1, 3-4 to host 2 and 5-6 to host 3, odd ids being
+// shard-storage and even ones state replicas.
+func TestClusterQueries(t *testing.T) {
+	cfg, err := LoadConfig(filepath.Join("testdata", "cluster_topology.toml"))
+	require.NoError(t, err)
+
+	host, ok := cfg.localHost(2)
+	require.True(t, ok)
+	assert.Equal(t, "10.11.12.2:6660", host.PublicAddr)
+
+	_, ok = cfg.localHost(99)
+	assert.False(t, ok, "an unknown host resolves to nothing")
+
+	local := cfg.localNodes(1)
+	require.Len(t, local, 2)
+	assert.Equal(t, []NodeID{1, 2}, []NodeID{local[0].ID, local[1].ID})
+	assert.Empty(t, cfg.localNodes(99), "an unknown host runs no nodes")
+
+	// Raft treats an identically ordered replica set as idempotent across
+	// replicas, so the sort is load-bearing rather than cosmetic.
+	replicas := cfg.nodesByRole(RoleStateReplica)
+	require.Len(t, replicas, 3)
+	assert.Equal(t, []NodeID{2, 4, 6}, []NodeID{replicas[0].ID, replicas[1].ID, replicas[2].ID})
+	assert.Equal(t, []NodeID{1, 3, 5}, cfg.storageNodeIDs())
+
+	assert.Equal(t, filepath.Join("/var/lib/predastore", "node-3"), cfg.dataDir(3))
+	assert.Empty(t, cfg.dataDir(99), "an unknown node has no data directory")
+}

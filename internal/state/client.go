@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/internal/rpc"
+	"github.com/mulgadc/predastore/internal/topology"
 )
 
 // ErrNotFound is returned by reads when no replica holds the key.
@@ -34,12 +35,12 @@ type Item struct {
 // redirects and cache the leader they land on.
 type Client struct {
 	rpc        *rpc.Client
-	replicas   []uint64
+	replicas   []topology.NodeID
 	timeout    time.Duration
 	maxRetries int
 
 	mu     sync.Mutex
-	leader uint64 // cached leader replica id; 0 means unknown
+	leader topology.NodeID // cached leader replica id; 0 means unknown
 }
 
 // ClientConfig configures a Client.
@@ -48,7 +49,7 @@ type ClientConfig struct {
 	// address, so this client only ever names replicas by id.
 	Client *rpc.Client
 	// Replicas lists the state replica node ids.
-	Replicas []uint64
+	Replicas []topology.NodeID
 	// Timeout bounds each attempt. Default 10s.
 	Timeout time.Duration
 	// MaxRetries bounds write retry rounds across the replica set.
@@ -79,14 +80,11 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 // call performs one request round trip against a replica: header, optional
 // body, half-close, then the response envelope.
-func (c *Client) call(target uint64, op rpc.Opcode, req *StateRequest, body []byte) (*StateResponse, error) {
+func (c *Client) call(target topology.NodeID, op rpc.Opcode, req *StateRequest, body []byte) (*StateResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
-	// Replica ids are uint64 here because raft interops in uint64; the rpc
-	// layer addresses nodes as ints, so the conversion lands at this boundary.
-	nodeID := int(target) //nolint:gosec // G115: node ids are small positives from a validated topology.
-	stream, err := rpc.OpenStream(ctx, c.rpc, nodeID, op, req)
+	stream, err := rpc.OpenStream(ctx, c.rpc, target, op, req)
 	if err != nil {
 		return nil, fmt.Errorf("open stream to replica %d: %w", target, err)
 	}
@@ -115,12 +113,12 @@ func (c *Client) call(target uint64, op rpc.Opcode, req *StateRequest, body []by
 }
 
 // readOrder returns replicas with the cached leader first.
-func (c *Client) readOrder() []uint64 {
+func (c *Client) readOrder() []topology.NodeID {
 	c.mu.Lock()
 	leader := c.leader
 	c.mu.Unlock()
 
-	order := make([]uint64, 0, len(c.replicas))
+	order := make([]topology.NodeID, 0, len(c.replicas))
 	if leader != 0 {
 		order = append(order, leader)
 	}
@@ -132,7 +130,7 @@ func (c *Client) readOrder() []uint64 {
 	return order
 }
 
-func (c *Client) cacheLeader(id uint64) {
+func (c *Client) cacheLeader(id topology.NodeID) {
 	c.mu.Lock()
 	c.leader = id
 	c.mu.Unlock()

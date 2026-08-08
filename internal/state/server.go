@@ -13,6 +13,7 @@ import (
 	"github.com/dgraph-io/badger/v4"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
+	"github.com/mulgadc/predastore/internal/topology"
 )
 
 // Server is one state replica: the raft node itself, its FSM and badger
@@ -20,7 +21,7 @@ import (
 // running several replicas builds one Server per node, each on its own rpc
 // server, so a Server never learns that it has siblings.
 type Server struct {
-	id        uint64
+	id        topology.NodeID
 	config    *ClusterConfig
 	raft      *raft.Raft
 	fsm       *FSM
@@ -70,7 +71,7 @@ func NewServer(config *ClusterConfig) (*Server, error) {
 
 	// Configure Raft
 	raftConfig := raft.DefaultConfig()
-	raftConfig.LocalID = raft.ServerID(strconv.FormatUint(config.NodeID, 10))
+	raftConfig.LocalID = raft.ServerID(strconv.FormatUint(uint64(config.NodeID), 10))
 	raftConfig.HeartbeatTimeout = config.HeartbeatTimeout
 	raftConfig.ElectionTimeout = config.ElectionTimeout
 	raftConfig.CommitTimeout = config.CommitTimeout
@@ -134,7 +135,7 @@ func (n *Server) bootstrap() error {
 	servers := make([]raft.Server, 0, len(n.config.Peers))
 	for _, peer := range n.config.Peers {
 		servers = append(servers, raft.Server{
-			ID:      raft.ServerID(strconv.FormatUint(peer.ID, 10)),
+			ID:      raft.ServerID(strconv.FormatUint(uint64(peer.ID), 10)),
 			Address: raft.ServerAddress(peer.Address),
 		})
 	}
