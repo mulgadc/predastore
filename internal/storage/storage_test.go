@@ -33,7 +33,7 @@ func (p procTopo) NodeAddr(nodeID topology.NodeID) (net.Addr, error) {
 	if !ok {
 		return nil, fmt.Errorf("unknown node %d", nodeID)
 	}
-	return transport.ResolveAddr(string(transport.NetworkPipe), name)
+	return transport.NewAddr(transport.NetworkPipe, name), nil
 }
 
 func (p procTopo) ListenAddrs(nodeID topology.NodeID) ([]net.Addr, error) {

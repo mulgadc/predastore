@@ -7,10 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net"
-	"slices"
-	"strings"
+	"strconv"
 	"sync"
 	"time"
 
@@ -20,336 +18,141 @@ import (
 
 const NetworkQUIC Network = "quic"
 
-// alpnPrefix is the intra-cluster application protocol. The target node's key
-// is appended to it, so ALPN negotiation both pins the cluster protocol and
-// selects which node on the endpoint the connection belongs to. A dial for a
-// node the peer does not run fails the handshake instead of misrouting.
-const alpnPrefix = "mulga-repl-v1/"
+// alpnProto is the intra-cluster application protocol. Both sides pin it, so
+// a handshake against anything but a cluster peer fails outright.
+const alpnProto = "mulga-repl-v1"
 
-// Connection-level error codes the transport reports to peers.
-const (
-	// ConnCodeUnknownNode closes a connection whose ALPN names a node this
-	// process does not serve.
-	ConnCodeUnknownNode ConnErrorCode = 1
-	// ConnCodeBusy closes a connection the target node's accept queue has no
-	// room for.
-	ConnCodeBusy ConnErrorCode = 2
-	// ConnCodeShutdown closes a connection because the listener is going away.
-	ConnCodeShutdown ConnErrorCode = 3
-)
-
-// acceptQueueDepth bounds how many accepted connections may wait for one
-// node. Beyond it the transport refuses connections rather than blocking the
-// shared accept router and starving the other nodes on the socket.
-const acceptQueueDepth = 32
-
-// QUICAddr identifies one node reachable over QUIC: the endpoint whose socket
-// carries it, and the node key that selects it there. Several nodes share an
-// endpoint, so the key is what makes the address unique.
-type QUICAddr struct {
-	endpoint string
-	node     string
-}
-
-func newQUICAddr(addr string) *QUICAddr {
-	endpoint, node, _ := strings.Cut(addr, "/")
-	return &QUICAddr{endpoint: endpoint, node: node}
-}
-
-// NewQUICAddr builds an address from its parts. The node key is opaque to the
-// transport; callers derive it from the node id.
-func NewQUICAddr(endpoint, node string) *QUICAddr {
-	return &QUICAddr{endpoint: endpoint, node: node}
-}
-
-func (qa *QUICAddr) Network() string { return string(NetworkQUIC) }
-
-// Endpoint is the "host:port" whose socket serves this address.
-func (qa *QUICAddr) Endpoint() string { return qa.endpoint }
-
-// Node is the key selecting this node among those sharing the endpoint.
-func (qa *QUICAddr) Node() string { return qa.node }
-
-func (qa *QUICAddr) String() string {
-	if qa.node == "" {
-		return qa.endpoint
-	}
-	return qa.endpoint + "/" + qa.node
-}
+// ConnCodeShutdown is reported to the peer when a connection is closed
+// because the listener is going away.
+const ConnCodeShutdown ConnErrorCode = 3
 
 var _ Transport = (*QUICTransport)(nil)
 
-type QUICTransportConfig struct {
-	// TLSCert and TLSKey are paths to the server certificate keypair,
-	// required by Listen. A dial-only transport can leave them empty.
-	TLSCert string
-	TLSKey  string
-	// RootCAs verifies peer certificates when dialing; nil uses the OS
-	// trust store.
-	RootCAs *x509.CertPool
+type QUICOption func(*QUICTransport)
+
+// WithRootCAs verifies peer certificates against p when dialing. Unset means
+// the OS trust store.
+func WithRootCAs(p *x509.CertPool) QUICOption {
+	return func(qt *QUICTransport) { qt.rootCAs = p }
 }
 
-// QUICTransport carries streams between hosts over QUIC with TLS 1.3.
-// Intra-cluster auth is the server certificate: dialers verify against
-// RootCAs (or the OS trust store) and both sides pin the cluster ALPN.
-//
-// One instance serves a whole process over a single UDP socket. quic-go
-// allows only one listener per socket, so Listen registers each node against
-// a shared accept router that hands every inbound connection to the node its
-// ALPN names. Dialling opens one connection per target node over the same
-// socket, which QUIC demultiplexes by connection id.
+// QUICTransport carries streams to other hosts over QUIC with TLS 1.3, one
+// UDP socket per node. Intra-cluster auth is the server certificate: dialers
+// verify it against RootCAs, and both sides pin the cluster ALPN.
 type QUICTransport struct {
-	cfg QUICTransportConfig
+	pc      *net.UDPConn
+	tr      *quic.Transport
+	cert    tls.Certificate
+	rootCAs *x509.CertPool
+	addr    *Addr
 
-	mu sync.Mutex
-	// tr carries both directions once Listen has bound the socket; dialTr is
-	// the ephemeral fallback for a process that never listens.
-	tr     *quic.Transport
-	dialTr *quic.Transport
+	mu     sync.Mutex
 	ln     *quic.Listener
-	// requested is the endpoint callers named; endpoint is what the socket
-	// actually bound, which differs when the request used port 0.
-	requested string
-	endpoint  string
-	lns       map[string]*quicListener
-	closed    bool
+	closed bool
 }
 
-func NewQUICTransport(cfg QUICTransportConfig) *QUICTransport {
-	return &QUICTransport{cfg: cfg, lns: make(map[string]*quicListener)}
+// NewQUICTransport binds a UDP socket at addr:port. Port 0 takes an
+// OS-assigned port, which yields a transport that dials but is never dialed.
+func NewQUICTransport(addr string, port int, cert, key string, opts ...QUICOption) (*QUICTransport, error) {
+	kp, err := tls.LoadX509KeyPair(cert, key)
+	if err != nil {
+		return nil, fmt.Errorf("load x509 key pair from %s/%s: %w", cert, key, err)
+	}
+	hostPort := net.JoinHostPort(addr, strconv.Itoa(port))
+	udpAddr, err := net.ResolveUDPAddr("udp", hostPort)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", hostPort, err)
+	}
+	pc, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("quic bind %s: %w", hostPort, err)
+	}
+
+	qt := &QUICTransport{
+		pc:   pc,
+		tr:   &quic.Transport{Conn: pc},
+		cert: kp,
+		addr: NewAddr(NetworkQUIC, pc.LocalAddr().String()),
+	}
+	for _, opt := range opts {
+		opt(qt)
+	}
+	return qt, nil
 }
 
 func (qt *QUICTransport) Network() string { return string(NetworkQUIC) }
 
-// quicAddr narrows a net.Addr to this transport's address type.
-func quicAddr(op string, addr net.Addr) (*QUICAddr, error) {
-	if addr == nil {
-		return nil, &net.OpError{Op: op, Net: string(NetworkQUIC), Err: ErrMissingAddr}
-	}
-	qa, ok := addr.(*QUICAddr)
-	if !ok {
-		return nil, &net.OpError{Op: op, Net: string(NetworkQUIC), Addr: addr, Err: UnknownNetworkError(addr.Network())}
-	}
-	if qa.endpoint == "" || qa.node == "" {
-		return nil, &net.OpError{Op: op, Net: string(NetworkQUIC), Addr: addr, Err: ErrMissingAddr}
-	}
-	return qa, nil
-}
+// Addr is the endpoint the socket bound, which differs from the requested one
+// when the request named port 0.
+func (qt *QUICTransport) Addr() net.Addr { return qt.addr }
 
-// Listen serves one node at addr. The first call binds the process socket;
-// later calls register additional nodes on it and must name the same endpoint.
-func (qt *QUICTransport) Listen(addr net.Addr) (Listener, error) {
-	qa, err := quicAddr("listen", addr)
-	if err != nil {
-		return nil, err
-	}
-
+// Listen accepts connections on the transport's own socket. One socket serves
+// one node, so it may be called once.
+func (qt *QUICTransport) Listen() (Listener, error) {
 	qt.mu.Lock()
 	defer qt.mu.Unlock()
 	if qt.closed {
 		return nil, ErrTransportClosed
 	}
-	if qt.ln == nil {
-		if err := qt.bindLocked(qa.endpoint); err != nil {
-			return nil, err
-		}
-	} else if qt.requested != qa.endpoint {
-		return nil, fmt.Errorf("quic transport: already bound to %s, cannot also listen on %s", qt.requested, qa.endpoint)
-	}
-	if _, ok := qt.lns[qa.node]; ok {
-		return nil, &net.OpError{Op: "listen", Net: string(NetworkQUIC), Addr: qa, Err: ErrAddrAlreadyInUse}
+	if qt.ln != nil {
+		return nil, &net.OpError{Op: "listen", Net: string(NetworkQUIC), Addr: qt.addr, Err: ErrAddrAlreadyInUse}
 	}
 
-	// Report the address peers can actually reach, which is not the requested
-	// one when the socket bound an ephemeral port.
-	l := &quicListener{
-		tr:     qt,
-		qa:     NewQUICAddr(qt.endpoint, qa.node),
-		accept: make(chan *QUICConn, acceptQueueDepth),
-		closed: make(chan struct{}),
-	}
-	qt.lns[qa.node] = l
-	return l, nil
-}
-
-// bindLocked opens the process socket and starts the accept router. The
-// listener's ALPN list is resolved per handshake so nodes registering after
-// the bind are still reachable.
-func (qt *QUICTransport) bindLocked(endpoint string) error {
-	if qt.cfg.TLSCert == "" || qt.cfg.TLSKey == "" {
-		return fmt.Errorf("quic transport: tls cert and key are required to listen")
-	}
-	cert, err := tls.LoadX509KeyPair(qt.cfg.TLSCert, qt.cfg.TLSKey)
-	if err != nil {
-		return fmt.Errorf("load x509 key pair from %s/%s: %w", qt.cfg.TLSCert, qt.cfg.TLSKey, err)
-	}
-	udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
-	if err != nil {
-		return fmt.Errorf("resolve %s: %w", endpoint, err)
-	}
-	pc, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return fmt.Errorf("quic listen on %s: %w", endpoint, err)
-	}
-
-	base := &tls.Config{
-		Certificates:     []tls.Certificate{cert},
+	tlsConf := &tls.Config{
+		Certificates:     []tls.Certificate{qt.cert},
 		MinVersion:       tls.VersionTLS13,
 		CurvePreferences: tlsconfig.Curves,
+		NextProtos:       []string{alpnProto},
 	}
-	base.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
-		c := base.Clone()
-		c.GetConfigForClient = nil
-		c.NextProtos = qt.alpnList()
-		return c, nil
-	}
-
-	tr := &quic.Transport{Conn: pc}
-	ln, err := tr.Listen(base, listenQUICConfig())
+	ln, err := qt.tr.Listen(tlsConf, listenQUICConfig())
 	if err != nil {
-		pc.Close()
-		return fmt.Errorf("quic listen on %s: %w", endpoint, err)
+		return nil, fmt.Errorf("quic listen on %s: %w", qt.addr, err)
 	}
-
-	qt.tr = tr
 	qt.ln = ln
-	qt.requested = endpoint
-	qt.endpoint = pc.LocalAddr().String()
-	go qt.route(ln)
-	return nil
+	return &quicListener{ln: ln, addr: qt.addr}, nil
 }
 
-// alpnList reports the protocol string of every node currently registered.
-// It runs on the handshake path, so it must not be called with mu held.
-func (qt *QUICTransport) alpnList() []string {
-	qt.mu.Lock()
-	defer qt.mu.Unlock()
-	out := make([]string, 0, len(qt.lns))
-	for node := range qt.lns {
-		out = append(out, alpnPrefix+node)
+func (qt *QUICTransport) Dial(ctx context.Context, remote net.Addr) (Conn, error) {
+	if remote == nil {
+		return nil, &net.OpError{Op: "dial", Net: string(NetworkQUIC), Source: qt.addr, Err: ErrMissingAddr}
 	}
-	slices.Sort(out)
-	return out
-}
-
-// route hands each accepted connection to the node its ALPN names. It is the
-// only reader of the shared listener, so it must never block.
-func (qt *QUICTransport) route(ln *quic.Listener) {
-	for {
-		conn, err := ln.Accept(context.Background())
-		if err != nil {
-			qt.failListeners(err)
-			return
-		}
-		node := strings.TrimPrefix(conn.ConnectionState().TLS.NegotiatedProtocol, alpnPrefix)
-		qt.deliver(node, conn)
+	if remote.Network() != string(NetworkQUIC) {
+		return nil, &net.OpError{Op: "dial", Net: string(NetworkQUIC), Source: qt.addr, Addr: remote, Err: UnknownNetworkError(remote.Network())}
 	}
-}
-
-func (qt *QUICTransport) deliver(node string, conn *quic.Conn) {
 	qt.mu.Lock()
-	l := qt.lns[node]
+	closed := qt.closed
 	qt.mu.Unlock()
-
-	// ALPN negotiation should already have rejected an unknown node; close
-	// rather than drop so the dialer learns why.
-	if l == nil {
-		conn.CloseWithError(quic.ApplicationErrorCode(ConnCodeUnknownNode), "unknown node")
-		return
-	}
-	select {
-	case <-l.closed:
-		conn.CloseWithError(quic.ApplicationErrorCode(ConnCodeShutdown), "listener closed")
-		return
-	default:
-	}
-	select {
-	case l.accept <- &QUICConn{conn: conn}:
-	default:
-		conn.CloseWithError(quic.ApplicationErrorCode(ConnCodeBusy), "accept queue full")
-	}
-}
-
-// failListeners terminates every node listener when the shared router dies,
-// so nobody is left blocked in Accept on a socket that no longer reads.
-func (qt *QUICTransport) failListeners(err error) {
-	qt.mu.Lock()
-	lns := slices.Collect(maps.Values(qt.lns))
-	qt.mu.Unlock()
-	for _, l := range lns {
-		l.fail(err)
-	}
-}
-
-// release drops a node's registration. The socket and shared listener belong
-// to the transport, not to the last node standing: one node draining must
-// leave its siblings serving, and a process closes the transport itself when
-// it exits. Connections arriving for a released node are refused as unknown.
-func (qt *QUICTransport) release(node string, l *quicListener) {
-	qt.mu.Lock()
-	defer qt.mu.Unlock()
-	if qt.lns[node] == l {
-		delete(qt.lns, node)
-	}
-}
-
-// dialer returns the transport to dial over: the bound socket when this
-// process listens, otherwise a lazily created ephemeral one.
-func (qt *QUICTransport) dialer() (*quic.Transport, error) {
-	qt.mu.Lock()
-	defer qt.mu.Unlock()
-	if qt.closed {
+	if closed {
 		return nil, ErrTransportClosed
 	}
-	if qt.tr != nil {
-		return qt.tr, nil
-	}
-	if qt.dialTr == nil {
-		pc, err := net.ListenUDP("udp", &net.UDPAddr{})
-		if err != nil {
-			return nil, fmt.Errorf("quic dial socket: %w", err)
-		}
-		qt.dialTr = &quic.Transport{Conn: pc}
-	}
-	return qt.dialTr, nil
-}
 
-func (qt *QUICTransport) Dial(ctx context.Context, addr net.Addr) (Conn, error) {
-	qa, err := quicAddr("dial", addr)
+	udpAddr, err := net.ResolveUDPAddr("udp", remote.String())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("resolve %s: %w", remote, err)
 	}
-	tr, err := qt.dialer()
+	host, _, err := net.SplitHostPort(remote.String())
 	if err != nil {
-		return nil, err
-	}
-	udpAddr, err := net.ResolveUDPAddr("udp", qa.endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("resolve %s: %w", qa.endpoint, err)
-	}
-	host, _, err := net.SplitHostPort(qa.endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("split %s: %w", qa.endpoint, err)
+		return nil, fmt.Errorf("split %s: %w", remote, err)
 	}
 
 	// Strict server verification: RootCAs nil means the OS trust store, and
-	// ServerName comes from the endpoint rather than the node key, which
-	// names a node rather than a certificate subject.
+	// ServerName is the peer host, which is the certificate subject.
 	tlsConf := &tls.Config{
 		ServerName:       host,
-		RootCAs:          qt.cfg.RootCAs,
+		RootCAs:          qt.rootCAs,
 		MinVersion:       tls.VersionTLS13,
 		CurvePreferences: tlsconfig.Curves,
-		NextProtos:       []string{alpnPrefix + qa.node},
+		NextProtos:       []string{alpnProto},
 	}
-	conn, err := tr.Dial(ctx, udpAddr, tlsConf, dialQUICConfig())
+	conn, err := qt.tr.Dial(ctx, udpAddr, tlsConf, dialQUICConfig())
 	if err != nil {
-		return nil, fmt.Errorf("quic dial %s: %w", qa, err)
+		return nil, fmt.Errorf("quic dial %s: %w", remote, err)
 	}
 	return &QUICConn{conn: conn}, nil
 }
 
-// Close tears down every node listener, the shared listener and the sockets.
+// Close tears down the listener and the socket. Established connections are
+// terminated abruptly, so callers drain them first.
 func (qt *QUICTransport) Close() error {
 	qt.mu.Lock()
 	if qt.closed {
@@ -357,25 +160,18 @@ func (qt *QUICTransport) Close() error {
 		return nil
 	}
 	qt.closed = true
-	lns := slices.Collect(maps.Values(qt.lns))
-	clear(qt.lns)
-	ln, tr, dialTr := qt.ln, qt.tr, qt.dialTr
-	qt.ln, qt.tr, qt.dialTr = nil, nil, nil
+	ln := qt.ln
 	qt.mu.Unlock()
 
-	for _, l := range lns {
-		l.fail(ErrTransportClosed)
-	}
 	if ln != nil {
 		ln.Close()
 	}
-	if tr != nil {
-		tr.Close()
+	err := qt.tr.Close()
+	// quic-go leaves a caller-supplied socket open.
+	if cerr := qt.pc.Close(); err == nil {
+		err = cerr
 	}
-	if dialTr != nil {
-		dialTr.Close()
-	}
-	return nil
+	return err
 }
 
 // QUIC flow-control window sizes, shared by the listen and dial configs so the
@@ -423,77 +219,36 @@ func dialQUICConfig() *quic.Config {
 
 var _ Listener = (*quicListener)(nil)
 
-// quicListener is one node's view of the shared socket: the accept router
-// feeds it only the connections whose ALPN named this node.
+// quicListener is the transport's single listener, wrapping quic-go's.
 type quicListener struct {
-	tr     *QUICTransport
-	qa     *QUICAddr
-	accept chan *QUICConn
-	closed chan struct{}
-	once   sync.Once
-
-	mu sync.Mutex
-	// err records why the shared router stopped, so Accept reports the cause
-	// rather than a bare closed-listener error.
-	err error
+	ln   *quic.Listener
+	addr *Addr
 }
 
 func (l *quicListener) Accept(ctx context.Context) (Conn, error) {
-	select {
-	case <-ctx.Done():
-		return nil, &net.OpError{Op: "accept", Net: string(NetworkQUIC), Addr: l.qa, Err: ctx.Err()}
-	case <-l.closed:
-		return nil, &net.OpError{Op: "accept", Net: string(NetworkQUIC), Addr: l.qa, Err: l.cause()}
-	case conn := <-l.accept:
-		return conn, nil
+	conn, err := l.ln.Accept(ctx)
+	if err != nil {
+		if errors.Is(err, quic.ErrServerClosed) {
+			err = ErrListenerClosed
+		}
+		return nil, &net.OpError{Op: "accept", Net: string(NetworkQUIC), Addr: l.addr, Err: err}
 	}
+	return &QUICConn{conn: conn}, nil
 }
 
-func (l *quicListener) Addr() net.Addr { return l.qa }
+func (l *quicListener) Addr() net.Addr { return l.addr }
 
-func (l *quicListener) cause() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.err != nil {
-		return l.err
-	}
-	return ErrListenerClosed
-}
-
-// fail terminates the listener with the router's error. Connections already
-// queued are dropped: nothing will read them.
-func (l *quicListener) fail(err error) {
-	l.mu.Lock()
-	if l.err == nil {
-		l.err = err
-	}
-	l.mu.Unlock()
-	l.shutdown()
-}
-
+// Close stops accepting and closes whatever is still queued: nothing will
+// read those connections, and the peer is told why.
 func (l *quicListener) Close() error {
-	l.shutdown()
-	return nil
-}
-
-// shutdown deregisters the node and closes the shared socket once the last
-// node has gone, so one node draining leaves its siblings serving.
-func (l *quicListener) shutdown() {
-	l.once.Do(func() {
-		close(l.closed)
-		for {
-			select {
-			case conn := <-l.accept:
-				conn.conn.CloseWithError(quic.ApplicationErrorCode(ConnCodeShutdown), "listener closed")
-				continue
-			default:
-			}
-			break
+	l.ln.Close()
+	for {
+		conn, err := l.ln.Accept(context.Background())
+		if err != nil {
+			return nil
 		}
-		if l.tr != nil {
-			l.tr.release(l.qa.node, l)
-		}
-	})
+		conn.CloseWithError(quic.ApplicationErrorCode(ConnCodeShutdown), "listener closed")
+	}
 }
 
 var _ Conn = (*QUICConn)(nil)

@@ -22,11 +22,12 @@ func quicPair(t *testing.T) (dial, accepted transport.Conn) {
 
 	certPath, keyPath, pool := testcerts.Generate(t)
 
-	server := transport.NewQUICTransport(transport.QUICTransportConfig{
-		TLSCert: certPath,
-		TLSKey:  keyPath,
-	})
-	ln, err := server.Listen(transport.NewQUICAddr("127.0.0.1:0", "node-1"))
+	server, err := transport.NewQUICTransport("127.0.0.1", 0, certPath, keyPath)
+	if err != nil {
+		t.Fatalf("NewQUICTransport: %v", err)
+	}
+	t.Cleanup(func() { server.Close() })
+	ln, err := server.Listen()
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -43,7 +44,11 @@ func quicPair(t *testing.T) (dial, accepted transport.Conn) {
 		acceptedCh <- c
 	}()
 
-	client := transport.NewQUICTransport(transport.QUICTransportConfig{RootCAs: pool})
+	client, err := transport.NewQUICTransport("127.0.0.1", 0, certPath, keyPath, transport.WithRootCAs(pool))
+	if err != nil {
+		t.Fatalf("NewQUICTransport: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
 	dial, err = client.Dial(ctx, ln.Addr())
 	if err != nil {
 		t.Fatalf("Dial: %v", err)
@@ -57,30 +62,6 @@ func quicPair(t *testing.T) (dial, accepted transport.Conn) {
 	}
 	t.Cleanup(func() { accepted.Close() })
 	return dial, accepted
-}
-
-func TestQUICResolveAddr(t *testing.T) {
-	addr, err := transport.ResolveAddr(string(transport.NetworkQUIC), "10.0.0.1:6660")
-	if err != nil {
-		t.Fatalf("ResolveAddr: %v", err)
-	}
-	if addr.Network() != "quic" || addr.String() != "10.0.0.1:6660" {
-		t.Fatalf("got %s/%s, want quic/10.0.0.1:6660", addr.Network(), addr.String())
-	}
-}
-
-func TestQUICListenRequiresCerts(t *testing.T) {
-	qt := transport.NewQUICTransport(transport.QUICTransportConfig{})
-	if _, err := qt.Listen(transport.NewQUICAddr("127.0.0.1:0", "node-1")); err == nil {
-		t.Fatal("Listen without certs succeeded")
-	}
-	if _, err := qt.Listen(nil); !errors.Is(err, transport.ErrMissingAddr) {
-		t.Fatalf("got %v, want ErrMissingAddr", err)
-	}
-	// An address without a node key names no listener.
-	if _, err := qt.Listen(transport.NewQUICAddr("127.0.0.1:0", "")); !errors.Is(err, transport.ErrMissingAddr) {
-		t.Fatalf("got %v, want ErrMissingAddr", err)
-	}
 }
 
 func TestQUICStreamRoundTrip(t *testing.T) {
@@ -195,11 +176,12 @@ func TestQUICStreamReadFromWriteTo(t *testing.T) {
 
 func TestQUICListenerCloseUnblocksAccept(t *testing.T) {
 	certPath, keyPath, _ := testcerts.Generate(t)
-	qt := transport.NewQUICTransport(transport.QUICTransportConfig{
-		TLSCert: certPath,
-		TLSKey:  keyPath,
-	})
-	ln, err := qt.Listen(transport.NewQUICAddr("127.0.0.1:0", "node-1"))
+	qt, err := transport.NewQUICTransport("127.0.0.1", 0, certPath, keyPath)
+	if err != nil {
+		t.Fatalf("NewQUICTransport: %v", err)
+	}
+	defer qt.Close()
+	ln, err := qt.Listen()
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -224,11 +206,12 @@ func TestQUICListenerCloseUnblocksAccept(t *testing.T) {
 
 func TestQUICDialUntrustedServer(t *testing.T) {
 	certPath, keyPath, _ := testcerts.Generate(t)
-	server := transport.NewQUICTransport(transport.QUICTransportConfig{
-		TLSCert: certPath,
-		TLSKey:  keyPath,
-	})
-	ln, err := server.Listen(transport.NewQUICAddr("127.0.0.1:0", "node-1"))
+	server, err := transport.NewQUICTransport("127.0.0.1", 0, certPath, keyPath)
+	if err != nil {
+		t.Fatalf("NewQUICTransport: %v", err)
+	}
+	defer server.Close()
+	ln, err := server.Listen()
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
@@ -236,7 +219,11 @@ func TestQUICDialUntrustedServer(t *testing.T) {
 
 	// A client trusting a different CA must refuse the server certificate.
 	_, _, otherPool := testcerts.Generate(t)
-	client := transport.NewQUICTransport(transport.QUICTransportConfig{RootCAs: otherPool})
+	client, err := transport.NewQUICTransport("127.0.0.1", 0, certPath, keyPath, transport.WithRootCAs(otherPool))
+	if err != nil {
+		t.Fatalf("NewQUICTransport: %v", err)
+	}
+	defer client.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if _, err := client.Dial(ctx, ln.Addr()); err == nil {

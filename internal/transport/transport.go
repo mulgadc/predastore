@@ -20,29 +20,33 @@ func (e UnknownNetworkError) Error() string { return "unknown network " + string
 
 type Network string
 
-func ResolveAddr(network, addr string) (net.Addr, error) {
-	switch network {
-	case string(NetworkPipe):
-		return newPipeAddr(addr), nil
-	case string(NetworkQUIC):
-		return newQUICAddr(addr), nil
-	default:
-		return nil, UnknownNetworkError(network)
-	}
+// Addr names one endpoint: the network carrying it and the host:port that
+// selects it there. Both transports address their endpoints this way.
+type Addr struct {
+	network  Network
+	hostPort string
 }
 
-// Transport carries streams over one network. A process creates one instance
-// per network and uses it for every node it runs: Listen may be called
-// repeatedly for different addresses, and implementations share whatever
-// underlying resources that allows.
+func NewAddr(network Network, hostPort string) *Addr {
+	return &Addr{network: network, hostPort: hostPort}
+}
+
+func (a *Addr) Network() string { return string(a.network) }
+func (a *Addr) String() string  { return a.hostPort }
+
+// Transport carries streams over one network for one node: it owns a single
+// endpoint, bound at construction, that it both dials from and listens on.
 type Transport interface {
 	// Network names the network this transport serves, matching the Network()
 	// of every address it accepts.
 	Network() string
-	Dial(ctx context.Context, addr net.Addr) (Conn, error)
-	// Listen serves addr. Calling it again for a different address adds
-	// another listener rather than replacing the first.
-	Listen(addr net.Addr) (Listener, error)
+	Dial(ctx context.Context, remote net.Addr) (Conn, error)
+	// Listen serves this transport's own endpoint. It may be called once.
+	Listen() (Listener, error)
+	// Addr is the endpoint the transport bound, which differs from the one
+	// requested when the request named port 0.
+	Addr() net.Addr
+	Close() error
 }
 
 type Listener interface {
