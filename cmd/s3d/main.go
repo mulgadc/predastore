@@ -32,16 +32,13 @@ func main() {
 
 func run() error {
 	configPath := flag.String("config", "", "S3 server configuration file (required)")
-	tlsKey := flag.String("tls-key", "certs/server.key", "Path to TLS key")
-	tlsCert := flag.String("tls-cert", "certs/server.pem", "Path to TLS cert")
 	basePath := flag.String("base-path", "", "Base path for the S3 directory when undefined in the config file")
 	debug := flag.Bool("debug", false, "Enable verbose debug logs")
-	port := flag.Int("port", 443, "S3 gateway port")
 	host := flag.Int("host", 0, "ID of the [[host]] this process runs (required)")
 	encryptionKeyFile := flag.String("encryption-key-file", "", "Path to 32-byte AES-256 master key for encryption at rest (required)")
 
 	flag.Parse()
-	applyEnvOverrides(configPath, tlsKey, tlsCert, port, host, encryptionKeyFile)
+	applyEnvOverrides(configPath, host, encryptionKeyFile)
 
 	if *configPath == "" {
 		flag.Usage()
@@ -90,37 +87,18 @@ func run() error {
 		return fmt.Errorf("load master key: %w", err)
 	}
 
-	h, err := predastore.New(predastore.Options{
+	return predastore.Run(ctx, predastore.Options{
 		Config:    cfg,
 		HostID:    predastore.HostID(*host),
-		Port:      *port,
-		TLSCert:   *tlsCert,
-		TLSKey:    *tlsKey,
 		MasterKey: key,
 		Debug:     *debug,
 	})
-	if err != nil {
-		return fmt.Errorf("build predastore host: %w", err)
-	}
-
-	return h.Run(ctx)
 }
 
 // applyEnvOverrides lets the launcher configure s3d without rewriting flags.
-func applyEnvOverrides(config, tlsKey, tlsCert *string, port, host *int, encryptionKeyFile *string) {
+func applyEnvOverrides(config *string, host *int, encryptionKeyFile *string) {
 	if v := os.Getenv("CONFIG"); v != "" {
 		*config = v
-	}
-	if v := os.Getenv("TLS_KEY"); v != "" {
-		*tlsKey = v
-	}
-	if v := os.Getenv("TLS_CERT"); v != "" {
-		*tlsCert = v
-	}
-	if v := os.Getenv("PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			*port = p
-		}
 	}
 	if v := os.Getenv("HOST"); v != "" {
 		if id, err := strconv.Atoi(v); err == nil {

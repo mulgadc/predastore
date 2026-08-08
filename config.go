@@ -88,8 +88,8 @@ func basePath(c *Config) (string, error) {
 // and treats an identically ordered set as idempotent across replicas, so the
 // order is part of the contract rather than a tidiness.
 
-// localHost is the [[host]] this process runs.
-func localHost(c *Config, hostID HostID) (HostConfig, bool) {
+// hostOf is the [[host]] a node runs on.
+func hostOf(c *Config, hostID HostID) (HostConfig, bool) {
 	for _, h := range c.Hosts {
 		if h.ID == hostID {
 			return h, true
@@ -108,16 +108,27 @@ func nodesByRole(c *Config, role Role) []NodeConfig {
 	return selectNodes(c, func(n NodeConfig) bool { return n.Role == role })
 }
 
+// hasRemoteNodes reports whether any node runs off hostID, which is the only
+// reason a node on it opens a network socket.
+func hasRemoteNodes(c *Config, hostID HostID) bool {
+	return slices.ContainsFunc(c.Nodes, func(n NodeConfig) bool { return n.HostID != hostID })
+}
+
 // dataDir is where a node keeps its state, derived from its own host's base
-// directory and its node id. A relative path is resolved against BasePath by
-// the caller, which is the only thing that knows it.
-func dataDir(c *Config, nodeID NodeID) string {
+// directory and its node id. A relative path is resolved against the base
+// path, so a config can be shared across machines and the launcher decides
+// where state lands.
+func dataDir(c *Config, nodeID NodeID, base string) string {
 	for _, n := range c.Nodes {
 		if n.ID != nodeID {
 			continue
 		}
-		if h, ok := localHost(c, n.HostID); ok {
-			return filepath.Join(h.DataDir, nodeKey(nodeID))
+		if h, ok := hostOf(c, n.HostID); ok {
+			dir := filepath.Join(h.DataDir, nodeKey(nodeID))
+			if !filepath.IsAbs(dir) {
+				dir = filepath.Join(base, dir)
+			}
+			return dir
 		}
 	}
 	return ""
@@ -128,9 +139,8 @@ func nodeKey(nodeID NodeID) string {
 	return fmt.Sprintf("node-%d", nodeID)
 }
 
-// storageNodeIDs are the shard-storage nodes the gateway places shards across.
-func storageNodeIDs(c *Config) []NodeID {
-	nodes := nodesByRole(c, RoleShardStorage)
+// nodeIDs names a set of nodes by id, which is how every client addresses one.
+func nodeIDs(nodes []NodeConfig) []NodeID {
 	ids := make([]NodeID, 0, len(nodes))
 	for _, n := range nodes {
 		ids = append(ids, n.ID)
@@ -224,6 +234,6 @@ func gatewayConfig(c *Config, basePath string, debug bool) *gateway.Config {
 		Debug:          c.Debug || debug,
 		DisableLogging: c.DisableLogging,
 		RateLimit:      c.RateLimit,
-		StorageNodeIDs: storageNodeIDs(c),
+		StorageNodeIDs: nodeIDs(nodesByRole(c, RoleShardStorage)),
 	}
 }
