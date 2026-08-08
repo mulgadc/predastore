@@ -110,7 +110,7 @@ func New(opts Options) (*Host, error) {
 
 	cfg := opts.Config
 
-	basePath, err := cfg.basePath()
+	base, err := basePath(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +119,7 @@ func New(opts Options) (*Host, error) {
 	if err != nil {
 		return nil, err
 	}
-	localHost, ok := cfg.localHost(opts.HostID)
+	host, ok := localHost(cfg, opts.HostID)
 	if !ok {
 		return nil, fmt.Errorf("predastore: host %d not in topology", opts.HostID)
 	}
@@ -154,7 +154,7 @@ func New(opts Options) (*Host, error) {
 		return rpc.OpenStream(ctx, h.client, target, state.OpRaftDial, &state.RaftDial{})
 	}
 
-	peers := raftPeers(cfg.nodesByRole(RoleStateReplica))
+	peers := raftPeers(nodesByRole(cfg, RoleStateReplica))
 	replicaIDs := make([]NodeID, len(peers))
 	for i, p := range peers {
 		replicaIDs[i] = p.ID
@@ -168,8 +168,8 @@ func New(opts Options) (*Host, error) {
 		engine.WithCompaction(time.Duration(cfg.Compaction.IntervalSeconds) * time.Second),
 	}
 
-	for _, local := range cfg.localNodes(opts.HostID) {
-		if err := h.addNode(cfg, resolver, local, basePath, raftDial, peers, storeOpts); err != nil {
+	for _, local := range localNodes(cfg, opts.HostID) {
+		if err := h.addNode(cfg, resolver, local, base, raftDial, peers, storeOpts); err != nil {
 			h.close()
 			return nil, err
 		}
@@ -187,8 +187,8 @@ func New(opts Options) (*Host, error) {
 	}
 
 	h.gateway, err = gateway.NewServer(gateway.ServerConfig{
-		Config:          cfg.gatewayConfig(basePath, opts.Debug),
-		Host:            gatewayHost(localHost),
+		Config:          gatewayConfig(cfg, base, opts.Debug),
+		Host:            gatewayHost(host),
 		Port:            opts.Port,
 		TLSCert:         opts.TLSCert,
 		TLSKey:          opts.TLSKey,
@@ -233,7 +233,7 @@ func (h *Host) addNode(
 	cfg *Config,
 	resolver *topology.Resolver,
 	local NodeConfig,
-	basePath string,
+	base string,
 	raftDial func(context.Context, raft.ServerAddress) (transport.Stream, error),
 	peers []state.RaftPeer,
 	storeOpts []engine.Option,
@@ -242,9 +242,9 @@ func (h *Host) addNode(
 
 	// A relative data_dir is resolved against the base path, so a config can
 	// be shared across machines and the launcher decides where state lands.
-	dataDir := cfg.dataDir(local.ID)
-	if !filepath.IsAbs(dataDir) {
-		dataDir = filepath.Join(basePath, dataDir)
+	dir := dataDir(cfg, local.ID)
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(base, dir)
 	}
 
 	mux := rpc.NewMux()
@@ -254,7 +254,7 @@ func (h *Host) addNode(
 	case RoleStateReplica:
 		ccfg := state.DefaultClusterConfig()
 		ccfg.NodeID = id
-		ccfg.DataDir = dataDir
+		ccfg.DataDir = dir
 		// Bootstrapping with an identical peer set is idempotent across
 		// replicas, so every replica may attempt it.
 		ccfg.Bootstrap = true
@@ -270,10 +270,10 @@ func (h *Host) addNode(
 
 	case RoleShardStorage:
 		// The store expects its directory to exist.
-		if err := os.MkdirAll(dataDir, 0750); err != nil {
-			return fmt.Errorf("create shard store directory %s: %w", dataDir, err)
+		if err := os.MkdirAll(dir, 0750); err != nil {
+			return fmt.Errorf("create shard store directory %s: %w", dir, err)
 		}
-		st, err := engine.Open(dataDir, storeOpts...)
+		st, err := engine.Open(dir, storeOpts...)
 		if err != nil {
 			return fmt.Errorf("open shard store for node %d: %w", local.ID, err)
 		}
