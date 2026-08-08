@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 	"golang.org/x/sync/errgroup"
 )
@@ -40,68 +39,34 @@ func RegisterHandler[T any, PT interface {
 	}
 }
 
-// ServerConfig describes one node's rpc endpoint. The node answers on every
-// address the resolver gives it: an in-process pipe address always, plus a
-// network address when peers run outside this process. Transports are the
-// process-wide set, shared with every other node's server.
-type ServerConfig struct {
-	Mux *Mux
-	// NodeID is the node this server answers for.
-	NodeID topology.NodeID
-	// Resolver supplies that node's listen addresses. Required.
-	Resolver     Resolver
-	Transports   []transport.Transport
-	DrainTimeout time.Duration
+type ServerOption func(*Server)
+
+// WithDrainTimeout bounds how long Run waits for in-flight handlers once the
+// accept loops have stopped.
+func WithDrainTimeout(d time.Duration) ServerOption {
+	return func(s *Server) { s.drainTimeout = d }
 }
 
+// Server answers rpc streams for one node on the listeners it is given. The
+// listeners are already bound: whoever built the node owns its transports, so
+// a server never learns which networks it is reached over.
 type Server struct {
-	cfg ServerConfig
-	lns []transport.Listener
+	mux          *Mux
+	lns          []transport.Listener
+	drainTimeout time.Duration
 }
 
-func NewServer(cfg ServerConfig) (*Server, error) {
+func NewServer(mux *Mux, lns []transport.Listener, opts ...ServerOption) (*Server, error) {
+	if mux == nil {
+		return nil, fmt.Errorf("server has no mux")
+	}
+
 	const defaultDrainTimeout = 30 * time.Second
-	if cfg.DrainTimeout == 0 {
-		cfg.DrainTimeout = defaultDrainTimeout
+	s := &Server{mux: mux, lns: lns, drainTimeout: defaultDrainTimeout}
+	for _, opt := range opts {
+		opt(s)
 	}
-	if cfg.Resolver == nil {
-		return nil, fmt.Errorf("server has no resolver")
-	}
-	addrs, err := cfg.Resolver.ListenAddrs(cfg.NodeID)
-	if err != nil {
-		return nil, fmt.Errorf("listen addresses for node %d: %w", cfg.NodeID, err)
-	}
-
-	trs := make(map[string]transport.Transport, len(cfg.Transports))
-	for _, tr := range cfg.Transports {
-		trs[tr.Network()] = tr
-	}
-
-	lns := make([]transport.Listener, 0, len(addrs))
-	// Release the addresses already bound on any failure; leaving them held
-	// would fail a retry of this same config with "address already in use".
-	bail := func(err error) error {
-		for _, bound := range lns {
-			bound.Close()
-		}
-		return err
-	}
-	for _, addr := range addrs {
-		tr, ok := trs[addr.Network()]
-		if !ok {
-			return nil, bail(fmt.Errorf("no %s transport available", addr.Network()))
-		}
-		ln, err := tr.Listen(addr)
-		if err != nil {
-			return nil, bail(err)
-		}
-		lns = append(lns, ln)
-	}
-
-	return &Server{
-		cfg: cfg,
-		lns: lns,
-	}, nil
+	return s, nil
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -142,7 +107,7 @@ func (s *Server) Run(ctx context.Context) error {
 		close(done)
 	}()
 
-	t := time.NewTimer(s.cfg.DrainTimeout)
+	t := time.NewTimer(s.drainTimeout)
 	defer t.Stop()
 	deadline := t.C
 
@@ -270,7 +235,7 @@ func (s *Server) handleStream(ctx context.Context, stream transport.Stream) erro
 		return fmt.Errorf("read header: %w", err)
 	}
 
-	h, ok := s.cfg.Mux.handlers[op]
+	h, ok := s.mux.handlers[op]
 	if !ok {
 		return fmt.Errorf("no handler found")
 	}

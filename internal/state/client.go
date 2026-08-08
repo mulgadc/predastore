@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/rpc"
-	"github.com/mulgadc/predastore/internal/topology"
 )
 
 // ErrNotFound is returned by reads when no replica holds the key.
@@ -35,12 +35,12 @@ type Item struct {
 // redirects and cache the leader they land on.
 type Client struct {
 	rpc        *rpc.Client
-	replicas   []topology.NodeID
+	replicas   []config.NodeID
 	timeout    time.Duration
 	maxRetries int
 
 	mu     sync.Mutex
-	leader topology.NodeID // cached leader replica id; 0 means unknown
+	leader config.NodeID // cached leader replica id; 0 means unknown
 }
 
 // ClientConfig configures a Client.
@@ -49,7 +49,7 @@ type ClientConfig struct {
 	// address, so this client only ever names replicas by id.
 	Client *rpc.Client
 	// Replicas lists the state replica node ids.
-	Replicas []topology.NodeID
+	Replicas []config.NodeID
 	// Timeout bounds each attempt. Default 10s.
 	Timeout time.Duration
 	// MaxRetries bounds write retry rounds across the replica set.
@@ -80,7 +80,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 
 // call performs one request round trip against a replica: header, optional
 // body, half-close, then the response envelope.
-func (c *Client) call(target topology.NodeID, op rpc.Opcode, req *StateRequest, body []byte) (*StateResponse, error) {
+func (c *Client) call(target config.NodeID, op rpc.Opcode, req *StateRequest, body []byte) (*StateResponse, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -113,12 +113,12 @@ func (c *Client) call(target topology.NodeID, op rpc.Opcode, req *StateRequest, 
 }
 
 // readOrder returns replicas with the cached leader first.
-func (c *Client) readOrder() []topology.NodeID {
+func (c *Client) readOrder() []config.NodeID {
 	c.mu.Lock()
 	leader := c.leader
 	c.mu.Unlock()
 
-	order := make([]topology.NodeID, 0, len(c.replicas))
+	order := make([]config.NodeID, 0, len(c.replicas))
 	if leader != 0 {
 		order = append(order, leader)
 	}
@@ -130,7 +130,7 @@ func (c *Client) readOrder() []topology.NodeID {
 	return order
 }
 
-func (c *Client) cacheLeader(id topology.NodeID) {
+func (c *Client) cacheLeader(id config.NodeID) {
 	c.mu.Lock()
 	c.leader = id
 	c.mu.Unlock()

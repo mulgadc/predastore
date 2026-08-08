@@ -11,9 +11,9 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/storage/engine"
-	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
@@ -21,17 +21,17 @@ import (
 // several nodes builds one Server per node, each carried by its own rpc
 // server, so the shard service never learns that it has siblings.
 type Server struct {
-	id    topology.NodeID
+	id    config.NodeID
 	store *engine.Store
 }
 
 // NewServer builds the shard service for one node's store.
-func NewServer(id topology.NodeID, st *engine.Store) *Server {
+func NewServer(id config.NodeID, st *engine.Store) *Server {
 	return &Server{id: id, store: st}
 }
 
 // ID is the node this server serves.
-func (s *Server) ID() topology.NodeID { return s.id }
+func (s *Server) ID() config.NodeID { return s.id }
 
 // Run holds the node open until ctx is cancelled, then closes its store. The
 // rpc server draining is the caller's concern; by the time Run returns no

@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/rpc"
-	"github.com/mulgadc/predastore/internal/topology"
 )
 
 // Opcodes are allocated per service in non-overlapping ranges so a stream's
@@ -38,17 +38,17 @@ const (
 const raftAddrPrefix = "node-"
 
 // RaftAddress returns the raft advertise address for a state replica.
-func RaftAddress(nodeID topology.NodeID) string {
+func RaftAddress(nodeID config.NodeID) string {
 	return raftAddrPrefix + strconv.FormatUint(uint64(nodeID), 10)
 }
 
 // ParseRaftAddress recovers the node id from a raft advertise address.
-func ParseRaftAddress(addr string) (topology.NodeID, error) {
+func ParseRaftAddress(addr string) (config.NodeID, error) {
 	id, err := strconv.ParseUint(strings.TrimPrefix(addr, raftAddrPrefix), 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("state: bad raft address %q: %w", addr, err)
 	}
-	return topology.NodeID(id), nil
+	return config.NodeID(id), nil
 }
 
 // appendJSON implements the rpc.Header Append side for JSON-encoded headers.

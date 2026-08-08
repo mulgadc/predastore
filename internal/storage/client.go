@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/rpc"
-	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
@@ -79,7 +79,7 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 }
 
 // open starts a shard stream against the node.
-func (c *Client) open(ctx context.Context, nodeID topology.NodeID, op rpc.Opcode, h *ShardRequest) (transport.Stream, error) {
+func (c *Client) open(ctx context.Context, nodeID config.NodeID, op rpc.Opcode, h *ShardRequest) (transport.Stream, error) {
 	stream, err := rpc.OpenStream(ctx, c.rpc, nodeID, op, h)
 	if err != nil {
 		return nil, fmt.Errorf("open stream to storage node %d: %w", nodeID, err)
@@ -102,7 +102,7 @@ func readEnvelope(br *bufio.Reader) (*ShardResponse, error) {
 }
 
 // PutShard streams a shard to the node and returns the commit result.
-func (c *Client) PutShard(ctx context.Context, nodeID topology.NodeID, req PutRequest, body io.Reader) (*PutResponse, error) {
+func (c *Client) PutShard(ctx context.Context, nodeID config.NodeID, req PutRequest, body io.Reader) (*PutResponse, error) {
 	stream, err := c.open(ctx, nodeID, OpShardPut, &ShardRequest{
 		ObjectHash: req.ObjectHash,
 		ShardIndex: req.ShardIndex,
@@ -141,7 +141,7 @@ func (c *Client) PutShard(ctx context.Context, nodeID topology.NodeID, req PutRe
 }
 
 // DeleteShard marks a shard deleted on the node.
-func (c *Client) DeleteShard(ctx context.Context, nodeID topology.NodeID, req DeleteRequest) (*DeleteResponse, error) {
+func (c *Client) DeleteShard(ctx context.Context, nodeID config.NodeID, req DeleteRequest) (*DeleteResponse, error) {
 	stream, err := c.open(ctx, nodeID, OpShardDelete, &ShardRequest{
 		ObjectHash: req.ObjectHash,
 		ShardIndex: req.ShardIndex,
@@ -167,16 +167,16 @@ func (c *Client) DeleteShard(ctx context.Context, nodeID topology.NodeID, req De
 
 // GetShard streams a whole shard from the node. The caller must Close the
 // returned reader to release the stream.
-func (c *Client) GetShard(ctx context.Context, nodeID topology.NodeID, req GetRequest) (io.ReadCloser, error) {
+func (c *Client) GetShard(ctx context.Context, nodeID config.NodeID, req GetRequest) (io.ReadCloser, error) {
 	return c.get(ctx, nodeID, req)
 }
 
 // GetShardRange streams the byte range [RangeStart, RangeEnd] of a shard.
-func (c *Client) GetShardRange(ctx context.Context, nodeID topology.NodeID, req GetRequest) (io.ReadCloser, error) {
+func (c *Client) GetShardRange(ctx context.Context, nodeID config.NodeID, req GetRequest) (io.ReadCloser, error) {
 	return c.get(ctx, nodeID, req)
 }
 
-func (c *Client) get(ctx context.Context, nodeID topology.NodeID, req GetRequest) (io.ReadCloser, error) {
+func (c *Client) get(ctx context.Context, nodeID config.NodeID, req GetRequest) (io.ReadCloser, error) {
 	stream, err := c.open(ctx, nodeID, OpShardGet, &ShardRequest{
 		ObjectHash: req.ObjectHash,
 		ShardIndex: req.ShardIndex,

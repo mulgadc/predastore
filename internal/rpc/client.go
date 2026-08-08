@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mulgadc/predastore/internal/topology"
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/transport"
 	"golang.org/x/sync/singleflight"
 )
@@ -21,40 +21,37 @@ var ErrClientClosed = errors.New("client closed")
 
 func poolKey(addr net.Addr) string { return addr.Network() + "|" + addr.String() }
 
-type ClientConfig struct {
-	Transports []transport.Transport
-	// Resolver resolves the node ids OpenStream is given. Required: a client
-	// without one cannot address anything.
-	Resolver    Resolver
-	DialTimeout time.Duration
+type ClientOption func(*Client)
+
+// WithDialTimeout bounds a single dial. It does not bound OpenStream, which
+// stops when its own context does.
+func WithDialTimeout(d time.Duration) ClientOption {
+	return func(c *Client) { c.dialTimeout = d }
 }
 
+// Client opens streams to nodes named by id. The resolver turns an id into
+// the route that reaches it, so the client holds no notion of a network.
 type Client struct {
-	cfg ClientConfig
-	trs map[string]transport.Transport
-	sf  singleflight.Group
+	res         *Resolver
+	dialTimeout time.Duration
+	sf          singleflight.Group
 
 	mu     sync.RWMutex
 	pool   map[string]transport.Conn
 	closed bool
 }
 
-func NewClient(cfg ClientConfig) *Client {
+func NewClient(res *Resolver, opts ...ClientOption) *Client {
 	const defaultDialTimeout = 15 * time.Second
-	if cfg.DialTimeout == 0 {
-		cfg.DialTimeout = defaultDialTimeout
+	c := &Client{
+		res:         res,
+		dialTimeout: defaultDialTimeout,
+		pool:        make(map[string]transport.Conn),
 	}
-
-	trs := make(map[string]transport.Transport)
-	for _, tr := range cfg.Transports {
-		trs[tr.Network()] = tr
+	for _, opt := range opts {
+		opt(c)
 	}
-
-	return &Client{
-		cfg:  cfg,
-		trs:  trs,
-		pool: make(map[string]transport.Conn),
-	}
+	return c
 }
 
 // OpenStream opens a stream to a node, addressed by id. Whether that node is
@@ -63,7 +60,7 @@ func NewClient(cfg ClientConfig) *Client {
 func OpenStream[T Header](
 	ctx context.Context,
 	c *Client,
-	nodeID topology.NodeID,
+	nodeID config.NodeID,
 	op Opcode,
 	header T,
 ) (transport.Stream, error) {
@@ -114,14 +111,15 @@ func OpenStream[T Header](
 
 // dial resolves the node through the resolver and returns a pooled connection
 // to it, along with the address it resolved to so callers can evict it.
-func (c *Client) dial(ctx context.Context, nodeID topology.NodeID) (transport.Conn, net.Addr, error) {
-	if c.cfg.Resolver == nil {
+func (c *Client) dial(ctx context.Context, nodeID config.NodeID) (transport.Conn, net.Addr, error) {
+	if c.res == nil {
 		return nil, nil, fmt.Errorf("client has no resolver")
 	}
-	addr, err := c.cfg.Resolver.NodeAddr(nodeID)
+	route, err := c.res.Route(nodeID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("resolve node %d: %w", nodeID, err)
+		return nil, nil, err
 	}
+	addr := route.Addr
 
 	key := poolKey(addr)
 	c.mu.RLock()
@@ -142,12 +140,8 @@ func (c *Client) dial(ctx context.Context, nodeID topology.NodeID) (transport.Co
 			return conn, nil
 		}
 
-		tr, ok := c.trs[addr.Network()]
-		if !ok {
-			return nil, fmt.Errorf("no %s transport available", addr.Network())
-		}
-		dialCtx, cancelTimeout := context.WithTimeout(context.Background(), c.cfg.DialTimeout)
-		conn, err := tr.Dial(dialCtx, addr)
+		dialCtx, cancelTimeout := context.WithTimeout(context.Background(), c.dialTimeout)
+		conn, err := route.Transport.Dial(dialCtx, addr)
 		cancelTimeout()
 		if err != nil {
 			return nil, fmt.Errorf("dial target address: %w", err)

@@ -14,18 +14,18 @@ import (
 	"sync"
 
 	"github.com/klauspost/reedsolomon"
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/gateway/placement"
 	"github.com/mulgadc/predastore/internal/storage"
-	"github.com/mulgadc/predastore/internal/topology"
 )
 
 // ObjectToShardNodes maps an object to its shard locations.
 type ObjectToShardNodes struct {
 	Object           [32]byte
 	Size             int64
-	DataShardNodes   []topology.NodeID
-	ParityShardNodes []topology.NodeID
+	DataShardNodes   []config.NodeID
+	ParityShardNodes []config.NodeID
 }
 
 // shardWriteOutcome captures the result of writing a shard to a storage node.
@@ -68,8 +68,8 @@ func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int
 	return ObjectToShardNodes{
 		Object:           objectHash,
 		Size:             size,
-		DataShardNodes:   append([]topology.NodeID(nil), nodes[:cfg.DataShards]...),
-		ParityShardNodes: append([]topology.NodeID(nil), nodes[cfg.DataShards:]...),
+		DataShardNodes:   append([]config.NodeID(nil), nodes[:cfg.DataShards]...),
+		ParityShardNodes: append([]config.NodeID(nil), nodes[cfg.DataShards:]...),
 	}, nil
 }
 
@@ -277,7 +277,7 @@ func openInput(st Store, ring *placement.Ring, cfg Config, bucket string, object
 func shardReaders(client *storage.Client, objectHash [32]byte, shards ObjectToShardNodes, parity bool) ([]io.Reader, error) {
 	readers := make([]io.Reader, len(shards.DataShardNodes)+len(shards.ParityShardNodes))
 
-	totalNodes := make([]topology.NodeID, 0)
+	totalNodes := make([]config.NodeID, 0)
 	totalNodes = append(totalNodes, shards.DataShardNodes...)
 
 	if parity {
@@ -395,7 +395,7 @@ func reconstructObject(ctx context.Context, client *storage.Client, objectHash [
 func deleteObjectViaQUIC(ctx context.Context, client *storage.Client, bucket, key string, objectHash [32]byte, shards ObjectToShardNodes) error {
 	// Build (node, shardIndex) pairs so each delete carries the correct shard index.
 	type nodeShard struct {
-		node       topology.NodeID
+		node       config.NodeID
 		shardIndex int
 	}
 	targets := make([]nodeShard, 0, len(shards.DataShardNodes)+len(shards.ParityShardNodes))

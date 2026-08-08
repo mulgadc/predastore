@@ -13,7 +13,7 @@ import (
 	"github.com/dgraph-io/badger/v4"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
-	"github.com/mulgadc/predastore/internal/topology"
+	"github.com/mulgadc/predastore/internal/config"
 )
 
 // Server is one state replica: the raft node itself, its FSM and badger
@@ -21,7 +21,7 @@ import (
 // running several replicas builds one Server per node, each on its own rpc
 // server, so a Server never learns that it has siblings.
 type Server struct {
-	id        topology.NodeID
+	id        config.NodeID
 	config    *ClusterConfig
 	raft      *raft.Raft
 	fsm       *FSM

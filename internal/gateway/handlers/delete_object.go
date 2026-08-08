@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gateway/model"
 	"github.com/mulgadc/predastore/internal/storage"
-	"github.com/mulgadc/predastore/internal/topology"
 )
 
 // deletedObjectPrefix keys the tombstone left behind by a delete, so a future
@@ -19,12 +19,12 @@ const deletedObjectPrefix = "deleted:"
 
 // DeletedObjectInfo tracks a deleted object for compaction coordination.
 type DeletedObjectInfo struct {
-	Bucket         string            `json:"bucket"`
-	Key            string            `json:"key"`
-	ObjectHash     [32]byte          `json:"object_hash"`
-	DeletedAt      int64             `json:"deleted_at"`       // Unix timestamp
-	DataShardNodes []topology.NodeID `json:"data_shard_nodes"` // Which nodes had data shards
-	ParityNodes    []topology.NodeID `json:"parity_nodes"`     // Which nodes had parity shards
+	Bucket         string          `json:"bucket"`
+	Key            string          `json:"key"`
+	ObjectHash     [32]byte        `json:"object_hash"`
+	DeletedAt      int64           `json:"deleted_at"`       // Unix timestamp
+	DataShardNodes []config.NodeID `json:"data_shard_nodes"` // Which nodes had data shards
+	ParityNodes    []config.NodeID `json:"parity_nodes"`     // Which nodes had parity shards
 }
 
 // DeleteObject serves DELETE /{bucket}/{key} with no uploadId.

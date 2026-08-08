@@ -1,7 +1,7 @@
 package state
 
 import (
-	"github.com/mulgadc/predastore/internal/topology"
+	"github.com/mulgadc/predastore/internal/config"
 	"time"
 )
 
@@ -9,15 +9,15 @@ import (
 // node-identifying, and the stream layer's dial function resolves it to a
 // transport.
 type RaftPeer struct {
-	ID      topology.NodeID
+	ID      config.NodeID
 	Address string
 }
 
 // ClusterConfig represents the full cluster configuration.
 type ClusterConfig struct {
-	NodeID    topology.NodeID // This node's ID
-	DataDir   string          // Base data directory
-	Bootstrap bool            // Whether to bootstrap a new cluster
+	NodeID    config.NodeID // This node's ID
+	DataDir   string        // Base data directory
+	Bootstrap bool          // Whether to bootstrap a new cluster
 
 	// StreamLayer carries all raft traffic; Peers lists the voting members
 	// bootstrap uses. Addressing and encryption are the transport's concern,

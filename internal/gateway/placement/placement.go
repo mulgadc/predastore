@@ -11,7 +11,7 @@ import (
 
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash/v2"
-	"github.com/mulgadc/predastore/internal/topology"
+	"github.com/mulgadc/predastore/internal/config"
 )
 
 // Ring tuning. The load factor bounds how unevenly partitions may be spread
@@ -42,7 +42,7 @@ type Ring struct {
 }
 
 // NewRing builds the placement ring over the given storage node ids.
-func NewRing(nodeIDs []topology.NodeID) *Ring {
+func NewRing(nodeIDs []config.NodeID) *Ring {
 	ring := consistent.New(nil, consistent.Config{
 		PartitionCount:    partitionCount,
 		ReplicationFactor: replicationFactor,
@@ -57,12 +57,12 @@ func NewRing(nodeIDs []topology.NodeID) *Ring {
 
 // Nodes returns the ids of the count nodes an object's shards belong on, in
 // shard order: the caller writes shard i to Nodes()[i].
-func (r *Ring) Nodes(objectHash [32]byte, count int) ([]topology.NodeID, error) {
+func (r *Ring) Nodes(objectHash [32]byte, count int) ([]config.NodeID, error) {
 	members, err := r.ring.GetClosestN(objectHash[:], count)
 	if err != nil {
 		return nil, err
 	}
-	ids := make([]topology.NodeID, len(members))
+	ids := make([]config.NodeID, len(members))
 	for i, m := range members {
 		ids[i], err = nodeID(m.String())
 		if err != nil {
@@ -75,7 +75,7 @@ func (r *Ring) Nodes(objectHash [32]byte, count int) ([]topology.NodeID, error) 
 // nodeID recovers the node id from a ring member name. Zero is rejected
 // because the topology validates ids as positive, so a member named node-0
 // means the ring was built from something that is not a cluster.
-func nodeID(name string) (topology.NodeID, error) {
+func nodeID(name string) (config.NodeID, error) {
 	v, err := strconv.ParseUint(strings.Replace(name, memberPrefix, "", 1), 10, 64)
 	if err != nil {
 		return 0, err
@@ -83,5 +83,5 @@ func nodeID(name string) (topology.NodeID, error) {
 	if v == 0 {
 		return 0, fmt.Errorf("node id %d is not positive", v)
 	}
-	return topology.NodeID(v), nil
+	return config.NodeID(v), nil
 }

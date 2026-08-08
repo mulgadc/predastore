@@ -5,9 +5,9 @@
 package gateway
 
 import (
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gateway/auth"
 	"github.com/mulgadc/predastore/internal/gateway/handlers"
-	"github.com/mulgadc/predastore/internal/topology"
 	"github.com/mulgadc/predastore/pkg/ratelimit"
 )
 
@@ -31,7 +31,7 @@ type Config struct {
 
 	// StorageNodeIDs are the shard-storage nodes the placement ring spreads
 	// objects across.
-	StorageNodeIDs []topology.NodeID
+	StorageNodeIDs []config.NodeID
 
 	// TODO: Move to IAM
 	Auth []auth.Entry
