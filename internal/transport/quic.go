@@ -148,7 +148,7 @@ func (qt *QUICTransport) Dial(ctx context.Context, remote net.Addr) (Conn, error
 	if err != nil {
 		return nil, fmt.Errorf("quic dial %s: %w", remote, err)
 	}
-	return &QUICConn{conn: conn}, nil
+	return newQUICConn(conn), nil
 }
 
 // Close tears down the listener and the socket. Established connections are
@@ -233,7 +233,7 @@ func (l *quicListener) Accept(ctx context.Context) (Conn, error) {
 		}
 		return nil, &net.OpError{Op: "accept", Net: string(NetworkQUIC), Addr: l.addr, Err: err}
 	}
-	return &QUICConn{conn: conn}, nil
+	return newQUICConn(conn), nil
 }
 
 func (l *quicListener) Addr() net.Addr { return l.addr }
@@ -253,12 +253,25 @@ func (l *quicListener) Close() error {
 
 var _ Conn = (*QUICConn)(nil)
 
+// QUICConn reports its endpoints as transport addresses rather than the UDP
+// addresses underneath, so a connection's remote is comparable with the
+// addresses a route names.
 type QUICConn struct {
-	conn *quic.Conn
+	conn  *quic.Conn
+	laddr *Addr
+	raddr *Addr
 }
 
-func (qc *QUICConn) LocalAddr() net.Addr  { return qc.conn.LocalAddr() }
-func (qc *QUICConn) RemoteAddr() net.Addr { return qc.conn.RemoteAddr() }
+func newQUICConn(conn *quic.Conn) *QUICConn {
+	return &QUICConn{
+		conn:  conn,
+		laddr: NewAddr(NetworkQUIC, conn.LocalAddr().String()),
+		raddr: NewAddr(NetworkQUIC, conn.RemoteAddr().String()),
+	}
+}
+
+func (qc *QUICConn) LocalAddr() net.Addr  { return qc.laddr }
+func (qc *QUICConn) RemoteAddr() net.Addr { return qc.raddr }
 
 // Context returns a context that is cancelled when the connection is closed,
 // letting callers detect a dead connection without a stream operation.
@@ -269,7 +282,7 @@ func (qc *QUICConn) OpenStream(ctx context.Context) (Stream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &QUICStream{s: s, laddr: qc.conn.LocalAddr(), raddr: qc.conn.RemoteAddr()}, nil
+	return &QUICStream{s: s, laddr: qc.laddr, raddr: qc.raddr}, nil
 }
 
 func (qc *QUICConn) AcceptStream(ctx context.Context) (Stream, error) {
@@ -277,7 +290,7 @@ func (qc *QUICConn) AcceptStream(ctx context.Context) (Stream, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &QUICStream{s: s, laddr: qc.conn.LocalAddr(), raddr: qc.conn.RemoteAddr()}, nil
+	return &QUICStream{s: s, laddr: qc.laddr, raddr: qc.raddr}, nil
 }
 
 func (qc *QUICConn) Close() error {

@@ -50,19 +50,23 @@ func WithDrainTimeout(d time.Duration) ServerOption {
 // Server answers rpc streams for one node on the listeners it is given. The
 // listeners are already bound: whoever built the node owns its transports, so
 // a server never learns which networks it is reached over.
+//
+// A nil pool is meaningful: such a server owns and closes what it accepts and
+// donates nothing, which is what a node that never dials wants.
 type Server struct {
 	mux          *Mux
 	lns          []transport.Listener
+	pool         *ConnPool
 	drainTimeout time.Duration
 }
 
-func NewServer(mux *Mux, lns []transport.Listener, opts ...ServerOption) (*Server, error) {
+func NewServer(mux *Mux, lns []transport.Listener, pool *ConnPool, opts ...ServerOption) (*Server, error) {
 	if mux == nil {
 		return nil, fmt.Errorf("server has no mux")
 	}
 
 	const defaultDrainTimeout = 30 * time.Second
-	s := &Server{mux: mux, lns: lns, drainTimeout: defaultDrainTimeout}
+	s := &Server{mux: mux, lns: lns, pool: pool, drainTimeout: defaultDrainTimeout}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -155,11 +159,19 @@ func (s *Server) acceptConns(
 		backoff = 5 * time.Millisecond
 
 		conns.Go(func() {
-			// Handlers outlive the accept loop, so the connection is tracked
-			// here and closed only once they have drained. Waiting inside the
-			// conns goroutine is what makes Run's conns.Wait a full drain.
+			// Handlers outlive the accept loop, so the connection is released
+			// here and only once they have drained. Waiting inside the conns
+			// goroutine is what makes Run's conns.Wait a full drain.
 			var streams sync.WaitGroup
-			defer conn.Close()
+
+			// A donated connection belongs to the pool, so releasing it means
+			// evicting rather than closing: a connection that dies inbound is
+			// taken out of the pool instead of handed to a dialer dead.
+			if s.pool != nil && s.pool.Donate(conn) {
+				defer s.pool.Evict(conn)
+			} else {
+				defer conn.Close()
+			}
 
 			// Cancelled handlers mean the drain deadline expired. Aborting the
 			// connection is the only way to unblock a handler parked in a
