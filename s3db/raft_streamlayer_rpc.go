@@ -98,9 +98,15 @@ func (l *RPCStreamLayer) Deliver(ctx context.Context, stream transport.Stream) e
 	}
 
 	// Raft owns the connection now; hold the stream open until it lets go.
+	// Closing the layer also releases it: raft's transport Close does not tear
+	// down established conns, so without this the stream is only reclaimed when
+	// the peer's I/O deadline expires, stalling the rpc server's drain.
 	select {
 	case <-conn.Done():
 		return nil
+	case <-l.closed:
+		conn.Close()
+		return net.ErrClosed
 	case <-ctx.Done():
 		conn.Close()
 		return ctx.Err()
