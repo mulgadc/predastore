@@ -11,7 +11,7 @@ Predastore is a distributed, S3-compatible, erasure-coded object store designed 
 3. [System Architecture](#3-system-architecture)
 4. [Logical Data Model](#4-logical-data-model)
 5. [Global Metadata (s3db)](#5-global-metadata-s3db)
-6. [Local Shard Storage](#6-local-shard-storage)
+6. [Local Shard Storage](#6-local-blob)
 7. [Reed-Solomon Encoding](#7-reed-solomon-encoding)
 8. [Hash Ring Placement](#8-hash-ring-placement)
 9. [QUIC Protocol](#9-quic-protocol)
@@ -45,7 +45,7 @@ Predastore is a distributed, S3-compatible, erasure-coded object store designed 
 One process runs one host, and every node the config pins to that host runs inside it. Start one process per `[[host]]`, each naming its own id:
 
 ```bash
-# Host 1, and every node pinned to it — gateway included.
+# Host 1, and every node pinned to it — gate included.
 ./bin/s3d -config cluster.toml -host 1 -encryption-key-file /etc/predastore/master.key
 
 # Host 2, on another machine, reading the same config.
@@ -64,7 +64,7 @@ A config whose hosts are all one host is a single-process cluster. That is not a
 | `-base-path` | - | Fallback for `base_path` when the config file does not set it |
 | `-debug` | - | Verbose debug logs regardless of the config file |
 
-The S3 port and the TLS keypair are configuration, not flags: the port is the gateway node's `port` and the keypair is its host's `tls_cert` / `tls_key`. See §15 for the `[[host]]` and `[[node]]` tables the config is built from.
+The S3 port and the TLS keypair are configuration, not flags: the port is the gate node's `port` and the keypair is its host's `tls_cert` / `tls_key`. See §15 for the `[[host]]` and `[[node]]` tables the config is built from.
 
 `quicd` (the standalone shard-node binary) accepts the same
 `-encryption-key-file` / `ENCRYPTION_KEY_FILE` and refuses to start without
@@ -1210,7 +1210,7 @@ construction. Operationally:
 
 # 14. Deployment Modes
 
-One process runs one host. `-host` selects the `[[host]]` this process is, and the process runs every `[[node]]` pinned to it — the S3 gateway among them — as goroutines under a single context. There is no separate dev mode and no per-node binary: `predastore.Run(ctx, opts)` builds the nodes, serves until the context is cancelled or a node fails, then drains what it started.
+One process runs one host. `-host` selects the `[[host]]` this process is, and the process runs every `[[node]]` pinned to it — the S3 gate among them — as goroutines under a single context. There is no separate dev mode and no per-node binary: `predastore.Run(ctx, opts)` builds the nodes, serves until the context is cancelled or a node fails, then drains what it started.
 
 ## Development Mode (Single Host)
 
@@ -1225,13 +1225,13 @@ Put every node on one host and the whole cluster is one process. Its nodes reach
 Spread the nodes across hosts and run the same command per machine, each naming its own host id. Which transport a pair uses follows from the config: same host is a pipe, different hosts is QUIC. Nothing in the deployment names a transport.
 
 ```bash
-# Host 1: gateway + state replica
+# Host 1: gate + meta replica
 ./bin/s3d -config cluster.toml -host 1 -encryption-key-file /etc/predastore/master.key
 
-# Host 2: shard storage + state replica
+# Host 2: shard storage + meta replica
 ./bin/s3d -config cluster.toml -host 2 -encryption-key-file /etc/predastore/master.key
 
-# Host 3: shard storage + state replica
+# Host 3: shard storage + meta replica
 ./bin/s3d -config cluster.toml -host 3 -encryption-key-file /etc/predastore/master.key
 ```
 
@@ -1334,19 +1334,19 @@ tls_key  = "/etc/predastore/server.key"
 [[node]]
 id = 1
 host_id = 1
-role = "gateway"               # S3 frontend
+role = "gate"               # S3 frontend
 port = 443                     # the S3 port
 
 [[node]]
 id = 2
 host_id = 1
-role = "state-replica"
+role = "meta"
 port = 6661
 
 [[node]]
 id = 3
 host_id = 2
-role = "shard-storage"
+role = "blob"
 port = 6662
 ```
 
@@ -1358,11 +1358,11 @@ Host addresses carry no port. A node's port comes from its own `[[node]]` entry 
 
 | Role | Purpose |
 |------|---------|
-| `gateway` | Serves the S3 API. Its `port` is the S3 port; its rpc transports bind ephemerally, since nothing dials a gateway and it therefore listens on no rpc socket. |
-| `state-replica` | Participates in Raft consensus over global state. Dials its peers and is dialed by them, so one pooled connection serves both directions. |
-| `shard-storage` | Stores erasure-coded shards. Never dials, so it holds no pool. |
+| `gate` | Serves the S3 API. Its `port` is the S3 port; its rpc transports bind ephemerally, since nothing dials a gate and it therefore listens on no rpc socket. |
+| `meta` | Participates in Raft consensus over global state. Dials its peers and is dialed by them, so one pooled connection serves both directions. |
+| `blob` | Stores erasure-coded shards. Never dials, so it holds no pool. |
 
-The gateway is a node with a role, not a per-host special case. A host may declare at most one — two would be two S3 endpoints answering for one machine — and a host declaring none simply serves no S3 API.
+The gate is a node with a role, not a per-host special case. A host may declare at most one — two would be two S3 endpoints answering for one machine — and a host declaring none simply serves no S3 API.
 
 ### TLS
 

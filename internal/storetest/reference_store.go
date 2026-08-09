@@ -5,7 +5,7 @@ import (
 	"maps"
 	"slices"
 
-	"github.com/mulgadc/predastore/internal/storage/engine"
+	"github.com/mulgadc/predastore/internal/blob/engine"
 )
 
 var fs = make(map[string]*RefStore)

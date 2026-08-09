@@ -80,7 +80,7 @@ Cluster runtime data (logs, PID files, segment files, BadgerDB indexes) lives un
 
 ### Run a Host
 
-`./bin/s3d` runs one host of a cluster: the nodes the config pins to it, plus the S3 gateway in front of them. `--host` names the `[[host]]` to run, and everything else about the process — which nodes, which addresses, which data directory — follows from that entry:
+`./bin/s3d` runs one host of a cluster: the nodes the config pins to it, plus the S3 gate in front of them. `--host` names the `[[host]]` to run, and everything else about the process — which nodes, which addresses, which data directory — follows from that entry:
 
 ```bash
 ./bin/s3d \
@@ -93,7 +93,7 @@ Cluster runtime data (logs, PID files, segment files, BadgerDB indexes) lives un
   --encryption-key-file /tmp/predastore/dev/master.key
 ```
 
-A cluster whose `[[node]]` entries all name the same host runs entirely in one process over the in-process pipe, with no inter-node socket and no certificates beyond the S3 gateway's. That is a property of the config, not a launch mode.
+A cluster whose `[[node]]` entries all name the same host runs entirely in one process over the in-process pipe, with no inter-node socket and no certificates beyond the S3 gate's. That is a property of the config, not a launch mode.
 
 The encryption key file must be exactly 32 raw bytes (no base64, no header) with mode `0600`. Generate one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key must be supplied to every host in a cluster; rotating it is not currently supported (see Roadmap → envelope encryption).
 
@@ -107,7 +107,7 @@ region  = "ap-southeast-2"
 
 [rs]
 data   = 2    # data shards
-parity = 1    # parity shards; data + parity = the shard-storage node count
+parity = 1    # parity shards; data + parity = the blob node count
 
 # One host = one s3d process, launched with `-host <id>`.
 [[host]]
@@ -116,11 +116,11 @@ bind_addr   = "10.11.12.1:6660"   # inter-node listen address; 0.0.0.0 binds all
 public_addr = "10.11.12.1:6660"   # what other hosts dial; split from bind_addr for NAT
 data_dir    = "data/host-1"       # on-disk root; relative paths resolve against base_path
 
-# A role pinned to a host. role is "shard-storage" or "state-replica".
+# A role pinned to a host. role is "blob" or "meta".
 [[node]]
 id      = 1
 host_id = 1
-role    = "shard-storage"
+role    = "blob"
 ```
 
 Pin every `[[node]]` to the same `[[host]]` and the cluster runs in one process over the in-process pipe. Spread them across hosts and each process is launched separately with its own `-host` id.

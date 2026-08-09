@@ -36,7 +36,7 @@ type Resolver struct {
 }
 
 // NewResolver builds the table source dials from. Nodes on source's own host
-// are reached over the pipe and every other node over quic. Gateways are left
+// are reached over the pipe and every other node over quic. Gates are left
 // out: nothing dials one, their port is an S3 port and their rpc sockets are
 // ephemeral.
 //
@@ -69,7 +69,7 @@ func NewResolver(cfg *config.Config, source config.NodeID, trs ...transport.Tran
 		nodes:  make(map[addrKey]config.NodeID, len(cfg.Nodes)),
 	}
 	for _, n := range cfg.Nodes {
-		if n.ID == source || n.Role == config.RoleGateway {
+		if n.ID == source || n.Role == config.RoleGate {
 			continue
 		}
 		h, ok := hosts[n.HostID]
@@ -99,7 +99,7 @@ func NewResolver(cfg *config.Config, source config.NodeID, trs ...transport.Tran
 }
 
 // Route is the route to a node. A node with no route is one nothing dials:
-// this node itself, or a gateway.
+// this node itself, or a gate.
 func (r *Resolver) Route(remote config.NodeID) (Route, error) {
 	route, ok := r.routes[remote]
 	if !ok {

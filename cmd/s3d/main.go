@@ -1,5 +1,5 @@
 // Command s3d runs one host of a predastore cluster: the nodes the config
-// pins to the host named by -host, and the S3 gateway in front of them. It is
+// pins to the host named by -host, and the S3 gate in front of them. It is
 // a thin entrypoint — flags, environment, telemetry and a signal context, then
 // predastore.Run.
 package main
@@ -54,7 +54,7 @@ func run() error {
 	}
 
 	// One context for the whole process: ctrl-c cancels the rpc servers, the
-	// node services and the S3 gateway together.
+	// node services and the S3 gate together.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

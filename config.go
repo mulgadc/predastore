@@ -10,9 +10,9 @@ import (
 	"slices"
 
 	"github.com/mulgadc/predastore/internal/config"
-	"github.com/mulgadc/predastore/internal/gateway"
-	"github.com/mulgadc/predastore/internal/gateway/auth"
-	"github.com/mulgadc/predastore/internal/gateway/handlers"
+	"github.com/mulgadc/predastore/internal/gate"
+	"github.com/mulgadc/predastore/internal/gate/auth"
+	"github.com/mulgadc/predastore/internal/gate/handlers"
 )
 
 // The TOML file is this package's contract with operators, so every type it
@@ -33,12 +33,12 @@ type (
 type Role = config.Role
 
 const (
-	// RoleGateway serves the S3 API in front of the cluster.
-	RoleGateway = config.RoleGateway
-	// RoleShardStorage stores erasure-coded object shards.
-	RoleShardStorage = config.RoleShardStorage
-	// RoleStateReplica participates in Raft consensus over global state.
-	RoleStateReplica = config.RoleStateReplica
+	// RoleGate serves the S3 API in front of the cluster.
+	RoleGate = config.RoleGate
+	// RoleBlob stores erasure-coded object shards.
+	RoleBlob = config.RoleBlob
+	// RoleMeta participates in Raft consensus over global state.
+	RoleMeta = config.RoleMeta
 )
 
 // HostConfig is one machine, as written under [[host]]: a data directory, an
@@ -84,7 +84,7 @@ func basePath(c *Config) (string, error) {
 // than in the config package because they are inventory questions about a
 // parsed file, not part of parsing it.
 //
-// Each returns nodes sorted by id. Raft bootstraps from the state-replica set
+// Each returns nodes sorted by id. Raft bootstraps from the meta set
 // and treats an identically ordered set as idempotent across replicas, so the
 // order is part of the contract rather than a tidiness.
 
@@ -160,7 +160,7 @@ func selectNodes(c *Config, keep func(NodeConfig) bool) []NodeConfig {
 }
 
 // The conversions below turn the file into each subsystem's own settings. They
-// live here rather than in the config package because gateway.Config names a
+// live here rather than in the config package because gate.Config names a
 // NodeID and so imports config; converting there would close the cycle.
 
 // bucketConfigs converts the config-defined buckets, resolving relative
@@ -222,18 +222,18 @@ func iamConfig(c *Config) *auth.IAMConfig {
 	}
 }
 
-// gatewayConfig is the slice of the file the S3 frontend reads, with the
+// gateConfig is the slice of the file the S3 frontend reads, with the
 // process-level debug override already folded in.
-func gatewayConfig(c *Config, basePath string, debug bool) *gateway.Config {
-	return &gateway.Config{
+func gateConfig(c *Config, basePath string, debug bool) *gate.Config {
+	return &gate.Config{
 		Region:         c.Region,
-		RS:             gateway.RS{Data: c.RS.Data, Parity: c.RS.Parity},
+		RS:             gate.RS{Data: c.RS.Data, Parity: c.RS.Parity},
 		Buckets:        bucketConfigs(c, basePath),
 		Auth:           authEntries(c),
 		IAM:            iamConfig(c),
 		Debug:          c.Debug || debug,
 		DisableLogging: c.DisableLogging,
 		RateLimit:      c.RateLimit,
-		StorageNodeIDs: nodeIDs(nodesByRole(c, RoleShardStorage)),
+		BlobNodeIDs:    nodeIDs(nodesByRole(c, RoleBlob)),
 	}
 }

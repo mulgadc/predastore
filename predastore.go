@@ -1,11 +1,11 @@
 // Package predastore is an S3-compatible object store: a Raft-replicated
-// metadata plane, erasure-coded shard storage, and an S3 gateway in front of
+// metadata plane, erasure-coded shard storage, and an S3 gate in front of
 // both. It is the module's whole public surface — Config and LoadConfig for
 // the on-disk configuration, Options and Run to serve a host until the context
 // is cancelled.
 //
 // One process runs one host: the cluster nodes pinned to it in the
-// configuration, the S3 gateway among them. Those nodes talk over an
+// configuration, the S3 gate among them. Those nodes talk over an
 // in-process pipe; nodes on other hosts are reached over QUIC. A cluster whose
 // nodes all sit on one host is therefore a single-process deployment, with no
 // code path of its own.
@@ -21,17 +21,17 @@ import (
 	"time"
 
 	"github.com/hashicorp/raft"
-	"github.com/mulgadc/predastore/internal/gateway"
+	"github.com/mulgadc/predastore/internal/blob"
+	"github.com/mulgadc/predastore/internal/blob/engine"
+	"github.com/mulgadc/predastore/internal/gate"
+	"github.com/mulgadc/predastore/internal/meta"
 	"github.com/mulgadc/predastore/internal/rpc"
-	"github.com/mulgadc/predastore/internal/state"
-	"github.com/mulgadc/predastore/internal/storage"
-	"github.com/mulgadc/predastore/internal/storage/engine"
 	"github.com/mulgadc/predastore/internal/transport"
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"golang.org/x/sync/errgroup"
 )
 
-// leaderWait bounds how long the gateway holds off serving while consensus
+// leaderWait bounds how long the gate holds off serving while consensus
 // settles. Exceeding it is a warning, not a failure: the state client retries.
 const leaderWait = 30 * time.Second
 
@@ -58,17 +58,17 @@ type Options struct {
 	PprofPath string
 }
 
-// leaderGate holds the gateway off until local consensus settles: serving
+// leaderBarrier holds the gate off until local consensus settles: serving
 // before it does would fail writes that would have succeeded a moment later.
-// Local state replicas open it, and a host running none starts it open.
-type leaderGate struct {
+// Local meta replicas open it, and a host running none starts it open.
+type leaderBarrier struct {
 	open func()
 	wait <-chan struct{}
 }
 
-func newLeaderGate() leaderGate {
+func newLeaderBarrier() leaderBarrier {
 	open := make(chan struct{})
-	return leaderGate{open: sync.OnceFunc(func() { close(open) }), wait: open}
+	return leaderBarrier{open: sync.OnceFunc(func() { close(open) }), wait: open}
 }
 
 // Run serves one host until ctx is cancelled or one of its nodes fails, then
@@ -94,10 +94,10 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	// A host with no replica of its own has no local consensus to wait on, so
-	// its gateway serves immediately.
-	gate := newLeaderGate()
-	if !slices.ContainsFunc(local, func(n NodeConfig) bool { return n.Role == RoleStateReplica }) {
-		gate.open()
+	// its gate serves immediately.
+	barrier := newLeaderBarrier()
+	if !slices.ContainsFunc(local, func(n NodeConfig) bool { return n.Role == RoleMeta }) {
+		barrier.open()
 	}
 
 	// Every node is built before any of them starts. A node that dialed a
@@ -110,7 +110,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}()
 	for _, n := range local {
-		run, cleanup, err := buildNode(cfg, n, base, opts, gate)
+		run, cleanup, err := buildNode(cfg, n, base, opts, barrier)
 		if err != nil {
 			return err
 		}
@@ -128,7 +128,7 @@ func Run(ctx context.Context, opts Options) error {
 // buildNode builds one node of this host: the transports it is reached over,
 // the rpc plumbing around them and the service it runs. Nothing listens or
 // dials until run is called, and cleanup releases what run does not.
-func buildNode(cfg *Config, n NodeConfig, base string, opts Options, gate leaderGate) (
+func buildNode(cfg *Config, n NodeConfig, base string, opts Options, barrier leaderBarrier) (
 	run func(context.Context) error, cleanup func(), err error,
 ) {
 	host, ok := hostOf(cfg, n.HostID)
@@ -136,9 +136,9 @@ func buildNode(cfg *Config, n NodeConfig, base string, opts Options, gate leader
 		return nil, nil, fmt.Errorf("node %d references unknown host %d", n.ID, n.HostID)
 	}
 
-	// A gateway's port is its S3 port, so its rpc sockets bind ephemerally.
+	// A gate's port is its S3 port, so its rpc sockets bind ephemerally.
 	port := n.Port
-	if n.Role == RoleGateway {
+	if n.Role == RoleGate {
 		port = 0
 	}
 
@@ -158,7 +158,7 @@ func buildNode(cfg *Config, n NodeConfig, base string, opts Options, gate leader
 	}
 
 	// pool is set by the roles that dial; closing it and the transports is all
-	// a node leaves behind, since each service closes its own state.
+	// a node leaves behind, since each service closes its own meta.
 	var pool *rpc.ConnPool
 	cleanup = func() {
 		if pool != nil {
@@ -175,10 +175,10 @@ func buildNode(cfg *Config, n NodeConfig, base string, opts Options, gate leader
 		return nil, nil, err
 	}
 
-	// Nothing dials a gateway, so it listens on nothing: the S3 frontend is
+	// Nothing dials a gate, so it listens on nothing: the S3 frontend is
 	// its only listener.
 	var lns []transport.Listener
-	if n.Role != RoleGateway {
+	if n.Role != RoleGate {
 		for _, tr := range trs {
 			ln, lerr := tr.Listen()
 			if lerr != nil {
@@ -194,24 +194,24 @@ func buildNode(cfg *Config, n NodeConfig, base string, opts Options, gate leader
 	var serve func(context.Context) error
 
 	switch n.Role {
-	case RoleGateway:
-		// The pool is private: a gateway dials but is never dialed, so it has
+	case RoleGate:
+		// The pool is private: a gate dials but is never dialed, so it has
 		// nothing to share one with.
 		pool = rpc.NewConnPool(n.ID, res)
-		gw, gerr := gatewayServer(cfg, n, host, base, opts, rpc.NewClient(pool))
+		gw, gerr := gateServer(cfg, n, host, base, opts, rpc.NewClient(pool))
 		if gerr != nil {
 			cleanup()
-			return nil, nil, fmt.Errorf("create s3 gateway: %w", gerr)
+			return nil, nil, fmt.Errorf("create s3 gate: %w", gerr)
 		}
 		serve = func(ctx context.Context) error {
 			select {
-			case <-gate.wait:
+			case <-barrier.wait:
 			case <-ctx.Done():
 			}
 			return gw.Run(ctx)
 		}
 
-	case RoleShardStorage:
+	case RoleBlob:
 		// The store expects its directory to exist.
 		if mkErr := os.MkdirAll(dir, 0750); mkErr != nil {
 			cleanup()
@@ -227,36 +227,36 @@ func buildNode(cfg *Config, n NodeConfig, base string, opts Options, gate leader
 			cleanup()
 			return nil, nil, fmt.Errorf("open shard store for node %d: %w", n.ID, oerr)
 		}
-		svc := storage.NewServer(n.ID, st)
+		svc := blob.NewServer(n.ID, st)
 		svc.Register(mux)
 		serve = svc.Run
 
-	case RoleStateReplica:
+	case RoleMeta:
 		// One pool between the client and the server: a replica both dials its
 		// peers and is dialed by them, so a connection serves either direction.
 		pool = rpc.NewConnPool(n.ID, res)
-		ccfg := state.DefaultClusterConfig()
+		ccfg := meta.DefaultClusterConfig()
 		ccfg.NodeID = n.ID
 		ccfg.DataDir = dir
 		// Bootstrapping with an identical peer set is idempotent across
 		// replicas, so every replica may attempt it.
 		ccfg.Bootstrap = true
-		ccfg.StreamLayer = state.NewRPCStreamLayer(state.RaftAddress(n.ID), raftDial(rpc.NewClient(pool)))
-		ccfg.Peers = raftPeers(nodesByRole(cfg, RoleStateReplica))
-		replica, rerr := state.NewServer(ccfg)
+		ccfg.StreamLayer = meta.NewRPCStreamLayer(meta.RaftAddress(n.ID), raftDial(rpc.NewClient(pool)))
+		ccfg.Peers = raftPeers(nodesByRole(cfg, RoleMeta))
+		replica, rerr := meta.NewServer(ccfg)
 		if rerr != nil {
 			cleanup()
-			return nil, nil, fmt.Errorf("start state replica %d: %w", n.ID, rerr)
+			return nil, nil, fmt.Errorf("start meta replica %d: %w", n.ID, rerr)
 		}
 		replica.Register(mux)
 		serve = func(ctx context.Context) error {
-			// The gate opens however the election goes: a slow one warns and
-			// the gateway serves anyway rather than never serving.
+			// The barrier opens however the election goes: a slow one warns and
+			// the gate serves anyway rather than never serving.
 			go func() {
 				if werr := replica.WaitForLeader(leaderWait); werr != nil {
 					slog.Warn("No leader elected within timeout, serving anyway", "error", werr)
 				}
-				gate.open()
+				barrier.open()
 			}()
 			return replica.Run(ctx)
 		}
@@ -266,10 +266,10 @@ func buildNode(cfg *Config, n NodeConfig, base string, opts Options, gate leader
 		return nil, nil, fmt.Errorf("node %d has unknown role %q", n.ID, n.Role)
 	}
 
-	// A storage node never dials, so it donates to no pool; a replica donates
+	// A blob node never dials, so it donates to no pool; a replica donates
 	// to the one it dials from. Both are the same call with a different pool.
 	var srv *rpc.Server
-	if n.Role != RoleGateway {
+	if n.Role != RoleGate {
 		srv, err = rpc.NewServer(mux, lns, pool)
 		if err != nil {
 			cleanup()
@@ -296,51 +296,51 @@ func buildNode(cfg *Config, n NodeConfig, base string, opts Options, gate leader
 // and opening a stream to it.
 func raftDial(cli *rpc.Client) func(context.Context, raft.ServerAddress) (transport.Stream, error) {
 	return func(ctx context.Context, address raft.ServerAddress) (transport.Stream, error) {
-		target, err := state.ParseRaftAddress(string(address))
+		target, err := meta.ParseRaftAddress(string(address))
 		if err != nil {
 			return nil, err
 		}
-		return rpc.OpenStream(ctx, cli, target, state.OpRaftDial, &state.RaftDial{})
+		return rpc.OpenStream(ctx, cli, target, meta.OpRaftDial, &meta.RaftDial{})
 	}
 }
 
-// gatewayServer builds the S3 frontend a gateway node runs: the file's gateway
+// gateServer builds the S3 frontend a gate node runs: the file's gate
 // slice, its host's listen address and TLS identity, and the cluster clients
 // it works through.
-func gatewayServer(
+func gateServer(
 	cfg *Config, n NodeConfig, host HostConfig, base string, opts Options, cli *rpc.Client,
-) (*gateway.Server, error) {
-	stateClient, err := state.NewClient(state.ClientConfig{
+) (*gate.Server, error) {
+	metaClient, err := meta.NewClient(meta.ClientConfig{
 		Client:   cli,
-		Replicas: nodeIDs(nodesByRole(cfg, RoleStateReplica)),
+		Replicas: nodeIDs(nodesByRole(cfg, RoleMeta)),
 	})
 	if err != nil {
 		return nil, err
 	}
-	shardClient, err := storage.NewClient(storage.ClientConfig{Client: cli})
+	blobClient, err := blob.NewClient(blob.ClientConfig{Client: cli})
 	if err != nil {
 		return nil, err
 	}
-	return gateway.NewServer(gateway.ServerConfig{
-		Config:          gatewayConfig(cfg, base, opts.Debug),
+	return gate.NewServer(gate.ServerConfig{
+		Config:          gateConfig(cfg, base, opts.Debug),
 		Host:            host.BindAddr,
 		Port:            n.Port,
 		TLSCert:         host.TLSCert,
 		TLSKey:          host.TLSKey,
 		MasterKey:       opts.MasterKey,
-		Clients:         gateway.Clients{State: stateClient, Storage: shardClient},
+		Clients:         gate.Clients{Meta: metaClient, Blob: blobClient},
 		PprofEnabled:    opts.Pprof,
 		PprofOutputPath: opts.PprofPath,
 	})
 }
 
-// raftPeers maps state replicas to the raft members they become. The address
+// raftPeers maps meta replicas to the raft members they become. The address
 // is the node key the stream layer resolves, so it stays valid however the
 // replica is reached.
-func raftPeers(replicas []NodeConfig) []state.RaftPeer {
-	peers := make([]state.RaftPeer, len(replicas))
+func raftPeers(replicas []NodeConfig) []meta.RaftPeer {
+	peers := make([]meta.RaftPeer, len(replicas))
 	for i, n := range replicas {
-		peers[i] = state.RaftPeer{ID: n.ID, Address: state.RaftAddress(n.ID)}
+		peers[i] = meta.RaftPeer{ID: n.ID, Address: meta.RaftAddress(n.ID)}
 	}
 	return peers
 }

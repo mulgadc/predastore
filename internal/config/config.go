@@ -13,7 +13,7 @@ import (
 	"net"
 	"os"
 
-	"github.com/mulgadc/predastore/internal/gateway/model"
+	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/pkg/ratelimit"
 	"github.com/pelletier/go-toml/v2"
 )
@@ -39,12 +39,12 @@ type (
 type Role string
 
 const (
-	// RoleGateway serves the S3 API in front of the cluster.
-	RoleGateway Role = "gateway"
-	// RoleShardStorage stores erasure-coded object shards.
-	RoleShardStorage Role = "shard-storage"
-	// RoleStateReplica participates in Raft consensus over global state.
-	RoleStateReplica Role = "state-replica"
+	// RoleGate serves the S3 API in front of the cluster.
+	RoleGate Role = "gate"
+	// RoleBlob stores erasure-coded object shards.
+	RoleBlob Role = "blob"
+	// RoleMeta participates in Raft consensus over global state.
+	RoleMeta Role = "meta"
 )
 
 // Host is one s3d process, as written under [[host]]: the machine that owns a
@@ -76,7 +76,7 @@ type Node struct {
 	HostID HostID `toml:"host_id"`
 	Role   Role   `toml:"role"`
 	// Port is the port this node answers on, unique within its host. For a
-	// gateway it is the S3 port, and its rpc sockets bind ephemerally.
+	// gate it is the S3 port, and its rpc sockets bind ephemerally.
 	Port int `toml:"port"`
 }
 
@@ -274,7 +274,7 @@ func (c *Config) validateTopology() error {
 	}
 	nodeIDs := make(map[NodeID]bool, len(c.Nodes))
 	ports := make(map[hostPort]NodeID, len(c.Nodes))
-	gateways := make(map[HostID]NodeID, len(c.Hosts))
+	gates := make(map[HostID]NodeID, len(c.Hosts))
 
 	for _, n := range c.Nodes {
 		if n.ID == 0 {
@@ -288,7 +288,7 @@ func (c *Config) validateTopology() error {
 			return fmt.Errorf("config: node %d references unknown host %d", n.ID, n.HostID)
 		}
 		switch n.Role {
-		case RoleGateway, RoleShardStorage, RoleStateReplica:
+		case RoleGate, RoleBlob, RoleMeta:
 		default:
 			return fmt.Errorf("config: node %d has unknown role %q", n.ID, n.Role)
 		}
@@ -299,13 +299,13 @@ func (c *Config) validateTopology() error {
 			return fmt.Errorf("config: nodes %d and %d both use port %d on host %d", other, n.ID, n.Port, n.HostID)
 		}
 		ports[hostPort{n.HostID, n.Port}] = n.ID
-		if n.Role == RoleGateway {
-			// Two gateways on one host would be two S3 endpoints answering for
+		if n.Role == RoleGate {
+			// Two gates on one host would be two S3 endpoints answering for
 			// the same machine, which nothing downstream can choose between.
-			if other, ok := gateways[n.HostID]; ok {
-				return fmt.Errorf("config: host %d has more than one gateway (nodes %d and %d)", n.HostID, other, n.ID)
+			if other, ok := gates[n.HostID]; ok {
+				return fmt.Errorf("config: host %d has more than one gate (nodes %d and %d)", n.HostID, other, n.ID)
 			}
-			gateways[n.HostID] = n.ID
+			gates[n.HostID] = n.ID
 		}
 	}
 
