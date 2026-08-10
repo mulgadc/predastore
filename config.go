@@ -2,8 +2,6 @@ package predastore
 
 import (
 	"cmp"
-	"fmt"
-	"path/filepath"
 	"slices"
 
 	"github.com/mulgadc/predastore/internal/config"
@@ -102,12 +100,6 @@ func hasRemoteNodes(c *Config, hostID HostID) bool {
 	return slices.ContainsFunc(c.Hosts, func(h HostConfig) bool {
 		return h.ID != hostID && len(h.Nodes) > 0
 	})
-}
-
-// dataDir is where a node keeps its state: a directory of its own under the
-// data root of the host it runs on.
-func dataDir(host HostConfig, nodeID NodeID) string {
-	return filepath.Join(host.DataDir, fmt.Sprintf("node-%d", nodeID))
 }
 
 // nodeIDs names a set of nodes by id, which is how every client addresses one.

@@ -8,10 +8,12 @@
 package config
 
 import (
+	"cmp"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/pkg/ratelimit"
@@ -62,8 +64,8 @@ type Host struct {
 	// Addr is the address other hosts dial, without a port, split from
 	// BindAddr for NAT and multi-homed machines.
 	Addr string `toml:"addr"`
-	// DataDir is the on-disk root; nodes derive their subdirectories from
-	// node id.
+	// DataDir is the on-disk root for the nodes that do not name one of their
+	// own; each of those derives a subdirectory from its node id.
 	DataDir string `toml:"data_dir"`
 	// EncryptionKey is the path to the AES-256 key shards are encrypted with
 	// at rest.
@@ -84,6 +86,16 @@ type Node struct {
 	// Port is the port this node answers on, unique within its host. For a
 	// gate it is the S3 port, and its rpc sockets bind ephemerally.
 	Port int `toml:"port"`
+	// DataDir is an absolute directory this node owns outright, so that blob
+	// nodes on one host can sit on separate disks. Empty derives one under the
+	// host's root instead. It has no flag: it is per-node, and a flag is not.
+	DataDir string `toml:"data_dir"`
+}
+
+// NodeDataDir is where a node keeps its state: the directory it names, or one
+// of its own under the data root of the host it runs on.
+func NodeDataDir(h Host, n Node) string {
+	return cmp.Or(n.DataDir, filepath.Join(h.DataDir, fmt.Sprintf("node-%d", n.ID)))
 }
 
 // RS fixes the erasure code. The counts must match what the cluster was
@@ -252,6 +264,11 @@ func (c *Config) validateTopology() error {
 		}
 
 		ports := make(map[int]NodeID, len(h.Nodes))
+		// Derived directories are unique by node id, so a collision means an
+		// explicit data_dir. One that names another node's derived directory is
+		// only visible here when the file supplied the host root; when it comes
+		// from --data-dir, this runs again after the flags are merged.
+		dirs := make(map[string]NodeID, len(h.Nodes))
 		var gate NodeID
 
 		for _, n := range h.Nodes {
@@ -275,13 +292,24 @@ func (c *Config) validateTopology() error {
 			}
 			ports[n.Port] = n.ID
 			if n.Role == RoleGate {
+				// A gate keeps nothing on disk, so a data_dir on one is a
+				// misunderstanding rather than something to ignore.
+				if n.DataDir != "" {
+					return fmt.Errorf("config: gate node %d must not set data_dir", n.ID)
+				}
 				// Two gates on one host would be two S3 endpoints answering for
 				// the same machine, which nothing downstream can choose between.
 				if gate != 0 {
 					return fmt.Errorf("config: host %d has more than one gate (nodes %d and %d)", h.ID, gate, n.ID)
 				}
 				gate = n.ID
+				continue
 			}
+			dir := NodeDataDir(h, n)
+			if other, ok := dirs[dir]; ok {
+				return fmt.Errorf("config: nodes %d and %d both use data dir %s on host %d", other, n.ID, dir, h.ID)
+			}
+			dirs[dir] = n.ID
 		}
 	}
 

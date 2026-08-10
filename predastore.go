@@ -23,6 +23,7 @@ import (
 	"github.com/hashicorp/raft"
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/blob/engine"
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate"
 	"github.com/mulgadc/predastore/internal/meta"
 	"github.com/mulgadc/predastore/internal/rpc"
@@ -180,7 +181,7 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 	}
 
 	mux := rpc.NewMux()
-	dir := dataDir(host, n.ID)
+	dir := config.NodeDataDir(host, n)
 	var serve func(context.Context) error
 
 	switch n.Role {

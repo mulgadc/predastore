@@ -95,6 +95,12 @@ func run() error {
 	if err := validateHost(host); err != nil {
 		return err
 	}
+	// The file's own checks run again over the merged tree: -data-dir can
+	// supply a root the file never had, and a node's derived directory only
+	// collides with an explicit one once that root is known.
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 
 	key, err := masterkey.Load(host.EncryptionKey)
 	if err != nil {
@@ -131,10 +137,10 @@ func validateHost(h *predastore.HostConfig) error {
 	if h.TLSCert == "" || h.TLSKey == "" {
 		return errors.New("no TLS identity: set --tls-cert and --tls-key, or tls_cert and tls_key")
 	}
-	// Only a gate keeps nothing on disk, so a host running one and nothing else
-	// needs no data directory.
+	// The root is only needed by the nodes that derive a directory from it: a
+	// gate keeps nothing on disk, and a node naming its own is already placed.
 	if h.DataDir == "" && slices.ContainsFunc(h.Nodes, func(n predastore.NodeConfig) bool {
-		return n.Role != predastore.RoleGate
+		return n.Role != predastore.RoleGate && n.DataDir == ""
 	}) {
 		return errors.New("no data directory: set --data-dir or data_dir")
 	}
