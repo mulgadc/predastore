@@ -171,7 +171,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 			})
 
 			rr := httptest.NewRecorder()
-			server.sigV4AuthMiddleware(next).ServeHTTP(rr, req)
+			server.s3TargetMiddleware(server.sigV4AuthMiddleware(next)).ServeHTTP(rr, req)
 
 			if tt.expectStatus == -1 {
 				// Sentinel: valid auth should pass through to next.
@@ -238,7 +238,7 @@ func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
 				t.Fatal("next handler must not be invoked when SignedHeaders guard fires")
 			})
 			rr := httptest.NewRecorder()
-			server.sigV4AuthMiddleware(next).ServeHTTP(rr, req)
+			server.s3TargetMiddleware(server.sigV4AuthMiddleware(next)).ServeHTTP(rr, req)
 
 			assert.Equal(t, http.StatusBadRequest, rr.Code)
 			assert.Contains(t, rr.Body.String(), "AuthorizationHeaderMalformed")

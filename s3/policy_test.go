@@ -12,25 +12,26 @@ import (
 func TestS3Action(t *testing.T) {
 	tests := []struct {
 		method string
-		path   string
+		bucket string
+		key    string
 		want   string
 	}{
-		{"GET", "/", "s3:ListAllMyBuckets"},
-		{"GET", "/my-bucket", "s3:ListBucket"},
-		{"GET", "/my-bucket/key.txt", "s3:GetObject"},
-		{"HEAD", "/my-bucket/key.txt", "s3:GetObject"},
-		{"HEAD", "/my-bucket", "s3:ListBucket"},
-		{"PUT", "/my-bucket", "s3:CreateBucket"},
-		{"PUT", "/my-bucket/key.txt", "s3:PutObject"},
-		{"POST", "/my-bucket/key.txt", "s3:PutObject"},
-		{"DELETE", "/my-bucket", "s3:DeleteBucket"},
-		{"DELETE", "/my-bucket/key.txt", "s3:DeleteObject"},
-		{"PATCH", "/my-bucket/key.txt", ""},
+		{"GET", "", "", "s3:ListAllMyBuckets"},
+		{"GET", "my-bucket", "", "s3:ListBucket"},
+		{"GET", "my-bucket", "key.txt", "s3:GetObject"},
+		{"HEAD", "my-bucket", "key.txt", "s3:GetObject"},
+		{"HEAD", "my-bucket", "", "s3:ListBucket"},
+		{"PUT", "my-bucket", "", "s3:CreateBucket"},
+		{"PUT", "my-bucket", "key.txt", "s3:PutObject"},
+		{"POST", "my-bucket", "key.txt", "s3:PutObject"},
+		{"DELETE", "my-bucket", "", "s3:DeleteBucket"},
+		{"DELETE", "my-bucket", "key.txt", "s3:DeleteObject"},
+		{"PATCH", "my-bucket", "key.txt", ""},
 	}
 
 	for _, tt := range tests {
-		got := s3Action(tt.method, tt.path)
-		assert.Equal(t, tt.want, got, "s3Action(%q, %q)", tt.method, tt.path)
+		got := s3Action(tt.method, tt.bucket, tt.key)
+		assert.Equal(t, tt.want, got, "s3Action(%q, %q, %q)", tt.method, tt.bucket, tt.key)
 	}
 }
 
@@ -38,18 +39,19 @@ func TestS3Action(t *testing.T) {
 
 func TestS3Resource(t *testing.T) {
 	tests := []struct {
-		path string
-		want string
+		bucket string
+		key    string
+		want   string
 	}{
-		{"/", "arn:aws:s3:::*"},
-		{"/my-bucket", "arn:aws:s3:::my-bucket"},
-		{"/my-bucket/key.txt", "arn:aws:s3:::my-bucket/key.txt"},
-		{"/my-bucket/path/to/key.txt", "arn:aws:s3:::my-bucket/path/to/key.txt"},
+		{"", "", "arn:aws:s3:::*"},
+		{"my-bucket", "", "arn:aws:s3:::my-bucket"},
+		{"my-bucket", "key.txt", "arn:aws:s3:::my-bucket/key.txt"},
+		{"my-bucket", "path/to/key.txt", "arn:aws:s3:::my-bucket/path/to/key.txt"},
 	}
 
 	for _, tt := range tests {
-		got := s3Resource(tt.path)
-		assert.Equal(t, tt.want, got, "s3Resource(%q)", tt.path)
+		got := s3Resource(tt.bucket, tt.key)
+		assert.Equal(t, tt.want, got, "s3Resource(%q, %q)", tt.bucket, tt.key)
 	}
 }
 

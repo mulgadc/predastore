@@ -30,9 +30,13 @@ func TestS3SpanMiddlewareRenamesSpan(t *testing.T) {
 		{http.MethodDelete, "/my-bucket/obj", "s3:DeleteObject", "my-bucket", "obj"},
 	}
 
+	// The span attributes come from the resolved target, so the middleware
+	// that resolves it has to be in the chain.
+	server := NewHTTP2ServerWithBackend(&Config{}, nil, nil)
+
 	for _, tt := range tests {
 		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
-			handler := s3SpanMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+			handler := server.s3TargetMiddleware(s3SpanMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})))
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			ctx, span := tp.Tracer("test").Start(req.Context(), "HTTP")
 			handler.ServeHTTP(httptest.NewRecorder(), req.WithContext(ctx))

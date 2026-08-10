@@ -74,7 +74,6 @@ func (s *HTTP2Server) setupRoutes() {
 
 	// Middleware
 	r.Use(otelsetup.HTTPMiddleware("predastore"))
-	r.Use(s3SpanMiddleware)
 	// chi's access log duplicates the APM transaction from HTTPMiddleware and
 	// is a synchronous per-request write on the hot path; only enable it for
 	// explicit debug sessions.
@@ -87,6 +86,10 @@ func (s *HTTP2Server) setupRoutes() {
 	// StripSlashes only rewrites chi's routing context, not r.URL.Path, so
 	// SigV4 verification still sees the exact URI the client signed.
 	r.Use(middleware.StripSlashes)
+	// Must follow StripSlashes: everything downstream authorizes, meters and
+	// dispatches on the pair resolved here, never on r.URL.Path.
+	r.Use(s.s3TargetMiddleware)
+	r.Use(s3SpanMiddleware)
 	r.Use(s.sigV4AuthMiddleware)
 
 	// API request throttling (post-auth, per-account + per-action)
@@ -101,7 +104,11 @@ func (s *HTTP2Server) setupRoutes() {
 					return acct, nil
 				},
 				func(r *http.Request) (string, error) {
-					return s3Action(r.Method, r.URL.Path), nil
+					target, ok := requestTargetFrom(r.Context())
+					if !ok {
+						return "", fmt.Errorf("request target missing from request context")
+					}
+					return s3Action(r.Method, target.bucket, target.key), nil
 				},
 			},
 			func(w http.ResponseWriter, r *http.Request) {
@@ -133,10 +140,18 @@ func (s *HTTP2Server) setupRoutes() {
 // cross-account bucket-ownership check.
 func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := r.URL.Path
+		// Fail closed: an unresolved target would authorize as ListAllMyBuckets
+		// while the router still dispatched a bucket or key.
+		target, ok := requestTargetFrom(r.Context())
+		if !ok {
+			slog.ErrorContext(r.Context(), "Request target missing from context, s3TargetMiddleware did not run",
+				"method", r.Method, "path", r.URL.Path)
+			s.writeS3Error(w, r, http.StatusInternalServerError, "InternalError", "An internal error occurred")
+			return
+		}
 		method := r.Method
 
-		publicBucketAccess := s.config.validatePublicBucketPermission(method, path)
+		publicBucketAccess := s.config.validatePublicBucketPermission(method, target.bucket)
 
 		// Parse recognizes both header-authed and presigned requests; only a request with
 		// neither returns ErrMissingAuthentication.
@@ -168,7 +183,7 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		// ListBuckets is the only global operation served here, and clients sign it against
 		// us-east-1 whatever region they are configured for. Some SDKs sign it with the
 		// configured region instead, so accept either rather than pinning to us-east-1.
-		if bucket, _ := parseS3Path(path); bucket == "" && sig.Credential.Region == globalSigningRegion {
+		if target.bucket == "" && sig.Credential.Region == globalSigningRegion {
 			expectedRegion = globalSigningRegion
 		}
 
@@ -179,14 +194,14 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		// IAM policy evaluation (NATS-sourced credentials only).
 		if !credResult.SkipPolicyCheck {
-			action := s3Action(method, path)
+			action := s3Action(method, target.bucket, target.key)
 			if action == "" {
 				slog.WarnContext(r.Context(), "Unsupported HTTP method for S3 action mapping",
-					"method", method, "path", path, "remoteAddr", r.RemoteAddr)
+					"method", method, "path", r.URL.Path, "remoteAddr", r.RemoteAddr)
 				s.writeS3Error(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed", "The specified method is not allowed")
 				return
 			}
-			resource := s3Resource(path)
+			resource := s3Resource(target.bucket, target.key)
 			if len(credResult.PolicyDocuments) == 0 {
 				slog.DebugContext(r.Context(), "No policies resolved for user, implicit deny",
 					"accessKeyID", accessKey, "accountID", credResult.AccountID)
@@ -206,8 +221,8 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		// and CreateBucket (no existing owner). A sub-resource query on a bare
 		// bucket (?policy, ?acl, ?versioning, ...) is NOT CreateBucket and must
 		// stay subject to the cross-account check.
-		bucket, key := parseS3Path(path)
-		isCreateBucket := method == http.MethodPut && bucket != "" && key == "" && r.URL.RawQuery == ""
+		bucket := target.bucket
+		isCreateBucket := method == http.MethodPut && bucket != "" && target.key == "" && r.URL.RawQuery == ""
 		if bucket != "" && !isCreateBucket {
 			meta, err := s.resolveBucketMetadata(bucket)
 			if err != nil {
@@ -225,8 +240,8 @@ func (s *HTTP2Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 					"callerAccountID", credResult.AccountID,
 					"bucketAccountID", meta.AccountID,
 					"bucket", bucket,
-					"action", s3Action(method, path),
-					"resource", s3Resource(path))
+					"action", s3Action(method, target.bucket, target.key),
+					"resource", s3Resource(target.bucket, target.key))
 				s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 				return
 			}
@@ -397,7 +412,7 @@ func (s *HTTP2Server) listBuckets(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTP2Server) createBucket(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
+	bucket, _ := requestBucketKey(ctx)
 
 	// PUT /{bucket}?policy — bucket policies are not supported
 	if r.URL.Query().Has("policy") {
@@ -441,7 +456,7 @@ func (s *HTTP2Server) createBucket(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTP2Server) headBucket(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
+	bucket, _ := requestBucketKey(ctx)
 
 	resp, err := s.backend.HeadBucket(ctx, &backend.HeadBucketRequest{Bucket: bucket})
 	if err != nil {
@@ -455,7 +470,7 @@ func (s *HTTP2Server) headBucket(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTP2Server) deleteBucket(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
+	bucket, _ := requestBucketKey(ctx)
 
 	// DELETE /{bucket}?policy — no-op, bucket policies are not supported
 	if r.URL.Query().Has("policy") {
@@ -482,7 +497,7 @@ func (s *HTTP2Server) deleteBucket(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTP2Server) listObjects(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
+	bucket, _ := requestBucketKey(ctx)
 	query := r.URL.Query()
 
 	// Return proper errors for unsupported bucket sub-resource operations
@@ -545,8 +560,7 @@ func (s *HTTP2Server) listObjects(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTP2Server) headObject(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
+	bucket, key := requestBucketKey(ctx)
 
 	resp, err := s.backend.HeadObject(ctx, bucket, key)
 	if err != nil {
@@ -563,8 +577,7 @@ func (s *HTTP2Server) headObject(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTP2Server) getObject(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
+	bucket, key := requestBucketKey(ctx)
 
 	req := &backend.GetObjectRequest{
 		Bucket:     bucket,
@@ -616,8 +629,7 @@ func (s *HTTP2Server) getObject(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
+	bucket, key := requestBucketKey(ctx)
 
 	// Check for multipart part upload
 	if partNum := r.URL.Query().Get("partNumber"); partNum != "" {
@@ -673,8 +685,7 @@ func (s *HTTP2Server) putObject(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTP2Server) postObject(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
+	bucket, key := requestBucketKey(ctx)
 
 	uploadID := r.URL.Query().Get("uploadId")
 	if uploadID == "" {
@@ -743,8 +754,7 @@ func (s *HTTP2Server) postObject(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTP2Server) deleteObject(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	bucket := chi.URLParam(r, "bucket")
-	key := chi.URLParam(r, "*")
+	bucket, key := requestBucketKey(ctx)
 
 	err := s.backend.DeleteObject(ctx, &backend.DeleteObjectRequest{
 		Bucket: bucket,
