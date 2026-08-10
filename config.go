@@ -26,7 +26,7 @@ type (
 )
 
 // Role is the function a node performs in the cluster, as written under
-// [[node]].
+// [[host.node]].
 type Role = config.Role
 
 const (
@@ -39,10 +39,11 @@ const (
 )
 
 // HostConfig is one machine, as written under [[host]]: a data directory, an
-// address and a TLS identity. Nodes pinned to it run in one process.
+// address, a TLS identity and the nodes it runs in one process.
 type HostConfig = config.Host
 
-// NodeConfig is a logical role pinned to a host, as written under [[node]].
+// NodeConfig is a logical role pinned to a host, as written under
+// [[host.node]].
 type NodeConfig = config.Node
 
 // The remaining tables of the configuration file.
@@ -67,11 +68,11 @@ func LoadConfig(path string) (*Config, error) {
 // than in the config package because they are inventory questions about a
 // parsed file, not part of parsing it.
 //
-// Each returns nodes sorted by id. Raft bootstraps from the meta set
-// and treats an identically ordered set as idempotent across replicas, so the
-// order is part of the contract rather than a tidiness.
+// nodesByRole sorts by id. Raft bootstraps from the meta set and treats an
+// identically ordered set as idempotent across replicas, so the order is part
+// of the contract rather than a tidiness.
 
-// hostOf is the [[host]] a node runs on.
+// hostOf is the [[host]] with this id, and whether the file names one.
 func hostOf(c *Config, hostID HostID) (HostConfig, bool) {
 	for _, h := range c.Hosts {
 		if h.ID == hostID {
@@ -81,39 +82,32 @@ func hostOf(c *Config, hostID HostID) (HostConfig, bool) {
 	return HostConfig{}, false
 }
 
-// localNodes are the nodes pinned to hostID: the ones this process runs.
-func localNodes(c *Config, hostID HostID) []NodeConfig {
-	return selectNodes(c, func(n NodeConfig) bool { return n.HostID == hostID })
-}
-
 // nodesByRole is every node with the role, wherever it runs.
 func nodesByRole(c *Config, role Role) []NodeConfig {
-	return selectNodes(c, func(n NodeConfig) bool { return n.Role == role })
+	var out []NodeConfig
+	for _, h := range c.Hosts {
+		for _, n := range h.Nodes {
+			if n.Role == role {
+				out = append(out, n)
+			}
+		}
+	}
+	slices.SortFunc(out, func(a, b NodeConfig) int { return cmp.Compare(a.ID, b.ID) })
+	return out
 }
 
 // hasRemoteNodes reports whether any node runs off hostID, which is the only
 // reason a node on it opens a network socket.
 func hasRemoteNodes(c *Config, hostID HostID) bool {
-	return slices.ContainsFunc(c.Nodes, func(n NodeConfig) bool { return n.HostID != hostID })
+	return slices.ContainsFunc(c.Hosts, func(h HostConfig) bool {
+		return h.ID != hostID && len(h.Nodes) > 0
+	})
 }
 
-// dataDir is where a node keeps its state, derived from its own host's data
-// directory and its node id.
-func dataDir(c *Config, nodeID NodeID) string {
-	for _, n := range c.Nodes {
-		if n.ID != nodeID {
-			continue
-		}
-		if h, ok := hostOf(c, n.HostID); ok {
-			return filepath.Join(h.DataDir, nodeKey(nodeID))
-		}
-	}
-	return ""
-}
-
-// nodeKey names a node's directory under its host's data root.
-func nodeKey(nodeID NodeID) string {
-	return fmt.Sprintf("node-%d", nodeID)
+// dataDir is where a node keeps its state: a directory of its own under the
+// data root of the host it runs on.
+func dataDir(host HostConfig, nodeID NodeID) string {
+	return filepath.Join(host.DataDir, fmt.Sprintf("node-%d", nodeID))
 }
 
 // nodeIDs names a set of nodes by id, which is how every client addresses one.
@@ -123,17 +117,6 @@ func nodeIDs(nodes []NodeConfig) []NodeID {
 		ids = append(ids, n.ID)
 	}
 	return ids
-}
-
-func selectNodes(c *Config, keep func(NodeConfig) bool) []NodeConfig {
-	var out []NodeConfig
-	for _, n := range c.Nodes {
-		if keep(n) {
-			out = append(out, n)
-		}
-	}
-	slices.SortFunc(out, func(a, b NodeConfig) int { return cmp.Compare(a.ID, b.ID) })
-	return out
 }
 
 // The conversions below turn the file into each subsystem's own settings. They

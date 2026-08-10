@@ -1,6 +1,6 @@
 // Package config parses and validates predastore's on-disk TOML file and
 // holds the vocabulary the rest of the tree is written in: node and host ids,
-// roles, and the [[host]] and [[node]] tables themselves.
+// roles, and the [[host]] and [[host.node]] tables themselves.
 //
 // It is a leaf. It answers what the file says and whether it is coherent, and
 // nothing else — placement, addressing and the conversions into each
@@ -35,7 +35,7 @@ type (
 )
 
 // Role is the function a node performs within the cluster, as written under
-// [[node]].
+// [[host.node]].
 type Role string
 
 const (
@@ -55,9 +55,9 @@ type Host struct {
 	// BindAddr is the local listen address, without a port; 0.0.0.0 binds all
 	// interfaces.
 	BindAddr string `toml:"bind_addr"`
-	// PublicAddr is the address other hosts dial, without a port, split from
+	// Addr is the address other hosts dial, without a port, split from
 	// BindAddr for NAT and multi-homed machines.
-	PublicAddr string `toml:"public_addr"`
+	Addr string `toml:"addr"`
 	// DataDir is the on-disk root; nodes derive their subdirectories from
 	// node id and role.
 	DataDir string `toml:"data_dir"`
@@ -65,15 +65,16 @@ type Host struct {
 	// A single-host cluster opens no network socket and needs neither.
 	TLSCert string `toml:"tls_cert"`
 	TLSKey  string `toml:"tls_key"`
+	// Nodes are the roles this host runs, as written under [[host.node]].
+	Nodes []Node `toml:"node"`
 }
 
-// Node is a logical role pinned to a host, as written under [[node]]. Nodes
-// sharing a host are colocated and talk over the in-process pipe; nodes on
-// different hosts talk over the network.
+// Node is a logical role pinned to the host it is written under. Nodes sharing
+// a host are colocated and talk over the in-process pipe; nodes on different
+// hosts talk over the network.
 type Node struct {
-	ID     NodeID `toml:"id"`
-	HostID HostID `toml:"host_id"`
-	Role   Role   `toml:"role"`
+	ID   NodeID `toml:"id"`
+	Role Role   `toml:"role"`
 	// Port is the port this node answers on, unique within its host. For a
 	// gate it is the S3 port, and its rpc sockets bind ephemerally.
 	Port int `toml:"port"`
@@ -136,15 +137,14 @@ type Config struct {
 
 	RS RS `toml:"rs"`
 
-	// Hosts are machines owning a data directory and a TLS identity; Nodes
-	// are roles pinned to those hosts. Everything per-node derives from the
-	// host base and the node id.
+	// Hosts are the machines of the cluster, each owning a data directory, a
+	// TLS identity and the nodes pinned to it. Everything per-node derives
+	// from the host base and the node id.
 	Hosts []Host `toml:"host"`
-	Nodes []Node `toml:"node"`
 
 	Compaction Compaction `toml:"compaction"`
 
-	Buckets []Bucket `toml:"buckets"`
+	Buckets []Bucket `toml:"bucket"`
 
 	// TODO: Move to IAM
 	Auth []AuthEntry `toml:"auth"`
@@ -210,24 +210,21 @@ func (c *Config) Validate() error {
 
 	// The topology is optional; callers gate on its presence, so an empty one
 	// is only invalid once something has been written.
-	if len(c.Hosts) > 0 || len(c.Nodes) > 0 {
+	if len(c.Hosts) > 0 {
 		return c.validateTopology()
 	}
 	return nil
 }
 
-// validateTopology checks the cluster as a whole: ids unique, placements
-// resolvable, roles known, and every node reachable at a port no sibling on
-// its host has already claimed.
+// validateTopology checks the cluster as a whole: ids unique, roles known, and
+// every node reachable at a port no sibling on its host has already claimed.
 func (c *Config) validateTopology() error {
-	if len(c.Hosts) == 0 {
-		return fmt.Errorf("config: no hosts defined")
-	}
-	if len(c.Nodes) == 0 {
-		return fmt.Errorf("config: no nodes defined")
-	}
-
 	hostIDs := make(map[HostID]bool, len(c.Hosts))
+	// Node ids are unique across the file, not within a host: the rpc resolver
+	// keys one flat table by id. The host each is on names both sides of a
+	// collision, which the nesting otherwise hides.
+	nodeHosts := make(map[NodeID]HostID)
+
 	for _, h := range c.Hosts {
 		if h.ID == 0 {
 			return fmt.Errorf("config: host id must be positive")
@@ -239,8 +236,8 @@ func (c *Config) validateTopology() error {
 		if h.BindAddr == "" {
 			return fmt.Errorf("config: host %d missing bind_addr", h.ID)
 		}
-		if h.PublicAddr == "" {
-			return fmt.Errorf("config: host %d missing public_addr", h.ID)
+		if h.Addr == "" {
+			return fmt.Errorf("config: host %d missing addr", h.ID)
 		}
 		if h.DataDir == "" {
 			return fmt.Errorf("config: host %d missing data_dir", h.ID)
@@ -250,52 +247,47 @@ func (c *Config) validateTopology() error {
 		if hasPort(h.BindAddr) {
 			return fmt.Errorf("config: host %d bind_addr %q must not carry a port", h.ID, h.BindAddr)
 		}
-		if hasPort(h.PublicAddr) {
-			return fmt.Errorf("config: host %d public_addr %q must not carry a port", h.ID, h.PublicAddr)
+		if hasPort(h.Addr) {
+			return fmt.Errorf("config: host %d addr %q must not carry a port", h.ID, h.Addr)
 		}
-	}
 
-	type hostPort struct {
-		host HostID
-		port int
-	}
-	nodeIDs := make(map[NodeID]bool, len(c.Nodes))
-	ports := make(map[hostPort]NodeID, len(c.Nodes))
-	gates := make(map[HostID]NodeID, len(c.Hosts))
+		ports := make(map[int]NodeID, len(h.Nodes))
+		var gate NodeID
 
-	for _, n := range c.Nodes {
-		if n.ID == 0 {
-			return fmt.Errorf("config: node id must be positive")
-		}
-		if nodeIDs[n.ID] {
-			return fmt.Errorf("config: duplicate node id %d", n.ID)
-		}
-		nodeIDs[n.ID] = true
-		if !hostIDs[n.HostID] {
-			return fmt.Errorf("config: node %d references unknown host %d", n.ID, n.HostID)
-		}
-		switch n.Role {
-		case RoleGate, RoleBlob, RoleMeta:
-		default:
-			return fmt.Errorf("config: node %d has unknown role %q", n.ID, n.Role)
-		}
-		if n.Port == 0 {
-			return fmt.Errorf("config: node %d missing port", n.ID)
-		}
-		if other, ok := ports[hostPort{n.HostID, n.Port}]; ok {
-			return fmt.Errorf("config: nodes %d and %d both use port %d on host %d", other, n.ID, n.Port, n.HostID)
-		}
-		ports[hostPort{n.HostID, n.Port}] = n.ID
-		if n.Role == RoleGate {
-			// Two gates on one host would be two S3 endpoints answering for
-			// the same machine, which nothing downstream can choose between.
-			if other, ok := gates[n.HostID]; ok {
-				return fmt.Errorf("config: host %d has more than one gate (nodes %d and %d)", n.HostID, other, n.ID)
+		for _, n := range h.Nodes {
+			if n.ID == 0 {
+				return fmt.Errorf("config: node id must be positive")
 			}
-			gates[n.HostID] = n.ID
+			if other, ok := nodeHosts[n.ID]; ok {
+				return fmt.Errorf("config: duplicate node id %d on hosts %d and %d", n.ID, other, h.ID)
+			}
+			nodeHosts[n.ID] = h.ID
+			switch n.Role {
+			case RoleGate, RoleBlob, RoleMeta:
+			default:
+				return fmt.Errorf("config: node %d has unknown role %q", n.ID, n.Role)
+			}
+			if n.Port == 0 {
+				return fmt.Errorf("config: node %d missing port", n.ID)
+			}
+			if other, ok := ports[n.Port]; ok {
+				return fmt.Errorf("config: nodes %d and %d both use port %d on host %d", other, n.ID, n.Port, h.ID)
+			}
+			ports[n.Port] = n.ID
+			if n.Role == RoleGate {
+				// Two gates on one host would be two S3 endpoints answering for
+				// the same machine, which nothing downstream can choose between.
+				if gate != 0 {
+					return fmt.Errorf("config: host %d has more than one gate (nodes %d and %d)", h.ID, gate, n.ID)
+				}
+				gate = n.ID
+			}
 		}
 	}
 
+	if len(nodeHosts) == 0 {
+		return fmt.Errorf("config: no nodes defined")
+	}
 	return nil
 }
 

@@ -44,20 +44,18 @@ type Resolver struct {
 // configuration, so it cannot be a compile-time guarantee. A route with no
 // matching transport fails here rather than at the dial it would have served.
 func NewResolver(cfg *config.Config, source config.NodeID, trs ...transport.Transport) (*Resolver, error) {
-	hosts := make(map[config.HostID]config.Host, len(cfg.Hosts))
-	for _, h := range cfg.Hosts {
-		hosts[h.ID] = h
-	}
 	byNetwork := make(map[string]transport.Transport, len(trs))
 	for _, tr := range trs {
 		byNetwork[tr.Network()] = tr
 	}
 
-	var local config.Node
+	var localHost config.HostID
 	var found bool
-	for _, n := range cfg.Nodes {
-		if n.ID == source {
-			local, found = n, true
+	for _, h := range cfg.Hosts {
+		for _, n := range h.Nodes {
+			if n.ID == source {
+				localHost, found = h.ID, true
+			}
 		}
 	}
 	if !found {
@@ -65,34 +63,32 @@ func NewResolver(cfg *config.Config, source config.NodeID, trs ...transport.Tran
 	}
 
 	r := &Resolver{
-		routes: make(map[config.NodeID]Route, len(cfg.Nodes)),
-		nodes:  make(map[addrKey]config.NodeID, len(cfg.Nodes)),
+		routes: make(map[config.NodeID]Route),
+		nodes:  make(map[addrKey]config.NodeID),
 	}
-	for _, n := range cfg.Nodes {
-		if n.ID == source || n.Role == config.RoleGate {
-			continue
-		}
-		h, ok := hosts[n.HostID]
-		if !ok {
-			return nil, fmt.Errorf("rpc: node %d references unknown host %d", n.ID, n.HostID)
-		}
-		network := transport.NetworkQUIC
-		if n.HostID == local.HostID {
-			network = transport.NetworkPipe
-		}
-		tr, ok := byNetwork[string(network)]
-		if !ok {
-			return nil, fmt.Errorf("rpc: node %d needs a %s transport", n.ID, network)
-		}
+	for _, h := range cfg.Hosts {
+		for _, n := range h.Nodes {
+			if n.ID == source || n.Role == config.RoleGate {
+				continue
+			}
+			network := transport.NetworkQUIC
+			if h.ID == localHost {
+				network = transport.NetworkPipe
+			}
+			tr, ok := byNetwork[string(network)]
+			if !ok {
+				return nil, fmt.Errorf("rpc: node %d needs a %s transport", n.ID, network)
+			}
 
-		addr := transport.NewAddr(network, net.JoinHostPort(h.PublicAddr, strconv.Itoa(n.Port)))
-		// Two nodes at one address is a configuration the table cannot reverse,
-		// so NodeAt would have to guess between them.
-		if other, ok := r.nodes[addrKeyOf(addr)]; ok {
-			return nil, fmt.Errorf("rpc: nodes %d and %d are both at %s %s", other, n.ID, addr.Network(), addr)
+			addr := transport.NewAddr(network, net.JoinHostPort(h.Addr, strconv.Itoa(n.Port)))
+			// Two nodes at one address is a configuration the table cannot
+			// reverse, so NodeAt would have to guess between them.
+			if other, ok := r.nodes[addrKeyOf(addr)]; ok {
+				return nil, fmt.Errorf("rpc: nodes %d and %d are both at %s %s", other, n.ID, addr.Network(), addr)
+			}
+			r.routes[n.ID] = Route{Transport: tr, Addr: addr}
+			r.nodes[addrKeyOf(addr)] = n.ID
 		}
-		r.routes[n.ID] = Route{Transport: tr, Addr: addr}
-		r.nodes[addrKeyOf(addr)] = n.ID
 	}
 
 	return r, nil

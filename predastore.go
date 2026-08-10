@@ -80,29 +80,32 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	cfg := opts.Config
-	local := localNodes(cfg, opts.HostID)
-	if len(local) == 0 {
+	host, ok := hostOf(cfg, opts.HostID)
+	if !ok {
+		return fmt.Errorf("predastore: host %d is not in the configuration", opts.HostID)
+	}
+	if len(host.Nodes) == 0 {
 		return fmt.Errorf("predastore: host %d runs no nodes", opts.HostID)
 	}
 
 	// A host with no replica of its own has no local consensus to wait on, so
 	// its gate serves immediately.
 	barrier := newLeaderBarrier()
-	if !slices.ContainsFunc(local, func(n NodeConfig) bool { return n.Role == RoleMeta }) {
+	if !slices.ContainsFunc(host.Nodes, func(n NodeConfig) bool { return n.Role == RoleMeta }) {
 		barrier.open()
 	}
 
 	// Every node is built before any of them starts. A node that dialed a
 	// colocated peer first would otherwise find no listener registered for it.
-	runs := make([]func(context.Context) error, 0, len(local))
-	cleanups := make([]func(), 0, len(local))
+	runs := make([]func(context.Context) error, 0, len(host.Nodes))
+	cleanups := make([]func(), 0, len(host.Nodes))
 	defer func() {
 		for _, cleanup := range cleanups {
 			cleanup()
 		}
 	}()
-	for _, n := range local {
-		run, cleanup, err := buildNode(cfg, n, opts, barrier)
+	for _, n := range host.Nodes {
+		run, cleanup, err := buildNode(cfg, host, n, opts, barrier)
 		if err != nil {
 			return err
 		}
@@ -120,14 +123,9 @@ func Run(ctx context.Context, opts Options) error {
 // buildNode builds one node of this host: the transports it is reached over,
 // the rpc plumbing around them and the service it runs. Nothing listens or
 // dials until run is called, and cleanup releases what run does not.
-func buildNode(cfg *Config, n NodeConfig, opts Options, barrier leaderBarrier) (
+func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier leaderBarrier) (
 	run func(context.Context) error, cleanup func(), err error,
 ) {
-	host, ok := hostOf(cfg, n.HostID)
-	if !ok {
-		return nil, nil, fmt.Errorf("node %d references unknown host %d", n.ID, n.HostID)
-	}
-
 	// A gate's port is its S3 port, so its rpc sockets bind ephemerally.
 	port := n.Port
 	if n.Role == RoleGate {
@@ -138,8 +136,8 @@ func buildNode(cfg *Config, n NodeConfig, opts Options, barrier leaderBarrier) (
 	// traffic to other hosts, so each exists only when the cluster puts a peer
 	// on the other end of it.
 	var trs []transport.Transport
-	if len(localNodes(cfg, host.ID)) > 1 {
-		trs = append(trs, transport.NewPipeTransport(host.PublicAddr, port))
+	if len(host.Nodes) > 1 {
+		trs = append(trs, transport.NewPipeTransport(host.Addr, port))
 	}
 	if hasRemoteNodes(cfg, host.ID) {
 		quic, qerr := transport.NewQUICTransport(host.BindAddr, port, host.TLSCert, host.TLSKey)
@@ -182,7 +180,7 @@ func buildNode(cfg *Config, n NodeConfig, opts Options, barrier leaderBarrier) (
 	}
 
 	mux := rpc.NewMux()
-	dir := dataDir(cfg, n.ID)
+	dir := dataDir(host, n.ID)
 	var serve func(context.Context) error
 
 	switch n.Role {
