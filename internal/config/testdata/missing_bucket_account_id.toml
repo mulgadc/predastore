@@ -1,6 +1,6 @@
 # Test fixture: a [[bucket]] entry without account_id must hard-fail config
 # load even when the bucket name itself is valid.
-version = "1.0"
+version = 1
 region = "ap-southeast-2"
 
 [[auth]]
@@ -13,4 +13,3 @@ policy = []
 name = "valid-bucket-name"
 region = "ap-southeast-2"
 public = false
-encryption = ""

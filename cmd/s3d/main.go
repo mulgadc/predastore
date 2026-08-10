@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"slices"
 	"syscall"
 	"time"
 
@@ -136,13 +135,6 @@ func validateHost(h *predastore.HostConfig) error {
 	}
 	if h.TLSCert == "" || h.TLSKey == "" {
 		return errors.New("no TLS identity: set --tls-cert and --tls-key, or tls_cert and tls_key")
-	}
-	// The root is only needed by the nodes that derive a directory from it: a
-	// gate keeps nothing on disk, and a node naming its own is already placed.
-	if h.DataDir == "" && slices.ContainsFunc(h.Nodes, func(n predastore.NodeConfig) bool {
-		return n.Role != predastore.RoleGate && n.DataDir == ""
-	}) {
-		return errors.New("no data directory: set --data-dir or data_dir")
 	}
 	return nil
 }

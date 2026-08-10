@@ -1,6 +1,6 @@
 # Test configuration with intentionally invalid bucket names.
 # Used by config_test.go to verify bucket name validation.
-version = "1.0"
+version = 1
 region = "ap-southeast-2"
 
 # Invalid bucket name ([a-z0-9-.])
@@ -8,7 +8,6 @@ region = "ap-southeast-2"
 name = "INVALIDNAME"
 region = "ap-southeast-2"
 public = false
-encryption = ""
 account_id = "123456789012"
 
 # Invalid bucket name < 3 chars
@@ -16,7 +15,6 @@ account_id = "123456789012"
 name = "hi"
 region = "ap-southeast-2"
 public = false
-encryption = ""
 account_id = "123456789012"
 
 # Invalid bucket name > 63 chars
@@ -24,7 +22,6 @@ account_id = "123456789012"
 name = "1111111111111111111111111111111111111111111111111111111111111111"
 region = "ap-southeast-2"
 public = false
-encryption = ""
 account_id = "123456789012"
 
 # Invalid bucket name contains _ chars
@@ -32,7 +29,6 @@ account_id = "123456789012"
 name = "invalid_characters"
 region = "ap-southeast-2"
 public = false
-encryption = ""
 account_id = "123456789012"
 
 # Invalid bucket name contains special chars
@@ -40,7 +36,6 @@ account_id = "123456789012"
 name = "bad^bucket;'"
 region = "ap-southeast-2"
 public = false
-encryption = ""
 account_id = "123456789012"
 
 # Invalid bucket must end in a-z0-9
@@ -48,7 +43,6 @@ account_id = "123456789012"
 name = "badbucket-"
 region = "ap-southeast-2"
 public = false
-encryption = ""
 account_id = "123456789012"
 
 [[auth]]

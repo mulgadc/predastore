@@ -12,7 +12,7 @@ func TestLoad_InvalidBucketNamesAreDropped(t *testing.T) {
 	cfg, err := Load(filepath.Join("testdata", "invalid.toml"))
 
 	require.NoError(t, err, "Should read config without error")
-	assert.Equal(t, "1.0", cfg.Version, "Config version should match")
+	assert.Equal(t, 1, cfg.Version, "Config version should match")
 	assert.Equal(t, "ap-southeast-2", cfg.Region, "Region should match")
 
 	// All bucket names are invalid — none should survive validation

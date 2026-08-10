@@ -8,17 +8,24 @@
 package config
 
 import (
+	"bytes"
 	"cmp"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/pkg/ratelimit"
 	"github.com/pelletier/go-toml/v2"
 )
+
+// Version is the file format this build reads. There is no migration between
+// versions: a format change rewrites the file.
+const Version = 1
 
 // NodeID and HostID identify the two levels of the cluster. They are distinct
 // types because almost every function taking one takes the other too and they
@@ -150,7 +157,7 @@ type IAMConfig struct {
 // Config is predastore's on-disk configuration: the cluster topology, the
 // erasure code, the config-defined buckets and the S3 credentials.
 type Config struct {
-	Version string `toml:"version"`
+	Version int    `toml:"version"`
 	Region  string `toml:"region"`
 
 	RS RS `toml:"rs"`
@@ -181,8 +188,16 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 
+	// Strict, because an unknown key is either a typo or a setting this build
+	// dropped, and both read as configured until something misbehaves.
+	dec := toml.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
 	cfg := &Config{}
-	if err := toml.Unmarshal(raw, cfg); err != nil {
+	if err := dec.Decode(cfg); err != nil {
+		var unknown *toml.StrictMissingError
+		if errors.As(err, &unknown) {
+			return nil, fmt.Errorf("parse %s: unknown key %q", path, strings.Join(unknown.Errors[0].Key(), "."))
+		}
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 
@@ -209,6 +224,16 @@ func Load(path string) (*Config, error) {
 // everything the file decides for the whole cluster; the host-local fields are
 // checked by whoever resolves them against the flags, on the local host alone.
 func (c *Config) Validate() error {
+	// First, because a file from another format explains every other complaint
+	// this function could make about it.
+	if c.Version != Version {
+		return fmt.Errorf("config: version %d, s3d reads version %d", c.Version, Version)
+	}
+
+	if c.IAM != nil && isRelative(c.IAM.MasterKeyPath) {
+		return fmt.Errorf("config: iam master_key_path %q must be absolute", c.IAM.MasterKeyPath)
+	}
+
 	// Every config-defined service account must have an account_id so that
 	// buckets it creates land with a real owner ID — otherwise the ownership
 	// check would compare callerAccountID against "".
@@ -242,6 +267,7 @@ func (c *Config) validateTopology() error {
 	// keys one flat table by id. The host each is on names both sides of a
 	// collision, which the nesting otherwise hides.
 	nodeHosts := make(map[NodeID]HostID)
+	blobs := 0
 
 	for _, h := range c.Hosts {
 		if h.ID == 0 {
@@ -261,6 +287,21 @@ func (c *Config) validateTopology() error {
 		}
 		if hasPort(h.Addr) {
 			return fmt.Errorf("config: host %d addr %q must not carry a port", h.ID, h.Addr)
+		}
+		// Peers dial addr, so a wildcard or a group address names nothing they
+		// can reach. bind_addr is the one that may be a wildcard.
+		if ip := net.ParseIP(h.Addr); ip != nil && (ip.IsUnspecified() || ip.IsMulticast()) {
+			return fmt.Errorf("config: host %d addr %q is not an address a peer can dial", h.ID, h.Addr)
+		}
+		for _, p := range [][2]string{
+			{"data_dir", h.DataDir},
+			{"encryption_key", h.EncryptionKey},
+			{"tls_cert", h.TLSCert},
+			{"tls_key", h.TLSKey},
+		} {
+			if isRelative(p[1]) {
+				return fmt.Errorf("config: host %d %s %q must be absolute", h.ID, p[0], p[1])
+			}
 		}
 
 		ports := make(map[int]NodeID, len(h.Nodes))
@@ -305,6 +346,12 @@ func (c *Config) validateTopology() error {
 				gate = n.ID
 				continue
 			}
+			if n.Role == RoleBlob {
+				blobs++
+			}
+			if isRelative(n.DataDir) {
+				return fmt.Errorf("config: node %d data_dir %q must be absolute", n.ID, n.DataDir)
+			}
 			dir := NodeDataDir(h, n)
 			if other, ok := dirs[dir]; ok {
 				return fmt.Errorf("config: nodes %d and %d both use data dir %s on host %d", other, n.ID, dir, h.ID)
@@ -316,6 +363,11 @@ func (c *Config) validateTopology() error {
 	if len(nodeHosts) == 0 {
 		return fmt.Errorf("config: no nodes defined")
 	}
+	// Placement spreads a stripe over distinct blob nodes, so a cluster with
+	// fewer of them than the stripe is wide fails every write.
+	if shards := c.RS.Data + c.RS.Parity; shards > blobs {
+		return fmt.Errorf("config: rs data+parity is %d but the cluster has %d blob nodes", shards, blobs)
+	}
 	return nil
 }
 
@@ -324,4 +376,11 @@ func (c *Config) validateTopology() error {
 func hasPort(addr string) bool {
 	_, _, err := net.SplitHostPort(addr)
 	return err == nil
+}
+
+// isRelative reports whether a path is present and relative. Nothing anchors a
+// relative one: s3d is started from wherever the operator happens to be. Empty
+// means the file supplied none, which the flags may still.
+func isRelative(path string) bool {
+	return path != "" && !filepath.IsAbs(path)
 }

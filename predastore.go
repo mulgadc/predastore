@@ -88,6 +88,14 @@ func Run(ctx context.Context, opts Options) error {
 	if len(host.Nodes) == 0 {
 		return fmt.Errorf("predastore: host %d runs no nodes", opts.HostID)
 	}
+	// A node that names no directory of its own derives one under the host
+	// root, and an empty root derives a relative path under whatever directory
+	// the process was started in.
+	if host.DataDir == "" && slices.ContainsFunc(host.Nodes, func(n NodeConfig) bool {
+		return n.Role != RoleGate && n.DataDir == ""
+	}) {
+		return fmt.Errorf("predastore: host %d has no data directory", opts.HostID)
+	}
 
 	// A host with no replica of its own has no local consensus to wait on, so
 	// its gate serves immediately.
