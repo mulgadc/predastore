@@ -50,19 +50,25 @@ const (
 // Host is one s3d process, as written under [[host]]: the machine that owns a
 // data directory and a TLS identity. Nodes pinned to it run inside that
 // process as goroutines, each on its own port.
+//
+// The file is meant to be identical on every machine, so the fields only the
+// machine itself reads are optional here and may instead come from its s3d
+// flags. Empty means the file did not supply one.
 type Host struct {
 	ID HostID `toml:"id"`
 	// BindAddr is the local listen address, without a port; 0.0.0.0 binds all
-	// interfaces.
+	// interfaces. It defaults to Addr.
 	BindAddr string `toml:"bind_addr"`
 	// Addr is the address other hosts dial, without a port, split from
 	// BindAddr for NAT and multi-homed machines.
 	Addr string `toml:"addr"`
 	// DataDir is the on-disk root; nodes derive their subdirectories from
-	// node id and role.
+	// node id.
 	DataDir string `toml:"data_dir"`
+	// EncryptionKey is the path to the AES-256 key shards are encrypted with
+	// at rest.
+	EncryptionKey string `toml:"encryption_key"`
 	// TLSCert and TLSKey identify the host to its peers and to S3 clients.
-	// A single-host cluster opens no network socket and needs neither.
 	TLSCert string `toml:"tls_cert"`
 	TLSKey  string `toml:"tls_key"`
 	// Nodes are the roles this host runs, as written under [[host.node]].
@@ -188,8 +194,8 @@ func Load(path string) (*Config, error) {
 }
 
 // Validate reports whether the configuration is internally coherent. It is
-// everything that can be decided from the file alone, so that nothing
-// downstream has to re-check what it derives placement or addresses from.
+// everything the file decides for the whole cluster; the host-local fields are
+// checked by whoever resolves them against the flags, on the local host alone.
 func (c *Config) Validate() error {
 	// Every config-defined service account must have an account_id so that
 	// buckets it creates land with a real owner ID — otherwise the ownership
@@ -233,14 +239,8 @@ func (c *Config) validateTopology() error {
 			return fmt.Errorf("config: duplicate host id %d", h.ID)
 		}
 		hostIDs[h.ID] = true
-		if h.BindAddr == "" {
-			return fmt.Errorf("config: host %d missing bind_addr", h.ID)
-		}
 		if h.Addr == "" {
 			return fmt.Errorf("config: host %d missing addr", h.ID)
-		}
-		if h.DataDir == "" {
-			return fmt.Errorf("config: host %d missing data_dir", h.ID)
 		}
 		// Ports belong to nodes, so a host address carrying one is naming
 		// something the cluster no longer has a use for.

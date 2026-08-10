@@ -4,6 +4,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
@@ -30,8 +32,12 @@ func main() {
 
 func run() error {
 	configPath := flag.String("config", "", "S3 server configuration file (required)")
-	host := flag.Int("host", 0, "ID of the [[host]] this process runs (required)")
-	encryptionKeyFile := flag.String("encryption-key-file", "", "Path to 32-byte AES-256 master key for encryption at rest (required)")
+	hostID := flag.Int("host", 0, "ID of the [[host]] this process runs (required)")
+	bindAddr := flag.String("bind-addr", "", "Local listen address, without a port (overrides bind_addr)")
+	dataDir := flag.String("data-dir", "", "On-disk root for this host's nodes (overrides data_dir)")
+	encryptionKey := flag.String("encryption-key", "", "Path to the 32-byte AES-256 key protecting data at rest (overrides encryption_key)")
+	tlsCert := flag.String("tls-cert", "", "Path to this host's TLS certificate (overrides tls_cert)")
+	tlsKey := flag.String("tls-key", "", "Path to this host's TLS key (overrides tls_key)")
 	pprofEnabled := flag.Bool("pprof", false, "Write a CPU profile for the lifetime of the process")
 	pprofOutput := flag.String("pprof-output", "", "Where the CPU profile is saved")
 	logLevel := slog.LevelInfo
@@ -43,13 +49,9 @@ func run() error {
 		flag.Usage()
 		return errors.New("missing required flag: -config")
 	}
-	if *host <= 0 {
+	if *hostID <= 0 {
 		flag.Usage()
 		return errors.New("missing required flag: -host")
-	}
-	if *encryptionKeyFile == "" {
-		flag.Usage()
-		return errors.New("missing required flag: -encryption-key-file")
 	}
 
 	// One context for the whole process: ctrl-c cancels the rpc servers, the
@@ -79,16 +81,62 @@ func run() error {
 		return fmt.Errorf("read config: %w", err)
 	}
 
-	key, err := masterkey.Load(*encryptionKeyFile)
+	// The host-local fields have two sources, so they are settled here, into the
+	// entry the rest of the tree reads: flag, then config, then default.
+	host := hostEntry(cfg, predastore.HostID(*hostID))
+	if host == nil {
+		return fmt.Errorf("host %d is not in %s", *hostID, *configPath)
+	}
+	host.BindAddr = cmp.Or(*bindAddr, host.BindAddr, host.Addr)
+	host.DataDir = cmp.Or(*dataDir, host.DataDir)
+	host.EncryptionKey = cmp.Or(*encryptionKey, host.EncryptionKey)
+	host.TLSCert = cmp.Or(*tlsCert, host.TLSCert)
+	host.TLSKey = cmp.Or(*tlsKey, host.TLSKey)
+	if err := validateHost(host); err != nil {
+		return err
+	}
+
+	key, err := masterkey.Load(host.EncryptionKey)
 	if err != nil {
 		return fmt.Errorf("load master key: %w", err)
 	}
 
 	return predastore.Run(ctx, predastore.Options{
 		Config:    cfg,
-		HostID:    predastore.HostID(*host),
+		HostID:    host.ID,
 		MasterKey: key,
 		Pprof:     *pprofEnabled,
 		PprofPath: *pprofOutput,
 	})
+}
+
+// hostEntry is the [[host]] this process runs, addressable so the flags that
+// override it can be written back into the config everything downstream reads.
+func hostEntry(cfg *predastore.Config, id predastore.HostID) *predastore.HostConfig {
+	for i := range cfg.Hosts {
+		if cfg.Hosts[i].ID == id {
+			return &cfg.Hosts[i]
+		}
+	}
+	return nil
+}
+
+// validateHost checks the resolved fields this machine needs. It is local by
+// design: a path missing from another host's entry is that host's problem and
+// must not stop this one from starting.
+func validateHost(h *predastore.HostConfig) error {
+	if h.EncryptionKey == "" {
+		return errors.New("no encryption key: set --encryption-key or encryption_key")
+	}
+	if h.TLSCert == "" || h.TLSKey == "" {
+		return errors.New("no TLS identity: set --tls-cert and --tls-key, or tls_cert and tls_key")
+	}
+	// Only a gate keeps nothing on disk, so a host running one and nothing else
+	// needs no data directory.
+	if h.DataDir == "" && slices.ContainsFunc(h.Nodes, func(n predastore.NodeConfig) bool {
+		return n.Role != predastore.RoleGate
+	}) {
+		return errors.New("no data directory: set --data-dir or data_dir")
+	}
+	return nil
 }
