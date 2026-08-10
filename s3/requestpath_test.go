@@ -5,10 +5,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/mulgadc/predastore/backend"
 	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/stretchr/testify/assert"
@@ -100,14 +102,17 @@ var guardrailPolicy = iampolicy.PolicyDocument{
 	},
 }
 
-// exactGrantPolicy grants one object by exact ARN and nothing else.
-var exactGrantPolicy = iampolicy.PolicyDocument{
-	Version: "2012-10-17",
-	Statement: []iampolicy.Statement{{
-		Effect:   "Allow",
-		Action:   iampolicy.StringOrArr{"s3:GetObject"},
-		Resource: iampolicy.StringOrArr{"arn:aws:s3:::owner-bucket/secret/data"},
-	}},
+// exactObjectGrant grants one object by exact ARN and nothing else, so a
+// request that succeeds under it can only have been authorized on that ARN.
+func exactObjectGrant(key string) iampolicy.PolicyDocument {
+	return iampolicy.PolicyDocument{
+		Version: "2012-10-17",
+		Statement: []iampolicy.Statement{{
+			Effect:   "Allow",
+			Action:   iampolicy.StringOrArr{"s3:GetObject"},
+			Resource: iampolicy.StringOrArr{"arn:aws:s3:::owner-bucket/" + key},
+		}},
+	}
 }
 
 func parityServer(t *testing.T, policy iampolicy.PolicyDocument) (*HTTP2Server, *recordingBackend) {
@@ -129,15 +134,15 @@ func serveSigned(t *testing.T, server *HTTP2Server, method, target string) *http
 	return rr
 }
 
-// An exact-ARN Deny must survive every spelling of the path it protects: the
-// decision and the dispatch now come from one resolved pair.
-func TestPathParity_ExplicitDenyNotBypassable(t *testing.T) {
+// Paths that only normalise into their dispatched form never reach the
+// authorization decision. They are a client error, not a policy outcome, so
+// they must not be reported as AccessDenied.
+func TestRequestPath_MalformedRejected(t *testing.T) {
 	tests := []struct {
 		name   string
 		method string
 		target string
 	}{
-		{"canonical path", http.MethodGet, "/owner-bucket/secret/data"},
 		{"trailing slash GET", http.MethodGet, "/owner-bucket/secret/data/"},
 		{"trailing slash DELETE", http.MethodDelete, "/owner-bucket/secret/data/"},
 		{"encoded trailing slash", http.MethodGet, "/owner-bucket/secret/data%2F"},
@@ -150,6 +155,21 @@ func TestPathParity_ExplicitDenyNotBypassable(t *testing.T) {
 			server, be := parityServer(t, guardrailPolicy)
 			rr := serveSigned(t, server, tt.method, tt.target)
 
+			assert.Equal(t, http.StatusBadRequest, rr.Code)
+			assert.Contains(t, rr.Body.String(), "InvalidURI")
+			assert.NotContains(t, rr.Body.String(), "AccessDenied")
+			assert.Empty(t, be.calls, "backend must not be reached for a rejected path")
+		})
+	}
+}
+
+// An exact-ARN Deny must survive the spellings that do reach the decision.
+func TestPathParity_ExplicitDenyNotBypassable(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			server, be := parityServer(t, guardrailPolicy)
+			rr := serveSigned(t, server, method, "/owner-bucket/secret/data")
+
 			assert.Equal(t, http.StatusForbidden, rr.Code)
 			assert.Contains(t, rr.Body.String(), "AccessDenied")
 			assert.Empty(t, be.calls, "backend must not be reached for a denied request")
@@ -157,23 +177,67 @@ func TestPathParity_ExplicitDenyNotBypassable(t *testing.T) {
 	}
 }
 
+// The invariant itself: for every spelling that survives validation, the ARN
+// the policy was evaluated against is the bucket/key the backend receives. An
+// exact-ARN grant makes a 200 proof that the two agree, since nothing else
+// could have authorized it.
+func TestPathParity_AuthorizedARNMatchesDispatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		target  string
+		wantKey string
+	}{
+		{"canonical", "/owner-bucket/secret/data", "secret/data"},
+		{"over-encoded segment", "/owner-bucket/%73ecret/data", "%73ecret/data"},
+		{"encoded separator", "/owner-bucket/secret%2Fdata", "secret%2Fdata"},
+		{"encoded reserved char", "/owner-bucket/a%3Ab", "a%3Ab"},
+		{"canonically escaped utf-8", "/owner-bucket/reports/r%C3%A9union.txt", "reports/réunion.txt"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server, be := parityServer(t, exactObjectGrant(tt.wantKey))
+			rr := serveSigned(t, server, http.MethodGet, tt.target)
+
+			require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+			assert.Equal(t, []string{"GetObject owner-bucket/" + tt.wantKey}, be.calls)
+		})
+	}
+}
+
+// The routing subject must be the StripSlashes rewrite, so the middleware that
+// resolves it has to be registered after StripSlashes. Nothing observable in a
+// response distinguishes the two orderings, so assert the registration itself.
+func TestPathParity_TargetResolvedAfterStripSlashes(t *testing.T) {
+	server, _ := parityServer(t, guardrailPolicy)
+
+	stripIdx, targetIdx := -1, -1
+	wantStrip := reflect.ValueOf(middleware.StripSlashes).Pointer()
+	wantTarget := reflect.ValueOf(server.s3TargetMiddleware).Pointer()
+	for i, mw := range server.router.Middlewares() {
+		switch reflect.ValueOf(mw).Pointer() {
+		case wantStrip:
+			stripIdx = i
+		case wantTarget:
+			targetIdx = i
+		}
+	}
+
+	require.NotEqual(t, -1, stripIdx, "StripSlashes is not registered")
+	require.NotEqual(t, -1, targetIdx, "s3TargetMiddleware is not registered")
+	assert.Less(t, stripIdx, targetIdx,
+		"s3TargetMiddleware must run after StripSlashes or it resolves a different path than chi routes on")
+}
+
 // The percent-encoding variant of the split: the grant covers secret/data, and
 // the router dispatches %73ecret/data, so the grant must not authorize it.
 func TestPathParity_EncodedKeyDoesNotSatisfyExactGrant(t *testing.T) {
-	server, be := parityServer(t, exactGrantPolicy)
+	server, be := parityServer(t, exactObjectGrant("secret/data"))
 	rr := serveSigned(t, server, http.MethodGet, "/owner-bucket/%73ecret/data")
 
 	assert.Equal(t, http.StatusForbidden, rr.Code)
 	assert.Contains(t, rr.Body.String(), "AccessDenied")
 	assert.Empty(t, be.calls, "backend must not be reached for a denied request")
-}
-
-func TestPathParity_GrantedObjectStillServed(t *testing.T) {
-	server, be := parityServer(t, exactGrantPolicy)
-	rr := serveSigned(t, server, http.MethodGet, "/owner-bucket/secret/data")
-
-	assert.Equal(t, http.StatusOK, rr.Code)
-	assert.Equal(t, []string{"GetObject owner-bucket/secret/data"}, be.calls)
 }
 
 // The Deny covers one object, not the prefix: everything else in the bucket

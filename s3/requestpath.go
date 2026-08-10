@@ -28,10 +28,13 @@ var (
 // the ownership check, throttling and the route handlers all read one pair.
 func (s *HTTP2Server) s3TargetMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// InvalidURI, not AccessDenied: this fires before authentication, so
+		// reporting it as a policy outcome sends operators to audit IAM.
 		if err := validateRequestPath(r); err != nil {
-			slog.DebugContext(r.Context(), "Rejected malformed S3 request path",
+			slog.WarnContext(r.Context(), "Rejected malformed S3 request path",
 				"path", r.URL.Path, "rawPath", r.URL.RawPath, "error", err, "remoteAddr", r.RemoteAddr)
-			s.writeS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
+			s.writeS3Error(w, r, http.StatusBadRequest, "InvalidURI",
+				"Couldn't parse the specified URI: "+err.Error())
 			return
 		}
 
