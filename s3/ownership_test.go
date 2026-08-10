@@ -204,7 +204,7 @@ func runMiddleware(t *testing.T, server *HTTP2Server, req *http.Request) (status
 		nextCalled = true
 		w.WriteHeader(http.StatusOK)
 	})
-	server.sigV4AuthMiddleware(next).ServeHTTP(rr, req)
+	server.s3TargetMiddleware(server.sigV4AuthMiddleware(next)).ServeHTTP(rr, req)
 	b, _ := io.ReadAll(rr.Body)
 	return rr.Code, nextCalled, string(b)
 }

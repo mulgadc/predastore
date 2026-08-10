@@ -53,9 +53,7 @@ type Config struct {
 	Buckets []S3_Buckets `toml:"buckets"`
 
 	// TODO: Move to IAM
-	Auth                  []AuthEntry `toml:"auth"`
-	AllowAnonymousListing bool        `toml:"allow_anonymous_listing"`
-	AllowAnonymousAccess  bool        `toml:"allow_anonymous_access"`
+	Auth []AuthEntry `toml:"auth"`
 
 	// IAM authentication via NATS KV (optional, enables multi-account S3 access)
 	IAM *IAMConfig `toml:"iam"`
@@ -210,6 +208,8 @@ const (
 	ContextKeyAccessKeyID contextKey = "accessKeyID"
 	// ContextKeyAccountID is the context key for the authenticated user's account ID.
 	ContextKeyAccountID contextKey = "accountID"
+	// contextKeyTarget is the context key for the resolved bucket/key pair.
+	contextKeyTarget contextKey = "requestTarget"
 )
 
 // IAMConfig configures IAM authentication via NATS KV.
