@@ -230,6 +230,18 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: version %d, s3d reads version %d", c.Version, Version)
 	}
 
+	// The region is what a request's credential scope is compared against, so
+	// an empty one matches nothing a client can sign.
+	if c.Region == "" {
+		return fmt.Errorf("config: missing region")
+	}
+
+	// The erasure code has no default: a substituted one would place objects
+	// the file never asked for, at a width the blob-node check below never saw.
+	if c.RS.Data <= 0 || c.RS.Parity <= 0 {
+		return fmt.Errorf("config: rs data and parity must be positive")
+	}
+
 	if c.IAM != nil && isRelative(c.IAM.MasterKeyPath) {
 		return fmt.Errorf("config: iam master_key_path %q must be absolute", c.IAM.MasterKeyPath)
 	}

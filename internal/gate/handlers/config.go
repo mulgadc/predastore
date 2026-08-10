@@ -4,12 +4,6 @@
 // route table.
 package handlers
 
-// Reed-Solomon defaults, applied when the config leaves them at zero.
-const (
-	DefaultDataShards   = 3
-	DefaultParityShards = 2
-)
-
 // Config is the gate's slice of the TOML config: the settings the handlers
 // read, without the topology, transport or process settings that only the
 // server assembly cares about.

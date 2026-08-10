@@ -42,21 +42,12 @@ type Config struct {
 	RateLimit ratelimit.Config
 }
 
-// handlerConfig is the slice of the config the handlers read. Shard counts fall
-// back to the erasure-code defaults so a config that omits them still places
-// objects the way the rest of the cluster expects.
+// handlerConfig is the slice of the config the handlers read.
 func (s3 *Config) handlerConfig() handlers.Config {
-	cfg := handlers.Config{
+	return handlers.Config{
 		Region:       s3.Region,
 		DataShards:   s3.RS.Data,
 		ParityShards: s3.RS.Parity,
 		Buckets:      s3.Buckets,
 	}
-	if cfg.DataShards == 0 {
-		cfg.DataShards = handlers.DefaultDataShards
-	}
-	if cfg.ParityShards == 0 {
-		cfg.ParityShards = handlers.DefaultParityShards
-	}
-	return cfg
 }

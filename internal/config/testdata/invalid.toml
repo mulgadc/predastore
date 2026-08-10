@@ -3,6 +3,10 @@
 version = 1
 region = "ap-southeast-2"
 
+[rs]
+data = 3
+parity = 2
+
 # Invalid bucket name ([a-z0-9-.])
 [[bucket]]
 name = "INVALIDNAME"
