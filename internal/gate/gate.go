@@ -38,9 +38,6 @@ type Config struct {
 	// IAM authentication via NATS KV (optional, enables multi-account S3 access)
 	IAM *auth.IAMConfig
 
-	Debug          bool
-	DisableLogging bool
-
 	// API request throttling
 	RateLimit ratelimit.Config
 }

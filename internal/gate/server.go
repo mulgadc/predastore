@@ -22,7 +22,6 @@ import (
 	"github.com/mulgadc/predastore/internal/meta"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
 	"github.com/mulgadc/predastore/pkg/masterkey"
-	"github.com/mulgadc/predastore/pkg/otelsetup"
 	"github.com/mulgadc/predastore/pkg/ratelimit"
 )
 
@@ -124,7 +123,9 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.Port == 0 {
 		cfg.Port = defaultPort
 	}
-	resolvePprof(&cfg)
+	if cfg.PprofEnabled && cfg.PprofOutputPath == "" {
+		cfg.PprofOutputPath = defaultPprofOutput
+	}
 
 	if cfg.Config == nil {
 		return nil, fmt.Errorf("no configuration provided: set ServerConfig.Config")
@@ -137,12 +138,6 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("master key is required: set ServerConfig.MasterKey")
 	}
 	slog.Info("master key loaded", "fingerprint", cfg.MasterKey.Fingerprint)
-
-	// Set the log level early so debug logs during the rest of init are visible.
-	otelsetup.SetDefaultJSONLogger(logLevel(config))
-	if config.Debug {
-		slog.Info("Debug logging enabled")
-	}
 
 	// The clients arrive fully wired from the process that owns the cluster
 	// nodes; the gate never launches storage or state itself.
@@ -211,18 +206,6 @@ func newCredentialProvider(config *Config) (auth.CredentialProvider, error) {
 
 	slog.Info("Using NATS IAM + config chain auth")
 	return auth.NewChainProvider(natsProv, configProv), nil
-}
-
-// logLevel maps the config's logging switches onto a slog level.
-func logLevel(config *Config) slog.Level {
-	switch {
-	case config.Debug:
-		return slog.LevelDebug
-	case config.DisableLogging:
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
 }
 
 // Run serves S3 over TLS until ctx is cancelled or the listener fails, then
@@ -317,20 +300,6 @@ func (s *Server) Run(ctx context.Context) error {
 			return nil
 		}
 		return fmt.Errorf("s3 gate: %w", err)
-	}
-}
-
-// resolvePprof fills in the profiling settings the environment supplies, so a
-// launcher can turn profiling on without the caller plumbing a flag through.
-func resolvePprof(cfg *ServerConfig) {
-	if !cfg.PprofEnabled && os.Getenv("PPROF_ENABLED") == "1" {
-		cfg.PprofEnabled = true
-		if cfg.PprofOutputPath == "" {
-			cfg.PprofOutputPath = os.Getenv("PPROF_OUTPUT")
-		}
-	}
-	if cfg.PprofEnabled && cfg.PprofOutputPath == "" {
-		cfg.PprofOutputPath = defaultPprofOutput
 	}
 }
 

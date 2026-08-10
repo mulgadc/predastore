@@ -50,9 +50,6 @@ type Options struct {
 	// Required: predastore never writes plaintext shards.
 	MasterKey *masterkey.Key
 
-	// Debug forces debug logging on regardless of the config file.
-	Debug bool
-
 	// Pprof writes a CPU profile for the lifetime of Run, saved to PprofPath.
 	Pprof     bool
 	PprofPath string
@@ -317,7 +314,7 @@ func gateServer(
 		return nil, err
 	}
 	return gate.NewServer(gate.ServerConfig{
-		Config:          gateConfig(cfg, opts.Debug),
+		Config:          gateConfig(cfg),
 		Host:            host.BindAddr,
 		Port:            n.Port,
 		TLSCert:         host.TLSCert,

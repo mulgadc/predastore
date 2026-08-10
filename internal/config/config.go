@@ -151,9 +151,6 @@ type Config struct {
 
 	IAM *IAMConfig `toml:"iam"`
 
-	Debug          bool `toml:"debug"`
-	DisableLogging bool `toml:"disable_logging"`
-
 	RateLimit ratelimit.Config `toml:"ratelimit"`
 }
 

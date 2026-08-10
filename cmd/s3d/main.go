@@ -1,7 +1,6 @@
 // Command s3d runs one host of a predastore cluster: the nodes the config
 // pins to the host named by -host, and the S3 gate in front of them. It is
-// a thin entrypoint — flags, environment, telemetry and a signal context, then
-// predastore.Run.
+// a thin entrypoint — flags, telemetry and a signal context, then predastore.Run.
 package main
 
 import (
@@ -12,7 +11,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -32,12 +30,14 @@ func main() {
 
 func run() error {
 	configPath := flag.String("config", "", "S3 server configuration file (required)")
-	debug := flag.Bool("debug", false, "Enable verbose debug logs")
 	host := flag.Int("host", 0, "ID of the [[host]] this process runs (required)")
 	encryptionKeyFile := flag.String("encryption-key-file", "", "Path to 32-byte AES-256 master key for encryption at rest (required)")
+	pprofEnabled := flag.Bool("pprof", false, "Write a CPU profile for the lifetime of the process")
+	pprofOutput := flag.String("pprof-output", "", "Where the CPU profile is saved")
+	logLevel := slog.LevelInfo
+	flag.TextVar(&logLevel, "log-level", logLevel, "Minimum log level (debug|info|warn|error)")
 
 	flag.Parse()
-	applyEnvOverrides(configPath, host, encryptionKeyFile)
 
 	if *configPath == "" {
 		flag.Usage()
@@ -45,11 +45,11 @@ func run() error {
 	}
 	if *host <= 0 {
 		flag.Usage()
-		return errors.New("missing required flag: -host (or HOST)")
+		return errors.New("missing required flag: -host")
 	}
 	if *encryptionKeyFile == "" {
 		flag.Usage()
-		return errors.New("missing required flag: -encryption-key-file (or ENCRYPTION_KEY_FILE)")
+		return errors.New("missing required flag: -encryption-key-file")
 	}
 
 	// One context for the whole process: ctrl-c cancels the rpc servers, the
@@ -71,6 +71,9 @@ func run() error {
 		}()
 	}
 
+	// After Init, so the default logger also fans out to the OTLP bridge.
+	otelsetup.SetDefaultJSONLogger(logLevel)
+
 	cfg, err := predastore.LoadConfig(*configPath)
 	if err != nil {
 		return fmt.Errorf("read config: %w", err)
@@ -85,21 +88,7 @@ func run() error {
 		Config:    cfg,
 		HostID:    predastore.HostID(*host),
 		MasterKey: key,
-		Debug:     *debug,
+		Pprof:     *pprofEnabled,
+		PprofPath: *pprofOutput,
 	})
-}
-
-// applyEnvOverrides lets the launcher configure s3d without rewriting flags.
-func applyEnvOverrides(config *string, host *int, encryptionKeyFile *string) {
-	if v := os.Getenv("CONFIG"); v != "" {
-		*config = v
-	}
-	if v := os.Getenv("HOST"); v != "" {
-		if id, err := strconv.Atoi(v); err == nil {
-			*host = id
-		}
-	}
-	if v := os.Getenv("ENCRYPTION_KEY_FILE"); v != "" {
-		*encryptionKeyFile = v
-	}
 }

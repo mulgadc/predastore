@@ -182,18 +182,15 @@ func iamConfig(c *Config) *auth.IAMConfig {
 	}
 }
 
-// gateConfig is the slice of the file the S3 frontend reads, with the
-// process-level debug override already folded in.
-func gateConfig(c *Config, debug bool) *gate.Config {
+// gateConfig is the slice of the file the S3 frontend reads.
+func gateConfig(c *Config) *gate.Config {
 	return &gate.Config{
-		Region:         c.Region,
-		RS:             gate.RS{Data: c.RS.Data, Parity: c.RS.Parity},
-		Buckets:        bucketConfigs(c),
-		Auth:           authEntries(c),
-		IAM:            iamConfig(c),
-		Debug:          c.Debug || debug,
-		DisableLogging: c.DisableLogging,
-		RateLimit:      c.RateLimit,
-		BlobNodeIDs:    nodeIDs(nodesByRole(c, RoleBlob)),
+		Region:      c.Region,
+		RS:          gate.RS{Data: c.RS.Data, Parity: c.RS.Parity},
+		Buckets:     bucketConfigs(c),
+		Auth:        authEntries(c),
+		IAM:         iamConfig(c),
+		RateLimit:   c.RateLimit,
+		BlobNodeIDs: nodeIDs(nodesByRole(c, RoleBlob)),
 	}
 }

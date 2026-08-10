@@ -26,14 +26,12 @@ const globalSigningRegion = "us-east-1"
 func (s *Server) setupMiddleware() {
 	r := s.router
 
-	otelsetup.SetDefaultJSONLogger(logLevel(s.config))
-
 	r.Use(otelsetup.HTTPMiddleware("predastore"))
 	r.Use(s3SpanMiddleware)
 	// chi's access log duplicates the APM transaction from HTTPMiddleware and
 	// is a synchronous per-request write on the hot path; only enable it for
 	// explicit debug sessions.
-	if s.config.Debug {
+	if slog.Default().Enabled(context.Background(), slog.LevelDebug) {
 		r.Use(middleware.Logger)
 	}
 	r.Use(middleware.Recoverer)
