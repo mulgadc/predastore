@@ -33,13 +33,10 @@ type Config struct {
 func (c Config) TotalShards() int { return c.DataShards + c.ParityShards }
 
 // BucketConfig is a bucket declared in the configuration rather than created
-// through the API. Pathname, when set, is already absolute: the root package
-// resolves it while parsing.
+// through the API.
 type BucketConfig struct {
 	Name      string
 	Region    string
-	Type      string
-	Pathname  string
 	Public    bool
 	AccountID string
 }

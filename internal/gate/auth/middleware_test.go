@@ -35,7 +35,7 @@ func sessionGate(p auth.CredentialProvider) http.Handler {
 	cfg := &gate.Config{
 		Region: sessionRegion,
 		Buckets: []handlers.BucketConfig{{
-			Name: "session-bucket", Region: sessionRegion, Type: "distributed",
+			Name: "session-bucket", Region: sessionRegion,
 			Public: false, AccountID: auth.TestSessionAccount,
 		}},
 	}

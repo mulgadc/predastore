@@ -59,8 +59,7 @@ type Host struct {
 	// BindAddr for NAT and multi-homed machines.
 	PublicAddr string `toml:"public_addr"`
 	// DataDir is the on-disk root; nodes derive their subdirectories from
-	// node id and role. A relative path resolves against the config's
-	// BasePath.
+	// node id and role.
 	DataDir string `toml:"data_dir"`
 	// TLSCert and TLSKey identify the host to its peers and to S3 clients.
 	// A single-host cluster opens no network socket and needs neither.
@@ -97,12 +96,8 @@ type Compaction struct {
 // Bucket is a bucket declared in the config rather than created through the
 // API.
 type Bucket struct {
-	Name   string `toml:"name"`
-	Region string `toml:"region"`
-	Type   string `toml:"type"`
-	// Pathname is an on-disk directory backing the bucket; a relative path
-	// resolves against BasePath.
-	Pathname  string `toml:"pathname"`
+	Name      string `toml:"name"`
+	Region    string `toml:"region"`
 	Public    bool   `toml:"public"`
 	AccountID string `toml:"account_id"`
 }
@@ -152,24 +147,19 @@ type Config struct {
 	Buckets []Bucket `toml:"buckets"`
 
 	// TODO: Move to IAM
-	Auth                  []AuthEntry `toml:"auth"`
-	AllowAnonymousListing bool        `toml:"allow_anonymous_listing"`
-	AllowAnonymousAccess  bool        `toml:"allow_anonymous_access"`
+	Auth []AuthEntry `toml:"auth"`
 
 	IAM *IAMConfig `toml:"iam"`
 
-	Debug bool `toml:"debug"`
-	// BasePath is the directory relative bucket and data paths resolve
-	// against. Empty means the working directory.
-	BasePath       string `toml:"base_path"`
-	DisableLogging bool   `toml:"disable_logging"`
+	Debug          bool `toml:"debug"`
+	DisableLogging bool `toml:"disable_logging"`
 
 	RateLimit ratelimit.Config `toml:"ratelimit"`
 }
 
 // Load reads and validates a TOML configuration file. It touches no
-// filesystem beyond the file itself: paths are resolved and directories
-// created by the caller, so BasePath may still be overridden afterwards.
+// filesystem beyond the file itself: the directories the config names are
+// created by whoever uses them.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {

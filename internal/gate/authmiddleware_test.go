@@ -19,11 +19,9 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 		Region: "ap-southeast-2",
 		Buckets: []handlers.BucketConfig{
 			{
-				Name:     "test-bucket01",
-				Region:   "ap-southeast-2",
-				Type:     "distributed",
-				Pathname: "testdata/test-bucket01",
-				Public:   false, // Not public - requires authentication
+				Name:   "test-bucket01",
+				Region: "ap-southeast-2",
+				Public: false, // Not public - requires authentication
 			},
 		},
 		Auth: []auth.Entry{
@@ -194,11 +192,9 @@ func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
 	s3Config := &Config{
 		Region: "ap-southeast-2",
 		Buckets: []handlers.BucketConfig{{
-			Name:     "test-bucket01",
-			Region:   "ap-southeast-2",
-			Type:     "distributed",
-			Pathname: "testdata/test-bucket01",
-			Public:   false,
+			Name:   "test-bucket01",
+			Region: "ap-southeast-2",
+			Public: false,
 		}},
 		Auth: []auth.Entry{{
 			AccessKeyID:     "TESTACCESSKEY",

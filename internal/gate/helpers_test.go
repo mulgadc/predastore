@@ -56,9 +56,9 @@ func newAuthTestConfig() *Config {
 	return &Config{
 		Region: "ap-southeast-2",
 		Buckets: []handlers.BucketConfig{
-			{Name: "test-bucket01", Region: "ap-southeast-2", Type: "distributed", Public: true},
-			{Name: "private", Region: "ap-southeast-2", Type: "distributed", Public: false},
-			{Name: "local", Region: "ap-southeast-2", Type: "distributed", Public: false},
+			{Name: "test-bucket01", Region: "ap-southeast-2", Public: true},
+			{Name: "private", Region: "ap-southeast-2", Public: false},
+			{Name: "local", Region: "ap-southeast-2", Public: false},
 		},
 		Auth: []auth.Entry{
 			{

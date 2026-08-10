@@ -37,7 +37,6 @@ func (c *BucketCache) add(name, region, accountID string, public bool) {
 	c.entries = append(c.entries, BucketConfig{
 		Name:      name,
 		Region:    region,
-		Type:      "distributed",
 		Public:    public,
 		AccountID: accountID,
 	})

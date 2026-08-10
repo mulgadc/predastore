@@ -25,8 +25,7 @@ type Config struct {
 
 	RS RS
 
-	// Buckets are the config-defined buckets, with pathnames already resolved
-	// to absolute directories.
+	// Buckets are the config-defined buckets.
 	Buckets []handlers.BucketConfig
 
 	// BlobNodeIDs are the blob nodes the placement ring spreads

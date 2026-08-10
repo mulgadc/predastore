@@ -170,7 +170,6 @@ func ownershipServer(t *testing.T) *Server {
 		Buckets: []handlers.BucketConfig{{
 			Name:      "predastore",
 			Region:    "ap-southeast-2",
-			Type:      "distributed",
 			Public:    false,
 			AccountID: acctSys,
 		}},

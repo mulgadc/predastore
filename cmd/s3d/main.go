@@ -32,7 +32,6 @@ func main() {
 
 func run() error {
 	configPath := flag.String("config", "", "S3 server configuration file (required)")
-	basePath := flag.String("base-path", "", "Base path for the S3 directory when undefined in the config file")
 	debug := flag.Bool("debug", false, "Enable verbose debug logs")
 	host := flag.Int("host", 0, "ID of the [[host]] this process runs (required)")
 	encryptionKeyFile := flag.String("encryption-key-file", "", "Path to 32-byte AES-256 master key for encryption at rest (required)")
@@ -75,11 +74,6 @@ func run() error {
 	cfg, err := predastore.LoadConfig(*configPath)
 	if err != nil {
 		return fmt.Errorf("read config: %w", err)
-	}
-	// The flag is the fallback the config file overrides, not the other way
-	// round, so a config that pins its own base path stays portable.
-	if cfg.BasePath == "" {
-		cfg.BasePath = *basePath
 	}
 
 	key, err := masterkey.Load(*encryptionKeyFile)

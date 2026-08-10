@@ -2,10 +2,7 @@ package predastore
 
 import (
 	"cmp"
-	"errors"
 	"fmt"
-	"log/slog"
-	"os"
 	"path/filepath"
 	"slices"
 
@@ -66,20 +63,6 @@ func LoadConfig(path string) (*Config, error) {
 	return config.Load(path)
 }
 
-// basePath resolves BasePath to an absolute directory, since relative bucket
-// and data paths are resolved against it long after the working directory
-// stops being meaningful.
-func basePath(c *Config) (string, error) {
-	if filepath.IsAbs(c.BasePath) {
-		return c.BasePath, nil
-	}
-	dir, err := os.Getwd()
-	if err != nil {
-		return "", fmt.Errorf("resolve base path: %w", err)
-	}
-	return filepath.Join(dir, c.BasePath), nil
-}
-
 // The queries below answer what the cluster is made of. They live here rather
 // than in the config package because they are inventory questions about a
 // parsed file, not part of parsing it.
@@ -114,21 +97,15 @@ func hasRemoteNodes(c *Config, hostID HostID) bool {
 	return slices.ContainsFunc(c.Nodes, func(n NodeConfig) bool { return n.HostID != hostID })
 }
 
-// dataDir is where a node keeps its state, derived from its own host's base
-// directory and its node id. A relative path is resolved against the base
-// path, so a config can be shared across machines and the launcher decides
-// where state lands.
-func dataDir(c *Config, nodeID NodeID, base string) string {
+// dataDir is where a node keeps its state, derived from its own host's data
+// directory and its node id.
+func dataDir(c *Config, nodeID NodeID) string {
 	for _, n := range c.Nodes {
 		if n.ID != nodeID {
 			continue
 		}
 		if h, ok := hostOf(c, n.HostID); ok {
-			dir := filepath.Join(h.DataDir, nodeKey(nodeID))
-			if !filepath.IsAbs(dir) {
-				dir = filepath.Join(base, dir)
-			}
-			return dir
+			return filepath.Join(h.DataDir, nodeKey(nodeID))
 		}
 	}
 	return ""
@@ -163,32 +140,15 @@ func selectNodes(c *Config, keep func(NodeConfig) bool) []NodeConfig {
 // live here rather than in the config package because gate.Config names a
 // NodeID and so imports config; converting there would close the cycle.
 
-// bucketConfigs converts the config-defined buckets, resolving relative
-// pathnames against basePath and creating the directories they name. A
-// directory that cannot be created is a warning, not a failure: only buckets
-// that are actually served from disk need one.
-func bucketConfigs(c *Config, basePath string) []handlers.BucketConfig {
-	buckets := make([]handlers.BucketConfig, 0, len(c.Buckets))
-	for _, b := range c.Buckets {
-		out := handlers.BucketConfig{
+func bucketConfigs(c *Config) []handlers.BucketConfig {
+	buckets := make([]handlers.BucketConfig, len(c.Buckets))
+	for i, b := range c.Buckets {
+		buckets[i] = handlers.BucketConfig{
 			Name:      b.Name,
 			Region:    b.Region,
-			Type:      b.Type,
-			Pathname:  b.Pathname,
 			Public:    b.Public,
 			AccountID: b.AccountID,
 		}
-		if out.Pathname != "" {
-			if !filepath.IsAbs(out.Pathname) {
-				out.Pathname = filepath.Join(basePath, out.Pathname)
-			}
-			if _, err := os.Stat(out.Pathname); errors.Is(err, os.ErrNotExist) {
-				if mkErr := os.MkdirAll(out.Pathname, 0750); mkErr != nil {
-					slog.Warn("Failed to create bucket directory", "path", out.Pathname, "error", mkErr)
-				}
-			}
-		}
-		buckets = append(buckets, out)
 	}
 	return buckets
 }
@@ -224,11 +184,11 @@ func iamConfig(c *Config) *auth.IAMConfig {
 
 // gateConfig is the slice of the file the S3 frontend reads, with the
 // process-level debug override already folded in.
-func gateConfig(c *Config, basePath string, debug bool) *gate.Config {
+func gateConfig(c *Config, debug bool) *gate.Config {
 	return &gate.Config{
 		Region:         c.Region,
 		RS:             gate.RS{Data: c.RS.Data, Parity: c.RS.Parity},
-		Buckets:        bucketConfigs(c, basePath),
+		Buckets:        bucketConfigs(c),
 		Auth:           authEntries(c),
 		IAM:            iamConfig(c),
 		Debug:          c.Debug || debug,

@@ -12,6 +12,5 @@ policy = []
 [[buckets]]
 name = "valid-bucket-name"
 region = "ap-southeast-2"
-type = "distributed"
 public = false
 encryption = ""

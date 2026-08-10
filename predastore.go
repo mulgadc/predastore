@@ -83,11 +83,6 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	cfg := opts.Config
-	base, err := basePath(cfg)
-	if err != nil {
-		return err
-	}
-
 	local := localNodes(cfg, opts.HostID)
 	if len(local) == 0 {
 		return fmt.Errorf("predastore: host %d runs no nodes", opts.HostID)
@@ -110,7 +105,7 @@ func Run(ctx context.Context, opts Options) error {
 		}
 	}()
 	for _, n := range local {
-		run, cleanup, err := buildNode(cfg, n, base, opts, barrier)
+		run, cleanup, err := buildNode(cfg, n, opts, barrier)
 		if err != nil {
 			return err
 		}
@@ -128,7 +123,7 @@ func Run(ctx context.Context, opts Options) error {
 // buildNode builds one node of this host: the transports it is reached over,
 // the rpc plumbing around them and the service it runs. Nothing listens or
 // dials until run is called, and cleanup releases what run does not.
-func buildNode(cfg *Config, n NodeConfig, base string, opts Options, barrier leaderBarrier) (
+func buildNode(cfg *Config, n NodeConfig, opts Options, barrier leaderBarrier) (
 	run func(context.Context) error, cleanup func(), err error,
 ) {
 	host, ok := hostOf(cfg, n.HostID)
@@ -190,7 +185,7 @@ func buildNode(cfg *Config, n NodeConfig, base string, opts Options, barrier lea
 	}
 
 	mux := rpc.NewMux()
-	dir := dataDir(cfg, n.ID, base)
+	dir := dataDir(cfg, n.ID)
 	var serve func(context.Context) error
 
 	switch n.Role {
@@ -198,7 +193,7 @@ func buildNode(cfg *Config, n NodeConfig, base string, opts Options, barrier lea
 		// The pool is private: a gate dials but is never dialed, so it has
 		// nothing to share one with.
 		pool = rpc.NewConnPool(n.ID, res)
-		gw, gerr := gateServer(cfg, n, host, base, opts, rpc.NewClient(pool))
+		gw, gerr := gateServer(cfg, n, host, opts, rpc.NewClient(pool))
 		if gerr != nil {
 			cleanup()
 			return nil, nil, fmt.Errorf("create s3 gate: %w", gerr)
@@ -308,7 +303,7 @@ func raftDial(cli *rpc.Client) func(context.Context, raft.ServerAddress) (transp
 // slice, its host's listen address and TLS identity, and the cluster clients
 // it works through.
 func gateServer(
-	cfg *Config, n NodeConfig, host HostConfig, base string, opts Options, cli *rpc.Client,
+	cfg *Config, n NodeConfig, host HostConfig, opts Options, cli *rpc.Client,
 ) (*gate.Server, error) {
 	metaClient, err := meta.NewClient(meta.ClientConfig{
 		Client:   cli,
@@ -322,7 +317,7 @@ func gateServer(
 		return nil, err
 	}
 	return gate.NewServer(gate.ServerConfig{
-		Config:          gateConfig(cfg, base, opts.Debug),
+		Config:          gateConfig(cfg, opts.Debug),
 		Host:            host.BindAddr,
 		Port:            n.Port,
 		TLSCert:         host.TLSCert,
