@@ -1,0 +1,124 @@
+# Five-host development cluster, RS(3,2).
+#
+# Each host is its own s3d process with a gate, a meta replica and a blob
+# node. Colocated nodes talk over the in-process pipe; nodes on different
+# hosts talk over QUIC. Nothing here names a transport — the pinning does.
+#
+#     ./scripts/start.sh 5host
+#
+# The hosts share one machine over loopback aliases, so each binds its own
+# address: five processes cannot share a port on one.
+
+version = 1
+region = "ap-southeast-2"
+
+[rs]
+data = 3
+parity = 2
+
+# data_dir, tls_cert, tls_key and encryption_key are deliberately absent:
+# they are host-local, and start.sh passes them as flags so this file stays
+# identical on every machine.
+[[host]]
+id = 1
+addr = "10.11.12.1"
+
+  [[host.node]]
+  id = 1
+  role = "gate"
+  port = 8443
+
+  [[host.node]]
+  id = 2
+  role = "meta"
+  port = 6660
+
+  [[host.node]]
+  id = 3
+  role = "blob"
+  port = 9991
+
+[[host]]
+id = 2
+addr = "10.11.12.2"
+
+  [[host.node]]
+  id = 4
+  role = "gate"
+  port = 8443
+
+  [[host.node]]
+  id = 5
+  role = "meta"
+  port = 6660
+
+  [[host.node]]
+  id = 6
+  role = "blob"
+  port = 9991
+
+[[host]]
+id = 3
+addr = "10.11.12.3"
+
+  [[host.node]]
+  id = 7
+  role = "gate"
+  port = 8443
+
+  [[host.node]]
+  id = 8
+  role = "meta"
+  port = 6660
+
+  [[host.node]]
+  id = 9
+  role = "blob"
+  port = 9991
+
+[[host]]
+id = 4
+addr = "10.11.12.4"
+
+  [[host.node]]
+  id = 10
+  role = "gate"
+  port = 8443
+
+  [[host.node]]
+  id = 11
+  role = "meta"
+  port = 6660
+
+  [[host.node]]
+  id = 12
+  role = "blob"
+  port = 9991
+
+[[host]]
+id = 5
+addr = "10.11.12.5"
+
+  [[host.node]]
+  id = 13
+  role = "gate"
+  port = 8443
+
+  [[host.node]]
+  id = 14
+  role = "meta"
+  port = 6660
+
+  [[host.node]]
+  id = 15
+  role = "blob"
+  port = 9991
+
+# A config-defined service account. These are trusted: the policy table is
+# only consulted for IAM accounts, so none is written here.
+[[auth]]
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+account_id = "123456789012"
+
+# No buckets defined — tests and benchmarks create their own.
