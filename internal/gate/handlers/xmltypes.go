@@ -72,6 +72,31 @@ type InitiateMultipartUploadResult struct {
 	UploadId string   `xml:"UploadId"`
 }
 
+// ListPartsResult answers GET /{bucket}/{key}?uploadId=X. Clients call this
+// before completing an upload to learn which parts the server holds, so an
+// empty or missing response makes them send an empty completion.
+type ListPartsResult struct {
+	XMLName              xml.Name    `xml:"ListPartsResult"`
+	Bucket               string      `xml:"Bucket"`
+	Key                  string      `xml:"Key"`
+	UploadId             string      `xml:"UploadId"`
+	StorageClass         string      `xml:"StorageClass"`
+	PartNumberMarker     int         `xml:"PartNumberMarker"`
+	NextPartNumberMarker int         `xml:"NextPartNumberMarker"`
+	MaxParts             int         `xml:"MaxParts"`
+	IsTruncated          bool        `xml:"IsTruncated"`
+	Parts                []ListPart  `xml:"Part"`
+	Initiator            BucketOwner `xml:"Initiator"`
+	Owner                BucketOwner `xml:"Owner"`
+}
+
+type ListPart struct {
+	PartNumber   int       `xml:"PartNumber"`
+	LastModified time.Time `xml:"LastModified"`
+	ETag         string    `xml:"ETag"`
+	Size         int64     `xml:"Size"`
+}
+
 type CompleteMultipartUploadRequest struct {
 	XMLName xml.Name              `xml:"CompleteMultipartUpload"`
 	Parts   []MultipartUploadPart `xml:"Part"`

@@ -59,7 +59,9 @@ func (s *Server) setupRoutes(ring *placement.Ring) {
 		s.useRequestChain(r)
 
 		r.Method(http.MethodHead, "/{bucket}/*", handlers.HeadObject(mc, ring, cache, cfg))
-		r.Method(http.MethodGet, "/{bucket}/*", handlers.GetObject(mc, bc, ring, cache, cfg))
+		r.Method(http.MethodGet, "/{bucket}/*", byQuery("uploadId",
+			handlers.ListParts(mc, cache),
+			handlers.GetObject(mc, bc, ring, cache, cfg)))
 		r.Method(http.MethodPut, "/{bucket}/*", byQuery("partNumber",
 			handlers.UploadPart(mc, bc, ring, cache, cfg),
 			handlers.PutObject(mc, bc, ring, cache, cfg)))
