@@ -14,12 +14,10 @@ package predastore
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"slices"
 	"sync"
 	"time"
 
-	"github.com/hashicorp/raft"
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate"
@@ -29,10 +27,6 @@ import (
 	"github.com/mulgadc/predastore/pkg/masterkey"
 	"golang.org/x/sync/errgroup"
 )
-
-// leaderWait bounds how long the gate holds off serving while consensus
-// settles. Exceeding it is a warning, not a failure: the state client retries.
-const leaderWait = 30 * time.Second
 
 // Options is everything a predastore process needs that does not come from the
 // configuration file: which host to run and the key that protects data at
@@ -150,8 +144,9 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		trs = append(trs, quic)
 	}
 
-	// pool is set by the roles that dial; closing it and the transports is all
-	// a node leaves behind, since each service closes its own meta.
+	// pool is set by the gate, the one role that dials without running a
+	// server of its own; closing it and the transports is all a node leaves
+	// behind, since every service releases what it opened.
 	var pool *rpc.ConnPool
 	cleanup = func() {
 		if pool != nil {
@@ -182,7 +177,6 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		}
 	}
 
-	mux := rpc.NewMux()
 	dir := config.NodeDataDir(host, n)
 	var serve func(context.Context) error
 
@@ -221,76 +215,37 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		serve = svc.Run
 
 	case RoleMeta:
-		// One pool between the client and the server: a replica both dials its
-		// peers and is dialed by them, so a connection serves either direction.
-		pool = rpc.NewConnPool(n.ID, res)
-		ccfg := meta.DefaultClusterConfig()
-		ccfg.NodeID = n.ID
-		ccfg.DataDir = dir
-		// Bootstrapping with an identical peer set is idempotent across
-		// replicas, so every replica may attempt it.
-		ccfg.Bootstrap = true
-		ccfg.StreamLayer = meta.NewRPCStreamLayer(meta.RaftAddress(n.ID), raftDial(rpc.NewClient(pool)))
-		ccfg.Peers = raftPeers(nodesByRole(cfg, RoleMeta))
-		replica, rerr := meta.NewServer(ccfg)
-		if rerr != nil {
+		// The replica owns its raft node and the pool it is both dialed
+		// through and dials its peers with, so no failure here can leak one.
+		// The barrier opens however the election goes: a slow one still
+		// releases the gate rather than never serving.
+		svc, merr := meta.New(meta.Config{
+			NodeID:    n.ID,
+			DataDir:   dir,
+			Peers:     nodeIDs(nodesByRole(cfg, RoleMeta)),
+			Bootstrap: true,
+			Listeners: lns,
+			Resolver:  res,
+			OnLeader:  barrier.open,
+		})
+		if merr != nil {
 			cleanup()
-			return nil, nil, fmt.Errorf("start meta replica %d: %w", n.ID, rerr)
+			return nil, nil, fmt.Errorf("create meta replica %d: %w", n.ID, merr)
 		}
-		replica.Register(mux)
-		serve = func(ctx context.Context) error {
-			// The barrier opens however the election goes: a slow one warns and
-			// the gate serves anyway rather than never serving.
-			go func() {
-				if werr := replica.WaitForLeader(leaderWait); werr != nil {
-					slog.Warn("No leader elected within timeout, serving anyway", "error", werr)
-				}
-				barrier.open()
-			}()
-			return replica.Run(ctx)
-		}
+		serve = svc.Run
 
 	default:
 		cleanup()
 		return nil, nil, fmt.Errorf("node %d has unknown role %q", n.ID, n.Role)
 	}
 
-	// A blob node builds its own rpc server, and a gate is never dialed at
-	// all; only a replica needs one here, donating to the pool it dials from.
-	var srv *rpc.Server
-	if n.Role == RoleMeta {
-		srv, err = rpc.NewServer(mux, lns, pool)
-		if err != nil {
-			cleanup()
-			return nil, nil, fmt.Errorf("serve node %d: %w", n.ID, err)
-		}
-	}
-
 	run = func(ctx context.Context) error {
-		g, gctx := errgroup.WithContext(ctx)
-		if srv != nil {
-			g.Go(func() error { return srv.Run(gctx) })
-		}
-		g.Go(func() error { return serve(gctx) })
-		if err := g.Wait(); err != nil {
+		if err := serve(ctx); err != nil {
 			return fmt.Errorf("node %d: %w", n.ID, err)
 		}
 		return nil
 	}
 	return run, cleanup, nil
-}
-
-// raftDial opens a raft connection through the replica's own client. Raft
-// advertises node keys as addresses, so dialing one is parsing out the node id
-// and opening a stream to it.
-func raftDial(cli *rpc.Client) func(context.Context, raft.ServerAddress) (transport.Stream, error) {
-	return func(ctx context.Context, address raft.ServerAddress) (transport.Stream, error) {
-		target, err := meta.ParseRaftAddress(string(address))
-		if err != nil {
-			return nil, err
-		}
-		return rpc.OpenStream(ctx, cli, target, meta.OpRaftDial, &meta.RaftDial{})
-	}
 }
 
 // gateServer builds the S3 frontend a gate node runs: the file's gate
@@ -319,15 +274,4 @@ func gateServer(
 		MasterKey: opts.MasterKey,
 		Clients:   gate.Clients{Meta: metaClient, Blob: blobClient},
 	})
-}
-
-// raftPeers maps meta replicas to the raft members they become. The address
-// is the node key the stream layer resolves, so it stays valid however the
-// replica is reached.
-func raftPeers(replicas []NodeConfig) []meta.RaftPeer {
-	peers := make([]meta.RaftPeer, len(replicas))
-	for i, n := range replicas {
-		peers[i] = meta.RaftPeer{ID: n.ID, Address: meta.RaftAddress(n.ID)}
-	}
-	return peers
 }

@@ -11,28 +11,8 @@ import (
 	"io"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/mulgadc/predastore/internal/config"
-	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/transport"
 )
-
-// ID is the node this replica serves.
-func (s *Server) ID() config.NodeID { return s.id }
-
-// Run holds the replica open until ctx is cancelled, then shuts raft down.
-func (s *Server) Run(ctx context.Context) error {
-	<-ctx.Done()
-	return s.Close()
-}
-
-// Register installs the state service handlers on the mux.
-func (s *Server) Register(mux *rpc.Mux) {
-	rpc.RegisterHandler(mux, OpRaftDial, s.handleRaftDial)
-	rpc.RegisterHandler(mux, OpMetaGet, s.handleGet)
-	rpc.RegisterHandler(mux, OpMetaPut, s.handlePut)
-	rpc.RegisterHandler(mux, OpMetaDelete, s.handleDelete)
-	rpc.RegisterHandler(mux, OpMetaScan, s.handleScan)
-}
 
 // handleRaftDial hands the stream to the target replica's raft transport and
 // holds it for the connection's lifetime.
@@ -49,7 +29,7 @@ func respond(stream transport.Stream, resp *MetaResponse) error {
 func (s *Server) handleGet(ctx context.Context, h MetaRequest, stream transport.Stream) error {
 	// The raft node keys by Go string; the bytes survive the conversion, so
 	// the key badger stores is the one the client sent.
-	value, err := s.Get(string(h.Key))
+	value, err := s.get(string(h.Key))
 	switch {
 	case errors.Is(err, badger.ErrKeyNotFound):
 		return respond(stream, &MetaResponse{Err: ErrCodeNotFound})
@@ -65,11 +45,11 @@ func (s *Server) handlePut(ctx context.Context, h MetaRequest, stream transport.
 	if err != nil {
 		return fmt.Errorf("read put value: %w", err)
 	}
-	return respond(stream, s.writeResult(s.Put(string(h.Key), value)))
+	return respond(stream, s.writeResult(s.put(string(h.Key), value)))
 }
 
 func (s *Server) handleDelete(ctx context.Context, h MetaRequest, stream transport.Stream) error {
-	return respond(stream, s.writeResult(s.Delete(string(h.Key))))
+	return respond(stream, s.writeResult(s.delete(string(h.Key))))
 }
 
 // writeResult maps a consensus write outcome onto the response envelope,
@@ -77,7 +57,7 @@ func (s *Server) handleDelete(ctx context.Context, h MetaRequest, stream transpo
 func (s *Server) writeResult(err error) *MetaResponse {
 	switch {
 	case errors.Is(err, ErrNotLeader):
-		return &MetaResponse{Err: ErrCodeNotLeader, Leader: s.LeaderAddr()}
+		return &MetaResponse{Err: ErrCodeNotLeader, Leader: s.leaderAddr()}
 	case err != nil:
 		return &MetaResponse{Err: err.Error()}
 	}
@@ -89,7 +69,7 @@ func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport
 	// surfacing an error to the client.
 	errScanLimit := errors.New("scan limit reached")
 	var items []ScanItem
-	err := s.Scan(string(h.Key), func(key string, value []byte) error {
+	err := s.scan(string(h.Key), func(key string, value []byte) error {
 		if h.Limit > 0 && len(items) >= h.Limit {
 			return errScanLimit
 		}
