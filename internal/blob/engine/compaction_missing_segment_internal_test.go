@@ -43,15 +43,15 @@ func TestGetSegmentReadPathErrorsOnMissingSegment(t *testing.T) {
 // candidates rather than aborting selection or the whole cycle on the first
 // error.
 func TestCompactOnceSkipsUnopenableSegment(t *testing.T) {
-	// Small segments so each shard lands in its own, giving several independent
+	// Small segments so each value lands in its own, giving several independent
 	// candidates rather than one shared segment.
 	st, dir := openTestStore(t, WithMaxSegSize(40*KiB))
 
 	body := bytes.Repeat([]byte{0xcc}, 12*KiB)
-	const shards = 5
-	for i := range shards {
+	const values = 5
+	for i := range values {
 		oh := [32]byte{byte(0xA0 + i)}
-		putShard(t, st, oh, 0, body)
+		putValue(t, st, oh, 0, body)
 		// Delete each one so its segment is all-dead and therefore a candidate.
 		if _, err := st.Delete(oh, 0); err != nil {
 			t.Fatalf("delete %d: %v", i, err)
@@ -130,10 +130,10 @@ func TestCompactOnceSkipsDroppedButStillTombstonedSegment(t *testing.T) {
 	st, dir := openTestStore(t, WithMaxSegSize(40*KiB))
 
 	body := bytes.Repeat([]byte{0xcc}, 12*KiB)
-	const shards = 5
-	for i := range shards {
+	const values = 5
+	for i := range values {
 		oh := [32]byte{byte(0xB0 + i)}
-		putShard(t, st, oh, 0, body)
+		putValue(t, st, oh, 0, body)
 		if _, err := st.Delete(oh, 0); err != nil {
 			t.Fatalf("delete %d: %v", i, err)
 		}

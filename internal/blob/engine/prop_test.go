@@ -14,7 +14,7 @@ import (
 
 const (
 	pbtFragBodySize = 8 * engine.KiB
-	pbtMaxShardSize = 64 * engine.KiB
+	pbtMaxValueSize = 64 * engine.KiB
 )
 
 // readBody randomizes between io.ReadAll and WriteTo so both reader paths
@@ -66,9 +66,9 @@ func (sm *baseSM) drawKey(t *rapid.T, tag string) [36]byte {
 		return rapid.SampledFrom(sm.Ref.Keys()).Draw(t, tag+"/existingKey")
 	}
 
-	return [36]byte(engine.MakeShardKey(
-		[32]byte(rapid.SliceOfN(rapid.Byte(), 32, 32).Draw(t, tag+"/objectHash")),
-		rapid.Uint32().Draw(t, tag+"/shardIndex"),
+	return [36]byte(engine.MakeKey(
+		[32]byte(rapid.SliceOfN(rapid.Byte(), 32, 32).Draw(t, tag+"/key")),
+		rapid.Uint32().Draw(t, tag+"/index"),
 	))
 }
 
@@ -79,7 +79,7 @@ func (sm *baseSM) drawBody(t *rapid.T, tag string) []byte {
 		rapid.SliceOfN(rapid.Byte(), pbtFragBodySize, pbtFragBodySize),
 		rapid.SliceOfN(rapid.Byte(), pbtFragBodySize+1, pbtFragBodySize+1),
 		rapid.SliceOfN(rapid.Byte(), 2*pbtFragBodySize, 2*pbtFragBodySize),
-		rapid.SliceOfN(rapid.Byte(), 0, pbtMaxShardSize),
+		rapid.SliceOfN(rapid.Byte(), 0, pbtMaxValueSize),
 	).Draw(t, tag+"/body")
 }
 
@@ -110,18 +110,18 @@ func (sm *baseSM) Close(t *rapid.T) {
 }
 
 func (sm *baseSM) Lookup(t *rapid.T) {
-	key := sm.drawKey(t, "lookup")
-	sm.checkKey(t, "lookup", key)
+	idxKey := sm.drawKey(t, "lookup")
+	sm.checkKey(t, "lookup", idxKey)
 }
 
 func (sm *baseSM) Append(t *rapid.T) {
-	key := sm.drawKey(t, "append")
-	objectHash := [32]byte(key[:32])
-	shardIndex := binary.BigEndian.Uint32(key[32:])
+	idxKey := sm.drawKey(t, "append")
+	key := [32]byte(idxKey[:32])
+	index := binary.BigEndian.Uint32(idxKey[32:])
 	body := sm.drawBody(t, "append")
 
-	refW, refErr := sm.Ref.Append(objectHash, shardIndex, int64(len(body)))
-	realW, realErr := sm.Real.Append(objectHash, shardIndex, int64(len(body)))
+	refW, refErr := sm.Ref.Append(key, index, int64(len(body)))
+	realW, realErr := sm.Real.Append(key, index, int64(len(body)))
 	defer func() {
 		if refW != nil {
 			refW.Close()
@@ -161,7 +161,7 @@ func (sm *baseSM) Append(t *rapid.T) {
 
 	// Lookup before commit: writer.Close hasn't run yet, so neither store
 	// should have committed the new extent.
-	sm.checkKey(t, "append/precommit", key)
+	sm.checkKey(t, "append/precommit", idxKey)
 
 	refErr = refW.Close()
 	realErr = realW.Close()
@@ -171,12 +171,12 @@ func (sm *baseSM) Append(t *rapid.T) {
 }
 
 func (sm *baseSM) Delete(t *rapid.T) {
-	key := sm.drawKey(t, "delete")
-	objectHash := [32]byte(key[:32])
-	shardIndex := binary.BigEndian.Uint32(key[32:])
+	idxKey := sm.drawKey(t, "delete")
+	key := [32]byte(idxKey[:32])
+	index := binary.BigEndian.Uint32(idxKey[32:])
 
-	refDeleted, refErr := sm.Ref.Delete(objectHash, shardIndex)
-	realDeleted, realErr := sm.Real.Delete(objectHash, shardIndex)
+	refDeleted, refErr := sm.Ref.Delete(key, index)
+	realDeleted, realErr := sm.Real.Delete(key, index)
 	if sm.Strict() && !errors.Is(realErr, refErr) {
 		t.Fatalf("delete: ref=%v real=%v", refErr, realErr)
 	}
@@ -187,7 +187,7 @@ func (sm *baseSM) Delete(t *rapid.T) {
 
 // Compact runs one compaction cycle on the real store. Compaction is invisible
 // to logical state, so the reference oracle is untouched; the post-action Check
-// then asserts every live shard still reads back byte-identical — the central
+// then asserts every live value still reads back byte-identical — the central
 // compaction-correctness invariant. Under relaxed mode a fault-injected error
 // is tolerated.
 func (sm *baseSM) Compact(t *rapid.T) {
@@ -203,20 +203,20 @@ func (sm *baseSM) Compact(t *rapid.T) {
 // identical bytes from the real store. Under relaxed mode (post-fault),
 // per-key divergence is tolerated.
 func (sm *baseSM) Check(t *rapid.T) {
-	for _, key := range sm.Ref.Keys() {
-		sm.checkKey(t, "check", key)
+	for _, idxKey := range sm.Ref.Keys() {
+		sm.checkKey(t, "check", idxKey)
 	}
 }
 
-// checkKey verifies one shard's ref/real conformance. tag is included in the
+// checkKey verifies one value's ref/real conformance. tag is included in the
 // failure messages and rapid Draw labels so traces show which call site (the
 // Check invariant scan, or Append's pre-commit lookup) hit the failure.
-func (sm *baseSM) checkKey(t *rapid.T, tag string, key [36]byte) {
-	objectHash := [32]byte(key[:32])
-	shardIndex := binary.BigEndian.Uint32(key[32:])
+func (sm *baseSM) checkKey(t *rapid.T, tag string, idxKey [36]byte) {
+	key := [32]byte(idxKey[:32])
+	index := binary.BigEndian.Uint32(idxKey[32:])
 
-	refR, refErr := sm.Ref.Lookup(objectHash, shardIndex)
-	realR, realErr := sm.Real.Lookup(objectHash, shardIndex)
+	refR, refErr := sm.Ref.Lookup(key, index)
+	realR, realErr := sm.Real.Lookup(key, index)
 	defer func() {
 		if refR != nil {
 			refR.Close()

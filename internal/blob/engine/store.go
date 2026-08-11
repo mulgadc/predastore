@@ -1,5 +1,5 @@
-// Package engine implements segment-based shard storage with authenticated
-// at-rest encryption. Shards are written as contiguous extents of fixed-size
+// Package engine implements segment-based large-value storage with authenticated
+// at-rest encryption. Values are written as contiguous extents of fixed-size
 // fragments within append-only segment files. Segments roll when they reach
 // maxSegSize. Each fragment is sealed under AES-256-GCM (master key per
 // cluster, storeID per data dir) — see docs/DESIGN.md §6.
@@ -23,16 +23,16 @@ const indexFilename = "db"
 
 // fragNumReservation is how many fragNums one durable state.json reservation
 // covers; only an allocation that crosses the high-water costs an fsync. Sized
-// so a typical shard fsyncs about every 10k Appends. Tunable, and not
+// so a typical value fsyncs about every 10k Appends. Tunable, and not
 // on-disk-format-critical.
 const fragNumReservation = 1 << 20 // 1 048 576
 
-// Store manages segment files and an index mapping shard keys to on-disk
+// Store manages segment files and an index mapping keys to on-disk
 // extents. All public methods are safe for concurrent use.
 type Store struct {
 	dir string
 
-	// The on-disk index: shard key -> extent, plus the tombstone namespace.
+	// The on-disk index: key -> extent, plus the tombstone namespace.
 	index *badger.DB
 
 	// Unbounded: entries accumulate as the store touches old segments. Fine at
@@ -52,7 +52,7 @@ type Store struct {
 
 	// Monotonic counters persisted to state.json across restarts.
 	segNum   uint64
-	shardNum uint64
+	valueNum uint64
 	fragNum  uint64
 
 	// The durably-reserved ceiling on fragNum; Append fsyncs only to raise it.
@@ -95,7 +95,7 @@ type Writer interface {
 var (
 	ErrClosedStore = errors.New("closed store")
 	ErrKeyNotFound = errors.New("key not found")
-	ErrShardFull   = errors.New("shard full")
+	ErrValueFull   = errors.New("value full")
 
 	// ErrStoreFull is returned by Append when free space has dropped below
 	// the full watermark (see WithFreeSpaceWatermark).
@@ -219,9 +219,9 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 	return store, nil
 }
 
-// Lookup returns a reader for the given shard. The underlying segment is
+// Lookup returns a reader for the given key. The underlying segment is
 // reference-counted: the caller must call reader.Close() to release it.
-func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (Reader, error) {
+func (store *Store) Lookup(key [32]byte, index uint32) (Reader, error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
@@ -229,8 +229,8 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (Reader, erro
 		return nil, ErrClosedStore
 	}
 
-	key := MakeShardKey(objectHash, shardIndex)
-	data, err := store.indexGet(key)
+	idxKey := MakeKey(key, index)
+	data, err := store.indexGet(idxKey)
 	if err != nil {
 		if errors.Is(err, badger.ErrKeyNotFound) {
 			return nil, ErrKeyNotFound
@@ -254,20 +254,20 @@ func (store *Store) Lookup(objectHash [32]byte, shardIndex uint32) (Reader, erro
 	seg.addRef()
 
 	return &reader{
-		objectHash: objectHash,
-		shardIndex: shardIndex,
-		storeID:    store.storeID,
-		aead:       store.aead,
-		seg:        seg,
-		ext:        ext,
-		buf:        make([]byte, min(int64(bufLen), ext.PSize/totalFragSize)*totalFragSize),
+		key:     key,
+		index:   index,
+		storeID: store.storeID,
+		aead:    store.aead,
+		seg:     seg,
+		ext:     ext,
+		buf:     make([]byte, min(int64(bufLen), ext.PSize/totalFragSize)*totalFragSize),
 	}, nil
 }
 
-// Append reserves space for a shard of the given logical size and returns a
-// writer. The shard reaches the index only when that writer is closed, so an
+// Append reserves space for a value of the given logical size and returns a
+// writer. The value reaches the index only when that writer is closed, so an
 // overwrite keeps serving its previous data until then.
-func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (Writer, error) {
+func (store *Store) Append(key [32]byte, index uint32, size int64) (Writer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("negative size %d", size)
 	}
@@ -319,25 +319,25 @@ func (store *Store) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 		LSize:  size,
 	}
 
-	key := MakeShardKey(objectHash, shardIndex)
-	if err := seg.appendIdx(idxEntry{Off: off, Key: [36]byte(key), PSize: ext.PSize}); err != nil {
+	idxKey := MakeKey(key, index)
+	if err := seg.appendIdx(idxEntry{Off: off, Key: [36]byte(idxKey), PSize: ext.PSize}); err != nil {
 		seg.releaseRef()
 		return nil, fmt.Errorf("append idx: %w", err)
 	}
 
 	w := &writer{
-		store:      store,
-		objectHash: objectHash,
-		shardIndex: shardIndex,
-		storeID:    store.storeID,
-		seg:        seg,
-		ext:        ext,
-		shardNum:   store.shardNum,
-		fragNum:    store.fragNum,
-		buf:        make([]byte, min(uint64(bufLen), fragCount)*totalFragSize),
+		store:    store,
+		key:      key,
+		index:    index,
+		storeID:  store.storeID,
+		seg:      seg,
+		ext:      ext,
+		valueNum: store.valueNum,
+		fragNum:  store.fragNum,
+		buf:      make([]byte, min(uint64(bufLen), fragCount)*totalFragSize),
 	}
 
-	store.shardNum += 1
+	store.valueNum += 1
 	store.fragNum += fragCount
 
 	// Count toward the statfs byte bound; see statfsBytesInterval.
@@ -374,8 +374,8 @@ func (store *Store) reserveExtent(fragCount uint64) (*segment, int64, error) {
 		}
 	}
 
-	// Roll if the shard would overflow, unless the segment is fresh: one
-	// oversized shard is let through so a pathological size still makes progress.
+	// Roll if the value would overflow, unless the segment is fresh: one
+	// oversized value is let through so a pathological size still makes progress.
 	if newSegSize > store.maxSegSize && segSize != segHeaderSize {
 		seg, err = store.rollSegment()
 		if err != nil {
@@ -396,15 +396,14 @@ func (store *Store) reserveExtent(fragCount uint64) (*segment, int64, error) {
 	return seg, off, nil
 }
 
-// commitExtent points a shard's key at ext, tombstoning any extent it
-// supersedes. Called from writer.Close once the data is durable; takes no
-// store.mutex.
-func (store *Store) commitExtent(objectHash [32]byte, shardIndex uint32, ext extent) error {
-	key := MakeShardKey(objectHash, shardIndex)
+// commitExtent points a key at ext, tombstoning any extent it supersedes.
+// Called from writer.Close once the data is durable; takes no store.mutex.
+func (store *Store) commitExtent(key [32]byte, index uint32, ext extent) error {
+	idxKey := MakeKey(key, index)
 
 	for {
 		err := store.index.Update(func(txn *badger.Txn) error {
-			old, err := readExtent(txn, key)
+			old, err := readExtent(txn, idxKey)
 			switch {
 			// A first write supersedes nothing.
 			case errors.Is(err, badger.ErrKeyNotFound):
@@ -418,7 +417,7 @@ func (store *Store) commitExtent(objectHash [32]byte, shardIndex uint32, ext ext
 				}
 			}
 
-			return txn.Set(key, ext.encode())
+			return txn.Set(idxKey, ext.encode())
 		})
 
 		// The read above puts this txn under badger's conflict detection, which a
@@ -451,11 +450,11 @@ func readExtent(txn *badger.Txn, key []byte) (extent, error) {
 	return ext, nil
 }
 
-// Delete removes a shard's index entry and tombstones its extent, in one
+// Delete removes a key's index entry and tombstones its extent, in one
 // transaction so the dead-space hint cannot outlive or precede the deletion.
-// Reports whether an extent existed; a missing shard is not an error, which
+// Reports whether an extent existed; a missing key is not an error, which
 // keeps deletes idempotent.
-func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) (bool, error) {
+func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
@@ -463,10 +462,10 @@ func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) (bool, error)
 		return false, ErrClosedStore
 	}
 
-	key := MakeShardKey(objectHash, shardIndex)
+	idxKey := MakeKey(key, index)
 	deleted := false
 	err := store.index.Update(func(txn *badger.Txn) error {
-		ext, err := readExtent(txn, key)
+		ext, err := readExtent(txn, idxKey)
 		if errors.Is(err, badger.ErrKeyNotFound) {
 			return nil
 		}
@@ -477,7 +476,7 @@ func (store *Store) Delete(objectHash [32]byte, shardIndex uint32) (bool, error)
 		if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
 			return fmt.Errorf("delete: put tombstone: %w", err)
 		}
-		if err := txn.Delete(key); err != nil {
+		if err := txn.Delete(idxKey); err != nil {
 			return err
 		}
 		deleted = true
@@ -558,11 +557,11 @@ func tombstoneValue(psize int64) []byte {
 	return v
 }
 
-// MakeShardKey builds a 36-byte index key: 32-byte object hash || 4-byte big-endian shard index.
-func MakeShardKey(objectHash [32]byte, shardIndex uint32) []byte {
-	key := make([]byte, 36)
-	copy(key[:32], objectHash[:])
-	binary.BigEndian.PutUint32(key[32:], shardIndex)
+// MakeKey builds a 36-byte index key: the 32-byte key || 4-byte big-endian index.
+func MakeKey(key [32]byte, index uint32) []byte {
+	idxKey := make([]byte, 36)
+	copy(idxKey[:32], key[:])
+	binary.BigEndian.PutUint32(idxKey[32:], index)
 
-	return key
+	return idxKey
 }

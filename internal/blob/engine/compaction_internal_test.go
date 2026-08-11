@@ -37,7 +37,7 @@ func openTestStore(t *testing.T, opts ...Option) (*Store, string) {
 	return st, dir
 }
 
-func putShard(t *testing.T, st *Store, oh [32]byte, idx uint32, body []byte) {
+func putValue(t *testing.T, st *Store, oh [32]byte, idx uint32, body []byte) {
 	t.Helper()
 	w, err := st.Append(oh, idx, int64(len(body)))
 	if err != nil {
@@ -51,7 +51,7 @@ func putShard(t *testing.T, st *Store, oh [32]byte, idx uint32, body []byte) {
 	}
 }
 
-func readShard(t *testing.T, st *Store, oh [32]byte, idx uint32) []byte {
+func readValue(t *testing.T, st *Store, oh [32]byte, idx uint32) []byte {
 	t.Helper()
 	r, err := st.Lookup(oh, idx)
 	if err != nil {
@@ -67,7 +67,7 @@ func readShard(t *testing.T, st *Store, oh [32]byte, idx uint32) []byte {
 
 func extentOf(t *testing.T, st *Store, oh [32]byte, idx uint32) extent {
 	t.Helper()
-	raw, err := st.indexGet(MakeShardKey(oh, idx))
+	raw, err := st.indexGet(MakeKey(oh, idx))
 	if err != nil {
 		t.Fatalf("index get: %v", err)
 	}
@@ -100,16 +100,16 @@ func fragNumsAt(t *testing.T, dir string, ext extent) []uint64 {
 	return nums
 }
 
-// Three ~12 KiB shards under a 40 KiB cap pack two into segment 0 and roll the
-// third into segment 1; deleting one of segment 0's shards drops its live
+// Three ~12 KiB values under a 40 KiB cap pack two into segment 0 and roll the
+// third into segment 1; deleting one of segment 0's values drops its live
 // fraction below threshold, making it the sole compaction candidate.
 func segment0LayoutStore(t *testing.T) (st *Store, dir string, oh [32]byte) {
 	st, dir = openTestStore(t, WithMaxSegSize(40*KiB))
 	oh = [32]byte{0x42}
 	body := bytes.Repeat([]byte{0xcd}, 12*KiB)
-	putShard(t, st, oh, 0, body)
-	putShard(t, st, oh, 1, body)
-	putShard(t, st, oh, 2, body)
+	putValue(t, st, oh, 0, body)
+	putValue(t, st, oh, 1, body)
+	putValue(t, st, oh, 2, body)
 	return st, dir, oh
 }
 
@@ -118,10 +118,10 @@ func TestCompactionPreservesFragNum(t *testing.T) {
 
 	before := extentOf(t, st, oh, 1)
 	if before.SegNum != 0 {
-		t.Fatalf("expected shard 1 in segment 0, got %d", before.SegNum)
+		t.Fatalf("expected value 1 in segment 0, got %d", before.SegNum)
 	}
 	wantFragNums := fragNumsAt(t, dir, before)
-	wantBody := readShard(t, st, oh, 1)
+	wantBody := readValue(t, st, oh, 1)
 
 	if _, err := st.Delete(oh, 0); err != nil {
 		t.Fatalf("delete: %v", err)
@@ -132,7 +132,7 @@ func TestCompactionPreservesFragNum(t *testing.T) {
 
 	after := extentOf(t, st, oh, 1)
 	if after.SegNum == before.SegNum && after.Off == before.Off {
-		t.Fatalf("shard 1 was not relocated; still at seg %d off %d", after.SegNum, after.Off)
+		t.Fatalf("value 1 was not relocated; still at seg %d off %d", after.SegNum, after.Off)
 	}
 
 	gotFragNums := fragNumsAt(t, dir, after)
@@ -145,7 +145,7 @@ func TestCompactionPreservesFragNum(t *testing.T) {
 		}
 	}
 
-	if got := readShard(t, st, oh, 1); !bytes.Equal(got, wantBody) {
+	if got := readValue(t, st, oh, 1); !bytes.Equal(got, wantBody) {
 		t.Fatalf("body changed after relocation")
 	}
 }
@@ -205,7 +205,7 @@ func TestCandidateSelectionAllLiveNoCandidates(t *testing.T) {
 func TestCandidateSelectionNeverSelectsActiveSegment(t *testing.T) {
 	st, _ := openTestStore(t, WithMaxSegSize(64*KiB))
 	oh := [32]byte{0x7}
-	putShard(t, st, oh, 0, bytes.Repeat([]byte{0x1}, 4*KiB))
+	putValue(t, st, oh, 0, bytes.Repeat([]byte{0x1}, 4*KiB))
 	if _, err := st.Delete(oh, 0); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
@@ -230,7 +230,7 @@ func tombstones(t *testing.T, st *Store) map[slot]int64 {
 	t.Helper()
 	found := map[slot]int64{}
 	err := st.indexScan([]byte{tombstonePrefix}, func(k, v []byte) error {
-		// Shard keys whose hash starts with tombstonePrefix share this scan, so
+		// Keys whose hash starts with tombstonePrefix share this scan, so
 		// width-check before decoding a slot out of one.
 		if len(k) != tombstoneKeySize {
 			return nil
@@ -259,10 +259,10 @@ func TestOverwriteTombstonesSupersededExtent(t *testing.T) {
 	st, _ := openTestStore(t, WithMaxSegSize(1*MiB))
 	oh := [32]byte{0x11}
 
-	putShard(t, st, oh, 0, bytes.Repeat([]byte{0xaa}, 12*KiB))
+	putValue(t, st, oh, 0, bytes.Repeat([]byte{0xaa}, 12*KiB))
 	old := extentOf(t, st, oh, 0)
 
-	putShard(t, st, oh, 0, bytes.Repeat([]byte{0xbb}, 12*KiB))
+	putValue(t, st, oh, 0, bytes.Repeat([]byte{0xbb}, 12*KiB))
 	cur := extentOf(t, st, oh, 0)
 
 	if slotOf(cur) == slotOf(old) {
@@ -286,7 +286,7 @@ func TestFirstWriteLeavesNoTombstone(t *testing.T) {
 	st, _ := openTestStore(t, WithMaxSegSize(1*MiB))
 	oh := [32]byte{0x22}
 
-	putShard(t, st, oh, 0, bytes.Repeat([]byte{0xcc}, 12*KiB))
+	putValue(t, st, oh, 0, bytes.Repeat([]byte{0xcc}, 12*KiB))
 
 	if found := tombstones(t, st); len(found) != 0 {
 		t.Fatalf("first write produced %d tombstone(s): %v", len(found), found)
@@ -301,7 +301,7 @@ func TestTombstoneLandsAtCommitNotAppend(t *testing.T) {
 	oh := [32]byte{0x33}
 	body := bytes.Repeat([]byte{0xdd}, 12*KiB)
 
-	putShard(t, st, oh, 0, body)
+	putValue(t, st, oh, 0, body)
 	old := extentOf(t, st, oh, 0)
 
 	// Reserve and fill an overwrite, but hold it short of Close.
@@ -319,7 +319,7 @@ func TestTombstoneLandsAtCommitNotAppend(t *testing.T) {
 	if got := extentOf(t, st, oh, 0); slotOf(got) != slotOf(old) {
 		t.Fatalf("uncommitted append moved the index off %v to %v", slotOf(old), slotOf(got))
 	}
-	if got := readShard(t, st, oh, 0); !bytes.Equal(got, body) {
+	if got := readValue(t, st, oh, 0); !bytes.Equal(got, body) {
 		t.Fatalf("uncommitted append changed the readable body")
 	}
 
@@ -340,10 +340,10 @@ func TestOverwriteChurnDrainsSegment(t *testing.T) {
 	st, dir, oh := segment0LayoutStore(t)
 	body := bytes.Repeat([]byte{0x99}, 12*KiB)
 
-	// Shards 0 and 1 fill segment 0; rewriting both relocates them and leaves
+	// Values 0 and 1 fill segment 0; rewriting both relocates them and leaves
 	// segment 0 entirely dead.
-	putShard(t, st, oh, 0, body)
-	putShard(t, st, oh, 1, body)
+	putValue(t, st, oh, 0, body)
+	putValue(t, st, oh, 1, body)
 
 	cands, failed, err := st.candidateSegments()
 	if err != nil {
@@ -364,15 +364,15 @@ func TestOverwriteChurnDrainsSegment(t *testing.T) {
 		t.Fatalf("drained segment 0 still on disk: %v", err)
 	}
 	for _, idx := range []uint32{0, 1} {
-		if got := readShard(t, st, oh, idx); !bytes.Equal(got, body) {
-			t.Fatalf("shard %d body wrong after overwrite churn + compaction", idx)
+		if got := readValue(t, st, oh, idx); !bytes.Equal(got, body) {
+			t.Fatalf("value %d body wrong after overwrite churn + compaction", idx)
 		}
 	}
 }
 
 // Every index-committed extent must already be enumerable from its segment's
 // .idx, or a drop could lose a live extent. Assert the back-check slot for each
-// live shard appears in scanIdx of its segment.
+// live value appears in scanIdx of its segment.
 func TestIdxCoversEveryCommittedExtent(t *testing.T) {
 	st, dir := openTestStore(t, WithMaxSegSize(40*KiB))
 	oh := [32]byte{0x55}
@@ -383,7 +383,7 @@ func TestIdxCoversEveryCommittedExtent(t *testing.T) {
 		3: bytes.Repeat([]byte{0xd}, 5*KiB),
 	}
 	for idx, body := range bodies {
-		putShard(t, st, oh, idx, body)
+		putValue(t, st, oh, idx, body)
 	}
 
 	for idx := range bodies {
@@ -392,7 +392,7 @@ func TestIdxCoversEveryCommittedExtent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("scan idx %d: %v", ext.SegNum, err)
 		}
-		wantKey := [36]byte(MakeShardKey(oh, idx))
+		wantKey := [36]byte(MakeKey(oh, idx))
 		found := false
 		for _, e := range entries {
 			if e.Off == ext.Off && e.Key == wantKey {
@@ -401,7 +401,7 @@ func TestIdxCoversEveryCommittedExtent(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Fatalf("committed shard %d (seg %d off %d) missing from .idx", idx, ext.SegNum, ext.Off)
+			t.Fatalf("committed value %d (seg %d off %d) missing from .idx", idx, ext.SegNum, ext.Off)
 		}
 	}
 }

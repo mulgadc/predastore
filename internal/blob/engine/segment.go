@@ -251,7 +251,7 @@ func (store *Store) nextAvailableSegment() (*segment, error) {
 
 // rollSegment advances past the current segment unconditionally and opens
 // the next one. Used when the current segment is non-full but can't fit the
-// incoming shard. Callers must hold store.mutex.
+// incoming value. Callers must hold store.mutex.
 func (store *Store) rollSegment() (*segment, error) {
 	store.segNum++
 	// Append path: fabricate the segment if it doesn't exist yet.

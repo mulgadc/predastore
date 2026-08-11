@@ -5,7 +5,7 @@ import (
 	"fmt"
 )
 
-// extent locates a shard's data on disk. Encoded as 32 bytes in the index:
+// extent locates a value's data on disk. Encoded as 32 bytes in the index:
 // SegNum, Off, PSize, LSize, each 8-byte big-endian.
 //   - PSize: physical (on-disk) size including fragment headers and GCM tags = fragCount * totalFragSize
 //   - LSize: logical (data-only) size as seen by callers of Read/Write

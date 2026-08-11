@@ -37,23 +37,23 @@ func Open(dir string) *RefStore {
 	return st
 }
 
-func (st *RefStore) Lookup(objectHash [32]byte, shardIndex uint32) (r engine.Reader, err error) {
+func (st *RefStore) Lookup(key [32]byte, index uint32) (r engine.Reader, err error) {
 	if st.closed {
 		return nil, engine.ErrClosedStore
 	}
 
-	shard, ok := st.state[[36]byte(engine.MakeShardKey(objectHash, shardIndex))]
+	value, ok := st.state[[36]byte(engine.MakeKey(key, index))]
 	if !ok {
 		return nil, engine.ErrKeyNotFound
 	}
 
 	return &refReader{
-		Reader: bytes.NewReader(shard),
+		Reader: bytes.NewReader(value),
 		closed: false,
 	}, nil
 }
 
-func (st *RefStore) Append(objectHash [32]byte, shardIndex uint32, size int64) (w engine.Writer, err error) {
+func (st *RefStore) Append(key [32]byte, index uint32, size int64) (w engine.Writer, err error) {
 	if st.closed {
 		return nil, engine.ErrClosedStore
 	}
@@ -61,23 +61,27 @@ func (st *RefStore) Append(objectHash [32]byte, shardIndex uint32, size int64) (
 	return &refWriter{
 		Buffer: new(bytes.Buffer),
 		st:     st,
-		key:    [36]byte(engine.MakeShardKey(objectHash, shardIndex)),
+		key:    [36]byte(engine.MakeKey(key, index)),
 		size:   size,
 		closed: false,
 	}, nil
 }
 
-func (st *RefStore) Delete(objectHash [32]byte, shardIndex uint32) (bool, error) {
+func (st *RefStore) Delete(key [32]byte, index uint32) (bool, error) {
 	if st.closed {
 		return false, engine.ErrClosedStore
 	}
 
-	key := [36]byte(engine.MakeShardKey(objectHash, shardIndex))
-	_, existed := st.state[key]
-	delete(st.state, key)
+	idxKey := [36]byte(engine.MakeKey(key, index))
+	_, existed := st.state[idxKey]
+	delete(st.state, idxKey)
 
 	return existed, nil
 }
+
+// NearFull always reports false: the reference store lives in memory and has
+// no free-space watermark to cross.
+func (st *RefStore) NearFull() bool { return false }
 
 func (st *RefStore) Len() int {
 	return len(st.state)

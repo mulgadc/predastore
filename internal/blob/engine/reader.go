@@ -9,13 +9,13 @@ import (
 
 var ErrClosedReader = errors.New("closed reader")
 
-// reader gives random and sequential access to one shard, decrypting fragments
+// reader gives random and sequential access to one value, decrypting fragments
 // as it goes.
 type reader struct {
-	objectHash [32]byte
-	shardIndex uint32
-	storeID    uint32
-	aead       cipher.AEAD
+	key     [32]byte
+	index   uint32
+	storeID uint32
+	aead    cipher.AEAD
 
 	seg *segment
 	ext extent
@@ -43,7 +43,7 @@ func (r *reader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// ReadAt reads len(p) bytes from the shard's logical offset, translating it to
+// ReadAt reads len(p) bytes from the value's logical offset, translating it to
 // on-disk fragment positions. A failed decrypt wraps ErrIntegrity, so
 // corruption, tamper and a wrong master key all surface the same way.
 func (r *reader) ReadAt(p []byte, off int64) (int, error) {
@@ -84,7 +84,7 @@ func (r *reader) ReadAt(p []byte, off int64) (int, error) {
 			pos := i * totalFragSize
 			frag := (*fragment)(r.buf[pos : pos+totalFragSize])
 
-			plaintext, err := frag.open(r.aead, r.objectHash, r.shardIndex, r.storeID)
+			plaintext, err := frag.open(r.aead, r.key, r.index, r.storeID)
 			if err != nil {
 				return totalCopied, fmt.Errorf("segment %d offset %d: %w", r.ext.SegNum, batchDiskOff+int64(pos), err)
 			}
@@ -102,7 +102,7 @@ func (r *reader) ReadAt(p []byte, off int64) (int, error) {
 	return totalCopied, nil
 }
 
-// WriteTo streams the full shard to w via io.SectionReader over ReadAt.
+// WriteTo streams the full value to w via io.SectionReader over ReadAt.
 func (r *reader) WriteTo(w io.Writer) (int64, error) {
 	if r.closed {
 		return 0, ErrClosedReader
@@ -111,7 +111,7 @@ func (r *reader) WriteTo(w io.Writer) (int64, error) {
 	return io.Copy(w, io.NewSectionReader(r, 0, r.ext.LSize))
 }
 
-// Size returns the logical (data-only) size of the shard, excluding fragment headers.
+// Size returns the logical (data-only) size of the value, excluding fragment headers.
 func (r *reader) Size() int64 {
 	return r.ext.LSize
 }
@@ -119,7 +119,7 @@ func (r *reader) Size() int64 {
 // Close releases the segment reference. Must be called exactly once.
 func (r *reader) Close() error {
 	if r.closed {
-		return fmt.Errorf("shard reader closed")
+		return fmt.Errorf("closed reader")
 	}
 
 	r.closed = true

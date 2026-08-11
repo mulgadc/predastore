@@ -71,7 +71,7 @@ func TestCompactionDropsDrainedSegmentAndShrinks(t *testing.T) {
 	defer st.Close()
 
 	oh := [32]byte{0x1}
-	body := bytes.Repeat([]byte{0xaa}, 12*engine.KiB) // one ~12 KiB shard fills a 20 KiB segment
+	body := bytes.Repeat([]byte{0xaa}, 12*engine.KiB) // one ~12 KiB value fills a 20 KiB segment
 	write(t, st, oh, 0, body)                         // segment 0
 	write(t, st, oh, 1, body)                         // rolls to segment 1
 	write(t, st, oh, 2, body)                         // rolls to segment 2 (active)
@@ -103,10 +103,10 @@ func TestCompactionDropsDrainedSegmentAndShrinks(t *testing.T) {
 	for _, idx := range []uint32{1, 2} {
 		got, err := readAll(t, st, oh, idx)
 		if err != nil {
-			t.Fatalf("read surviving shard %d: %v", idx, err)
+			t.Fatalf("read surviving value %d: %v", idx, err)
 		}
 		if !bytes.Equal(got, body) {
-			t.Errorf("surviving shard %d corrupted", idx)
+			t.Errorf("surviving value %d corrupted", idx)
 		}
 	}
 }
@@ -180,7 +180,7 @@ func TestConcurrentOverwriteDuringCompaction(t *testing.T) {
 	filler := bytes.Repeat([]byte{0xbb}, 12*engine.KiB)
 	write(t, st, oh, 0, filler) // segment 0
 	write(t, st, oh, 1, filler) // segment 0
-	write(t, st, oh, 2, filler) // rolls; segment 0 now drainable once a shard dies
+	write(t, st, oh, 2, filler) // rolls; segment 0 now drainable once a value dies
 
 	if _, err := st.Delete(oh, 0); err != nil {
 		t.Fatalf("delete: %v", err)
@@ -235,7 +235,7 @@ func TestNoCompactorWithoutOption(t *testing.T) {
 	}
 }
 
-// A fault mid-compaction must leave every live shard readable on reopen — the
+// A fault mid-compaction must leave every live value readable on reopen — the
 // drained segment is only dropped after all relocations commit, so an aborted
 // cycle loses nothing.
 func TestCompactionFaultLeavesLiveDataReadable(t *testing.T) {
@@ -285,10 +285,10 @@ func TestCompactionFaultLeavesLiveDataReadable(t *testing.T) {
 	for _, idx := range []uint32{1, 2} {
 		got, err := readAll(t, st2, oh, idx)
 		if err != nil {
-			t.Fatalf("live shard %d unreadable after interrupted compaction: %v", idx, err)
+			t.Fatalf("live value %d unreadable after interrupted compaction: %v", idx, err)
 		}
 		if !bytes.Equal(got, body) {
-			t.Fatalf("live shard %d corrupted after interrupted compaction", idx)
+			t.Fatalf("live value %d corrupted after interrupted compaction", idx)
 		}
 	}
 }

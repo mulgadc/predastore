@@ -163,7 +163,7 @@ func (store *Store) compactOnce() error {
 func (store *Store) candidateSegments() ([]uint64, int, error) {
 	dead := make(map[uint64]int64)
 	err := store.indexScan([]byte{tombstonePrefix}, func(k, v []byte) error {
-		// Shard keys carry no namespace prefix, so roughly one object hash in
+		// Keys carry no namespace prefix, so roughly one hash in
 		// 256 starts with tombstonePrefix and lands in this scan. Reading a
 		// segment number out of the middle of a hash invents one, so match on
 		// the fixed tombstone width before trusting the key.
@@ -397,7 +397,7 @@ func (store *Store) deleteTombstones(segNum uint64) error {
 
 	var keys [][]byte
 	if err := store.indexScan(prefix, func(k, _ []byte) error {
-		// This scan feeds deletes, so a shard key colliding with the tombstone
+		// This scan feeds deletes, so a key colliding with the tombstone
 		// namespace would cost live data rather than accuracy. Width-check it.
 		if len(k) != tombstoneKeySize {
 			return nil

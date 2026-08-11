@@ -244,9 +244,9 @@ func TestCompactorLoopRunsOnKick(t *testing.T) {
 	for i := range body {
 		body[i] = 0xaa
 	}
-	putShard(t, st, oh, 0, body)
-	putShard(t, st, oh, 1, body)
-	putShard(t, st, oh, 2, body) // rolls into segment 1
+	putValue(t, st, oh, 0, body)
+	putValue(t, st, oh, 1, body)
+	putValue(t, st, oh, 2, body) // rolls into segment 1
 
 	if _, err := st.Delete(oh, 0); err != nil {
 		t.Fatalf("delete: %v", err)

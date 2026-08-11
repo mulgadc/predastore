@@ -14,7 +14,7 @@ const stateFilename = "state.json"
 
 type state struct {
 	SegNum           uint64 `json:"segNum"`
-	ShardNum         uint64 `json:"shardNum"`
+	ValueNum         uint64 `json:"valueNum"`
 	FragNum          uint64 `json:"fragNum"`
 	FragNumHighWater uint64 `json:"fragNumHighWater"`
 	StoreID          uint32 `json:"storeID"`
@@ -45,7 +45,7 @@ func (store *Store) loadState() error {
 	}
 
 	store.segNum = sta.SegNum
-	store.shardNum = sta.ShardNum
+	store.valueNum = sta.ValueNum
 	store.storeID = sta.StoreID
 	store.fragNumHighWater = sta.FragNumHighWater
 	// Resume from the high-water, not the last fragNum: the unflushed window from
@@ -59,7 +59,7 @@ func (store *Store) loadState() error {
 func (store *Store) saveState() (retErr error) {
 	sta := state{
 		SegNum:           store.segNum,
-		ShardNum:         store.shardNum,
+		ValueNum:         store.valueNum,
 		FragNum:          store.fragNum,
 		FragNumHighWater: store.fragNumHighWater,
 		StoreID:          store.storeID,

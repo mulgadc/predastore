@@ -7,7 +7,7 @@ import (
 )
 
 // openIndex opens the badger instance backing the store's on-disk index,
-// which maps shard keys to extents and carries the tombstone namespace.
+// which maps keys to extents and carries the tombstone namespace.
 func openIndex(dir string) (*badger.DB, error) {
 	return badger.Open(badger.DefaultOptions(dir).WithLoggingLevel(badger.WARNING))
 }
