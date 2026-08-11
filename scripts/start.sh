@@ -2,19 +2,24 @@
 #
 # start.sh - Start a Predastore cluster from a config profile
 #
+# Launches one s3d process per [[host]] in the profile. Whether nodes reach
+# each other over the in-process pipe or over QUIC follows from the config —
+# same host is a pipe, different hosts is QUIC — so there is no launch mode
+# to choose here.
+#
 # Usage:
-#   ./scripts/start.sh [-w] [-s] <clustername>
+#   ./scripts/start.sh [-w] <clustername>
 #
 # Options:
-#   -w    Wait for all nodes to become ready (60s timeout)
-#   -s    Split the cluster across one process per host. Without it the whole
-#         topology runs in a single process over the in-process pipe, which
-#         needs no loopback aliases, no certificates and no network socket.
+#   -w    Wait for every gate to answer (60s timeout)
+#
+# Environment:
+#   PREDA_DIR   Root for cluster data, certs and the master key
+#   LOG_LEVEL   Passed through as -log-level (debug|info|warn|error)
 #
 # Examples:
-#   ./scripts/start.sh 3node          # one process, every node
-#   ./scripts/start.sh -s 3node       # one process per host, over quic
-#   ./scripts/start.sh -w -s 5node
+#   ./scripts/start.sh 1host          # one process, pipe only
+#   ./scripts/start.sh -w 3host       # three processes over quic
 #
 
 set -euo pipefail
@@ -23,7 +28,9 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 REPO_DIR="$SCRIPT_DIR/.."
 CONFIG_DIR="$REPO_DIR/config"
 S3D_BINARY="$REPO_DIR/bin/s3d"
-S3_PORT=8443
+
+# shellcheck source=scripts/lib.sh
+source "$SCRIPT_DIR/lib.sh"
 
 # Colors
 RED='\033[0;31m'
@@ -38,26 +45,26 @@ log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 # --- Parse options ---
 
 WAIT_READY=false
-SPLIT=false
 
-while getopts "ws" opt; do
+while getopts "w" opt; do
     case $opt in
         w) WAIT_READY=true ;;
-        s) SPLIT=true ;;
-        *) echo "Usage: $0 [-w] [-s] <clustername>"; exit 1 ;;
+        *) echo "Usage: $0 [-w] <clustername>"; exit 1 ;;
     esac
 done
 shift $((OPTIND - 1))
 
-# --- Validate argument ---
-
-if [ $# -ne 1 ]; then
-    echo "Usage: $0 [-w] [-s] <clustername>"
-    echo ""
+list_clusters() {
     echo "Available clusters:"
     for f in "$CONFIG_DIR"/*.toml; do
         [ -f "$f" ] && echo "  $(basename "$f" .toml)"
     done
+}
+
+if [ $# -ne 1 ]; then
+    echo "Usage: $0 [-w] <clustername>"
+    echo ""
+    list_clusters
     exit 1
 fi
 
@@ -66,21 +73,26 @@ CONFIG_FILE="$CONFIG_DIR/${CLUSTER_NAME}.toml"
 
 if [ ! -f "$CONFIG_FILE" ]; then
     log_error "Config not found: $CONFIG_FILE"
-    echo "Available clusters:"
-    for f in "$CONFIG_DIR"/*.toml; do
-        [ -f "$f" ] && echo "  $(basename "$f" .toml)"
-    done
+    list_clusters
     exit 1
 fi
 
-if ! grep -qE '^\s*\[\[host\]\]' "$CONFIG_FILE"; then
-    log_error "$CONFIG_FILE has no [[host]] topology"
+# --- Parse topology ---
+
+HOSTS="$(parse_hosts "$CONFIG_FILE")"
+if [ -z "$HOSTS" ]; then
+    log_error "$CONFIG_FILE declares no [[host]] entries"
     exit 1
 fi
+
+HOST_COUNT="$(echo "$HOSTS" | wc -l)"
 
 # --- Paths ---
+#
+# s3d rejects a relative data_dir: nothing anchors one, since the process is
+# started from wherever the operator happens to be.
 
-ROOT="${PREDA_DIR:-/tmp/predastore}"
+ROOT="$(realpath -m "${PREDA_DIR:-/tmp/predastore}")"
 BASE="$ROOT/${CLUSTER_NAME}"
 LOGS="$BASE/logs"
 PIDS="$BASE/pids"
@@ -102,29 +114,19 @@ if [ -d "$PIDS" ]; then
     done
 fi
 
-# --- Create directories ---
-
 mkdir -p "$ROOT" "$LOGS" "$PIDS"
 
-# --- Parse host IPs from config ---
-
-# Emits each host's public IP. An empty result is normal for a config with no
-# routable hosts, so the pipeline must not abort under `set -e`.
-parse_host_ips() {
-    grep -E '^\s*public_addr\s*=' "$CONFIG_FILE" | \
-        sed 's/.*=\s*"\(.*\)".*/\1/' | \
-        cut -d: -f1 | \
-        grep -v '0\.0\.0\.0' | \
-        sort -u || true
-}
-
 # --- Generate certs ---
+#
+# One keypair covers the whole cluster: the gate serves it to S3 clients and
+# every host presents it to its peers. TLS is host-scoped by design, so a SAN
+# per host address is all that is needed.
 
 TLS_KEY="$ROOT/server.key"
 TLS_CERT="$ROOT/server.pem"
 
 SAN="DNS:localhost,IP:127.0.0.1"
-for ip in $(parse_host_ips); do
+for ip in $(routable_addrs "$CONFIG_FILE"); do
     SAN="${SAN},IP:${ip}"
 done
 
@@ -133,10 +135,10 @@ done
 # smaller topology otherwise survives and peers fail verification at dial
 # time with an error that points at TLS rather than at the stale cert.
 cert_covers_hosts() {
-    [ -f "$TLS_CERT" ] || return 1
+    [ -f "$TLS_CERT" ] && [ -f "$TLS_KEY" ] || return 1
     local have
     have=$(openssl x509 -in "$TLS_CERT" -noout -ext subjectAltName 2>/dev/null) || return 1
-    for ip in $(parse_host_ips); do
+    for ip in $(routable_addrs "$CONFIG_FILE"); do
         echo "$have" | grep -qw "$ip" || return 1
     done
     return 0
@@ -156,15 +158,15 @@ fi
 
 # --- Install cert into the OS trust store ---
 #
-# s3d verifies inter-node Raft and QUIC peer certs strictly against the OS
-# trust store (quicclient.tlsConfigForDial / raft_streamlayer.Dial), with no
-# CA-bundle flag. A self-signed cert that is not a trust anchor fails with
-# "x509: certificate signed by unknown authority", so the cluster never elects
-# a leader. Install it so the dialers trust it.
+# s3d verifies QUIC peer certificates strictly against the OS trust store
+# (transport.NewQUICTransport is built with no RootCAs override), so a
+# self-signed cert that is not a trust anchor fails with "certificate signed
+# by unknown authority" and the cluster never elects a leader. A single-host
+# profile opens no QUIC socket at all, so it needs none of this.
 
 TRUST_ANCHOR="/usr/local/share/ca-certificates/predastore-${CLUSTER_NAME}.crt"
 
-if [ "$SPLIT" = true ] && ! cmp -s "$TLS_CERT" "$TRUST_ANCHOR" 2>/dev/null; then
+if [ "$HOST_COUNT" -gt 1 ] && ! cmp -s "$TLS_CERT" "$TRUST_ANCHOR" 2>/dev/null; then
     log_info "Installing TLS cert into OS trust store..."
     sudo cp "$TLS_CERT" "$TRUST_ANCHOR"
     sudo update-ca-certificates >/dev/null
@@ -194,9 +196,11 @@ if [ ! -f "$S3D_BINARY" ] || [ -n "$(find "$REPO_DIR" -name '*.go' -newer "$S3D_
     make -C "$REPO_DIR" build
 fi
 
-if [ "$SPLIT" = true ]; then
+# --- Loopback aliases ---
+
+if [ "$HOST_COUNT" -gt 1 ]; then
     log_info "Setting up loopback IP aliases..."
-    for ip in $(parse_host_ips); do
+    for ip in $(routable_addrs "$CONFIG_FILE"); do
         if ! ip addr show lo | grep -qw "$ip"; then
             sudo ip addr add "${ip}/24" dev lo
             log_info "  Added $ip to lo"
@@ -204,80 +208,48 @@ if [ "$SPLIT" = true ]; then
     done
 fi
 
-# --- Parse topology ---
-
-# Emits "host_id ip" pairs from [[host]] blocks, e.g. "1 10.11.12.1".
-parse_hosts() {
-    awk '
-    /^\[\[host\]\]/                            { in_h=1; id=""; ip="" }
-    /^\[/ && !/^\[\[host\]\]/                  { in_h=0 }
-    in_h && /^[[:space:]]*id[[:space:]]*=/       { gsub(/[[:space:]]/, ""); split($0,a,"="); id=a[2] }
-    in_h && /^[[:space:]]*public_addr[[:space:]]*=/ { gsub(/.*= *"/,""); gsub(/".*/,""); split($0,b,":"); ip=b[1] }
-    in_h && id != "" && ip != ""                 { print id, ip; in_h=0 }
-    ' "$CONFIG_FILE"
-}
-
-# Emits the comma-separated node ids pinned to the given host id.
-parse_host_nodes() {
-    awk -v want="$1" '
-    /^\[\[node\]\]/                            { in_n=1; id=""; host="" }
-    /^\[/ && !/^\[\[node\]\]/                  { in_n=0 }
-    in_n && /^[[:space:]]*id[[:space:]]*=/       { gsub(/[[:space:]]/, ""); split($0,a,"="); id=a[2] }
-    in_n && /^[[:space:]]*host_id[[:space:]]*=/  { gsub(/[[:space:]]/, ""); split($0,b,"="); host=b[2] }
-    in_n && id != "" && host != ""               { if (host == want) ids = ids (ids == "" ? "" : ",") id; in_n=0 }
-    END                                          { print ids }
-    ' "$CONFIG_FILE"
-}
-
-# launch starts one s3d process and records its pid.
-# Args: label, s3 gateway ip, node selection ("" = every node)
-launch() {
-    local label="$1" ip="$2" node_sel="$3"
-    local log_file="$LOGS/${label}.log"
-    local pid_file="$PIDS/${label}.pid"
-    local args=(
-        -config "$CONFIG_FILE"
-        -host "$ip"
-        -port "$S3_PORT"
-        -base-path "$BASE"
-        -tls-key "$TLS_KEY"
-        -tls-cert "$TLS_CERT"
-        -encryption-key-file "$MASTER_KEY"
-    )
-    if [ -n "$node_sel" ]; then
-        args+=(-nodes "$node_sel")
-    fi
-
-    nohup "$S3D_BINARY" "${args[@]}" > "$log_file" 2>&1 &
-    local pid=$!
-    echo "$pid" > "$pid_file"
-    LAUNCHED_PIDS+=("$pid")
-    LAUNCHED_IPS+=("$ip")
-    log_info "  $label started (PID: $pid, https://${ip}:${S3_PORT})"
-}
-
 # --- Launch ---
+#
+# Everything host-local is passed as a flag rather than written into the
+# profile, so the profile stays identical on every machine.
 
 LAUNCHED_PIDS=()
-LAUNCHED_IPS=()
+LAUNCHED_ENDPOINTS=()
 
-if [ "$SPLIT" = true ]; then
-    log_info "Launching cluster '$CLUSTER_NAME' split across one process per host (quic transport)"
-    while read -r host_id host_ip; do
-        [ -n "$host_id" ] || continue
-        node_sel="$(parse_host_nodes "$host_id")"
-        if [ -z "$node_sel" ]; then
-            log_warn "  host $host_id has no nodes, skipping"
-            continue
-        fi
-        launch "host-${host_id}" "$host_ip" "$node_sel"
-    done <<< "$(parse_hosts)"
-else
-    # No -nodes selection: every node in the topology runs in this process
-    # over the pipe, so no socket, certificates or aliases are involved.
-    log_info "Launching cluster '$CLUSTER_NAME' colocated in one process (pipe transport)"
-    launch "colo" "127.0.0.1" ""
-fi
+launch() {
+    local host_id="$1" addr="$2" gate_port="$3"
+    local label="host-${host_id}"
+    local data_dir="$BASE/${label}"
+    local args=(
+        -config "$CONFIG_FILE"
+        -host "$host_id"
+        -data-dir "$data_dir"
+        -tls-cert "$TLS_CERT"
+        -tls-key "$TLS_KEY"
+        -encryption-key "$MASTER_KEY"
+    )
+    [ -n "${LOG_LEVEL:-}" ] && args+=(-log-level "$LOG_LEVEL")
+
+    mkdir -p "$data_dir"
+    nohup "$S3D_BINARY" "${args[@]}" > "$LOGS/${label}.log" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$PIDS/${label}.pid"
+    LAUNCHED_PIDS+=("$pid")
+
+    if [ -n "$gate_port" ]; then
+        LAUNCHED_ENDPOINTS+=("${addr}:${gate_port}")
+        log_info "  $label started (PID: $pid, https://${addr}:${gate_port})"
+    else
+        LAUNCHED_ENDPOINTS+=("")
+        log_info "  $label started (PID: $pid, no gate)"
+    fi
+}
+
+log_info "Launching cluster '$CLUSTER_NAME' across $HOST_COUNT host(s)"
+while read -r host_id addr gate_port; do
+    [ -n "$host_id" ] || continue
+    launch "$host_id" "$addr" "${gate_port:-}"
+done <<< "$HOSTS"
 
 if [ ${#LAUNCHED_PIDS[@]} -eq 0 ]; then
     log_error "No processes launched — check $CONFIG_FILE"
@@ -291,10 +263,12 @@ if [ "$WAIT_READY" = true ]; then
     deadline=$(( $(date +%s) + 60 ))
     for i in "${!LAUNCHED_PIDS[@]}"; do
         pid="${LAUNCHED_PIDS[$i]}"
-        ip="${LAUNCHED_IPS[$i]}"
+        endpoint="${LAUNCHED_ENDPOINTS[$i]}"
+        # A host with no gate serves no S3, so there is nothing to poll.
+        [ -n "$endpoint" ] || continue
         while :; do
-            if curl -k -s "https://${ip}:${S3_PORT}/" >/dev/null 2>&1; then
-                log_info "  $ip ready"
+            if curl -k -s "https://${endpoint}/" >/dev/null 2>&1; then
+                log_info "  $endpoint ready"
                 break
             fi
             if ! kill -0 "$pid" 2>/dev/null; then
