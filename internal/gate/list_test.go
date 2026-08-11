@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/stretchr/testify/assert"
 )
@@ -14,7 +13,7 @@ import (
 func TestListBucketsNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := newTestGate(t, config)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
@@ -26,7 +25,7 @@ func TestListBucketsNoAuth(t *testing.T) {
 func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := newTestGate(t, config)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	rr := httptest.NewRecorder()
@@ -43,7 +42,7 @@ func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
 func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := newTestGate(t, config)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")

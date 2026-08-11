@@ -4,14 +4,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"io"
 	"net/http"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/mulgadc/predastore/internal/blob"
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
+	"github.com/mulgadc/predastore/internal/testcerts"
 	"github.com/stretchr/testify/require"
 )
 
@@ -50,10 +55,45 @@ func signTestReq(t *testing.T, req *http.Request, body []byte,
 		req, payloadHash, service, region, o.signingTime))
 }
 
+// fakeBlob stands in for the shard client. New requires one, but no test that
+// takes this reaches a route that reads or writes a shard.
+type fakeBlob struct{}
+
+func (fakeBlob) Put(context.Context, config.NodeID, blob.PutRequest, io.Reader) (*blob.PutResponse, error) {
+	return nil, errors.New("no blob nodes")
+}
+
+func (fakeBlob) Get(context.Context, config.NodeID, blob.GetRequest) (io.ReadCloser, error) {
+	return nil, errors.New("no blob nodes")
+}
+
+func (fakeBlob) Delete(context.Context, config.NodeID, blob.DeleteRequest) (*blob.DeleteResponse, error) {
+	return nil, errors.New("no blob nodes")
+}
+
+// newTestGate builds a gate through the production constructor, filling in
+// what New requires and a test rarely cares about: a loadable TLS pair and the
+// two cluster clients. Whatever cfg already sets is left alone.
+func newTestGate(t *testing.T, cfg Config) *Server {
+	t.Helper()
+	if cfg.TLSCert == "" {
+		cfg.TLSCert, cfg.TLSKey, _ = testcerts.Generate(t)
+	}
+	if cfg.Meta == nil {
+		cfg.Meta = newFakeMeta(t)
+	}
+	if cfg.Blob == nil {
+		cfg.Blob = fakeBlob{}
+	}
+	s, err := New(cfg)
+	require.NoError(t, err)
+	return s
+}
+
 // newAuthTestConfig returns an inline Config for tests that only exercise
 // auth middleware (no real backend needed). Avoids reading any TOML file.
-func newAuthTestConfig() *Config {
-	return &Config{
+func newAuthTestConfig() Config {
+	return Config{
 		Region: "ap-southeast-2",
 		Buckets: []handlers.BucketConfig{
 			{Name: "test-bucket01", Region: "ap-southeast-2", Public: true},

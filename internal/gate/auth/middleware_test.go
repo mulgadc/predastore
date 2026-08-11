@@ -13,6 +13,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -20,26 +22,66 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/mulgadc/predastore/internal/blob"
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
+	"github.com/mulgadc/predastore/internal/meta"
+	"github.com/mulgadc/predastore/internal/testcerts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const sessionRegion = "ap-southeast-2"
 
+// errNoCluster is what the stand-in clients below return. gate.New requires
+// both, but a config-defined bucket resolves from the gate's own cache, so a
+// HEAD against one never reaches state or a shard.
+var errNoCluster = errors.New("no cluster")
+
+type noMeta struct{}
+
+func (noMeta) Get(context.Context, string) ([]byte, error) { return nil, errNoCluster }
+func (noMeta) Put(context.Context, string, []byte) error   { return errNoCluster }
+func (noMeta) Delete(context.Context, string) error        { return errNoCluster }
+func (noMeta) Scan(context.Context, string, int) ([]meta.Item, error) {
+	return nil, errNoCluster
+}
+
+type noBlob struct{}
+
+func (noBlob) Put(context.Context, config.NodeID, blob.PutRequest, io.Reader) (*blob.PutResponse, error) {
+	return nil, errNoCluster
+}
+
+func (noBlob) Get(context.Context, config.NodeID, blob.GetRequest) (io.ReadCloser, error) {
+	return nil, errNoCluster
+}
+
+func (noBlob) Delete(context.Context, config.NodeID, blob.DeleteRequest) (*blob.DeleteResponse, error) {
+	return nil, errNoCluster
+}
+
 // sessionGate builds a gate whose only bucket is config-defined and owned
 // by the session's account, so authorization is the only thing under test.
-func sessionGate(p auth.CredentialProvider) http.Handler {
-	cfg := &gate.Config{
+func sessionGate(t *testing.T, p auth.CredentialProvider) http.Handler {
+	t.Helper()
+	cert, key, _ := testcerts.Generate(t)
+	s, err := gate.New(gate.Config{
 		Region: sessionRegion,
 		Buckets: []handlers.BucketConfig{{
 			Name: "session-bucket", Region: sessionRegion,
 			Public: false, AccountID: auth.TestSessionAccount,
 		}},
-	}
-	return gate.NewHandler(cfg, gate.Clients{}, p)
+		TLSCert:  cert,
+		TLSKey:   key,
+		Meta:     noMeta{},
+		Blob:     noBlob{},
+		CredProv: p,
+	})
+	require.NoError(t, err)
+	return s
 }
 
 // signSession signs a body-less request with the AWS SDK's SigV4 signer, as a
@@ -71,7 +113,7 @@ func TestSigV4Middleware_SessionCredential(t *testing.T) {
 	k := auth.LoadTestKey(t)
 	const secret = "session-secret-value"
 	sessions, users, policies := auth.UserSessionFixture(t, k, secret, time.Now().UTC().Add(time.Hour))
-	h := sessionGate(auth.NewSessionProvider(k, sessions, users, nil, policies))
+	h := sessionGate(t, auth.NewSessionProvider(k, sessions, users, nil, policies))
 
 	t.Run("valid session passes auth", func(t *testing.T) {
 		assert.Equal(t, http.StatusOK, headBucket(t, h, auth.TestSessionAKID, secret),
@@ -87,7 +129,7 @@ func TestSigV4Middleware_SessionExpired(t *testing.T) {
 	k := auth.LoadTestKey(t)
 	const secret = "session-secret-value"
 	sessions, users, policies := auth.UserSessionFixture(t, k, secret, time.Now().UTC().Add(-time.Minute))
-	h := sessionGate(auth.NewSessionProvider(k, sessions, users, nil, policies))
+	h := sessionGate(t, auth.NewSessionProvider(k, sessions, users, nil, policies))
 
 	assert.Equal(t, http.StatusForbidden, headBucket(t, h, auth.TestSessionAKID, secret),
 		"expired session must not reach the handler")
@@ -103,7 +145,7 @@ func TestSigV4Middleware_AssumedRole(t *testing.T) {
 	t.Run("role policy permits → 200", func(t *testing.T) {
 		roles, policies := auth.RoleWithPolicy(t, "S3FullAccess", auth.AllowAllS3Policy)
 		sessions := auth.AssumedRoleSession(t, k, secret, auth.TestSessionRoleARN, time.Now().UTC().Add(time.Hour))
-		h := sessionGate(auth.NewSessionProvider(k, sessions, nil, roles, policies))
+		h := sessionGate(t, auth.NewSessionProvider(k, sessions, nil, roles, policies))
 
 		assert.Equal(t, http.StatusOK, headBucket(t, h, auth.TestSessionAKID, secret),
 			"an allowed assumed-role request must pass through to the handler")
@@ -112,7 +154,7 @@ func TestSigV4Middleware_AssumedRole(t *testing.T) {
 	t.Run("role policy denies → 403", func(t *testing.T) {
 		roles, policies := auth.RoleWithPolicy(t, "S3Deny", auth.DenyAllS3Policy)
 		sessions := auth.AssumedRoleSession(t, k, secret, auth.TestSessionRoleARN, time.Now().UTC().Add(time.Hour))
-		h := sessionGate(auth.NewSessionProvider(k, sessions, nil, roles, policies))
+		h := sessionGate(t, auth.NewSessionProvider(k, sessions, nil, roles, policies))
 
 		assert.Equal(t, http.StatusForbidden, headBucket(t, h, auth.TestSessionAKID, secret),
 			"a denied assumed-role request must not reach the handler")

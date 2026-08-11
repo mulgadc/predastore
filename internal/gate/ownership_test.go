@@ -166,7 +166,7 @@ var allowAllPolicy = iampolicy.PolicyDocument{
 
 func ownershipServer(t *testing.T) *Server {
 	t.Helper()
-	cfg := &Config{
+	return newTestGate(t, Config{
 		Region: "ap-southeast-2",
 		Buckets: []handlers.BucketConfig{{
 			Name:      "predastore",
@@ -174,17 +174,17 @@ func ownershipServer(t *testing.T) *Server {
 			Public:    false,
 			AccountID: acctSys,
 		}},
-	}
-	credProv := &stubCredProvider{creds: map[string]*auth.CredentialResult{
-		keyOwner:  {SecretAccessKey: secret, AccountID: acctOwner, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
-		keyOther:  {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
-		keyConfig: {SecretAccessKey: secret, AccountID: acctSys, SkipPolicyCheck: true},
-		keyNoIAM:  {SecretAccessKey: secret, AccountID: acctOwner /* no policies */},
-	}}
-	return newGate(cfg, newFakeMeta(t,
-		model.BucketMetadata{Name: "owner-bucket", Region: "ap-southeast-2", AccountID: acctOwner},
-		model.BucketMetadata{Name: "public-bucket", Region: "ap-southeast-2", AccountID: acctOwner, Public: true},
-	), nil, credProv)
+		Meta: newFakeMeta(t,
+			model.BucketMetadata{Name: "owner-bucket", Region: "ap-southeast-2", AccountID: acctOwner},
+			model.BucketMetadata{Name: "public-bucket", Region: "ap-southeast-2", AccountID: acctOwner, Public: true},
+		),
+		CredProv: &stubCredProvider{creds: map[string]*auth.CredentialResult{
+			keyOwner:  {SecretAccessKey: secret, AccountID: acctOwner, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
+			keyOther:  {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
+			keyConfig: {SecretAccessKey: secret, AccountID: acctSys, SkipPolicyCheck: true},
+			keyNoIAM:  {SecretAccessKey: secret, AccountID: acctOwner /* no policies */},
+		}},
+	})
 }
 
 func signedReq(t *testing.T, method, path, accessKey string) *http.Request {
@@ -349,11 +349,13 @@ func TestOwnership_CrossAccountDeniedOnBucketSubresources(t *testing.T) {
 // returned (nil, nil) would silently allow cross-account access via the
 // "unknown bucket — let the handler return NoSuchBucket" branch.
 func TestOwnership_BackendErrorReturnsInternalError(t *testing.T) {
-	cfg := &Config{Region: "ap-southeast-2"} // no config buckets — force the state lookup
-	credProv := &stubCredProvider{creds: map[string]*auth.CredentialResult{
-		keyOther: {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
-	}}
-	server := newGate(cfg, &fakeMeta{rows: map[string][]byte{}, err: errors.New("state infrastructure failure")}, nil, credProv)
+	server := newTestGate(t, Config{
+		Region: "ap-southeast-2", // no config buckets — force the state lookup
+		Meta:   &fakeMeta{rows: map[string][]byte{}, err: errors.New("state infrastructure failure")},
+		CredProv: &stubCredProvider{creds: map[string]*auth.CredentialResult{
+			keyOther: {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
+		}},
+	})
 
 	req := signedReq(t, http.MethodGet, "/some-bucket", keyOther)
 	status, nextCalled, body := runMiddleware(t, server, req)

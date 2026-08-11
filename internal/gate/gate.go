@@ -17,8 +17,9 @@ type RS struct {
 	Parity int
 }
 
-// Config is the gate's slice of the product configuration, already parsed
-// and resolved. The on-disk TOML surface belongs to the root package, which
+// Config is everything one S3 gate runs on: its slice of the product
+// configuration, already parsed and resolved, and the wiring the process
+// supplies. The on-disk TOML surface belongs to the root package, which
 // converts it to this; the gate sees settings, never a file.
 type Config struct {
 	Region string
@@ -40,6 +41,26 @@ type Config struct {
 
 	// API request throttling
 	RateLimit ratelimit.Config
+
+	// Addr and Port are the S3 listen address. Zero values default to
+	// 0.0.0.0:8443.
+	Addr string
+	Port int
+
+	// TLSCert and TLSKey are required: the gate only serves HTTPS.
+	TLSCert string
+	TLSKey  string
+
+	// Meta reaches the replicas holding bucket, object and upload metadata,
+	// and Blob the nodes holding shards. Both are required: the gate runs the
+	// S3 frontend only, and the process that runs the cluster nodes owns the
+	// transports underneath them.
+	Meta handlers.MetaClient
+	Blob handlers.BlobClient
+
+	// CredProv stands in for the credential chain New resolves from Auth and
+	// IAM. Test seam: production leaves it nil.
+	CredProv auth.CredentialProvider
 }
 
 // handlerConfig is the slice of the config the handlers read.

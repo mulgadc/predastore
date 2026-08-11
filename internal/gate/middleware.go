@@ -73,7 +73,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		path := r.URL.Path
 		method := r.Method
 
-		publicBucketAccess := s.config.validatePublicBucketPermission(method, path)
+		publicBucketAccess := s.cfg.validatePublicBucketPermission(method, path)
 
 		// Parse recognizes both header-authed and presigned requests; only a request with
 		// neither returns ErrMissingAuthentication.
@@ -100,7 +100,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		}
 
 		// Regional operations must carry the endpoint's own region, as AWS enforces.
-		expectedRegion := s.config.Region
+		expectedRegion := s.cfg.Region
 
 		// ListBuckets is the only global operation served here, and clients sign it against
 		// us-east-1 whatever region they are configured for. Some SDKs sign it with the
@@ -146,7 +146,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		bucket, key := parseS3Path(path)
 		isCreateBucket := method == http.MethodPut && bucket != "" && key == "" && r.URL.RawQuery == ""
 		if bucket != "" && !isCreateBucket {
-			meta, err := handlers.ResolveBucketMetadata(r.Context(), s.meta, s.handlerCfg, bucket)
+			meta, err := handlers.ResolveBucketMetadata(r.Context(), s.cfg.Meta, s.handlerCfg, bucket)
 			if err != nil {
 				slog.ErrorContext(r.Context(), "Failed to resolve bucket metadata for ownership check",
 					"bucket", bucket, "error", err, "accessKeyID", accessKey)

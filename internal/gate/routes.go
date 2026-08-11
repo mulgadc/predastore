@@ -25,9 +25,10 @@ func byQuery(param string, with, without http.Handler) http.Handler {
 // over the dependencies it needs. It runs after the middleware chain is
 // installed, since chi requires all middleware to be registered before the
 // first route.
-func (s *Server) setupRoutes(bc handlers.BlobClient, ring *placement.Ring) {
+func (s *Server) setupRoutes(ring *placement.Ring) {
 	r := s.router
-	mc, cache, cfg := s.meta, s.buckets, s.handlerCfg
+	mc, bc := s.cfg.Meta, s.cfg.Blob
+	cache, cfg := s.buckets, s.handlerCfg
 
 	r.Method(http.MethodGet, "/", handlers.ListBuckets(mc))
 

@@ -6,14 +6,13 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestPutObjectPublicBucketNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := newTestGate(t, config)
 
 	testContent := []byte("This is a test file created during unit testing")
 	req := httptest.NewRequest(http.MethodPut, "/test-bucket01/test_upload.txt", bytes.NewReader(testContent))
@@ -27,7 +26,7 @@ func TestPutObjectPublicBucketNoAuth(t *testing.T) {
 func TestPutObjectPrivateBucketNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := newTestGate(t, config)
 
 	testContent := []byte("This is a test file created during unit testing")
 	req := httptest.NewRequest(http.MethodPut, "/private/test_upload.txt", bytes.NewReader(testContent))

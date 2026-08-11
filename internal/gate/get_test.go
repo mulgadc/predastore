@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/stretchr/testify/assert"
 )
@@ -14,7 +13,7 @@ import (
 func TestGetObjectNoBucketPermissions(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := newTestGate(t, config)
 
 	req := httptest.NewRequest(http.MethodGet, "/private/note.txt", nil)
 	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")

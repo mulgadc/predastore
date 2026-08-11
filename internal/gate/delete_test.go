@@ -5,14 +5,13 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestDeleteObjectNoAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := newTestGate(t, config)
 
 	// Send a delete request
 	req := httptest.NewRequest(http.MethodDelete, "/local/unknownfile.txt", nil)
@@ -26,7 +25,7 @@ func TestDeleteObjectNoAuth(t *testing.T) {
 func TestDeleteObjectBadAuth(t *testing.T) {
 	config := newAuthTestConfig()
 
-	server := NewHandler(config, Clients{}, auth.NewConfigProvider(config.Auth))
+	server := newTestGate(t, config)
 
 	// Send a delete request
 	req := httptest.NewRequest(http.MethodDelete, "/local/unknownfile.txt", nil)

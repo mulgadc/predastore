@@ -157,9 +157,13 @@ func iamConfig(c *Config) *auth.IAMConfig {
 	}
 }
 
-// gateConfig is the slice of the file the S3 frontend reads.
-func gateConfig(c *Config) *gate.Config {
-	return &gate.Config{
+// gateConfig is everything the S3 frontend runs on: the slice of the file it
+// reads, plus the wiring its host supplies — where it listens, the TLS
+// identity it serves under, and the cluster clients it works through.
+func gateConfig(
+	c *Config, host HostConfig, n NodeConfig, mc handlers.MetaClient, bc handlers.BlobClient,
+) gate.Config {
+	return gate.Config{
 		Region:      c.Region,
 		RS:          gate.RS{Data: c.RS.Data, Parity: c.RS.Parity},
 		Buckets:     bucketConfigs(c),
@@ -167,5 +171,12 @@ func gateConfig(c *Config) *gate.Config {
 		IAM:         iamConfig(c),
 		RateLimit:   c.RateLimit,
 		BlobNodeIDs: nodeIDs(nodesByRole(c, RoleBlob)),
+
+		Addr:    host.BindAddr,
+		Port:    n.Port,
+		TLSCert: host.TLSCert,
+		TLSKey:  host.TLSKey,
+		Meta:    mc,
+		Blob:    bc,
 	}
 }

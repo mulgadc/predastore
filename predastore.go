@@ -185,7 +185,21 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		// The pool is private: a gate dials but is never dialed, so it has
 		// nothing to share one with.
 		pool = rpc.NewConnPool(n.ID, res)
-		gw, gerr := gateServer(cfg, n, host, opts, rpc.NewClient(pool))
+		cli := rpc.NewClient(pool)
+		metaClient, cerr := meta.NewClient(meta.ClientConfig{
+			Client:   cli,
+			Replicas: nodeIDs(nodesByRole(cfg, RoleMeta)),
+		})
+		if cerr != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("create s3 gate: %w", cerr)
+		}
+		blobClient, cerr := blob.NewClient(blob.ClientConfig{Client: cli})
+		if cerr != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("create s3 gate: %w", cerr)
+		}
+		gw, gerr := gate.New(gateConfig(cfg, host, n, metaClient, blobClient))
 		if gerr != nil {
 			cleanup()
 			return nil, nil, fmt.Errorf("create s3 gate: %w", gerr)
@@ -246,32 +260,4 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		return nil
 	}
 	return run, cleanup, nil
-}
-
-// gateServer builds the S3 frontend a gate node runs: the file's gate
-// slice, its host's listen address and TLS identity, and the cluster clients
-// it works through.
-func gateServer(
-	cfg *Config, n NodeConfig, host HostConfig, opts Options, cli *rpc.Client,
-) (*gate.Server, error) {
-	metaClient, err := meta.NewClient(meta.ClientConfig{
-		Client:   cli,
-		Replicas: nodeIDs(nodesByRole(cfg, RoleMeta)),
-	})
-	if err != nil {
-		return nil, err
-	}
-	blobClient, err := blob.NewClient(blob.ClientConfig{Client: cli})
-	if err != nil {
-		return nil, err
-	}
-	return gate.NewServer(gate.ServerConfig{
-		Config:    gateConfig(cfg),
-		Host:      host.BindAddr,
-		Port:      n.Port,
-		TLSCert:   host.TLSCert,
-		TLSKey:    host.TLSKey,
-		MasterKey: opts.MasterKey,
-		Clients:   gate.Clients{Meta: metaClient, Blob: blobClient},
-	})
 }

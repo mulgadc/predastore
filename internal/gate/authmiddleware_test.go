@@ -15,7 +15,7 @@ import (
 
 func TestSigV4AuthMiddleware(t *testing.T) {
 	// Create a test S3 config with known auth credentials
-	s3Config := &Config{
+	s3Config := Config{
 		Region: "ap-southeast-2",
 		Buckets: []handlers.BucketConfig{
 			{
@@ -152,7 +152,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 		},
 	}
 
-	server := newGate(s3Config, nil, nil, auth.NewConfigProvider(s3Config.Auth))
+	server := newTestGate(t, s3Config)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -189,7 +189,7 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 // missing "host" or "x-amz-date" from SignedHeaders are rejected with
 // AuthorizationHeaderMalformed.
 func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
-	s3Config := &Config{
+	s3Config := Config{
 		Region: "ap-southeast-2",
 		Buckets: []handlers.BucketConfig{{
 			Name:   "test-bucket01",
@@ -205,7 +205,7 @@ func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
 			}},
 		}},
 	}
-	server := newGate(s3Config, nil, nil, auth.NewConfigProvider(s3Config.Auth))
+	server := newTestGate(t, s3Config)
 
 	rewriteSignedHeaders := func(req *http.Request, list string) {
 		ah := req.Header.Get("Authorization")
