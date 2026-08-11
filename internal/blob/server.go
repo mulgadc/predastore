@@ -1,7 +1,6 @@
-// Package blob serves and consumes erasure-coded shard operations over
-// rpc streams. The service side fronts the shard stores hosted in a process;
-// the client side is used by the distributed backend to reach blob nodes
-// wherever they run.
+// Package blob serves and consumes opaque value operations over rpc streams.
+// The service side fronts the stores hosted in a process; the client side is
+// used by the distributed backend to reach blob nodes wherever they run.
 package blob
 
 import (
@@ -17,15 +16,15 @@ import (
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
-// Server serves shard rpc requests for one blob node. A process running
-// several nodes builds one Server per node, each carried by its own rpc
-// server, so the shard service never learns that it has siblings.
+// Server serves rpc requests for one blob node. A process running several
+// nodes builds one Server per node, each carried by its own rpc server, so
+// the storage service never learns that it has siblings.
 type Server struct {
 	id    config.NodeID
 	store *engine.Store
 }
 
-// NewServer builds the shard service for one node's store.
+// NewServer builds the storage service for one node's store.
 func NewServer(id config.NodeID, st *engine.Store) *Server {
 	return &Server{id: id, store: st}
 }
@@ -43,61 +42,61 @@ func (s *Server) Run(ctx context.Context) error {
 
 // Register installs the storage service handlers on the mux.
 func (s *Server) Register(mux *rpc.Mux) {
-	rpc.RegisterHandler(mux, OpShardGet, s.handleGet)
-	rpc.RegisterHandler(mux, OpShardPut, s.handlePut)
-	rpc.RegisterHandler(mux, OpShardDelete, s.handleDelete)
+	rpc.RegisterHandler(mux, OpGet, s.handleGet)
+	rpc.RegisterHandler(mux, OpPut, s.handlePut)
+	rpc.RegisterHandler(mux, OpDelete, s.handleDelete)
 }
 
-// respondShard writes the newline-terminated JSON envelope; get responses
-// stream the shard bytes after it.
-func respondShard(stream transport.Stream, resp *ShardResponse) error {
+// respond writes the newline-terminated JSON envelope; get responses stream
+// the body bytes after it.
+func respond(stream transport.Stream, resp *Response) error {
 	return json.NewEncoder(stream).Encode(resp)
 }
 
-func (s *Server) handlePut(ctx context.Context, h ShardRequest, stream transport.Stream) error {
+func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stream) error {
 	st := s.store
-	if h.ShardSize <= 0 {
-		return respondShard(stream, &ShardResponse{Err: "no shard size specified"})
+	if h.Size <= 0 {
+		return respond(stream, &Response{Err: "no size specified"})
 	}
 
-	writer, err := st.Append(h.ObjectHash, h.ShardIndex, h.ShardSize)
+	writer, err := st.Append(h.Key, h.Index, h.Size)
 	if err != nil {
 		// Drain the client's in-flight body so the reply is carried
 		// instead of racing a stream reset.
-		if _, derr := io.Copy(io.Discard, io.LimitReader(stream, h.ShardSize)); derr != nil {
+		if _, derr := io.Copy(io.Discard, io.LimitReader(stream, h.Size)); derr != nil {
 			return fmt.Errorf("drain body after append error: %w", derr)
 		}
 		if errors.Is(err, engine.ErrStoreFull) {
-			return respondShard(stream, &ShardResponse{Err: ErrCodeStoreFull})
+			return respond(stream, &Response{Err: ErrCodeStoreFull})
 		}
-		return respondShard(stream, &ShardResponse{Err: fmt.Sprintf("append: %v", err)})
+		return respond(stream, &Response{Err: fmt.Sprintf("append: %v", err)})
 	}
 
-	if _, err := writer.ReadFrom(io.LimitReader(stream, h.ShardSize)); err != nil {
-		return respondShard(stream, &ShardResponse{Err: fmt.Sprintf("write: %v", err)})
+	if _, err := writer.ReadFrom(io.LimitReader(stream, h.Size)); err != nil {
+		return respond(stream, &Response{Err: fmt.Sprintf("write: %v", err)})
 	}
 	if err := writer.Close(); err != nil {
-		return respondShard(stream, &ShardResponse{Err: fmt.Sprintf("commit: %v", err)})
+		return respond(stream, &Response{Err: fmt.Sprintf("commit: %v", err)})
 	}
 
 	// Surface nearfull pressure on success too, so callers can back off
 	// before a write is ever outright rejected.
-	return respondShard(stream, &ShardResponse{ShardSize: h.ShardSize, PoolNearFull: st.NearFull()})
+	return respond(stream, &Response{Size: h.Size, PoolNearFull: st.NearFull()})
 }
 
-func (s *Server) handleGet(ctx context.Context, h ShardRequest, stream transport.Stream) error {
+func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stream) error {
 	st := s.store
 
-	reader, err := st.Lookup(h.ObjectHash, h.ShardIndex)
+	reader, err := st.Lookup(h.Key, h.Index)
 	if err != nil {
-		return respondShard(stream, &ShardResponse{Err: ErrCodeNotFound})
+		return respond(stream, &Response{Err: ErrCodeNotFound})
 	}
 	defer reader.Close()
 
 	totalSize := reader.Size()
 
 	// Values >= 0 are explicit range bounds (including 0 for "start from
-	// beginning"); negative means unset and falls back to the full shard.
+	// beginning"); negative means unset and falls back to the whole value.
 	rangeStart := h.RangeStart
 	rangeEnd := h.RangeEnd
 	if rangeStart < 0 {
@@ -107,24 +106,24 @@ func (s *Server) handleGet(ctx context.Context, h ShardRequest, stream transport
 		rangeEnd = totalSize - 1
 	}
 	if rangeStart > rangeEnd || rangeStart >= totalSize {
-		return respondShard(stream, &ShardResponse{Err: "invalid range"})
+		return respond(stream, &Response{Err: "invalid range"})
 	}
 	responseSize := rangeEnd - rangeStart + 1
 
-	if err := respondShard(stream, &ShardResponse{BodyLen: responseSize}); err != nil {
+	if err := respond(stream, &Response{BodyLen: responseSize}); err != nil {
 		return fmt.Errorf("write envelope: %w", err)
 	}
 	if _, err := stream.ReadFrom(io.NewSectionReader(reader, rangeStart, responseSize)); err != nil {
-		return fmt.Errorf("stream shard: %w", err)
+		return fmt.Errorf("stream body: %w", err)
 	}
 	return nil
 }
 
-func (s *Server) handleDelete(ctx context.Context, h ShardRequest, stream transport.Stream) error {
+func (s *Server) handleDelete(ctx context.Context, h Request, stream transport.Stream) error {
 	st := s.store
-	deleted, err := st.Delete(h.ObjectHash, h.ShardIndex)
+	deleted, err := st.Delete(h.Key, h.Index)
 	if err != nil {
-		return respondShard(stream, &ShardResponse{Err: err.Error()})
+		return respond(stream, &Response{Err: err.Error()})
 	}
-	return respondShard(stream, &ShardResponse{Deleted: deleted})
+	return respond(stream, &Response{Deleted: deleted})
 }

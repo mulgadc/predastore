@@ -195,8 +195,8 @@ func readRangeFromSingleShard(ctx context.Context, bc BlobClient, cfg Config, ob
 
 	nodeNum := place.DataShardNodes[shardIdx]
 	objectRequest := blob.GetRequest{
-		ObjectHash: objectHash,
-		ShardIndex: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards (small uint).
+		Key:        objectHash,
+		Index:      uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards (small uint).
 		RangeStart: offsetInShard,
 		RangeEnd:   endInShard,
 	}

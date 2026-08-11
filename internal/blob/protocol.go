@@ -7,12 +7,12 @@ import (
 )
 
 // Opcodes are allocated per service in non-overlapping ranges so a stream's
-// opcode identifies the service that answers it. Storage owns 0x2xxx; state
-// owns 0x0001 and 0x1xxx.
+// opcode identifies the service that answers it. blob owns 0x2xxx; meta owns
+// 0x0001 and 0x1xxx.
 const (
-	OpShardGet    rpc.Opcode = 0x2001
-	OpShardPut    rpc.Opcode = 0x2002
-	OpShardDelete rpc.Opcode = 0x2003
+	OpGet    rpc.Opcode = 0x2001
+	OpPut    rpc.Opcode = 0x2002
+	OpDelete rpc.Opcode = 0x2003
 )
 
 // Response error codes with protocol meaning; anything else in Err is an
@@ -31,34 +31,33 @@ func appendJSON(buf []byte, v any) ([]byte, error) {
 	return append(buf, b...), nil
 }
 
-// ShardRequest is the header for every storage service operation. Put shard
-// data travels in the stream body after the header. ObjectHash is the client's
-// to compute; a blob node only ever treats it as 32 opaque bytes naming a
-// shard set.
-type ShardRequest struct {
-	ObjectHash [32]byte `json:"object_hash"`
-	ShardIndex uint32   `json:"shard_index"`
-	// ShardSize is the body length for puts.
-	ShardSize int64 `json:"shard_size,omitempty"`
+// Request is the header for every storage service operation. Put data travels
+// in the stream body after the header. Key is the client's to compute; a blob
+// node only ever treats it as 32 opaque bytes naming a value set.
+type Request struct {
+	Key   [32]byte `json:"key"`
+	Index uint32   `json:"index"`
+	// Size is the body length for puts.
+	Size int64 `json:"size,omitempty"`
 	// RangeStart and RangeEnd bound gets; -1 means unset.
 	RangeStart int64 `json:"range_start"`
 	RangeEnd   int64 `json:"range_end"`
 }
 
-func (h *ShardRequest) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
-func (h *ShardRequest) Unmarshal(b []byte) error          { return json.Unmarshal(b, h) }
+func (h *Request) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
+func (h *Request) Unmarshal(b []byte) error          { return json.Unmarshal(b, h) }
 
-// ShardResponse is the JSON envelope answering every shard stream. It is
-// newline-terminated; get responses stream BodyLen shard bytes after it.
-type ShardResponse struct {
+// Response is the JSON envelope answering every stream. It is
+// newline-terminated; get responses stream BodyLen body bytes after it.
+type Response struct {
 	Err string `json:"err,omitempty"`
-	// ShardSize echoes the committed byte count for puts.
-	ShardSize int64 `json:"shard_size,omitempty"`
+	// Size echoes the committed byte count for puts.
+	Size int64 `json:"size,omitempty"`
 	// PoolNearFull reports nearfull free-space pressure at commit time so
 	// callers can back off before writes are rejected outright.
 	PoolNearFull bool `json:"pool_near_full,omitempty"`
-	// Deleted reports whether a delete removed an existing shard.
+	// Deleted reports whether a delete removed an existing value.
 	Deleted bool `json:"deleted,omitempty"`
-	// BodyLen is the number of shard bytes following the envelope.
+	// BodyLen is the number of body bytes following the envelope.
 	BodyLen int64 `json:"body_len,omitempty"`
 }

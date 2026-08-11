@@ -15,6 +15,7 @@ import (
 
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/internal/blob"
+	"github.com/mulgadc/predastore/internal/blob/engine"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
@@ -50,7 +51,7 @@ func (w *bytesBufferWriter) Write(p []byte) (n int, err error) {
 // client. A pool-full shard write must surface as 507, not the generic 500
 // other failures get.
 func mapPutErr(err error) *model.S3Error {
-	if errors.Is(err, blob.ErrStoreFull) {
+	if errors.Is(err, engine.ErrStoreFull) {
 		return model.ErrInsufficientStorageError
 	}
 	return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
@@ -134,9 +135,9 @@ func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg C
 			nodeNum := shardNodes[idx]
 
 			putReq := blob.PutRequest{
-				ObjectHash: objectHash,
-				ShardSize:  int64(len(shardData)),
-				ShardIndex: uint32(idx), //nolint:gosec // G115: idx bounded by DataShards (small uint).
+				Key:   objectHash,
+				Size:  int64(len(shardData)),
+				Index: uint32(idx), //nolint:gosec // G115: idx bounded by DataShards (small uint).
 			}
 
 			resp, putErr := bc.Put(ctx, nodeNum, putReq, bytes.NewReader(shardData))
@@ -146,7 +147,7 @@ func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg C
 				return
 			}
 
-			dataCh <- shardWriteOutcome{shardIndex: idx, shardSize: resp.ShardSize, poolNearFull: resp.PoolNearFull}
+			dataCh <- shardWriteOutcome{shardIndex: idx, shardSize: resp.Size, poolNearFull: resp.PoolNearFull}
 		}(i, dataShardBuffers[i])
 	}
 
@@ -192,9 +193,9 @@ func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg C
 			nodeNum := shardNodes[shardIdx]
 
 			putReq := blob.PutRequest{
-				ObjectHash: objectHash,
-				ShardSize:  int64(shardSize),
-				ShardIndex: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards + ParityShards (small uint).
+				Key:   objectHash,
+				Size:  int64(shardSize),
+				Index: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards + ParityShards (small uint).
 			}
 
 			resp, putErr := bc.Put(ctx, nodeNum, putReq, r)
@@ -204,7 +205,7 @@ func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg C
 				return
 			}
 
-			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, shardSize: resp.ShardSize, poolNearFull: resp.PoolNearFull}
+			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, shardSize: resp.Size, poolNearFull: resp.PoolNearFull}
 		}(i, parityIdx, pr)
 	}
 
@@ -288,10 +289,10 @@ func shardReaders(bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, 
 		nodeNum := totalNodes[i]
 
 		objectRequest := blob.GetRequest{
-			ObjectHash: objectHash,
+			Key:        objectHash,
 			RangeStart: -1, // -1 means full shard (no range)
 			RangeEnd:   -1,
-			ShardIndex: uint32(i), // Include shard index for unique lookup
+			Index:      uint32(i), // Include shard index for unique lookup
 		}
 
 		reader, err := bc.Get(context.Background(), nodeNum, objectRequest)
@@ -415,8 +416,8 @@ func deleteObject(ctx context.Context, bc BlobClient, bucket, key string, object
 			defer wg.Done()
 
 			delReq := blob.DeleteRequest{
-				ObjectHash: objectHash,
-				ShardIndex: uint32(ns.shardIndex), //nolint:gosec // G115: shardIndex bounded by DataShards + ParityShards (small uint).
+				Key:   objectHash,
+				Index: uint32(ns.shardIndex), //nolint:gosec // G115: shardIndex bounded by DataShards + ParityShards (small uint).
 			}
 
 			resp, err := bc.Delete(ctx, ns.node, delReq)
