@@ -238,8 +238,14 @@ func (c *Config) Validate() error {
 
 	// The erasure code has no default: a substituted one would place objects
 	// the file never asked for, at a width the blob-node check below never saw.
-	if c.RS.Data <= 0 || c.RS.Parity <= 0 {
-		return fmt.Errorf("rs data and parity must be positive")
+	if c.RS.Data <= 0 || c.RS.Parity < 0 {
+		return fmt.Errorf("rs data must be positive and parity must not be negative")
+	}
+	// Zero parity is redundancy delegated to whatever sits under the blob node,
+	// which only holds while the object is one shard on one node. Striping it
+	// wider without parity makes losing any node lose every object.
+	if c.RS.Parity == 0 && c.RS.Data != 1 {
+		return fmt.Errorf("rs parity 0 requires rs data 1, got data %d", c.RS.Data)
 	}
 
 	if c.IAM != nil && isRelative(c.IAM.MasterKeyPath) {
