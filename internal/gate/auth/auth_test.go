@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/mulgadc/predastore/pkg/iampolicy"
+	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -162,6 +164,40 @@ func TestNewNATSIAMProvider_MissingMasterKeyPath(t *testing.T) {
 	})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "master_key_path is required")
+}
+
+// applyNATSOptions resolves an option slice into the nats.Options it produces,
+// so a test can assert on the settings rather than on a live connection.
+func applyNATSOptions(t *testing.T, opts []nats.Option) nats.Options {
+	t.Helper()
+	var resolved nats.Options
+	for _, opt := range opts {
+		require.NoError(t, opt(&resolved))
+	}
+	return resolved
+}
+
+// TestNATSIAMOptions_ReconnectsForever guards the defect that took every
+// authenticated S3 request out for 20 hours: with nats.go's default 60
+// attempts at 2s, a NATS restart longer than ~2 minutes closed this connection
+// permanently and no credential could be validated until predastore restarted.
+func TestNATSIAMOptions_ReconnectsForever(t *testing.T) {
+	resolved := applyNATSOptions(t, natsIAMOptions(&IAMConfig{NATSUrl: "nats://localhost:4222"}))
+
+	assert.Equal(t, -1, resolved.MaxReconnect, "a bounded retry count silently ends IAM auth")
+	assert.Equal(t, time.Second, resolved.ReconnectWait)
+	assert.NotNil(t, resolved.DisconnectedErrCB, "an outage must be visible without waiting for a request to fail")
+	assert.NotNil(t, resolved.ReconnectedCB)
+}
+
+func TestNATSIAMOptions_TokenOnlySetWhenConfigured(t *testing.T) {
+	withToken := applyNATSOptions(t, natsIAMOptions(&IAMConfig{
+		NATSUrl: "nats://localhost:4222", NATSToken: "secret",
+	}))
+	assert.Equal(t, "secret", withToken.Token)
+
+	withoutToken := applyNATSOptions(t, natsIAMOptions(&IAMConfig{NATSUrl: "nats://localhost:4222"}))
+	assert.Empty(t, withoutToken.Token)
 }
 
 // --- inline role policy resolution (resolveRolePolicies) ---

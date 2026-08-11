@@ -75,28 +75,10 @@ var (
 		StatusCode: 404,
 	}
 
-	ErrInvalidKeyError = &S3Error{
-		Code:       ErrInvalidKey,
-		Message:    "The specified key is not valid",
-		StatusCode: 400,
-	}
-
-	ErrInvalidPartError = &S3Error{
-		Code:       ErrInvalidPart,
-		Message:    "One or more of the specified parts could not be found",
-		StatusCode: 400,
-	}
-
 	ErrAccessDeniedError = &S3Error{
 		Code:       ErrAccessDenied,
 		Message:    "Access Denied",
 		StatusCode: 403,
-	}
-
-	ErrInternalServerError = &S3Error{
-		Code:       ErrInternalError,
-		Message:    "We encountered an internal error. Please try again.",
-		StatusCode: 500,
 	}
 
 	ErrInvalidRangeError = &S3Error{
@@ -115,12 +97,6 @@ var (
 		Code:       ErrBucketAlreadyOwnedByYou,
 		Message:    "Your previous request to create the named bucket succeeded and you already own it.",
 		StatusCode: 409,
-	}
-
-	ErrInvalidBucketNameError = &S3Error{
-		Code:       ErrInvalidBucketName,
-		Message:    "The specified bucket is not valid.",
-		StatusCode: 400,
 	}
 
 	ErrBucketNotEmptyError = &S3Error{
@@ -165,12 +141,4 @@ func IsS3Error(err error) (*S3Error, bool) {
 		return s3err, true
 	}
 	return nil, false
-}
-
-// GetHTTPStatus returns the HTTP status code for an error.
-func GetHTTPStatus(err error) int {
-	if s3err, ok := IsS3Error(err); ok {
-		return s3err.StatusCode
-	}
-	return 500
 }

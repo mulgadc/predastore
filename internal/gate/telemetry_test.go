@@ -32,7 +32,9 @@ func TestS3SpanMiddlewareRenamesSpan(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
-			handler := s3SpanMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+			// The span attributes come from the resolved resource, so the
+			// resolvers have to be in the chain.
+			handler := resolveRouter(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), s3SpanMiddleware)
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			ctx, span := tp.Tracer("test").Start(req.Context(), "HTTP")
 			handler.ServeHTTP(httptest.NewRecorder(), req.WithContext(ctx))

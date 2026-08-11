@@ -226,6 +226,29 @@ type NATSIAMProvider struct {
 var _ CredentialProvider = (*NATSIAMProvider)(nil)
 
 // NewNATSIAMProvider creates a provider that looks up IAM credentials from NATS KV.
+// natsIAMOptions builds the IAM connection's NATS options.
+//
+// MaxReconnects is unlimited on purpose. nats.go defaults to 60 attempts at 2s,
+// so a NATS restart lasting over ~2 minutes closes this connection for good and
+// every credential lookup fails until predastore itself is restarted.
+func natsIAMOptions(cfg *IAMConfig) []nats.Option {
+	opts := []nats.Option{
+		nats.Name("predastore-iam"),
+		nats.ReconnectWait(time.Second),
+		nats.MaxReconnects(-1),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			slog.Warn("IAM NATS disconnected; credential lookups fail until it returns", "error", err)
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			slog.Info("IAM NATS reconnected", "url", nc.ConnectedUrl())
+		}),
+	}
+	if cfg.NATSToken != "" {
+		opts = append(opts, nats.Token(cfg.NATSToken))
+	}
+	return opts
+}
+
 // The provider connects to NATS eagerly but opens KV buckets lazily — this allows
 // predastore to start before the spinifex daemon creates the IAM buckets during bootstrap.
 func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
@@ -245,13 +268,7 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 		return nil, fmt.Errorf("load master key: %w", err)
 	}
 
-	// Connect to NATS
-	opts := []nats.Option{nats.Name("predastore-iam")}
-	if cfg.NATSToken != "" {
-		opts = append(opts, nats.Token(cfg.NATSToken))
-	}
-
-	conn, err := nats.Connect(cfg.NATSUrl, opts...)
+	conn, err := nats.Connect(cfg.NATSUrl, natsIAMOptions(cfg)...)
 	if err != nil {
 		return nil, fmt.Errorf("connect to NATS: %w", err)
 	}

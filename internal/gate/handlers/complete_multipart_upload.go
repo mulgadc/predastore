@@ -12,7 +12,6 @@ import (
 	"os"
 	"sync"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
@@ -27,8 +26,11 @@ const maxParallelPartFetches = 10
 func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		bucket := chi.URLParam(r, "bucket")
-		key := chi.URLParam(r, "*")
+		resource, ok := routedObject(w, r)
+		if !ok {
+			return
+		}
+		bucket, key := resource.Bucket.Name, resource.Key
 		uploadID := r.URL.Query().Get("uploadId")
 
 		body, err := io.ReadAll(r.Body)
@@ -46,14 +48,6 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			parts[i] = model.CompletedPart{PartNumber: p.PartNumber, ETag: p.ETag}
 		}
 
-		if bucket == "" {
-			HandleError(w, r, model.ErrNoSuchBucketError.WithResource(bucket))
-			return
-		}
-		if key == "" {
-			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
-			return
-		}
 		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return

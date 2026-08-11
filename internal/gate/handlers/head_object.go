@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 )
@@ -17,8 +16,11 @@ const httpTimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
 func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		bucket := chi.URLParam(r, "bucket")
-		key := chi.URLParam(r, "*")
+		resource, ok := routedObject(w, r)
+		if !ok {
+			return
+		}
+		bucket, key := resource.Bucket.Name, resource.Key
 
 		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)

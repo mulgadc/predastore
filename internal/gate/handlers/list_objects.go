@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
@@ -20,7 +19,11 @@ const defaultMaxKeys = 1000
 func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		bucket := chi.URLParam(r, "bucket")
+		resource, ok := routedBucket(w, r)
+		if !ok {
+			return
+		}
+		bucket := resource.Name
 		query := r.URL.Query()
 
 		// Return proper errors for unsupported bucket sub-resource operations

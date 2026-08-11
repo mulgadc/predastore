@@ -259,7 +259,7 @@ func loadPlacement(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg
 
 	var objectToShardNodes ObjectToShardNodes
 	r := bytes.NewReader(data)
-	dec := gob.NewDecoder(r) //nolint:gosec // G709: the input is state this gate wrote, not client data.
+	dec := gob.NewDecoder(r)
 
 	if err := dec.Decode(&objectToShardNodes); err != nil {
 		return ObjectToShardNodes{}, 0, err

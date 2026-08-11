@@ -13,7 +13,8 @@ import (
 // for metrics. Span work is a no-op when tracing is not exporting.
 func s3SpanMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		action := s3Action(r.Method, r.URL.Path)
+		bucket, key := requestBucketKey(r.Context())
+		action := s3Action(r.Method, bucket, key)
 		if action != "" {
 			otelsetup.SetRequestAction(r.Context(), action)
 		}
@@ -22,7 +23,6 @@ func s3SpanMiddleware(next http.Handler) http.Handler {
 			if action != "" {
 				span.SetName(action)
 			}
-			bucket, key := parseS3Path(r.URL.Path)
 			if bucket != "" {
 				span.SetAttributes(attribute.String("s3.bucket", bucket))
 			}

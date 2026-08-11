@@ -203,7 +203,7 @@ func runMiddleware(t *testing.T, server *Server, req *http.Request) (status int,
 		nextCalled = true
 		w.WriteHeader(http.StatusOK)
 	})
-	server.sigV4AuthMiddleware(next).ServeHTTP(rr, req)
+	resolveRouter(next, server.sigV4AuthMiddleware).ServeHTTP(rr, req)
 	b, _ := io.ReadAll(rr.Body)
 	return rr.Code, nextCalled, string(b)
 }

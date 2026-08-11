@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
@@ -17,17 +16,12 @@ import (
 func CreateMultipartUpload(mc MetaClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		bucket := chi.URLParam(r, "bucket")
-		key := chi.URLParam(r, "*")
+		resource, ok := routedObject(w, r)
+		if !ok {
+			return
+		}
+		bucket, key := resource.Bucket.Name, resource.Key
 
-		if bucket == "" {
-			HandleError(w, r, model.ErrNoSuchBucketError.WithResource(bucket))
-			return
-		}
-		if key == "" {
-			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
-			return
-		}
 		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return

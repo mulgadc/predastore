@@ -55,7 +55,7 @@ func TestValidatePartSize(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidatePartSize(tt.size, tt.isLastPart)
+			err := validatePartSize(tt.size, tt.isLastPart)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {
@@ -80,7 +80,7 @@ func TestValidatePartsCount(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidatePartsCount(tt.count)
+			err := validatePartsCount(tt.count)
 			if tt.wantErr {
 				assert.Error(t, err)
 			} else {

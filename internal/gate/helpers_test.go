@@ -12,6 +12,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/auth"
@@ -19,6 +21,28 @@ import (
 	"github.com/mulgadc/predastore/internal/testcerts"
 	"github.com/stretchr/testify/require"
 )
+
+// resolveRouter mirrors setupRoutes' group structure, terminating every route
+// shape in next rather than a real handler. Middleware tests must route through
+// chi, because the resolvers read the URL parameters a match produces.
+func resolveRouter(next http.Handler, mws ...func(http.Handler) http.Handler) http.Handler {
+	r := chi.NewRouter()
+	r.Use(middleware.StripSlashes)
+
+	r.Group(func(r chi.Router) {
+		r.Use(mws...)
+		r.Method(http.MethodGet, "/", next)
+	})
+	r.Group(func(r chi.Router) {
+		r.Use(append([]func(http.Handler) http.Handler{resolveBucket}, mws...)...)
+		r.Handle("/{bucket}", next)
+	})
+	r.Group(func(r chi.Router) {
+		r.Use(append([]func(http.Handler) http.Handler{resolveObject}, mws...)...)
+		r.Handle("/{bucket}/*", next)
+	})
+	return r
+}
 
 // signOpts configures signTestReq.
 type signOpts struct{ signingTime time.Time }

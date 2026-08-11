@@ -2,15 +2,17 @@ package handlers
 
 import (
 	"net/http"
-
-	"github.com/go-chi/chi/v5"
 )
 
 // HeadBucket serves HEAD /{bucket}: existence plus the bucket's region.
 func HeadBucket(mc MetaClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		bucket := chi.URLParam(r, "bucket")
+		resource, ok := routedBucket(w, r)
+		if !ok {
+			return
+		}
+		bucket := resource.Name
 
 		meta, err := lookupBucket(ctx, mc, cache, bucket)
 		if err != nil {

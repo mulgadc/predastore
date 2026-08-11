@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
@@ -18,7 +17,11 @@ import (
 func CreateBucket(mc MetaClient, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		bucket := chi.URLParam(r, "bucket")
+		resource, ok := routedBucket(w, r)
+		if !ok {
+			return
+		}
+		bucket := resource.Name
 
 		// PUT /{bucket}?policy — bucket policies are not supported
 		if r.URL.Query().Has("policy") {
@@ -39,11 +42,6 @@ func CreateBucket(mc MetaClient, cache *BucketCache, cfg Config) http.Handler {
 		}
 		if region == "" {
 			region = "us-east-1"
-		}
-
-		if err := model.IsValidBucketName(bucket); err != nil {
-			HandleError(w, r, model.ErrInvalidBucketNameError.WithResource(bucket))
-			return
 		}
 
 		// An existing bucket is reported differently depending on who owns it, so

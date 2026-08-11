@@ -5,7 +5,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/attribute"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 )
 
@@ -36,8 +36,8 @@ func (p *utf8Processor) OnEmit(ctx context.Context, record *sdklog.Record) error
 	}
 
 	var dirty bool
-	record.WalkAttributes(func(kv log.KeyValue) bool {
-		if !utf8.ValidString(kv.Key) {
+	record.WalkAttributes(func(kv attribute.KeyValue) bool {
+		if !utf8.ValidString(string(kv.Key)) {
 			dirty = true
 			return false
 		}
@@ -48,10 +48,10 @@ func (p *utf8Processor) OnEmit(ctx context.Context, record *sdklog.Record) error
 		return true
 	})
 	if dirty {
-		attrs := make([]log.KeyValue, 0, record.AttributesLen())
-		record.WalkAttributes(func(kv log.KeyValue) bool {
+		attrs := make([]attribute.KeyValue, 0, record.AttributesLen())
+		record.WalkAttributes(func(kv attribute.KeyValue) bool {
 			v, _ := sanitizeValue(kv.Value)
-			attrs = append(attrs, log.KeyValue{Key: sanitizeString(kv.Key), Value: v})
+			attrs = append(attrs, attribute.KeyValue{Key: attribute.Key(sanitizeString(string(kv.Key))), Value: v})
 			return true
 		})
 		record.SetAttributes(attrs...)
@@ -81,22 +81,33 @@ func sanitizeString(s string) string {
 	return strings.ToValidUTF8(s, replacementRune)
 }
 
-// sanitizeValue recurses through string, slice, and map values, returning the
-// sanitised value and whether anything changed. Non-string scalars (bool, int,
-// float, bytes) pass through untouched — bytes marshal as a protobuf `bytes`
-// field, which permits arbitrary octets.
-func sanitizeValue(v log.Value) (log.Value, bool) {
-	switch v.Kind() {
-	case log.KindString:
+// sanitizeValue recurses through string, string-slice, slice and map values,
+// returning the sanitised value and whether anything changed. Non-string scalars
+// pass through — bytes marshal as a protobuf `bytes`, which permits any octet.
+func sanitizeValue(v attribute.Value) (attribute.Value, bool) {
+	switch v.Type() {
+	case attribute.STRING:
 		s := v.AsString()
 		if utf8.ValidString(s) {
 			return v, false
 		}
-		return log.StringValue(strings.ToValidUTF8(s, replacementRune)), true
-	case log.KindSlice:
+		return attribute.StringValue(strings.ToValidUTF8(s, replacementRune)), true
+	case attribute.STRINGSLICE:
+		elems := v.AsStringSlice()
+		var changed bool
+		out := make([]string, len(elems))
+		for i, e := range elems {
+			out[i] = sanitizeString(e)
+			changed = changed || out[i] != e
+		}
+		if !changed {
+			return v, false
+		}
+		return attribute.StringSliceValue(out), true
+	case attribute.SLICE:
 		elems := v.AsSlice()
 		var changed bool
-		out := make([]log.Value, len(elems))
+		out := make([]attribute.Value, len(elems))
 		for i, e := range elems {
 			sv, c := sanitizeValue(e)
 			out[i] = sv
@@ -105,25 +116,25 @@ func sanitizeValue(v log.Value) (log.Value, bool) {
 		if !changed {
 			return v, false
 		}
-		return log.SliceValue(out...), true
-	case log.KindMap:
+		return attribute.SliceValue(out...), true
+	case attribute.MAP:
 		kvs := v.AsMap()
 		var changed bool
-		out := make([]log.KeyValue, len(kvs))
+		out := make([]attribute.KeyValue, len(kvs))
 		for i, kv := range kvs {
 			sv, c := sanitizeValue(kv.Value)
-			key := kv.Key
+			key := string(kv.Key)
 			if !utf8.ValidString(key) {
 				key = strings.ToValidUTF8(key, replacementRune)
 				c = true
 			}
-			out[i] = log.KeyValue{Key: key, Value: sv}
+			out[i] = attribute.KeyValue{Key: attribute.Key(key), Value: sv}
 			changed = changed || c
 		}
 		if !changed {
 			return v, false
 		}
-		return log.MapValue(out...), true
+		return attribute.MapValue(out...), true
 	default:
 		return v, false
 	}

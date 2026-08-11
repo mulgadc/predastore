@@ -2,7 +2,6 @@ package gate
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
@@ -30,23 +29,8 @@ func bucketAccessAllowed(method, callerAccountID string, meta *model.BucketMetad
 	return false
 }
 
-// parseS3Path splits an S3 request URL path into bucket and object key. Returns
-// ("", "") for the root (ListAllMyBuckets) and (bucket, "") for bucket-level
-// requests. A trailing slash after the bucket is treated as bucket-only.
-func parseS3Path(path string) (bucket, key string) {
-	cleanPath := strings.TrimPrefix(path, "/")
-	if cleanPath == "" {
-		return "", ""
-	}
-	if before, after, ok := strings.Cut(cleanPath, "/"); ok {
-		return before, after
-	}
-	return cleanPath, ""
-}
-
-// s3Action maps HTTP method + path to the corresponding IAM S3 action.
-func s3Action(method, path string) string {
-	bucket, key := parseS3Path(path)
+// s3Action maps an HTTP method and the resolved bucket/key to the IAM S3 action.
+func s3Action(method, bucket, key string) string {
 	hasKey := key != ""
 
 	switch method {
@@ -80,16 +64,15 @@ func s3Action(method, path string) string {
 	}
 }
 
-// s3Resource builds the ARN for the resource being accessed.
-func s3Resource(path string) string {
-	cleanPath := strings.TrimPrefix(path, "/")
-	if cleanPath == "" {
+// s3Resource builds the ARN for the resolved bucket/key.
+func s3Resource(bucket, key string) string {
+	if bucket == "" {
 		// ListAllMyBuckets — use ARN wildcard so policies with
 		// Resource: "arn:aws:s3:::*" match correctly.
 		return "arn:aws:s3:::*"
 	}
-
-	// For bucket-level operations: arn:aws:s3:::bucket-name
-	// For object-level operations: arn:aws:s3:::bucket-name/key
-	return "arn:aws:s3:::" + cleanPath
+	if key == "" {
+		return "arn:aws:s3:::" + bucket
+	}
+	return "arn:aws:s3:::" + bucket + "/" + key
 }

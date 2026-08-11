@@ -61,8 +61,8 @@ func ValidatePartNumber(partNumber int) error {
 	return nil
 }
 
-// ValidatePartSize validates part size for non-last parts.
-func ValidatePartSize(size int64, isLastPart bool) error {
+// validatePartSize validates part size for non-last parts.
+func validatePartSize(size int64, isLastPart bool) error {
 	if size > MaxPartSize {
 		return NewS3Error(
 			ErrEntityTooLarge,
@@ -80,8 +80,8 @@ func ValidatePartSize(size int64, isLastPart bool) error {
 	return nil
 }
 
-// ValidatePartsCount validates the number of parts.
-func ValidatePartsCount(count int) error {
+// validatePartsCount validates the number of parts.
+func validatePartsCount(count int) error {
 	if count < 1 {
 		return NewS3Error(
 			ErrInvalidPart,
@@ -102,7 +102,7 @@ func ValidatePartsCount(count int) error {
 // ValidatePartsForCompletion validates parts array for CompleteMultipartUpload
 // Parts must be in ascending order by part number and all referenced parts must exist.
 func ValidatePartsForCompletion(requestedParts []CompletedPart, storedParts []PartMetadata) error {
-	if err := ValidatePartsCount(len(requestedParts)); err != nil {
+	if err := validatePartsCount(len(requestedParts)); err != nil {
 		return err
 	}
 
@@ -143,7 +143,7 @@ func ValidatePartsForCompletion(requestedParts []CompletedPart, storedParts []Pa
 
 		// Validate part size (all except last must be >= MinPartSize)
 		isLastPart := i == len(requestedParts)-1
-		if err := ValidatePartSize(stored.Size, isLastPart); err != nil {
+		if err := validatePartSize(stored.Size, isLastPart); err != nil {
 			return NewS3Error(
 				ErrEntityTooSmall,
 				fmt.Sprintf("Part %d is too small (%d bytes)", part.PartNumber, stored.Size),

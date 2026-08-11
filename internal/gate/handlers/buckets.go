@@ -74,7 +74,7 @@ func lookupBucket(ctx context.Context, mc MetaClient, cache *BucketCache, bucket
 	}
 
 	var metadata model.BucketMetadata
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&metadata); err != nil { //nolint:gosec // G709: the input is state this gate wrote, not client data.
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&metadata); err != nil {
 		return nil, model.NewS3Error(model.ErrInternalError, "failed to decode bucket metadata: "+err.Error(), 500)
 	}
 	return &metadata, nil
@@ -99,7 +99,7 @@ func bucketExists(ctx context.Context, mc MetaClient, cache *BucketCache, bucket
 		// Not found in global state, check the cached buckets below.
 	} else if len(data) > 0 {
 		var metadata model.BucketMetadata
-		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&metadata); err != nil { //nolint:gosec // G709: the input is state this gate wrote, not client data.
+		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&metadata); err != nil {
 			return false, "", err
 		}
 		return true, metadata.OwnerID, nil

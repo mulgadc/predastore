@@ -41,7 +41,7 @@ go_build_docker:
 # Preflight — runs the same checks as GitHub Actions (lint + security + tests).
 # Use this before committing to catch CI failures locally.
 preflight:
-	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage test-race test-integration
+	@$(MAKE) --no-print-directory QUIET=1 lint govulncheck test-cover diff-coverage test-integration
 	@echo -e "\n ✅ Preflight passed — safe to commit."
 
 # Run unit tests

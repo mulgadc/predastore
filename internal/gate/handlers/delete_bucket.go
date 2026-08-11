@@ -3,7 +3,6 @@ package handlers
 import (
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
@@ -12,7 +11,11 @@ import (
 func DeleteBucket(mc MetaClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		bucket := chi.URLParam(r, "bucket")
+		resource, ok := routedBucket(w, r)
+		if !ok {
+			return
+		}
+		bucket := resource.Name
 
 		// DELETE /{bucket}?policy — no-op, bucket policies are not supported
 		if r.URL.Query().Has("policy") {

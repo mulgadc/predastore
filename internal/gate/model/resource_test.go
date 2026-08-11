@@ -6,7 +6,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestIsValidKeyName(t *testing.T) {
+func TestObjectValidateKey(t *testing.T) {
 	tests := []struct {
 		name    string
 		key     []byte
@@ -22,7 +22,7 @@ func TestIsValidKeyName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := IsValidKeyName(string(tt.key))
+			err := Object{Bucket: Bucket{Name: "valid-bucket"}, Key: string(tt.key)}.Validate()
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 			} else {
@@ -33,7 +33,7 @@ func TestIsValidKeyName(t *testing.T) {
 	}
 }
 
-func TestIsValidBucketName(t *testing.T) {
+func TestBucketValidate(t *testing.T) {
 	tests := []struct {
 		name    string
 		bucket  string
@@ -49,10 +49,10 @@ func TestIsValidBucketName(t *testing.T) {
 		{"valid multiple periods", "my-bucket-with-multiple.periods.here.and.there", ""},
 
 		// Length violations
-		{"too short empty", "", "> 3 characters"},
-		{"too short 1 char", "a", "> 3 characters"},
-		{"too short 2 chars", "ab", "> 3 characters"},
-		{"too long 64 chars", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "< 63 characters"},
+		{"too short empty", "", "at least 3 characters"},
+		{"too short 1 char", "a", "at least 3 characters"},
+		{"too short 2 chars", "ab", "at least 3 characters"},
+		{"too long 64 chars", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "at most 63 characters"},
 
 		// Character rules
 		{"uppercase letters", "MyBucket", "lowercase letters"},
@@ -86,7 +86,7 @@ func TestIsValidBucketName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := IsValidBucketName(tt.bucket)
+			err := Bucket{Name: tt.bucket}.Validate()
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 			} else {

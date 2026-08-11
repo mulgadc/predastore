@@ -209,7 +209,7 @@ func Load(path string) (*Config, error) {
 	// is still serviceable and the operator gets a warning.
 	buckets := make([]Bucket, 0, len(cfg.Buckets))
 	for _, b := range cfg.Buckets {
-		if err := model.IsValidBucketName(b.Name); err != nil {
+		if err := (model.Bucket{Name: b.Name}).Validate(); err != nil {
 			slog.Warn("Invalid bucket name", "bucket", b.Name, "error", err)
 			continue
 		}

@@ -74,31 +74,6 @@ func TestIsS3Error(t *testing.T) {
 	assert.Nil(t, result)
 }
 
-func TestGetHTTPStatus(t *testing.T) {
-	tests := []struct {
-		name     string
-		err      error
-		expected int
-	}{
-		{
-			name:     "S3Error with status",
-			err:      &S3Error{Code: ErrNoSuchBucket, StatusCode: 404},
-			expected: 404,
-		},
-		{
-			name:     "regular error",
-			err:      errors.New("regular error"),
-			expected: 500,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, GetHTTPStatus(tt.err))
-		})
-	}
-}
-
 func TestPredefinedErrors(t *testing.T) {
 	tests := []struct {
 		err        *S3Error
@@ -108,10 +83,7 @@ func TestPredefinedErrors(t *testing.T) {
 		{ErrNoSuchBucketError, ErrNoSuchBucket, 404},
 		{ErrNoSuchKeyError, ErrNoSuchKey, 404},
 		{ErrNoSuchUploadError, ErrNoSuchUpload, 404},
-		{ErrInvalidKeyError, ErrInvalidKey, 400},
-		{ErrInvalidPartError, ErrInvalidPart, 400},
 		{ErrAccessDeniedError, ErrAccessDenied, 403},
-		{ErrInternalServerError, ErrInternalError, 500},
 		{ErrInvalidRangeError, ErrInvalidRange, 416},
 	}
 
