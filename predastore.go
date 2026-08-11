@@ -131,13 +131,14 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 
 	// The pipe carries traffic between colocated nodes and the QUIC socket
 	// traffic to other hosts, so each exists only when the cluster puts a peer
-	// on the other end of it.
+	// on the other end of it. Both are the cluster plane and bind the host's
+	// address; only the gate's S3 listener may be given a public one.
 	var trs []transport.Transport
 	if len(host.Nodes) > 1 {
 		trs = append(trs, transport.NewPipeTransport(host.Addr, port))
 	}
 	if hasRemoteNodes(cfg, host.ID) {
-		quic, qerr := transport.NewQUICTransport(host.BindAddr, port, host.TLSCert, host.TLSKey)
+		quic, qerr := transport.NewQUICTransport(config.HostBindAddr(host), port, host.TLSCert, host.TLSKey)
 		if qerr != nil {
 			return nil, nil, fmt.Errorf("node %d quic transport: %w", n.ID, qerr)
 		}

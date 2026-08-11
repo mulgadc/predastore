@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="596" viewBox="0 0 1000 596" role="img" aria-label="Predastore GET object path: the gate reads the recorded placement from the Raft metadata plane, fetches the data shards from their blob nodes in parallel, joins them, and falls back to fetching parity and Reed-Solomon reconstruction when a shard is missing or fails its integrity check.">
+<rect x="0" y="0" width="1000" height="596" rx="20" fill="#14181D" stroke="#2A2F36" stroke-width="1"/>
+
+<text x="28" y="42" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11.5" fill="#F5B500" font-weight="600" letter-spacing="2.5">GET OBJECT</text>
+<text x="972" y="42" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11.5" fill="#9AA1A8" text-anchor="end">data shards first, parity only on failure</text>
+<text x="28" y="72" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="21" fill="#F5F3EE" font-weight="800">Read K shards, join, reconstruct if you must.</text>
+
+<rect x="28" y="88" width="944" height="52" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1"/>
+<text x="48" y="112" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#9AA1A8" font-weight="700" letter-spacing="1.5">S3 CLIENT</text>
+<text x="48" y="130" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11.5" fill="#5B636C">aws s3 cp s3://my-bucket/file.txt ./file.txt</text>
+<rect x="742" y="103" width="210" height="22" rx="7" fill="none" stroke="#2A2F36" stroke-width="1"/><text x="847" y="118" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#9AA1A8" text-anchor="middle">GET · optional Range</text>
+
+<line x1="500" y1="140" x2="500" y2="168" stroke="#F5B500" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="494,166 506,166 500,175" fill="#F5B500" fill-opacity="0.6"/>
+
+<rect x="28" y="176" width="608" height="96" rx="13" fill="#181D23" stroke="#F5B500" stroke-width="1" stroke-opacity="0.35"/>
+<text x="48" y="202" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#F5B500" font-weight="700" letter-spacing="1.5">GATE</text>
+<text x="616" y="202" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">internal/gate/handlers/get_object.go</text>
+<text x="48" y="226" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11.5" fill="#9AA1A8">1 · authenticate, resolve the bucket and key</text>
+<text x="48" y="246" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11.5" fill="#9AA1A8">2 · hash the name, read the recorded placement</text>
+<text x="48" y="264" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11.5" fill="#5B636C">the placement carries the object size, which the join needs</text>
+
+<rect x="664" y="176" width="308" height="96" rx="13" fill="#181D23" stroke="#5AA9E6" stroke-width="1" stroke-opacity="0.35"/>
+<text x="684" y="202" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#5AA9E6" font-weight="700" letter-spacing="1.5">META</text>
+<text x="952" y="202" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">any replica answers</text>
+<text x="684" y="226" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10.5" fill="#9AA1A8">objects/&lt;hash&gt; → gob placement</text>
+<text x="684" y="246" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11.5" fill="#9AA1A8">cached leader first, then every replica</text>
+<text x="684" y="264" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11.5" fill="#5B636C">a follower read may be stale</text>
+<line x1="636" y1="224" x2="662" y2="224" stroke="#5AA9E6" stroke-width="1.2" stroke-opacity="0.6" stroke-dasharray="3 3"/><polygon points="642,220 642,228 634,224" fill="#5AA9E6" fill-opacity="0.7"/><polygon points="656,220 656,228 664,224" fill="#5AA9E6" fill-opacity="0.7"/>
+
+<line x1="176" y1="272" x2="176" y2="300" stroke="#3FB950" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="170,298 182,298 176,307" fill="#3FB950" fill-opacity="0.6"/>
+<line x1="500" y1="272" x2="500" y2="300" stroke="#3FB950" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="494,298 506,298 500,307" fill="#3FB950" fill-opacity="0.6"/>
+<line x1="824" y1="272" x2="824" y2="300" stroke="#9AA1A8" stroke-width="1.2" stroke-opacity="0.4" stroke-dasharray="3 3"/><polygon points="818,298 830,298 824,307" fill="#9AA1A8" fill-opacity="0.5"/>
+
+<rect x="28" y="308" width="296" height="112" rx="13" fill="#181D23" stroke="#3FB950" stroke-width="1" stroke-opacity="0.35"/>
+<text x="48" y="332" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#3FB950" font-weight="700">blob · shard 0</text>
+<line x1="48" y1="342" x2="304" y2="342" stroke="#2A2F36" stroke-width="1"/>
+<text x="48" y="364" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">index row → extent</text>
+<text x="48" y="384" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">batched ReadAt, GCM open in place</text>
+<text x="48" y="404" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">a ranged read stops at the range</text>
+
+<rect x="352" y="308" width="296" height="112" rx="13" fill="#181D23" stroke="#3FB950" stroke-width="1" stroke-opacity="0.35"/>
+<text x="372" y="332" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#3FB950" font-weight="700">blob · shard 1</text>
+<line x1="372" y1="342" x2="628" y2="342" stroke="#2A2F36" stroke-width="1"/>
+<text x="372" y="364" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">missing row → not-found</text>
+<text x="372" y="384" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">failed tag → integrity error</text>
+<text x="372" y="404" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">either way the shard is unreadable</text>
+
+<rect x="676" y="308" width="296" height="112" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="696" y="332" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#9AA1A8" font-weight="700">blob · parity</text>
+<text x="952" y="332" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">fallback only</text>
+<line x1="696" y1="342" x2="952" y2="342" stroke="#2A2F36" stroke-width="1"/>
+<text x="696" y="364" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">not touched while the join succeeds</text>
+<text x="696" y="384" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">fetched when a data shard is absent</text>
+<text x="696" y="404" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">any K of K+M shards rebuild the object</text>
+
+<line x1="176" y1="420" x2="176" y2="444" stroke="#3FB950" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="170,442 182,442 176,451" fill="#3FB950" fill-opacity="0.6"/>
+<line x1="500" y1="420" x2="500" y2="444" stroke="#3FB950" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="494,442 506,442 500,451" fill="#3FB950" fill-opacity="0.6"/>
+<line x1="824" y1="420" x2="824" y2="444" stroke="#9AA1A8" stroke-width="1.2" stroke-opacity="0.4" stroke-dasharray="3 3"/><polygon points="818,442 830,442 824,451" fill="#9AA1A8" fill-opacity="0.5"/>
+
+<rect x="28" y="452" width="944" height="60" rx="13" fill="#181D23" stroke="#F5B500" stroke-width="1" stroke-opacity="0.35"/>
+<text x="48" y="476" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#F5B500" font-weight="700" letter-spacing="1.5">JOIN · RECONSTRUCT</text>
+<text x="48" y="496" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">Join the data shards to the recorded size. A failed join refetches with parity and rebuilds the missing shards.</text>
+<rect x="768" y="470" width="184" height="26" rx="7" fill="#F5B500" fill-opacity="0.14"/><text x="860" y="487" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10.5" fill="#F5B500" text-anchor="middle">fewer than K valid → 500</text>
+
+<line x1="500" y1="512" x2="500" y2="536" stroke="#F5B500" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="494,534 506,534 500,543" fill="#F5B500" fill-opacity="0.6"/>
+
+<rect x="28" y="544" width="944" height="34" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1"/>
+<text x="48" y="566" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11.5" fill="#9AA1A8">200 OK with the whole object, or 206 Partial Content with the requested range.</text>
+<text x="952" y="566" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10.5" fill="#5B636C" text-anchor="end">the response is assembled in memory</text>
+</svg>

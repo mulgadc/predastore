@@ -9,10 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
-	"sync"
 
-	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 )
@@ -63,7 +60,22 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to retrieve parts", 500))
 			return
 		}
+		// A completion naming no parts means "use everything uploaded". AWS
+		// rejects that, but MinIO accepts it and clients written against MinIO
+		// rely on it. Honouring it costs nothing: a client that does send a
+		// list is still held to that list exactly.
+		if len(parts) == 0 && len(storedParts) > 0 {
+			parts = make([]model.CompletedPart, len(storedParts))
+			for i, p := range storedParts {
+				parts[i] = model.CompletedPart{PartNumber: p.PartNumber, ETag: p.ETag}
+			}
+		}
+
 		if err := model.ValidatePartsForCompletion(parts, storedParts); err != nil {
+			// A rejected completion is a client-visible 400 and nothing else,
+			// so without this the upload simply disappears from the logs.
+			slog.WarnContext(ctx, "Multipart completion rejected",
+				"uploadID", uploadID, "requested", len(parts), "stored", len(storedParts), "error", err)
 			HandleError(w, r, err)
 			return
 		}
@@ -73,87 +85,28 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			storedMap[p.PartNumber] = p
 		}
 
-		// Assemble the parts into a temp file, which is then written exactly as a
-		// single-shot PutObject would write it.
-		tmpFile, err := os.CreateTemp("", "multipart-complete-*")
-		if err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to create temp file", 500))
-			return
-		}
-		defer os.Remove(tmpFile.Name())
-		defer tmpFile.Close()
-
+		// Validation has already established that every requested part exists,
+		// so the final size is known without assembling anything to measure.
 		partETags := make([]string, len(parts))
-		partData := make([][]byte, len(parts))
-
-		type partResult struct {
-			index int
-			data  []byte
-			err   error
-		}
-		resultChan := make(chan partResult, len(parts))
-		semaphore := make(chan struct{}, maxParallelPartFetches)
-
-		var wg sync.WaitGroup
+		var finalSize int64
 		for i, part := range parts {
 			partETags[i] = model.NormalizeETag(storedMap[part.PartNumber].ETag)
-
-			wg.Add(1)
-			go func(idx int, partNum int) {
-				defer wg.Done()
-				semaphore <- struct{}{}
-				defer func() { <-semaphore }()
-
-				data, err := getPartData(ctx, mc, bc, cfg, bucket, key, uploadID, partNum)
-				resultChan <- partResult{index: idx, data: data, err: err}
-			}(i, part.PartNumber)
+			finalSize += storedMap[part.PartNumber].Size
 		}
 
-		go func() {
-			wg.Wait()
-			close(resultChan)
-		}()
-
-		for result := range resultChan {
-			if result.err != nil {
-				slog.ErrorContext(ctx, "Failed to retrieve part data", "uploadID", uploadID, "index", result.index, "error", result.err)
-				HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to retrieve part data", 500))
-				return
-			}
-			partData[result.index] = result.data
-		}
-
-		for _, data := range partData {
-			if _, err := tmpFile.Write(data); err != nil {
-				HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to write assembled data", 500))
-				return
-			}
-		}
-		if closeErr := tmpFile.Close(); closeErr != nil {
-			slog.DebugContext(ctx, "Failed to close temp file", "path", tmpFile.Name(), "error", closeErr)
-		}
-
-		finalInfo, err := os.Stat(tmpFile.Name())
-		if err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to get final object size", 500))
-			return
-		}
-
-		assembled, err := os.Open(tmpFile.Name())
-		if err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to reopen assembled object", 500))
-			return
-		}
+		// The parts are streamed into the write path in order, so the assembled
+		// object is erasure coded as it is read back rather than staged whole.
+		assembled := streamParts(ctx, mc, bc, cfg, bucket, key, uploadID, parts)
 		defer assembled.Close()
 
 		objectHash := model.ObjectHash(bucket, key)
-		if _, err := writeObject(ctx, bc, ring, cfg, assembled, finalInfo.Size(), objectHash); err != nil {
+		if _, err := writeObject(ctx, bc, ring, cfg, assembled, finalSize, objectHash); err != nil {
 			slog.ErrorContext(ctx, "Failed to store final object", "uploadID", uploadID, "error", err)
 			HandleError(w, r, mapPutErr(err))
 			return
 		}
 
-		place, err := placeShards(ring, cfg, objectHash, finalInfo.Size())
+		place, err := placeShards(ring, cfg, objectHash, finalSize)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to get shard placement", 500))
 			return
@@ -191,7 +144,79 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 	})
 }
 
-// getPartData reads one part back from its shards.
+// streamParts reads the parts back and writes them, in order, to the returned
+// reader. Parts are fetched concurrently but only a bounded number are held at
+// once: a fetch cannot start until the writer has consumed an earlier part, so
+// completion stays parallel without ever holding the whole object.
+//
+// The caller must Close the reader. Closing it unblocks the writer and cancels
+// any fetch still in flight, which is what stops an abandoned completion from
+// leaking goroutines.
+func streamParts(
+	ctx context.Context, mc MetaClient, bc BlobClient, cfg Config,
+	bucket, key, uploadID string, parts []model.CompletedPart,
+) *io.PipeReader {
+	type fetched struct {
+		data []byte
+		err  error
+	}
+
+	pr, pw := io.Pipe()
+
+	go func() {
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		// One slot per part in flight. The writer returns a slot after it has
+		// consumed a part, which is what bounds the window.
+		slots := make(chan struct{}, maxParallelPartFetches)
+		results := make([]chan fetched, len(parts))
+		for i := range results {
+			results[i] = make(chan fetched, 1)
+		}
+
+		go func() {
+			for i, part := range parts {
+				select {
+				case slots <- struct{}{}:
+				case <-ctx.Done():
+					return
+				}
+				go func(idx, partNumber int) {
+					data, err := getPartData(ctx, mc, bc, cfg, bucket, key, uploadID, partNumber)
+					results[idx] <- fetched{data: data, err: err}
+				}(i, part.PartNumber)
+			}
+		}()
+
+		for i := range parts {
+			var res fetched
+			select {
+			case res = <-results[i]:
+			case <-ctx.Done():
+				_ = pw.CloseWithError(ctx.Err())
+				return
+			}
+			if res.err != nil {
+				_ = pw.CloseWithError(res.err)
+				return
+			}
+			if _, err := pw.Write(res.data); err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+			<-slots
+		}
+		_ = pw.Close()
+	}()
+
+	return pr
+}
+
+// getPartData reads one part back from its shards. A part is an object under a
+// hidden key, so it is read exactly as GET reads one: the data shards are
+// joined directly, and parity is only pulled in if that join fails. Going
+// straight to reconstruction would read every shard twice for every part.
 func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, bucket, key, uploadID string, partNumber int) ([]byte, error) {
 	data, err := metaGet(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber))
 	if err != nil {
@@ -203,16 +228,5 @@ func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, 
 		return nil, err
 	}
 
-	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Reed-Solomon decoder: %w", err)
-	}
-
-	partKey := partObjectKey(key, uploadID, partNumber)
-	buf, err := reconstructObject(ctx, bc, model.ObjectHash(bucket, partKey), place, enc, place.Size)
-	if err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
+	return readObject(ctx, bc, cfg, bucket, partObjectKey(key, uploadID, partNumber), place, place.Size)
 }

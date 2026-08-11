@@ -1,125 +1,151 @@
 # Predastore Roadmap
 
-Gaps between [DESIGN.md](./DESIGN.md) and the current codebase, plus longer-horizon work. DESIGN covers the intended architecture and rationale; this file tracks the distance to it.
+Work not yet done. [DESIGN.md](./DESIGN.md) describes what the code does today, and its §15 lists the gaps between that and the intended architecture; this file is the plan for closing them, plus longer-horizon work.
 
-Items become `bd` issues when claimed. Priority below is rough ordering, not a queue.
+Items become `bd` issues when claimed. The ordering below is rough priority, not a queue.
 
 ---
 
 ## Performance
 
-The lock-free segment write path is sound at 3-node, c=10, 1 MiB warp-mixed: PUT ~53 MiB/s, p50 ~83 ms. Per-PUT timing instrumentation (since reverted) showed the floor is **two synchronous Raft writes** (`globalState.Set` ×2) to the s3db cluster on the critical path of every PUT, ~40 ms median combined. The per-shard segment fsync (~9 ms) and per-node store-index Badger writes (~60 µs) are not the bottleneck. Items below are ordered by expected ROI.
+The measurements below were taken on the pre-refactor tree (3 nodes, warp mixed, c=10, 1 MiB objects): PUT ~53 MiB/s, p50 ~83 ms. Per-PUT instrumentation put the floor at **two synchronous Raft commits** on the critical path of every PUT, ~40 ms median combined. The per-shard segment fsync (~9 ms) and the per-node index writes (~60 µs) were not the bottleneck.
 
-### Raft-side BatchSet for metadata commits
+Transport and package names have changed since — the two commits are now `metaPut` calls from `internal/gate/handlers/put_object.go` — but nothing in the refactor moved the metadata commits off the critical path, so the ordering below still holds. Re-measure with `./scripts/bench.sh 3host` before claiming any of it.
 
-S3 PutObject commits two keys to the s3db cluster after shards land: `objectHash → shard metadata` and `arnKey → objectHash`. Today they go as two separate `client.Put` calls — two Raft round-trips, two majority fsyncs. Add a server-side batch endpoint and route both keys through a single Raft proposal.
+### Batch the two metadata commits
 
-- Extend `s3db.Client` with a batch Put.
-- Add the matching FSM apply (single `Update` txn writing both keys).
-- Wire `GlobalState.BatchSet` (interface already sketched and reverted) through `DistributedState`.
-- Update `PutObject` and `CompleteMultipartUpload` callers.
+`PutObject` writes two keys after the shards land: `objects/<hash> → placement` and `objects/<arn> → hash`. They go as two separate `Put` calls, which is two Raft round-trips and two majority fsyncs for one object.
 
-Expected savings: ~20 ms median per PUT (one Raft round-trip).
+- Add a batch opcode alongside `OpMetaPut`, carrying several key-value pairs in one header.
+- Add the matching FSM command type, applying all pairs in a single badger `Update` txn.
+- Extend `meta.Client` with the batch call, and route both keys through it.
+- Update `PutObject` and `CompleteMultipartUpload`.
 
-### Eliminate the per-PUT temp file in `distributed.PutObject`
+Expected saving: ~20 ms median per PUT, one Raft round-trip.
 
-The body is currently spooled to `/tmp/distributed-put-*`, then re-opened inside `putObjectViaQUIC` and read back to populate `dataShardBuffers` for RS split. On tmpfs this is invisible; on a real disk it's two unnecessary disk hops on every PUT. Stream the request body directly into the data shard buffers (the RS streaming encoder accepts an `io.Reader`).
+### Overlap the parity send with the data send
 
-- Remove `os.CreateTemp` + `io.Copy(tmpFile, reader)` from `PutObject`.
-- Pass the body reader to a new `putObjectViaQUIC` signature that takes `io.Reader` and `size int64` instead of a path.
-- Make the existing `bytesBufferWriter` path the only path.
+In `writeObject` (`internal/gate/handlers/shards.go`), the parity goroutines and `enc.Encode` only start once every data shard has finished uploading, even though the encoder reads the already-populated `dataShardBuffers` and the parity sends are independent of the data sends.
 
-### Overlap parity send with data send
+- Spawn the parity goroutines and start `enc.Encode` as soon as `enc.Split` returns, in parallel with the data-shard send loop.
+- Wait on both sets at the end, keeping the current first-error semantics.
 
-In `putObjectViaQUIC`, parity goroutines and `enc.Encode` start only after all data shards have fully uploaded, even though the encoder reads the already-populated `dataShardBuffers` and the parity sends are independent of data sends.
-
-- Spawn parity goroutines + start `enc.Encode` immediately after `enc.Split` returns, in parallel with the data-shard send loop.
-- Wait on both sets at the end.
-
-Expected savings: ~20 ms on `quic_us` median.
+Expected saving: ~20 ms median.
 
 ### Async metadata commit
 
-Largest single lever. Reply 200 OK to the client after QUIC shards commit; write `globalState` metadata in a background goroutine. Removes the full ~40 ms metadata Raft cost from the critical path.
+The largest single lever, and the one with the most surface area. Reply 200 once the shards commit and write the metadata in the background, taking the whole ~40 ms Raft cost off the critical path.
 
-- Cost: a crash window between shard commit and metadata commit leaves orphaned shards. Needs a startup scrubber that scans the per-node store index, reconciles against the metadata table, and either backfills missing metadata or garbage-collects orphans.
-- Likely the right answer long-term, but bigger surface area than the items above.
+- Requires the orphan scrubber below: the crash window between shard commit and metadata commit becomes routine rather than exceptional.
+- Worth doing after the batch commit lands, since batching halves the cost this removes.
 
-### Periodic fsync (deferred)
+### Periodic fsync
 
-Originally tracked as Stage 3 of the store rewrite. Bench data shows the per-close `seg.Sync()` costs ~9 ms median latency but is **not** the throughput cap (removing it entirely tied throughput, while p99 latency got 4× worse from kernel writeback storms). A 200 ms periodic syncer would likely be a Pareto improvement on latency without hurting p99, but the throughput payoff is small relative to the Raft items above. Reorder once those land.
+`shardWriter.Close` fsyncs the segment per value (`internal/blob/engine/writer.go`). Bench data showed this costs ~9 ms median but is **not** the throughput cap: removing it entirely tied throughput while p99 got 4× worse from kernel writeback storms. A 200 ms periodic syncer would likely be a Pareto improvement on latency without hurting p99, but the payoff is small next to the Raft items.
 
 - Add a 200 ms ticker to `Store` that fsyncs dirty segments.
-- Drop `seg.Sync()` from `shardWriter.Close()`.
-- Final sync on `store.Close()`.
+- Drop `seg.Sync()` from `shardWriter.Close()`, keeping the `.idx` fsync ordering intact — the sidecar must still be durable before the index row commits.
+- Final sync on `Store.Close()`.
 
-### Deletion tracking in Store
+### Stop buffering whole objects in memory
 
-`store.Delete` removes the index entry but leaves the on-disk extent as dead space. Compaction needs a record of freed extents to reclaim them.
+The PUT path holds every data shard in memory before sending, and the GET path assembles the whole object before responding. Multipart completion additionally stages the assembled object through a temp file. Object size is therefore bounded by gate memory, and concurrency multiplies it.
 
-- Persist a freed-extents log (segment-local or store-global).
-- Surface it to the future compactor.
+- PUT: stream `enc.Split` output straight into the per-shard `Put` bodies rather than into `[]byte` buffers.
+- GET: stream the join to the response writer; only the reconstruction path needs the shards resident.
+- Multipart: concatenate parts into the shard writers directly instead of a temp file.
 
 ---
 
-## Design–Implementation Gaps
+## Design–implementation gaps
 
-### Background Compaction & Cold-Storage Tiering
+These are the items behind [DESIGN.md §15](./DESIGN.md#15-known-gaps).
 
-DESIGN §6 treats compaction as live; not implemented.
+### Node-local healer
 
-- Scan closed segments, rewrite live extents, reclaim dead space, atomically update index entries.
-- Migrate aged segments to long-term cold storage; rehydrate on demand during GET (rehydration may complete asynchronously with the GET).
+Nothing reconstructs a shard that a blob node lost or never received. A GET rebuilds the object from parity on the fly but does not write the missing shard back, so a replaced blob node leaves every object it held permanently down one shard.
+
+- Periodically ask the meta plane for the shards the ring assigns to this node, and reconstruct any that are locally absent by fetching `K` valid peers and RS decoding.
+- Write the result as a normal reservation, so a heal is indistinguishable from a write on disk.
+- Optionally feed an in-memory recent-failures queue from failed reads for faster repair.
+
+### Startup scrubber for orphaned shards
+
+Shards commit before metadata. A crash in between leaves shards that nothing references and nothing tombstones, so compaction never reclaims them. This is also the precondition for the async metadata commit above.
+
+- Walk the node's index, reconcile each key against the metadata plane, and either backfill the missing placement or tombstone the extent.
+- Needs care against in-flight writes: a key with no placement may be a PUT still in progress, not an orphan.
+
+### Index rebuild from the .idx sidecars
+
+If a blob node's badger index is lost, its data is unreachable through that node even though the bytes are intact. The `.idx` sidecars record the 36-byte key of every extent ever allocated, so a rebuild is mechanically possible.
+
+- Walk each segment's sidecar, validate each extent by opening its first fragment (a failed GCM tag rejects a torn or superseded row), and rebuild the index rows.
+- Resolve duplicate allocations for one key: the sidecar records every allocation, including the ones an overwrite superseded, and only one is live.
+- Rebuild the tombstone namespace as dead space rather than trying to recover it.
+
+### Cold-storage tiering
+
+Compaction is implemented and always on; tiering is not.
+
+- Migrate aged segments to long-term cold storage, rehydrating on demand during a GET (rehydration may complete asynchronously with the GET).
 - Policy for "aged" and "cold" is TBD.
 
-### Node-Local Healer
+### Envelope encryption and key rotation
 
-DESIGN §11 describes pull-based repair; not implemented.
-
-- Periodically query s3db for ring-assigned shards; reconstruct any that are absent locally by fetching `K` valid peers and RS decoding, writing the result as a new reservation.
-- Optional in-memory recent-failures queue for faster repair.
-
-### Envelope Encryption (Master Key Rotation)
-
-The current encryption-at-rest implementation uses a single cluster-wide master key with no rotation. Rotating the master would require re-encrypting every fragment, which is not viable.
+One cluster-wide master key, no envelope layer. Rotating it would mean re-encrypting every fragment, which is not viable.
 
 - Introduce a per-data-dir derived key wrapped by a true cluster master held in NATS KV; rotating the master re-wraps the derived keys without re-encrypting any ciphertext.
-- Per-bucket / per-tenant keys ride the same envelope layer.
-- Collapses the cluster-wide `storeID` collision domain (each data dir gets its own per-key collision space).
+- Per-bucket and per-tenant keys ride the same envelope layer.
+- Collapses the cluster-wide `storeID` collision domain, since each data dir gets its own per-key nonce space.
 
-### Formal Verification Harness
+### Extend the property-based harness past the engine
 
-Reference model + stateful PBT against the QUIC server + Store.
+`internal/storetest` holds a reference model and `internal/blob/engine` drives it with `rapid`, including fault injection. The layers above it are not covered.
 
-- Reference model in Go (~50 lines): state is `committed: map[ShardID]ShardBytes`; ops `Append`/`Write`/`Close`/`Lookup`/`Read`.
-- Driver via `pgregory.net/rapid`.
-- Invariant: reads see a linearisation of commits, nothing else.
-- Scope: QUIC server + Store only. s3db and the S3 API layer are out of scope for this first pass.
+- Extend the model through the blob rpc server, so the protocol framing and the range paths are exercised against the same invariant.
+- A separate model for the meta FSM: apply, snapshot and restore should round-trip arbitrary binary keys and values.
+- Invariant throughout: reads see a linearisation of commits, and nothing else.
 
 ---
 
 ## S3 API
 
-- `POST /{bucket}?delete=` (S3 batch DeleteObjects). Currently returns 405 because no route exists; warp's mixed test cleanup hits it. Routing-only change.
-- Unit tests for put/get/list/delete without the correct permission set.
-- Auth header session invalidation after 15 minutes.
-- Checksum support (CRC32, crc64nvme, etc.) for `aws s3 cp` and multipart.
-- `DeleteBucket`.
+- `POST /{bucket}?delete=` (batch DeleteObjects). Returns 405 because no route exists; warp's mixed-test cleanup hits it. Routing plus a fan-out over the existing single-object delete.
+- **Pagination for `ListObjects`.** The handler scans and returns everything under the prefix, hardcodes `IsTruncated: false`, and does not enforce `max-keys`. A large bucket returns an unbounded response.
+- **`LastModified` is not stored.** Listings report the current time for every object. Needs a timestamp in the placement record, or a parallel metadata key.
+- **Content-derived ETags.** `ObjectETag` is `hex(sha256("bucket/key")[:16])`, so it identifies the object but never changes when the object does, and clients cannot use it to detect a modification. Needs the hash computed over the body during the split.
+- **Checksum support.** `internal/gate/chunked` computes CRC64NVME and can verify the trailer, but no handler calls `VerifyTrailerChecksum`, the `x-amz-checksum-*` request headers are not honoured, and `ChecksumCRC64NVME` in the multipart response is never populated.
+- **End-to-end authorization tests.** Policy evaluation is unit tested in `internal/gate/policy_test.go`, but no test drives PUT, GET, LIST or DELETE through the full handler stack with a credential that lacks the action.
 
 ---
 
-## Future Work
+## Future work
 
 Longer-horizon, not planned for this cycle.
 
-- **Process separation**: split `s3d` into independent HTTP, s3db (Raft), and QUIC storage binaries to enable independent scaling and reduce blast radius.
-- **Gossip protocol**: replace static `cluster.toml` with dynamic node discovery.
-- **Dynamic bucket operations**: create/delete buckets via s3db, not config.
-- **Cluster rebalancing**: redistribute shards on node join/leave or when the RS configuration changes.
-- **Read replicas**: serve reads from s3db followers.
+- **Cluster rebalancing**: redistribute shards on node join or leave, and when the RS configuration changes. Today the ring change applies to new objects only.
+- **Process separation**: run each node as its own process rather than as a goroutine inside one `s3d`, to reduce blast radius and let roles be scheduled independently. The rpc layer already makes this mostly a matter of how nodes are launched, since a colocated pair would simply move from the pipe transport to QUIC.
+- **Gossip protocol**: dynamic node discovery in place of a static config file on every host.
+- **mTLS between nodes**: client certificates so a peer is authenticated, not just the ALPN and the server certificate.
 - **Storage classes**: per-object redundancy selection.
 - **Object versioning**: S3-compatible versioning.
 - **Lifecycle policies**: automatic object expiration.
-- **Compression**: optional LZ4/Snappy applied by the compactor to closed WAL files.
+- **Compression**: optional LZ4/Snappy applied by the compactor to segments it rewrites.
 - **Event notifications**: S3-compatible hooks.
-- **Metrics & observability**: Prometheus, structured logging.
+- **Metrics**: `pkg/otelsetup` covers traces, metrics and structured logging; what is missing is coverage of the storage internals — segment counts, live fraction, compaction cycles, free-space watermarks.
+
+---
+
+## Recently closed
+
+Tracked here so an old reference to one of these is not mistaken for outstanding work.
+
+- **Background compaction** — `internal/blob/engine/compaction.go`. Always on, interval from `[compaction] interval_seconds`, with an out-of-cycle pass on nearfull.
+- **Deletion tracking** — tombstones keyed by physical slot, written in the same transaction as the index removal.
+- **The per-PUT temp file** — the body is split straight into the shard buffers. Only multipart completion still stages a temp file.
+- **`DeleteBucket`** — implemented, with the bucket record removed from the meta plane.
+- **Dynamic bucket operations** — `CreateBucket` and `DeleteBucket` write to the meta plane. Config-defined buckets remain as a static set known at startup.
+- **Read replicas** — `meta.Client` reads from the cached leader first and then any replica; only writes need the leader.
+- **Session expiry** — session credentials carry `ExpiresAt`, are never cached, and expiry is re-checked on every request.
+- **A reference model and property tests** — `internal/storetest` plus the `rapid` suites in `internal/blob/engine`, including fault injection.

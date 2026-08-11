@@ -65,8 +65,10 @@ const (
 // flags. Empty means the file did not supply one.
 type Host struct {
 	ID HostID `toml:"id"`
-	// BindAddr is the local listen address, without a port; 0.0.0.0 binds all
-	// interfaces. It defaults to Addr.
+	// BindAddr is where this host's cluster traffic listens — raft and blob
+	// over QUIC — without a port; 0.0.0.0 binds all interfaces. It defaults to
+	// Addr, which keeps the cluster plane off any interface peers do not use.
+	// The S3 API is public and binds separately, per gate node.
 	BindAddr string `toml:"bind_addr"`
 	// Addr is the address other hosts dial, without a port, split from
 	// BindAddr for NAT and multi-homed machines.
@@ -93,6 +95,11 @@ type Node struct {
 	// Port is the port this node answers on, unique within its host. For a
 	// gate it is the S3 port, and its rpc sockets bind ephemerally.
 	Port int `toml:"port"`
+	// BindAddr is where a gate serves the S3 API, without a port. S3 is a
+	// public service and the cluster plane is not, so a multi-homed host puts
+	// this on the public interface and leaves the host's bind_addr on the
+	// private one. Empty follows the host. Only a gate may set it.
+	BindAddr string `toml:"bind_addr"`
 	// DataDir is an absolute directory this node owns outright, so that blob
 	// nodes on one host can sit on separate disks. Empty derives one under the
 	// host's root instead. It has no flag: it is per-node, and a flag is not.
@@ -103,6 +110,22 @@ type Node struct {
 // of its own under the data root of the host it runs on.
 func NodeDataDir(h Host, n Node) string {
 	return cmp.Or(n.DataDir, filepath.Join(h.DataDir, fmt.Sprintf("node-%d", n.ID)))
+}
+
+// HostBindAddr is where this host's cluster traffic listens: the address it
+// names, or the one its peers dial. The fallback is what keeps raft and blob
+// traffic off the interfaces nothing in the cluster uses — an empty bind
+// address is a wildcard to the network stack, so leaving it out must not mean
+// publishing consensus to every interface.
+func HostBindAddr(h Host) string {
+	return cmp.Or(h.BindAddr, h.Addr)
+}
+
+// NodeBindAddr is where a gate serves the S3 API: the address it names, or the
+// one its host binds the cluster plane to. A host that says nothing binds one
+// address for both, which is what a single-homed machine wants.
+func NodeBindAddr(h Host, n Node) string {
+	return cmp.Or(n.BindAddr, HostBindAddr(h))
 }
 
 // RS fixes the erasure code. The counts must match what the cluster was
@@ -350,6 +373,15 @@ func (c *Config) validateTopology() error {
 				return fmt.Errorf("nodes %d and %d both use port %d on host %d", other, n.ID, n.Port, h.ID)
 			}
 			ports[n.Port] = n.ID
+			// Only the S3 API is served on an address of its own; every other
+			// node reaches its peers over the host's cluster plane, so a
+			// bind_addr on one names a listener it does not have.
+			if n.Role != RoleGate && n.BindAddr != "" {
+				return fmt.Errorf("node %d has role %q and must not set bind_addr", n.ID, n.Role)
+			}
+			if hasPort(n.BindAddr) {
+				return fmt.Errorf("node %d bind_addr %q must not carry a port", n.ID, n.BindAddr)
+			}
 			if n.Role == RoleGate {
 				// A gate keeps nothing on disk, so a data_dir on one is a
 				// misunderstanding rather than something to ignore.

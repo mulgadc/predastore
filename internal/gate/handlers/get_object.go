@@ -97,6 +97,12 @@ func parseRangeHeader(header string) (start, end int64) {
 // readObject reconstructs the complete object from its data shards, falling
 // back to parity reconstruction when the data shards alone will not join.
 func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64) ([]byte, error) {
+	// An empty object has no shards to read: the write path stores none, since
+	// the blob protocol has no zero-length value to store.
+	if size == 0 {
+		return nil, nil
+	}
+
 	// The stream encoder is constructed per request; hoisting it into the
 	// gate belongs with the streaming refactor, not here.
 	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)

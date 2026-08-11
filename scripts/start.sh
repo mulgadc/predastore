@@ -14,8 +14,9 @@
 #   -w    Wait for every gate to answer (60s timeout)
 #
 # Environment:
-#   PREDA_DIR   Root for cluster data, certs and the master key
-#   LOG_LEVEL   Passed through as -log-level (debug|info|warn|error)
+#   PREDA_DIR          Root for cluster data, certs and the master key
+#   PREDA_CONFIG_DIR   Where profiles are read from (default: repo config/)
+#   LOG_LEVEL          Passed through as -log-level (debug|info|warn|error)
 #
 # Examples:
 #   ./scripts/start.sh 1host          # one process, pipe only
@@ -26,7 +27,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 REPO_DIR="$SCRIPT_DIR/.."
-CONFIG_DIR="$REPO_DIR/config"
+# PREDA_CONFIG_DIR lets a harness run generated profiles — on shifted ports, so
+# a benchmark does not collide with a cluster already using the defaults.
+CONFIG_DIR="${PREDA_CONFIG_DIR:-$REPO_DIR/config}"
 S3D_BINARY="$REPO_DIR/bin/s3d"
 
 # shellcheck source=scripts/lib.sh

@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -213,15 +214,19 @@ func TestCalculatePartETag(t *testing.T) {
 	assert.Equal(t, expectedETag, etag)
 }
 
-func TestCalculatePartETagFromReader(t *testing.T) {
+// The streaming hasher has to agree with the buffered one, because the two
+// ETags are compared against each other when an upload completes.
+func TestPartETagFromMatchesCalculatePartETag(t *testing.T) {
 	data := []byte("test data for etag calculation")
-	expected := md5.Sum(data)
-	expectedETag := fmt.Sprintf("\"%x\"", expected)
+	expectedETag := fmt.Sprintf("\"%x\"", md5.Sum(data))
 
-	etag, readData, err := CalculatePartETagFromReader(bytes.NewReader(data))
+	h := NewPartETagHasher()
+	n, err := io.Copy(h, bytes.NewReader(data))
 	require.NoError(t, err)
-	assert.Equal(t, expectedETag, etag)
-	assert.Equal(t, data, readData)
+	assert.Equal(t, int64(len(data)), n)
+
+	assert.Equal(t, expectedETag, PartETagFrom(h))
+	assert.Equal(t, CalculatePartETag(data), PartETagFrom(h))
 }
 
 func TestCalculateMultipartETag(t *testing.T) {

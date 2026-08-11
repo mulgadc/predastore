@@ -62,6 +62,16 @@ func LoadConfig(path string) (*Config, error) {
 	return config.Load(path)
 }
 
+// HostBindAddr is where a host's cluster traffic listens, and NodeBindAddr
+// where a gate serves S3. Both are re-exported because an embedder settling
+// host-local fields has to know which plane it is settling: the S3 address
+// belongs to the gate, and putting it on the host would move raft and blob
+// traffic onto the public interface with it.
+func HostBindAddr(h HostConfig) string { return config.HostBindAddr(h) }
+
+// NodeBindAddr resolves a gate's S3 listen address against its host.
+func NodeBindAddr(h HostConfig, n NodeConfig) string { return config.NodeBindAddr(h, n) }
+
 // The queries below answer what the cluster is made of. They live here rather
 // than in the config package because they are inventory questions about a
 // parsed file, not part of parsing it.
@@ -172,7 +182,7 @@ func gateConfig(
 		RateLimit:   c.RateLimit,
 		BlobNodeIDs: nodeIDs(nodesByRole(c, RoleBlob)),
 
-		Addr:    host.BindAddr,
+		Addr:    config.NodeBindAddr(host, n),
 		Port:    n.Port,
 		TLSCert: host.TLSCert,
 		TLSKey:  host.TLSKey,

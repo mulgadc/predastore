@@ -8,6 +8,10 @@
 #
 # The hosts share one machine over loopback aliases, so each binds its own
 # address: five processes cannot share a port on one.
+#
+# Neither plane is split here, because there is one interface to split over. On
+# a multi-homed machine the host's bind_addr keeps raft and blob traffic on the
+# private interface, and the gate takes bind_addr = "0.0.0.0" for public S3.
 
 version = 1
 region = "ap-southeast-2"

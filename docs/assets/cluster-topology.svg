@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="580" viewBox="0 0 1000 580" role="img" aria-label="Predastore cluster topology: S3 clients reach a gate node over HTTPS with Signature V4; each host is one s3d process running gate, meta and blob nodes that talk over an in-process pipe, while nodes on different hosts talk over QUIC.">
+<rect x="0" y="0" width="1000" height="580" rx="20" fill="#14181D" stroke="#2A2F36" stroke-width="1"/>
+
+<text x="28" y="42" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11.5" fill="#F5B500" font-weight="600" letter-spacing="2.5">PREDASTORE CLUSTER TOPOLOGY</text>
+<text x="972" y="42" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11.5" fill="#9AA1A8" text-anchor="end">one s3d process per host · roles pinned by config</text>
+<text x="28" y="72" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="21" fill="#F5F3EE" font-weight="800">A host is a process. A node is a role inside it.</text>
+
+<rect x="28" y="88" width="944" height="52" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1"/>
+<text x="48" y="112" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#9AA1A8" font-weight="700" letter-spacing="1.5">S3 CLIENTS</text>
+<text x="48" y="130" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11.5" fill="#5B636C">Unmodified AWS tooling. No shims, no custom SDK.</text>
+<rect x="604" y="103" width="70" height="22" rx="7" fill="none" stroke="#2A2F36" stroke-width="1"/><text x="639" y="118" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#9AA1A8" text-anchor="middle">aws-cli</text>
+<rect x="684" y="103" width="84" height="22" rx="7" fill="none" stroke="#2A2F36" stroke-width="1"/><text x="726" y="118" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#9AA1A8" text-anchor="middle">AWS SDKs</text>
+<rect x="778" y="103" width="76" height="22" rx="7" fill="none" stroke="#2A2F36" stroke-width="1"/><text x="816" y="118" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#9AA1A8" text-anchor="middle">Spinifex</text>
+<rect x="864" y="103" width="88" height="22" rx="7" fill="none" stroke="#2A2F36" stroke-width="1"/><text x="908" y="118" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#9AA1A8" text-anchor="middle">Viperblock</text>
+
+<line x1="176" y1="140" x2="176" y2="172" stroke="#F5B500" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="170,170 182,170 176,179" fill="#F5B500" fill-opacity="0.6"/>
+<line x1="500" y1="140" x2="500" y2="172" stroke="#F5B500" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="494,170 506,170 500,179" fill="#F5B500" fill-opacity="0.6"/>
+<line x1="824" y1="140" x2="824" y2="172" stroke="#F5B500" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="818,170 830,170 824,179" fill="#F5B500" fill-opacity="0.6"/>
+<rect x="530" y="149" width="124" height="20" rx="10" fill="#F5B500" fill-opacity="0.14"/><text x="592" y="163" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#F5B500" text-anchor="middle">HTTPS · SigV4</text>
+
+<rect x="28" y="180" width="296" height="304" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1"/>
+<text x="48" y="206" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#F5F3EE" font-weight="700">host 1</text>
+<text x="304" y="206" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">addr 10.11.12.1</text>
+<line x1="48" y1="216" x2="304" y2="216" stroke="#2A2F36" stroke-width="1"/>
+<line x1="38" y1="250" x2="38" y2="416" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<line x1="38" y1="261" x2="48" y2="261" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35"/><line x1="38" y1="333" x2="48" y2="333" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35"/><line x1="38" y1="405" x2="48" y2="405" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35"/>
+<rect x="48" y="230" width="256" height="62" rx="8" fill="#F5B500" fill-opacity="0.10" stroke="#F5B500" stroke-width="1.2" stroke-opacity="0.5"/>
+<text x="64" y="252" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#F5B500" font-weight="700">gate</text><text x="288" y="252" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="end">node 1 · :8443</text>
+<text x="64" y="270" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">S3 API · SigV4 · IAM · placement</text>
+<text x="64" y="284" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">erasure codes and reassembles objects</text>
+<rect x="48" y="302" width="256" height="62" rx="8" fill="#5AA9E6" fill-opacity="0.10" stroke="#5AA9E6" stroke-width="1.2" stroke-opacity="0.5"/>
+<text x="64" y="324" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#5AA9E6" font-weight="700">meta</text><text x="288" y="324" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="end">node 2 · :6660</text>
+<text x="64" y="342" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">Raft replica · bolt log · badger FSM</text>
+<text x="64" y="356" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">buckets, objects, uploads</text>
+<rect x="48" y="374" width="256" height="62" rx="8" fill="#3FB950" fill-opacity="0.10" stroke="#3FB950" stroke-width="1.2" stroke-opacity="0.5"/>
+<text x="64" y="396" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#3FB950" font-weight="700">blob</text><text x="288" y="396" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="end">node 3 · :9991</text>
+<text x="64" y="414" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">append-only segments · AES-256-GCM</text>
+<text x="64" y="428" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">one shard of each object placed here</text>
+<text x="48" y="462" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C">colocated → in-process pipe, no socket</text>
+
+<rect x="352" y="180" width="296" height="304" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1"/>
+<text x="372" y="206" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#F5F3EE" font-weight="700">host 2</text>
+<text x="628" y="206" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">addr 10.11.12.2</text>
+<line x1="372" y1="216" x2="628" y2="216" stroke="#2A2F36" stroke-width="1"/>
+<line x1="362" y1="250" x2="362" y2="416" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<line x1="362" y1="261" x2="372" y2="261" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35"/><line x1="362" y1="333" x2="372" y2="333" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35"/><line x1="362" y1="405" x2="372" y2="405" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35"/>
+<rect x="372" y="230" width="256" height="62" rx="8" fill="#F5B500" fill-opacity="0.10" stroke="#F5B500" stroke-width="1.2" stroke-opacity="0.5"/>
+<text x="388" y="252" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#F5B500" font-weight="700">gate</text><text x="612" y="252" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="end">node 4 · :8443</text>
+<text x="388" y="270" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">every host may run at most one gate</text>
+<text x="388" y="284" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">nothing dials a gate: rpc binds ephemerally</text>
+<rect x="372" y="302" width="256" height="62" rx="8" fill="#5AA9E6" fill-opacity="0.10" stroke="#5AA9E6" stroke-width="1.2" stroke-opacity="0.5"/>
+<text x="388" y="324" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#5AA9E6" font-weight="700">meta</text><text x="612" y="324" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="end">node 5 · :6660</text>
+<text x="388" y="342" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">raft rides rpc streams, not its own port</text>
+<text x="388" y="356" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">advertise address is node-5</text>
+<rect x="372" y="374" width="256" height="62" rx="8" fill="#3FB950" fill-opacity="0.10" stroke="#3FB950" stroke-width="1.2" stroke-opacity="0.5"/>
+<text x="388" y="396" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#3FB950" font-weight="700">blob</text><text x="612" y="396" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="end">node 6 · :9991</text>
+<text x="388" y="414" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">never dials, so it holds no pool</text>
+<text x="388" y="428" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">own data_dir puts it on its own disk</text>
+<text x="372" y="462" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C">node ids unique per file, ports per host</text>
+
+<rect x="676" y="180" width="296" height="304" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1"/>
+<text x="696" y="206" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#F5F3EE" font-weight="700">host 3</text>
+<text x="952" y="206" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">addr 10.11.12.3</text>
+<line x1="696" y1="216" x2="952" y2="216" stroke="#2A2F36" stroke-width="1"/>
+<line x1="686" y1="250" x2="686" y2="416" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35" stroke-dasharray="2 4"/>
+<line x1="686" y1="261" x2="696" y2="261" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35"/><line x1="686" y1="333" x2="696" y2="333" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35"/><line x1="686" y1="405" x2="696" y2="405" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.35"/>
+<rect x="696" y="230" width="256" height="62" rx="8" fill="#F5B500" fill-opacity="0.10" stroke="#F5B500" stroke-width="1.2" stroke-opacity="0.5"/>
+<text x="712" y="252" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#F5B500" font-weight="700">gate</text><text x="936" y="252" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="end">node 7 · :8443</text>
+<text x="712" y="270" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">a host declaring none serves no S3</text>
+<text x="712" y="284" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">gate port is the S3 port</text>
+<rect x="696" y="302" width="256" height="62" rx="8" fill="#5AA9E6" fill-opacity="0.10" stroke="#5AA9E6" stroke-width="1.2" stroke-opacity="0.5"/>
+<text x="712" y="324" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#5AA9E6" font-weight="700">meta</text><text x="936" y="324" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="end">node 8 · :6660</text>
+<text x="712" y="342" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">quorum over the meta set</text>
+<text x="712" y="356" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">3 replicas tolerate 1 loss</text>
+<rect x="696" y="374" width="256" height="62" rx="8" fill="#3FB950" fill-opacity="0.10" stroke="#3FB950" stroke-width="1.2" stroke-opacity="0.5"/>
+<text x="712" y="396" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12.5" fill="#3FB950" font-weight="700">blob</text><text x="936" y="396" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="end">node 9 · :9991</text>
+<text x="712" y="414" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">rs data + parity ≤ blob node count</text>
+<text x="712" y="428" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">RS(2,1) here: any one node may be lost</text>
+<text x="696" y="462" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C">config/3host.toml ships this layout</text>
+
+<line x1="326" y1="333" x2="350" y2="333" stroke="#9AA1A8" stroke-width="1.2" stroke-opacity="0.6" stroke-dasharray="3 3"/><polygon points="332,329 332,337 324,333" fill="#9AA1A8" fill-opacity="0.7"/><polygon points="344,329 344,337 352,333" fill="#9AA1A8" fill-opacity="0.7"/>
+<line x1="326" y1="405" x2="350" y2="405" stroke="#9AA1A8" stroke-width="1.2" stroke-opacity="0.6" stroke-dasharray="3 3"/><polygon points="332,401 332,409 324,405" fill="#9AA1A8" fill-opacity="0.7"/><polygon points="344,401 344,409 352,405" fill="#9AA1A8" fill-opacity="0.7"/>
+<line x1="650" y1="333" x2="674" y2="333" stroke="#9AA1A8" stroke-width="1.2" stroke-opacity="0.6" stroke-dasharray="3 3"/><polygon points="656,329 656,337 648,333" fill="#9AA1A8" fill-opacity="0.7"/><polygon points="668,329 668,337 676,333" fill="#9AA1A8" fill-opacity="0.7"/>
+<line x1="650" y1="405" x2="674" y2="405" stroke="#9AA1A8" stroke-width="1.2" stroke-opacity="0.6" stroke-dasharray="3 3"/><polygon points="656,401 656,409 648,405" fill="#9AA1A8" fill-opacity="0.7"/><polygon points="668,401 668,409 676,405" fill="#9AA1A8" fill-opacity="0.7"/>
+
+<rect x="28" y="498" width="944" height="54" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1"/>
+<text x="48" y="522" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#9AA1A8" font-weight="700" letter-spacing="1.5">TRANSPORT</text>
+<text x="48" y="540" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11.5" fill="#5B636C">Nothing in a deployment names a transport: same host is a pipe, different hosts is QUIC.</text>
+<rect x="582" y="513" width="120" height="22" rx="7" fill="none" stroke="#2A2F36" stroke-width="1"/><text x="642" y="528" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#9AA1A8" text-anchor="middle">pipe · in-process</text>
+<rect x="712" y="513" width="112" height="22" rx="7" fill="#F5B500" fill-opacity="0.14"/><text x="768" y="528" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#F5B500" text-anchor="middle">QUIC · TLS 1.3</text>
+<rect x="834" y="513" width="118" height="22" rx="7" fill="none" stroke="#2A2F36" stroke-width="1"/><text x="893" y="528" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#9AA1A8" text-anchor="middle">1 conn per peer</text>
+</svg>
