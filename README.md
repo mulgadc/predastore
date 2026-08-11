@@ -77,7 +77,7 @@ A cluster whose `[[node]]` entries all name the same host runs entirely in one p
 
 The encryption key file must be exactly 32 raw bytes (no base64, no header) with mode `0600`. Generate one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key must be supplied to every host in a cluster; rotating it is not currently supported (see Roadmap → envelope encryption).
 
-## S3 API support
+## S3 API Support
 
 | Area | Operations |
 | --- | --- |
