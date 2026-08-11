@@ -28,7 +28,7 @@ func CreateMultipartUpload(mc MetaClient, cache *BucketCache) http.Handler {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(mc, cache, bucket); err != nil {
+		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -49,7 +49,7 @@ func CreateMultipartUpload(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
-		if err := metaPut(mc, model.TableMultipart, uploadID, buf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableMultipart, uploadID, buf.Bytes()); err != nil {
 			slog.ErrorContext(ctx, "Failed to store multipart upload metadata", "uploadID", uploadID, "error", err)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to create multipart upload", 500))
 			return

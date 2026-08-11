@@ -244,7 +244,7 @@ func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg C
 }
 
 // loadPlacement retrieves shard location metadata for an object.
-func loadPlacement(mc MetaClient, ring *placement.Ring, cfg Config, bucket string, object string) (ObjectToShardNodes, int64, error) {
+func loadPlacement(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg Config, bucket string, object string) (ObjectToShardNodes, int64, error) {
 	objectHash := model.ObjectHash(bucket, object)
 
 	shardNodes, err := ring.Nodes(objectHash, cfg.TotalShards())
@@ -252,7 +252,7 @@ func loadPlacement(mc MetaClient, ring *placement.Ring, cfg Config, bucket strin
 		return ObjectToShardNodes{}, 0, err
 	}
 
-	data, err := metaGet(mc, model.TableObjects, string(objectHash[:]))
+	data, err := metaGet(ctx, mc, model.TableObjects, string(objectHash[:]))
 	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}
@@ -275,7 +275,7 @@ func loadPlacement(mc MetaClient, ring *placement.Ring, cfg Config, bucket strin
 // shardReaders creates readers for each shard.
 // Data is buffered into memory before connections are closed to avoid
 // "connection closed" errors when the caller reads from the returned readers.
-func shardReaders(bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, parity bool) ([]io.Reader, error) {
+func shardReaders(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, parity bool) ([]io.Reader, error) {
 	readers := make([]io.Reader, len(place.DataShardNodes)+len(place.ParityShardNodes))
 
 	totalNodes := make([]config.NodeID, 0)
@@ -295,7 +295,7 @@ func shardReaders(bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, 
 			Index:      uint32(i), // Include shard index for unique lookup
 		}
 
-		reader, err := bc.Get(context.Background(), nodeNum, objectRequest)
+		reader, err := bc.Get(ctx, nodeNum, objectRequest)
 		if err != nil {
 			slog.Error("Error reading shard from blob node", "node", nodeNum, "err", err)
 			// Don't close - connection stays in pool
@@ -323,7 +323,7 @@ func shardReaders(bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, 
 // reconstructObject attempts to rebuild an object using parity shards.
 func reconstructObject(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, enc reedsolomon.StreamEncoder, size int64) (*bytes.Buffer, error) {
 	// Get all shard readers including parity
-	readers, err := shardReaders(bc, objectHash, place, true)
+	readers, err := shardReaders(ctx, bc, objectHash, place, true)
 	if err != nil {
 		return nil, err
 	}
@@ -365,7 +365,7 @@ func reconstructObject(ctx context.Context, bc BlobClient, objectHash [32]byte, 
 	}
 
 	// Re-read shards with reconstructed data
-	readers, err = shardReaders(bc, objectHash, place, true)
+	readers, err = shardReaders(ctx, bc, objectHash, place, true)
 	if err != nil {
 		return nil, err
 	}

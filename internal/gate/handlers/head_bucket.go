@@ -9,9 +9,10 @@ import (
 // HeadBucket serves HEAD /{bucket}: existence plus the bucket's region.
 func HeadBucket(mc MetaClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 		bucket := chi.URLParam(r, "bucket")
 
-		meta, err := lookupBucket(mc, cache, bucket)
+		meta, err := lookupBucket(ctx, mc, cache, bucket)
 		if err != nil {
 			HandleError(w, r, err)
 			return

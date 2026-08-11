@@ -29,12 +29,12 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// -1 for both ends means "no Range header"; any value >= 0 is a range request.
 		rangeStart, rangeEnd := parseRangeHeader(r.Header.Get("Range"))
 
-		if err := requireBucket(mc, cache, bucket); err != nil {
+		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
 
-		place, size, err := loadPlacement(mc, ring, cfg, bucket, key)
+		place, size, err := loadPlacement(ctx, mc, ring, cfg, bucket, key)
 		if err != nil {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
@@ -104,7 +104,7 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 
 	objectHash := model.ObjectHash(bucket, key)
 
-	readers, err := shardReaders(bc, objectHash, place, false)
+	readers, err := shardReaders(ctx, bc, objectHash, place, false)
 	if err != nil {
 		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}

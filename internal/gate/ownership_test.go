@@ -2,6 +2,7 @@ package gate
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
 	"errors"
 	"io"
@@ -85,7 +86,7 @@ type fakeMeta struct {
 	err  error
 }
 
-func (f *fakeMeta) Get(key string) ([]byte, error) {
+func (f *fakeMeta) Get(_ context.Context, key string) ([]byte, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -96,7 +97,7 @@ func (f *fakeMeta) Get(key string) ([]byte, error) {
 	return v, nil
 }
 
-func (f *fakeMeta) Put(key string, value []byte) error {
+func (f *fakeMeta) Put(_ context.Context, key string, value []byte) error {
 	if f.err != nil {
 		return f.err
 	}
@@ -104,7 +105,7 @@ func (f *fakeMeta) Put(key string, value []byte) error {
 	return nil
 }
 
-func (f *fakeMeta) Delete(key string) error {
+func (f *fakeMeta) Delete(_ context.Context, key string) error {
 	if f.err != nil {
 		return f.err
 	}
@@ -112,7 +113,7 @@ func (f *fakeMeta) Delete(key string) error {
 	return nil
 }
 
-func (f *fakeMeta) Scan(prefix string, limit int) ([]meta.Item, error) {
+func (f *fakeMeta) Scan(_ context.Context, prefix string, limit int) ([]meta.Item, error) {
 	if f.err != nil {
 		return nil, f.err
 	}

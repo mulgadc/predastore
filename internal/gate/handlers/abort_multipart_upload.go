@@ -26,11 +26,11 @@ func AbortMultipartUpload(mc MetaClient, bc BlobClient, cache *BucketCache) http
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(mc, cache, bucket); err != nil {
+		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
-		if err := requireUpload(mc, bucket, key, uploadID); err != nil {
+		if err := requireUpload(ctx, mc, bucket, key, uploadID); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -38,7 +38,7 @@ func AbortMultipartUpload(mc MetaClient, bc BlobClient, cache *BucketCache) http
 		// Parts that cannot be listed cannot be cleaned up, but the upload must
 		// still be closed out, so an unreadable part index degrades to dropping
 		// the upload metadata alone.
-		storedParts, err := getStoredParts(mc, uploadID)
+		storedParts, err := getStoredParts(ctx, mc, uploadID)
 		if err != nil {
 			slog.WarnContext(ctx, "Failed to get stored parts for cleanup", "uploadID", uploadID, "error", err)
 			storedParts = nil

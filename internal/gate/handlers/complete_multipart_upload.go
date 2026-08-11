@@ -54,16 +54,16 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(mc, cache, bucket); err != nil {
+		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
-		if err := requireUpload(mc, bucket, key, uploadID); err != nil {
+		if err := requireUpload(ctx, mc, bucket, key, uploadID); err != nil {
 			HandleError(w, r, err)
 			return
 		}
 
-		storedParts, err := getStoredParts(mc, uploadID)
+		storedParts, err := getStoredParts(ctx, mc, uploadID)
 		if err != nil {
 			slog.ErrorContext(ctx, "Failed to get stored parts", "uploadID", uploadID, "error", err)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to retrieve parts", 500))
@@ -162,11 +162,11 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
 			return
 		}
-		if err := metaPut(mc, model.TableObjects, string(objectHash[:]), shardBuf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), shardBuf.Bytes()); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store object metadata", 500))
 			return
 		}
-		if err := metaPut(mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
+		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store ARN mapping", 500))
 			return
 		}
@@ -192,7 +192,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 
 // getPartData reads one part back from its shards.
 func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, bucket, key, uploadID string, partNumber int) ([]byte, error) {
-	data, err := metaGet(mc, model.TableObjects, partShardKey(uploadID, partNumber))
+	data, err := metaGet(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber))
 	if err != nil {
 		return nil, fmt.Errorf("part not found: uploadID=%s part=%d", uploadID, partNumber)
 	}

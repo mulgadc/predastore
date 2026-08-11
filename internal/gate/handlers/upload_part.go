@@ -35,7 +35,7 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(mc, cache, bucket); err != nil {
+		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -43,7 +43,7 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, err)
 			return
 		}
-		if err := requireUpload(mc, bucket, key, uploadID); err != nil {
+		if err := requireUpload(ctx, mc, bucket, key, uploadID); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -101,7 +101,7 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode part metadata", 500))
 			return
 		}
-		if err := metaPut(mc, model.TableParts, multipartPartKey(uploadID, partNumber), partBuf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableParts, multipartPartKey(uploadID, partNumber), partBuf.Bytes()); err != nil {
 			slog.ErrorContext(ctx, "Failed to store part metadata", "uploadID", uploadID, "part", partNumber, "error", err)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store part metadata", 500))
 			return
@@ -117,7 +117,7 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
 			return
 		}
-		if err := metaPut(mc, model.TableObjects, partShardKey(uploadID, partNumber), shardBuf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber), shardBuf.Bytes()); err != nil {
 			slog.ErrorContext(ctx, "Failed to store part shard metadata", "uploadID", uploadID, "part", partNumber, "error", err)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store part shard metadata", 500))
 			return

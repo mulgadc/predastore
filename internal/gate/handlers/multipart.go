@@ -36,8 +36,8 @@ func partObjectKey(key, uploadID string, partNumber int) string {
 }
 
 // getUploadMetadata retrieves and validates upload metadata.
-func getUploadMetadata(mc MetaClient, uploadID string) (*model.UploadMetadata, error) {
-	data, err := metaGet(mc, model.TableMultipart, uploadID)
+func getUploadMetadata(ctx context.Context, mc MetaClient, uploadID string) (*model.UploadMetadata, error) {
+	data, err := metaGet(ctx, mc, model.TableMultipart, uploadID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			return nil, model.ErrNoSuchUploadError.WithResource(uploadID)
@@ -56,8 +56,8 @@ func getUploadMetadata(mc MetaClient, uploadID string) (*model.UploadMetadata, e
 // requireUpload resolves an upload and checks it belongs to the bucket and key
 // the request addressed, so one upload's parts can never be committed under
 // another object's name.
-func requireUpload(mc MetaClient, bucket, key, uploadID string) error {
-	metadata, err := getUploadMetadata(mc, uploadID)
+func requireUpload(ctx context.Context, mc MetaClient, bucket, key, uploadID string) error {
+	metadata, err := getUploadMetadata(ctx, mc, uploadID)
 	if err != nil {
 		return err
 	}
@@ -68,8 +68,8 @@ func requireUpload(mc MetaClient, bucket, key, uploadID string) error {
 }
 
 // getStoredParts retrieves all stored parts for an upload, in part order.
-func getStoredParts(mc MetaClient, uploadID string) ([]model.PartMetadata, error) {
-	items, err := metaScan(mc, model.TableParts, multipartPartsPrefix(uploadID), 0)
+func getStoredParts(ctx context.Context, mc MetaClient, uploadID string) ([]model.PartMetadata, error) {
+	items, err := metaScan(ctx, mc, model.TableParts, multipartPartsPrefix(uploadID), 0)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +100,7 @@ func cleanupMultipartUpload(ctx context.Context, mc MetaClient, bc BlobClient, b
 		// Drop the physical part shards before removing the shard-location map. A missing
 		// or corrupt map, or a per-node delete failure, is logged and skipped — cleanup is
 		// best-effort and must not fail the complete/abort request.
-		if data, err := metaGet(mc, model.TableObjects, shardKey); err != nil {
+		if data, err := metaGet(ctx, mc, model.TableObjects, shardKey); err != nil {
 			slog.WarnContext(ctx, "cleanup: part shard map missing, skipping shard delete", "uploadID", uploadID, "part", part.PartNumber)
 		} else {
 			var nodes ObjectToShardNodes
@@ -114,14 +114,14 @@ func cleanupMultipartUpload(ctx context.Context, mc MetaClient, bc BlobClient, b
 			}
 		}
 
-		if err := metaDelete(mc, model.TableParts, multipartPartKey(uploadID, part.PartNumber)); err != nil {
+		if err := metaDelete(ctx, mc, model.TableParts, multipartPartKey(uploadID, part.PartNumber)); err != nil {
 			slog.WarnContext(ctx, "Failed to delete part metadata", "uploadID", uploadID, "part", part.PartNumber, "error", err)
 		}
 
-		if err := metaDelete(mc, model.TableObjects, shardKey); err != nil {
+		if err := metaDelete(ctx, mc, model.TableObjects, shardKey); err != nil {
 			slog.WarnContext(ctx, "Failed to delete part shard metadata", "uploadID", uploadID, "part", part.PartNumber, "error", err)
 		}
 	}
 
-	return metaDelete(mc, model.TableMultipart, uploadID)
+	return metaDelete(ctx, mc, model.TableMultipart, uploadID)
 }

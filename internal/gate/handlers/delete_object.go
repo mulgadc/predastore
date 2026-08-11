@@ -41,14 +41,14 @@ func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handler
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(mc, cache, bucket); err != nil {
+		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
 
 		objectHash := model.ObjectHash(bucket, key)
 
-		data, err := metaGet(mc, model.TableObjects, string(objectHash[:]))
+		data, err := metaGet(ctx, mc, model.TableObjects, string(objectHash[:]))
 		if err != nil {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
@@ -78,15 +78,15 @@ func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handler
 		}
 		var deletedBuf bytes.Buffer
 		if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err == nil {
-			_ = metaPut(mc, model.TableObjects, deletedObjectPrefix+bucket+"/"+key, deletedBuf.Bytes()) // Best effort
+			_ = metaPut(ctx, mc, model.TableObjects, deletedObjectPrefix+bucket+"/"+key, deletedBuf.Bytes()) // Best effort
 		}
 
-		if err := metaDelete(mc, model.TableObjects, string(objectHash[:])); err != nil {
+		if err := metaDelete(ctx, mc, model.TableObjects, string(objectHash[:])); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 
-		_ = metaDelete(mc, model.TableObjects, objectARN(bucket, key)) // Best effort
+		_ = metaDelete(ctx, mc, model.TableObjects, objectARN(bucket, key)) // Best effort
 
 		w.WriteHeader(http.StatusNoContent)
 	})

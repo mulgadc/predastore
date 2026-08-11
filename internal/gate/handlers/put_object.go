@@ -32,7 +32,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(mc, cache, bucket); err != nil {
+		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -80,13 +80,13 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 
 		// Object hash -> shard placement, for retrieval.
-		if err := metaPut(mc, model.TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 
 		// Listing key -> object hash, for ListObjects.
-		if err := metaPut(mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
+		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}

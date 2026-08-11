@@ -44,7 +44,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			HandleError(w, r, model.ErrNoSuchBucketError.WithResource(bucket))
 			return
 		}
-		if err := requireBucket(mc, cache, bucket); err != nil {
+		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -52,7 +52,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 		prefix := query.Get("prefix")
 		delimiter := query.Get("delimiter")
 
-		items, err := metaScan(mc, model.TableObjects, objectARN(bucket, prefix), 0)
+		items, err := metaScan(ctx, mc, model.TableObjects, objectARN(bucket, prefix), 0)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
@@ -87,7 +87,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			// placement it keys.
 			var objectSize int64
 			if len(item.Value) == 32 {
-				if meta, err := metaGet(mc, model.TableObjects, string(item.Value)); err == nil && len(meta) > 0 {
+				if meta, err := metaGet(ctx, mc, model.TableObjects, string(item.Value)); err == nil && len(meta) > 0 {
 					var placement ObjectToShardNodes
 					if err := gob.NewDecoder(bytes.NewReader(meta)).Decode(&placement); err == nil {
 						objectSize = placement.Size

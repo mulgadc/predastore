@@ -48,7 +48,7 @@ func CreateBucket(mc MetaClient, cache *BucketCache, cfg Config) http.Handler {
 
 		// An existing bucket is reported differently depending on who owns it, so
 		// the caller can tell "already yours" from "taken by someone else".
-		exists, existingOwner, err := bucketExists(mc, cache, bucket)
+		exists, existingOwner, err := bucketExists(ctx, mc, cache, bucket)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
@@ -79,7 +79,7 @@ func CreateBucket(mc MetaClient, cache *BucketCache, cfg Config) http.Handler {
 			return
 		}
 
-		if err := metaPut(mc, model.TableBuckets, bucket, buf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableBuckets, bucket, buf.Bytes()); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "failed to store bucket: "+err.Error(), 500))
 			return
 		}

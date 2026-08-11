@@ -16,7 +16,7 @@ func ListBuckets(mc MetaClient) http.Handler {
 		ctx := r.Context()
 		accountID := auth.AccountID(ctx)
 
-		items, err := metaScan(mc, model.TableBuckets, "", 0)
+		items, err := metaScan(ctx, mc, model.TableBuckets, "", 0)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "failed to list buckets: "+err.Error(), 500))
 			return

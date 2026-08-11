@@ -50,7 +50,9 @@ type ClientConfig struct {
 	Client *rpc.Client
 	// Replicas lists the meta replica node ids.
 	Replicas []config.NodeID
-	// Timeout bounds each attempt. Default 10s.
+	// Timeout is a fallback deadline layered on the caller's context, so an
+	// attempt against an unresponsive replica cannot hang forever. The
+	// caller's own cancellation still wins. Default 10s.
 	Timeout time.Duration
 	// MaxRetries bounds write retry rounds across the replica set.
 	// Default 3.
@@ -79,9 +81,10 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 }
 
 // call performs one request round trip against a replica: header, optional
-// body, half-close, then the response envelope.
-func (c *Client) call(target config.NodeID, op rpc.Opcode, req *MetaRequest, body []byte) (*MetaResponse, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+// body, half-close, then the response envelope. The configured timeout bounds
+// the attempt only as a fallback; cancelling ctx aborts it sooner.
+func (c *Client) call(ctx context.Context, target config.NodeID, op rpc.Opcode, req *MetaRequest, body []byte) (*MetaResponse, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
 	stream, err := rpc.OpenStream(ctx, c.rpc, target, op, req)
@@ -144,11 +147,11 @@ func request(key string, limit int) *MetaRequest {
 
 // Get retrieves a value. A replica that has not applied the key yet answers
 // not-found, so every replica is consulted before giving up.
-func (c *Client) Get(key string) ([]byte, error) {
+func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
 	var lastErr error
 	notFound := false
 	for _, id := range c.readOrder() {
-		resp, err := c.call(id, OpMetaGet, request(key, 0), nil)
+		resp, err := c.call(ctx, id, OpMetaGet, request(key, 0), nil)
 		if err != nil {
 			lastErr = err
 			continue
@@ -172,8 +175,8 @@ func (c *Client) Get(key string) ([]byte, error) {
 }
 
 // Exists reports whether the key is present.
-func (c *Client) Exists(key string) (bool, error) {
-	_, err := c.Get(key)
+func (c *Client) Exists(ctx context.Context, key string) (bool, error) {
+	_, err := c.Get(ctx, key)
 	if errors.Is(err, ErrNotFound) {
 		return false, nil
 	}
@@ -186,10 +189,10 @@ func (c *Client) Exists(key string) (bool, error) {
 // Scan lists up to limit key-value pairs with the prefix, preferring the
 // leader for freshness but accepting any replica. A limit of zero or less
 // returns every match. Keys come back exactly as stored.
-func (c *Client) Scan(prefix string, limit int) ([]Item, error) {
+func (c *Client) Scan(ctx context.Context, prefix string, limit int) ([]Item, error) {
 	var lastErr error
 	for _, id := range c.readOrder() {
-		resp, err := c.call(id, OpMetaScan, request(prefix, limit), nil)
+		resp, err := c.call(ctx, id, OpMetaScan, request(prefix, limit), nil)
 		if err != nil {
 			lastErr = err
 			continue
@@ -208,8 +211,8 @@ func (c *Client) Scan(prefix string, limit int) ([]Item, error) {
 }
 
 // ListKeys returns every key with the prefix.
-func (c *Client) ListKeys(prefix string) ([]string, error) {
-	items, err := c.Scan(prefix, 0)
+func (c *Client) ListKeys(ctx context.Context, prefix string) ([]string, error) {
+	items, err := c.Scan(ctx, prefix, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -221,18 +224,18 @@ func (c *Client) ListKeys(prefix string) ([]string, error) {
 }
 
 // Put stores a key-value pair through the leader.
-func (c *Client) Put(key string, value []byte) error {
-	return c.write(OpMetaPut, request(key, 0), value)
+func (c *Client) Put(ctx context.Context, key string, value []byte) error {
+	return c.write(ctx, OpMetaPut, request(key, 0), value)
 }
 
 // Delete removes a key through the leader.
-func (c *Client) Delete(key string) error {
-	return c.write(OpMetaDelete, request(key, 0), nil)
+func (c *Client) Delete(ctx context.Context, key string) error {
+	return c.write(ctx, OpMetaDelete, request(key, 0), nil)
 }
 
 // write drives a consensus write to the leader, following not-leader
 // redirects and rotating through replicas while an election settles.
-func (c *Client) write(op rpc.Opcode, req *MetaRequest, body []byte) error {
+func (c *Client) write(ctx context.Context, op rpc.Opcode, req *MetaRequest, body []byte) error {
 	candidates := c.readOrder()
 	next := 0
 	target := candidates[next]
@@ -240,7 +243,7 @@ func (c *Client) write(op rpc.Opcode, req *MetaRequest, body []byte) error {
 	var lastErr error
 	attempts := c.maxRetries * len(c.replicas)
 	for attempt := range attempts {
-		resp, err := c.call(target, op, req, body)
+		resp, err := c.call(ctx, target, op, req, body)
 		switch {
 		case err != nil:
 			lastErr = err
@@ -263,7 +266,13 @@ func (c *Client) write(op rpc.Opcode, req *MetaRequest, body []byte) error {
 		next = (next + 1) % len(candidates)
 		target = candidates[next]
 		if attempt < attempts-1 {
-			time.Sleep(100 * time.Millisecond)
+			timer := time.NewTimer(100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Errorf("write %q: %w", req.Key, ctx.Err())
+			case <-timer.C:
+			}
 		}
 	}
 	return fmt.Errorf("write %q failed after %d attempts: %w", req.Key, attempts, lastErr)
