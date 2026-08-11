@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 )
@@ -20,7 +19,7 @@ import (
 // UploadPart serves PUT /{bucket}/{key}?partNumber=N&uploadId=X. A part is
 // stored as an object in its own right, under a hidden key, so completion is
 // just a read-back and concatenation.
-func UploadPart(st Meta, shards *blob.Client, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
+func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		bucket := chi.URLParam(r, "bucket")
@@ -36,7 +35,7 @@ func UploadPart(st Meta, shards *blob.Client, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(st, cache, bucket); err != nil {
+		if err := requireBucket(mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -44,7 +43,7 @@ func UploadPart(st Meta, shards *blob.Client, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, err)
 			return
 		}
-		if err := requireUpload(st, bucket, key, uploadID); err != nil {
+		if err := requireUpload(mc, bucket, key, uploadID); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -85,7 +84,7 @@ func UploadPart(st Meta, shards *blob.Client, ring *placement.Ring, cache *Bucke
 			slog.DebugContext(ctx, "Failed to close temp file", "path", tmpPath, "error", closeErr)
 		}
 
-		if _, _, err := putObjectViaQUIC(ctx, shards, ring, cfg, tmpPath, objectHash); err != nil {
+		if _, _, err := writeObject(ctx, bc, ring, cfg, tmpPath, objectHash); err != nil {
 			slog.ErrorContext(ctx, "Failed to store part", "uploadID", uploadID, "part", partNumber, "error", err)
 			HandleError(w, r, mapPutErr(err))
 			return
@@ -102,7 +101,7 @@ func UploadPart(st Meta, shards *blob.Client, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode part metadata", 500))
 			return
 		}
-		if err := metaPut(st, model.TableParts, multipartPartKey(uploadID, partNumber), partBuf.Bytes()); err != nil {
+		if err := metaPut(mc, model.TableParts, multipartPartKey(uploadID, partNumber), partBuf.Bytes()); err != nil {
 			slog.ErrorContext(ctx, "Failed to store part metadata", "uploadID", uploadID, "part", partNumber, "error", err)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store part metadata", 500))
 			return
@@ -118,7 +117,7 @@ func UploadPart(st Meta, shards *blob.Client, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
 			return
 		}
-		if err := metaPut(st, model.TableObjects, partShardKey(uploadID, partNumber), shardBuf.Bytes()); err != nil {
+		if err := metaPut(mc, model.TableObjects, partShardKey(uploadID, partNumber), shardBuf.Bytes()); err != nil {
 			slog.ErrorContext(ctx, "Failed to store part shard metadata", "uploadID", uploadID, "part", partNumber, "error", err)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store part shard metadata", 500))
 			return

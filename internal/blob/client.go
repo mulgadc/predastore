@@ -101,8 +101,8 @@ func readEnvelope(br *bufio.Reader) (*ShardResponse, error) {
 	return &resp, nil
 }
 
-// PutShard streams a shard to the node and returns the commit result.
-func (c *Client) PutShard(ctx context.Context, nodeID config.NodeID, req PutRequest, body io.Reader) (*PutResponse, error) {
+// Put streams a shard to the node and returns the commit result.
+func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, body io.Reader) (*PutResponse, error) {
 	stream, err := c.open(ctx, nodeID, OpShardPut, &ShardRequest{
 		ObjectHash: req.ObjectHash,
 		ShardIndex: req.ShardIndex,
@@ -140,8 +140,8 @@ func (c *Client) PutShard(ctx context.Context, nodeID config.NodeID, req PutRequ
 	return &PutResponse{ShardSize: resp.ShardSize, PoolNearFull: resp.PoolNearFull}, nil
 }
 
-// DeleteShard marks a shard deleted on the node.
-func (c *Client) DeleteShard(ctx context.Context, nodeID config.NodeID, req DeleteRequest) (*DeleteResponse, error) {
+// Delete marks a shard deleted on the node.
+func (c *Client) Delete(ctx context.Context, nodeID config.NodeID, req DeleteRequest) (*DeleteResponse, error) {
 	stream, err := c.open(ctx, nodeID, OpShardDelete, &ShardRequest{
 		ObjectHash: req.ObjectHash,
 		ShardIndex: req.ShardIndex,
@@ -165,18 +165,10 @@ func (c *Client) DeleteShard(ctx context.Context, nodeID config.NodeID, req Dele
 	return &DeleteResponse{Deleted: resp.Deleted}, nil
 }
 
-// GetShard streams a whole shard from the node. The caller must Close the
-// returned reader to release the stream.
-func (c *Client) GetShard(ctx context.Context, nodeID config.NodeID, req GetRequest) (io.ReadCloser, error) {
-	return c.get(ctx, nodeID, req)
-}
-
-// GetShardRange streams the byte range [RangeStart, RangeEnd] of a shard.
-func (c *Client) GetShardRange(ctx context.Context, nodeID config.NodeID, req GetRequest) (io.ReadCloser, error) {
-	return c.get(ctx, nodeID, req)
-}
-
-func (c *Client) get(ctx context.Context, nodeID config.NodeID, req GetRequest) (io.ReadCloser, error) {
+// Get streams a shard from the node: the whole of it, or the byte range the
+// request bounds. The caller must Close the returned reader to release the
+// stream.
+func (c *Client) Get(ctx context.Context, nodeID config.NodeID, req GetRequest) (io.ReadCloser, error) {
 	stream, err := c.open(ctx, nodeID, OpShardGet, &ShardRequest{
 		ObjectHash: req.ObjectHash,
 		ShardIndex: req.ShardIndex,

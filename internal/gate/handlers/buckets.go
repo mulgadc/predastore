@@ -56,12 +56,12 @@ func (c *BucketCache) remove(name string) {
 // lookupBucket resolves a bucket the way HeadBucket does: the cache first
 // (config-defined buckets are static and known at startup), then global state
 // for buckets created at runtime. Returns NoSuchBucket when neither knows it.
-func lookupBucket(st Meta, cache *BucketCache, bucket string) (*model.BucketMetadata, error) {
+func lookupBucket(mc MetaClient, cache *BucketCache, bucket string) (*model.BucketMetadata, error) {
 	if b, ok := cache.find(bucket); ok {
 		return &model.BucketMetadata{Name: b.Name, Region: b.Region, AccountID: b.AccountID, Public: b.Public}, nil
 	}
 
-	data, err := metaGet(st, model.TableBuckets, bucket)
+	data, err := metaGet(mc, model.TableBuckets, bucket)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			return nil, model.ErrNoSuchBucketError.WithResource(bucket)
@@ -81,16 +81,16 @@ func lookupBucket(st Meta, cache *BucketCache, bucket string) (*model.BucketMeta
 
 // requireBucket rejects an object operation against a bucket that does not
 // exist, so a write never lands under a bucket no listing would show.
-func requireBucket(st Meta, cache *BucketCache, bucket string) error {
-	_, err := lookupBucket(st, cache, bucket)
+func requireBucket(mc MetaClient, cache *BucketCache, bucket string) error {
+	_, err := lookupBucket(mc, cache, bucket)
 	return err
 }
 
 // bucketExists reports whether a bucket exists and who owns it. Global state is
 // authoritative because it is the only source carrying an owner; config-defined
 // buckets exist but have no owner recorded.
-func bucketExists(st Meta, cache *BucketCache, bucket string) (exists bool, ownerID string, err error) {
-	data, err := metaGet(st, model.TableBuckets, bucket)
+func bucketExists(mc MetaClient, cache *BucketCache, bucket string) (exists bool, ownerID string, err error) {
+	data, err := metaGet(mc, model.TableBuckets, bucket)
 	if err != nil {
 		if !errors.Is(err, meta.ErrNotFound) {
 			return false, "", err
@@ -116,8 +116,8 @@ func bucketExists(st Meta, cache *BucketCache, bucket string) (exists bool, owne
 // a transient state error whose message coincidentally contained "not found"
 // would otherwise be converted into NoSuchBucket and short-circuit the
 // bucket-ownership check via the config fallback.
-func getBucketMetadata(st Meta, bucket string) (*model.BucketMetadata, error) {
-	data, err := metaGet(st, model.TableBuckets, bucket)
+func getBucketMetadata(mc MetaClient, bucket string) (*model.BucketMetadata, error) {
+	data, err := metaGet(mc, model.TableBuckets, bucket)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			return nil, model.ErrNoSuchBucketError.WithResource(bucket)
@@ -146,7 +146,7 @@ func getBucketMetadata(st Meta, bucket string) (*model.BucketMetadata, error) {
 // The gate's auth middleware calls this for its cross-account ownership
 // check, which is why bucket resolution lives with the handlers rather than
 // inside one of them.
-func ResolveBucketMetadata(st Meta, cfg Config, bucket string) (*model.BucketMetadata, error) {
+func ResolveBucketMetadata(mc MetaClient, cfg Config, bucket string) (*model.BucketMetadata, error) {
 	if b, ok := cfg.Find(bucket); ok {
 		return &model.BucketMetadata{
 			Name:      b.Name,
@@ -155,10 +155,10 @@ func ResolveBucketMetadata(st Meta, cfg Config, bucket string) (*model.BucketMet
 			Public:    b.Public,
 		}, nil
 	}
-	if st == nil {
+	if mc == nil {
 		return nil, nil
 	}
-	meta, err := getBucketMetadata(st, bucket)
+	meta, err := getBucketMetadata(mc, bucket)
 	if err == nil {
 		return meta, nil
 	}

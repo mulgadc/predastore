@@ -57,7 +57,7 @@ func mapPutErr(err error) *model.S3Error {
 }
 
 // placeShards resolves where an object's shards live, in the ring order
-// putObjectViaQUIC writes them in. Recording the placement is what makes the
+// writeObject writes them in. Recording the placement is what makes the
 // object retrievable, so the two must derive from the same object hash.
 func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int64) (ObjectToShardNodes, error) {
 	nodes, err := ring.Nodes(objectHash, cfg.TotalShards())
@@ -73,13 +73,13 @@ func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int
 	}, nil
 }
 
-// putObjectViaQUIC splits a file into RS shards and sends each to the
+// writeObject splits a file into RS shards and sends each to the
 // appropriate node. poolNearFull is set if any shard's target node reported
 // pressure.
 //
 // The stream encoder is constructed per request; hoisting it into the gate
 // belongs with the streaming refactor, not here.
-func putObjectViaQUIC(ctx context.Context, shards *blob.Client, ring *placement.Ring, cfg Config, objectPath string, objectHash [32]byte) (size int64, poolNearFull bool, err error) {
+func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg Config, objectPath string, objectHash [32]byte) (size int64, poolNearFull bool, err error) {
 	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
 	if err != nil {
 		return 0, false, err
@@ -139,9 +139,9 @@ func putObjectViaQUIC(ctx context.Context, shards *blob.Client, ring *placement.
 				ShardIndex: uint32(idx), //nolint:gosec // G115: idx bounded by DataShards (small uint).
 			}
 
-			resp, putErr := shards.PutShard(ctx, nodeNum, putReq, bytes.NewReader(shardData))
+			resp, putErr := bc.Put(ctx, nodeNum, putReq, bytes.NewReader(shardData))
 			if putErr != nil {
-				slog.Error("putObjectViaQUIC: put failed", "node", nodeNum, "error", putErr)
+				slog.Error("writeObject: put failed", "node", nodeNum, "error", putErr)
 				dataCh <- shardWriteOutcome{shardIndex: idx, err: putErr}
 				return
 			}
@@ -197,9 +197,9 @@ func putObjectViaQUIC(ctx context.Context, shards *blob.Client, ring *placement.
 				ShardIndex: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards + ParityShards (small uint).
 			}
 
-			resp, putErr := shards.PutShard(ctx, nodeNum, putReq, r)
+			resp, putErr := bc.Put(ctx, nodeNum, putReq, r)
 			if putErr != nil {
-				slog.Error("putObjectViaQUIC: put parity failed", "node", nodeNum, "error", putErr)
+				slog.Error("writeObject: put parity failed", "node", nodeNum, "error", putErr)
 				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, err: putErr}
 				return
 			}
@@ -242,8 +242,8 @@ func putObjectViaQUIC(ctx context.Context, shards *blob.Client, ring *placement.
 	return size, poolNearFull, nil
 }
 
-// openInput retrieves shard location metadata for an object.
-func openInput(st Meta, ring *placement.Ring, cfg Config, bucket string, object string) (ObjectToShardNodes, int64, error) {
+// loadPlacement retrieves shard location metadata for an object.
+func loadPlacement(mc MetaClient, ring *placement.Ring, cfg Config, bucket string, object string) (ObjectToShardNodes, int64, error) {
 	objectHash := model.ObjectHash(bucket, object)
 
 	shardNodes, err := ring.Nodes(objectHash, cfg.TotalShards())
@@ -251,7 +251,7 @@ func openInput(st Meta, ring *placement.Ring, cfg Config, bucket string, object 
 		return ObjectToShardNodes{}, 0, err
 	}
 
-	data, err := metaGet(st, model.TableObjects, string(objectHash[:]))
+	data, err := metaGet(mc, model.TableObjects, string(objectHash[:]))
 	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}
@@ -274,14 +274,14 @@ func openInput(st Meta, ring *placement.Ring, cfg Config, bucket string, object 
 // shardReaders creates readers for each shard.
 // Data is buffered into memory before connections are closed to avoid
 // "connection closed" errors when the caller reads from the returned readers.
-func shardReaders(client *blob.Client, objectHash [32]byte, shards ObjectToShardNodes, parity bool) ([]io.Reader, error) {
-	readers := make([]io.Reader, len(shards.DataShardNodes)+len(shards.ParityShardNodes))
+func shardReaders(bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, parity bool) ([]io.Reader, error) {
+	readers := make([]io.Reader, len(place.DataShardNodes)+len(place.ParityShardNodes))
 
 	totalNodes := make([]config.NodeID, 0)
-	totalNodes = append(totalNodes, shards.DataShardNodes...)
+	totalNodes = append(totalNodes, place.DataShardNodes...)
 
 	if parity {
-		totalNodes = append(totalNodes, shards.ParityShardNodes...)
+		totalNodes = append(totalNodes, place.ParityShardNodes...)
 	}
 
 	for i := range totalNodes {
@@ -294,7 +294,7 @@ func shardReaders(client *blob.Client, objectHash [32]byte, shards ObjectToShard
 			ShardIndex: uint32(i), // Include shard index for unique lookup
 		}
 
-		reader, err := client.GetShard(context.Background(), nodeNum, objectRequest)
+		reader, err := bc.Get(context.Background(), nodeNum, objectRequest)
 		if err != nil {
 			slog.Error("Error reading shard from blob node", "node", nodeNum, "err", err)
 			// Don't close - connection stays in pool
@@ -320,9 +320,9 @@ func shardReaders(client *blob.Client, objectHash [32]byte, shards ObjectToShard
 }
 
 // reconstructObject attempts to rebuild an object using parity shards.
-func reconstructObject(ctx context.Context, client *blob.Client, objectHash [32]byte, shards ObjectToShardNodes, enc reedsolomon.StreamEncoder, size int64) (*bytes.Buffer, error) {
+func reconstructObject(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, enc reedsolomon.StreamEncoder, size int64) (*bytes.Buffer, error) {
 	// Get all shard readers including parity
-	readers, err := shardReaders(client, objectHash, shards, true)
+	readers, err := shardReaders(bc, objectHash, place, true)
 	if err != nil {
 		return nil, err
 	}
@@ -364,7 +364,7 @@ func reconstructObject(ctx context.Context, client *blob.Client, objectHash [32]
 	}
 
 	// Re-read shards with reconstructed data
-	readers, err = shardReaders(client, objectHash, shards, true)
+	readers, err = shardReaders(bc, objectHash, place, true)
 	if err != nil {
 		return nil, err
 	}
@@ -391,19 +391,19 @@ func reconstructObject(ctx context.Context, client *blob.Client, objectHash [32]
 	return &out, nil
 }
 
-// deleteObjectViaQUIC sends DELETE requests to all shard nodes.
-func deleteObjectViaQUIC(ctx context.Context, client *blob.Client, bucket, key string, objectHash [32]byte, shards ObjectToShardNodes) error {
+// deleteObject sends DELETE requests to all shard nodes.
+func deleteObject(ctx context.Context, bc BlobClient, bucket, key string, objectHash [32]byte, place ObjectToShardNodes) error {
 	// Build (node, shardIndex) pairs so each delete carries the correct shard index.
 	type nodeShard struct {
 		node       config.NodeID
 		shardIndex int
 	}
-	targets := make([]nodeShard, 0, len(shards.DataShardNodes)+len(shards.ParityShardNodes))
-	for i, n := range shards.DataShardNodes {
+	targets := make([]nodeShard, 0, len(place.DataShardNodes)+len(place.ParityShardNodes))
+	for i, n := range place.DataShardNodes {
 		targets = append(targets, nodeShard{node: n, shardIndex: i})
 	}
-	for i, n := range shards.ParityShardNodes {
-		targets = append(targets, nodeShard{node: n, shardIndex: len(shards.DataShardNodes) + i})
+	for i, n := range place.ParityShardNodes {
+		targets = append(targets, nodeShard{node: n, shardIndex: len(place.DataShardNodes) + i})
 	}
 
 	var wg sync.WaitGroup
@@ -419,17 +419,17 @@ func deleteObjectViaQUIC(ctx context.Context, client *blob.Client, bucket, key s
 				ShardIndex: uint32(ns.shardIndex), //nolint:gosec // G115: shardIndex bounded by DataShards + ParityShards (small uint).
 			}
 
-			resp, err := client.DeleteShard(ctx, ns.node, delReq)
+			resp, err := bc.Delete(ctx, ns.node, delReq)
 			if err != nil {
-				slog.Error("deleteObjectViaQUIC: delete failed", "node", ns.node, "error", err)
+				slog.Error("deleteObject: delete failed", "node", ns.node, "error", err)
 				errCh <- err
 				return
 			}
 
 			if !resp.Deleted {
-				slog.Warn("deleteObjectViaQUIC: shard not found on node", "node", ns.node, "shardIndex", ns.shardIndex)
+				slog.Warn("deleteObject: shard not found on node", "node", ns.node, "shardIndex", ns.shardIndex)
 			} else {
-				slog.Debug("deleteObjectViaQUIC: deleted shard", "node", ns.node, "shardIndex", ns.shardIndex, "bucket", bucket, "key", key)
+				slog.Debug("deleteObject: deleted shard", "node", ns.node, "shardIndex", ns.shardIndex, "bucket", bucket, "key", key)
 			}
 		}(t)
 	}

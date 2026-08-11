@@ -8,9 +8,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
-	"runtime/pprof"
 	"strconv"
 	"time"
 
@@ -26,11 +23,8 @@ import (
 )
 
 const (
-	defaultHost = "0.0.0.0"
+	defaultAddr = "0.0.0.0"
 	defaultPort = 8443
-
-	// defaultPprofOutput is where a CPU profile lands when none is configured.
-	defaultPprofOutput = "/tmp/predastore-cpu.prof"
 
 	// shutdownGrace bounds how long Run waits for in-flight requests to finish
 	// after the context is cancelled.
@@ -47,14 +41,23 @@ type Clients struct {
 	Blob *blob.Client
 }
 
-// store returns the metadata store behind the state client. Resolved through
-// the nil check so a typed-nil client cannot masquerade as a live one behind
-// the interface.
-func (c Clients) store() handlers.Meta {
+// metaClient returns the metadata client the handlers work through. Resolved
+// through the nil check so a typed-nil client cannot masquerade as a live one
+// behind the interface.
+func (c Clients) metaClient() handlers.MetaClient {
 	if c.Meta == nil {
 		return nil
 	}
 	return c.Meta
+}
+
+// blobClient returns the shard client the handlers work through, with the same
+// typed-nil guard metaClient applies.
+func (c Clients) blobClient() handlers.BlobClient {
+	if c.Blob == nil {
+		return nil
+	}
+	return c.Blob
 }
 
 // ServerConfig is the process-supplied half of the gate's configuration:
@@ -83,11 +86,6 @@ type ServerConfig struct {
 	// server only runs the S3 HTTPS frontend: no state or blob nodes are
 	// launched, and the caller owns their supporting runtime.
 	Clients Clients
-
-	// PprofEnabled writes a CPU profile for the lifetime of Run, saved to
-	// PprofOutputPath (default /tmp/predastore-cpu.prof) as Run returns.
-	PprofEnabled    bool
-	PprofOutputPath string
 }
 
 // Server is predastore's S3 gate: the HTTPS listener, the SigV4 + IAM
@@ -105,12 +103,8 @@ type Server struct {
 
 	// Handler dependencies, shared by the route table and the auth middleware.
 	handlerCfg handlers.Config
-	state      handlers.Meta         // bucket, object and upload metadata
+	meta       handlers.MetaClient   // bucket, object and upload metadata
 	buckets    *handlers.BucketCache // config-defined buckets, plus those created since startup
-
-	// pprofFile is the temp file the CPU profile streams into while Run is
-	// serving; it is copied to the output path on the way out.
-	pprofFile *os.File
 }
 
 // NewServer builds the S3 gate: it resolves the credential chain and
@@ -118,15 +112,11 @@ type Server struct {
 // Nothing listens until Run is called.
 func NewServer(cfg ServerConfig) (*Server, error) {
 	if cfg.Host == "" {
-		cfg.Host = defaultHost
+		cfg.Host = defaultAddr
 	}
 	if cfg.Port == 0 {
 		cfg.Port = defaultPort
 	}
-	if cfg.PprofEnabled && cfg.PprofOutputPath == "" {
-		cfg.PprofOutputPath = defaultPprofOutput
-	}
-
 	if cfg.Config == nil {
 		return nil, fmt.Errorf("no configuration provided: set ServerConfig.Config")
 	}
@@ -150,7 +140,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		return nil, fmt.Errorf("failed to initialize credential provider: %w", err)
 	}
 
-	s := newGate(config, cfg.Clients.store(), cfg.Clients.Blob, credProv)
+	s := newGate(config, cfg.Clients.metaClient(), cfg.Clients.blobClient(), credProv)
 	s.cfg = cfg
 	s.masterKey = cfg.MasterKey
 	slog.Info("HTTP/2 server initialized - using net/http for connection multiplexing")
@@ -162,13 +152,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 // without a listener or a master key. Production goes through NewServer; this
 // is the seam tests drive with httptest.
 func NewHandler(config *Config, clients Clients, credProv auth.CredentialProvider) http.Handler {
-	return newGate(config, clients.store(), clients.Blob, credProv).router
+	return newGate(config, clients.metaClient(), clients.blobClient(), credProv).router
 }
 
-// newGate builds the routing half of the server over an arbitrary state
-// store. It is the seam tests use to stand a map in for a raft cluster;
+// newGate builds the routing half of the server over arbitrary cluster
+// clients. It is the seam tests use to stand a map in for a raft cluster;
 // production always arrives here through NewServer with a *meta.Client.
-func newGate(config *Config, store handlers.Meta, shards *blob.Client, credProv auth.CredentialProvider) *Server {
+func newGate(config *Config, mc handlers.MetaClient, bc handlers.BlobClient, credProv auth.CredentialProvider) *Server {
 	cfg := config.handlerConfig()
 
 	s := &Server{
@@ -176,7 +166,7 @@ func newGate(config *Config, store handlers.Meta, shards *blob.Client, credProv 
 		router:     chi.NewRouter(),
 		credProv:   credProv,
 		handlerCfg: cfg,
-		state:      store,
+		meta:       mc,
 		buckets:    handlers.NewBucketCache(cfg.Buckets),
 	}
 
@@ -185,7 +175,7 @@ func newGate(config *Config, store handlers.Meta, shards *blob.Client, credProv 
 	}
 
 	s.setupMiddleware()
-	s.setupRoutes(shards, placement.NewRing(config.BlobNodeIDs))
+	s.setupRoutes(bc, placement.NewRing(config.BlobNodeIDs))
 	return s
 }
 
@@ -219,19 +209,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// Teardown runs LIFO, so registration order here is the reverse of the
 	// order things are released in: the listener drains first, then the
-	// credential provider and the throttler that fronted it, and profiling
-	// last so it covers the whole shutdown.
-	if s.cfg.PprofEnabled {
-		if err := s.startProfiling(); err != nil {
-			// A missing profile is not worth refusing to serve over.
-			slog.Error("Failed to start CPU profiling", "error", err)
-		}
-		defer func() {
-			if err := s.stopProfiling(); err != nil {
-				slog.Error("Error stopping CPU profile", "error", err)
-			}
-		}()
-	}
+	// credential provider and the throttler that fronted it.
 	if s.throttler != nil {
 		defer s.throttler.Stop()
 	}
@@ -301,78 +279,4 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		return fmt.Errorf("s3 gate: %w", err)
 	}
-}
-
-// startProfiling starts CPU profiling into a temp file.
-func (s *Server) startProfiling() error {
-	tmpFile, err := os.CreateTemp("", "predastore-cpu-*.prof.tmp")
-	if err != nil {
-		return fmt.Errorf("failed to create temp profile file: %w", err)
-	}
-	s.pprofFile = tmpFile
-
-	if err := pprof.StartCPUProfile(tmpFile); err != nil {
-		if closeErr := tmpFile.Close(); closeErr != nil {
-			slog.Debug("Failed to close temp profile file", "error", closeErr)
-		}
-		if removeErr := os.Remove(tmpFile.Name()); removeErr != nil {
-			slog.Debug("Failed to remove temp profile file", "error", removeErr)
-		}
-		s.pprofFile = nil
-		return fmt.Errorf("failed to start CPU profile: %w", err)
-	}
-
-	slog.Info("CPU profiling started", "tempFile", tmpFile.Name(), "outputPath", s.cfg.PprofOutputPath)
-	return nil
-}
-
-// stopProfiling stops CPU profiling and saves the profile to the output path.
-func (s *Server) stopProfiling() error {
-	if s.pprofFile == nil {
-		return nil
-	}
-
-	pprof.StopCPUProfile()
-	tempPath := s.pprofFile.Name()
-	if err := s.pprofFile.Close(); err != nil {
-		slog.Warn("Failed to close pprof file", "error", err)
-	}
-	s.pprofFile = nil
-
-	if err := copyFile(tempPath, s.cfg.PprofOutputPath); err != nil {
-		slog.Error("Failed to save CPU profile", "error", err, "tempPath", tempPath)
-		return err
-	}
-
-	if err := os.Remove(tempPath); err != nil {
-		slog.Debug("Failed to remove temp profile file", "path", tempPath, "error", err)
-	}
-
-	slog.Info("CPU profile saved", "path", s.cfg.PprofOutputPath)
-	return nil
-}
-
-// copyFile copies a file from src to dst.
-func copyFile(src, dst string) error {
-	srcFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer srcFile.Close()
-
-	// Ensure output directory exists
-	if err := os.MkdirAll(filepath.Dir(dst), 0750); err != nil {
-		return err
-	}
-
-	dstFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer dstFile.Close()
-
-	if _, err := dstFile.ReadFrom(srcFile); err != nil {
-		return err
-	}
-	return dstFile.Sync()
 }

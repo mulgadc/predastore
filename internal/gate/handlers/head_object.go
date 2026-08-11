@@ -14,17 +14,17 @@ import (
 const httpTimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
 
 // HeadObject serves HEAD /{bucket}/{key}: size and entity tag, no body.
-func HeadObject(st Meta, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
+func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bucket := chi.URLParam(r, "bucket")
 		key := chi.URLParam(r, "*")
 
-		if err := requireBucket(st, cache, bucket); err != nil {
+		if err := requireBucket(mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
 
-		_, size, err := openInput(st, ring, cfg, bucket, key)
+		_, size, err := loadPlacement(mc, ring, cfg, bucket, key)
 		if err != nil {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return

@@ -37,8 +37,6 @@ func run() error {
 	encryptionKey := flag.String("encryption-key", "", "Path to the 32-byte AES-256 key protecting data at rest (overrides encryption_key)")
 	tlsCert := flag.String("tls-cert", "", "Path to this host's TLS certificate (overrides tls_cert)")
 	tlsKey := flag.String("tls-key", "", "Path to this host's TLS key (overrides tls_key)")
-	pprofEnabled := flag.Bool("pprof", false, "Write a CPU profile for the lifetime of the process")
-	pprofOutput := flag.String("pprof-output", "", "Where the CPU profile is saved")
 	logLevel := slog.LevelInfo
 	flag.TextVar(&logLevel, "log-level", logLevel, "Minimum log level (debug|info|warn|error)")
 
@@ -110,8 +108,6 @@ func run() error {
 		Config:    cfg,
 		HostID:    host.ID,
 		MasterKey: key,
-		Pprof:     *pprofEnabled,
-		PprofPath: *pprofOutput,
 	})
 }
 

@@ -17,7 +17,7 @@ const defaultMaxKeys = 1000
 
 // ListObjects serves GET /{bucket} (ListObjectsV2). Objects are listed by
 // scanning their ARN keys in global state.
-func ListObjects(st Meta, cache *BucketCache) http.Handler {
+func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		bucket := chi.URLParam(r, "bucket")
@@ -44,7 +44,7 @@ func ListObjects(st Meta, cache *BucketCache) http.Handler {
 			HandleError(w, r, model.ErrNoSuchBucketError.WithResource(bucket))
 			return
 		}
-		if err := requireBucket(st, cache, bucket); err != nil {
+		if err := requireBucket(mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -52,7 +52,7 @@ func ListObjects(st Meta, cache *BucketCache) http.Handler {
 		prefix := query.Get("prefix")
 		delimiter := query.Get("delimiter")
 
-		items, err := metaScan(st, model.TableObjects, objectARN(bucket, prefix), 0)
+		items, err := metaScan(mc, model.TableObjects, objectARN(bucket, prefix), 0)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
@@ -87,7 +87,7 @@ func ListObjects(st Meta, cache *BucketCache) http.Handler {
 			// placement it keys.
 			var objectSize int64
 			if len(item.Value) == 32 {
-				if meta, err := metaGet(st, model.TableObjects, string(item.Value)); err == nil && len(meta) > 0 {
+				if meta, err := metaGet(mc, model.TableObjects, string(item.Value)); err == nil && len(meta) > 0 {
 					var placement ObjectToShardNodes
 					if err := gob.NewDecoder(bytes.NewReader(meta)).Decode(&placement); err == nil {
 						objectSize = placement.Size

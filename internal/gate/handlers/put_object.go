@@ -10,7 +10,6 @@ import (
 	"strconv"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/gate/chunked"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
@@ -19,7 +18,7 @@ import (
 // PutObject serves PUT /{bucket}/{key}: the body is staged to a temporary file,
 // erasure coded across the blob nodes, and its placement recorded in global
 // state under both the object hash and the listing key.
-func PutObject(st Meta, shards *blob.Client, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
+func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		bucket := chi.URLParam(r, "bucket")
@@ -33,7 +32,7 @@ func PutObject(st Meta, shards *blob.Client, ring *placement.Ring, cache *Bucket
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(st, cache, bucket); err != nil {
+		if err := requireBucket(mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -61,7 +60,7 @@ func PutObject(st Meta, shards *blob.Client, ring *placement.Ring, cache *Bucket
 			slog.DebugContext(ctx, "Failed to close temp file", "path", tmpFile.Name(), "error", closeErr)
 		}
 
-		size, poolNearFull, err := putObjectViaQUIC(ctx, shards, ring, cfg, tmpFile.Name(), objectHash)
+		size, poolNearFull, err := writeObject(ctx, bc, ring, cfg, tmpFile.Name(), objectHash)
 		if err != nil {
 			slog.ErrorContext(ctx, "putObject: shard distribution failed", "error", err)
 			HandleError(w, r, mapPutErr(err))
@@ -81,13 +80,13 @@ func PutObject(st Meta, shards *blob.Client, ring *placement.Ring, cache *Bucket
 		}
 
 		// Object hash -> shard placement, for retrieval.
-		if err := metaPut(st, model.TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
+		if err := metaPut(mc, model.TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 
 		// Listing key -> object hash, for ListObjects.
-		if err := metaPut(st, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
+		if err := metaPut(mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}

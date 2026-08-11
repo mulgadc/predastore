@@ -9,7 +9,7 @@ import (
 )
 
 // DeleteBucket serves DELETE /{bucket}.
-func DeleteBucket(st Meta, cache *BucketCache) http.Handler {
+func DeleteBucket(mc MetaClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bucket := chi.URLParam(r, "bucket")
 
@@ -21,7 +21,7 @@ func DeleteBucket(st Meta, cache *BucketCache) http.Handler {
 
 		ownerID := auth.AccessKeyID(r.Context())
 
-		exists, bucketOwner, err := bucketExists(st, cache, bucket)
+		exists, bucketOwner, err := bucketExists(mc, cache, bucket)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
@@ -36,7 +36,7 @@ func DeleteBucket(st Meta, cache *BucketCache) http.Handler {
 		}
 
 		// One object is enough to reject the delete, so the scan stops at the first.
-		objects, err := metaScan(st, model.TableObjects, objectARN(bucket, ""), 1)
+		objects, err := metaScan(mc, model.TableObjects, objectARN(bucket, ""), 1)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
@@ -46,7 +46,7 @@ func DeleteBucket(st Meta, cache *BucketCache) http.Handler {
 			return
 		}
 
-		if err := metaDelete(st, model.TableBuckets, bucket); err != nil {
+		if err := metaDelete(mc, model.TableBuckets, bucket); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "failed to delete bucket: "+err.Error(), 500))
 			return
 		}

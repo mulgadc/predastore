@@ -14,7 +14,7 @@ import (
 
 // CreateMultipartUpload serves POST /{bucket}/{key} without an uploadId: it
 // registers an upload the client then sends parts against.
-func CreateMultipartUpload(st Meta, cache *BucketCache) http.Handler {
+func CreateMultipartUpload(mc MetaClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		bucket := chi.URLParam(r, "bucket")
@@ -28,7 +28,7 @@ func CreateMultipartUpload(st Meta, cache *BucketCache) http.Handler {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(st, cache, bucket); err != nil {
+		if err := requireBucket(mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -49,7 +49,7 @@ func CreateMultipartUpload(st Meta, cache *BucketCache) http.Handler {
 			return
 		}
 
-		if err := metaPut(st, model.TableMultipart, uploadID, buf.Bytes()); err != nil {
+		if err := metaPut(mc, model.TableMultipart, uploadID, buf.Bytes()); err != nil {
 			slog.ErrorContext(ctx, "Failed to store multipart upload metadata", "uploadID", uploadID, "error", err)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to create multipart upload", 500))
 			return

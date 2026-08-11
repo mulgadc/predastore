@@ -5,14 +5,13 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
 // AbortMultipartUpload serves DELETE /{bucket}/{key}?uploadId=X: it discards an
 // upload's parts and metadata. The object itself is untouched — an abort of an
 // overwrite must leave the existing object in place.
-func AbortMultipartUpload(st Meta, shards *blob.Client, cache *BucketCache) http.Handler {
+func AbortMultipartUpload(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		bucket := chi.URLParam(r, "bucket")
@@ -27,11 +26,11 @@ func AbortMultipartUpload(st Meta, shards *blob.Client, cache *BucketCache) http
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(st, cache, bucket); err != nil {
+		if err := requireBucket(mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
-		if err := requireUpload(st, bucket, key, uploadID); err != nil {
+		if err := requireUpload(mc, bucket, key, uploadID); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -39,7 +38,7 @@ func AbortMultipartUpload(st Meta, shards *blob.Client, cache *BucketCache) http
 		// Parts that cannot be listed cannot be cleaned up, but the upload must
 		// still be closed out, so an unreadable part index degrades to dropping
 		// the upload metadata alone.
-		storedParts, err := getStoredParts(st, uploadID)
+		storedParts, err := getStoredParts(mc, uploadID)
 		if err != nil {
 			slog.WarnContext(ctx, "Failed to get stored parts for cleanup", "uploadID", uploadID, "error", err)
 			storedParts = nil
@@ -49,7 +48,7 @@ func AbortMultipartUpload(st Meta, shards *blob.Client, cache *BucketCache) http
 			parts[i] = model.CompletedPart{PartNumber: p.PartNumber, ETag: p.ETag}
 		}
 
-		if err := cleanupMultipartUpload(ctx, st, shards, bucket, key, uploadID, parts); err != nil {
+		if err := cleanupMultipartUpload(ctx, mc, bc, bucket, key, uploadID, parts); err != nil {
 			slog.WarnContext(ctx, "Failed to cleanup multipart upload", "uploadID", uploadID, "error", err)
 		}
 

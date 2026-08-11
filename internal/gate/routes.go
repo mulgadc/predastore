@@ -3,7 +3,6 @@ package gate
 import (
 	"net/http"
 
-	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 )
@@ -26,28 +25,28 @@ func byQuery(param string, with, without http.Handler) http.Handler {
 // over the dependencies it needs. It runs after the middleware chain is
 // installed, since chi requires all middleware to be registered before the
 // first route.
-func (s *Server) setupRoutes(shards *blob.Client, ring *placement.Ring) {
+func (s *Server) setupRoutes(bc handlers.BlobClient, ring *placement.Ring) {
 	r := s.router
-	st, cache, cfg := s.state, s.buckets, s.handlerCfg
+	mc, cache, cfg := s.meta, s.buckets, s.handlerCfg
 
-	r.Method(http.MethodGet, "/", handlers.ListBuckets(st))
+	r.Method(http.MethodGet, "/", handlers.ListBuckets(mc))
 
 	// Bucket operations (no key).
-	r.Method(http.MethodPut, "/{bucket}", handlers.CreateBucket(st, cache, cfg))
-	r.Method(http.MethodHead, "/{bucket}", handlers.HeadBucket(st, cache))
-	r.Method(http.MethodDelete, "/{bucket}", handlers.DeleteBucket(st, cache))
-	r.Method(http.MethodGet, "/{bucket}", handlers.ListObjects(st, cache))
+	r.Method(http.MethodPut, "/{bucket}", handlers.CreateBucket(mc, cache, cfg))
+	r.Method(http.MethodHead, "/{bucket}", handlers.HeadBucket(mc, cache))
+	r.Method(http.MethodDelete, "/{bucket}", handlers.DeleteBucket(mc, cache))
+	r.Method(http.MethodGet, "/{bucket}", handlers.ListObjects(mc, cache))
 
 	// Object operations (with key).
-	r.Method(http.MethodHead, "/{bucket}/*", handlers.HeadObject(st, ring, cache, cfg))
-	r.Method(http.MethodGet, "/{bucket}/*", handlers.GetObject(st, shards, ring, cache, cfg))
+	r.Method(http.MethodHead, "/{bucket}/*", handlers.HeadObject(mc, ring, cache, cfg))
+	r.Method(http.MethodGet, "/{bucket}/*", handlers.GetObject(mc, bc, ring, cache, cfg))
 	r.Method(http.MethodPut, "/{bucket}/*", byQuery("partNumber",
-		handlers.UploadPart(st, shards, ring, cache, cfg),
-		handlers.PutObject(st, shards, ring, cache, cfg)))
+		handlers.UploadPart(mc, bc, ring, cache, cfg),
+		handlers.PutObject(mc, bc, ring, cache, cfg)))
 	r.Method(http.MethodPost, "/{bucket}/*", byQuery("uploadId",
-		handlers.CompleteMultipartUpload(st, shards, ring, cache, cfg),
-		handlers.CreateMultipartUpload(st, cache)))
+		handlers.CompleteMultipartUpload(mc, bc, ring, cache, cfg),
+		handlers.CreateMultipartUpload(mc, cache)))
 	r.Method(http.MethodDelete, "/{bucket}/*", byQuery("uploadId",
-		handlers.AbortMultipartUpload(st, shards, cache),
-		handlers.DeleteObject(st, shards, cache)))
+		handlers.AbortMultipartUpload(mc, bc, cache),
+		handlers.DeleteObject(mc, bc, cache)))
 }

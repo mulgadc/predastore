@@ -20,7 +20,7 @@ import (
 
 // GetObject serves GET /{bucket}/{key}, reconstructing the object from its
 // shards and honouring a byte range when one is asked for.
-func GetObject(st Meta, shards *blob.Client, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
+func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		bucket := chi.URLParam(r, "bucket")
@@ -29,12 +29,12 @@ func GetObject(st Meta, shards *blob.Client, ring *placement.Ring, cache *Bucket
 		// -1 for both ends means "no Range header"; any value >= 0 is a range request.
 		rangeStart, rangeEnd := parseRangeHeader(r.Header.Get("Range"))
 
-		if err := requireBucket(st, cache, bucket); err != nil {
+		if err := requireBucket(mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
 
-		place, size, err := openInput(st, ring, cfg, bucket, key)
+		place, size, err := loadPlacement(mc, ring, cfg, bucket, key)
 		if err != nil {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
@@ -45,10 +45,10 @@ func GetObject(st Meta, shards *blob.Client, ring *placement.Ring, cache *Bucket
 		status := http.StatusOK
 
 		if rangeStart >= 0 || rangeEnd >= 0 {
-			body, contentRange, err = readRange(ctx, shards, cfg, bucket, key, place, size, rangeStart, rangeEnd)
+			body, contentRange, err = readRange(ctx, bc, cfg, bucket, key, place, size, rangeStart, rangeEnd)
 			status = http.StatusPartialContent
 		} else {
-			body, err = readObject(ctx, shards, cfg, bucket, key, place, size)
+			body, err = readObject(ctx, bc, cfg, bucket, key, place, size)
 		}
 		if err != nil {
 			HandleError(w, r, err)
@@ -94,7 +94,7 @@ func parseRangeHeader(header string) (start, end int64) {
 
 // readObject reconstructs the complete object from its data shards, falling
 // back to parity reconstruction when the data shards alone will not join.
-func readObject(ctx context.Context, client *blob.Client, cfg Config, bucket, key string, shards ObjectToShardNodes, size int64) ([]byte, error) {
+func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64) ([]byte, error) {
 	// The stream encoder is constructed per request; hoisting it into the
 	// gate belongs with the streaming refactor, not here.
 	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
@@ -104,7 +104,7 @@ func readObject(ctx context.Context, client *blob.Client, cfg Config, bucket, ke
 
 	objectHash := model.ObjectHash(bucket, key)
 
-	readers, err := shardReaders(client, objectHash, shards, false)
+	readers, err := shardReaders(bc, objectHash, place, false)
 	if err != nil {
 		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
@@ -114,7 +114,7 @@ func readObject(ctx context.Context, client *blob.Client, cfg Config, bucket, ke
 		slog.WarnContext(ctx, "Initial join failed, attempting reconstruction", "err", err)
 
 		out.Reset()
-		reconstructed, err := reconstructObject(ctx, client, objectHash, shards, enc, size)
+		reconstructed, err := reconstructObject(ctx, bc, objectHash, place, enc, size)
 		if err != nil {
 			return nil, model.NewS3Error(model.ErrInternalError,
 				fmt.Sprintf("reconstruction failed: %v", err), 500)
@@ -128,7 +128,7 @@ func readObject(ctx context.Context, client *blob.Client, cfg Config, bucket, ke
 // readRange serves a byte range. Reed-Solomon splits data sequentially across
 // the data shards, so a range inside one shard is a single ranged shard read;
 // anything wider falls back to reconstructing the object and slicing it.
-func readRange(ctx context.Context, client *blob.Client, cfg Config, bucket, key string, shards ObjectToShardNodes, totalSize, reqStart, reqEnd int64) (data []byte, contentRange string, err error) {
+func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, totalSize, reqStart, reqEnd int64) (data []byte, contentRange string, err error) {
 	start, end := reqStart, reqEnd
 	if start < 0 {
 		start = 0
@@ -146,14 +146,14 @@ func readRange(ctx context.Context, client *blob.Client, cfg Config, bucket, key
 
 	if startShardIdx == endShardIdx {
 		objectHash := model.ObjectHash(bucket, key)
-		data, err := readRangeFromSingleShard(ctx, client, cfg, objectHash, shards, startShardIdx, start, end, shardSize, totalSize)
+		data, err := readRangeFromSingleShard(ctx, bc, cfg, objectHash, place, startShardIdx, start, end, shardSize, totalSize)
 		if err == nil {
 			return data, fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize), nil
 		}
 		slog.WarnContext(ctx, "Single shard range read failed, falling back to full reconstruction", "err", err)
 	}
 
-	full, err := readObject(ctx, client, cfg, bucket, key, shards, totalSize)
+	full, err := readObject(ctx, bc, cfg, bucket, key, place, totalSize)
 	if err != nil {
 		slog.ErrorContext(ctx, "Full object reconstruction failed", "err", err)
 		return nil, "", err
@@ -172,8 +172,8 @@ func readRange(ctx context.Context, client *blob.Client, cfg Config, bucket, key
 
 // readRangeFromSingleShard reads a byte range from one data shard: the fast
 // path when the whole range lands inside it.
-func readRangeFromSingleShard(ctx context.Context, client *blob.Client, cfg Config, objectHash [32]byte, shards ObjectToShardNodes, shardIdx int, globalStart, globalEnd, shardSize, totalSize int64) ([]byte, error) {
-	if shardIdx >= len(shards.DataShardNodes) {
+func readRangeFromSingleShard(ctx context.Context, bc BlobClient, cfg Config, objectHash [32]byte, place ObjectToShardNodes, shardIdx int, globalStart, globalEnd, shardSize, totalSize int64) ([]byte, error) {
+	if shardIdx >= len(place.DataShardNodes) {
 		return nil, fmt.Errorf("shard index %d out of range", shardIdx)
 	}
 
@@ -193,7 +193,7 @@ func readRangeFromSingleShard(ctx context.Context, client *blob.Client, cfg Conf
 		endInShard = actualShardSize - 1
 	}
 
-	nodeNum := shards.DataShardNodes[shardIdx]
+	nodeNum := place.DataShardNodes[shardIdx]
 	objectRequest := blob.GetRequest{
 		ObjectHash: objectHash,
 		ShardIndex: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards (small uint).
@@ -201,7 +201,7 @@ func readRangeFromSingleShard(ctx context.Context, client *blob.Client, cfg Conf
 		RangeEnd:   endInShard,
 	}
 
-	reader, err := client.GetShardRange(ctx, nodeNum, objectRequest)
+	reader, err := bc.Get(ctx, nodeNum, objectRequest)
 	if err != nil {
 		return nil, fmt.Errorf("get range from node %d: %w", nodeNum, err)
 	}

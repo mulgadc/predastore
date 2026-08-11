@@ -7,11 +7,11 @@ import (
 )
 
 // HeadBucket serves HEAD /{bucket}: existence plus the bucket's region.
-func HeadBucket(st Meta, cache *BucketCache) http.Handler {
+func HeadBucket(mc MetaClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bucket := chi.URLParam(r, "bucket")
 
-		meta, err := lookupBucket(st, cache, bucket)
+		meta, err := lookupBucket(mc, cache, bucket)
 		if err != nil {
 			HandleError(w, r, err)
 			return

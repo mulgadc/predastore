@@ -14,7 +14,6 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/klauspost/reedsolomon"
-	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 )
@@ -25,7 +24,7 @@ const maxParallelPartFetches = 10
 
 // CompleteMultipartUpload serves POST /{bucket}/{key}?uploadId=X: it reads the
 // parts back, concatenates them, and stores the result as one object.
-func CompleteMultipartUpload(st Meta, shards *blob.Client, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
+func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		bucket := chi.URLParam(r, "bucket")
@@ -55,16 +54,16 @@ func CompleteMultipartUpload(st Meta, shards *blob.Client, ring *placement.Ring,
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(st, cache, bucket); err != nil {
+		if err := requireBucket(mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
-		if err := requireUpload(st, bucket, key, uploadID); err != nil {
+		if err := requireUpload(mc, bucket, key, uploadID); err != nil {
 			HandleError(w, r, err)
 			return
 		}
 
-		storedParts, err := getStoredParts(st, uploadID)
+		storedParts, err := getStoredParts(mc, uploadID)
 		if err != nil {
 			slog.ErrorContext(ctx, "Failed to get stored parts", "uploadID", uploadID, "error", err)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to retrieve parts", 500))
@@ -111,7 +110,7 @@ func CompleteMultipartUpload(st Meta, shards *blob.Client, ring *placement.Ring,
 				semaphore <- struct{}{}
 				defer func() { <-semaphore }()
 
-				data, err := getPartData(ctx, st, shards, cfg, bucket, key, uploadID, partNum)
+				data, err := getPartData(ctx, mc, bc, cfg, bucket, key, uploadID, partNum)
 				resultChan <- partResult{index: idx, data: data, err: err}
 			}(i, part.PartNumber)
 		}
@@ -141,7 +140,7 @@ func CompleteMultipartUpload(st Meta, shards *blob.Client, ring *placement.Ring,
 		}
 
 		objectHash := model.ObjectHash(bucket, key)
-		if _, _, err := putObjectViaQUIC(ctx, shards, ring, cfg, tmpFile.Name(), objectHash); err != nil {
+		if _, _, err := writeObject(ctx, bc, ring, cfg, tmpFile.Name(), objectHash); err != nil {
 			slog.ErrorContext(ctx, "Failed to store final object", "uploadID", uploadID, "error", err)
 			HandleError(w, r, mapPutErr(err))
 			return
@@ -163,18 +162,18 @@ func CompleteMultipartUpload(st Meta, shards *blob.Client, ring *placement.Ring,
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
 			return
 		}
-		if err := metaPut(st, model.TableObjects, string(objectHash[:]), shardBuf.Bytes()); err != nil {
+		if err := metaPut(mc, model.TableObjects, string(objectHash[:]), shardBuf.Bytes()); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store object metadata", 500))
 			return
 		}
-		if err := metaPut(st, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
+		if err := metaPut(mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store ARN mapping", 500))
 			return
 		}
 
 		// Cleanup is best-effort: the object is already durable, so a failed part
 		// delete must not fail the request.
-		if err := cleanupMultipartUpload(ctx, st, shards, bucket, key, uploadID, parts); err != nil {
+		if err := cleanupMultipartUpload(ctx, mc, bc, bucket, key, uploadID, parts); err != nil {
 			slog.WarnContext(ctx, "Failed to cleanup multipart upload", "uploadID", uploadID, "error", err)
 		}
 
@@ -192,8 +191,8 @@ func CompleteMultipartUpload(st Meta, shards *blob.Client, ring *placement.Ring,
 }
 
 // getPartData reads one part back from its shards.
-func getPartData(ctx context.Context, st Meta, client *blob.Client, cfg Config, bucket, key, uploadID string, partNumber int) ([]byte, error) {
-	data, err := metaGet(st, model.TableObjects, partShardKey(uploadID, partNumber))
+func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, bucket, key, uploadID string, partNumber int) ([]byte, error) {
+	data, err := metaGet(mc, model.TableObjects, partShardKey(uploadID, partNumber))
 	if err != nil {
 		return nil, fmt.Errorf("part not found: uploadID=%s part=%d", uploadID, partNumber)
 	}
@@ -209,7 +208,7 @@ func getPartData(ctx context.Context, st Meta, client *blob.Client, cfg Config, 
 	}
 
 	partKey := partObjectKey(key, uploadID, partNumber)
-	buf, err := reconstructObject(ctx, client, model.ObjectHash(bucket, partKey), place, enc, place.Size)
+	buf, err := reconstructObject(ctx, bc, model.ObjectHash(bucket, partKey), place, enc, place.Size)
 	if err != nil {
 		return nil, err
 	}

@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
@@ -28,7 +27,7 @@ type DeletedObjectInfo struct {
 }
 
 // DeleteObject serves DELETE /{bucket}/{key} with no uploadId.
-func DeleteObject(st Meta, shards *blob.Client, cache *BucketCache) http.Handler {
+func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		bucket := chi.URLParam(r, "bucket")
@@ -42,14 +41,14 @@ func DeleteObject(st Meta, shards *blob.Client, cache *BucketCache) http.Handler
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
-		if err := requireBucket(st, cache, bucket); err != nil {
+		if err := requireBucket(mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
 
 		objectHash := model.ObjectHash(bucket, key)
 
-		data, err := metaGet(st, model.TableObjects, string(objectHash[:]))
+		data, err := metaGet(mc, model.TableObjects, string(objectHash[:]))
 		if err != nil {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
@@ -63,8 +62,8 @@ func DeleteObject(st Meta, shards *blob.Client, cache *BucketCache) http.Handler
 
 		// A node that refuses its shard delete leaves garbage the compactor will
 		// reclaim; the object must still disappear from state.
-		if err := deleteObjectViaQUIC(ctx, shards, bucket, key, objectHash, place); err != nil {
-			slog.ErrorContext(ctx, "deleteObjectViaQUIC failed", "error", err)
+		if err := deleteObject(ctx, bc, bucket, key, objectHash, place); err != nil {
+			slog.ErrorContext(ctx, "deleteObject failed", "error", err)
 		}
 
 		// TODO: A future compaction coordinator can scan these entries to know which
@@ -79,15 +78,15 @@ func DeleteObject(st Meta, shards *blob.Client, cache *BucketCache) http.Handler
 		}
 		var deletedBuf bytes.Buffer
 		if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err == nil {
-			_ = metaPut(st, model.TableObjects, deletedObjectPrefix+bucket+"/"+key, deletedBuf.Bytes()) // Best effort
+			_ = metaPut(mc, model.TableObjects, deletedObjectPrefix+bucket+"/"+key, deletedBuf.Bytes()) // Best effort
 		}
 
-		if err := metaDelete(st, model.TableObjects, string(objectHash[:])); err != nil {
+		if err := metaDelete(mc, model.TableObjects, string(objectHash[:])); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 
-		_ = metaDelete(st, model.TableObjects, objectARN(bucket, key)) // Best effort
+		_ = metaDelete(mc, model.TableObjects, objectARN(bucket, key)) // Best effort
 
 		w.WriteHeader(http.StatusNoContent)
 	})

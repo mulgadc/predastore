@@ -11,12 +11,12 @@ import (
 )
 
 // ListBuckets serves GET /: every bucket the caller's account owns.
-func ListBuckets(st Meta) http.Handler {
+func ListBuckets(mc MetaClient) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		accountID := auth.AccountID(ctx)
 
-		items, err := metaScan(st, model.TableBuckets, "", 0)
+		items, err := metaScan(mc, model.TableBuckets, "", 0)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "failed to list buckets: "+err.Error(), 500))
 			return

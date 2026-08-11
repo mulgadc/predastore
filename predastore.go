@@ -50,10 +50,6 @@ type Options struct {
 	// MasterKey is the AES-256 key shards are encrypted with at rest.
 	// Required: predastore never writes plaintext shards.
 	MasterKey *masterkey.Key
-
-	// Pprof writes a CPU profile for the lifetime of Run, saved to PprofPath.
-	Pprof     bool
-	PprofPath string
 }
 
 // leaderBarrier holds the gate off until local consensus settles: serving
@@ -321,15 +317,13 @@ func gateServer(
 		return nil, err
 	}
 	return gate.NewServer(gate.ServerConfig{
-		Config:          gateConfig(cfg),
-		Host:            host.BindAddr,
-		Port:            n.Port,
-		TLSCert:         host.TLSCert,
-		TLSKey:          host.TLSKey,
-		MasterKey:       opts.MasterKey,
-		Clients:         gate.Clients{Meta: metaClient, Blob: blobClient},
-		PprofEnabled:    opts.Pprof,
-		PprofOutputPath: opts.PprofPath,
+		Config:    gateConfig(cfg),
+		Host:      host.BindAddr,
+		Port:      n.Port,
+		TLSCert:   host.TLSCert,
+		TLSKey:    host.TLSKey,
+		MasterKey: opts.MasterKey,
+		Clients:   gate.Clients{Meta: metaClient, Blob: blobClient},
 	})
 }
 
