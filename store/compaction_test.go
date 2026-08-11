@@ -111,6 +111,71 @@ func TestCompactionDropsDrainedSegmentAndShrinks(t *testing.T) {
 	}
 }
 
+// A store whose data never crosses maxSegSize never rolls past segment 0, so
+// segment 0 is always both the sole segment and the active one. Before the
+// fix, candidateSegments unconditionally excluded the active segment, so a
+// store in this shape could never reclaim dead bytes no matter how much of
+// it was deleted -- compaction always reported segments:0. This asserts the
+// physical file shrinks, not just that the index entry is gone.
+func TestCompactionReclaimsSoleActiveSegment(t *testing.T) {
+	st, dir := openStore(t, store.WithMaxSegSize(1*store.MiB))
+	defer st.Close()
+
+	keep := [32]byte{0x5}
+	dead := [32]byte{0x6}
+	keepBody := bytes.Repeat([]byte{0x11}, 40*store.KiB)
+	deadBody := bytes.Repeat([]byte{0x22}, 200*store.KiB)
+	write(t, st, keep, 0, keepBody)
+	write(t, st, dead, 0, deadBody)
+
+	seg0 := filepath.Join(dir, fmt.Sprintf("%016d.seg", 0))
+	seg1 := filepath.Join(dir, fmt.Sprintf("%016d.seg", 1))
+	if _, err := os.Stat(seg0); err != nil {
+		t.Fatalf("segment 0 should exist: %v", err)
+	}
+	if _, err := os.Stat(seg1); !os.IsNotExist(err) {
+		t.Fatalf("precondition: store should still hold a single segment, stat err=%v", err)
+	}
+
+	if _, err := st.Delete(dead, 0); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	before := dirBytes(t, dir)
+
+	// Cycle 1: segment 0 is still active, so it is only sealed and rolled
+	// past, not dropped yet.
+	if err := st.CompactOnce(); err != nil {
+		t.Fatalf("compact cycle 1: %v", err)
+	}
+	if _, err := os.Stat(seg1); err != nil {
+		t.Fatalf("segment 0 should have been sealed and rolled past: %v", err)
+	}
+	if _, err := os.Stat(seg0); err != nil {
+		t.Fatalf("segment 0 should not be dropped in the same cycle it was sealed: %v", err)
+	}
+
+	// Cycle 2: segment 0 is no longer active, so it is now an ordinary
+	// drained candidate and gets compacted away.
+	if err := st.CompactOnce(); err != nil {
+		t.Fatalf("compact cycle 2: %v", err)
+	}
+	if _, err := os.Stat(seg0); !os.IsNotExist(err) {
+		t.Errorf("segment 0 should be unlinked once no longer active, stat err=%v", err)
+	}
+
+	if after := dirBytes(t, dir); after >= before {
+		t.Errorf("on-disk bytes should shrink once the sole active segment is reclaimed: before=%d after=%d", before, after)
+	}
+
+	got, err := readAll(t, st, keep, 0)
+	if err != nil {
+		t.Fatalf("read surviving shard: %v", err)
+	}
+	if !bytes.Equal(got, keepBody) {
+		t.Errorf("surviving shard corrupted")
+	}
+}
+
 // persistedSegNum reads the active segment counter back out of state.json.
 func persistedSegNum(t *testing.T, dir string) uint64 {
 	t.Helper()
