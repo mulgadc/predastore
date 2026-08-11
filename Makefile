@@ -78,10 +78,38 @@ fix:
 govulncheck:
 	go tool govulncheck ./...
 
+# Warp is pinned so a before/after comparison is not measuring a client change.
+TOOLS_DIR    := $(CURDIR)/bin/tools
+WARP_VERSION ?= v1.1.4
+WARP         ?= $(TOOLS_DIR)/warp
+
+warp-install:
+	@if [ ! -x "$(WARP)" ]; then \
+		echo -e "\n....Installing warp $(WARP_VERSION)"; \
+		mkdir -p "$(TOOLS_DIR)"; \
+		GOBIN="$(TOOLS_DIR)" go install github.com/minio/warp@$(WARP_VERSION); \
+	fi
+
+# Local, self-contained correctness and performance run. The default smoke
+# preset records every request for 30 seconds per workload; PERF_PRESET=compare
+# uses two-minute samples for before/after decisions.
+PERF_PRESET  ?= smoke
+PERF_CONFIGS ?= 1host 3host
+e2e-performance: build certs warp-install
+	@PERF_PRESET="$(PERF_PRESET)" PERF_CONFIGS="$(PERF_CONFIGS)" WARP="$(WARP)" \
+		WARP_VERSION="$(WARP_VERSION)" \
+		./scripts/bench/e2e-performance.sh
+
+# Usage: make e2e-performance-compare PERF_BEFORE=/path/to/before PERF_AFTER=/path/to/after
+e2e-performance-compare: warp-install
+	@test -n "$(PERF_BEFORE)" || { echo "PERF_BEFORE is required" >&2; exit 2; }
+	@test -n "$(PERF_AFTER)" || { echo "PERF_AFTER is required" >&2; exit 2; }
+	@WARP="$(WARP)" ./scripts/bench/compare-performance.sh "$(PERF_BEFORE)" "$(PERF_AFTER)"
+
 # NilAway — advisory nil-panic analysis. Not in preflight: it has a known
 # false-positive rate, so findings are triaged by hand rather than gating commits.
 nilaway:
 	go tool nilaway -include-pkgs=github.com/mulgadc/predastore -exclude-test-files ./...
 
 .PHONY: certs build go_build preflight test test-cover test-race test-integration diff-coverage \
-	clean lint fix govulncheck nilaway
+	clean lint fix govulncheck nilaway warp-install e2e-performance e2e-performance-compare
