@@ -83,7 +83,8 @@ Stop, reset or benchmark the cluster with:
 | `-data-dir` | On-disk root for this host's nodes; overrides `data_dir` |
 | `-encryption-key` | Path to the 32-byte AES-256 key protecting data at rest; overrides `encryption_key` |
 | `-tls-cert`, `-tls-key` | This host's TLS identity; overrides `tls_cert` / `tls_key` |
-| `-bind-addr` | Local listen address, without a port; overrides `bind_addr` |
+| `-bind-addr` | Listen address for this host's cluster traffic, without a port; overrides `bind_addr` |
+| `-gate-bind-addr` | Listen address for the S3 API, without a port; overrides the gate node's `bind_addr` |
 | `-log-level` | `debug`, `info`, `warn` or `error` |
 
 Each of these host-local settings may come from either the file or a flag, so the same configuration file can be deployed unchanged to every machine and the paths supplied per process. The S3 port is not a flag: it is the gate node's `port`.
@@ -170,7 +171,7 @@ parity = 1    # parity shards; data + parity must not exceed the blob node count
 [[host]]
 id   = 1
 addr = "10.11.12.1"        # what other hosts dial; no port — nodes carry those
-# bind_addr = "0.0.0.0"    # optional local listen address, split from addr for NAT
+# bind_addr = "10.11.12.1" # where raft and blob listen; defaults to addr
 # data_dir  = "/var/lib/predastore"   # absolute; -data-dir supplies it otherwise
 
   # A role this host runs. One of "gate", "blob" or "meta".
@@ -178,6 +179,7 @@ addr = "10.11.12.1"        # what other hosts dial; no port — nodes carry thos
   id   = 1
   role = "gate"            # the S3 endpoint; port is the S3 port
   port = 8443
+  # bind_addr = "0.0.0.0"  # where S3 listens; gate only, defaults to the host's
 
   [[host.node]]
   id   = 2
@@ -191,6 +193,8 @@ addr = "10.11.12.1"        # what other hosts dial; no port — nodes carry thos
 ```
 
 Node ids are unique across the whole file; ports are unique within a host. A blob or meta node without its own `data_dir` derives one from the host's root and its node id, so separate disks are a per-node setting rather than a deployment layout.
+
+S3 is a public service and replication is not, so the two bind separately on a multi-homed machine: the host's `bind_addr` is where raft and blob traffic listens, and the gate's own `bind_addr` is where S3 does. Set the first to a private address and the second to `0.0.0.0` and the S3 endpoint answers on every interface while nothing reaches consensus or shard traffic from outside. Neither is required — a host that names only `addr` binds that one address for both, which is what a single-homed machine wants.
 
 Write every node under one `[[host]]` and the cluster runs in one process over the in-process pipe. Spread them across hosts and each process is launched separately with its own `-host` id. Nothing else changes.
 

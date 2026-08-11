@@ -32,7 +32,8 @@ func main() {
 func run() error {
 	configPath := flag.String("config", "", "S3 server configuration file (required)")
 	hostID := flag.Int("host", 0, "ID of the [[host]] this process runs (required)")
-	bindAddr := flag.String("bind-addr", "", "Local listen address, without a port (overrides bind_addr)")
+	bindAddr := flag.String("bind-addr", "", "Listen address for this host's cluster traffic, without a port (overrides bind_addr)")
+	gateBindAddr := flag.String("gate-bind-addr", "", "Listen address for the S3 API, without a port (overrides the gate's bind_addr)")
 	dataDir := flag.String("data-dir", "", "On-disk root for this host's nodes (overrides data_dir)")
 	encryptionKey := flag.String("encryption-key", "", "Path to the 32-byte AES-256 key protecting data at rest (overrides encryption_key)")
 	tlsCert := flag.String("tls-cert", "", "Path to this host's TLS certificate (overrides tls_cert)")
@@ -85,6 +86,13 @@ func run() error {
 		return fmt.Errorf("host %d is not in %s", *hostID, *configPath)
 	}
 	host.BindAddr = cmp.Or(*bindAddr, host.BindAddr, host.Addr)
+	if *gateBindAddr != "" {
+		gate := gateEntry(host)
+		if gate == nil {
+			return fmt.Errorf("-gate-bind-addr given but host %d runs no gate", *hostID)
+		}
+		gate.BindAddr = *gateBindAddr
+	}
 	host.DataDir = cmp.Or(*dataDir, host.DataDir)
 	host.EncryptionKey = cmp.Or(*encryptionKey, host.EncryptionKey)
 	host.TLSCert = cmp.Or(*tlsCert, host.TLSCert)
@@ -117,6 +125,18 @@ func hostEntry(cfg *predastore.Config, id predastore.HostID) *predastore.HostCon
 	for i := range cfg.Hosts {
 		if cfg.Hosts[i].ID == id {
 			return &cfg.Hosts[i]
+		}
+	}
+	return nil
+}
+
+// gateEntry is the gate of this host, addressable for the same reason: the S3
+// listen address is a flag as well as a config field. A host declares at most
+// one, so the first is the only one.
+func gateEntry(h *predastore.HostConfig) *predastore.NodeConfig {
+	for i := range h.Nodes {
+		if h.Nodes[i].Role == predastore.RoleGate {
+			return &h.Nodes[i]
 		}
 	}
 	return nil
