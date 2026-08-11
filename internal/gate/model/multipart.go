@@ -4,7 +4,7 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
-	"io"
+	"hash"
 	"strings"
 	"time"
 )
@@ -173,16 +173,16 @@ func CalculatePartETag(data []byte) string {
 	return fmt.Sprintf("\"%x\"", hash)
 }
 
-// CalculatePartETagFromReader calculates the MD5-based ETag while reading from a reader
-// Returns the ETag and all data read.
-func CalculatePartETagFromReader(r io.Reader) (etag string, data []byte, err error) {
-	hash := md5.New()
-	data, err = io.ReadAll(io.TeeReader(r, hash))
-	if err != nil {
-		return "", nil, err
-	}
-	etag = fmt.Sprintf("\"%x\"", hash.Sum(nil))
-	return etag, data, nil
+// NewPartETagHasher returns the hash a part ETag is computed over. A caller
+// that already reads the part end to end tees into this rather than buffering
+// the part a second time to hash it.
+func NewPartETagHasher() hash.Hash {
+	return md5.New()
+}
+
+// PartETagFrom formats a finished part hash as an S3 ETag.
+func PartETagFrom(h hash.Hash) string {
+	return fmt.Sprintf("\"%x\"", h.Sum(nil))
 }
 
 // CalculateMultipartETag calculates the ETag for a completed multipart upload

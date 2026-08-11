@@ -74,6 +74,39 @@ func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int
 	}, nil
 }
 
+// countingReader records how many bytes were actually read, so a body that
+// stops short of its declared length can be told from a complete one once the
+// stream has already been consumed.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// writeSingleShard streams the body to one node without staging it. The blob
+// client reads at most size bytes, so an over-long body is truncated rather
+// than overrunning the shard; a short one is caught here, because placement
+// records size and a short value would read back as a corrupt object.
+func writeSingleShard(
+	ctx context.Context, bc BlobClient, node config.NodeID, body io.Reader, size int64, objectHash [32]byte,
+) (poolNearFull bool, err error) {
+	counted := &countingReader{r: body}
+
+	resp, err := bc.Put(ctx, node, blob.PutRequest{Key: objectHash, Size: size, Index: 0}, counted)
+	if err != nil {
+		return false, err
+	}
+	if counted.n != size {
+		return false, fmt.Errorf("body delivered %d bytes, declared %d", counted.n, size)
+	}
+	return resp.PoolNearFull, nil
+}
+
 // writeObject splits body into RS shards and sends each to the appropriate
 // node. size is what the caller declared the body to be: the splitter needs it
 // up front, and it is what placement records, so a body that does not deliver
@@ -83,13 +116,26 @@ func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int
 // The stream encoder is constructed per request; hoisting it into the gate
 // belongs with the streaming refactor, not here.
 func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg Config, body io.Reader, size int64, objectHash [32]byte) (poolNearFull bool, err error) {
-	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
-	if err != nil {
-		return false, err
+	// An empty object has no shard to write: the blob protocol rejects a
+	// zero-length value, and recorded placement is enough to serve the GET.
+	if size == 0 {
+		return false, nil
 	}
 
 	// Use objectHash for hash ring placement for consistency with storage and retrieval
 	shardNodes, err := ring.Nodes(objectHash, cfg.TotalShards())
+	if err != nil {
+		return false, err
+	}
+
+	// RS(1,0) is the whole object on one node: nothing to split and no parity
+	// to encode. Streaming it straight through is what keeps a single-node
+	// write off the heap, so it is its own path rather than a degenerate split.
+	if cfg.DataShards == 1 && cfg.ParityShards == 0 {
+		return writeSingleShard(ctx, bc, shardNodes[0], body, size, objectHash)
+	}
+
+	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
 	if err != nil {
 		return false, err
 	}
