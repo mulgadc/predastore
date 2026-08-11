@@ -15,14 +15,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/mulgadc/predastore/internal/blob"
-	"github.com/mulgadc/predastore/internal/blob/engine"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate"
 	"github.com/mulgadc/predastore/internal/meta"
@@ -207,23 +205,19 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		}
 
 	case RoleBlob:
-		// The store expects its directory to exist.
-		if mkErr := os.MkdirAll(dir, 0750); mkErr != nil {
+		// The node owns its store: it creates the directory, opens the engine
+		// and closes it again, so no failure here can leak one.
+		svc, berr := blob.New(blob.Config{
+			NodeID:     n.ID,
+			DataDir:    dir,
+			AEAD:       opts.MasterKey.AEAD,
+			Compaction: time.Duration(cfg.Compaction.IntervalSeconds) * time.Second,
+			Listeners:  lns,
+		})
+		if berr != nil {
 			cleanup()
-			return nil, nil, fmt.Errorf("create shard store directory %s: %w", dir, mkErr)
+			return nil, nil, fmt.Errorf("create blob node %d: %w", n.ID, berr)
 		}
-		// Compaction is always enabled: without it, overwrite and delete churn
-		// never reclaims dead shards and the store fills. A zero interval falls
-		// back to the store's default.
-		st, oerr := engine.Open(dir,
-			engine.WithAEAD(opts.MasterKey.AEAD),
-			engine.WithCompaction(time.Duration(cfg.Compaction.IntervalSeconds)*time.Second))
-		if oerr != nil {
-			cleanup()
-			return nil, nil, fmt.Errorf("open shard store for node %d: %w", n.ID, oerr)
-		}
-		svc := blob.NewServer(n.ID, st)
-		svc.Register(mux)
 		serve = svc.Run
 
 	case RoleMeta:
@@ -261,10 +255,10 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		return nil, nil, fmt.Errorf("node %d has unknown role %q", n.ID, n.Role)
 	}
 
-	// A blob node never dials, so it donates to no pool; a replica donates
-	// to the one it dials from. Both are the same call with a different pool.
+	// A blob node builds its own rpc server, and a gate is never dialed at
+	// all; only a replica needs one here, donating to the pool it dials from.
 	var srv *rpc.Server
-	if n.Role != RoleGate {
+	if n.Role == RoleMeta {
 		srv, err = rpc.NewServer(mux, lns, pool)
 		if err != nil {
 			cleanup()

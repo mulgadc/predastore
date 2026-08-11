@@ -5,10 +5,13 @@ package blob
 
 import (
 	"context"
+	"crypto/cipher"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"time"
 
 	"github.com/mulgadc/predastore/internal/blob/engine"
 	"github.com/mulgadc/predastore/internal/config"
@@ -16,35 +19,93 @@ import (
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
+// Store is the value store a node serves. The engine is the production
+// implementation; Config.Store is the seam a test substitutes through.
+type Store interface {
+	Append(key [32]byte, index uint32, size int64) (engine.Writer, error)
+	Lookup(key [32]byte, index uint32) (engine.Reader, error)
+	Delete(key [32]byte, index uint32) (bool, error)
+	NearFull() bool
+	Close() error
+}
+
+var _ Store = (*engine.Store)(nil)
+
+// Config is everything one blob node runs on. The listeners arrive already
+// bound because the process that owns the transports registers them before
+// any colocated node dials; everything else the node acquires itself.
+type Config struct {
+	NodeID    config.NodeID        // The node this server serves. Required.
+	DataDir   string               // Where the store lives; Run creates it. Required.
+	AEAD      cipher.AEAD          // Seals values at rest. Required unless Store is set.
+	Listeners []transport.Listener // The bound listeners the node answers rpc on.
+
+	// Compaction is how often dead space is reclaimed. It is always enabled:
+	// without it, overwrite and delete churn frees nothing and the store
+	// fills. Zero uses the engine's default interval.
+	Compaction time.Duration
+
+	// Store stands in for the engine that would be opened at DataDir. Test
+	// seam: production leaves it nil.
+	Store Store
+}
+
 // Server serves rpc requests for one blob node. A process running several
-// nodes builds one Server per node, each carried by its own rpc server, so
-// the storage service never learns that it has siblings.
+// nodes builds one Server per node, each with its own rpc server, so the
+// storage service never learns that it has siblings.
 type Server struct {
-	id    config.NodeID
-	store *engine.Store
+	cfg   Config
+	store Store
 }
 
-// NewServer builds the storage service for one node's store.
-func NewServer(id config.NodeID, st *engine.Store) *Server {
-	return &Server{id: id, store: st}
+// New validates cfg and applies its defaults. It creates no directory, opens
+// no store, binds nothing and starts no goroutine: everything the node holds
+// is acquired by Run and released by it.
+func New(cfg Config) (*Server, error) {
+	if cfg.NodeID == 0 {
+		return nil, errors.New("node id is required")
+	}
+	if cfg.DataDir == "" {
+		return nil, fmt.Errorf("node %d has no data directory", cfg.NodeID)
+	}
+	if cfg.Store == nil && cfg.AEAD == nil {
+		return nil, fmt.Errorf("node %d has no aead: values are never stored in plaintext", cfg.NodeID)
+	}
+	// A node nothing can reach stores nothing. Failing here says so, rather
+	// than leaving a process holding an open store no peer can dial.
+	if len(cfg.Listeners) == 0 {
+		return nil, fmt.Errorf("node %d has no listeners", cfg.NodeID)
+	}
+	return &Server{cfg: cfg}, nil
 }
 
-// ID is the node this server serves.
-func (s *Server) ID() config.NodeID { return s.id }
-
-// Run holds the node open until ctx is cancelled, then closes its store. The
-// rpc server draining is the caller's concern; by the time Run returns no
-// handler is still touching the store.
+// Run opens the store, answers rpc on the configured listeners until ctx is
+// cancelled, then closes the store. A blob node never dials, so its rpc
+// server donates to no pool and owns every connection it accepts.
 func (s *Server) Run(ctx context.Context) error {
-	<-ctx.Done()
-	return s.store.Close()
-}
+	s.store = s.cfg.Store
+	if s.store == nil {
+		if err := os.MkdirAll(s.cfg.DataDir, 0750); err != nil {
+			return fmt.Errorf("create store directory %s: %w", s.cfg.DataDir, err)
+		}
+		st, err := engine.Open(s.cfg.DataDir,
+			engine.WithAEAD(s.cfg.AEAD), engine.WithCompaction(s.cfg.Compaction))
+		if err != nil {
+			return fmt.Errorf("open store %s: %w", s.cfg.DataDir, err)
+		}
+		s.store = st
+	}
 
-// Register installs the storage service handlers on the mux.
-func (s *Server) Register(mux *rpc.Mux) {
+	mux := rpc.NewMux()
 	rpc.RegisterHandler(mux, OpGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpPut, s.handlePut)
 	rpc.RegisterHandler(mux, OpDelete, s.handleDelete)
+	srv, err := rpc.NewServer(mux, s.cfg.Listeners, nil)
+	if err != nil {
+		return errors.Join(err, s.store.Close())
+	}
+
+	return errors.Join(srv.Run(ctx), s.store.Close())
 }
 
 // respond writes the newline-terminated JSON envelope; get responses stream
