@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="662" viewBox="0 0 1000 662" role="img" aria-label="Predastore blob node on-disk format: a data directory of state.json, a badger index, append-only .seg segment files and their .idx sidecars; each segment is a 14-byte header followed by fixed 8240-byte fragments; each fragment is a 32-byte plaintext header, an 8192-byte AES-256-GCM ciphertext body and a 16-byte tag bound to the value's position.">
+<rect x="0" y="0" width="1000" height="662" rx="20" fill="#14181D" stroke="#2A2F36" stroke-width="1"/>
+
+<text x="28" y="42" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11.5" fill="#3FB950" font-weight="600" letter-spacing="2.5">BLOB NODE · ON-DISK FORMAT</text>
+<text x="972" y="42" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11.5" fill="#9AA1A8" text-anchor="end">append-only · fixed fragments · sealed at rest</text>
+<text x="28" y="72" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="21" fill="#F5F3EE" font-weight="800">A value is a contiguous extent of sealed fragments.</text>
+
+<rect x="28" y="88" width="944" height="112" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1"/>
+<text x="48" y="112" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#9AA1A8" font-weight="700" letter-spacing="1.5">DATA DIRECTORY</text>
+<text x="952" y="112" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">one per blob node</text>
+<rect x="48" y="126" width="214" height="60" rx="8" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="62" y="147" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#3FB950">state.json</text>
+<text x="62" y="165" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">segNum, valueNum, fragNum,</text>
+<text x="62" y="179" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">fragNumHighWater, storeID</text>
+<rect x="278" y="126" width="214" height="60" rx="8" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="292" y="147" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#3FB950">db/</text>
+<text x="292" y="165" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">badger index: key‖index → extent,</text>
+<text x="292" y="179" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">plus the tombstone namespace</text>
+<rect x="508" y="126" width="214" height="60" rx="8" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="522" y="147" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#3FB950">0000000000000000.seg</text>
+<text x="522" y="165" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">the fragments themselves,</text>
+<text x="522" y="179" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">rolled at 4 GiB</text>
+<rect x="738" y="126" width="214" height="60" rx="8" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="752" y="147" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#3FB950">0000000000000000.idx</text>
+<text x="752" y="165" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">52-byte rows: off ‖ key ‖ psize,</text>
+<text x="752" y="179" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">what compaction enumerates</text>
+
+<rect x="28" y="216" width="944" height="124" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1"/>
+<text x="48" y="240" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#9AA1A8" font-weight="700" letter-spacing="1.5">SEGMENT FILE</text>
+<text x="952" y="240" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">magic S3SE · version 1</text>
+<rect x="48" y="256" width="70" height="46" rx="6" fill="#3FB950" fill-opacity="0.14" stroke="#3FB950" stroke-width="1" stroke-opacity="0.4"/>
+<text x="83" y="275" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#3FB950" text-anchor="middle">header</text><text x="83" y="290" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#3FB950" text-anchor="middle">14 B</text>
+<rect x="118" y="256" width="154" height="46" rx="6" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="195" y="275" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="middle">fragment 0</text><text x="195" y="290" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="middle">8240 B</text>
+<rect x="272" y="256" width="154" height="46" rx="6" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="349" y="275" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="middle">fragment 1</text><text x="349" y="290" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="middle">8240 B</text>
+<rect x="426" y="256" width="154" height="46" rx="6" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="503" y="275" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="middle">fragment 2</text><text x="503" y="290" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="middle">8240 B</text>
+<rect x="580" y="256" width="154" height="46" rx="6" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="657" y="275" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="middle">fragment 3</text><text x="657" y="290" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="middle">8240 B</text>
+<rect x="734" y="256" width="218" height="46" rx="6" fill="none" stroke="#2A2F36" stroke-width="1" stroke-dasharray="3 4"/>
+<text x="843" y="275" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="middle">… up to 4 GiB</text><text x="843" y="290" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="middle">then flagFull, roll to the next segment</text>
+<text x="48" y="324" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">One value occupies a contiguous run of fragments. Runs from different values share a segment but never interleave.</text>
+
+<rect x="28" y="356" width="944" height="150" rx="13" fill="#181D23" stroke="#3FB950" stroke-width="1" stroke-opacity="0.35"/>
+<text x="48" y="380" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#3FB950" font-weight="700" letter-spacing="1.5">FRAGMENT · 8240 B FIXED</text>
+<text x="952" y="380" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">32 + 8192 + 16</text>
+<rect x="48" y="396" width="180" height="46" rx="6" fill="none" stroke="#9AA1A8" stroke-width="1" stroke-opacity="0.5"/>
+<text x="138" y="415" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#9AA1A8" text-anchor="middle">header · 32 B</text><text x="138" y="431" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="9.5" fill="#5B636C" text-anchor="middle">plaintext, authenticated</text>
+<rect x="228" y="396" width="592" height="46" rx="6" fill="#3FB950" fill-opacity="0.14" stroke="#3FB950" stroke-width="1" stroke-opacity="0.4"/>
+<text x="524" y="415" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#3FB950" text-anchor="middle">body · 8192 B — AES-256-GCM ciphertext</text><text x="524" y="431" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="9.5" fill="#3FB950" text-anchor="middle">zero-padded before sealing when the payload is shorter</text>
+<rect x="820" y="396" width="132" height="46" rx="6" fill="#F5B500" fill-opacity="0.14" stroke="#F5B500" stroke-width="1" stroke-opacity="0.4"/>
+<text x="886" y="415" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#F5B500" text-anchor="middle">tag · 16 B</text><text x="886" y="431" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="9.5" fill="#F5B500" text-anchor="middle">GCM</text>
+<text x="48" y="466" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10.5" fill="#9AA1A8">header = fragNum(8) ‖ valueNum(8) ‖ reserved(4) ‖ size(4) ‖ flags(4) ‖ reserved(4)</text>
+<text x="48" y="486" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">The header must be readable before decryption, so it is plaintext — but it feeds the AAD, so tampering with it fails the tag.</text>
+
+<rect x="28" y="522" width="944" height="112" rx="13" fill="#181D23" stroke="#F5B500" stroke-width="1" stroke-opacity="0.35"/>
+<text x="48" y="546" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#F5B500" font-weight="700" letter-spacing="1.5">WHAT EACH FRAGMENT IS BOUND TO</text>
+<text x="952" y="546" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">reconstructed at read time</text>
+<text x="48" y="574" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#9AA1A8">nonce (12 B) = BE(fragNum) ‖ BE(storeID)</text>
+<text x="48" y="596" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#9AA1A8">aad   (52 B) = key(32) ‖ index(4) ‖ BE(valueNum) ‖ BE(fragNum)</text>
+<text x="48" y="620" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">storeID is random per data dir, so a fragment spliced between data dirs opens under the wrong nonce and fails.</text>
+</svg>

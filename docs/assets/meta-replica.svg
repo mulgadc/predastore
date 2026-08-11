@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="506" viewBox="0 0 1000 506" role="img" aria-label="Predastore meta replica: the client prefers the cached Raft leader and follows not-leader redirects; the replica answers key-value opcodes over rpc streams and carries Raft's own traffic over the same streams, applying committed commands into a badger FSM while bolt holds the Raft log and a file store holds snapshots.">
+<rect x="0" y="0" width="1000" height="506" rx="20" fill="#14181D" stroke="#2A2F36" stroke-width="1"/>
+
+<text x="28" y="42" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11.5" fill="#5AA9E6" font-weight="600" letter-spacing="2.5">META PLANE · ONE REPLICA</text>
+<text x="972" y="42" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11.5" fill="#9AA1A8" text-anchor="end">raft rides rpc streams · no port of its own</text>
+<text x="28" y="72" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="21" fill="#F5F3EE" font-weight="800">A flat key-value store, replicated by Raft.</text>
+
+<rect x="28" y="88" width="296" height="290" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1"/>
+<text x="48" y="112" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#9AA1A8" font-weight="700" letter-spacing="1.5">meta.Client</text>
+<text x="304" y="112" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">held by the gate</text>
+<line x1="48" y1="122" x2="304" y2="122" stroke="#2A2F36" stroke-width="1"/>
+<rect x="48" y="136" width="256" height="72" rx="8" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="62" y="157" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#5AA9E6">reads</text>
+<text x="62" y="175" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">cached leader first, then every</text>
+<text x="62" y="191" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">replica; a follower may be stale</text>
+<rect x="48" y="220" width="256" height="90" rx="8" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="62" y="241" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#5AA9E6">writes</text>
+<text x="62" y="259" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">follow the not-leader redirect,</text>
+<text x="62" y="275" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">otherwise rotate replicas while</text>
+<text x="62" y="291" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">an election settles</text>
+<text x="48" y="336" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">Keys are opaque strings that may hold</text>
+<text x="48" y="352" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">arbitrary bytes. Namespacing is the</text>
+<text x="48" y="368" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#5B636C">caller's, not the replica's.</text>
+
+<line x1="326" y1="200" x2="350" y2="200" stroke="#5AA9E6" stroke-width="1.2" stroke-opacity="0.6" stroke-dasharray="3 3"/><polygon points="344,196 344,204 352,200" fill="#5AA9E6" fill-opacity="0.7"/>
+
+<rect x="352" y="88" width="620" height="290" rx="13" fill="#181D23" stroke="#5AA9E6" stroke-width="1" stroke-opacity="0.35"/>
+<text x="372" y="112" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#5AA9E6" font-weight="700" letter-spacing="1.5">meta replica · node 5</text>
+<text x="952" y="112" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#5B636C" text-anchor="end">advertise address: node-5</text>
+<line x1="372" y1="122" x2="952" y2="122" stroke="#2A2F36" stroke-width="1"/>
+
+<rect x="372" y="134" width="282" height="52" rx="8" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="386" y="155" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10.5" fill="#5AA9E6">0x1001–0x1004</text>
+<text x="386" y="173" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">get · put · delete · scan</text>
+<rect x="670" y="134" width="282" height="52" rx="8" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="684" y="155" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10.5" fill="#5AA9E6">0x0001 · raft dial</text>
+<text x="684" y="173" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">the stream becomes a raft conn</text>
+
+<line x1="513" y1="186" x2="513" y2="206" stroke="#5AA9E6" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="507,204 519,204 513,212" fill="#5AA9E6" fill-opacity="0.6"/>
+<line x1="811" y1="186" x2="811" y2="206" stroke="#5AA9E6" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="805,204 817,204 811,212" fill="#5AA9E6" fill-opacity="0.6"/>
+
+<rect x="372" y="212" width="580" height="52" rx="8" fill="#5AA9E6" fill-opacity="0.10" stroke="#5AA9E6" stroke-width="1.2" stroke-opacity="0.5"/>
+<text x="386" y="233" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11.5" fill="#5AA9E6" font-weight="700">hashicorp/raft</text>
+<text x="938" y="233" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="10" fill="#9AA1A8" text-anchor="end">RPCStreamLayer</text>
+<text x="386" y="253" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11" fill="#9AA1A8">Only the leader may apply. Commands are JSON: put or delete, one key, one value.</text>
+
+<line x1="463" y1="264" x2="463" y2="284" stroke="#5AA9E6" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="457,282 469,282 463,290" fill="#5AA9E6" fill-opacity="0.6"/>
+<line x1="662" y1="264" x2="662" y2="284" stroke="#5AA9E6" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="656,282 668,282 662,290" fill="#5AA9E6" fill-opacity="0.6"/>
+<line x1="861" y1="264" x2="861" y2="284" stroke="#5AA9E6" stroke-width="1.2" stroke-opacity="0.5"/><polygon points="855,282 867,282 861,290" fill="#5AA9E6" fill-opacity="0.6"/>
+
+<rect x="372" y="290" width="182" height="68" rx="8" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="386" y="311" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#F5F3EE">raft.db</text>
+<text x="386" y="329" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">bolt: the log and</text>
+<text x="386" y="345" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">the stable store</text>
+<rect x="571" y="290" width="182" height="68" rx="8" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="585" y="311" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#F5F3EE">badger/</text>
+<text x="585" y="329" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">the FSM: the state</text>
+<text x="585" y="345" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">the log builds</text>
+<rect x="770" y="290" width="182" height="68" rx="8" fill="none" stroke="#2A2F36" stroke-width="1"/>
+<text x="784" y="311" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="11" fill="#F5F3EE">snapshots/</text>
+<text x="784" y="329" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">length-prefixed key</text>
+<text x="784" y="345" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="10.5" fill="#9AA1A8">and value frames</text>
+
+<rect x="28" y="396" width="944" height="82" rx="13" fill="#181D23" stroke="#2A2F36" stroke-width="1"/>
+<text x="48" y="420" font-family="ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace" font-size="12" fill="#9AA1A8" font-weight="700" letter-spacing="1.5">WHY TWO DATABASES</text>
+<text x="48" y="442" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11.5" fill="#9AA1A8">Bolt stores how to build the state — the ordered log Raft replicates. Badger stores the state itself.</text>
+<text x="48" y="462" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, system-ui, sans-serif" font-size="11.5" fill="#5B636C">Snapshots compact the log and let a new replica catch up without replaying it from the beginning.</text>
+</svg>
