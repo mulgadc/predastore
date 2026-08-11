@@ -182,7 +182,7 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 	}
 
 	if store.aead == nil {
-		return nil, errors.New("store: aead is required (use WithAEAD)")
+		return nil, errors.New("aead is required (use WithAEAD)")
 	}
 
 	if err := store.loadState(); err != nil {

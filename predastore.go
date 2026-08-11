@@ -70,19 +70,19 @@ func newLeaderBarrier() leaderBarrier {
 // signal stops the lot; there is nothing else to stop it with.
 func Run(ctx context.Context, opts Options) error {
 	if opts.Config == nil {
-		return fmt.Errorf("predastore: Options.Config is required")
+		return fmt.Errorf("Options.Config is required")
 	}
 	if opts.MasterKey == nil {
-		return fmt.Errorf("predastore: Options.MasterKey is required")
+		return fmt.Errorf("Options.MasterKey is required")
 	}
 
 	cfg := opts.Config
 	host, ok := hostOf(cfg, opts.HostID)
 	if !ok {
-		return fmt.Errorf("predastore: host %d is not in the configuration", opts.HostID)
+		return fmt.Errorf("host %d is not in the configuration", opts.HostID)
 	}
 	if len(host.Nodes) == 0 {
-		return fmt.Errorf("predastore: host %d runs no nodes", opts.HostID)
+		return fmt.Errorf("host %d runs no nodes", opts.HostID)
 	}
 	// A node that names no directory of its own derives one under the host
 	// root, and an empty root derives a relative path under whatever directory
@@ -90,7 +90,7 @@ func Run(ctx context.Context, opts Options) error {
 	if host.DataDir == "" && slices.ContainsFunc(host.Nodes, func(n NodeConfig) bool {
 		return n.Role != RoleGate && n.DataDir == ""
 	}) {
-		return fmt.Errorf("predastore: host %d has no data directory", opts.HostID)
+		return fmt.Errorf("host %d has no data directory", opts.HostID)
 	}
 
 	// A host with no replica of its own has no local consensus to wait on, so

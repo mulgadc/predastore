@@ -73,7 +73,7 @@ type ClientConfig struct {
 
 func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.Client == nil {
-		return nil, fmt.Errorf("storage client: missing rpc client")
+		return nil, fmt.Errorf("missing rpc client")
 	}
 	return &Client{rpc: cfg.Client}, nil
 }

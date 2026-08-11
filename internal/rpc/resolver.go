@@ -59,7 +59,7 @@ func NewResolver(cfg *config.Config, source config.NodeID, trs ...transport.Tran
 		}
 	}
 	if !found {
-		return nil, fmt.Errorf("rpc: node %d is not in the configuration", source)
+		return nil, fmt.Errorf("node %d is not in the configuration", source)
 	}
 
 	r := &Resolver{
@@ -77,14 +77,14 @@ func NewResolver(cfg *config.Config, source config.NodeID, trs ...transport.Tran
 			}
 			tr, ok := byNetwork[string(network)]
 			if !ok {
-				return nil, fmt.Errorf("rpc: node %d needs a %s transport", n.ID, network)
+				return nil, fmt.Errorf("node %d needs a %s transport", n.ID, network)
 			}
 
 			addr := transport.NewAddr(network, net.JoinHostPort(h.Addr, strconv.Itoa(n.Port)))
 			// Two nodes at one address is a configuration the table cannot
 			// reverse, so NodeAt would have to guess between them.
 			if other, ok := r.nodes[addrKeyOf(addr)]; ok {
-				return nil, fmt.Errorf("rpc: nodes %d and %d are both at %s %s", other, n.ID, addr.Network(), addr)
+				return nil, fmt.Errorf("nodes %d and %d are both at %s %s", other, n.ID, addr.Network(), addr)
 			}
 			r.routes[n.ID] = Route{Transport: tr, Addr: addr}
 			r.nodes[addrKeyOf(addr)] = n.ID
@@ -99,7 +99,7 @@ func NewResolver(cfg *config.Config, source config.NodeID, trs ...transport.Tran
 func (r *Resolver) Route(remote config.NodeID) (Route, error) {
 	route, ok := r.routes[remote]
 	if !ok {
-		return Route{}, fmt.Errorf("rpc: no route to node %d", remote)
+		return Route{}, fmt.Errorf("no route to node %d", remote)
 	}
 	return route, nil
 }

@@ -46,7 +46,7 @@ func RaftAddress(nodeID config.NodeID) string {
 func ParseRaftAddress(addr string) (config.NodeID, error) {
 	id, err := strconv.ParseUint(strings.TrimPrefix(addr, raftAddrPrefix), 10, 64)
 	if err != nil {
-		return 0, fmt.Errorf("state: bad raft address %q: %w", addr, err)
+		return 0, fmt.Errorf("bad raft address %q: %w", addr, err)
 	}
 	return config.NodeID(id), nil
 }

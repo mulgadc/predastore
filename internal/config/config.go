@@ -227,23 +227,23 @@ func (c *Config) Validate() error {
 	// First, because a file from another format explains every other complaint
 	// this function could make about it.
 	if c.Version != Version {
-		return fmt.Errorf("config: version %d, s3d reads version %d", c.Version, Version)
+		return fmt.Errorf("config version %d, s3d reads version %d", c.Version, Version)
 	}
 
 	// The region is what a request's credential scope is compared against, so
 	// an empty one matches nothing a client can sign.
 	if c.Region == "" {
-		return fmt.Errorf("config: missing region")
+		return fmt.Errorf("missing region")
 	}
 
 	// The erasure code has no default: a substituted one would place objects
 	// the file never asked for, at a width the blob-node check below never saw.
 	if c.RS.Data <= 0 || c.RS.Parity <= 0 {
-		return fmt.Errorf("config: rs data and parity must be positive")
+		return fmt.Errorf("rs data and parity must be positive")
 	}
 
 	if c.IAM != nil && isRelative(c.IAM.MasterKeyPath) {
-		return fmt.Errorf("config: iam master_key_path %q must be absolute", c.IAM.MasterKeyPath)
+		return fmt.Errorf("iam master_key_path %q must be absolute", c.IAM.MasterKeyPath)
 	}
 
 	// Every config-defined service account must have an account_id so that
@@ -283,27 +283,27 @@ func (c *Config) validateTopology() error {
 
 	for _, h := range c.Hosts {
 		if h.ID == 0 {
-			return fmt.Errorf("config: host id must be positive")
+			return fmt.Errorf("host id must be positive")
 		}
 		if hostIDs[h.ID] {
-			return fmt.Errorf("config: duplicate host id %d", h.ID)
+			return fmt.Errorf("duplicate host id %d", h.ID)
 		}
 		hostIDs[h.ID] = true
 		if h.Addr == "" {
-			return fmt.Errorf("config: host %d missing addr", h.ID)
+			return fmt.Errorf("host %d missing addr", h.ID)
 		}
 		// Ports belong to nodes, so a host address carrying one is naming
 		// something the cluster no longer has a use for.
 		if hasPort(h.BindAddr) {
-			return fmt.Errorf("config: host %d bind_addr %q must not carry a port", h.ID, h.BindAddr)
+			return fmt.Errorf("host %d bind_addr %q must not carry a port", h.ID, h.BindAddr)
 		}
 		if hasPort(h.Addr) {
-			return fmt.Errorf("config: host %d addr %q must not carry a port", h.ID, h.Addr)
+			return fmt.Errorf("host %d addr %q must not carry a port", h.ID, h.Addr)
 		}
 		// Peers dial addr, so a wildcard or a group address names nothing they
 		// can reach. bind_addr is the one that may be a wildcard.
 		if ip := net.ParseIP(h.Addr); ip != nil && (ip.IsUnspecified() || ip.IsMulticast()) {
-			return fmt.Errorf("config: host %d addr %q is not an address a peer can dial", h.ID, h.Addr)
+			return fmt.Errorf("host %d addr %q is not an address a peer can dial", h.ID, h.Addr)
 		}
 		for _, p := range [][2]string{
 			{"data_dir", h.DataDir},
@@ -312,7 +312,7 @@ func (c *Config) validateTopology() error {
 			{"tls_key", h.TLSKey},
 		} {
 			if isRelative(p[1]) {
-				return fmt.Errorf("config: host %d %s %q must be absolute", h.ID, p[0], p[1])
+				return fmt.Errorf("host %d %s %q must be absolute", h.ID, p[0], p[1])
 			}
 		}
 
@@ -326,34 +326,34 @@ func (c *Config) validateTopology() error {
 
 		for _, n := range h.Nodes {
 			if n.ID == 0 {
-				return fmt.Errorf("config: node id must be positive")
+				return fmt.Errorf("node id must be positive")
 			}
 			if other, ok := nodeHosts[n.ID]; ok {
-				return fmt.Errorf("config: duplicate node id %d on hosts %d and %d", n.ID, other, h.ID)
+				return fmt.Errorf("duplicate node id %d on hosts %d and %d", n.ID, other, h.ID)
 			}
 			nodeHosts[n.ID] = h.ID
 			switch n.Role {
 			case RoleGate, RoleBlob, RoleMeta:
 			default:
-				return fmt.Errorf("config: node %d has unknown role %q", n.ID, n.Role)
+				return fmt.Errorf("node %d has unknown role %q", n.ID, n.Role)
 			}
 			if n.Port == 0 {
-				return fmt.Errorf("config: node %d missing port", n.ID)
+				return fmt.Errorf("node %d missing port", n.ID)
 			}
 			if other, ok := ports[n.Port]; ok {
-				return fmt.Errorf("config: nodes %d and %d both use port %d on host %d", other, n.ID, n.Port, h.ID)
+				return fmt.Errorf("nodes %d and %d both use port %d on host %d", other, n.ID, n.Port, h.ID)
 			}
 			ports[n.Port] = n.ID
 			if n.Role == RoleGate {
 				// A gate keeps nothing on disk, so a data_dir on one is a
 				// misunderstanding rather than something to ignore.
 				if n.DataDir != "" {
-					return fmt.Errorf("config: gate node %d must not set data_dir", n.ID)
+					return fmt.Errorf("gate node %d must not set data_dir", n.ID)
 				}
 				// Two gates on one host would be two S3 endpoints answering for
 				// the same machine, which nothing downstream can choose between.
 				if gate != 0 {
-					return fmt.Errorf("config: host %d has more than one gate (nodes %d and %d)", h.ID, gate, n.ID)
+					return fmt.Errorf("host %d has more than one gate (nodes %d and %d)", h.ID, gate, n.ID)
 				}
 				gate = n.ID
 				continue
@@ -362,23 +362,23 @@ func (c *Config) validateTopology() error {
 				blobs++
 			}
 			if isRelative(n.DataDir) {
-				return fmt.Errorf("config: node %d data_dir %q must be absolute", n.ID, n.DataDir)
+				return fmt.Errorf("node %d data_dir %q must be absolute", n.ID, n.DataDir)
 			}
 			dir := NodeDataDir(h, n)
 			if other, ok := dirs[dir]; ok {
-				return fmt.Errorf("config: nodes %d and %d both use data dir %s on host %d", other, n.ID, dir, h.ID)
+				return fmt.Errorf("nodes %d and %d both use data dir %s on host %d", other, n.ID, dir, h.ID)
 			}
 			dirs[dir] = n.ID
 		}
 	}
 
 	if len(nodeHosts) == 0 {
-		return fmt.Errorf("config: no nodes defined")
+		return fmt.Errorf("no nodes defined")
 	}
 	// Placement spreads a stripe over distinct blob nodes, so a cluster with
 	// fewer of them than the stripe is wide fails every write.
 	if shards := c.RS.Data + c.RS.Parity; shards > blobs {
-		return fmt.Errorf("config: rs data+parity is %d but the cluster has %d blob nodes", shards, blobs)
+		return fmt.Errorf("rs data+parity is %d but the cluster has %d blob nodes", shards, blobs)
 	}
 	return nil
 }

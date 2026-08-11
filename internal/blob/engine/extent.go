@@ -29,7 +29,7 @@ func (ext extent) encode() []byte {
 
 func decodeExtent(buf []byte) (ext extent, err error) {
 	if len(buf) != extentEncodedSize {
-		return ext, fmt.Errorf("extent: invalid length %d, want %d", len(buf), extentEncodedSize)
+		return ext, fmt.Errorf("invalid length %d, want %d", len(buf), extentEncodedSize)
 	}
 
 	ext.SegNum = binary.BigEndian.Uint64(buf[0:8])

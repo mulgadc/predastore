@@ -277,6 +277,6 @@ func (s *Server) Run(ctx context.Context) error {
 		if err == nil || errors.Is(err, http.ErrServerClosed) {
 			return nil
 		}
-		return fmt.Errorf("s3 gate: %w", err)
+		return err
 	}
 }

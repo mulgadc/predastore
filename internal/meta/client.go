@@ -13,7 +13,7 @@ import (
 )
 
 // ErrNotFound is returned by reads when no replica holds the key.
-var ErrNotFound = errors.New("state key not found")
+var ErrNotFound = errors.New("key not found")
 
 // ErrNotLeader is returned by a Server write this replica cannot commit, and
 // by client writes no replica would accept as leader, which usually means an
@@ -59,10 +59,10 @@ type ClientConfig struct {
 
 func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.Client == nil {
-		return nil, fmt.Errorf("state client: missing rpc client")
+		return nil, fmt.Errorf("missing rpc client")
 	}
 	if len(cfg.Replicas) == 0 {
-		return nil, fmt.Errorf("state client: no meta replicas")
+		return nil, fmt.Errorf("no meta replicas")
 	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 10 * time.Second

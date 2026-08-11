@@ -39,7 +39,7 @@ func NewServer(config *ClusterConfig) (*Server, error) {
 	// metadata, IAM state) and the stream layer is what encrypts them. There
 	// is no self-hosted fallback.
 	if config.StreamLayer == nil {
-		return nil, fmt.Errorf("state: a stream layer is required; refusing to start without one")
+		return nil, fmt.Errorf("a stream layer is required; refusing to start without one")
 	}
 
 	node := &Server{id: config.NodeID, config: config, layer: config.StreamLayer}
@@ -275,22 +275,22 @@ func (n *Server) Stats() map[string]string {
 // 3. Close BoltDB log store
 // 4. Close Badger FSM storage.
 func (n *Server) Close() error {
-	slog.Info("state: starting shutdown")
+	slog.Info("starting shutdown")
 
 	// Close transport first to stop all network activity.
 	// This prevents election loops when other nodes have already stopped,
 	// and causes immediate connection errors instead of timeouts.
 	if n.transport != nil {
-		slog.Info("state: closing transport")
+		slog.Info("closing transport")
 		if err := n.transport.Close(); err != nil {
-			slog.Warn("state: failed to close transport", "error", err)
+			slog.Warn("failed to close transport", "error", err)
 		}
 	}
 
 	// Shutdown Raft with a timeout to avoid blocking forever
 	// when we can't reach quorum (other nodes already stopped)
 	if n.raft != nil {
-		slog.Info("state: initiating raft shutdown")
+		slog.Info("initiating raft shutdown")
 		future := n.raft.Shutdown()
 
 		// Wait for shutdown with timeout
@@ -302,32 +302,32 @@ func (n *Server) Close() error {
 		select {
 		case err := <-done:
 			if err != nil {
-				slog.Warn("state: raft shutdown returned error", "error", err)
+				slog.Warn("raft shutdown returned error", "error", err)
 			} else {
-				slog.Info("state: raft shutdown completed gracefully")
+				slog.Info("raft shutdown completed gracefully")
 			}
 		case <-time.After(5 * time.Second):
-			slog.Warn("state: raft shutdown timed out after 5s, forcing close")
+			slog.Warn("raft shutdown timed out after 5s, forcing close")
 		}
 	}
 
 	// Close BoltDB log store
 	if store, ok := n.logStore.(*raftboltdb.BoltStore); ok {
-		slog.Info("state: closing BoltDB log store")
+		slog.Info("closing BoltDB log store")
 		if err := store.Close(); err != nil {
-			slog.Warn("state: failed to close BoltDB log store", "error", err)
+			slog.Warn("failed to close BoltDB log store", "error", err)
 		}
 	}
 
 	// Close Badger FSM storage
 	if n.badgerDB != nil {
-		slog.Info("state: closing Badger DB")
+		slog.Info("closing Badger DB")
 		if err := n.badgerDB.Close(); err != nil {
-			slog.Warn("state: failed to close Badger DB", "error", err)
+			slog.Warn("failed to close Badger DB", "error", err)
 		}
 	}
 
-	slog.Info("state: shutdown complete")
+	slog.Info("shutdown complete")
 	return nil
 }
 
