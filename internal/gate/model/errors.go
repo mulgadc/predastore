@@ -28,6 +28,7 @@ const (
 	ErrMissingParameter        S3ErrorCode = "MissingParameter"
 	ErrChecksumMismatch        S3ErrorCode = "XAmzContentChecksumMismatch"
 	ErrInsufficientStorage     S3ErrorCode = "InsufficientStorage"
+	ErrMissingContentLength    S3ErrorCode = "MissingContentLength"
 )
 
 // S3Error represents a typed S3 error with code and message.
@@ -112,6 +113,16 @@ var (
 		Code:       ErrInsufficientStorage,
 		Message:    "The storage pool is at capacity and cannot accept new writes",
 		StatusCode: http.StatusInsufficientStorage,
+	}
+
+	// ErrMissingContentLengthError is returned when a write carries a body of
+	// undeclared length. The erasure coder has to know the size before it can
+	// split, and S3 requires the header on every PUT, so there is nothing to
+	// fall back to.
+	ErrMissingContentLengthError = &S3Error{
+		Code:       ErrMissingContentLength,
+		Message:    "You must provide the Content-Length HTTP header",
+		StatusCode: http.StatusLengthRequired,
 	}
 )
 

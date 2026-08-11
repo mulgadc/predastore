@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"os"
 	"strconv"
 
 	"github.com/mulgadc/predastore/internal/gate/chunked"
@@ -14,9 +13,9 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/placement"
 )
 
-// PutObject serves PUT /{bucket}/{key}: the body is staged to a temporary file,
-// erasure coded across the blob nodes, and its placement recorded in global
-// state under both the object hash and the listing key.
+// PutObject serves PUT /{bucket}/{key}: the body is erasure coded across the
+// blob nodes as it is read, and its placement recorded in global state under
+// both the object hash and the listing key.
 func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
@@ -33,28 +32,13 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		objectHash := model.ObjectHash(bucket, key)
 
-		// The Reed-Solomon splitter needs a seekable, sized input, so the body is
-		// staged to a temporary file before any shard is written.
-		tmpFile, err := os.CreateTemp("", "distributed-put-*")
-		if err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+		body, size := decodeBody(r)
+		if size < 0 {
+			HandleError(w, r, model.ErrMissingContentLengthError)
 			return
 		}
-		defer os.Remove(tmpFile.Name())
-		defer tmpFile.Close()
 
-		if r.Body != nil {
-			if _, err := io.Copy(tmpFile, decodeBody(r)); err != nil {
-				slog.ErrorContext(ctx, "putObject: copy to temp file failed", "error", err)
-				HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
-				return
-			}
-		}
-		if closeErr := tmpFile.Close(); closeErr != nil {
-			slog.DebugContext(ctx, "Failed to close temp file", "path", tmpFile.Name(), "error", closeErr)
-		}
-
-		size, poolNearFull, err := writeObject(ctx, bc, ring, cfg, tmpFile.Name(), objectHash)
+		poolNearFull, err := writeObject(ctx, bc, ring, cfg, body, size, objectHash)
 		if err != nil {
 			slog.ErrorContext(ctx, "putObject: shard distribution failed", "error", err)
 			HandleError(w, r, mapPutErr(err))
@@ -96,11 +80,21 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 }
 
 // decodeBody unwraps aws-chunked framing when the client used it, so the rest
-// of the write path only ever sees object bytes.
-func decodeBody(r *http.Request) io.Reader {
-	if r.Header.Get("Content-Encoding") != "aws-chunked" {
-		return r.Body
+// of the write path only ever sees object bytes, and reports how many of those
+// bytes to expect. The count is negative when the request declared no length.
+func decodeBody(r *http.Request) (io.Reader, int64) {
+	if r.Body == nil {
+		return http.NoBody, 0
 	}
-	decodedLen, _ := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
-	return chunked.NewDecoder(r.Body, decodedLen)
+	if r.Header.Get("Content-Encoding") != "aws-chunked" {
+		return r.Body, r.ContentLength
+	}
+	// Content-Length on a chunked request measures the framing, not the object,
+	// so the decoded length is the only size the splitter can use. An absent or
+	// unparseable header leaves the object size undeclared.
+	decodedLen, err := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
+	if err != nil || decodedLen < 0 {
+		return chunked.NewDecoder(r.Body, 0), -1
+	}
+	return chunked.NewDecoder(r.Body, decodedLen), decodedLen
 }

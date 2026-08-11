@@ -3,11 +3,8 @@ package handlers
 import (
 	"bytes"
 	"encoding/gob"
-	"fmt"
 	"log/slog"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"time"
 
@@ -42,7 +39,8 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			return
 		}
 
-		etag, data, err := model.CalculatePartETagFromReader(decodeBody(r))
+		body, _ := decodeBody(r)
+		etag, data, err := model.CalculatePartETagFromReader(body)
 		if err != nil {
 			slog.ErrorContext(ctx, "Failed to read part data", "uploadID", uploadID, "part", partNumber, "error", err)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to read part data", 500))
@@ -60,25 +58,9 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		partKey := partObjectKey(key, uploadID, partNumber)
 		objectHash := model.ObjectHash(bucket, partKey)
 
-		// A deterministic temp path keeps a retried part on the same placement.
-		tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("multipart-%s-%05d.tmp", uploadID, partNumber))
-		tmpFile, err := os.Create(tmpPath)
-		if err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to create temp file", 500))
-			return
-		}
-		defer os.Remove(tmpPath)
-		defer tmpFile.Close()
-
-		if _, err := tmpFile.Write(data); err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to write temp file", 500))
-			return
-		}
-		if closeErr := tmpFile.Close(); closeErr != nil {
-			slog.DebugContext(ctx, "Failed to close temp file", "path", tmpPath, "error", closeErr)
-		}
-
-		if _, _, err := writeObject(ctx, bc, ring, cfg, tmpPath, objectHash); err != nil {
+		// Placement comes from the part's own object hash, so a retried part
+		// lands on the same nodes without anything deterministic on disk.
+		if _, err := writeObject(ctx, bc, ring, cfg, bytes.NewReader(data), partSize, objectHash); err != nil {
 			slog.ErrorContext(ctx, "Failed to store part", "uploadID", uploadID, "part", partNumber, "error", err)
 			HandleError(w, r, mapPutErr(err))
 			return

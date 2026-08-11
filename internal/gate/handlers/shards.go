@@ -74,43 +74,31 @@ func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int
 	}, nil
 }
 
-// writeObject splits a file into RS shards and sends each to the
-// appropriate node. poolNearFull is set if any shard's target node reported
-// pressure.
+// writeObject splits body into RS shards and sends each to the appropriate
+// node. size is what the caller declared the body to be: the splitter needs it
+// up front, and it is what placement records, so a body that does not deliver
+// exactly that many bytes is an error rather than a short object.
+// poolNearFull is set if any shard's target node reported pressure.
 //
 // The stream encoder is constructed per request; hoisting it into the gate
 // belongs with the streaming refactor, not here.
-func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg Config, objectPath string, objectHash [32]byte) (size int64, poolNearFull bool, err error) {
+func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg Config, body io.Reader, size int64, objectHash [32]byte) (poolNearFull bool, err error) {
 	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
 	if err != nil {
-		return 0, false, err
+		return false, err
 	}
-
-	f, err := os.Open(objectPath)
-	if err != nil {
-		return 0, false, err
-	}
-	defer f.Close()
-
-	instat, err := f.Stat()
-	if err != nil {
-		return 0, false, err
-	}
-
-	size = instat.Size()
 
 	// Use objectHash for hash ring placement for consistency with storage and retrieval
 	shardNodes, err := ring.Nodes(objectHash, cfg.TotalShards())
 	if err != nil {
-		return 0, false, err
+		return false, err
 	}
 
 	// Calculate shard size
-	fileSize := instat.Size()
 	ds := int64(cfg.DataShards)
-	shardSize := int((fileSize + ds - 1) / ds)
+	shardSize := int((size + ds - 1) / ds)
 
-	// Step 1: Split file into data shard buffers (in memory)
+	// Step 1: Split the body into data shard buffers (in memory)
 	// This allows us to both send to the blob nodes and use for parity encoding
 	dataShardBuffers := make([][]byte, cfg.DataShards)
 	dataWriters := make([]io.Writer, cfg.DataShards)
@@ -119,8 +107,8 @@ func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg C
 		dataWriters[i] = &bytesBufferWriter{buf: &dataShardBuffers[i]}
 	}
 
-	if splitErr := enc.Split(f, dataWriters, fileSize); splitErr != nil {
-		return 0, false, splitErr
+	if splitErr := enc.Split(body, dataWriters, size); splitErr != nil {
+		return false, splitErr
 	}
 
 	// Step 2: Send data shards to their nodes
@@ -166,10 +154,16 @@ func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg C
 		}
 	}
 	if firstErr != nil {
-		return 0, false, firstErr
+		return false, firstErr
 	}
 
-	// Step 3: Encode parity shards using the buffered data shards
+	// Step 3: Encode parity shards using the buffered data shards. Zero parity
+	// has nothing to encode, and the encoder would read every data shard back
+	// to produce nothing, so stop at the data shards.
+	if cfg.ParityShards == 0 {
+		return poolNearFull, nil
+	}
+
 	dataReaders := make([]io.Reader, cfg.DataShards)
 	for i := 0; i < cfg.DataShards; i++ {
 		dataReaders[i] = bytes.NewReader(dataShardBuffers[i])
@@ -237,10 +231,10 @@ func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg C
 		firstErr = encodeErr
 	}
 	if firstErr != nil {
-		return 0, false, firstErr
+		return false, firstErr
 	}
 
-	return size, poolNearFull, nil
+	return poolNearFull, nil
 }
 
 // loadPlacement retrieves shard location metadata for an object.

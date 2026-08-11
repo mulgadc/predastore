@@ -133,16 +133,23 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			slog.DebugContext(ctx, "Failed to close temp file", "path", tmpFile.Name(), "error", closeErr)
 		}
 
-		objectHash := model.ObjectHash(bucket, key)
-		if _, _, err := writeObject(ctx, bc, ring, cfg, tmpFile.Name(), objectHash); err != nil {
-			slog.ErrorContext(ctx, "Failed to store final object", "uploadID", uploadID, "error", err)
-			HandleError(w, r, mapPutErr(err))
-			return
-		}
-
 		finalInfo, err := os.Stat(tmpFile.Name())
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to get final object size", 500))
+			return
+		}
+
+		assembled, err := os.Open(tmpFile.Name())
+		if err != nil {
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to reopen assembled object", 500))
+			return
+		}
+		defer assembled.Close()
+
+		objectHash := model.ObjectHash(bucket, key)
+		if _, err := writeObject(ctx, bc, ring, cfg, assembled, finalInfo.Size(), objectHash); err != nil {
+			slog.ErrorContext(ctx, "Failed to store final object", "uploadID", uploadID, "error", err)
+			HandleError(w, r, mapPutErr(err))
 			return
 		}
 
