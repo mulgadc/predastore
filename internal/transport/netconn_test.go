@@ -12,7 +12,7 @@ import (
 // connPair returns two StreamConns wired back to back over a pipe stream.
 func connPair(t *testing.T) (a, b net.Conn) {
 	t.Helper()
-	as, bs := newPipeStreamPair(newPipeAddr("nc-a"), newPipeAddr("nc-b"))
+	as, bs := newPipeStreamPair(NewAddr(NetworkPipe, "nc-a"), NewAddr(NetworkPipe, "nc-b"))
 	ac, bc := NewStreamConn(as), NewStreamConn(bs)
 	t.Cleanup(func() {
 		ac.Close()
@@ -109,7 +109,7 @@ func TestStreamConnPastDeadlineFailsImmediately(t *testing.T) {
 }
 
 func TestStreamConnCloseSignalsDoneAndPeer(t *testing.T) {
-	as, bs := newPipeStreamPair(newPipeAddr("nc-close-a"), newPipeAddr("nc-close-b"))
+	as, bs := newPipeStreamPair(NewAddr(NetworkPipe, "nc-close-a"), NewAddr(NetworkPipe, "nc-close-b"))
 	a, b := NewStreamConn(as), NewStreamConn(bs)
 	defer b.Close()
 

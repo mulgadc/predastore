@@ -13,7 +13,7 @@ import (
 var TestMasterKey = bytes.Repeat([]byte{0x42}, 32)
 
 // TestAEAD returns the cipher.AEAD derived from TestMasterKey. Use this in
-// tests that call store.WithAEAD directly — the store no longer accepts raw
+// tests that call engine.WithAEAD directly — the store no longer accepts raw
 // key bytes.
 func TestAEAD() cipher.AEAD {
 	aead, err := masterkey.NewAEAD(TestMasterKey)
@@ -23,8 +23,8 @@ func TestAEAD() cipher.AEAD {
 	return aead
 }
 
-// TestKey returns a *masterkey.Key derived from TestMasterKey, suitable for
-// quicserver.WithMasterKey in tests.
+// TestKey returns a *masterkey.Key derived from TestMasterKey, for tests that
+// need a whole key rather than the bare AEAD.
 func TestKey() *masterkey.Key {
 	return &masterkey.Key{
 		AEAD:        TestAEAD(),

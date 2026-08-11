@@ -3,65 +3,33 @@ package rpc
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
-	"net"
-	"sync"
-	"time"
 
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/transport"
-	"golang.org/x/sync/singleflight"
 )
 
-// ErrClientClosed is returned by OpenStream once the client has been closed.
-// A closed client is not reusable: it never dials again, so callers that need
-// to reconnect must build a new one.
-var ErrClientClosed = errors.New("client closed")
-
-func poolKey(addr net.Addr) string { return addr.Network() + "|" + addr.String() }
-
-type ClientConfig struct {
-	Transports  []transport.Transport
-	DialTimeout time.Duration
-}
-
+// Client opens streams to nodes named by id. It holds the pool that turns an
+// id into a connection and the framing every stream opens with, and nothing
+// else: connection lifetime belongs to the pool.
 type Client struct {
-	cfg ClientConfig
-	trs map[string]transport.Transport
-	sf  singleflight.Group
-
-	mu     sync.RWMutex
-	pool   map[string]transport.Conn
-	closed bool
+	pool *ConnPool
 }
 
-func NewClient(cfg ClientConfig) *Client {
-	const defaultDialTimeout = 15 * time.Second
-	if cfg.DialTimeout == 0 {
-		cfg.DialTimeout = defaultDialTimeout
-	}
+func NewClient(pool *ConnPool) *Client { return &Client{pool: pool} }
 
-	trs := make(map[string]transport.Transport)
-	for _, tr := range cfg.Transports {
-		trs[tr.Network()] = tr
-	}
-
-	return &Client{
-		cfg:  cfg,
-		trs:  trs,
-		pool: make(map[string]transport.Conn),
-	}
-}
-
+// OpenStream opens a stream to a node, addressed by id. Whether that node is
+// reached over the in-process pipe or the network follows from the route the
+// pool dials, which no caller sees.
 func OpenStream[T Header](
 	ctx context.Context,
 	c *Client,
-	addr net.Addr,
+	remote config.NodeID,
 	op Opcode,
 	header T,
 ) (transport.Stream, error) {
 	// Dial connection.
-	conn, err := c.dial(ctx, addr)
+	conn, err := c.pool.Dial(ctx, remote)
 	if err != nil {
 		return nil, fmt.Errorf("dial connection: %w", err)
 	}
@@ -84,7 +52,7 @@ func OpenStream[T Header](
 	if err != nil {
 		if conn.Context().Err() != nil {
 			// TODO: Define isConnDead function for smart evict.
-			c.evict(addr, conn)
+			c.pool.Evict(conn)
 		}
 		return nil, err
 	}
@@ -93,7 +61,7 @@ func OpenStream[T Header](
 	if _, err := stream.Write(buf); err != nil {
 		if conn.Context().Err() != nil {
 			// TODO: Define isConnDead function for smart evict.
-			c.evict(addr, conn)
+			c.pool.Evict(conn)
 		} else {
 			// TODO: Figure out better error codes.
 			stream.CancelRead(0)
@@ -103,99 +71,4 @@ func OpenStream[T Header](
 	}
 
 	return stream, nil
-}
-
-func (c *Client) dial(ctx context.Context, addr net.Addr) (transport.Conn, error) {
-	key := poolKey(addr)
-	c.mu.RLock()
-	conn, closed := c.pool[key], c.closed
-	c.mu.RUnlock()
-	if closed {
-		return nil, ErrClientClosed
-	}
-	if conn != nil && conn.Context().Err() == nil {
-		return conn, nil
-	}
-
-	ch := c.sf.DoChan(key, func() (any, error) {
-		c.mu.RLock()
-		conn := c.pool[key]
-		c.mu.RUnlock()
-		if conn != nil && conn.Context().Err() == nil {
-			return conn, nil
-		}
-
-		tr, ok := c.trs[addr.Network()]
-		if !ok {
-			return nil, fmt.Errorf("no %s transport available", addr.Network())
-		}
-		dialCtx, cancelTimeout := context.WithTimeout(context.Background(), c.cfg.DialTimeout)
-		conn, err := tr.Dial(dialCtx, addr)
-		cancelTimeout()
-		if err != nil {
-			return nil, fmt.Errorf("dial target address: %w", err)
-		}
-
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		if c.closed {
-			conn.Close()
-			return nil, ErrClientClosed
-		}
-
-		if stale := c.pool[key]; stale != nil {
-			stale.Close()
-		}
-
-		c.pool[key] = conn
-		return conn, nil
-	})
-
-	select {
-	case res := <-ch:
-		// A failed dial carries no connection, so the assertion below only
-		// holds once the error is out of the way.
-		if res.Err != nil {
-			return nil, res.Err
-		}
-		conn, ok := res.Val.(transport.Conn)
-		if !ok {
-			panic("singleflight did not return a valid Conn")
-		}
-		return conn, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
-
-func (c *Client) evict(addr net.Addr, conn transport.Conn) {
-	key := poolKey(addr)
-	c.mu.Lock()
-	if c.pool[key] == conn {
-		delete(c.pool, key)
-	}
-	c.mu.Unlock()
-	conn.Close()
-}
-
-func (c *Client) Close() error {
-	c.mu.Lock()
-	if c.closed {
-		c.mu.Unlock()
-		return nil
-	}
-	c.closed = true
-
-	pool := c.pool
-	c.pool = make(map[string]transport.Conn)
-	c.mu.Unlock()
-
-	errs := make([]error, 0, len(pool))
-	for _, conn := range pool {
-		if err := conn.Close(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	return errors.Join(errs...)
 }

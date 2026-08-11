@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"slices"
 	"sync"
 	"time"
@@ -40,58 +39,38 @@ func RegisterHandler[T any, PT interface {
 	}
 }
 
-// ServerConfig describes one node's rpc endpoint. Addrs are every address the
-// node answers on: an in-process pipe address always, plus a network address
-// when peers run outside this process. Transports are the process-wide set,
-// shared with every other node's server.
-type ServerConfig struct {
-	Mux          *Mux
-	Addrs        []net.Addr
-	Transports   []transport.Transport
-	DrainTimeout time.Duration
+type ServerOption func(*Server)
+
+// WithDrainTimeout bounds how long Run waits for in-flight handlers once the
+// accept loops have stopped.
+func WithDrainTimeout(d time.Duration) ServerOption {
+	return func(s *Server) { s.drainTimeout = d }
 }
 
+// Server answers rpc streams for one node on the listeners it is given. The
+// listeners are already bound: whoever built the node owns its transports, so
+// a server never learns which networks it is reached over.
+//
+// A nil pool is meaningful: such a server owns and closes what it accepts and
+// donates nothing, which is what a node that never dials wants.
 type Server struct {
-	cfg ServerConfig
-	lns []transport.Listener
+	mux          *Mux
+	lns          []transport.Listener
+	pool         *ConnPool
+	drainTimeout time.Duration
 }
 
-func NewServer(cfg ServerConfig) (*Server, error) {
+func NewServer(mux *Mux, lns []transport.Listener, pool *ConnPool, opts ...ServerOption) (*Server, error) {
+	if mux == nil {
+		return nil, fmt.Errorf("server has no mux")
+	}
+
 	const defaultDrainTimeout = 30 * time.Second
-	if cfg.DrainTimeout == 0 {
-		cfg.DrainTimeout = defaultDrainTimeout
+	s := &Server{mux: mux, lns: lns, pool: pool, drainTimeout: defaultDrainTimeout}
+	for _, opt := range opts {
+		opt(s)
 	}
-
-	trs := make(map[string]transport.Transport, len(cfg.Transports))
-	for _, tr := range cfg.Transports {
-		trs[tr.Network()] = tr
-	}
-
-	lns := make([]transport.Listener, 0, len(cfg.Addrs))
-	// Release the addresses already bound on any failure; leaving them held
-	// would fail a retry of this same config with "address already in use".
-	bail := func(err error) error {
-		for _, bound := range lns {
-			bound.Close()
-		}
-		return err
-	}
-	for _, addr := range cfg.Addrs {
-		tr, ok := trs[addr.Network()]
-		if !ok {
-			return nil, bail(fmt.Errorf("no %s transport available", addr.Network()))
-		}
-		ln, err := tr.Listen(addr)
-		if err != nil {
-			return nil, bail(err)
-		}
-		lns = append(lns, ln)
-	}
-
-	return &Server{
-		cfg: cfg,
-		lns: lns,
-	}, nil
+	return s, nil
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -132,7 +111,7 @@ func (s *Server) Run(ctx context.Context) error {
 		close(done)
 	}()
 
-	t := time.NewTimer(s.cfg.DrainTimeout)
+	t := time.NewTimer(s.drainTimeout)
 	defer t.Stop()
 	deadline := t.C
 
@@ -180,11 +159,19 @@ func (s *Server) acceptConns(
 		backoff = 5 * time.Millisecond
 
 		conns.Go(func() {
-			// Handlers outlive the accept loop, so the connection is tracked
-			// here and closed only once they have drained. Waiting inside the
-			// conns goroutine is what makes Run's conns.Wait a full drain.
+			// Handlers outlive the accept loop, so the connection is released
+			// here and only once they have drained. Waiting inside the conns
+			// goroutine is what makes Run's conns.Wait a full drain.
 			var streams sync.WaitGroup
-			defer conn.Close()
+
+			// A donated connection belongs to the pool, so releasing it means
+			// evicting rather than closing: a connection that dies inbound is
+			// taken out of the pool instead of handed to a dialer dead.
+			if s.pool != nil && s.pool.Donate(conn) {
+				defer s.pool.Evict(conn)
+			} else {
+				defer conn.Close()
+			}
 
 			// Cancelled handlers mean the drain deadline expired. Aborting the
 			// connection is the only way to unblock a handler parked in a
@@ -260,7 +247,7 @@ func (s *Server) handleStream(ctx context.Context, stream transport.Stream) erro
 		return fmt.Errorf("read header: %w", err)
 	}
 
-	h, ok := s.cfg.Mux.handlers[op]
+	h, ok := s.mux.handlers[op]
 	if !ok {
 		return fmt.Errorf("no handler found")
 	}

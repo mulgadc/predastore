@@ -1,0 +1,139 @@
+package engine
+
+import (
+	"crypto/cipher"
+	"encoding/binary"
+	"errors"
+	"fmt"
+)
+
+// Fragment layout (8240 bytes):
+//
+//	[0:32]      header (see below)
+//	[32:8224]   body — AES-256-GCM ciphertext (same length as plaintext under GCM/CTR)
+//	[8224:8240] tag  — 16-byte GCM authentication tag binding ciphertext + AAD
+//
+// Fragment header layout (32 bytes):
+//
+//	[0:8]   fragNum — global fragment counter (monotonic across segments)
+//	[8:16]  valueNum — value identifier
+//	[16:20] reserved
+//	[20:24] size    — actual data bytes in this fragment's body (≤ fragBodySize)
+//	[24:28] flags   — fragFlags (flagEndOfValue marks the last fragment of a value)
+//	[28:32] reserved
+const (
+	fragHeaderSize = 32
+	fragBodySize   = 8 * KiB
+	fragTagSize    = 16
+	totalFragSize  = fragHeaderSize + fragBodySize + fragTagSize
+
+	// bufLen is the per-value fragment window each reader and writer batches
+	// into one syscall, trading ≈ bufLen * 8 KiB of RAM apiece for fewer of them.
+	bufLen = 32
+)
+
+// AAD layout (52 bytes, big-endian):
+//
+//	[0:32]   key     (SHA-256, already part of the index key)
+//	[32:36]  index
+//	[36:44]  valueNum (from the on-disk fragment header at read time)
+//	[44:52]  fragNum (from the on-disk fragment header at read time)
+const aadSize = 52
+
+type fragFlags uint32
+
+const (
+	flagEndOfValue fragFlags = 1 << iota
+)
+
+// ErrIntegrity is returned when a fragment's GCM tag fails to authenticate —
+// either the ciphertext, the on-disk header bytes that feed AAD reconstruction,
+// or the master key / storeID do not match what was bound at seal time.
+var ErrIntegrity = errors.New("fragment integrity check failed")
+
+// fragment is a fixed-size view over the on-disk layout, instantiated by casting
+// a slice of a window buffer:
+//
+//	frag := (*fragment)(buf[pos : pos+totalFragSize])
+type fragment [totalFragSize]byte
+
+func (f *fragment) fragNum() uint64       { return binary.BigEndian.Uint64(f[0:8]) }
+func (f *fragment) valueNum() uint64      { return binary.BigEndian.Uint64(f[8:16]) }
+func (f *fragment) size() uint32          { return binary.BigEndian.Uint32(f[20:24]) }
+func (f *fragment) setSize(n uint32)      { binary.BigEndian.PutUint32(f[20:24], n) }
+func (f *fragment) setFlags(fl fragFlags) { binary.BigEndian.PutUint32(f[24:28], uint32(fl)) }
+
+// stampHeader writes fragNum + valueNum and zeroes the rest of the 32-byte
+// header. size and flags are filled in at seal time.
+func (f *fragment) stampHeader(fragNum, valueNum uint64) {
+	binary.BigEndian.PutUint64(f[0:8], fragNum)
+	binary.BigEndian.PutUint64(f[8:16], valueNum)
+	clear(f[16:fragHeaderSize])
+}
+
+// body returns the body slot. Capacity reaches the end of the tag slot so
+// Seal can append the GCM tag in place.
+func (f *fragment) body() []byte {
+	return f[fragHeaderSize : fragHeaderSize+fragBodySize : totalFragSize]
+}
+
+// ciphertext returns body + tag as one slice for Open.
+func (f *fragment) ciphertext() []byte {
+	return f[fragHeaderSize:totalFragSize]
+}
+
+// seal stamps size and flags, then encrypts the body in place. valueNum and
+// fragNum come from the already-stamped header.
+func (f *fragment) seal(aead cipher.AEAD, key [32]byte, index, storeID uint32, size uint32, flags fragFlags) {
+	// Zero the tail: the ciphertext is fixed-length under GCM regardless of size.
+	if size < fragBodySize {
+		clear(f[fragHeaderSize+size : fragHeaderSize+fragBodySize])
+	}
+	f.setSize(size)
+	f.setFlags(flags)
+
+	aad := makeAAD(key, index, f.valueNum(), f.fragNum())
+	nonce := makeNonce(f.fragNum(), storeID)
+	aead.Seal(f.body()[:0], nonce[:], f.body(), aad[:])
+}
+
+// open decrypts and authenticates the body in place, returning the plaintext.
+// num and fragNum come from the on-disk header, so tampering with them
+// fails the tag.
+func (f *fragment) open(aead cipher.AEAD, key [32]byte, index, storeID uint32) ([]byte, error) {
+	aad := makeAAD(key, index, f.valueNum(), f.fragNum())
+	nonce := makeNonce(f.fragNum(), storeID)
+	plaintext, err := aead.Open(f.ciphertext()[:0], nonce[:], f.ciphertext(), aad[:])
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrIntegrity, err)
+	}
+
+	sz := int(f.size())
+	if sz > fragBodySize {
+		return nil, fmt.Errorf("invalid size %d", sz)
+	}
+
+	return plaintext[:sz], nil
+}
+
+// makeNonce builds the 12-byte GCM nonce as BE(fragNum) ‖ BE(storeID). fragNum
+// is monotonic per data dir and storeID is random per data dir, so the pair is
+// unique for the master key's lifetime — which GCM requires absolutely.
+func makeNonce(fragNum uint64, storeID uint32) [12]byte {
+	var nonce [12]byte
+	binary.BigEndian.PutUint64(nonce[0:8], fragNum)
+	binary.BigEndian.PutUint32(nonce[8:12], storeID)
+	return nonce
+}
+
+// makeAAD binds a fragment to its logical position, so one spliced into a
+// different value, key or offset fails to open. Returned by value to stay on
+// the stack on the per-fragment hot path.
+func makeAAD(key [32]byte, index uint32, valueNum, fragNum uint64) [aadSize]byte {
+	var aad [aadSize]byte
+	copy(aad[0:32], key[:])
+	binary.BigEndian.PutUint32(aad[32:36], index)
+	binary.BigEndian.PutUint64(aad[36:44], valueNum)
+	binary.BigEndian.PutUint64(aad[44:52], fragNum)
+	return aad
+}

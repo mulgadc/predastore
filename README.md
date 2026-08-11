@@ -37,42 +37,60 @@ make build
 
 ### Run a Development Cluster
 
-```bash
-./scripts/start.sh 3node
-```
-
-Other supplied configurations can be started with:
+`scripts/start.sh` launches a cluster from one of the profiles in `config/`, generating the TLS keypair and master key under `$PREDA_DIR` (default `/tmp/predastore`) on first run:
 
 ```bash
-./scripts/start.sh -w 5node
+./scripts/start.sh -w 1host     # one process, S3 on https://127.0.0.1:8443
 ```
+
+Three profiles ship with the repo. They differ only in how many hosts the nodes are spread over, which is what decides the transport between them:
+
+| Profile | Hosts | RS | Inter-node transport | Needs `sudo` |
+|---------|-------|----|----------------------|--------------|
+| `1host` | 1 | (1, 0) | in-process pipe only | no |
+| `3host` | 3 on `10.11.12.{1,2,3}` | (2, 1) | QUIC between hosts, pipe within | yes |
+| `5host` | 5 on `10.11.12.{1..5}` | (3, 2) | QUIC between hosts, pipe within | yes |
+
+The multi-host profiles put every host on one machine behind loopback aliases, so they need `sudo` to add those aliases and to install the generated certificate as a trust anchor. Each host answers S3 on its own address.
 
 Stop, reset or benchmark the cluster with:
 
 ```bash
 ./scripts/stop.sh
 ./scripts/clean.sh
-./scripts/bench.sh 3node
+./scripts/bench.sh 3host
 ./scripts/bench.sh disk
 ```
 
-### Run a Single Node
+### Run a Host
 
-`./bin/s3d` is a single-node process — for running one node of a cluster directly (e.g. on a dedicated host in production, or for inspecting one node in isolation):
+`./bin/s3d` runs one host of a cluster: the nodes the config pins to it, the S3 gate among them. `-host` names the `[[host]]` to run, and everything else about the process — which nodes, which addresses, which ports — follows from that entry:
 
 ```bash
 ./bin/s3d \
-  --config config/3node.toml \
-  --node 1 \
-  --host 10.11.12.1 \
-  --port 8443 \
-  --base-path /tmp/predastore/3node \
-  --tls-key /tmp/predastore/3node/server.key \
-  --tls-cert /tmp/predastore/3node/server.pem \
-  --encryption-key-file /tmp/predastore/3node/master.key
+  -config cluster.toml \
+  -host 1 \
+  -data-dir /var/lib/predastore \
+  -tls-cert /etc/predastore/server.pem \
+  -tls-key /etc/predastore/server.key \
+  -encryption-key /etc/predastore/master.key
 ```
 
-The encryption key file must be exactly 32 raw bytes (no base64, no header) with mode `0600`. Generate one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key must be supplied to every node in a cluster; rotating it is not currently supported (see Roadmap → envelope encryption).
+| Flag | Description |
+|------|-------------|
+| `-config` | Path to the configuration file (required) |
+| `-host` | ID of the `[[host]]` this process runs (required) |
+| `-data-dir` | On-disk root for this host's nodes; overrides `data_dir` |
+| `-encryption-key` | Path to the 32-byte AES-256 key protecting data at rest; overrides `encryption_key` |
+| `-tls-cert`, `-tls-key` | This host's TLS identity; overrides `tls_cert` / `tls_key` |
+| `-bind-addr` | Local listen address, without a port; overrides `bind_addr` |
+| `-log-level` | `debug`, `info`, `warn` or `error` |
+
+Each of these host-local settings may come from either the file or a flag, so the same configuration file can be deployed unchanged to every machine and the paths supplied per process. The S3 port is not a flag: it is the gate node's `port`.
+
+A cluster whose `[[host.node]]` entries all sit under one `[[host]]` runs entirely in one process over the in-process pipe, with no inter-node socket and no certificate beyond the one the gate serves. That is a property of the config, not a launch mode.
+
+The encryption key file must be exactly 32 raw bytes (no base64, no header) with mode `0600`. Generate one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key must be supplied to every host in a cluster; rotating it is not currently supported (see Roadmap → envelope encryption).
 
 ## S3 API Support
 
@@ -80,23 +98,31 @@ The encryption key file must be exactly 32 raw bytes (no base64, no header) with
 | --- | --- |
 | Buckets | `CreateBucket`, `DeleteBucket`, `ListBuckets`, `HeadBucket` |
 | Objects | `PutObject`, `GetObject`, `DeleteObject`, `HeadObject`, `ListObjects`, `ListObjectsV2` |
-| Multipart | `InitiateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload` |
-| Authentication | AWS Signature Version 4 |
+| Multipart | `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` |
+| Authentication | AWS Signature Version 4, presigned URLs |
+
+Multi-object delete (`DeleteObjects`) is not implemented; delete objects one at a time.
 
 ### AWS CLI Examples
 
+Against the `1host` dev profile. Its certificate is self-signed, so either install it as a trust anchor or pass `--no-verify-ssl`:
+
 ```bash
+export AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+export AWS_DEFAULT_REGION=ap-southeast-2
+
 # Create a bucket
-aws --endpoint-url https://10.11.12.1:8443/ s3 mb s3://my-bucket
+aws --no-verify-ssl --endpoint-url https://127.0.0.1:8443/ s3 mb s3://my-bucket
 
 # Upload a file
-aws --endpoint-url https://10.11.12.1:8443/ s3 cp ./file.txt s3://my-bucket/
+aws --no-verify-ssl --endpoint-url https://127.0.0.1:8443/ s3 cp ./file.txt s3://my-bucket/
 
 # List bucket contents
-aws --endpoint-url https://10.11.12.1:8443/ s3 ls s3://my-bucket/
+aws --no-verify-ssl --endpoint-url https://127.0.0.1:8443/ s3 ls s3://my-bucket/
 
 # Download a file
-aws --endpoint-url https://10.11.12.1:8443/ s3 cp s3://my-bucket/file.txt ./downloaded.txt
+aws --no-verify-ssl --endpoint-url https://127.0.0.1:8443/ s3 cp s3://my-bucket/file.txt ./downloaded.txt
 ```
 
 ## Architecture
@@ -105,13 +131,15 @@ aws --endpoint-url https://10.11.12.1:8443/ s3 cp s3://my-bucket/file.txt ./down
   <img src=".github/assets/platform.svg" alt="Predastore: S3 applications and tooling on top, authenticated S3 services backed by Raft metadata and erasure-coded storage, distributed across encrypted storage nodes over QUIC." width="900">
 </p>
 
-Predastore consists of three primary layers:
+A cluster is built from three node roles. `s3d` is one process running the roles a host is assigned, and any mix of them can share a host:
 
-- `s3d` exposes the S3 HTTP interface and Signature Version 4 authentication.
-- `s3db` maintains strongly consistent metadata with HashiCorp Raft and local embedded databases.
-- Storage nodes exchange erasure-coded shards over QUIC and store them in append-only segment files.
+- **gate** — serves the S3 HTTP interface and Signature Version 4 authentication.
+- **meta** — maintains strongly consistent metadata with HashiCorp Raft over a local embedded database.
+- **blob** — holds erasure-coded shards in append-only segment files, sealed with AES-256-GCM.
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the complete design.
+Nodes sharing a host talk over an in-process pipe; nodes on different hosts talk over QUIC. Nothing in a deployment names a transport — it follows from where the config pins each node.
+
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the design in full.
 
 ## Capabilities
 
@@ -126,17 +154,47 @@ See [`docs/DESIGN.md`](docs/DESIGN.md) for the complete design.
 
 ## Configuration
 
-Example cluster configurations are supplied in:
+A cluster configuration is a TOML file describing two levels: `[[host]]` entries, which are the s3d processes owning an address and a data directory, and the `[[host.node]]` entries nested under them, which are the roles that host runs. The same file also carries the Reed-Solomon parameters, the config-defined buckets and the S3 credentials.
 
-- `config/3node.toml`
-- `config/5node.toml`
-- `config/7node.toml`
+The file is meant to be identical on every machine, so the settings only the local machine cares about — its data directory, TLS identity and encryption key — may be left out and supplied as flags instead.
 
-Generate local development certificates with:
+```toml
+version = 1
+region  = "ap-southeast-2"
 
-```bash
-make certs
+[rs]
+data   = 2    # data shards
+parity = 1    # parity shards; data + parity must not exceed the blob node count
+
+# One host = one s3d process, launched with `-host <id>`.
+[[host]]
+id   = 1
+addr = "10.11.12.1"        # what other hosts dial; no port — nodes carry those
+# bind_addr = "0.0.0.0"    # optional local listen address, split from addr for NAT
+# data_dir  = "/var/lib/predastore"   # absolute; -data-dir supplies it otherwise
+
+  # A role this host runs. One of "gate", "blob" or "meta".
+  [[host.node]]
+  id   = 1
+  role = "gate"            # the S3 endpoint; port is the S3 port
+  port = 8443
+
+  [[host.node]]
+  id   = 2
+  role = "meta"
+  port = 6660
+
+  [[host.node]]
+  id   = 3
+  role = "blob"
+  port = 9991
 ```
+
+Node ids are unique across the whole file; ports are unique within a host. A blob or meta node without its own `data_dir` derives one from the host's root and its node id, so separate disks are a per-node setting rather than a deployment layout.
+
+Write every node under one `[[host]]` and the cluster runs in one process over the in-process pipe. Spread them across hosts and each process is launched separately with its own `-host` id. Nothing else changes.
+
+`config/` holds three ready-made profiles — see [Run a Development Cluster](#run-a-development-cluster).
 
 ### Standalone TLS Trust
 
@@ -154,13 +212,7 @@ sudo update-ca-trust
 
 ## Storage Backend
 
-Distributed storage with erasure coding, Raft-consensus metadata, and QUIC transport. The simplest way to bring up a cluster locally:
-
-```bash
-./scripts/start.sh -w 3node     # 3-node cluster on loopback aliases
-```
-
-The distributed backend's data model:
+Distributed storage with erasure coding, Raft-consensus metadata, and QUIC transport. The data model:
 
 | Unit | Size | Description |
 |------|------|-------------|
@@ -169,7 +221,7 @@ The distributed backend's data model:
 | Fragment | 32 B header + 8 KiB body + 16 B GCM tag = 8240 B | On-disk unit; AES-256-GCM seals body with AAD bound to `(objectHash, shardIndex, shardNum, fragNum)` |
 | Segment file | up to 4 GiB | Append-only container holding extents from one or more shards |
 
-See [DESIGN.md](docs/DESIGN.md) for full configuration reference, including database node setup, shard node setup, RS tuning, and deployment modes.
+See [DESIGN.md](docs/DESIGN.md) §6 for the on-disk format: the segment layout, the fragment header field by field, and the AAD the GCM seal is bound to.
 
 ## Spinifex Integration
 
@@ -179,29 +231,24 @@ Predastore is the default S3 storage provider for [Spinifex](https://github.com/
 - **EBS volume snapshots** — via [Viperblock](https://github.com/mulgadc/viperblock), which uses Predastore as its S3-compatible backend
 - **User data** — cloud-init configurations and system artifacts
 
-Predastore subscribes to NATS topics (`s3.putobject`, `s3.getobject`, `s3.createbucket`, etc.) for seamless integration with the rest of the Spinifex control plane.
+Predastore serves these over the S3 API like any other client traffic. It uses NATS for one thing only: when an `[iam]` table is configured, access keys, users, roles and policies are read from JetStream KV buckets, layered over the config-defined service accounts.
 
 ## Development
 
 ```bash
-make build            # Build s3d binary (also generates TLS certs)
-make certs            # Generate dev TLS certs
+make build            # Build the s3d binary
+make certs            # Generate the dev TLS certs the integration tests serve
 make test             # Run tests
-make preflight        # Full CI checks (lint, govulncheck, tests, race detector)
+make preflight        # Full CI checks (lint, govulncheck, coverage, integration)
+make test-race        # Run tests under the race detector
 make clean            # Clean build artifacts
 ```
 
-### Docker
-
-```bash
-make docker_s3d           # Build Docker image
-make docker_compose_up    # Start with docker-compose
-make docker_compose_down  # Stop services
-```
+`make preflight` must pass before committing; `make fix` auto-fixes what the linter can.
 
 ### Performance Tuning
 
-For distributed mode, increase system socket buffers for QUIC:
+For multi-host clusters, increase system socket buffers for QUIC:
 
 ```bash
 sudo sysctl -w net.core.rmem_max=7500000
@@ -213,13 +260,14 @@ sudo sysctl -w net.core.wmem_max=7500000
 - [x] S3 API core (buckets, objects, multipart)
 - [x] AWS Signature V4 authentication
 - [x] Distributed storage with Reed-Solomon erasure coding
-- [x] Raft-consensus metadata (s3db)
+- [x] Raft-consensus metadata
 - [x] QUIC transport with connection pooling
 - [x] Consistent hash ring placement
 - [x] AES-256-GCM encryption at rest (single cluster-wide master key)
+- [x] Background segment compaction
 - [ ] Envelope encryption (master key rotation, per-bucket / per-tenant keys)
 - [ ] Gossip-based node discovery
-- [ ] Segment compaction and garbage collection
+- [ ] Multi-object delete (`DeleteObjects`)
 - [ ] Automatic shard rebalancing
 - [ ] Background read-repair
 - [ ] Bucket versioning

@@ -1,6 +1,10 @@
+// Command s3d runs one host of a predastore cluster: the nodes the config
+// pins to the host named by -host, and the S3 gate in front of them. It is
+// a thin entrypoint — flags, telemetry and a signal context, then predastore.Run.
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"flag"
@@ -8,16 +12,12 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
-	"github.com/mulgadc/predastore/clusterrun"
-	"github.com/mulgadc/predastore/otelsetup"
+	"github.com/mulgadc/predastore"
 	"github.com/mulgadc/predastore/pkg/masterkey"
-	"github.com/mulgadc/predastore/s3"
-	"golang.org/x/sync/errgroup"
+	"github.com/mulgadc/predastore/pkg/otelsetup"
 
 	_ "github.com/mulgadc/predastore/internal/fipsboot"
 )
@@ -30,30 +30,29 @@ func main() {
 }
 
 func run() error {
-	config := flag.String("config", "", "S3 server configuration file (required)")
-	tlsKey := flag.String("tls-key", "certs/server.key", "Path to TLS key")
-	tlsCert := flag.String("tls-cert", "certs/server.pem", "Path to TLS cert")
-	basePath := flag.String("base-path", "", "Base path for the S3 directory when undefined in the config file")
-	debug := flag.Bool("debug", false, "Enable verbose debug logs")
-	port := flag.Int("port", 443, "S3 gateway port")
-	host := flag.String("host", "0.0.0.0", "S3 gateway host")
-	nodes := flag.String("nodes", "", "Comma-separated node IDs to run in this process (empty = every node in the topology)")
-	encryptionKeyFile := flag.String("encryption-key-file", "", "Path to 32-byte AES-256 master key for encryption at rest (required)")
+	configPath := flag.String("config", "", "S3 server configuration file (required)")
+	hostID := flag.Int("host", 0, "ID of the [[host]] this process runs (required)")
+	bindAddr := flag.String("bind-addr", "", "Local listen address, without a port (overrides bind_addr)")
+	dataDir := flag.String("data-dir", "", "On-disk root for this host's nodes (overrides data_dir)")
+	encryptionKey := flag.String("encryption-key", "", "Path to the 32-byte AES-256 key protecting data at rest (overrides encryption_key)")
+	tlsCert := flag.String("tls-cert", "", "Path to this host's TLS certificate (overrides tls_cert)")
+	tlsKey := flag.String("tls-key", "", "Path to this host's TLS key (overrides tls_key)")
+	logLevel := slog.LevelInfo
+	flag.TextVar(&logLevel, "log-level", logLevel, "Minimum log level (debug|info|warn|error)")
 
 	flag.Parse()
-	applyEnvOverrides(config, tlsKey, tlsCert, port, nodes, encryptionKeyFile)
 
-	if *config == "" {
+	if *configPath == "" {
 		flag.Usage()
 		return errors.New("missing required flag: -config")
 	}
-	if *encryptionKeyFile == "" {
+	if *hostID <= 0 {
 		flag.Usage()
-		return errors.New("missing required flag: -encryption-key-file (or ENCRYPTION_KEY_FILE)")
+		return errors.New("missing required flag: -host")
 	}
 
 	// One context for the whole process: ctrl-c cancels the rpc servers, the
-	// node services and the S3 gateway together.
+	// node services and the S3 gate together.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -71,111 +70,67 @@ func run() error {
 		}()
 	}
 
-	cfg := &s3.Config{ConfigPath: *config, BasePath: *basePath}
-	if err := cfg.ReadConfig(); err != nil {
+	// After Init, so the default logger also fans out to the OTLP bridge.
+	otelsetup.SetDefaultJSONLogger(logLevel)
+
+	cfg, err := predastore.LoadConfig(*configPath)
+	if err != nil {
 		return fmt.Errorf("read config: %w", err)
 	}
 
-	localIDs, err := parseNodeIDs(*nodes, cfg)
-	if err != nil {
-		return fmt.Errorf("invalid -nodes selection: %w", err)
+	// The host-local fields have two sources, so they are settled here, into the
+	// entry the rest of the tree reads: flag, then config, then default.
+	host := hostEntry(cfg, predastore.HostID(*hostID))
+	if host == nil {
+		return fmt.Errorf("host %d is not in %s", *hostID, *configPath)
 	}
-	key, err := masterkey.Load(*encryptionKeyFile)
+	host.BindAddr = cmp.Or(*bindAddr, host.BindAddr, host.Addr)
+	host.DataDir = cmp.Or(*dataDir, host.DataDir)
+	host.EncryptionKey = cmp.Or(*encryptionKey, host.EncryptionKey)
+	host.TLSCert = cmp.Or(*tlsCert, host.TLSCert)
+	host.TLSKey = cmp.Or(*tlsKey, host.TLSKey)
+	if err := validateHost(host); err != nil {
+		return err
+	}
+	// The file's own checks run again over the merged tree: -data-dir can
+	// supply a root the file never had, and a node's derived directory only
+	// collides with an explicit one once that root is known.
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+
+	key, err := masterkey.Load(host.EncryptionKey)
 	if err != nil {
 		return fmt.Errorf("load master key: %w", err)
 	}
 
-	rt, err := clusterrun.Build(cfg, localIDs, *tlsCert, *tlsKey, key)
-	if err != nil {
-		return fmt.Errorf("build cluster runtime: %w", err)
-	}
-
-	server, err := s3.NewServer(
-		s3.WithConfigPath(*config),
-		s3.WithAddress(*host, *port),
-		s3.WithTLS(*tlsCert, *tlsKey),
-		s3.WithBasePath(*basePath),
-		s3.WithDebug(*debug),
-		s3.WithEncryptionKeyFile(*encryptionKeyFile),
-		s3.WithPreparedBackend(rt.Backend),
-	)
-	if err != nil {
-		rt.Close()
-		return fmt.Errorf("create server: %w", err)
-	}
-
-	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return rt.Run(gctx) })
-	g.Go(func() error {
-		// Serving before consensus settles would fail writes that would have
-		// succeeded a moment later; a timeout degrades rather than aborts,
-		// since the state client retries.
-		if err := rt.WaitReady(30 * time.Second); err != nil {
-			slog.Warn("No leader elected within timeout, serving anyway", "error", err)
-		}
-		return serveS3(gctx, server)
+	return predastore.Run(ctx, predastore.Options{
+		Config:    cfg,
+		HostID:    host.ID,
+		MasterKey: key,
 	})
-	return g.Wait()
 }
 
-// serveS3 runs the gateway until the context is cancelled, then shuts it down
-// within a bounded grace period.
-func serveS3(ctx context.Context, server *s3.Server) error {
-	if err := server.ListenAndServeAsync(); err != nil {
-		return fmt.Errorf("start s3 gateway: %w", err)
-	}
-	select {
-	case <-ctx.Done():
-	case err := <-server.ServeError():
-		return fmt.Errorf("s3 gateway: %w", err)
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shut down s3 gateway: %w", err)
+// hostEntry is the [[host]] this process runs, addressable so the flags that
+// override it can be written back into the config everything downstream reads.
+func hostEntry(cfg *predastore.Config, id predastore.HostID) *predastore.HostConfig {
+	for i := range cfg.Hosts {
+		if cfg.Hosts[i].ID == id {
+			return &cfg.Hosts[i]
+		}
 	}
 	return nil
 }
 
-// applyEnvOverrides lets the launcher configure s3d without rewriting flags.
-func applyEnvOverrides(config, tlsKey, tlsCert *string, port *int, nodes, encryptionKeyFile *string) {
-	if v := os.Getenv("CONFIG"); v != "" {
-		*config = v
+// validateHost checks the resolved fields this machine needs. It is local by
+// design: a path missing from another host's entry is that host's problem and
+// must not stop this one from starting.
+func validateHost(h *predastore.HostConfig) error {
+	if h.EncryptionKey == "" {
+		return errors.New("no encryption key: set --encryption-key or encryption_key")
 	}
-	if v := os.Getenv("TLS_KEY"); v != "" {
-		*tlsKey = v
+	if h.TLSCert == "" || h.TLSKey == "" {
+		return errors.New("no TLS identity: set --tls-cert and --tls-key, or tls_cert and tls_key")
 	}
-	if v := os.Getenv("TLS_CERT"); v != "" {
-		*tlsCert = v
-	}
-	if v := os.Getenv("PORT"); v != "" {
-		if p, err := strconv.Atoi(v); err == nil {
-			*port = p
-		}
-	}
-	if v := os.Getenv("NODES"); v != "" {
-		*nodes = v
-	}
-	if v := os.Getenv("ENCRYPTION_KEY_FILE"); v != "" {
-		*encryptionKeyFile = v
-	}
-}
-
-// parseNodeIDs resolves the -nodes selection; empty selects every node in the
-// topology, running the whole cluster in one process.
-func parseNodeIDs(selection string, cfg *s3.Config) ([]int, error) {
-	if selection == "" {
-		return clusterrun.AllNodeIDs(cfg), nil
-	}
-	parts := strings.Split(selection, ",")
-	ids := make([]int, 0, len(parts))
-	for _, p := range parts {
-		id, err := strconv.Atoi(strings.TrimSpace(p))
-		if err != nil {
-			return nil, fmt.Errorf("bad node id %q: %w", p, err)
-		}
-		ids = append(ids, id)
-	}
-	return ids, nil
+	return nil
 }

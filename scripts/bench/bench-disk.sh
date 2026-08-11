@@ -6,8 +6,8 @@
 # dir. No orchestration beyond invoking fio — this is the disk ceiling, the
 # bench-cluster.sh script measures what predastore extracts from it.
 #
-# Layout mirrors bench-cluster.sh: fio target lives next to predastore's
-# distributed/ tree under PREDA_DIR, results land under
+# Layout mirrors bench-cluster.sh: the fio target lives under PREDA_DIR
+# alongside the per-cluster data directories, results land under
 # scripts/bench/results/disk-<timestamp>/.
 
 set -euo pipefail

@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./scripts/bench.sh disk
-#   ./scripts/bench.sh <clustername>
+#   ./scripts/bench.sh <clustername>     # e.g. 1host, 3host, 5host
 #
 
 set -euo pipefail
@@ -16,7 +16,7 @@ if [ $# -lt 1 ]; then
     echo "Usage: $0 disk|<clustername>"
     echo ""
     echo "  disk            Run raw-disk fio benchmark"
-    echo "  <clustername>   Run warp cluster benchmark (e.g. 3node, 5node)"
+    echo "  <clustername>   Run warp cluster benchmark (e.g. 1host, 3host, 5host)"
     exit 1
 fi
 

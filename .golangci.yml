@@ -162,11 +162,6 @@ linters:
         linters:
           - errcheck
 
-      # quic server: json.Marshal on known-safe types, errors not actionable
-      - path: "quic/quicserver/"
-        linters:
-          - errchkjson
-
       # predastore-specific gosec exclusions
       - text: "G204"
         linters: [gosec] # subprocess execution

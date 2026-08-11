@@ -14,6 +14,9 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 REPO_DIR="$SCRIPT_DIR/.."
 CONFIG_DIR="$REPO_DIR/config"
 
+# shellcheck source=scripts/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
 BASE_DIR="${PREDA_DIR:-/tmp/predastore}"
 
 # Colors
@@ -65,22 +68,18 @@ for pid_dir in "$BASE_DIR"/*/pids; do
     done
 done
 
-# Teardown loopback IPs for each cluster that has a matching config
+# Teardown loopback IPs for each cluster that has a matching config. Only
+# addresses start.sh could have aliased are removed: loopback is the machine's
+# own and a single-host profile never aliased anything.
 for cluster_dir in "$BASE_DIR"/*/; do
     [ -d "$cluster_dir" ] || continue
     cluster=$(basename "$cluster_dir")
     config="$CONFIG_DIR/${cluster}.toml"
     [ -f "$config" ] || continue
 
-    # An absent or all-wildcard address list is normal, not an error: the
-    # pipeline must not abort the script under `set -e`.
-    ips=$(grep -E '^\s*public_addr\s*=' "$config" | \
-        sed 's/.*=\s*"\(.*\)".*/\1/' | \
-        cut -d: -f1 | \
-        grep -v '0\.0\.0\.0' | \
-        sort -u || true)
-
-    for ip in $ips; do
+    # A profile with no routable host is normal, not an error: the pipeline
+    # must not abort the script under `set -e`.
+    for ip in $(routable_addrs "$config" || true); do
         sudo ip addr del "${ip}/24" dev lo 2>/dev/null || true
     done
 done

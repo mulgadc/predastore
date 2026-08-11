@@ -31,13 +31,6 @@ go_build:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
 	GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/s3d ./cmd/s3d
 
-# Build multi-arch for docker, TODO add ARM
-go_build_docker:
-	@echo -e "\n....Building $(GO_PROJECT_NAME)"
-	GOOS=linux GOARCH=amd64 GOFIPS140=v1.0.0 go build -ldflags "-s -w" --ldflags '-extldflags "-static"' -o ./bin/linux/s3d ./cmd/s3d
-
-	GOOS=darwin GOARCH=$(GOARCH) GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/darwin/s3d ./cmd/s3d
-
 # Preflight — runs the same checks as GitHub Actions (lint + security + tests).
 # Use this before committing to catch CI failures locally.
 preflight:
@@ -61,10 +54,10 @@ test-race:
 	@echo -e "\n....Running tests with race detector for $(GO_PROJECT_NAME)...."
 	$(_Q)LOG_IGNORE=1 go test -race -timeout 300s ./... $(_RACEQ)
 
-# Run integration tests (gated behind the 'integration' build tag — these
-# bind real network ports and are excluded from default/test-race runs).
-# certs is a prerequisite: these serve TLS, and certs/ is gitignored, so a
-# fresh worktree has none and every one of them fails to dial.
+# Run tests behind the 'integration' build tag, for suites that bind real
+# network ports. No file carries the tag at present, so this currently runs
+# the same set as `test`. certs is a prerequisite: tagged suites serve TLS,
+# and certs/ is gitignored, so a fresh worktree has none.
 test-integration: certs
 	@echo -e "\n....Running integration tests for $(GO_PROJECT_NAME)...."
 	$(_Q)LOG_IGNORE=1 go test -tags=integration -timeout 300s ./... $(_RACEQ)
@@ -72,27 +65,6 @@ test-integration: certs
 # Check that new/changed code meets coverage threshold (runs tests first)
 diff-coverage: test-cover
 	@QUIET=$(QUIET) scripts/diff-coverage.sh $(COVERPROFILE)
-
-# Docker builds
-docker_s3d:
-	@echo "Building docker (s3d)"
-	docker build -t mulgadc/predastore:latest -f- . < docker/Dockerfile-s3d
-
-docker_compose_up:
-	@echo "Running docker-compose"
-	docker-compose -f docker/docker-compose.yaml up --build -d
-
-docker_compose_down:
-	@echo "Stopping docker-compose"
-	docker-compose -f docker/docker-compose.yaml down
-
-docker: go_build_docker docker_s3d
-
-docker_clean:
-	@echo "Removing Docker images and volumes"
-	docker rmi mulgadc/predastore:latest
-
-docker_test: docker docker_compose_up test docker_compose_down docker_clean
 
 clean:
 	rm -f ./bin/s3d
@@ -111,6 +83,5 @@ govulncheck:
 nilaway:
 	go tool nilaway -include-pkgs=github.com/mulgadc/predastore -exclude-test-files ./...
 
-.PHONY: certs build go_build go_build_docker preflight test test-cover test-race test-integration diff-coverage \
-	docker_s3d docker_compose_up docker_compose_down docker docker_clean docker_test \
+.PHONY: certs build go_build preflight test test-cover test-race test-integration diff-coverage \
 	clean lint fix govulncheck nilaway

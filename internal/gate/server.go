@@ -1,0 +1,207 @@
+package gate
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/mulgadc/predastore/internal/gate/auth"
+	"github.com/mulgadc/predastore/internal/gate/handlers"
+	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/tlsconfig"
+	"github.com/mulgadc/predastore/pkg/ratelimit"
+)
+
+const (
+	defaultAddr = "0.0.0.0"
+	defaultPort = 8443
+
+	// shutdownGrace bounds how long Run waits for in-flight requests to finish
+	// after the context is cancelled.
+	shutdownGrace = 10 * time.Second
+)
+
+// Server is predastore's S3 gate: the HTTPS listener, the SigV4 + IAM
+// middleware chain and the route table. It is the S3 implementation, not a
+// front end onto one — the handlers it routes to erasure code, place and
+// record their own operations.
+type Server struct {
+	cfg Config
+	// cert is loaded by New, so a gate that cannot serve TLS fails to build
+	// rather than at its first request.
+	cert tls.Certificate
+
+	router    chi.Router
+	credProv  auth.CredentialProvider
+	throttler *ratelimit.Throttler
+
+	// Handler dependencies, shared by the route table and the auth middleware.
+	handlerCfg handlers.Config
+	buckets    *handlers.BucketCache // config-defined buckets, plus those created since startup
+}
+
+var _ http.Handler = (*Server)(nil)
+
+// New validates cfg, applies its defaults, resolves the credential chain and
+// assembles the route table. It binds nothing and starts no goroutine: the
+// listener is Run's, and nothing on the server is set after this returns.
+func New(cfg Config) (*Server, error) {
+	if cfg.Region == "" {
+		return nil, errors.New("region is required")
+	}
+	// The clients arrive fully wired from the process that owns the cluster
+	// nodes; the gate never launches storage or state itself.
+	if cfg.Meta == nil {
+		return nil, errors.New("no metadata client: build the cluster runtime and set Config.Meta")
+	}
+	if cfg.Blob == nil {
+		return nil, errors.New("no blob client: build the cluster runtime and set Config.Blob")
+	}
+	// TLS is a construction input, not a serving one: a gate that cannot load
+	// its certificate says so now rather than at the first request.
+	if cfg.TLSCert == "" || cfg.TLSKey == "" {
+		return nil, errors.New("TLS is required: set Config.TLSCert and Config.TLSKey")
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
+	}
+
+	if cfg.Addr == "" {
+		cfg.Addr = defaultAddr
+	}
+	if cfg.Port == 0 {
+		cfg.Port = defaultPort
+	}
+
+	credProv := cfg.CredProv
+	if credProv == nil {
+		var perr error
+		if credProv, perr = newCredentialProvider(cfg); perr != nil {
+			return nil, fmt.Errorf("failed to initialize credential provider: %w", perr)
+		}
+	}
+
+	handlerCfg := cfg.handlerConfig()
+	s := &Server{
+		cfg:        cfg,
+		cert:       cert,
+		router:     chi.NewRouter(),
+		credProv:   credProv,
+		handlerCfg: handlerCfg,
+		buckets:    handlers.NewBucketCache(handlerCfg.Buckets),
+	}
+	if cfg.RateLimit.Enabled {
+		s.throttler = ratelimit.New(cfg.RateLimit)
+	}
+
+	s.setupMiddleware()
+	s.setupRoutes(placement.NewRing(cfg.BlobNodeIDs))
+	return s, nil
+}
+
+// ServeHTTP routes one S3 request through the middleware chain. Run serves
+// this same handler over TLS; a caller holding a Server can drive it directly.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.router.ServeHTTP(w, r)
+}
+
+// newCredentialProvider resolves the auth chain: NATS-backed IAM when it is
+// configured, with the config-defined accounts always as the fallback.
+func newCredentialProvider(config Config) (auth.CredentialProvider, error) {
+	configProv := auth.NewConfigProvider(config.Auth)
+
+	if config.IAM == nil {
+		slog.Info("IAM not configured, using config-only auth")
+		return configProv, nil
+	}
+
+	natsProv, err := auth.NewNATSIAMProvider(config.IAM)
+	if err != nil {
+		return nil, fmt.Errorf("IAM configured but NATS provider failed to initialize: %w", err)
+	}
+
+	slog.Info("Using NATS IAM + config chain auth")
+	return auth.NewChainProvider(natsProv, configProv), nil
+}
+
+// Run serves S3 over TLS until ctx is cancelled or the listener fails, then
+// drains in-flight requests within the grace period and releases everything it
+// started. It is the server's whole lifecycle: there is nothing to stop it
+// with but the context.
+func (s *Server) Run(ctx context.Context) error {
+	// Teardown runs LIFO, so registration order here is the reverse of the
+	// order things are released in: the listener drains first, then the
+	// credential provider and the throttler that fronted it.
+	if s.throttler != nil {
+		defer s.throttler.Stop()
+	}
+	if s.credProv != nil {
+		defer s.credProv.Close()
+	}
+
+	// NextProtos advertises HTTP/2 over ALPN, with HTTP/1.1 as the fallback.
+	tlsCfg := &tls.Config{
+		Certificates:     []tls.Certificate{s.cert},
+		NextProtos:       []string{"h2", "http/1.1"},
+		MinVersion:       tls.VersionTLS13,
+		CurvePreferences: tlsconfig.Curves,
+	}
+
+	addr := net.JoinHostPort(s.cfg.Addr, strconv.Itoa(s.cfg.Port))
+	httpSrv := &http.Server{
+		Addr:              addr,
+		Handler:           s.router,
+		TLSConfig:         tlsCfg,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", addr, err)
+	}
+
+	// Buffered so the send never blocks, and closed after it so the drain below
+	// can wait for Serve to return whether or not the select already took the
+	// value. No goroutine outlives Run.
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- httpSrv.Serve(tls.NewListener(ln, tlsCfg))
+		close(serveErr)
+	}()
+
+	defer func() {
+		drainCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		if err := httpSrv.Shutdown(drainCtx); err != nil {
+			slog.Error("S3 gate did not drain within grace period", "error", err)
+		}
+		<-serveErr
+	}()
+
+	slog.Info("Starting S3 gate", "addr", addr, "http2", true)
+
+	select {
+	case <-ctx.Done():
+		slog.Info("Shutting down S3 gate...")
+		return nil
+	case err := <-serveErr:
+		// A gate that cannot bind must take the process down rather than
+		// leave the cluster running headless.
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}
