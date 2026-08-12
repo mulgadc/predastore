@@ -1,13 +1,13 @@
 package handlers
 
 import (
-	"bytes"
-	"encoding/gob"
+	"errors"
+	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strconv"
 
+	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/internal/gate/chunked"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
@@ -30,52 +30,122 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
-		objectHash := model.ObjectHash(bucket, key)
+		/* Per-object settings */
+
+		// dataShards is the number of data shards that a stripe is split into before erasure coding.
+		dataShards := cfg.DataShards
+		// parityShards is the number of parity shards to compute per stripe.
+		parityShards := cfg.ParityShards
+		// ackThreshold is the minimum number of shards that must be durably written to storage
+		// nodes before a stripe is considered durable. Must be >= dataShards and <= dataShards + parityShards.
+		ackThreshold := dataShards
+		// queueDepth is the maximum number of shards that may be in a stream writer's queue at a
+		// time, after which senders block.
+		queueDepth := 3
+		// maxFrameSize is the maximum size (in bytes) of a single encrypted unit, including overhead bytes.
+		maxFrameSize := 64 * 1024
+		// maxFramesPerShard is the number of frames that make up each data shard of a stripe. The
+		// shards of the last stripe of the object may be shorter in order to keep shards equal in
+		// size.
+		maxFramesPerShard := 1
+
+		totalShards := dataShards + parityShards
+		maxShardSize := maxFrameSize * maxFramesPerShard
+		maxStripeSize := maxShardSize * dataShards
+
+		// Compute object eTag.
+		// TODO: Decide whether this should be an MD5 of the body bytes, or something random.
+		eTag := model.ObjectHash(bucket, key)
+
+		// Use eTag to compute the placement preference list from the hash ring.
+		nodes, err := ring.Nodes(eTag, totalShards)
+		if err != nil {
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+			return
+		}
+
+		// Initialise RS encoder.
+		rs, err := reedsolomon.New(dataShards, parityShards)
+		if err != nil {
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+			return
+		}
 
 		body, size := decodeBody(r)
-		if size < 0 {
-			HandleError(w, r, model.ErrMissingContentLengthError)
-			return
+
+		// Pre-allocate stripe buffers to eliminate copies between stages.
+		free := make(chan [][]byte, queueDepth)
+		for range queueDepth {
+			free <- reedsolomon.AllocAligned(totalShards, maxShardSize)
 		}
 
-		poolNearFull, err := writeObject(ctx, bc, ring, cfg, body, size, objectHash)
-		if err != nil {
-			slog.ErrorContext(ctx, "putObject: shard distribution failed", "error", err)
-			HandleError(w, r, mapPutErr(err))
-			return
-		}
+		read := 0
+		for int64(read) < size {
+			// Wait for a free stripe buffer.
+			var stripe [][]byte
+			select {
+			case stripe = <-free:
+			case <-ctx.Done():
+				return
+			}
 
-		place, err := placeShards(ring, cfg, objectHash, size)
-		if err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
-			return
-		}
+			// Zero the parity shards.
+			for _, shard := range stripe[dataShards:] {
+				clear(shard)
+			}
 
-		var buf bytes.Buffer
-		if err := gob.NewEncoder(&buf).Encode(place); err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
-			return
-		}
+			// Fill data shards with object plaintext.
+		read:
+			for i, shard := range stripe[:dataShards] {
+				for j := range maxFramesPerShard {
+					// Read into the current data shard, leaving space for encryption overhead.
+					plaintextStart := j * maxFrameSize
+					plaintextEnd := plaintextStart + maxFrameSize - 16 // TODO: Dynamically size encryption overhead.
+					n, err := io.ReadFull(body, shard[plaintextStart:plaintextEnd])
+					read += n
 
-		// Object hash -> shard placement, for retrieval.
-		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
-			return
-		}
+					switch {
+					case err == nil:
+						continue
+					case errors.Is(err, io.ErrUnexpectedEOF), i == 0:
+						// If the first shard is short, slice all shards to the same length to minimize padding.
+						for i, shard := range stripe {
+							stripe[i] = shard[:plaintextStart+n+16] // TODO: Dynamically size encryption overhead.
+						}
+						fallthrough
+					case errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, io.EOF):
+						// Zero the remainder of the current shard.
+						clear(shard[plaintextStart+n:])
+						// Zero any unused data shards in the stripe.
+						for _, shard := range stripe[i+1 : dataShards] {
+							clear(shard)
+						}
+						break read
+					default:
+						HandleError(w, r, model.NewS3Error(model.ErrInternalError, fmt.Errorf("read plaintext frame: %w", err).Error(), 500))
+						return
+					}
+				}
+			}
 
-		// Listing key -> object hash, for ListObjects.
-		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
-			return
-		}
+			// TODO: Seal plaintext frames.
 
-		// Nearfull writes still succeed; the header lets clients back off before
-		// hitting the hard 507 rejection.
-		if poolNearFull {
-			w.Header().Set("X-Predastore-Pool-Pressure", "nearfull")
+			// Compute parity shards.
+			// TODO: Skip encoding parity for the empty shards in the tail stripe.
+			for i, shard := range stripe[:dataShards] {
+				if err := rs.EncodeIdx(shard, i, stripe[dataShards:]); err != nil {
+					HandleError(w, r, model.NewS3Error(model.ErrInternalError, fmt.Errorf("compute parity shards: %w", err).Error(), 500))
+					return
+				}
+			}
+
+			res := make(chan error)
+			for _, shard := range stripe {
+				go func() {
+
+				}()
+			}
 		}
-		w.Header().Set("ETag", model.ObjectETag(bucket, key))
-		w.WriteHeader(http.StatusOK)
 	})
 }
 
