@@ -14,9 +14,9 @@ import (
 	"sync"
 	"time"
 
-	iamarn "github.com/mulgadc/predastore/pkg/auth"
-	"github.com/mulgadc/predastore/pkg/iampolicy"
-	"github.com/mulgadc/predastore/pkg/masterkey"
+	iamarn "github.com/mulgadc/bluebottle/pkg/auth"
+	"github.com/mulgadc/bluebottle/pkg/iampolicy"
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )

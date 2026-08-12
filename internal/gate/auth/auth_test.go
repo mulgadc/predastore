@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mulgadc/predastore/pkg/iampolicy"
+	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

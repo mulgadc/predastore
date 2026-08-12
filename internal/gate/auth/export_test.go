@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mulgadc/predastore/pkg/masterkey"
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
 )
 
 // Re-exports of the session fixtures for the external auth_test package, which

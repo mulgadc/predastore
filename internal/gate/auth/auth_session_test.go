@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mulgadc/predastore/pkg/masterkey"
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"

@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/mulgadc/predastore/pkg/masterkey"
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
 )
 
 func testAEAD(t *testing.T) cipher.AEAD {

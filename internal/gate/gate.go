@@ -5,10 +5,10 @@
 package gate
 
 import (
+	"github.com/mulgadc/bluebottle/pkg/ratelimit"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
-	"github.com/mulgadc/predastore/pkg/ratelimit"
 )
 
 // RS fixes the erasure code the gate places objects with.

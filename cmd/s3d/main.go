@@ -15,9 +15,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
+	"github.com/mulgadc/bluebottle/pkg/otelsetup"
 	"github.com/mulgadc/predastore"
-	"github.com/mulgadc/predastore/pkg/masterkey"
-	"github.com/mulgadc/predastore/pkg/otelsetup"
 
 	_ "github.com/mulgadc/predastore/internal/fipsboot"
 )

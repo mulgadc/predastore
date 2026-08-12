@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"crypto/cipher"
 
-	"github.com/mulgadc/predastore/pkg/masterkey"
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
 )
 
 // TestMasterKey is a deterministic 32-byte AES-256 key for use in tests that

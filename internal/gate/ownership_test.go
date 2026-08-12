@@ -11,11 +11,11 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/meta"
-	"github.com/mulgadc/predastore/pkg/iampolicy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

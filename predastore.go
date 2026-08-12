@@ -18,13 +18,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate"
 	"github.com/mulgadc/predastore/internal/meta"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/transport"
-	"github.com/mulgadc/predastore/pkg/masterkey"
 	"golang.org/x/sync/errgroup"
 )
 

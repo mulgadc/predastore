@@ -9,10 +9,10 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/mulgadc/bluebottle/pkg/otelsetup"
+	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/model"
-	"github.com/mulgadc/predastore/pkg/otelsetup"
-	"github.com/mulgadc/predastore/pkg/sigv4"
 )
 
 // RespondSigV4Error maps a parse/verify sentinel or a credential lookup

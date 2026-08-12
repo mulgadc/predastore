@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/mulgadc/bluebottle/pkg/ratelimit"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 	"github.com/mulgadc/predastore/internal/tlsconfig"
-	"github.com/mulgadc/predastore/pkg/ratelimit"
 )
 
 const (

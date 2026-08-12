@@ -18,8 +18,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mulgadc/bluebottle/pkg/ratelimit"
 	"github.com/mulgadc/predastore/internal/gate/model"
-	"github.com/mulgadc/predastore/pkg/ratelimit"
 	"github.com/pelletier/go-toml/v2"
 )
 
