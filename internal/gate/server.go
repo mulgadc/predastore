@@ -47,8 +47,6 @@ type Server struct {
 	buckets    *handlers.BucketCache // config-defined buckets, plus those created since startup
 }
 
-var _ http.Handler = (*Server)(nil)
-
 // New validates cfg, applies its defaults, resolves the credential chain and
 // assembles the route table. It binds nothing and starts no goroutine: the
 // listener is Run's, and nothing on the server is set after this returns.
@@ -105,12 +103,6 @@ func New(cfg Config) (*Server, error) {
 	s.setupMiddleware()
 	s.setupRoutes(placement.NewRing(cfg.BlobNodeIDs))
 	return s, nil
-}
-
-// ServeHTTP routes one S3 request through the middleware chain. Run serves
-// this same handler over TLS; a caller holding a Server can drive it directly.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.router.ServeHTTP(w, r)
 }
 
 // newCredentialProvider resolves the auth chain: NATS-backed IAM when it is

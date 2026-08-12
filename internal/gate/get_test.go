@@ -19,7 +19,7 @@ func TestGetObjectNoBucketPermissions(t *testing.T) {
 	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")
 
 	rr := httptest.NewRecorder()
-	server.ServeHTTP(rr, req)
+	server.router.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 

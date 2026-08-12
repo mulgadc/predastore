@@ -18,7 +18,7 @@ func TestPutObjectPublicBucketNoAuth(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/test-bucket01/test_upload.txt", bytes.NewReader(testContent))
 
 	rr := httptest.NewRecorder()
-	server.ServeHTTP(rr, req)
+	server.router.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 }
@@ -32,7 +32,7 @@ func TestPutObjectPrivateBucketNoAuth(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPut, "/private/test_upload.txt", bytes.NewReader(testContent))
 
 	rr := httptest.NewRecorder()
-	server.ServeHTTP(rr, req)
+	server.router.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 }

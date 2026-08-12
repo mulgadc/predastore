@@ -17,7 +17,7 @@ func TestListBucketsNoAuth(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rr := httptest.NewRecorder()
-	server.ServeHTTP(rr, req)
+	server.router.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 }
@@ -29,7 +29,7 @@ func TestListObjectsV2HandlerPrivateBucketNoAuth(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
 	rr := httptest.NewRecorder()
-	server.ServeHTTP(rr, req)
+	server.router.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 
@@ -48,7 +48,7 @@ func TestListObjectsV2HandlerPrivateBucketBadAuth(t *testing.T) {
 	signTestReq(t, req, nil, "BADACCESSKEY", "BADSECRETKEY", config.Region, "s3")
 
 	rr := httptest.NewRecorder()
-	server.ServeHTTP(rr, req)
+	server.router.ServeHTTP(rr, req)
 
 	assert.Equal(t, 403, rr.Code, "Status code should be 403")
 
