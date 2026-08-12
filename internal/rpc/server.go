@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"slices"
 	"sync"
 	"time"
 
@@ -47,12 +46,11 @@ func WithDrainTimeout(d time.Duration) ServerOption {
 	return func(s *Server) { s.drainTimeout = d }
 }
 
-// Server answers rpc streams for one node on the listeners it is given. The
-// listeners are already bound: whoever built the node owns its transports, so
-// a server never learns which networks it is reached over.
+// Server answers rpc streams for one node on the listeners it is given, which
+// arrive already bound.
 //
-// A nil pool is meaningful: such a server owns and closes what it accepts and
-// donates nothing, which is what a node that never dials wants.
+// With a nil pool it owns and closes every connection it accepts, donating
+// none.
 type Server struct {
 	mux          *Mux
 	lns          []transport.Listener
@@ -73,7 +71,12 @@ func NewServer(mux *Mux, lns []transport.Listener, pool *ConnPool, opts ...Serve
 	return s, nil
 }
 
+// Run accepts on every listener until ctx is cancelled, then drains in-flight
+// handlers before returning.
 func (s *Server) Run(ctx context.Context) error {
+	// Handlers hang off Background rather than ctx, so cancelling ctx stops the
+	// accept loops without cutting a request short mid-flight. They are only
+	// cancelled once the drain deadline expires.
 	g, acceptCtx := errgroup.WithContext(ctx)
 	handlerCtx, cancelHandlers := context.WithCancel(context.Background())
 	defer cancelHandlers()
@@ -102,9 +105,8 @@ func (s *Server) Run(ctx context.Context) error {
 		ln.Close()
 	}
 
-	// Each conns goroutine waits for its own handlers, so this covers every
-	// in-flight request: once it returns, nothing is still touching state the
-	// caller is about to tear down.
+	// Each conns goroutine waits for its own handlers, so this drains every
+	// in-flight request.
 	done := make(chan struct{})
 	go func() {
 		conns.Wait()
@@ -119,6 +121,8 @@ func (s *Server) Run(ctx context.Context) error {
 	case <-done:
 		return serveErr
 	case <-deadline:
+		// Cancelling aborts the connections handlers are parked on, which is
+		// what lets the second wait finish.
 		cancelHandlers()
 		<-done
 		if serveErr != nil {
@@ -141,9 +145,8 @@ func (s *Server) acceptConns(
 		if err != nil {
 			var te interface{ Temporary() bool }
 			if errors.As(err, &te) && te.Temporary() {
-				// The timer is stopped rather than deferred: this loop runs
-				// for the life of the listener, so a deferred Stop per retry
-				// would accumulate for as long as the errors keep coming.
+				// Stopped inline, not deferred: this loop runs for the life of
+				// the listener, so deferred Stops would accumulate per retry.
 				t := time.NewTimer(backoff)
 				select {
 				case <-t.C:
@@ -160,22 +163,21 @@ func (s *Server) acceptConns(
 
 		conns.Go(func() {
 			// Handlers outlive the accept loop, so the connection is released
-			// here and only once they have drained. Waiting inside the conns
-			// goroutine is what makes Run's conns.Wait a full drain.
+			// here, once they have drained. Waiting inside this goroutine is
+			// what makes Run's conns.Wait a full drain.
 			var streams sync.WaitGroup
 
-			// A donated connection belongs to the pool, so releasing it means
-			// evicting rather than closing: a connection that dies inbound is
-			// taken out of the pool instead of handed to a dialer dead.
+			// A donated connection belongs to the pool, so it leaves through
+			// Evict rather than being closed behind the pool's back.
 			if s.pool != nil && s.pool.Donate(conn) {
 				defer s.pool.Evict(conn)
 			} else {
 				defer conn.Close()
 			}
 
-			// Cancelled handlers mean the drain deadline expired. Aborting the
-			// connection is the only way to unblock a handler parked in a
-			// stream read, which has no deadline and never observes ctx.
+			// A handler parked in a stream read has no deadline and never
+			// observes ctx, so closing the connection under it is the only way
+			// to unblock one once the drain deadline has expired.
 			drained := make(chan struct{})
 			defer close(drained)
 			go func() {
@@ -216,14 +218,17 @@ func (s *Server) acceptStreams(
 		}
 
 		streams.Go(func() {
-			if err := s.handleStream(handlerCtx, stream); err != nil {
+			// Closing the write side is what marks a response complete, so a
+			// handler that answered at all lands in the second branch. A reset
+			// says the stream broke before any answer was written.
+			if code, err := s.handleStream(handlerCtx, stream); err != nil {
 				slog.ErrorContext(acceptCtx, "stream error",
 					"err", err,
+					"code", code,
 					"source", conn.LocalAddr(),
 					"addr", conn.RemoteAddr())
-				// TODO: Figure out better error codes.
-				stream.CancelRead(0)
-				stream.CancelWrite(0)
+				stream.CancelRead(code)
+				stream.CancelWrite(code)
 			} else {
 				stream.Close()
 			}
@@ -231,25 +236,28 @@ func (s *Server) acceptStreams(
 	}
 }
 
-func (s *Server) handleStream(ctx context.Context, stream transport.Stream) error {
-	buf := make([]byte, 8)
-	if _, err := io.ReadFull(stream, buf); err != nil {
-		return fmt.Errorf("read metadata: %w", err)
+// handleStream dispatches one stream, returning the code to reset it with if
+// it broke. A nil error means the handler ran to completion.
+func (s *Server) handleStream(ctx context.Context, stream transport.Stream) (transport.StreamErrorCode, error) {
+	// The opcode precedes the frame, since it is what picks the header type the
+	// frame is then decoded as.
+	var opBuf [4]byte
+	if _, err := io.ReadFull(stream, opBuf[:]); err != nil {
+		return ErrCodeBadHeader, fmt.Errorf("read opcode: %w", err)
 	}
-	op := Opcode(binary.BigEndian.Uint32(buf))
-	n := binary.BigEndian.Uint32(buf[4:8])
-	if n > maxHeaderSize {
-		return fmt.Errorf("%w: %v", ErrHeaderTooLarge, n)
-	}
-	buf = slices.Grow(buf, int(n))
-	buf = buf[:8+n]
-	if _, err := io.ReadFull(stream, buf[8:]); err != nil {
-		return fmt.Errorf("read header: %w", err)
+	op := Opcode(binary.BigEndian.Uint32(opBuf[:]))
+
+	header, err := readFrame(stream)
+	if err != nil {
+		return ErrCodeBadHeader, fmt.Errorf("read header: %w", err)
 	}
 
 	h, ok := s.mux.handlers[op]
 	if !ok {
-		return fmt.Errorf("no handler found")
+		return ErrCodeUnknownOpcode, fmt.Errorf("no handler for opcode %#x", op)
 	}
-	return h(ctx, buf[8:], stream)
+	if err := h(ctx, header, stream); err != nil {
+		return ErrCodeHandlerFailed, err
+	}
+	return 0, nil
 }

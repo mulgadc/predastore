@@ -1,12 +1,15 @@
 // Package blob serves and consumes opaque value operations over rpc streams.
-// The service side fronts the stores hosted in a process; the client side is
-// used by the distributed backend to reach blob nodes wherever they run.
+// The server side answers for one node's store; the client side is used by a
+// gate to reach blob nodes wherever they run.
+//
+// Every operation names its value by an opaque key. Whatever structure the
+// caller encodes there — an object hash, a shard or stripe index, a version —
+// is the caller's alone: a node compares keys and never reads into them.
 package blob
 
 import (
 	"context"
 	"crypto/cipher"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,27 +25,28 @@ import (
 // Store is the value store a node serves. The engine is the production
 // implementation; Config.Store is the seam a test substitutes through.
 type Store interface {
-	Append(key [32]byte, index uint32, size int64) (engine.Writer, error)
-	Lookup(key [32]byte, index uint32) (engine.Reader, error)
-	Delete(key [32]byte, index uint32) (bool, error)
+	// Put commits size bytes read from r, consuming at most size so the caller
+	// keeps whatever follows. Nothing it reserves outlives the call, and a
+	// short r commits nothing: the key names whatever it named before.
+	Put(key []byte, size uint64, r io.Reader) error
+	Lookup(key []byte) (engine.Reader, error)
+	Delete(key []byte) (bool, error)
 	NearFull() bool
 	Close() error
 }
 
 var _ Store = (*engine.Store)(nil)
 
-// Config is everything one blob node runs on. The listeners arrive already
-// bound because the process that owns the transports registers them before
-// any colocated node dials; everything else the node acquires itself.
+// Config is everything one blob node runs on. Everything but the listeners,
+// which arrive already bound, the node acquires itself.
 type Config struct {
 	NodeID    config.NodeID        // The node this server serves. Required.
 	DataDir   string               // Where the store lives; Run creates it. Required.
 	AEAD      cipher.AEAD          // Seals values at rest. Required unless Store is set.
 	Listeners []transport.Listener // The bound listeners the node answers rpc on.
 
-	// Compaction is how often dead space is reclaimed. It is always enabled:
-	// without it, overwrite and delete churn frees nothing and the store
-	// fills. Zero uses the engine's default interval.
+	// Compaction is how often dead space is reclaimed, and is always enabled.
+	// Zero uses the engine's default interval.
 	Compaction time.Duration
 
 	// Store stands in for the engine that would be opened at DataDir. Test
@@ -51,8 +55,11 @@ type Config struct {
 }
 
 // Server serves rpc requests for one blob node. A process running several
-// nodes builds one Server per node, each with its own rpc server, so the
-// storage service never learns that it has siblings.
+// nodes builds one Server per node, each with its own rpc server.
+//
+// Its handlers answer on their own half of the stream and return nil, whether
+// they succeeded or reported a failure status; a returned error resets the
+// stream instead, and so is reserved for one that broke.
 type Server struct {
 	cfg   Config
 	store Store
@@ -71,8 +78,6 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Store == nil && cfg.AEAD == nil {
 		return nil, fmt.Errorf("node %d has no aead: values are never stored in plaintext", cfg.NodeID)
 	}
-	// A node nothing can reach stores nothing. Failing here says so, rather
-	// than leaving a process holding an open store no peer can dial.
 	if len(cfg.Listeners) == 0 {
 		return nil, fmt.Errorf("node %d has no listeners", cfg.NodeID)
 	}
@@ -80,9 +85,10 @@ func New(cfg Config) (*Server, error) {
 }
 
 // Run opens the store, answers rpc on the configured listeners until ctx is
-// cancelled, then closes the store. A blob node never dials, so its rpc
-// server donates to no pool and owns every connection it accepts.
+// cancelled, then closes the store.
 func (s *Server) Run(ctx context.Context) error {
+	// A configured store is a test standing in for the engine; production
+	// leaves it nil and opens the real one here.
 	s.store = s.cfg.Store
 	if s.store == nil {
 		if err := os.MkdirAll(s.cfg.DataDir, 0750); err != nil {
@@ -100,6 +106,9 @@ func (s *Server) Run(ctx context.Context) error {
 	rpc.RegisterHandler(mux, OpGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpPut, s.handlePut)
 	rpc.RegisterHandler(mux, OpDelete, s.handleDelete)
+
+	// A blob node never dials, so it donates to no pool and owns every
+	// connection it accepts.
 	srv, err := rpc.NewServer(mux, s.cfg.Listeners, nil)
 	if err != nil {
 		return errors.Join(err, s.store.Close())
@@ -108,83 +117,67 @@ func (s *Server) Run(ctx context.Context) error {
 	return errors.Join(srv.Run(ctx), s.store.Close())
 }
 
-// respond writes the newline-terminated JSON envelope; get responses stream
-// the body bytes after it.
-func respond(stream transport.Stream, resp *Response) error {
-	return json.NewEncoder(stream).Encode(resp)
-}
-
-func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stream) error {
+func (s *Server) handlePut(ctx context.Context, h PutRequest, stream transport.Stream) error {
 	st := s.store
-	if h.Size <= 0 {
-		return respond(stream, &Response{Err: "no size specified"})
+	if h.Size == 0 {
+		return rpc.WriteError(stream, rpc.StatusInternal, "no size specified")
 	}
 
-	writer, err := st.Append(h.Key, h.Index, h.Size)
-	if err != nil {
-		// Drain the client's in-flight body so the reply is carried
-		// instead of racing a stream reset.
-		if _, derr := io.Copy(io.Discard, io.LimitReader(stream, h.Size)); derr != nil {
-			return fmt.Errorf("drain body after append error: %w", derr)
+	// The store reads the body straight off the stream, stopping at the
+	// declared size.
+	if err := st.Put(h.Key, h.Size, stream); err != nil {
+		// Drain what is still in flight, bounded by that size, so the reply is
+		// carried instead of racing a stream reset.
+		if _, derr := io.Copy(io.Discard, io.LimitReader(stream, int64(h.Size))); derr != nil { //nolint:gosec // G115: a declared body length never exceeds int64.
+			return fmt.Errorf("drain body after put error: %w", derr)
 		}
 		if errors.Is(err, engine.ErrStoreFull) {
-			return respond(stream, &Response{Err: ErrCodeStoreFull})
+			return rpc.WriteError(stream, StatusStoreFull, err.Error())
 		}
-		return respond(stream, &Response{Err: fmt.Sprintf("append: %v", err)})
+		return rpc.WriteError(stream, rpc.StatusInternal, fmt.Sprintf("put: %v", err))
 	}
-
-	if _, err := writer.ReadFrom(io.LimitReader(stream, h.Size)); err != nil {
-		return respond(stream, &Response{Err: fmt.Sprintf("write: %v", err)})
-	}
-	if err := writer.Close(); err != nil {
-		return respond(stream, &Response{Err: fmt.Sprintf("commit: %v", err)})
-	}
-
-	// Surface nearfull pressure on success too, so callers can back off
-	// before a write is ever outright rejected.
-	return respond(stream, &Response{Size: h.Size, PoolNearFull: st.NearFull()})
+	return rpc.WriteResponse(stream, &PutResponse{PoolNearFull: st.NearFull()})
 }
 
-func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stream) error {
+func (s *Server) handleGet(ctx context.Context, h GetRequest, stream transport.Stream) error {
 	st := s.store
 
-	reader, err := st.Lookup(h.Key, h.Index)
+	reader, err := st.Lookup(h.Key)
 	if err != nil {
-		return respond(stream, &Response{Err: ErrCodeNotFound})
+		return rpc.WriteError(stream, StatusNotFound, "")
 	}
 	defer reader.Close()
 
-	totalSize := reader.Size()
+	// Bounding the offset first is what keeps the subtraction below from
+	// wrapping.
+	totalSize := uint64(reader.Size()) //nolint:gosec // G115: a stored value's size is never negative.
+	if h.Off >= totalSize {
+		return rpc.WriteError(stream, StatusBadRange,
+			fmt.Sprintf("offset %d is past the value's %d bytes", h.Off, totalSize))
+	}
 
-	// Values >= 0 are explicit range bounds (including 0 for "start from
-	// beginning"); negative means unset and falls back to the whole value.
-	rangeStart := h.RangeStart
-	rangeEnd := h.RangeEnd
-	if rangeStart < 0 {
-		rangeStart = 0
+	// An unset or over-long length reads to the end of the value.
+	length := h.Len
+	if length == 0 || length > totalSize-h.Off {
+		length = totalSize - h.Off
 	}
-	if rangeEnd < 0 || rangeEnd >= totalSize {
-		rangeEnd = totalSize - 1
-	}
-	if rangeStart > rangeEnd || rangeStart >= totalSize {
-		return respond(stream, &Response{Err: "invalid range"})
-	}
-	responseSize := rangeEnd - rangeStart + 1
 
-	if err := respond(stream, &Response{BodyLen: responseSize}); err != nil {
-		return fmt.Errorf("write envelope: %w", err)
+	if err := rpc.WriteResponse(stream, &GetResponse{}); err != nil {
+		return err
 	}
-	if _, err := stream.ReadFrom(io.NewSectionReader(reader, rangeStart, responseSize)); err != nil {
+	// Returning closes this half of the stream, which is what ends the body.
+	//nolint:gosec // G115: both are bounded by the value's own size.
+	if _, err := stream.ReadFrom(io.NewSectionReader(reader, int64(h.Off), int64(length))); err != nil {
 		return fmt.Errorf("stream body: %w", err)
 	}
 	return nil
 }
 
-func (s *Server) handleDelete(ctx context.Context, h Request, stream transport.Stream) error {
+func (s *Server) handleDelete(ctx context.Context, h DeleteRequest, stream transport.Stream) error {
 	st := s.store
-	deleted, err := st.Delete(h.Key, h.Index)
+	deleted, err := st.Delete(h.Key)
 	if err != nil {
-		return respond(stream, &Response{Err: err.Error()})
+		return rpc.WriteError(stream, rpc.StatusInternal, err.Error())
 	}
-	return respond(stream, &Response{Deleted: deleted})
+	return rpc.WriteResponse(stream, &DeleteResponse{Deleted: deleted})
 }

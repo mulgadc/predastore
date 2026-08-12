@@ -10,16 +10,15 @@ import (
 )
 
 // Route is how one node is reached: the transport that dials it and the
-// address to dial. The transport is held directly rather than named, so
-// dialing is a table lookup and nothing else.
+// address to dial.
 type Route struct {
 	Transport transport.Transport
 	Addr      net.Addr
 }
 
 // addrKey identifies an address by its network as well as its host:port. A
-// node's pipe and quic addresses are the same host:port and differ only by
-// network, so host:port alone names two routes.
+// node's pipe and quic addresses differ only by network, so host:port alone
+// would name two routes.
 type addrKey struct {
 	network  string
 	hostPort string
@@ -28,21 +27,15 @@ type addrKey struct {
 func addrKeyOf(a net.Addr) addrKey { return addrKey{a.Network(), a.String()} }
 
 // Resolver is the flat table of routes one node dials, built once from the
-// configuration. It is the only place a node id becomes an address: callers
-// name peers by id and never handle an address themselves.
+// configuration. It is the only place a node id becomes an address.
 type Resolver struct {
 	routes map[config.NodeID]Route
 	nodes  map[addrKey]config.NodeID
 }
 
 // NewResolver builds the table source dials from. Nodes on source's own host
-// are reached over the pipe and every other node over quic. Gates are left
-// out: nothing dials one, their port is an S3 port and their rpc sockets are
-// ephemeral.
-//
-// Whether a node needs a pipe or a quic transport follows from the
-// configuration, so it cannot be a compile-time guarantee. A route with no
-// matching transport fails here rather than at the dial it would have served.
+// are reached over the pipe and every other node over quic; gates are left out,
+// since nothing dials one. A route with no matching transport fails here.
 func NewResolver(cfg *config.Config, source config.NodeID, trs ...transport.Transport) (*Resolver, error) {
 	byNetwork := make(map[string]transport.Transport, len(trs))
 	for _, tr := range trs {
@@ -81,8 +74,7 @@ func NewResolver(cfg *config.Config, source config.NodeID, trs ...transport.Tran
 			}
 
 			addr := transport.NewAddr(network, net.JoinHostPort(h.Addr, strconv.Itoa(n.Port)))
-			// Two nodes at one address is a configuration the table cannot
-			// reverse, so NodeAt would have to guess between them.
+			// Two nodes at one address leaves NodeAt guessing between them.
 			if other, ok := r.nodes[addrKeyOf(addr)]; ok {
 				return nil, fmt.Errorf("nodes %d and %d are both at %s %s", other, n.ID, addr.Network(), addr)
 			}
@@ -105,7 +97,7 @@ func (r *Resolver) Route(remote config.NodeID) (Route, error) {
 }
 
 // NodeAt reverses the table: the node whose dialable address this is, if any.
-// An address naming no node — an ephemeral socket, a rewritten one — is a
+// An address naming no node — an ephemeral socket, a rewritten one — returns
 // false rather than an error, since callers ask in order to decide.
 func (r *Resolver) NodeAt(addr net.Addr) (config.NodeID, bool) {
 	id, ok := r.nodes[addrKeyOf(addr)]

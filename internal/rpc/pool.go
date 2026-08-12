@@ -14,8 +14,7 @@ import (
 )
 
 // ErrPoolClosed is returned by Dial once the pool has been closed. A closed
-// pool is not reusable: it never dials again, so callers that need to
-// reconnect must build a new one.
+// pool never dials again; reconnecting means building a new one.
 var ErrPoolClosed = errors.New("connection pool closed")
 
 type PoolOption func(*ConnPool)
@@ -26,8 +25,7 @@ func WithDialTimeout(d time.Duration) PoolOption {
 	return func(p *ConnPool) { p.dialTimeout = d }
 }
 
-// pooled is a connection and which side opened it. Both ends of a pair know
-// both node ids, so the side that opened one is all the extra input the
+// pooled is a connection and which side opened it, the one extra input the
 // simultaneous-open tiebreak needs.
 type pooled struct {
 	conn   transport.Conn
@@ -35,11 +33,10 @@ type pooled struct {
 }
 
 // ConnPool holds one connection per peer node, whichever side opened it, and
-// owns every connection it holds: nothing else closes one, and a connection
-// leaves only through Evict or Close.
+// owns every one it holds: a connection leaves only through Evict or Close.
 //
-// It is keyed by node id rather than address so that a connection accepted
-// from a peer and one dialed to it are the same entry on either transport.
+// Keying by node id rather than address is what makes a connection accepted
+// from a peer and one dialed to it the same entry, on either transport.
 type ConnPool struct {
 	source      config.NodeID
 	res         *Resolver
@@ -66,8 +63,7 @@ func NewConnPool(source config.NodeID, res *Resolver, opts ...PoolOption) *ConnP
 }
 
 // Dial returns the connection to a node, opening one if the pool holds none.
-// The transport comes off the route, so dialing is a table lookup and nothing
-// else; concurrent dials to one peer collapse onto a single connection.
+// Concurrent dials to one peer collapse onto a single connection.
 func (p *ConnPool) Dial(ctx context.Context, remote config.NodeID) (transport.Conn, error) {
 	if conn, err := p.held(remote); conn != nil || err != nil {
 		return conn, err
@@ -90,8 +86,8 @@ func (p *ConnPool) Dial(ctx context.Context, remote config.NodeID) (transport.Co
 			return nil, fmt.Errorf("dial node %d: %w", remote, err)
 		}
 
-		// Losing the tiebreak leaves the peer's connection in the pool and this
-		// one owned here, so it is closed rather than returned.
+		// Losing the tiebreak leaves the peer's connection pooled and this one
+		// owned here, so it is closed rather than returned.
 		kept, ok := p.insert(remote, conn, true)
 		if !ok {
 			conn.Close()
@@ -104,8 +100,6 @@ func (p *ConnPool) Dial(ctx context.Context, remote config.NodeID) (transport.Co
 
 	select {
 	case res := <-ch:
-		// A failed dial carries no connection, so the assertion below only
-		// holds once the error is out of the way.
 		if res.Err != nil {
 			return nil, res.Err
 		}
@@ -120,9 +114,8 @@ func (p *ConnPool) Dial(ctx context.Context, remote config.NodeID) (transport.Co
 }
 
 // Donate offers an accepted connection to the pool, which takes ownership when
-// its remote names a node. A false return leaves the caller owning it: a peer
-// dialing from an ephemeral socket names no node, so nothing would ever ask,
-// and a donation that loses the tiebreak is still the peer's to use inbound.
+// its remote names a node. A false return leaves the caller owning it, still
+// usable inbound.
 func (p *ConnPool) Donate(c transport.Conn) bool {
 	remote, ok := p.res.NodeAt(c.RemoteAddr())
 	if !ok {
@@ -146,10 +139,8 @@ func (p *ConnPool) held(remote config.NodeID) (transport.Conn, error) {
 }
 
 // insert offers a connection to a peer's slot and reports what the pool holds
-// afterwards, plus whether that is c. When both ends open at once each keeps
-// the connection the lower node id dialed, which they compute alike; anything
-// else is last-write-wins. A displaced connection is closed, a rejected one is
-// left to its caller.
+// afterwards, plus whether that is c. A displaced connection is closed, a
+// rejected one is left to its caller.
 func (p *ConnPool) insert(remote config.NodeID, c transport.Conn, dialed bool) (transport.Conn, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -159,6 +150,8 @@ func (p *ConnPool) insert(remote config.NodeID, c transport.Conn, dialed bool) (
 
 	e, ok := p.conns[remote]
 	if ok && e.conn != c {
+		// Both ends open at once: each keeps the connection the lower node id
+		// dialed, which they compute alike. Anything else is last-write-wins.
 		preferred := p.source < remote
 		if e.dialed != dialed && e.conn.Context().Err() == nil && e.dialed == preferred {
 			return e.conn, false
@@ -169,9 +162,8 @@ func (p *ConnPool) insert(remote config.NodeID, c transport.Conn, dialed bool) (
 	return c, true
 }
 
-// Evict drops a connection and closes it. It is the only way a connection
-// leaves the pool short of Close, so both the dialing and the accepting side
-// release one through here.
+// Evict drops a connection and closes it. Short of Close, it is the only way
+// one leaves the pool, from either the dialing or the accepting side.
 func (p *ConnPool) Evict(c transport.Conn) {
 	p.mu.Lock()
 	for remote, held := range p.conns {
@@ -184,8 +176,8 @@ func (p *ConnPool) Evict(c transport.Conn) {
 	c.Close()
 }
 
-// Close closes every pooled connection. It is idempotent, and whoever built
-// the node calls it once both its server and its client have stopped.
+// Close closes every pooled connection. It is idempotent, and is called once
+// both the node's server and its client have stopped.
 func (p *ConnPool) Close() error {
 	p.mu.Lock()
 	if p.closed {

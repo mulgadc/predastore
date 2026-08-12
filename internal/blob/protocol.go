@@ -1,7 +1,8 @@
 package blob
 
 import (
-	"encoding/json"
+	"encoding/binary"
+	"fmt"
 
 	"github.com/mulgadc/predastore/internal/rpc"
 )
@@ -15,49 +16,118 @@ const (
 	OpDelete rpc.Opcode = 0x2003
 )
 
-// Response error codes with protocol meaning; anything else in Err is an
-// opaque failure message.
+// Failure statuses with protocol meaning, in the same 0x2xxx range as the
+// opcodes. Anything else arrives as rpc.StatusInternal with an opaque message.
 const (
-	ErrCodeNotFound  = "not-found"
-	ErrCodeStoreFull = "store-full"
+	StatusNotFound  rpc.Status = 0x2001
+	StatusStoreFull rpc.Status = 0x2002
+	StatusBadRange  rpc.Status = 0x2003
 )
 
-// appendJSON implements the rpc.Header Append side for JSON-encoded headers.
-func appendJSON(buf []byte, v any) ([]byte, error) {
-	b, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
+// PutRequest heads a put. The value's bytes follow the frame on the stream.
+type PutRequest struct {
+	Key []byte
+	// Size is the number of body bytes to commit. A body delivering fewer
+	// commits nothing.
+	Size uint64
+}
+
+func (h *PutRequest) Append(buf []byte) ([]byte, error) {
+	buf = binary.BigEndian.AppendUint64(buf, h.Size)
+	// The key trails the fixed-width fields, so the frame's own length bounds
+	// it and it carries none of its own.
+	return append(buf, h.Key...), nil
+}
+
+func (h *PutRequest) Unmarshal(b []byte) error {
+	if len(b) < 8 {
+		return fmt.Errorf("put header is %d bytes, want at least 8", len(b))
 	}
-	return append(buf, b...), nil
+	h.Size = binary.BigEndian.Uint64(b[:8])
+	// Whatever follows the fixed-width fields is the key, however long.
+	h.Key = b[8:]
+	return nil
 }
 
-// Request is the header for every storage service operation. Put data travels
-// in the stream body after the header. Key is the client's to compute; a blob
-// node only ever treats it as 32 opaque bytes naming a value set.
-type Request struct {
-	Key   [32]byte `json:"key"`
-	Index uint32   `json:"index"`
-	// Size is the body length for puts.
-	Size int64 `json:"size,omitempty"`
-	// RangeStart and RangeEnd bound gets; -1 means unset.
-	RangeStart int64 `json:"range_start"`
-	RangeEnd   int64 `json:"range_end"`
+// GetRequest heads a get, optionally bounding what it reads.
+type GetRequest struct {
+	Key []byte
+	// Off is where the read starts; Len bounds it. A Len of zero reads to the
+	// end of the value, so the zero request reads all of it.
+	Off uint64
+	Len uint64
 }
 
-func (h *Request) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
-func (h *Request) Unmarshal(b []byte) error          { return json.Unmarshal(b, h) }
+func (h *GetRequest) Append(buf []byte) ([]byte, error) {
+	buf = binary.BigEndian.AppendUint64(buf, h.Off)
+	buf = binary.BigEndian.AppendUint64(buf, h.Len)
+	return append(buf, h.Key...), nil
+}
 
-// Response is the JSON envelope answering every stream. It is
-// newline-terminated; get responses stream BodyLen body bytes after it.
-type Response struct {
-	Err string `json:"err,omitempty"`
-	// Size echoes the committed byte count for puts.
-	Size int64 `json:"size,omitempty"`
-	// PoolNearFull reports nearfull free-space pressure at commit time so
-	// callers can back off before writes are rejected outright.
-	PoolNearFull bool `json:"pool_near_full,omitempty"`
-	// Deleted reports whether a delete removed an existing value.
-	Deleted bool `json:"deleted,omitempty"`
-	// BodyLen is the number of body bytes following the envelope.
-	BodyLen int64 `json:"body_len,omitempty"`
+func (h *GetRequest) Unmarshal(b []byte) error {
+	if len(b) < 16 {
+		return fmt.Errorf("get header is %d bytes, want at least 16", len(b))
+	}
+	h.Off = binary.BigEndian.Uint64(b[:8])
+	h.Len = binary.BigEndian.Uint64(b[8:16])
+	h.Key = b[16:]
+	return nil
+}
+
+// DeleteRequest heads a delete.
+type DeleteRequest struct {
+	Key []byte
+}
+
+// With no fixed-width fields ahead of it, the key is the whole payload.
+func (h *DeleteRequest) Append(buf []byte) ([]byte, error) { return append(buf, h.Key...), nil }
+func (h *DeleteRequest) Unmarshal(b []byte) error          { h.Key = b; return nil }
+
+// PutResponse reports capacity pressure seen at commit time, so callers can
+// back off before writes are rejected outright.
+type PutResponse struct {
+	PoolNearFull bool
+}
+
+func (h *PutResponse) Append(buf []byte) ([]byte, error) {
+	return append(buf, boolByte(h.PoolNearFull)), nil
+}
+
+func (h *PutResponse) Unmarshal(b []byte) error {
+	if len(b) < 1 {
+		return fmt.Errorf("put response is %d bytes, want at least 1", len(b))
+	}
+	h.PoolNearFull = b[0] != 0
+	return nil
+}
+
+// GetResponse carries nothing: the body follows the frame and ends when the
+// node closes its write side.
+type GetResponse struct{}
+
+func (h *GetResponse) Append(buf []byte) ([]byte, error) { return buf, nil }
+func (h *GetResponse) Unmarshal([]byte) error            { return nil }
+
+// DeleteResponse reports whether the node held the value.
+type DeleteResponse struct {
+	Deleted bool
+}
+
+func (h *DeleteResponse) Append(buf []byte) ([]byte, error) {
+	return append(buf, boolByte(h.Deleted)), nil
+}
+
+func (h *DeleteResponse) Unmarshal(b []byte) error {
+	if len(b) < 1 {
+		return fmt.Errorf("delete response is %d bytes, want at least 1", len(b))
+	}
+	h.Deleted = b[0] != 0
+	return nil
+}
+
+func boolByte(b bool) byte {
+	if b {
+		return 1
+	}
+	return 0
 }
