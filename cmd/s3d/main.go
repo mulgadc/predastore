@@ -71,8 +71,7 @@ func run() error {
 		}()
 	}
 
-	// After Init, so the default logger also fans out to the OTLP bridge.
-	otelsetup.SetDefaultJSONLogger(logLevel)
+	otelsetup.SetDefaultJSONLogger("predastore", logLevel)
 
 	cfg, err := predastore.LoadConfig(*configPath)
 	if err != nil {
