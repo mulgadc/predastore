@@ -166,6 +166,21 @@ func (p *ConnPool) held(remote config.NodeID) (transport.Conn, error) {
 	return nil, nil
 }
 
+// Dialed is every connection the pool opened itself. A server starting after a
+// dial needs them: OnDial fires once, so a pool entry is the only record that a
+// connection was dialed while nothing was there to serve it.
+func (p *ConnPool) Dialed() []transport.Conn {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	conns := make([]transport.Conn, 0, len(p.conns))
+	for _, e := range p.conns {
+		if e.dialed {
+			conns = append(conns, e.conn)
+		}
+	}
+	return conns
+}
+
 // insert offers a connection to a peer's slot and reports what the pool holds
 // afterwards, plus whether that is c. Each end keeps the connection the lower
 // node id dialed, which they compute alike, whether the slot already holds one

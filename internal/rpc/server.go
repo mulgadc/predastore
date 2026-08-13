@@ -61,6 +61,7 @@ type Server struct {
 
 	mu      sync.Mutex
 	session *serveSession
+	served  map[transport.Conn]struct{}
 }
 
 // serveSession is what a running server lends to a connection it did not
@@ -77,7 +78,13 @@ func NewServer(mux *Mux, lns []transport.Listener, pool *ConnPool, opts ...Serve
 	}
 
 	const defaultDrainTimeout = 30 * time.Second
-	s := &Server{mux: mux, lns: lns, pool: pool, drainTimeout: defaultDrainTimeout}
+	s := &Server{
+		mux:          mux,
+		lns:          lns,
+		pool:         pool,
+		drainTimeout: defaultDrainTimeout,
+		served:       make(map[transport.Conn]struct{}),
+	}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -99,6 +106,15 @@ func (s *Server) Run(ctx context.Context) error {
 	s.mu.Lock()
 	s.session = &serveSession{acceptCtx: acceptCtx, handlerCtx: handlerCtx, conns: &conns}
 	s.mu.Unlock()
+
+	// A connection dialed before there was a session had its hook fire against
+	// nothing, and the pool is where it survives. Adopting those here is what
+	// stops one being outbound-only for the rest of its life.
+	if s.pool != nil {
+		for _, conn := range s.pool.Dialed() {
+			s.serveDialed(conn)
+		}
+	}
 
 	for _, ln := range s.lns {
 		g.Go(func() error {
@@ -199,8 +215,8 @@ func (s *Server) acceptConns(
 
 // serveDialed answers streams the peer opens on a connection this node dialed.
 // The pool calls it, because which end opened a pooled connection says nothing
-// about which end sends over it. A server that is not running serves nothing:
-// the connection is then outbound-only until the next one starts.
+// about which end sends over it. A server that is not running serves nothing
+// yet: Run adopts what the pool holds, so such a connection is picked up there.
 func (s *Server) serveDialed(conn transport.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -208,12 +224,28 @@ func (s *Server) serveDialed(conn transport.Conn) {
 		return
 	}
 
+	// Run's adoption and a concurrent dial can both offer one connection, and
+	// two serve loops on it would race to release it.
+	if _, ok := s.served[conn]; ok {
+		return
+	}
+	s.served[conn] = struct{}{}
+
 	sess := s.session
 	sess.conns.Go(func() {
+		defer s.forget(conn)
 		// The pool owns what it dialed, so a serve loop that ends releases the
 		// connection by evicting it rather than closing behind the pool's back.
 		s.serveConn(sess.acceptCtx, sess.handlerCtx, conn, func() { s.pool.Evict(conn) })
 	})
+}
+
+// forget drops a connection's serve record once its loop has ended, so a later
+// dial of the same connection is served again.
+func (s *Server) forget(conn transport.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.served, conn)
 }
 
 // serveConn answers streams on one connection until it dies or the server

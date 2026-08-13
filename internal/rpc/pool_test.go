@@ -164,6 +164,79 @@ func TestDonatedConnectionAnswersOutboundCalls(t *testing.T) {
 	}
 }
 
+// TestServerAdoptsConnectionsDialedBeforeStart covers the startup window: a
+// node dials a peer before its own server is running, so the dial's hook finds
+// nothing to serve with. Starting the server must still pick that connection up.
+func TestServerAdoptsConnectionsDialedBeforeStart(t *testing.T) {
+	const dialer, adopter = config.NodeID(1), config.NodeID(2)
+	trDialer := transport.NewPipeTransport(t.Name(), int(dialer))
+	trAdopter := transport.NewPipeTransport(t.Name(), int(adopter))
+	t.Cleanup(func() { _ = trDialer.Close(); _ = trAdopter.Close() })
+
+	lnDialer, err := trDialer.Listen()
+	if err != nil {
+		t.Fatalf("listen for node %d: %v", dialer, err)
+	}
+	lnAdopter, err := trAdopter.Listen()
+	if err != nil {
+		t.Fatalf("listen for node %d: %v", adopter, err)
+	}
+
+	poolDialer := NewConnPool(dialer, testResolver(trDialer, map[config.NodeID]*transport.PipeTransport{adopter: trAdopter}))
+	poolAdopter := NewConnPool(adopter, testResolver(trAdopter, map[config.NodeID]*transport.PipeTransport{dialer: trDialer}))
+	t.Cleanup(func() { _ = poolDialer.Close(); _ = poolAdopter.Close() })
+
+	srvDialer, err := NewServer(pingMux(), []transport.Listener{lnDialer}, poolDialer, WithDrainTimeout(2*time.Second))
+	if err != nil {
+		t.Fatalf("server for node %d: %v", dialer, err)
+	}
+	srvAdopter, err := NewServer(pingMux(), []transport.Listener{lnAdopter}, poolAdopter, WithDrainTimeout(2*time.Second))
+	if err != nil {
+		t.Fatalf("server for node %d: %v", adopter, err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	adopterDone, dialerDone := make(chan error, 1), make(chan error, 1)
+	t.Cleanup(func() {
+		cancel()
+		for _, done := range []chan error{adopterDone, dialerDone} {
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Error("server did not stop")
+			}
+		}
+	})
+
+	// Only the adopter is running, so the dial below is accepted and donated
+	// while the dialer's own server has no session to serve it with.
+	go func() { adopterDone <- srvAdopter.Run(ctx) }()
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer dialCancel()
+	if _, err := poolDialer.Dial(dialCtx, adopter); err != nil {
+		t.Fatalf("dial node %d: %v", adopter, err)
+	}
+	waitFor(t, "the donated connection to be pooled", func() bool {
+		c, _ := poolAdopter.held(dialer)
+		return c != nil
+	})
+
+	go func() { dialerDone <- srvDialer.Run(ctx) }()
+
+	callCtx, callCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer callCancel()
+
+	caller := &testNode{id: adopter, tr: trAdopter, pool: poolAdopter, client: NewClient(poolAdopter)}
+	got, err := ping(callCtx, caller, dialer)
+	if err != nil {
+		t.Fatalf("ping over the connection dialed before start: %v", err)
+	}
+	if got != "pong:hello" {
+		t.Fatalf("ping returned %q, want %q", got, "pong:hello")
+	}
+}
+
 // TestEmptySlotFollowsTiebreak covers the slot the tiebreak used to skip: an
 // empty one adopted whatever arrived, in either direction.
 func TestEmptySlotFollowsTiebreak(t *testing.T) {
