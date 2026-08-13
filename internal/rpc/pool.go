@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"sync"
 	"time"
@@ -18,6 +19,11 @@ import (
 // reconnect must build a new one.
 var ErrPoolClosed = errors.New("connection pool closed")
 
+// maxStreamStalls is how many streams in a row may get no response at all
+// before the pool drops the connection carrying them. One stall is ordinary
+// and three in a row is not a connection worth keeping.
+const maxStreamStalls = 3
+
 type PoolOption func(*ConnPool)
 
 // WithDialTimeout bounds a single dial. It does not bound Dial, which stops
@@ -26,12 +32,13 @@ func WithDialTimeout(d time.Duration) PoolOption {
 	return func(p *ConnPool) { p.dialTimeout = d }
 }
 
-// pooled is a connection and which side opened it. Both ends of a pair know
-// both node ids, so the side that opened one is all the extra input the
-// simultaneous-open tiebreak needs.
+// pooled is a connection, which side opened it, and the run of streams it has
+// answered nothing on. Both ends of a pair know both node ids, so the side that
+// opened one is all the extra input the simultaneous-open tiebreak needs.
 type pooled struct {
 	conn   transport.Conn
 	dialed bool
+	stalls int
 }
 
 // ConnPool holds one connection per peer node, whichever side opened it, and
@@ -48,6 +55,7 @@ type ConnPool struct {
 
 	mu     sync.RWMutex
 	conns  map[config.NodeID]pooled
+	serve  func(transport.Conn)
 	closed bool
 }
 
@@ -63,6 +71,16 @@ func NewConnPool(source config.NodeID, res *Resolver, opts ...PoolOption) *ConnP
 		opt(p)
 	}
 	return p
+}
+
+// OnDial registers what the pool hands each connection it dials to, so that
+// streams the peer opens on one are answered. A pool with nothing registered
+// carries only what this node sends over what it dialed, which is what a
+// caller that runs no server of its own wants.
+func (p *ConnPool) OnDial(serve func(transport.Conn)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.serve = serve
 }
 
 // Dial returns the connection to a node, opening one if the pool holds none.
@@ -98,6 +116,9 @@ func (p *ConnPool) Dial(ctx context.Context, remote config.NodeID) (transport.Co
 		}
 		if kept == nil {
 			return nil, ErrPoolClosed
+		}
+		if kept == conn {
+			p.serveDialed(conn)
 		}
 		return kept, nil
 	})
@@ -145,11 +166,26 @@ func (p *ConnPool) held(remote config.NodeID) (transport.Conn, error) {
 	return nil, nil
 }
 
+// Dialed is every connection the pool opened itself. A server starting after a
+// dial needs them: OnDial fires once, so a pool entry is the only record that a
+// connection was dialed while nothing was there to serve it.
+func (p *ConnPool) Dialed() []transport.Conn {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	conns := make([]transport.Conn, 0, len(p.conns))
+	for _, e := range p.conns {
+		if e.dialed {
+			conns = append(conns, e.conn)
+		}
+	}
+	return conns
+}
+
 // insert offers a connection to a peer's slot and reports what the pool holds
-// afterwards, plus whether that is c. When both ends open at once each keeps
-// the connection the lower node id dialed, which they compute alike; anything
-// else is last-write-wins. A displaced connection is closed, a rejected one is
-// left to its caller.
+// afterwards, plus whether that is c. Each end keeps the connection the lower
+// node id dialed, which they compute alike, whether the slot already holds one
+// or not; anything else is last-write-wins. A displaced connection is closed, a
+// rejected one is left to its caller.
 func (p *ConnPool) insert(remote config.NodeID, c transport.Conn, dialed bool) (transport.Conn, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -157,16 +193,83 @@ func (p *ConnPool) insert(remote config.NodeID, c transport.Conn, dialed bool) (
 		return nil, false
 	}
 
+	preferred := p.source < remote
 	e, ok := p.conns[remote]
-	if ok && e.conn != c {
-		preferred := p.source < remote
+	switch {
+	case ok && e.conn != c:
 		if e.dialed != dialed && e.conn.Context().Err() == nil && e.dialed == preferred {
 			return e.conn, false
 		}
 		e.conn.Close()
+	case !ok && !dialed && preferred:
+		// An empty slot taking whatever arrived is how a node came to hold a
+		// connection the peer opened. Our own dial fills it instead; refusing
+		// our own would leave the other end of the tiebreak unable to open one
+		// at all.
+		return nil, false
 	}
 	p.conns[remote] = pooled{conn: c, dialed: dialed}
 	return c, true
+}
+
+// serveDialed hands a freshly dialed connection to whoever answers streams on
+// this node, so the peer can send over it too.
+func (p *ConnPool) serveDialed(c transport.Conn) {
+	p.mu.RLock()
+	serve := p.serve
+	p.mu.RUnlock()
+	if serve != nil {
+		serve(c)
+	}
+}
+
+// noteStall records a stream that got no response on c, evicting the connection
+// once the run of them reaches maxStreamStalls. A connection can be alive at
+// the transport and answer nothing at this layer, and this is the only evidence
+// of it there is.
+func (p *ConnPool) noteStall(c transport.Conn) {
+	p.mu.Lock()
+	remote, e, ok := p.entry(c)
+	if !ok {
+		p.mu.Unlock()
+		return
+	}
+	e.stalls++
+	if e.stalls < maxStreamStalls {
+		p.conns[remote] = e
+		p.mu.Unlock()
+		return
+	}
+	delete(p.conns, remote)
+	p.mu.Unlock()
+
+	slog.Warn("evicting unresponsive connection",
+		"node", remote,
+		"addr", c.RemoteAddr(),
+		"stalls", e.stalls)
+	c.Close()
+}
+
+// noteProgress clears the run of stalls on c: a connection that answered is
+// being serviced, whatever came before it.
+func (p *ConnPool) noteProgress(c transport.Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if remote, e, ok := p.entry(c); ok && e.stalls != 0 {
+		e.stalls = 0
+		p.conns[remote] = e
+	}
+}
+
+// entry finds the slot holding c. The pool holds one connection per peer, so
+// the scan is over the peers of a single node.
+func (p *ConnPool) entry(c transport.Conn) (config.NodeID, pooled, bool) {
+	for remote, e := range p.conns {
+		if e.conn == c {
+			return remote, e, true
+		}
+	}
+	return 0, pooled{}, false
 }
 
 // Evict drops a connection and closes it. It is the only way a connection
@@ -174,11 +277,8 @@ func (p *ConnPool) insert(remote config.NodeID, c transport.Conn, dialed bool) (
 // release one through here.
 func (p *ConnPool) Evict(c transport.Conn) {
 	p.mu.Lock()
-	for remote, held := range p.conns {
-		if held.conn == c {
-			delete(p.conns, remote)
-			break
-		}
+	if remote, _, ok := p.entry(c); ok {
+		delete(p.conns, remote)
 	}
 	p.mu.Unlock()
 	c.Close()

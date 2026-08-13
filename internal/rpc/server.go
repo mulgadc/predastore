@@ -58,6 +58,18 @@ type Server struct {
 	lns          []transport.Listener
 	pool         *ConnPool
 	drainTimeout time.Duration
+
+	mu      sync.Mutex
+	session *serveSession
+	served  map[transport.Conn]struct{}
+}
+
+// serveSession is what a running server lends to a connection it did not
+// accept: the contexts that connection runs under and the group Run drains.
+type serveSession struct {
+	acceptCtx  context.Context
+	handlerCtx context.Context
+	conns      *sync.WaitGroup
 }
 
 func NewServer(mux *Mux, lns []transport.Listener, pool *ConnPool, opts ...ServerOption) (*Server, error) {
@@ -66,9 +78,21 @@ func NewServer(mux *Mux, lns []transport.Listener, pool *ConnPool, opts ...Serve
 	}
 
 	const defaultDrainTimeout = 30 * time.Second
-	s := &Server{mux: mux, lns: lns, pool: pool, drainTimeout: defaultDrainTimeout}
+	s := &Server{
+		mux:          mux,
+		lns:          lns,
+		pool:         pool,
+		drainTimeout: defaultDrainTimeout,
+		served:       make(map[transport.Conn]struct{}),
+	}
 	for _, opt := range opts {
 		opt(s)
+	}
+
+	// A pooled connection carries traffic in both directions, so the end that
+	// opened one still has to answer streams on it.
+	if pool != nil {
+		pool.OnDial(s.serveDialed)
 	}
 	return s, nil
 }
@@ -79,6 +103,18 @@ func (s *Server) Run(ctx context.Context) error {
 	defer cancelHandlers()
 
 	var conns sync.WaitGroup
+	s.mu.Lock()
+	s.session = &serveSession{acceptCtx: acceptCtx, handlerCtx: handlerCtx, conns: &conns}
+	s.mu.Unlock()
+
+	// A connection dialed before there was a session had its hook fire against
+	// nothing, and the pool is where it survives. Adopting those here is what
+	// stops one being outbound-only for the rest of its life.
+	if s.pool != nil {
+		for _, conn := range s.pool.Dialed() {
+			s.serveDialed(conn)
+		}
+	}
 
 	for _, ln := range s.lns {
 		g.Go(func() error {
@@ -101,6 +137,12 @@ func (s *Server) Run(ctx context.Context) error {
 	for _, ln := range s.lns {
 		ln.Close()
 	}
+
+	// Retiring the session is what makes the drain below safe: no dialed
+	// connection can join the group once Run is waiting on it.
+	s.mu.Lock()
+	s.session = nil
+	s.mu.Unlock()
 
 	// Each conns goroutine waits for its own handlers, so this covers every
 	// in-flight request: once it returns, nothing is still touching state the
@@ -159,48 +201,91 @@ func (s *Server) acceptConns(
 		backoff = 5 * time.Millisecond
 
 		conns.Go(func() {
-			// Handlers outlive the accept loop, so the connection is released
-			// here and only once they have drained. Waiting inside the conns
-			// goroutine is what makes Run's conns.Wait a full drain.
-			var streams sync.WaitGroup
-
 			// A donated connection belongs to the pool, so releasing it means
 			// evicting rather than closing: a connection that dies inbound is
 			// taken out of the pool instead of handed to a dialer dead.
+			release := func() { conn.Close() }
 			if s.pool != nil && s.pool.Donate(conn) {
-				defer s.pool.Evict(conn)
-			} else {
-				defer conn.Close()
+				release = func() { s.pool.Evict(conn) }
 			}
-
-			// Cancelled handlers mean the drain deadline expired. Aborting the
-			// connection is the only way to unblock a handler parked in a
-			// stream read, which has no deadline and never observes ctx.
-			drained := make(chan struct{})
-			defer close(drained)
-			go func() {
-				select {
-				case <-handlerCtx.Done():
-					conn.Close()
-				case <-drained:
-				}
-			}()
-
-			err := s.acceptStreams(acceptCtx, handlerCtx, conn, &streams)
-			streams.Wait()
-
-			switch {
-			case err == nil,
-				errors.Is(err, context.Canceled),
-				errors.Is(err, transport.ErrListenerClosed),
-				errors.Is(err, transport.ErrConnClosed):
-			default:
-				slog.ErrorContext(acceptCtx, "connection error",
-					"err", err,
-					"source", conn.LocalAddr(),
-					"addr", conn.RemoteAddr())
-			}
+			s.serveConn(acceptCtx, handlerCtx, conn, release)
 		})
+	}
+}
+
+// serveDialed answers streams the peer opens on a connection this node dialed.
+// The pool calls it, because which end opened a pooled connection says nothing
+// about which end sends over it. A server that is not running serves nothing
+// yet: Run adopts what the pool holds, so such a connection is picked up there.
+func (s *Server) serveDialed(conn transport.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.session == nil {
+		return
+	}
+
+	// Run's adoption and a concurrent dial can both offer one connection, and
+	// two serve loops on it would race to release it.
+	if _, ok := s.served[conn]; ok {
+		return
+	}
+	s.served[conn] = struct{}{}
+
+	sess := s.session
+	sess.conns.Go(func() {
+		defer s.forget(conn)
+		// The pool owns what it dialed, so a serve loop that ends releases the
+		// connection by evicting it rather than closing behind the pool's back.
+		s.serveConn(sess.acceptCtx, sess.handlerCtx, conn, func() { s.pool.Evict(conn) })
+	})
+}
+
+// forget drops a connection's serve record once its loop has ended, so a later
+// dial of the same connection is served again.
+func (s *Server) forget(conn transport.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.served, conn)
+}
+
+// serveConn answers streams on one connection until it dies or the server
+// stops, and then releases it. Handlers outlive the accept loop, so release
+// runs only once they have drained: waiting here is what makes Run's conns.Wait
+// a full drain.
+func (s *Server) serveConn(
+	acceptCtx, handlerCtx context.Context,
+	conn transport.Conn,
+	release func(),
+) {
+	var streams sync.WaitGroup
+	defer release()
+
+	// Cancelled handlers mean the drain deadline expired. Aborting the
+	// connection is the only way to unblock a handler parked in a stream read,
+	// which has no deadline and never observes ctx.
+	drained := make(chan struct{})
+	defer close(drained)
+	go func() {
+		select {
+		case <-handlerCtx.Done():
+			conn.Close()
+		case <-drained:
+		}
+	}()
+
+	err := s.acceptStreams(acceptCtx, handlerCtx, conn, &streams)
+	streams.Wait()
+
+	switch {
+	case err == nil,
+		errors.Is(err, context.Canceled),
+		errors.Is(err, transport.ErrListenerClosed),
+		errors.Is(err, transport.ErrConnClosed):
+	default:
+		slog.ErrorContext(acceptCtx, "connection error",
+			"err", err,
+			"source", conn.LocalAddr(),
+			"addr", conn.RemoteAddr())
 	}
 }
 

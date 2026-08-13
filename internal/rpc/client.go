@@ -3,7 +3,10 @@ package rpc
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
+	"sync/atomic"
 
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/transport"
@@ -70,5 +73,45 @@ func OpenStream[T Header](
 		return nil, fmt.Errorf("write metadata + header: %w", err)
 	}
 
-	return stream, nil
+	return &healthStream{Stream: stream, pool: c.pool, conn: conn}, nil
+}
+
+var _ transport.Stream = (*healthStream)(nil)
+
+// healthStream reports the outcome of a response read back to the pool, which
+// has no other way to tell a connection that is serviced from one that takes
+// requests and answers none. A stream reports once: the first read decides.
+type healthStream struct {
+	transport.Stream
+
+	pool     *ConnPool
+	conn     transport.Conn
+	reported atomic.Bool
+}
+
+func (s *healthStream) note(n int64, err error) {
+	switch {
+	// A clean EOF with no bytes still means the peer served the stream and
+	// closed it, which is the opposite of a stall.
+	case n > 0 || errors.Is(err, io.EOF):
+		if s.reported.CompareAndSwap(false, true) {
+			s.pool.noteProgress(s.conn)
+		}
+	case err != nil:
+		if s.reported.CompareAndSwap(false, true) {
+			s.pool.noteStall(s.conn)
+		}
+	}
+}
+
+func (s *healthStream) Read(p []byte) (int, error) {
+	n, err := s.Stream.Read(p)
+	s.note(int64(n), err)
+	return n, err
+}
+
+func (s *healthStream) WriteTo(w io.Writer) (int64, error) {
+	n, err := s.Stream.WriteTo(w)
+	s.note(n, err)
+	return n, err
 }
