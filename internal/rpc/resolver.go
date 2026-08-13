@@ -94,6 +94,35 @@ func NewResolver(cfg *config.Config, source config.NodeID, trs ...transport.Tran
 	return r, nil
 }
 
+// NewRemoteResolver builds a route table that reaches every node over quic,
+// including ones NewResolver would put on the pipe. It is for callers that
+// are not a node in the cluster at all — a status probe run from another
+// binary, say — which have no in-process pipe to any node, even one
+// colocated on the same physical host: the pipe transport rendezvous is a
+// process-wide registry, and such a caller is never in that process.
+func NewRemoteResolver(cfg *config.Config, quic transport.Transport) (*Resolver, error) {
+	r := &Resolver{
+		routes: make(map[config.NodeID]Route),
+		nodes:  make(map[addrKey]config.NodeID),
+	}
+	for _, h := range cfg.Hosts {
+		for _, n := range h.Nodes {
+			if n.Role == config.RoleGate {
+				continue
+			}
+			addr := transport.NewAddr(transport.NetworkQUIC, net.JoinHostPort(h.Addr, strconv.Itoa(n.Port)))
+			// Two nodes at one address is a configuration the table cannot
+			// reverse, so NodeAt would have to guess between them.
+			if other, ok := r.nodes[addrKeyOf(addr)]; ok {
+				return nil, fmt.Errorf("nodes %d and %d are both at %s %s", other, n.ID, addr.Network(), addr)
+			}
+			r.routes[n.ID] = Route{Transport: quic, Addr: addr}
+			r.nodes[addrKeyOf(addr)] = n.ID
+		}
+	}
+	return r, nil
+}
+
 // Route is the route to a node. A node with no route is one nothing dials:
 // this node itself, or a gate.
 func (r *Resolver) Route(remote config.NodeID) (Route, error) {

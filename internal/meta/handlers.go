@@ -64,6 +64,14 @@ func (s *Server) writeResult(err error) *MetaResponse {
 	return &MetaResponse{}
 }
 
+// handleStatus reports this replica's raft state. It is answered from local
+// state, never blocks on consensus, and cannot fail the way a data operation
+// can, so there is no error envelope to fill in.
+func (s *Server) handleStatus(ctx context.Context, h MetaStatusRequest, stream transport.Stream) error {
+	status := s.status()
+	return json.NewEncoder(stream).Encode(&status)
+}
+
 func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport.Stream) error {
 	// errScanLimit stops iteration once the limit is reached without
 	// surfacing an error to the client.

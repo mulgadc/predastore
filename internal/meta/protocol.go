@@ -23,6 +23,10 @@ const (
 	OpMetaPut    rpc.Opcode = 0x1002
 	OpMetaDelete rpc.Opcode = 0x1003
 	OpMetaScan   rpc.Opcode = 0x1004
+
+	// OpMetaStatus asks a replica to report its own raft state, rather than
+	// any data it holds.
+	OpMetaStatus rpc.Opcode = 0x1005
 )
 
 // Response error codes with protocol meaning; anything else in Err is an
@@ -102,3 +106,45 @@ type ScanItem struct {
 	Key   []byte `json:"key"`
 	Value []byte `json:"value"`
 }
+
+// MetaStatusRequest carries no fields: OpMetaStatus asks about the replica
+// answering the stream, never about a key.
+type MetaStatusRequest struct{}
+
+func (h *MetaStatusRequest) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
+func (h *MetaStatusRequest) Unmarshal(b []byte) error          { return json.Unmarshal(b, h) }
+
+// MetaStatus is one replica's raft state, closing an OpMetaStatus stream. A
+// caller outside this module already decodes this exact JSON shape, so the
+// field names are a wire contract and must not change independently of it.
+//
+// Leader and LeaderAddr are both empty while raft has no leader, which is a
+// successful answer rather than an error: "answered, but reports no leader"
+// is the condition a status probe exists to surface.
+type MetaStatus struct {
+	// NodeID is the replica that answered, not the one asked about.
+	NodeID string `json:"node_id"`
+	// State is this replica's own raft.State(): "Follower", "Candidate",
+	// "Leader" or "Shutdown".
+	State string `json:"state"`
+	// Leader is the raft advertise address ("node-<id>") of the leader this
+	// replica currently observes, empty when it observes none.
+	Leader string `json:"leader"`
+	// LeaderAddr is the address this replica would dial Leader on, resolved
+	// from the same routing table its own rpc traffic uses. It is left
+	// empty rather than repeating Leader when no distinct dial address is
+	// known — including when this replica is itself the leader, since a
+	// replica holds no route to dial itself.
+	LeaderAddr string `json:"leader_addr"`
+	// Term, CommitIndex and AppliedIndex come from raft.Stats(), which
+	// already renders them as strings.
+	Term         string `json:"term"`
+	CommitIndex  string `json:"commit_index"`
+	AppliedIndex string `json:"applied_index"`
+	// IsLeader is State == "Leader", spelled out for callers that only care
+	// about that.
+	IsLeader bool `json:"is_leader"`
+}
+
+func (h *MetaStatus) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
+func (h *MetaStatus) Unmarshal(b []byte) error          { return json.Unmarshal(b, h) }
