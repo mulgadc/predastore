@@ -1,0 +1,273 @@
+package rpc
+
+import (
+	"context"
+	"io"
+	"testing"
+	"time"
+
+	"github.com/mulgadc/predastore/internal/config"
+	"github.com/mulgadc/predastore/internal/transport"
+)
+
+const opPing Opcode = 0x7f01
+
+// pingHeader is the smallest header the mux can carry: a name the peer echoes
+// back, encoded as its own bytes.
+type pingHeader struct{ Name string }
+
+var _ Header = (*pingHeader)(nil)
+
+func (h *pingHeader) Append(buf []byte) ([]byte, error) { return append(buf, h.Name...), nil }
+func (h *pingHeader) Unmarshal(b []byte) error          { h.Name = string(b); return nil }
+
+// testNode is one node of a test cluster: its transport, the pool it dials
+// peers from and the server answering the streams it is sent.
+type testNode struct {
+	id     config.NodeID
+	tr     *transport.PipeTransport
+	pool   *ConnPool
+	client *Client
+	done   chan error
+}
+
+// testResolver builds a route table by hand, so a test names its peers without
+// a configuration behind them.
+func testResolver(own *transport.PipeTransport, peers map[config.NodeID]*transport.PipeTransport) *Resolver {
+	r := &Resolver{
+		routes: make(map[config.NodeID]Route, len(peers)),
+		nodes:  make(map[addrKey]config.NodeID, len(peers)),
+	}
+	for id, peer := range peers {
+		r.routes[id] = Route{Transport: own, Addr: peer.Addr()}
+		r.nodes[addrKeyOf(peer.Addr())] = id
+	}
+	return r
+}
+
+// newTestCluster wires one pipe-connected node per id, each running a server
+// that answers opPing. Every node is torn down when the test ends.
+func newTestCluster(t *testing.T, ids ...config.NodeID) map[config.NodeID]*testNode {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	trs := make(map[config.NodeID]*transport.PipeTransport, len(ids))
+	for _, id := range ids {
+		trs[id] = transport.NewPipeTransport(t.Name(), int(id))
+	}
+
+	nodes := make(map[config.NodeID]*testNode, len(ids))
+	for _, id := range ids {
+		peers := make(map[config.NodeID]*transport.PipeTransport, len(ids)-1)
+		for _, peer := range ids {
+			if peer != id {
+				peers[peer] = trs[peer]
+			}
+		}
+
+		ln, err := trs[id].Listen()
+		if err != nil {
+			t.Fatalf("listen for node %d: %v", id, err)
+		}
+
+		pool := NewConnPool(id, testResolver(trs[id], peers))
+		srv, err := NewServer(pingMux(), []transport.Listener{ln}, pool, WithDrainTimeout(2*time.Second))
+		if err != nil {
+			t.Fatalf("server for node %d: %v", id, err)
+		}
+
+		n := &testNode{id: id, tr: trs[id], pool: pool, client: NewClient(pool), done: make(chan error, 1)}
+		go func() { n.done <- srv.Run(ctx) }()
+		nodes[id] = n
+	}
+
+	t.Cleanup(func() {
+		cancel()
+		for _, n := range nodes {
+			select {
+			case <-n.done:
+			case <-time.After(10 * time.Second):
+				t.Errorf("node %d did not stop", n.id)
+			}
+			_ = n.pool.Close()
+			_ = n.tr.Close()
+		}
+	})
+	return nodes
+}
+
+func pingMux() *Mux {
+	mux := NewMux()
+	RegisterHandler(mux, opPing, func(_ context.Context, h pingHeader, stream transport.Stream) error {
+		_, err := stream.Write([]byte("pong:" + h.Name))
+		return err
+	})
+	return mux
+}
+
+// ping runs one request round trip, aborting the read side when ctx expires
+// the way a client with a deadline does.
+func ping(ctx context.Context, from *testNode, to config.NodeID) (string, error) {
+	stream, err := OpenStream(ctx, from.client, to, opPing, &pingHeader{Name: "hello"})
+	if err != nil {
+		return "", err
+	}
+	if err := stream.Close(); err != nil {
+		return "", err
+	}
+	stop := context.AfterFunc(ctx, func() { stream.CancelRead(0) })
+	defer stop()
+
+	b, err := io.ReadAll(stream)
+	return string(b), err
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestDonatedConnectionAnswersOutboundCalls is the direction regression: a node
+// that adopts a connection its peer dialed must still get answers on it.
+func TestDonatedConnectionAnswersOutboundCalls(t *testing.T) {
+	nodes := newTestCluster(t, 1, 2)
+	// The lower id is the preferred dialer, so node 2 keeps what node 1 dials.
+	dialer, adopter := nodes[1], nodes[2]
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if _, err := dialer.pool.Dial(ctx, adopter.id); err != nil {
+		t.Fatalf("dial node %d: %v", adopter.id, err)
+	}
+	waitFor(t, "the donated connection to be pooled", func() bool {
+		c, _ := adopter.pool.held(dialer.id)
+		return c != nil
+	})
+
+	callCtx, callCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer callCancel()
+
+	got, err := ping(callCtx, adopter, dialer.id)
+	if err != nil {
+		t.Fatalf("ping over the donated connection: %v", err)
+	}
+	if got != "pong:hello" {
+		t.Fatalf("ping returned %q, want %q", got, "pong:hello")
+	}
+}
+
+// TestEmptySlotFollowsTiebreak covers the slot the tiebreak used to skip: an
+// empty one adopted whatever arrived, in either direction.
+func TestEmptySlotFollowsTiebreak(t *testing.T) {
+	const low, high = config.NodeID(1), config.NodeID(2)
+	trLow := transport.NewPipeTransport(t.Name(), int(low))
+	trHigh := transport.NewPipeTransport(t.Name(), int(high))
+	t.Cleanup(func() { _ = trLow.Close(); _ = trHigh.Close() })
+
+	lnLow, err := trLow.Listen()
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	accepted := make(chan transport.Conn, 4)
+	go func() {
+		for {
+			c, err := lnLow.Accept(ctx)
+			if err != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+
+	poolLow := NewConnPool(low, testResolver(trLow, map[config.NodeID]*transport.PipeTransport{high: trHigh}))
+	poolHigh := NewConnPool(high, testResolver(trHigh, map[config.NodeID]*transport.PipeTransport{low: trLow}))
+	t.Cleanup(func() { _ = poolLow.Close(); _ = poolHigh.Close() })
+
+	// The lower id prefers to dial, so it must not adopt what the higher id
+	// dialed even with nothing in the slot.
+	if _, err := trHigh.Dial(ctx, trLow.Addr()); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	if poolLow.Donate(<-accepted) {
+		t.Fatal("node 1 adopted a connection it prefers to dial itself")
+	}
+	if c, _ := poolLow.held(high); c != nil {
+		t.Fatal("node 1 pooled a connection it prefers to dial itself")
+	}
+
+	// Its own dial is kept whichever way the tiebreak points: refusing that
+	// would leave the higher id with no way to open a connection at all.
+	conn, err := poolHigh.Dial(ctx, low)
+	if err != nil {
+		t.Fatalf("dial node %d: %v", low, err)
+	}
+	<-accepted
+	if c, _ := poolHigh.held(low); c != conn {
+		t.Fatal("node 2 dropped the connection it dialed")
+	}
+}
+
+// TestStalledStreamsEvictConnection covers the escape hatch: a connection alive
+// at the transport but answering nothing is dropped so a dial can replace it.
+func TestStalledStreamsEvictConnection(t *testing.T) {
+	nodes := newTestCluster(t, 1, 2)
+	caller, peer := nodes[1], nodes[2]
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	conn, err := caller.pool.Dial(ctx, peer.id)
+	if err != nil {
+		t.Fatalf("dial node %d: %v", peer.id, err)
+	}
+
+	stall := func() {
+		t.Helper()
+		stream, err := OpenStream(ctx, caller.client, peer.id, opPing, &pingHeader{Name: "hello"})
+		if err != nil {
+			t.Fatalf("open stream: %v", err)
+		}
+		// Aborting the read is what a caller's expiring deadline does, so the
+		// stream ends without a byte of response.
+		stream.CancelRead(0)
+		if _, err := io.ReadAll(stream); err == nil {
+			t.Fatal("read from an aborted stream succeeded")
+		}
+	}
+
+	// A round trip that gets an answer clears the run of stalls before it.
+	for range maxStreamStalls - 1 {
+		stall()
+	}
+	if got, err := ping(ctx, caller, peer.id); err != nil || got != "pong:hello" {
+		t.Fatalf("ping returned %q, %v", got, err)
+	}
+
+	for i := range maxStreamStalls {
+		stall()
+		held, _ := caller.pool.held(peer.id)
+		if i < maxStreamStalls-1 && held != conn {
+			t.Fatalf("connection evicted after %d stalls, want %d", i+1, maxStreamStalls)
+		}
+	}
+	if held, _ := caller.pool.held(peer.id); held == conn {
+		t.Fatalf("connection still pooled after %d stalls", maxStreamStalls)
+	}
+
+	// The pool must be usable again: the next call dials a replacement.
+	if got, err := ping(ctx, caller, peer.id); err != nil || got != "pong:hello" {
+		t.Fatalf("ping after eviction returned %q, %v", got, err)
+	}
+}

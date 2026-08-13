@@ -122,9 +122,11 @@ Callers name peers by node id and never handle an address. `rpc.Resolver` is the
 
 ## Connection pooling
 
-`rpc.ConnPool` keys connections by node id, so a connection dialed to a peer and one accepted from it are the same entry on either transport, and a replica pair reuses one connection in both directions. An accepted connection is offered to the pool by `Donate`, which reverses the route table to name the peer behind it; a peer dialing from an ephemeral socket resolves to no node and is simply not pooled. When both ends open at once, both keep the connection the lower of the two node ids dialed and close the other, which each side computes from the same two ids.
+`rpc.ConnPool` keys connections by node id, so a connection dialed to a peer and one accepted from it are the same entry on either transport, and a replica pair reuses one connection in both directions. An accepted connection is offered to the pool by `Donate`, which reverses the route table to name the peer behind it; a peer dialing from an ephemeral socket resolves to no node and is simply not pooled. Reuse in both directions only holds if both ends answer streams on one connection, so `rpc.Server` serves what the pool dials as well as what a listener accepts: the pool hands each connection it opens to the server through `OnDial`, and a node with no server of its own — a gate — simply registers nothing and sends over what it dialed without being sent anything back.
 
-The pool runs no idle sweeper. A connection leaves through `Evict`, called by whichever side observes it die, or through `Close` when the node shuts down. Concurrent dials to one peer collapse onto a single connection via singleflight.
+The tiebreak that keeps one connection per pair is the same whether the slot is empty or not: each end keeps the connection the lower of the two node ids dialed, which both compute from the same two ids. An empty slot therefore refuses a donation the node would rather have dialed itself, and the peer keeps that connection for its own outbound use until this node's dial displaces it. A node's own dial is always kept, since refusing it would leave the end that prefers to accept with no way to open a connection at all.
+
+The pool runs no idle sweeper. A connection leaves through `Evict`, called by whichever side observes it die, or through `Close` when the node shuts down. It also leaves once `maxStreamStalls` (3) consecutive streams opened on it get no response byte at all, which is the only evidence available that a connection alive at the transport is answering nothing at the rpc layer; any response clears the run. Concurrent dials to one peer collapse onto a single connection via singleflight.
 
 | Layer | Lifetime | Cost |
 |---|---|---|
