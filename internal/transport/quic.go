@@ -42,7 +42,7 @@ func WithRootCAs(p *x509.CertPool) QUICOption {
 type QUICTransport struct {
 	pc      *net.UDPConn
 	tr      *quic.Transport
-	cert    tls.Certificate
+	cert    *tls.Certificate
 	rootCAs *x509.CertPool
 	addr    *Addr
 
@@ -58,6 +58,37 @@ func NewQUICTransport(addr string, port int, cert, key string, opts ...QUICOptio
 	if err != nil {
 		return nil, fmt.Errorf("load x509 key pair from %s/%s: %w", cert, key, err)
 	}
+	qt, err := bindQUIC(addr, port)
+	if err != nil {
+		return nil, err
+	}
+	qt.cert = &kp
+	for _, opt := range opts {
+		opt(qt)
+	}
+	return qt, nil
+}
+
+// NewQUICDialTransport binds a UDP socket at addr:port for dialing only, with
+// no TLS identity of its own. Dial never presents a client certificate — the
+// wire has nowhere for one, since nothing in this cluster requests one back —
+// so a transport built to dial rather than listen needs none to load, and
+// asking a caller with no stake in this cluster's PKI for one would be asking
+// for something it has no business holding. Listen on it always fails.
+func NewQUICDialTransport(addr string, port int, opts ...QUICOption) (*QUICTransport, error) {
+	qt, err := bindQUIC(addr, port)
+	if err != nil {
+		return nil, err
+	}
+	for _, opt := range opts {
+		opt(qt)
+	}
+	return qt, nil
+}
+
+// bindQUIC opens the UDP socket both constructors share; the caller fills in
+// whatever TLS identity its own use of the transport needs, if any.
+func bindQUIC(addr string, port int) (*QUICTransport, error) {
 	hostPort := net.JoinHostPort(addr, strconv.Itoa(port))
 	udpAddr, err := net.ResolveUDPAddr("udp", hostPort)
 	if err != nil {
@@ -68,16 +99,11 @@ func NewQUICTransport(addr string, port int, cert, key string, opts ...QUICOptio
 		return nil, fmt.Errorf("quic bind %s: %w", hostPort, err)
 	}
 
-	qt := &QUICTransport{
+	return &QUICTransport{
 		pc:   pc,
 		tr:   &quic.Transport{Conn: pc},
-		cert: kp,
 		addr: NewAddr(NetworkQUIC, pc.LocalAddr().String()),
-	}
-	for _, opt := range opts {
-		opt(qt)
-	}
-	return qt, nil
+	}, nil
 }
 
 func (qt *QUICTransport) Network() string { return string(NetworkQUIC) }
@@ -97,9 +123,12 @@ func (qt *QUICTransport) Listen() (Listener, error) {
 	if qt.ln != nil {
 		return nil, &net.OpError{Op: "listen", Net: string(NetworkQUIC), Addr: qt.addr, Err: ErrAddrAlreadyInUse}
 	}
+	if qt.cert == nil {
+		return nil, fmt.Errorf("quic transport at %s has no TLS identity to listen with", qt.addr)
+	}
 
 	tlsConf := &tls.Config{
-		Certificates:     []tls.Certificate{qt.cert},
+		Certificates:     []tls.Certificate{*qt.cert},
 		MinVersion:       tls.VersionTLS13,
 		CurvePreferences: tlsconfig.Curves,
 		NextProtos:       []string{alpnProto},

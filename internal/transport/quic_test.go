@@ -230,3 +230,92 @@ func TestQUICDialUntrustedServer(t *testing.T) {
 		t.Fatal("Dial with untrusted CA succeeded")
 	}
 }
+
+// TestQUICDialTransportRoundTrip confirms a transport built with no TLS
+// identity of its own can still dial and carry a stream: Dial has never
+// presented a client certificate, so a dial-only transport losing the
+// ability to load one changes nothing about what a peer sees.
+func TestQUICDialTransportRoundTrip(t *testing.T) {
+	certPath, keyPath, pool := testcerts.Generate(t)
+	server, err := transport.NewQUICTransport("127.0.0.1", 0, certPath, keyPath)
+	if err != nil {
+		t.Fatalf("NewQUICTransport: %v", err)
+	}
+	defer server.Close()
+	ln, err := server.Listen()
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	client, err := transport.NewQUICDialTransport("127.0.0.1", 0, transport.WithRootCAs(pool))
+	if err != nil {
+		t.Fatalf("NewQUICDialTransport: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	acceptedCh := make(chan transport.Conn, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		acceptedCh <- c
+	}()
+
+	dial, err := client.Dial(ctx, ln.Addr())
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer dial.Close()
+
+	var accepted transport.Conn
+	select {
+	case accepted = <-acceptedCh:
+	case err := <-errCh:
+		t.Fatalf("Accept: %v", err)
+	}
+	defer accepted.Close()
+
+	opened, err := dial.OpenStream(ctx)
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	msg := []byte("hello over a dial-only transport")
+	if _, err := opened.Write(msg); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	opened.Close()
+
+	stream, err := accepted.AcceptStream(ctx)
+	if err != nil {
+		t.Fatalf("AcceptStream: %v", err)
+	}
+	got, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("got %q, want %q", got, msg)
+	}
+}
+
+// TestQUICDialTransportListenFails confirms a dial-only transport refuses to
+// listen rather than crashing a peer's handshake against an empty
+// certificate: it has none to present, so Listen must say so up front.
+func TestQUICDialTransportListenFails(t *testing.T) {
+	client, err := transport.NewQUICDialTransport("127.0.0.1", 0)
+	if err != nil {
+		t.Fatalf("NewQUICDialTransport: %v", err)
+	}
+	defer client.Close()
+
+	if _, err := client.Listen(); err == nil {
+		t.Fatal("Listen on a dial-only transport succeeded")
+	}
+}

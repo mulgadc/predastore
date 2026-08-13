@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
-	"os"
 
 	"github.com/mulgadc/predastore/internal/meta"
 	"github.com/mulgadc/predastore/internal/rpc"
@@ -41,28 +40,22 @@ func MetaNodesOnHost(cfg *Config, host HostID) []NodeID {
 // leader redirect, because the caller is asking what this specific process
 // observes, which is exactly what a health probe needs.
 //
-// The caller need not be a member of the cluster or hold any identity of
-// its own — a monitoring daemon reading the same configuration file
-// predastore runs from is the intended shape. Building the quic transport a
-// dial-only connection needs still requires loading a TLS keypair (the type
-// serves listening too), so NodeStatus reuses the target's own host
-// identity for it; that keypair is never presented on a dial-only
-// connection; TLS trust is not the OS store but a pool holding exactly the
-// certificate the configuration names for that host, which is the
-// verification a caller with nothing but the config file can do without an
-// externally supplied CA.
-func NodeStatus(ctx context.Context, cfg *Config, node NodeID) (Status, error) {
-	host, ok := hostOfNode(cfg, node)
-	if !ok {
+// The caller supplies rootCAs: the cluster's certificate authority, or any
+// pool naming exactly the certificates it should accept. cfg's per-host
+// tls_cert/tls_key name files on that host's own filesystem — a different
+// file under the same path on every host — so a caller reaching a node on
+// another machine cannot read them and must not guess at them. rootCAs is
+// how it verifies every node's identity instead. No local TLS identity of
+// the caller's own is required: nothing on this wire ever asks a dialer to
+// present one back, so NodeStatus asks for none either.
+func NodeStatus(ctx context.Context, cfg *Config, node NodeID, rootCAs *x509.CertPool) (Status, error) {
+	if _, ok := hostOfNode(cfg, node); !ok {
 		return Status{}, fmt.Errorf("node %d is not in the configuration", node)
 	}
 
-	pool, err := trustedPool(host.TLSCert)
-	if err != nil {
-		return Status{}, fmt.Errorf("load host %d TLS identity: %w", host.ID, err)
-	}
-
-	quic, err := transport.NewQUICTransport(HostBindAddr(host), 0, host.TLSCert, host.TLSKey, transport.WithRootCAs(pool))
+	// The transport binds its own outbound socket; it is not the target's
+	// address, so there is no host-specific bind address to pick.
+	quic, err := transport.NewQUICDialTransport("", 0, transport.WithRootCAs(rootCAs))
 	if err != nil {
 		return Status{}, fmt.Errorf("create status transport: %w", err)
 	}
@@ -85,22 +78,6 @@ func NodeStatus(ctx context.Context, cfg *Config, node NodeID) (Status, error) {
 	}
 
 	return cli.Status(ctx, node)
-}
-
-// trustedPool reads a PEM certificate file and returns a pool trusting
-// exactly it. A status probe verifies the one identity its own
-// configuration names for the target host, rather than any certificate a
-// public CA happened to issue.
-func trustedPool(certPath string) (*x509.CertPool, error) {
-	pem, err := os.ReadFile(certPath)
-	if err != nil {
-		return nil, err
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("no certificates found in %s", certPath)
-	}
-	return pool, nil
 }
 
 // hostOfNode returns the host a node id is pinned to.
