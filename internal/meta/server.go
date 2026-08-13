@@ -122,6 +122,7 @@ func (s *Server) open() (*rpc.Server, error) {
 	rpc.RegisterHandler(mux, OpMetaPut, s.handlePut)
 	rpc.RegisterHandler(mux, OpMetaDelete, s.handleDelete)
 	rpc.RegisterHandler(mux, OpMetaScan, s.handleScan)
+	rpc.RegisterHandler(mux, OpMetaStatus, s.handleStatus)
 	srv, err := rpc.NewServer(mux, s.cfg.Listeners, s.pool)
 	if err != nil {
 		return nil, err
@@ -348,4 +349,44 @@ func (s *Server) scan(prefix string, fn func(key string, value []byte) error) er
 func (s *Server) leaderAddr() string {
 	addr, _ := s.raft.LeaderWithID()
 	return string(addr)
+}
+
+// status reports this replica's own view of the cluster: its raft state, the
+// leader it currently observes and where that leader would be dialed, and
+// its log position. It reads only local raft state, so it always succeeds —
+// including while there is no leader to report.
+func (s *Server) status() MetaStatus {
+	stats := s.raft.Stats()
+	leader := string(s.raft.Leader())
+
+	return MetaStatus{
+		NodeID:       strconv.FormatUint(uint64(s.cfg.NodeID), 10),
+		State:        stats["state"],
+		Leader:       leader,
+		LeaderAddr:   s.leaderDialAddr(leader),
+		Term:         stats["term"],
+		CommitIndex:  stats["commit_index"],
+		AppliedIndex: stats["applied_index"],
+		IsLeader:     s.raft.State() == raft.Leader,
+	}
+}
+
+// leaderDialAddr resolves a raft advertise address to the address this
+// replica would dial it on, using the same routing table its own rpc traffic
+// uses. It returns empty whenever that resolution adds nothing new: no
+// leader, an address this replica's table does not name, or this replica's
+// own address, since nothing dials itself.
+func (s *Server) leaderDialAddr(leader string) string {
+	if leader == "" {
+		return ""
+	}
+	id, err := ParseRaftAddress(leader)
+	if err != nil {
+		return ""
+	}
+	route, err := s.cfg.Resolver.Route(id)
+	if err != nil {
+		return ""
+	}
+	return route.Addr.String()
 }

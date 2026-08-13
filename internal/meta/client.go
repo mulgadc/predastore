@@ -223,6 +223,35 @@ func (c *Client) ListKeys(ctx context.Context, prefix string) ([]string, error) 
 	return keys, nil
 }
 
+// Status queries target directly for its raft state. Unlike Get and Scan, it
+// consults exactly the replica named: it never tries another replica and
+// never follows a not-leader redirect, because the caller is asking what
+// this specific process observes, not for a leader-consistent answer.
+func (c *Client) Status(ctx context.Context, target config.NodeID) (MetaStatus, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	stream, err := rpc.OpenStream(ctx, c.rpc, target, OpMetaStatus, &MetaStatusRequest{})
+	if err != nil {
+		return MetaStatus{}, fmt.Errorf("open stream to replica %d: %w", target, err)
+	}
+	if err := stream.Close(); err != nil {
+		return MetaStatus{}, fmt.Errorf("half-close stream to replica %d: %w", target, err)
+	}
+
+	// The response can block until the deadline; abort the read side when
+	// the context fires so the decode does not outlive the attempt.
+	stop := context.AfterFunc(ctx, func() { stream.CancelRead(0) })
+	defer stop()
+
+	var status MetaStatus
+	if err := json.NewDecoder(stream).Decode(&status); err != nil {
+		stream.CancelRead(0)
+		return MetaStatus{}, fmt.Errorf("decode status from replica %d: %w", target, err)
+	}
+	return status, nil
+}
+
 // Put stores a key-value pair through the leader.
 func (c *Client) Put(ctx context.Context, key string, value []byte) error {
 	return c.write(ctx, OpMetaPut, request(key, 0), value)
