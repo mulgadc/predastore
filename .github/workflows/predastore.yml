@@ -11,6 +11,10 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/predastore.yml
+  pull_request:
+    branches:
+      - main
+      - dev
   workflow_dispatch:
 
 permissions:
