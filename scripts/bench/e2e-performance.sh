@@ -87,20 +87,6 @@ PERF_PORT_OFFSET="${PERF_PORT_OFFSET:-10000}"
 export PREDA_CONFIG_DIR="$WORK_DIR/config"
 mkdir -p "$PREDA_CONFIG_DIR"
 
-# render_profile shifts every node port by the offset. Ports appear only under
-# [[host.node]], so a plain key match is enough and stays readable.
-render_profile() {
-    awk -v offset="$PERF_PORT_OFFSET" '
-        /^[[:space:]]*port[[:space:]]*=/ {
-            match($0, /[0-9]+/)
-            printf "%s%d%s\n", substr($0, 1, RSTART - 1), \
-                substr($0, RSTART, RLENGTH) + offset, substr($0, RSTART + RLENGTH)
-            next
-        }
-        { print }
-    ' "$1" > "$2"
-}
-
 # Warp stages multi-MB upload payloads in TMPDIR. Keeping it under the work
 # directory stops those competing with the cluster for a small /tmp tmpfs.
 export TMPDIR="$WORK_DIR/tmp"
@@ -311,7 +297,7 @@ DIRTY="false"
 for config_name in $PERF_CONFIGS; do
     [ -f "$CONFIG_DIR/$config_name.toml" ] || { echo "missing config: $config_name" >&2; exit 1; }
     CONFIG_FILE="$PREDA_CONFIG_DIR/$config_name.toml"
-    render_profile "$CONFIG_DIR/$config_name.toml" "$CONFIG_FILE"
+    render_profile "$CONFIG_DIR/$config_name.toml" "$CONFIG_FILE" "$PERF_PORT_OFFSET"
 
     # The profile decides where S3 answers, so the endpoints are read from it
     # rather than assumed to be one gate on the default port.

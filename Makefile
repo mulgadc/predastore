@@ -106,10 +106,28 @@ e2e-performance-compare: warp-install
 	@test -n "$(PERF_AFTER)" || { echo "PERF_AFTER is required" >&2; exit 2; }
 	@WARP="$(WARP)" ./scripts/bench/compare-performance.sh "$(PERF_BEFORE)" "$(PERF_AFTER)"
 
+# Fault injection under live load: a four-host cluster has one host frozen
+# with SIGSTOP and is asserted to keep serving and then to rejoin. This is a
+# liveness test, not a benchmark, so it takes roughly four minutes regardless
+# of how fast the machine is.
+#
+# The default freezes a follower. STRESS_HOST=leader freezes whichever host
+# raft elected instead, which currently fails: a gate keeps the frozen node
+# first in its meta read order and pays the full client timeout per key, so
+# listing slows in proportion to the number of objects.
+STRESS_CONFIG ?= 4host
+STRESS_FREEZE ?= 90
+STRESS_HOST   ?= follower
+e2e-stress: build certs warp-install
+	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
+		STRESS_HOST="$(STRESS_HOST)" WARP="$(WARP)" \
+		./scripts/bench/e2e-stress.sh
+
 # NilAway — advisory nil-panic analysis. Not in preflight: it has a known
 # false-positive rate, so findings are triaged by hand rather than gating commits.
 nilaway:
 	go tool nilaway -include-pkgs=github.com/mulgadc/predastore -exclude-test-files ./...
 
 .PHONY: certs build go_build preflight test test-cover test-race test-integration diff-coverage \
-	clean lint fix govulncheck nilaway warp-install e2e-performance e2e-performance-compare
+	clean lint fix govulncheck nilaway warp-install e2e-performance e2e-performance-compare \
+	e2e-stress
