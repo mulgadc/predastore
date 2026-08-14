@@ -250,6 +250,17 @@ func (p *ConnPool) noteStall(c transport.Conn) {
 	c.Close()
 }
 
+// noteFailure records a connection that could not carry a stream at all. A dead
+// transport is dropped at once; one that still looks alive is counted, since it
+// is worth no more than a connection that opens streams and answers nothing.
+func (p *ConnPool) noteFailure(c transport.Conn) {
+	if c.Context().Err() != nil {
+		p.Evict(c)
+		return
+	}
+	p.noteStall(c)
+}
+
 // noteProgress clears the run of stalls on c: a connection that answered is
 // being serviced, whatever came before it.
 func (p *ConnPool) noteProgress(c transport.Conn) {

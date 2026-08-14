@@ -50,26 +50,21 @@ func OpenStream[T Header](
 	}
 	binary.BigEndian.PutUint32(buf[4:8], uint32(n)) //nolint:gosec // G115: n is bounded by maxHeaderSize above.
 
-	// Open stream.
+	// Open stream. A connection that cannot open one is reported to the pool:
+	// no response is ever read over it, so nothing else would ever record that
+	// it has stopped carrying traffic, and it would be handed out forever.
 	stream, err := conn.OpenStream(ctx)
 	if err != nil {
-		if conn.Context().Err() != nil {
-			// TODO: Define isConnDead function for smart evict.
-			c.pool.Evict(conn)
-		}
+		c.pool.noteFailure(conn)
 		return nil, err
 	}
 
 	// Write stream metadata
 	if _, err := stream.Write(buf); err != nil {
-		if conn.Context().Err() != nil {
-			// TODO: Define isConnDead function for smart evict.
-			c.pool.Evict(conn)
-		} else {
-			// TODO: Figure out better error codes.
-			stream.CancelRead(0)
-			stream.CancelWrite(0)
-		}
+		// TODO: Figure out better error codes.
+		stream.CancelRead(0)
+		stream.CancelWrite(0)
+		c.pool.noteFailure(conn)
 		return nil, fmt.Errorf("write metadata + header: %w", err)
 	}
 
