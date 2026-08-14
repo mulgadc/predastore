@@ -54,6 +54,10 @@ type Config struct {
 	// EnableHTTP2 advertises h2 over ALPN. Off leaves http/1.1 as the only
 	// offer, so a client that would otherwise multiplex falls back to a
 	// connection pool.
+	//
+	// Already resolved: the config default is on, and the zero value here is
+	// off, so a caller building this by hand supplies it rather than
+	// inheriting it.
 	EnableHTTP2 bool
 
 	// Meta reaches the replicas holding bucket, object and upload metadata,

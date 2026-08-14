@@ -144,13 +144,21 @@ type Compaction struct {
 
 // S3 tunes the gate's HTTP surface, as opposed to the S3 semantics above it.
 type S3 struct {
-	// EnableHTTP2 advertises h2 ahead of http/1.1 over ALPN. It defaults off.
-	// A client multiplexes every request onto one h2 connection, so a single
-	// large PUT exhausts the connection's flow-control window and stalls the
-	// small ranged GETs sharing it; pooled HTTP/1.1 gives each request its own
-	// socket. Turn it on for a client whose latency is dominated by round
-	// trips rather than by bodies.
-	EnableHTTP2 bool `toml:"enable_http2"`
+	// EnableHTTP2 advertises h2 ahead of http/1.1 over ALPN. Unset means on:
+	// the gate is a general-purpose S3 endpoint and h2 suits a client whose
+	// cost is round trips rather than bodies.
+	//
+	// It is a pointer because absent and false differ here, and only a client
+	// that offers h2 is given it — so this is a fleet-wide backstop, not the
+	// way to keep one client off h2. A client that multiplexes large bodies
+	// onto one connection should decline h2 itself, the way viperblock's
+	// backend does.
+	EnableHTTP2 *bool `toml:"enable_http2"`
+}
+
+// HTTP2Enabled resolves EnableHTTP2 against its default.
+func (s S3) HTTP2Enabled() bool {
+	return s.EnableHTTP2 == nil || *s.EnableHTTP2
 }
 
 // Bucket is a bucket declared in the config rather than created through the

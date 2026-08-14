@@ -187,7 +187,7 @@ func gateConfig(
 		Port:        n.Port,
 		TLSCert:     host.TLSCert,
 		TLSKey:      host.TLSKey,
-		EnableHTTP2: c.S3.EnableHTTP2,
+		EnableHTTP2: c.S3.HTTP2Enabled(),
 		Meta:        mc,
 		Blob:        bc,
 	}

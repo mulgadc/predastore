@@ -75,13 +75,15 @@ func TestClientGetsHTTP2WhenGateOffersIt(t *testing.T) {
 	require.Equal(t, "HTTP/2.0", negotiatedWith(t, true))
 }
 
-// The gate must build and run with the flag left unset, which is the state
-// every existing config file is in.
-func TestConfigDefaultsToHTTP2Off(t *testing.T) {
-	cfg := wired(t)
-	require.False(t, cfg.EnableHTTP2)
+// The gate must build either way; the default itself is the config package's
+// business, asserted in its own test.
+func TestGateBuildsWithEitherProtocolSetting(t *testing.T) {
+	for _, enable := range []bool{false, true} {
+		cfg := wired(t)
+		cfg.EnableHTTP2 = enable
 
-	s, err := New(cfg)
-	require.NoError(t, err)
-	require.False(t, s.cfg.EnableHTTP2)
+		s, err := New(cfg)
+		require.NoError(t, err)
+		require.Equal(t, enable, s.cfg.EnableHTTP2)
+	}
 }
