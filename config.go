@@ -48,6 +48,7 @@ type NodeConfig = config.Node
 type (
 	RS         = config.RS
 	Compaction = config.Compaction
+	S3         = config.S3
 	Bucket     = config.Bucket
 	AuthEntry  = config.AuthEntry
 	PolicyRule = config.PolicyRule
@@ -182,11 +183,12 @@ func gateConfig(
 		RateLimit:   c.RateLimit,
 		BlobNodeIDs: nodeIDs(nodesByRole(c, RoleBlob)),
 
-		Addr:    config.NodeBindAddr(host, n),
-		Port:    n.Port,
-		TLSCert: host.TLSCert,
-		TLSKey:  host.TLSKey,
-		Meta:    mc,
-		Blob:    bc,
+		Addr:        config.NodeBindAddr(host, n),
+		Port:        n.Port,
+		TLSCert:     host.TLSCert,
+		TLSKey:      host.TLSKey,
+		EnableHTTP2: c.S3.EnableHTTP2,
+		Meta:        mc,
+		Blob:        bc,
 	}
 }

@@ -132,6 +132,28 @@ func newCredentialProvider(config Config) (auth.CredentialProvider, error) {
 	return auth.NewChainProvider(natsProv, configProv), nil
 }
 
+// alpnProtocols is what the gate offers over ALPN. h2 is offered only when
+// asked for: a client multiplexes every request onto one h2 connection, so a
+// single large PUT exhausts the connection's flow-control window and stalls
+// the small ranged GETs sharing it. Offering only http/1.1 leaves such a
+// client on a connection pool, where each request gets its own socket.
+func alpnProtocols(enableHTTP2 bool) []string {
+	if enableHTTP2 {
+		return []string{"h2", "http/1.1"}
+	}
+	return []string{"http/1.1"}
+}
+
+// httpProtocols mirrors alpnProtocols for the server's own wiring. Both are
+// needed: Serve installs the h2 handler whenever TLSConfig mentions h2, so
+// leaving this unset would contradict the ALPN list above.
+func httpProtocols(enableHTTP2 bool) *http.Protocols {
+	var p http.Protocols
+	p.SetHTTP1(true)
+	p.SetHTTP2(enableHTTP2)
+	return &p
+}
+
 // Run serves S3 over TLS until ctx is cancelled or the listener fails, then
 // drains in-flight requests within the grace period and releases everything it
 // started. It is the server's whole lifecycle: there is nothing to stop it
@@ -147,19 +169,20 @@ func (s *Server) Run(ctx context.Context) error {
 		defer s.credProv.Close()
 	}
 
-	// NextProtos advertises HTTP/2 over ALPN, with HTTP/1.1 as the fallback.
 	tlsCfg := &tls.Config{
 		Certificates:     []tls.Certificate{s.cert},
-		NextProtos:       []string{"h2", "http/1.1"},
+		NextProtos:       alpnProtocols(s.cfg.EnableHTTP2),
 		MinVersion:       tls.VersionTLS13,
 		CurvePreferences: tlsconfig.Curves,
 	}
+	protocols := httpProtocols(s.cfg.EnableHTTP2)
 
 	addr := net.JoinHostPort(s.cfg.Addr, strconv.Itoa(s.cfg.Port))
 	httpSrv := &http.Server{
 		Addr:              addr,
 		Handler:           s.router,
 		TLSConfig:         tlsCfg,
+		Protocols:         protocols,
 		ReadTimeout:       60 * time.Second,
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
@@ -190,7 +213,7 @@ func (s *Server) Run(ctx context.Context) error {
 		<-serveErr
 	}()
 
-	slog.Info("Starting S3 gate", "addr", addr, "http2", true)
+	slog.Info("Starting S3 gate", "addr", addr, "http2", s.cfg.EnableHTTP2)
 
 	select {
 	case <-ctx.Done():

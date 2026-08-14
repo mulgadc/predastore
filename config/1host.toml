@@ -21,6 +21,13 @@ parity = 0
 # [compaction]
 # interval_seconds = 300
 
+# The S3 gate's HTTP surface. enable_http2 advertises h2 over ALPN and
+# defaults off: a client multiplexes every request onto one connection, so a
+# large PUT exhausts the connection's flow-control window and stalls the small
+# ranged GETs sharing it. Turn it on for clients dominated by round trips.
+# [s3]
+# enable_http2 = false
+
 # data_dir, tls_cert, tls_key and encryption_key are deliberately absent:
 # they are host-local, and start.sh passes them as flags so this file stays
 # identical on every machine.

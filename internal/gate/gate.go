@@ -51,6 +51,11 @@ type Config struct {
 	TLSCert string
 	TLSKey  string
 
+	// EnableHTTP2 advertises h2 over ALPN. Off leaves http/1.1 as the only
+	// offer, so a client that would otherwise multiplex falls back to a
+	// connection pool.
+	EnableHTTP2 bool
+
 	// Meta reaches the replicas holding bucket, object and upload metadata,
 	// and Blob the nodes holding shards. Both are required: the gate runs the
 	// S3 frontend only, and the process that runs the cluster nodes owns the

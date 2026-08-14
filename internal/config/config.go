@@ -142,6 +142,17 @@ type Compaction struct {
 	IntervalSeconds int `toml:"interval_seconds"`
 }
 
+// S3 tunes the gate's HTTP surface, as opposed to the S3 semantics above it.
+type S3 struct {
+	// EnableHTTP2 advertises h2 ahead of http/1.1 over ALPN. It defaults off.
+	// A client multiplexes every request onto one h2 connection, so a single
+	// large PUT exhausts the connection's flow-control window and stalls the
+	// small ranged GETs sharing it; pooled HTTP/1.1 gives each request its own
+	// socket. Turn it on for a client whose latency is dominated by round
+	// trips rather than by bodies.
+	EnableHTTP2 bool `toml:"enable_http2"`
+}
+
 // Bucket is a bucket declared in the config rather than created through the
 // API.
 type Bucket struct {
@@ -191,6 +202,8 @@ type Config struct {
 	Hosts []Host `toml:"host"`
 
 	Compaction Compaction `toml:"compaction"`
+
+	S3 S3 `toml:"s3"`
 
 	Buckets []Bucket `toml:"bucket"`
 
