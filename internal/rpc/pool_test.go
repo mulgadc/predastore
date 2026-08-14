@@ -292,6 +292,60 @@ func TestEmptySlotFollowsTiebreak(t *testing.T) {
 	}
 }
 
+// TestUnopenableStreamsEvictConnection covers the case the pool could not see:
+// a connection alive at the transport that cannot open a stream at all. No
+// response is ever read over it, so no stall was recorded and it was reused
+// forever, which is how a raft peer stayed unreachable for hours.
+func TestUnopenableStreamsEvictConnection(t *testing.T) {
+	const peerID config.NodeID = 2
+	callerTr := transport.NewPipeTransport(t.Name(), 1)
+	peerTr := transport.NewPipeTransport(t.Name(), int(peerID))
+	t.Cleanup(func() { _ = callerTr.Close(); _ = peerTr.Close() })
+
+	ln, err := peerTr.Listen()
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	ctx := t.Context()
+
+	// The peer completes the dial and then does nothing with the connection. It
+	// never accepts a stream, which is what a wedged replica presents to peers:
+	// a healthy socket that answers no request opened on it.
+	accepted := make(chan transport.Conn, 1)
+	go func() {
+		if conn, err := ln.Accept(ctx); err == nil {
+			accepted <- conn
+		}
+	}()
+
+	pool := NewConnPool(1, testResolver(callerTr, map[config.NodeID]*transport.PipeTransport{peerID: peerTr}))
+	t.Cleanup(func() { _ = pool.Close() })
+	client := NewClient(pool)
+
+	conn, err := pool.Dial(ctx, peerID)
+	if err != nil {
+		t.Fatalf("dial node %d: %v", peerID, err)
+	}
+	<-accepted
+
+	for i := range maxStreamStalls {
+		attemptCtx, attemptCancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		_, err := OpenStream(attemptCtx, client, peerID, opPing, &pingHeader{Name: "hello"})
+		attemptCancel()
+		if err == nil {
+			t.Fatal("opened a stream on a peer that never accepts one")
+		}
+		held, _ := pool.held(peerID)
+		if i < maxStreamStalls-1 && held != conn {
+			t.Fatalf("connection evicted after %d failed opens, want %d", i+1, maxStreamStalls)
+		}
+	}
+	if held, _ := pool.held(peerID); held == conn {
+		t.Fatalf("connection still pooled after %d failed stream opens", maxStreamStalls)
+	}
+}
+
 // TestStalledStreamsEvictConnection covers the escape hatch: a connection alive
 // at the transport but answering nothing is dropped so a dial can replace it.
 func TestStalledStreamsEvictConnection(t *testing.T) {
