@@ -232,19 +232,49 @@ write_warp_analysis() {
     done
 }
 
+# rejected_completions counts the multipart completions the gates in $1 have
+# refused, or only those that had no part stored when $2 is "empty". The gates
+# append for the life of the profile, so one workload's count is a difference.
+rejected_completions() {
+    local dir="$1" pattern='Multipart completion rejected'
+    if [ "${2:-}" = "empty" ]; then
+        pattern="$pattern"'.*"stored":0[,}]'
+    fi
+    { grep -hE "$pattern" "$dir"/*.log 2>/dev/null || true; } | wc -l
+}
+
 run_warp_checked() {
     local log_file="$1"
     shift
-    local status
+    local logs="$PREDA_DIR/$CURRENT_CONFIG/logs"
+    local status errors partless refused unstored
+
+    refused="$(rejected_completions "$logs")"
+    unstored="$(rejected_completions "$logs" empty)"
 
     set +e
     "$@" 2>&1 | tee "$log_file"
     status="${PIPESTATUS[0]}"
     set -e
 
+    refused=$(($(rejected_completions "$logs") - refused))
+    unstored=$(($(rejected_completions "$logs" empty) - unstored))
+
     # Warp reports some failures in its output while still exiting zero, so the
     # log is checked as well as the status.
-    if [ "$status" -ne 0 ] || grep -q 'warp: <ERROR>' "$log_file"; then
+    errors="$(grep -c 'warp: <ERROR>' "$log_file" || true)"
+    partless="$(grep -c 'warp: <ERROR> complete multipart upload' "$log_file" || true)"
+
+    # Warp completes an upload it never put a part into when its duration
+    # expires in between, and a gate is right to refuse that. Tolerated only
+    # when every error is that one and the gates agree no part was stored.
+    if [ "$status" -eq 0 ] && [ "$errors" -gt 0 ] && [ "$errors" -eq "$partless" ] &&
+        [ "$refused" -eq "$errors" ] && [ "$unstored" -eq "$refused" ]; then
+        echo "Tolerated $errors completion(s) of an upload with no part; see $log_file" >&2
+        return 0
+    fi
+
+    if [ "$status" -ne 0 ] || [ "$errors" -gt 0 ]; then
         echo "Warp workload failed; see $log_file" >&2
         return 1
     fi
