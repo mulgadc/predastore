@@ -4,14 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/internal/blob"
@@ -312,11 +310,41 @@ func loadPlacement(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg
 	return objectToShardNodes, objectToShardNodes.Size, nil
 }
 
-// shardReaders creates readers for each shard.
-// Data is buffered into memory before connections are closed to avoid
-// "connection closed" errors when the caller reads from the returned readers.
-func shardReaders(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, parity bool) ([]io.Reader, error) {
-	readers := make([]io.Reader, len(place.DataShardNodes)+len(place.ParityShardNodes))
+// readShard fetches one shard whole and buffers it. The data is read into
+// memory before the stream is closed, so the caller never reads from a closed
+// connection.
+func readShard(ctx context.Context, bc BlobClient, objectHash [32]byte, node config.NodeID, index int) ([]byte, error) {
+	reader, err := bc.Get(ctx, node, blob.GetRequest{
+		Key:        objectHash,
+		RangeStart: -1, // -1 means full shard (no range)
+		RangeEnd:   -1,
+		Index:      uint32(index), //nolint:gosec // G115: index bounded by shard count (small uint).
+	})
+	if err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(reader)
+	if closeErr := reader.Close(); closeErr != nil {
+		slog.DebugContext(ctx, "Failed to close shard stream reader", "node", node, "error", closeErr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// shardReaders creates readers for each shard, concurrently and tolerantly.
+//
+// Concurrently, because reading them one after another makes an object's read
+// latency the sum of its shards rather than the slowest of them, so one slow
+// node stalls every read that touches it.
+//
+// Tolerantly, because a shard that cannot be read is exactly what the parity
+// exists for. A failed shard leaves a nil reader for the caller to
+// reconstruct; an error is returned only when too few shards survive for any
+// reconstruction to be possible.
+func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, parity bool) ([][]byte, error) {
+	shards := make([][]byte, len(place.DataShardNodes)+len(place.ParityShardNodes))
 
 	totalNodes := make([]config.NodeID, 0)
 	totalNodes = append(totalNodes, place.DataShardNodes...)
@@ -325,110 +353,106 @@ func shardReaders(ctx context.Context, bc BlobClient, objectHash [32]byte, place
 		totalNodes = append(totalNodes, place.ParityShardNodes...)
 	}
 
+	var wg sync.WaitGroup
 	for i := range totalNodes {
-		nodeNum := totalNodes[i]
-
-		objectRequest := blob.GetRequest{
-			Key:        objectHash,
-			RangeStart: -1, // -1 means full shard (no range)
-			RangeEnd:   -1,
-			Index:      uint32(i), // Include shard index for unique lookup
-		}
-
-		reader, err := bc.Get(ctx, nodeNum, objectRequest)
-		if err != nil {
-			slog.Error("Error reading shard from blob node", "node", nodeNum, "err", err)
-			// Don't close - connection stays in pool
-			return readers, err
-		}
-
-		// Buffer the shard data into memory before closing the stream.
-		// This prevents "stream closed" errors when the caller reads.
-		data, err := io.ReadAll(reader)
-		if closeErr := reader.Close(); closeErr != nil {
-			slog.Debug("Failed to close shard stream reader", "node", nodeNum, "error", closeErr)
-		}
-
-		if err != nil {
-			slog.Error("Error buffering shard data", "node", nodeNum, "err", err)
-			return readers, err
-		}
-
-		readers[i] = bytes.NewReader(data)
+		wg.Go(func() {
+			start := time.Now()
+			data, err := readShard(ctx, bc, objectHash, totalNodes[i], i)
+			if err != nil {
+				slog.WarnContext(ctx, "Shard read failed, falling back to parity",
+					"node", totalNodes[i], "index", i, "err", err,
+					"duration_ms", time.Since(start).Milliseconds())
+				return
+			}
+			if elapsed := time.Since(start); elapsed >= slowShardThreshold {
+				slog.WarnContext(ctx, "Shard read slow",
+					"node", totalNodes[i], "index", i, "duration_ms", elapsed.Milliseconds())
+			}
+			// Distinct indices, so no synchronisation is needed here.
+			shards[i] = data
+		})
 	}
+	wg.Wait()
 
-	return readers, nil
+	available := 0
+	for _, s := range shards {
+		if s != nil {
+			available++
+		}
+	}
+	if available < len(place.DataShardNodes) {
+		return shards, fmt.Errorf("%w: %d of %d shards available",
+			errInsufficientShards, available, len(place.DataShardNodes))
+	}
+	return shards, nil
 }
 
-// reconstructObject attempts to rebuild an object using parity shards.
+// slowShardThreshold is the point past which a shard read is worth naming its
+// node for. A degrading node should be visible before it takes something down.
+const slowShardThreshold = 2 * time.Second
+
+// errInsufficientShards reports that too few shards survived to rebuild the
+// object, as distinct from some shards being missing but recoverable.
+var errInsufficientShards = errors.New("insufficient shards to reconstruct")
+
+// shardReadersOf turns shard bytes into readers, leaving a nil for every
+// shard that could not be read so the encoder knows to rebuild it.
+func shardReadersOf(shards [][]byte) []io.Reader {
+	readers := make([]io.Reader, len(shards))
+	for i, s := range shards {
+		if s != nil {
+			readers[i] = bytes.NewReader(s)
+		}
+	}
+	return readers
+}
+
+// missingShards counts the first n shards the read could not fill.
+func missingShards(shards [][]byte, n int) int {
+	missing := 0
+	for i := 0; i < n && i < len(shards); i++ {
+		if shards[i] == nil {
+			missing++
+		}
+	}
+	return missing
+}
+
+// reconstructObject rebuilds an object from its parity shards.
+//
+// Recovered shards are held in memory. They used to be written to temp files
+// named only for the object hash and shard index, so two concurrent reads of
+// one object wrote and deleted the same paths underneath each other. Keeping
+// them in memory also removes a second read of every shard, since the encoder
+// consumes the readers it is given.
 func reconstructObject(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, enc reedsolomon.StreamEncoder, size int64) (*bytes.Buffer, error) {
-	// Get all shard readers including parity
-	readers, err := shardReaders(ctx, bc, objectHash, place, true)
+	shards, err := shardBytes(ctx, bc, objectHash, place, true)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create reconstruction writers for missing shards
-	reconstruction := make([]io.Writer, len(readers))
-	files := make([]*os.File, len(readers))
-
-	for i := range reconstruction {
-		if readers[i] == nil {
-			filename := fmt.Sprintf("%s.%d", hex.EncodeToString(objectHash[:]), i)
-			outfn := filepath.Join(os.TempDir(), filename)
-
-			files[i], err = os.Create(outfn)
-			if err != nil {
-				return nil, err
-			}
-			defer os.Remove(outfn)
-			defer files[i].Close()
-
-			slog.InfoContext(ctx, "Creating temporary file for reconstruction", "filename", outfn)
-			reconstruction[i] = files[i]
+	recovered := make([]*bytes.Buffer, len(shards))
+	writers := make([]io.Writer, len(shards))
+	for i := range shards {
+		if shards[i] == nil {
+			recovered[i] = &bytes.Buffer{}
+			writers[i] = recovered[i]
 		}
 	}
 
-	// Reconstruct missing shards
-	err = enc.Reconstruct(readers, reconstruction)
-	if err != nil {
+	if err := enc.Reconstruct(shardReadersOf(shards), writers); err != nil {
 		return nil, fmt.Errorf("reconstruction failed: %w", err)
 	}
-
-	// Close reconstruction writers
-	for i := range files {
-		if files[i] != nil {
-			if closeErr := files[i].Close(); closeErr != nil {
-				slog.Debug("Failed to close reconstruction file", "index", i, "error", closeErr)
-			}
+	for i := range shards {
+		if shards[i] == nil && recovered[i] != nil {
+			shards[i] = recovered[i].Bytes()
 		}
 	}
 
-	// Re-read shards with reconstructed data
-	readers, err = shardReaders(ctx, bc, objectHash, place, true)
-	if err != nil {
-		return nil, err
-	}
-
-	// Fill in reconstructed shards
-	for i := range readers {
-		if readers[i] == nil && files[i] != nil {
-			f, err := os.Open(files[i].Name())
-			if err != nil {
-				return nil, err
-			}
-			defer f.Close()
-			readers[i] = f
-		}
-	}
-
-	// Join the shards
 	var out bytes.Buffer
-	err = enc.Join(&out, readers, size)
-	if err != nil {
+	if err := enc.Join(&out, shardReadersOf(shards), size); err != nil {
 		return nil, fmt.Errorf("join after reconstruction failed: %w", err)
 	}
-
 	return &out, nil
 }
 

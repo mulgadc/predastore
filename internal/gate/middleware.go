@@ -27,6 +27,7 @@ func (s *Server) setupMiddleware() {
 	r := s.router
 
 	r.Use(otelsetup.HTTPMiddleware("predastore"))
+	r.Use(requestLog)
 	// chi's access log duplicates the APM transaction from HTTPMiddleware and
 	// is a synchronous per-request write on the hot path; only enable it for
 	// explicit debug sessions.

@@ -112,25 +112,32 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 
 	objectHash := model.ObjectHash(bucket, key)
 
-	readers, err := shardReaders(ctx, bc, objectHash, place, false)
-	if err != nil {
-		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
-	}
+	// A failed shard read is what parity is for. Reconstruction is attempted
+	// whenever a data shard is missing, not only when the join fails, so that
+	// losing one node does not make every object on it unreadable.
+	shards, readErr := shardBytes(ctx, bc, objectHash, place, false)
+	missing := missingShards(shards, len(place.DataShardNodes))
 
 	var out bytes.Buffer
-	if err := enc.Join(&out, readers, size); err != nil {
-		slog.WarnContext(ctx, "Initial join failed, attempting reconstruction", "err", err)
-
-		out.Reset()
-		reconstructed, err := reconstructObject(ctx, bc, objectHash, place, enc, size)
-		if err != nil {
-			return nil, model.NewS3Error(model.ErrInternalError,
-				fmt.Sprintf("reconstruction failed: %v", err), 500)
+	switch {
+	case readErr != nil || missing > 0:
+		slog.WarnContext(ctx, "Data shards incomplete, reconstructing from parity",
+			"missing", missing, "of", len(place.DataShardNodes), "err", readErr)
+	default:
+		err := enc.Join(&out, shardReadersOf(shards), size)
+		if err == nil {
+			return out.Bytes(), nil
 		}
-		out = *reconstructed
+		slog.WarnContext(ctx, "Initial join failed, attempting reconstruction", "err", err)
 	}
 
-	return out.Bytes(), nil
+	out.Reset()
+	reconstructed, err := reconstructObject(ctx, bc, objectHash, place, enc, size)
+	if err != nil {
+		return nil, model.NewS3Error(model.ErrInternalError,
+			fmt.Sprintf("reconstruction failed: %v", err), 500)
+	}
+	return reconstructed.Bytes(), nil
 }
 
 // readRange serves a byte range. Reed-Solomon splits data sequentially across
