@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/mulgadc/predastore/internal/blob/engine"
 	"github.com/mulgadc/predastore/internal/config"
@@ -56,23 +57,58 @@ type DeleteResponse struct {
 	Deleted bool
 }
 
+// Default bounds for a client that does not configure its own.
+const (
+	DefaultEnvelopeTimeout = 10 * time.Second
+	DefaultIdleTimeout     = 30 * time.Second
+)
+
 // Client performs value operations against blob nodes over rpc streams,
 // addressed by node id.
 type Client struct {
-	rpc *rpc.Client
+	rpc             *rpc.Client
+	envelopeTimeout time.Duration
+	idleTimeout     time.Duration
 }
 
 type ClientConfig struct {
 	// Client carries the streams; it owns the mapping from node id to
 	// address, so this client only ever names nodes by id.
 	Client *rpc.Client
+	// EnvelopeTimeout bounds the fixed exchanges either side of a body:
+	// opening the stream, the half-close, and reading the response envelope.
+	// These are small and their size is known, so a total cap fits them. It
+	// is a fallback layered on the caller's context, which still wins.
+	EnvelopeTimeout time.Duration
+	// IdleTimeout bounds a body transfer that stops making progress. It is
+	// deliberately not a total duration: a large value transferring steadily
+	// must not be cut off, while one that stalls must not block forever.
+	IdleTimeout time.Duration
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.Client == nil {
 		return nil, fmt.Errorf("missing rpc client")
 	}
-	return &Client{rpc: cfg.Client}, nil
+	if cfg.EnvelopeTimeout <= 0 {
+		cfg.EnvelopeTimeout = DefaultEnvelopeTimeout
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = DefaultIdleTimeout
+	}
+	return &Client{
+		rpc:             cfg.Client,
+		envelopeTimeout: cfg.EnvelopeTimeout,
+		idleTimeout:     cfg.IdleTimeout,
+	}, nil
+}
+
+// abortStream tears down both directions. It is the cancel action for every
+// guard here: a bounded operation that gives up must leave nothing behind on
+// the wire for the peer to answer into.
+func abortStream(stream transport.Stream) {
+	stream.CancelRead(0)
+	stream.CancelWrite(0)
 }
 
 // open starts a stream against the node.
@@ -84,12 +120,28 @@ func (c *Client) open(ctx context.Context, nodeID config.NodeID, op rpc.Opcode, 
 	return stream, nil
 }
 
+// maxEnvelopeSize caps the response envelope. Without it a peer that never
+// sends a newline grows the buffer until the process runs out of memory,
+// which is a denial of service reachable from any blob node.
+const maxEnvelopeSize = 64 << 10
+
 // readEnvelope consumes the newline-terminated response envelope, leaving
-// any body bytes in the reader.
+// any body bytes in the reader. The line is read a byte at a time out of the
+// buffered reader so the cap can be enforced without consuming body bytes.
 func readEnvelope(br *bufio.Reader) (*Response, error) {
-	line, err := br.ReadBytes('\n')
-	if err != nil {
-		return nil, fmt.Errorf("read response envelope: %w", err)
+	line := make([]byte, 0, 256)
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("read response envelope: %w", err)
+		}
+		if b == '\n' {
+			break
+		}
+		line = append(line, b)
+		if len(line) > maxEnvelopeSize {
+			return nil, fmt.Errorf("response envelope exceeds %d bytes", maxEnvelopeSize)
+		}
 	}
 	var resp Response
 	if err := json.Unmarshal(line, &resp); err != nil {
@@ -98,9 +150,38 @@ func readEnvelope(br *bufio.Reader) (*Response, error) {
 	return &resp, nil
 }
 
+// openBounded opens a stream under a total cap, since opening is a fixed
+// exchange. The returned stop releases the guard without cancelling the
+// stream, for a caller moving on to a phase with its own bound.
+func (c *Client) openBounded(ctx context.Context, nodeID config.NodeID, op rpc.Opcode, h *Request) (transport.Stream, error) {
+	openCtx, cancel := context.WithTimeout(ctx, c.envelopeTimeout)
+	defer cancel()
+	return c.open(openCtx, nodeID, op, h)
+}
+
+// awaitEnvelope reads the response envelope under a total cap, aborting the
+// read side if the peer goes quiet. This is where an unbounded client blocks
+// forever against a node that accepts a stream and never answers.
+func (c *Client) awaitEnvelope(ctx context.Context, stream transport.Stream, br *bufio.Reader) (*Response, error) {
+	respCtx, cancel := context.WithTimeout(ctx, c.envelopeTimeout)
+	defer cancel()
+	stop := context.AfterFunc(respCtx, func() { stream.CancelRead(0) })
+	defer stop()
+
+	resp, err := readEnvelope(br)
+	if err != nil {
+		// Report our own deadline rather than the stream abort it caused.
+		if respCtx.Err() != nil && ctx.Err() == nil {
+			return nil, fmt.Errorf("await response envelope: %w", context.DeadlineExceeded)
+		}
+		return nil, err
+	}
+	return resp, nil
+}
+
 // Put streams a value to the node and returns the commit result.
 func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, body io.Reader) (*PutResponse, error) {
-	stream, err := c.open(ctx, nodeID, OpPut, &Request{
+	stream, err := c.openBounded(ctx, nodeID, OpPut, &Request{
 		Key:        req.Key,
 		Index:      req.Index,
 		Size:       req.Size,
@@ -111,19 +192,31 @@ func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, 
 		return nil, err
 	}
 
-	if _, err := stream.ReadFrom(io.LimitReader(body, req.Size)); err != nil {
-		stream.CancelRead(0)
-		stream.CancelWrite(0)
+	// The body is bounded by progress, not duration: a large value moving
+	// steadily must not be cut off. The caller's cancellation still applies.
+	stopCaller := context.AfterFunc(ctx, func() { abortStream(stream) })
+	guard := transport.NewWriteGuard(io.LimitReader(body, req.Size), stream, c.idleTimeout)
+	_, err = stream.ReadFrom(guard)
+	guard.Stop()
+	if err != nil {
+		stopCaller()
+		abortStream(stream)
+		if guard.Expired() {
+			return nil, fmt.Errorf("stream body to node %d: %w", nodeID, transport.ErrIdleTimeout)
+		}
 		return nil, fmt.Errorf("stream body to node %d: %w", nodeID, err)
 	}
 	if err := stream.Close(); err != nil {
+		stopCaller()
+		abortStream(stream)
 		return nil, fmt.Errorf("half-close put stream: %w", err)
 	}
+	stopCaller()
 
-	resp, err := readEnvelope(bufio.NewReader(stream))
+	resp, err := c.awaitEnvelope(ctx, stream, bufio.NewReader(stream))
 	if err != nil {
 		stream.CancelRead(0)
-		return nil, err
+		return nil, fmt.Errorf("put to node %d: %w", nodeID, err)
 	}
 	switch resp.Err {
 	case "":
@@ -139,7 +232,7 @@ func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, 
 
 // Delete marks a value deleted on the node.
 func (c *Client) Delete(ctx context.Context, nodeID config.NodeID, req DeleteRequest) (*DeleteResponse, error) {
-	stream, err := c.open(ctx, nodeID, OpDelete, &Request{
+	stream, err := c.openBounded(ctx, nodeID, OpDelete, &Request{
 		Key:        req.Key,
 		Index:      req.Index,
 		RangeStart: -1,
@@ -149,12 +242,13 @@ func (c *Client) Delete(ctx context.Context, nodeID config.NodeID, req DeleteReq
 		return nil, err
 	}
 	if err := stream.Close(); err != nil {
+		abortStream(stream)
 		return nil, fmt.Errorf("half-close delete stream: %w", err)
 	}
-	resp, err := readEnvelope(bufio.NewReader(stream))
+	resp, err := c.awaitEnvelope(ctx, stream, bufio.NewReader(stream))
 	if err != nil {
 		stream.CancelRead(0)
-		return nil, err
+		return nil, fmt.Errorf("delete on node %d: %w", nodeID, err)
 	}
 	if resp.Err != "" {
 		return nil, fmt.Errorf("delete on node %d: %s", nodeID, resp.Err)
@@ -166,7 +260,7 @@ func (c *Client) Delete(ctx context.Context, nodeID config.NodeID, req DeleteReq
 // request bounds. The caller must Close the returned reader to release the
 // stream.
 func (c *Client) Get(ctx context.Context, nodeID config.NodeID, req GetRequest) (io.ReadCloser, error) {
-	stream, err := c.open(ctx, nodeID, OpGet, &Request{
+	stream, err := c.openBounded(ctx, nodeID, OpGet, &Request{
 		Key:        req.Key,
 		Index:      req.Index,
 		RangeStart: req.RangeStart,
@@ -177,14 +271,15 @@ func (c *Client) Get(ctx context.Context, nodeID config.NodeID, req GetRequest) 
 	}
 	// No request body: half-close immediately so the server can respond.
 	if err := stream.Close(); err != nil {
+		abortStream(stream)
 		return nil, fmt.Errorf("half-close get stream: %w", err)
 	}
 
 	br := bufio.NewReader(stream)
-	resp, err := readEnvelope(br)
+	resp, err := c.awaitEnvelope(ctx, stream, br)
 	if err != nil {
 		stream.CancelRead(0)
-		return nil, err
+		return nil, fmt.Errorf("get from node %d: %w", nodeID, err)
 	}
 	switch resp.Err {
 	case "":
@@ -200,18 +295,51 @@ func (c *Client) Get(ctx context.Context, nodeID config.NodeID, req GetRequest) 
 		stream.CancelRead(0)
 		return io.NopCloser(bytes.NewReader(nil)), nil
 	}
-	return &bodyReadCloser{r: io.LimitReader(br, resp.BodyLen), stream: stream}, nil
+
+	// The envelope's cap has been released; the body gets a progress bound
+	// instead, plus the caller's own cancellation. Both are owned by the
+	// returned reader, since the caller reads it after this returns.
+	guard := transport.NewReadGuard(io.LimitReader(br, resp.BodyLen), stream, c.idleTimeout)
+	body := &bodyReadCloser{
+		r:         guard,
+		guard:     guard,
+		stream:    stream,
+		remaining: resp.BodyLen,
+	}
+	body.stopCaller = context.AfterFunc(ctx, func() { stream.CancelRead(0) })
+	return body, nil
 }
 
 // bodyReadCloser hands out the body bytes and releases the stream on Close.
+// It holds the guards covering the body, which outlive the Get call that
+// created them.
 type bodyReadCloser struct {
-	r      io.Reader
-	stream transport.Stream
+	r          io.Reader
+	guard      *transport.IdleGuard
+	stream     transport.Stream
+	stopCaller func() bool
+	// remaining counts down the bytes the envelope promised, so a peer that
+	// stops early is reported rather than passed off as a complete value. A
+	// short shard accepted silently would be reconstructed into a plausible
+	// wrong object, which is worse than a failed read.
+	remaining int64
 }
 
-func (s *bodyReadCloser) Read(p []byte) (int, error) { return s.r.Read(p) }
+func (s *bodyReadCloser) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	s.remaining -= int64(n)
+	if errors.Is(err, io.EOF) && s.remaining > 0 {
+		return n, fmt.Errorf("short body: %d of %d bytes missing: %w",
+			s.remaining, s.remaining+int64(n), io.ErrUnexpectedEOF)
+	}
+	return n, err
+}
 
 func (s *bodyReadCloser) Close() error {
+	s.guard.Stop()
+	if s.stopCaller != nil {
+		s.stopCaller()
+	}
 	// Abort the read side in case the body was not fully drained; the
 	// write side is already closed.
 	s.stream.CancelRead(0)
