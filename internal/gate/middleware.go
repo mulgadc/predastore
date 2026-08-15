@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
@@ -20,6 +21,23 @@ import (
 // independent of the region they are configured for or the endpoint they target.
 const globalSigningRegion = "us-east-1"
 
+// requestDeadline bounds the work one request may do. It sits below the
+// server's WriteTimeout so the gate wins the race and can answer with an error
+// naming the fault, instead of the connection being reset with no explanation
+// logged on either side.
+const requestDeadline = 50 * time.Second
+
+// requestDeadlineMiddleware puts requestDeadline on the request context, so
+// every context-aware call below inherits a bound rather than relying on the
+// transport to eventually give up.
+func requestDeadlineMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), requestDeadline)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 // setupMiddleware installs the chain that runs before chi has matched a route,
 // so nothing here may read the request's bucket or key. Everything that does is
 // registered per route group by setupRoutes.
@@ -28,6 +46,7 @@ func (s *Server) setupMiddleware() {
 
 	r.Use(otelsetup.HTTPMiddleware("predastore"))
 	r.Use(requestLog)
+	r.Use(requestDeadlineMiddleware)
 	// chi's access log duplicates the APM transaction from HTTPMiddleware and
 	// is a synchronous per-request write on the hot path; only enable it for
 	// explicit debug sessions.

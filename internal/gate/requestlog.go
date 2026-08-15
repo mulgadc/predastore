@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
@@ -14,6 +15,10 @@ import (
 // even though it succeeded. A gate that only logs failures cannot show which
 // node is degrading before it takes something down.
 const slowRequestThreshold = 5 * time.Second
+
+// inFlightReportInterval is how often a request already reported as stalled is
+// reported again, so a hang that outlives one log line stays visible.
+const inFlightReportInterval = 15 * time.Second
 
 // requestIDHeader is what S3 clients expect to quote when reporting a fault,
 // and what ties a gate log line to the caller's own record of the request.
@@ -30,7 +35,15 @@ func requestLog(next http.Handler) http.Handler {
 
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		start := time.Now()
+
+		watch := inFlightWatch{
+			logger: slog.Default(),
+			after:  slowRequestThreshold,
+			every:  inFlightReportInterval,
+		}
+		stopWatch := watch.start(r, id, start)
 		next.ServeHTTP(ww, r)
+		stopWatch()
 		elapsed := time.Since(start)
 
 		attrs := []any{
@@ -53,6 +66,51 @@ func requestLog(next http.Handler) http.Handler {
 			slog.DebugContext(r.Context(), "S3 request", attrs...)
 		}
 	})
+}
+
+// inFlightWatch reports a request that is taking too long while it is still
+// running. A handler that never returns produces no completion log at all, so
+// without this a stall is invisible from the gate and shows up only as a reset
+// stream on the client.
+type inFlightWatch struct {
+	logger *slog.Logger
+	after  time.Duration
+	every  time.Duration
+}
+
+// start arms the watch and returns a function that stops the reporting.
+func (w inFlightWatch) start(r *http.Request, id string, begun time.Time) (stop func()) {
+	var (
+		mu    sync.Mutex
+		timer *time.Timer
+	)
+
+	report := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		// Stopped between the timer firing and this taking the lock.
+		if timer == nil {
+			return
+		}
+		w.logger.WarnContext(r.Context(), "S3 request still running",
+			"request_id", id,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"elapsed_ms", time.Since(begun).Milliseconds(),
+		)
+		timer.Reset(w.every)
+	}
+
+	mu.Lock()
+	timer = time.AfterFunc(w.after, report)
+	mu.Unlock()
+
+	return func() {
+		mu.Lock()
+		defer mu.Unlock()
+		timer.Stop()
+		timer = nil
+	}
 }
 
 // newRequestID returns an opaque identifier. It only has to be unique enough
