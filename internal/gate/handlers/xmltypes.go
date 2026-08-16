@@ -65,6 +65,29 @@ type ListBucketsResult struct {
 	Buckets []ListBucket `xml:"Buckets>Bucket"`
 }
 
+// MultipartUpload is one in-flight upload in a ListMultipartUploads answer.
+type MultipartUpload struct {
+	Key       string    `xml:"Key"`
+	UploadId  string    `xml:"UploadId"`
+	Initiated time.Time `xml:"Initiated"`
+}
+
+// ListMultipartUploadsResult answers GET /{bucket}?uploads. The marker fields
+// are always empty and IsTruncated always false: the listing is unpaginated,
+// and a client that saw a truncation flag it could not follow would silently
+// stop short of the uploads it came for.
+type ListMultipartUploadsResult struct {
+	XMLName            xml.Name          `xml:"ListMultipartUploadsResult"`
+	Bucket             string            `xml:"Bucket"`
+	KeyMarker          string            `xml:"KeyMarker"`
+	UploadIdMarker     string            `xml:"UploadIdMarker"`
+	NextKeyMarker      string            `xml:"NextKeyMarker"`
+	NextUploadIdMarker string            `xml:"NextUploadIdMarker"`
+	MaxUploads         int               `xml:"MaxUploads"`
+	IsTruncated        bool              `xml:"IsTruncated"`
+	Uploads            []MultipartUpload `xml:"Upload"`
+}
+
 type InitiateMultipartUploadResult struct {
 	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
 	Bucket   string   `xml:"Bucket"`

@@ -50,7 +50,9 @@ func (s *Server) setupRoutes(ring *placement.Ring) {
 		r.Method(http.MethodPut, "/{bucket}", handlers.CreateBucket(mc, cache, cfg))
 		r.Method(http.MethodHead, "/{bucket}", handlers.HeadBucket(mc, cache))
 		r.Method(http.MethodDelete, "/{bucket}", handlers.DeleteBucket(mc, cache))
-		r.Method(http.MethodGet, "/{bucket}", handlers.ListObjects(mc, cache))
+		r.Method(http.MethodGet, "/{bucket}", byQuery("uploads",
+			handlers.ListMultipartUploads(mc, cache),
+			handlers.ListObjects(mc, cache)))
 	})
 
 	// Object operations (with key).

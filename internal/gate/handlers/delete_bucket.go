@@ -3,7 +3,6 @@ package handlers
 import (
 	"net/http"
 
-	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
@@ -23,9 +22,15 @@ func DeleteBucket(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
-		ownerID := auth.AccessKeyID(ctx)
+		// A config-declared bucket is part of the deployment, not tenant data,
+		// and is shared by every account. Nothing may delete one — not even a
+		// service credential, which the ownership check waves through.
+		if cache.isDeclared(bucket) {
+			HandleError(w, r, model.ErrAccessDeniedError.WithResource(bucket))
+			return
+		}
 
-		exists, bucketOwner, err := bucketExists(ctx, mc, cache, bucket)
+		exists, _, err := bucketExists(ctx, mc, cache, bucket)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
@@ -34,10 +39,11 @@ func DeleteBucket(mc MetaClient, cache *BucketCache) http.Handler {
 			HandleError(w, r, model.ErrNoSuchBucketError.WithResource(bucket))
 			return
 		}
-		if ownerID != "" && bucketOwner != ownerID {
-			HandleError(w, r, model.ErrAccessDeniedError.WithResource(bucket))
-			return
-		}
+
+		// Who may delete this bucket was already decided by the auth
+		// middleware, which compares accounts and honours a service
+		// credential. Re-deciding it here on the creating access key would
+		// mean only one user in an account could ever remove a bucket.
 
 		// One object is enough to reject the delete, so the scan stops at the first.
 		objects, err := metaScan(ctx, mc, model.TableObjects, objectARN(bucket, ""), 1)

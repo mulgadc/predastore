@@ -16,11 +16,30 @@ import (
 // by a request is visible to the next request's ownership check.
 type BucketCache struct {
 	entries []BucketConfig
+	// declared names the buckets that came from config rather than from a
+	// CreateBucket. It is written once and never added to, so it stays the
+	// answer to "is this part of the deployment" as entries grows.
+	declared map[string]bool
 }
 
 // NewBucketCache seeds the cache from the config-defined buckets.
 func NewBucketCache(configured []BucketConfig) *BucketCache {
-	return &BucketCache{entries: append([]BucketConfig(nil), configured...)}
+	declared := make(map[string]bool, len(configured))
+	for _, b := range configured {
+		declared[b.Name] = true
+	}
+	return &BucketCache{
+		entries:  append([]BucketConfig(nil), configured...),
+		declared: declared,
+	}
+}
+
+// isDeclared reports whether the bucket came from config. Those hold the
+// deployment's own state — the object store spinifex keeps volume metadata,
+// AMIs and key material in — and are shared by every account, so no request
+// may delete one however privileged the caller is.
+func (c *BucketCache) isDeclared(bucket string) bool {
+	return c.declared[bucket]
 }
 
 // find returns the cached entry for a bucket.

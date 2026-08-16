@@ -174,9 +174,13 @@ TLS 1.3 minimum, HTTP/2 advertised over ALPN with HTTP/1.1 as fallback. Read and
 | Service | `ListBuckets` |
 | Buckets | `CreateBucket`, `DeleteBucket`, `HeadBucket`, `ListObjects` / `ListObjectsV2` |
 | Objects | `PutObject`, `GetObject` (incl. `Range`), `HeadObject`, `DeleteObject` |
-| Multipart | `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` |
+| Multipart | `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListMultipartUploads` |
 
-S3 overloads one method and path across several operations and distinguishes them by query string, which chi cannot match on, so the split is explicit in `routes.go`: `?partNumber` selects `UploadPart` over `PutObject`, and `?uploadId` selects the multipart completion and abort handlers.
+S3 overloads one method and path across several operations and distinguishes them by query string, which chi cannot match on, so the split is explicit in `routes.go`: `?partNumber` selects `UploadPart` over `PutObject`, `?uploadId` selects the multipart completion and abort handlers, and `?uploads` on a bare bucket selects `ListMultipartUploads` over `ListObjects`.
+
+Uploads are keyed by upload id alone, so `ListMultipartUploads` scans the whole multipart table and filters on the bucket rather than reading a prefix. In-flight uploads are few and short-lived, which is what makes that affordable. Without the listing an abandoned upload could not be found at all — aborting one needs its bucket, key and upload id — so its parts held storage nothing could attribute to anyone. `DeleteBucket` still checks only for objects, so an upload in flight does not block a bucket delete; the parts are reachable now, but sweeping them is the caller's job.
+
+Deleting a bucket is authorized by the middleware's account comparison alone. The handler once re-decided it on the access key that created the bucket, which meant no other user in the account could remove it and no service credential ever could. Config-declared buckets are refused outright instead, to every caller: they hold the deployment's own state and are shared by every account, and a service credential is exactly the caller the ownership check waves through.
 
 `ListBuckets` carries one extension to the AWS surface. A config-defined service account may send `X-Predastore-Owner-Account-Id` to list the buckets of a named account instead of its own. Such a credential can already open any bucket it can name — `ConfigProvider` marks it `SkipPolicyCheck` and the ownership check short-circuits on that flag — so this adds enumeration, not access, and it is what lets an external control plane discover what a tenant owns in order to delete it.
 
