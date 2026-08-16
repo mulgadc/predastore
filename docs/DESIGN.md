@@ -178,6 +178,10 @@ TLS 1.3 minimum, HTTP/2 advertised over ALPN with HTTP/1.1 as fallback. Read and
 
 S3 overloads one method and path across several operations and distinguishes them by query string, which chi cannot match on, so the split is explicit in `routes.go`: `?partNumber` selects `UploadPart` over `PutObject`, and `?uploadId` selects the multipart completion and abort handlers.
 
+`ListBuckets` carries one extension to the AWS surface. A config-defined service account may send `X-Predastore-Owner-Account-Id` to list the buckets of a named account instead of its own. Such a credential can already open any bucket it can name — `ConfigProvider` marks it `SkipPolicyCheck` and the ownership check short-circuits on that flag — so this adds enumeration, not access, and it is what lets an external control plane discover what a tenant owns in order to delete it.
+
+Three properties make that safe, and each has a test. The header is ignored, not refused, for any other caller, so it cannot be used to tell a real account from an invented one. There is no value meaning "every account": the owner must be a single 12-digit account id, and anything else is `InvalidArgument` rather than an empty listing, because a caller tearing an account down would read empty as "nothing to delete". And a request that somehow reaches the handler with no account at all is refused before the bucket table is read.
+
 ## How the gate names things in global state
 
 The meta replicas are a plain key-value store. The table taxonomy is the gate's alone: it composes `<table>/` onto the front of every key it stores and strips it back off every key it scans.

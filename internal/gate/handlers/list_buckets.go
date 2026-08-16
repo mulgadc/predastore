@@ -5,16 +5,34 @@ import (
 	"encoding/gob"
 	"log/slog"
 	"net/http"
+	"regexp"
 
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
-// ListBuckets serves GET /: every bucket the caller's account owns.
+// OwnerAccountHeader asks for another account's buckets. It is honoured only
+// for config-defined service accounts and ignored for everyone else, which is
+// what keeps the tenant bucket namespace from becoming an enumeration oracle.
+const OwnerAccountHeader = "X-Predastore-Owner-Account-Id"
+
+// accountIDPattern is predastore's account id form. A value that is not one
+// would list nothing, and a caller tearing an account down reads an empty
+// listing as "no buckets" — so a malformed owner is refused rather than
+// answered.
+var accountIDPattern = regexp.MustCompile(`^[0-9]{12}$`)
+
+// ListBuckets serves GET /: every bucket owned by the caller's account, or by
+// the account named in OwnerAccountHeader when the caller is a service account.
 func ListBuckets(mc MetaClient) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
-		accountID := auth.AccountID(ctx)
+
+		owner, err := listBucketsOwner(r)
+		if err != nil {
+			HandleError(w, r, err)
+			return
+		}
 
 		items, err := metaScan(ctx, mc, model.TableBuckets, "", 0)
 		if err != nil {
@@ -22,12 +40,8 @@ func ListBuckets(mc MetaClient) http.Handler {
 			return
 		}
 
-		displayName := "Predastore"
-		if accountID != "" {
-			displayName = accountID
-		}
 		result := ListBucketsResult{
-			Owner: BucketOwner{ID: accountID, DisplayName: displayName},
+			Owner: BucketOwner{ID: owner, DisplayName: owner},
 		}
 
 		// A corrupt row is skipped rather than failing the listing: one bad bucket
@@ -39,7 +53,7 @@ func ListBuckets(mc MetaClient) http.Handler {
 				slog.WarnContext(ctx, "Skipping corrupt bucket entry during scan", "key", item.Key, "error", err)
 				continue
 			}
-			if accountID != "" && metadata.AccountID != accountID {
+			if metadata.AccountID != owner {
 				continue
 			}
 			if seen[metadata.Name] {
@@ -56,4 +70,37 @@ func ListBuckets(mc MetaClient) http.Handler {
 			slog.DebugContext(ctx, "failed to write XML response", "error", err)
 		}
 	})
+}
+
+// listBucketsOwner resolves whose buckets to list. There is deliberately no
+// value that means "every account": the owner is always exactly one account,
+// and a request that cannot name one is refused rather than answered broadly.
+func listBucketsOwner(r *http.Request) (string, error) {
+	ctx := r.Context()
+	caller := auth.AccountID(ctx)
+
+	requested := r.Header.Get(OwnerAccountHeader)
+	if requested == "" {
+		if caller == "" {
+			return "", model.NewS3Error(model.ErrAccessDenied, "Access Denied", http.StatusForbidden)
+		}
+		return caller, nil
+	}
+
+	if !auth.IsServiceAccount(ctx) {
+		// Ignored, not refused: an ordinary caller must not be able to tell a
+		// non-existent account from one it is not allowed to see.
+		slog.WarnContext(ctx, "Ignoring owner override from a non-service account",
+			"callerAccountID", caller, "requestedAccountID", requested)
+		if caller == "" {
+			return "", model.NewS3Error(model.ErrAccessDenied, "Access Denied", http.StatusForbidden)
+		}
+		return caller, nil
+	}
+
+	if !accountIDPattern.MatchString(requested) {
+		return "", model.NewS3Error(model.ErrInvalidArgument,
+			OwnerAccountHeader+" must be a 12-digit account id", http.StatusBadRequest)
+	}
+	return requested, nil
 }

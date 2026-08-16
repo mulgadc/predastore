@@ -41,6 +41,9 @@ const (
 	ContextKeyAccessKeyID contextKey = "accessKeyID"
 	// ContextKeyAccountID is the context key for the authenticated user's account ID.
 	ContextKeyAccountID contextKey = "accountID"
+	// ContextKeyServiceAccount marks the caller as a config-defined service
+	// account, the same credentials that carry SkipPolicyCheck.
+	ContextKeyServiceAccount contextKey = "serviceAccount"
 )
 
 // AccessKeyID returns the authenticated access key attached to ctx, or "" when
@@ -54,5 +57,13 @@ func AccessKeyID(ctx context.Context) string {
 // request was not authenticated.
 func AccountID(ctx context.Context) string {
 	v, _ := ctx.Value(ContextKeyAccountID).(string)
+	return v
+}
+
+// IsServiceAccount reports whether ctx carries a config-defined service
+// credential. It defaults to false, so an unauthenticated request or one that
+// never passed through the auth middleware is never treated as trusted.
+func IsServiceAccount(ctx context.Context) bool {
+	v, _ := ctx.Value(ContextKeyServiceAccount).(bool)
 	return v
 }

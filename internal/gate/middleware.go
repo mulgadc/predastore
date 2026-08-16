@@ -198,6 +198,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		ctx := context.WithValue(r.Context(), auth.ContextKeyAccessKeyID, accessKey)
 		ctx = context.WithValue(ctx, auth.ContextKeyAccountID, credResult.AccountID)
+		ctx = context.WithValue(ctx, auth.ContextKeyServiceAccount, credResult.SkipPolicyCheck)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

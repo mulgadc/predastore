@@ -29,6 +29,7 @@ const (
 	ErrChecksumMismatch        S3ErrorCode = "XAmzContentChecksumMismatch"
 	ErrInsufficientStorage     S3ErrorCode = "InsufficientStorage"
 	ErrMissingContentLength    S3ErrorCode = "MissingContentLength"
+	ErrInvalidArgument         S3ErrorCode = "InvalidArgument"
 )
 
 // S3Error represents a typed S3 error with code and message.
