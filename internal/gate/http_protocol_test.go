@@ -40,13 +40,15 @@ func negotiatedWith(t *testing.T, enableHTTP2 bool) string {
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(r.Proto))
 	}))
-	srv.EnableHTTP2 = true
+	// Both values must be in place before StartTLS spawns the serving
+	// goroutine, which reads them. StartTLS keeps a NextProtos that is already
+	// set and never touches Config.Protocols, so neither is overwritten.
+	srv.EnableHTTP2 = enableHTTP2
+	srv.Config.Protocols = httpProtocols(enableHTTP2)
+	srv.TLS = &tls.Config{NextProtos: alpnProtocols(enableHTTP2), MinVersion: tls.VersionTLS12}
+
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
-
-	// Restart the handler under the gate's own settings rather than httptest's.
-	srv.Config.Protocols = httpProtocols(enableHTTP2)
-	srv.TLS.NextProtos = alpnProtocols(enableHTTP2)
 
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{

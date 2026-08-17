@@ -389,7 +389,9 @@ func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place O
 
 		mu.Lock()
 		defer mu.Unlock()
-		// Distinct indices, so only the counter needs the lock.
+		// Indices are distinct, but the lock still guards the slice itself: the
+		// caller snapshots it once enough shards land, while slower reads are
+		// still outstanding and may yet write their own entry.
 		shards[index] = data
 		available++
 		if available >= need {
@@ -435,13 +437,18 @@ func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place O
 	case <-done:
 	}
 
+	// The hedge returns as soon as enough shards have landed, so the slower
+	// reads are still running. Hand back a snapshot: a straggler writing its
+	// entry must not mutate the slice the caller is reconstructing from.
 	mu.Lock()
 	defer mu.Unlock()
+	snapshot := make([][]byte, len(shards))
+	copy(snapshot, shards)
 	if available < need {
-		return shards, fmt.Errorf("%w: %d of %d shards available",
+		return snapshot, fmt.Errorf("%w: %d of %d shards available",
 			errInsufficientShards, available, need)
 	}
-	return shards, nil
+	return snapshot, nil
 }
 
 // slowShardThreshold is the point past which a shard read is worth naming its
