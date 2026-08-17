@@ -115,12 +115,19 @@ e2e-performance-compare: warp-install
 # raft elected instead, which currently fails: a gate keeps the frozen node
 # first in its meta read order and pays the full client timeout per key, so
 # listing slows in proportion to the number of objects.
-STRESS_CONFIG ?= 4host
-STRESS_FREEZE ?= 90
-STRESS_HOST   ?= follower
+#
+# STRESS_SCENARIO=partial-put runs a different fault entirely: a client that
+# stops sending mid-body. That one is not about the cluster surviving a host,
+# it is about a stalled upload neither running forever nor damaging the object
+# it is overwriting.
+STRESS_CONFIG   ?= 4host
+STRESS_FREEZE   ?= 90
+STRESS_HOST     ?= follower
+STRESS_SCENARIO ?= freeze
 e2e-stress: build certs warp-install
 	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
-		STRESS_HOST="$(STRESS_HOST)" WARP="$(WARP)" \
+		STRESS_HOST="$(STRESS_HOST)" STRESS_SCENARIO="$(STRESS_SCENARIO)" \
+		WARP="$(WARP)" \
 		./scripts/bench/e2e-stress.sh
 
 # NilAway — advisory nil-panic analysis. Not in preflight: it has a known

@@ -7,6 +7,62 @@ A minimal, manually-invoked harness for tracking predastore performance over tim
 - `bench-disk.sh` — raw-disk fio ceiling (run independently of predastore).
 - `bench-cluster.sh` — predastore cluster on loopback, driven by `warp mixed`.
 - `fio-jobs/` — four fio jobs covering predastore's predicted access patterns.
+- `e2e-stress.sh` — fault injection. Two scenarios, chosen by `STRESS_SCENARIO`.
+- `partialput/` — a PUT client that declares a body length and then stops sending,
+  used by the `partial-put` scenario. No S3 client can express this: they all
+  either finish the body or abort, and both already work. `-rate` paces the send
+  so a caller can kill it mid-body.
+
+### `e2e-stress` scenarios
+
+`freeze` (default) puts a four-host cluster under Warp GET load, stops one host
+with SIGSTOP, and asserts the survivors keep serving and the host rejoins raft.
+The fault is in the cluster.
+
+`partial-put` injects the fault in the *client* instead — the class that stranded
+PUTs for tens of minutes on a production cluster. It stores an object, opens an
+overwrite of the same key that does not complete, and asserts three things per
+case:
+
+- the object still reads back intact **while** the incomplete overwrite is outstanding;
+- the gate abandons the request within `STRESS_PARTIAL_ABANDON` seconds, measured
+  from the gate's own `S3 request still running` tracker rather than from the
+  client, whose elapsed time also counts however long it chose to stall;
+- the object still reads back intact afterwards.
+
+Six cases, varying the three things that could differ from production:
+
+| Case | Fault |
+|------|-------|
+| `http1-stall`, `http2-stall` | client stops sending mid-body and holds the connection open |
+| `http1-large` | the same, with a 512MiB declared body |
+| `http1-kill`, `http2-kill` | client SIGKILLed while genuinely still transmitting |
+| `concurrent` | eight stalled uploads at once, each declaring 512MiB |
+
+Both protocols appear because a stalled h2 stream is flow-control state on a
+shared connection while an HTTP/1.1 stall is a socket the server owns outright,
+and they need not fail the same way. The kill cases pace their send so the signal
+lands mid-body rather than after the upload has already finished.
+
+The concurrent case also logs the gate's peak RSS. `writeObject` allocates its
+shard buffers from the `Content-Length` the client declared, before reading any
+of the body, so N stalled uploads hold N × declared bytes. The figure is recorded,
+not asserted: no ceiling has been agreed, and a threshold would only be a guess.
+
+    make e2e-stress                                    # freeze
+    make e2e-stress STRESS_SCENARIO=partial-put        # incomplete client
+
+Tunables: `STRESS_PARTIAL_HOLD` (how long the client stalls, default 180),
+`STRESS_PARTIAL_ABANDON` (the bound the gate must meet, default 90),
+`STRESS_PARTIAL_DECLARE` and `STRESS_PARTIAL_SEND` (declared and actual body
+bytes), `STRESS_PARTIAL_LARGE_DECLARE` and `STRESS_PARTIAL_LARGE_SEND` (the same
+for the large and kill cases), `STRESS_PARTIAL_KILL_RATE` and
+`STRESS_PARTIAL_KILL_AFTER` (send pacing and when to kill),
+`STRESS_PARTIAL_CONCURRENCY` (default 8).
+
+The abandon bound must stay above the gate's 50s request deadline or it asserts
+nothing. Concurrency times the large declared size is roughly the peak memory the
+run needs, so raising either on a small machine is how it gets OOM-killed.
 
 All benchmarks can be run via the top-level dispatcher:
 

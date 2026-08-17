@@ -203,6 +203,282 @@ mapfile -t META_ALL < <(meta_nodes "$CONFIG_FILE" | awk '{print $2}')
 log "baseline raft state"
 meta_status "${META_ALL[@]}" | tee -a "$EVENTS"
 
+# --- Scenario: partial-put ---
+#
+# The freeze scenario below injects a fault in the cluster. This one injects a
+# fault in the client, which is the class that stranded PUTs for 51 minutes on
+# the test-prod cluster and corrupted eleven volume documents doing it.
+#
+# A client that stops sending mid-body is not a client that aborts: the request
+# stays open and the gate keeps waiting on bytes that never arrive. What makes
+# it a data-loss bug rather than a leak is that the shards of the object being
+# overwritten have already been replaced with the truncated ones, while the
+# metadata record still describes the object that was there before.
+if [ "${STRESS_SCENARIO:-freeze}" = partial-put ]; then
+    PARTIAL_PROBE="$WORK_DIR/partialput"
+    go build -o "$PARTIAL_PROBE" "$REPO_DIR/scripts/bench/partialput"
+
+    GATE="$(parse_hosts "$CONFIG_FILE" | awk '$3 != "" {print $2 ":" $3; exit}')"
+    [ -n "$GATE" ] || fail "no gate in $CONFIG_NAME"
+    ENDPOINT="https://$GATE"
+    BUCKET="stress-partial-${RUN_ID}"
+    KEY="victim.bin"
+    V1="$WORK_DIR/v1.bin"
+    GOT="$WORK_DIR/got.bin"
+
+    HOLD="${STRESS_PARTIAL_HOLD:-180}"
+    ABANDON="${STRESS_PARTIAL_ABANDON:-90}"
+    DECLARE="${STRESS_PARTIAL_DECLARE:-4194304}"
+    SEND="${STRESS_PARTIAL_SEND:-1048576}"
+
+    # The large case exists because the gate buffers every data shard in memory
+    # before it sends any of them, sized from the Content-Length the client
+    # declared. 512MiB declared is 512MiB of gate heap for a body that never
+    # arrives, which the 4MiB default cannot show.
+    LARGE_DECLARE="${STRESS_PARTIAL_LARGE_DECLARE:-536870912}"
+    LARGE_SEND="${STRESS_PARTIAL_LARGE_SEND:-134217728}"
+
+    # Paced so the client is provably still transmitting when it is killed,
+    # rather than already stalled: on loopback an unthrottled body of any size
+    # is finished before the kill lands.
+    KILL_RATE="${STRESS_PARTIAL_KILL_RATE:-4194304}"
+    KILL_AFTER="${STRESS_PARTIAL_KILL_AFTER:-5}"
+
+    log "partial-put scenario against $ENDPOINT (declare $DECLARE, send $SEND, hold ${HOLD}s)"
+
+    openssl rand -out "$V1" 1048576
+    aws_s3 "$ENDPOINT" s3 mb "s3://$BUCKET" >/dev/null
+    aws_s3 "$ENDPOINT" s3api put-object --bucket "$BUCKET" --key "$KEY" --body "$V1" >/dev/null
+    aws_s3 "$ENDPOINT" s3 cp "s3://$BUCKET/$KEY" "$GOT" --only-show-errors
+    diff -q "$V1" "$GOT" >/dev/null || fail "baseline object did not round trip"
+    log "baseline object stored and verified"
+
+    GATE_LOGS="$PREDA_DIR/$CONFIG_NAME/logs"
+
+    # gate_max_elapsed reports the longest the gate itself admits to still
+    # running a request for this key. The gate's own tracker is the measure that
+    # matters: a client's elapsed time also counts however long the client chose
+    # to stall, which is not evidence about the server.
+    #
+    # No matching line is the best possible answer, not an error: the tracker
+    # only starts logging once a request is already slow, so silence means the
+    # gate finished with it promptly. Reported as 0.
+    gate_max_elapsed() {
+        local found
+        found="$(grep -h "S3 request still running" "$GATE_LOGS"/*.log 2>/dev/null \
+            | grep -F "$1" \
+            | grep -oE '"elapsed_ms":[0-9]+' | cut -d: -f2 \
+            | sort -n | tail -1)" || true
+        echo "${found:-0}"
+    }
+
+    FAILURES=0
+
+    # run_case: <name> <http2> <declare> <send> <rate> <kill-after-seconds, 0 to stall>
+    #
+    # Each case stores a fresh object under its own key and then overwrites that
+    # key part-way. The overwrite has to target a key that already holds a
+    # readable object, or there is nothing for the partial write to damage and
+    # the assertions mean nothing.
+    run_case() {
+        local name="$1" http2_flag="$2" declare_len="$3" send_len="$4" rate="$5" kill_after="$6"
+        local case_key="case-${name}.bin"
+        local out="$RUN_DIR/partial-put-${name}.txt"
+
+        aws_s3 "$ENDPOINT" s3api put-object --bucket "$BUCKET" --key "$case_key" --body "$V1" >/dev/null
+        aws_s3 "$ENDPOINT" s3 cp "s3://$BUCKET/$case_key" "$GOT" --only-show-errors
+        diff -q "$V1" "$GOT" >/dev/null || fail "$name: baseline object did not round trip"
+
+        "$PARTIAL_PROBE" -endpoint "$ENDPOINT" -bucket "$BUCKET" -key "$case_key" \
+            -declare "$declare_len" -send "$send_len" -hold "${HOLD}s" -region "$REGION" \
+            -http2="$http2_flag" -rate "$rate" \
+            -access-key "$ACCESS_KEY" -secret-key "$SECRET_KEY" > "$out" 2>&1 &
+        local probe_pid="$!"
+
+        if [ "$kill_after" -gt 0 ]; then
+            # SIGKILL, because the production clients were killed rather than
+            # asked to stop: qemu and nbdkit went away mid-upload and never got
+            # to close anything. The kernel still closes the socket on process
+            # death, so this is the closest reachable approximation without
+            # dropping packets, and the gap between it and a truly vanished peer
+            # is itself worth knowing.
+            sleep "$kill_after"
+            kill -KILL "$probe_pid" 2>/dev/null || true
+            log "$name: killed the uploading client after ${kill_after}s"
+        else
+            # Long enough for the declared bytes to be sent and the gate to be
+            # waiting on the rest, short enough to still be inside the deadline.
+            sleep 10
+        fi
+
+        local during=pass
+        if ! aws_s3 "$ENDPOINT" s3 cp "s3://$BUCKET/$case_key" "$GOT" --only-show-errors 2>>"$EVENTS"; then
+            during="fail: GET errored"
+        elif ! diff -q "$V1" "$GOT" >/dev/null 2>&1; then
+            during="fail: GET returned different bytes"
+        fi
+
+        wait "$probe_pid" 2>/dev/null || true
+        if [ -s "$out" ]; then
+            log "$name probe: $(cat "$out")"
+        else
+            log "$name probe: killed before it reported"
+        fi
+
+        # The gate is given a moment past the bound to still be logging, so a
+        # request abandoned exactly on it is not read as one that ran.
+        sleep 5
+        local gate_ms
+        gate_ms="$(gate_max_elapsed "$case_key")"
+        gate_ms="${gate_ms:-0}"
+
+        local abandoned=pass
+        if [ "$gate_ms" -ge $(( ABANDON * 1000 )) ]; then
+            abandoned="fail: gate still ran the request at ${gate_ms}ms, past the ${ABANDON}s bound"
+        fi
+
+        local after=pass
+        if ! aws_s3 "$ENDPOINT" s3 cp "s3://$BUCKET/$case_key" "$GOT" --only-show-errors 2>>"$EVENTS"; then
+            after="fail: GET errored"
+        elif ! diff -q "$V1" "$GOT" >/dev/null 2>&1; then
+            after="fail: GET returned different bytes"
+        fi
+
+        log "$name: during=$during gate_max=${gate_ms}ms abandoned=$abandoned after=$after"
+        local result
+        for result in "$during" "$abandoned" "$after"; do
+            [ "$result" = pass ] || FAILURES=$(( FAILURES + 1 ))
+        done
+        CASES_RUN=$(( CASES_RUN + 3 ))
+    }
+
+    CASES_RUN=0
+
+    # Both protocols, because they need not fail the same way: a stalled h2
+    # stream is flow-control state on a shared connection, an HTTP/1.1 stall is
+    # a socket the server owns outright.
+    run_case http1-stall false "$DECLARE" "$SEND" 0 0
+    run_case http2-stall true  "$DECLARE" "$SEND" 0 0
+
+    # A body the size of the production writes that stranded, which were volume
+    # chunks rather than the 4MiB this defaults to. The gate buffers every data
+    # shard in memory before sending any, sized from the declared length, so
+    # size is the axis the small cases cannot vary.
+    run_case http1-large false "$LARGE_DECLARE" "$LARGE_SEND" 0 0
+
+    # The production shape: a client killed mid-upload rather than one that
+    # politely stops sending. Both protocols, because what the peer's death does
+    # to an h2 connection carrying other streams is not what it does to a
+    # dedicated HTTP/1.1 socket.
+    run_case http1-kill false "$LARGE_DECLARE" "$LARGE_SEND" "$KILL_RATE" "$KILL_AFTER"
+    run_case http2-kill true  "$LARGE_DECLARE" "$LARGE_SEND" "$KILL_RATE" "$KILL_AFTER"
+
+    # --- Many stalled uploads at once ---
+    #
+    # The last difference from production, which had 74 instances' worth of
+    # traffic in flight rather than one probe against an idle cluster.
+    #
+    # It also puts a number on the gate's shard buffers. writeObject reserves
+    # declared/DataShards bytes per data shard before it reads a byte, so N
+    # stalled uploads reserve N x declared bytes. Reserved is not resident, which
+    # is why both are recorded. Neither is asserted: what the right ceiling is
+    # has not been decided, and a threshold now would only be a guess.
+    CONCURRENCY="${STRESS_PARTIAL_CONCURRENCY:-8}"
+    GATE_PID="$(cat "$PREDA_DIR/$CONFIG_NAME/pids/host-1.pid")"
+
+    gate_rss_mb() {
+        awk '/^VmRSS:/ {print int($2/1024)}' "/proc/$GATE_PID/status" 2>/dev/null || echo 0
+    }
+
+    # Reserved separately from resident, because the shard buffers are allocated
+    # by capacity and untouched pages never become resident. A body that is
+    # declared but not sent moves this and not RSS, and the difference is the
+    # whole question.
+    gate_vsz_mb() {
+        awk '/^VmSize:/ {print int($2/1024)}' "/proc/$GATE_PID/status" 2>/dev/null || echo 0
+    }
+
+    CONC_KEYS=()
+    for i in $(seq 1 "$CONCURRENCY"); do
+        conc_key="case-concurrent-${i}.bin"
+        CONC_KEYS+=("$conc_key")
+        aws_s3 "$ENDPOINT" s3api put-object --bucket "$BUCKET" --key "$conc_key" --body "$V1" >/dev/null
+    done
+
+    RSS_BEFORE="$(gate_rss_mb)"
+    VSZ_BEFORE="$(gate_vsz_mb)"
+    CONC_PIDS=()
+    for conc_key in "${CONC_KEYS[@]}"; do
+        "$PARTIAL_PROBE" -endpoint "$ENDPOINT" -bucket "$BUCKET" -key "$conc_key" \
+            -declare "$LARGE_DECLARE" -send 1048576 -hold "${HOLD}s" -region "$REGION" \
+            -access-key "$ACCESS_KEY" -secret-key "$SECRET_KEY" \
+            > "$RUN_DIR/partial-put-concurrent-${#CONC_PIDS[@]}.txt" 2>&1 &
+        CONC_PIDS+=("$!")
+    done
+    log "concurrent: launched $CONCURRENCY stalled uploads declaring $LARGE_DECLARE each"
+
+    # Sampled across the deadline rather than read once, because the buffers are
+    # released when the handler returns and a single late read would miss them.
+    RSS_PEAK="$RSS_BEFORE"
+    VSZ_PEAK="$VSZ_BEFORE"
+    for _ in $(seq 1 30); do
+        sleep 2
+        rss="$(gate_rss_mb)"
+        if [ "$rss" -gt "$RSS_PEAK" ]; then
+            RSS_PEAK="$rss"
+        fi
+        vsz="$(gate_vsz_mb)"
+        if [ "$vsz" -gt "$VSZ_PEAK" ]; then
+            VSZ_PEAK="$vsz"
+        fi
+    done
+
+    CONC_DURING=pass
+    if ! aws_s3 "$ENDPOINT" s3 cp "s3://$BUCKET/${CONC_KEYS[0]}" "$GOT" --only-show-errors 2>>"$EVENTS"; then
+        CONC_DURING="fail: GET errored"
+    elif ! diff -q "$V1" "$GOT" >/dev/null 2>&1; then
+        CONC_DURING="fail: GET returned different bytes"
+    fi
+
+    for pid in "${CONC_PIDS[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    sleep 5
+
+    CONC_GATE_MS="$(gate_max_elapsed "case-concurrent-")"
+    CONC_ABANDONED=pass
+    if [ "$CONC_GATE_MS" -ge $(( ABANDON * 1000 )) ]; then
+        CONC_ABANDONED="fail: gate still ran a request at ${CONC_GATE_MS}ms, past the ${ABANDON}s bound"
+    fi
+
+    # Every key, not a sample: a partial write that damaged one object out of
+    # eight is exactly the production shape, and checking one would miss it.
+    CONC_AFTER=pass
+    for conc_key in "${CONC_KEYS[@]}"; do
+        if ! aws_s3 "$ENDPOINT" s3 cp "s3://$BUCKET/$conc_key" "$GOT" --only-show-errors 2>>"$EVENTS"; then
+            CONC_AFTER="fail: GET errored for $conc_key"
+            break
+        elif ! diff -q "$V1" "$GOT" >/dev/null 2>&1; then
+            CONC_AFTER="fail: $conc_key returned different bytes"
+            break
+        fi
+    done
+
+    log "concurrent: during=$CONC_DURING gate_max=${CONC_GATE_MS}ms abandoned=$CONC_ABANDONED after=$CONC_AFTER"
+    log "concurrent: gate rss ${RSS_BEFORE}->${RSS_PEAK}MB, vsz ${VSZ_BEFORE}->${VSZ_PEAK}MB across $CONCURRENCY stalled uploads"
+    for result in "$CONC_DURING" "$CONC_ABANDONED" "$CONC_AFTER"; do
+        [ "$result" = pass ] || FAILURES=$(( FAILURES + 1 ))
+    done
+    CASES_RUN=$(( CASES_RUN + 3 ))
+
+    aws_s3 "$ENDPOINT" s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true
+
+    echo "Stress results: $RUN_DIR"
+    [ "$FAILURES" -eq 0 ] || fail "partial-put scenario failed $FAILURES of $CASES_RUN assertions"
+    log "partial-put scenario passed"
+    exit 0
+fi
+
 # --- Topology ---
 #
 # Which host raft elects varies per run, so "leader" and "follower" are
