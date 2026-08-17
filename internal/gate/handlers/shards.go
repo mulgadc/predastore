@@ -333,56 +333,113 @@ func readShard(ctx context.Context, bc BlobClient, objectHash [32]byte, node con
 	return data, nil
 }
 
-// shardReaders creates readers for each shard, concurrently and tolerantly.
+// shardBytes reads an object's shards, concurrently, tolerantly and hedged.
 //
 // Concurrently, because reading them one after another makes an object's read
 // latency the sum of its shards rather than the slowest of them, so one slow
 // node stalls every read that touches it.
 //
 // Tolerantly, because a shard that cannot be read is exactly what the parity
-// exists for. A failed shard leaves a nil reader for the caller to
-// reconstruct; an error is returned only when too few shards survive for any
+// exists for. A failed shard leaves a nil entry for the caller to reconstruct
+// from; an error is returned only when too few shards survive for any
 // reconstruction to be possible.
-func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, parity bool) ([][]byte, error) {
-	shards := make([][]byte, len(place.DataShardNodes)+len(place.ParityShardNodes))
-
-	totalNodes := make([]config.NodeID, 0)
-	totalNodes = append(totalNodes, place.DataShardNodes...)
-
-	if parity {
-		totalNodes = append(totalNodes, place.ParityShardNodes...)
+//
+// Hedged, because the read is complete once enough shards have arrived, and
+// waiting for the rest hands a stalled node the power to set every reader's
+// latency. The data shards go first, so a healthy read never fetches a parity
+// shard it does not need; the parity shards follow only if the data shards have
+// not all landed shortly after, or one of them has already failed.
+func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes) ([][]byte, error) {
+	need := len(place.DataShardNodes)
+	shards := make([][]byte, need+len(place.ParityShardNodes))
+	if need == 0 {
+		return shards, nil
 	}
 
-	var wg sync.WaitGroup
-	for i := range totalNodes {
-		wg.Go(func() {
-			start := time.Now()
-			data, err := readShard(ctx, bc, objectHash, totalNodes[i], i)
-			if err != nil {
-				slog.WarnContext(ctx, "Shard read failed, falling back to parity",
-					"node", totalNodes[i], "index", i, "err", err,
-					"duration_ms", time.Since(start).Milliseconds())
-				return
-			}
-			if elapsed := time.Since(start); elapsed >= slowShardThreshold {
-				slog.WarnContext(ctx, "Shard read slow",
-					"node", totalNodes[i], "index", i, "duration_ms", elapsed.Milliseconds())
-			}
-			// Distinct indices, so no synchronisation is needed here.
-			shards[i] = data
-		})
-	}
-	wg.Wait()
+	// Cancelled on return, which abandons whatever is still outstanding: a
+	// shard that arrives after the object has been served is wasted work.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
+	var mu sync.Mutex
 	available := 0
-	for _, s := range shards {
-		if s != nil {
-			available++
+	enough := make(chan struct{})
+	dataFailed := make(chan struct{})
+	var enoughOnce, failedOnce sync.Once
+
+	read := func(index int, node config.NodeID) {
+		shardCtx, shardCancel := context.WithTimeout(ctx, shardReadTimeout)
+		defer shardCancel()
+
+		start := time.Now()
+		data, err := readShard(shardCtx, bc, objectHash, node, index)
+		if err != nil {
+			slog.WarnContext(ctx, "Shard read failed, falling back to parity",
+				"node", node, "index", index, "err", err,
+				"duration_ms", time.Since(start).Milliseconds())
+			if index < need {
+				failedOnce.Do(func() { close(dataFailed) })
+			}
+			return
+		}
+		if elapsed := time.Since(start); elapsed >= slowShardThreshold {
+			slog.WarnContext(ctx, "Shard read slow",
+				"node", node, "index", index, "duration_ms", elapsed.Milliseconds())
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		// Distinct indices, so only the counter needs the lock.
+		shards[index] = data
+		available++
+		if available >= need {
+			enoughOnce.Do(func() { close(enough) })
 		}
 	}
-	if available < len(place.DataShardNodes) {
+
+	// Every goroutine is registered before anything waits on them, so the
+	// parity reads wait for their cue rather than being started later.
+	var wg sync.WaitGroup
+	for i, node := range place.DataShardNodes {
+		wg.Go(func() { read(i, node) })
+	}
+	for i, node := range place.ParityShardNodes {
+		wg.Go(func() {
+			hedge := time.NewTimer(hedgeDelay)
+			defer hedge.Stop()
+			select {
+			case <-enough:
+				return // the data shards were enough on their own
+			case <-ctx.Done():
+				return
+			case <-dataFailed:
+			case <-hedge.C:
+			}
+			select {
+			case <-enough:
+				return
+			default:
+			}
+			read(need+i, node)
+		})
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-enough:
+	case <-done:
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if available < need {
 		return shards, fmt.Errorf("%w: %d of %d shards available",
-			errInsufficientShards, available, len(place.DataShardNodes))
+			errInsufficientShards, available, need)
 	}
 	return shards, nil
 }
@@ -390,6 +447,16 @@ func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place O
 // slowShardThreshold is the point past which a shard read is worth naming its
 // node for. A degrading node should be visible before it takes something down.
 const slowShardThreshold = 2 * time.Second
+
+// shardReadTimeout caps a single shard read regardless of how much budget the
+// caller had. A node that accepts a stream and never answers otherwise spends
+// the whole request on itself, and a generous caller is punished hardest.
+const shardReadTimeout = 5 * time.Second
+
+// hedgeDelay is how long the data shards get before the parity shards are
+// fetched as well. Comfortably above a healthy shard read, and far below
+// anything a client would notice.
+const hedgeDelay = 250 * time.Millisecond
 
 // errInsufficientShards reports that too few shards survived to rebuild the
 // object, as distinct from some shards being missing but recoverable.
@@ -425,12 +492,7 @@ func missingShards(shards [][]byte, n int) int {
 // one object wrote and deleted the same paths underneath each other. Keeping
 // them in memory also removes a second read of every shard, since the encoder
 // consumes the readers it is given.
-func reconstructObject(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, enc reedsolomon.StreamEncoder, size int64) (*bytes.Buffer, error) {
-	shards, err := shardBytes(ctx, bc, objectHash, place, true)
-	if err != nil {
-		return nil, err
-	}
-
+func reconstructObject(enc reedsolomon.StreamEncoder, shards [][]byte, size int64) (*bytes.Buffer, error) {
 	recovered := make([]*bytes.Buffer, len(shards))
 	writers := make([]io.Writer, len(shards))
 	for i := range shards {

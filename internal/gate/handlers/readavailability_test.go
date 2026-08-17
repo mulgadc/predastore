@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -164,3 +165,95 @@ func (b *slowBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequ
 }
 
 var _ BlobClient = (*slowBlob)(nil)
+
+// countingBlob records how many reads each node was asked for, so a test can
+// prove a shard was fetched once rather than once per pass.
+type countingBlob struct {
+	*fakeBlob
+
+	mu   sync.Mutex
+	gets map[config.NodeID]int
+}
+
+func newCountingBlob(inner *fakeBlob) *countingBlob {
+	return &countingBlob{fakeBlob: inner, gets: make(map[config.NodeID]int)}
+}
+
+func (b *countingBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
+	b.mu.Lock()
+	b.gets[node]++
+	b.mu.Unlock()
+	return b.fakeBlob.Get(ctx, node, req)
+}
+
+func (b *countingBlob) count(node config.NodeID) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.gets[node]
+}
+
+var _ BlobClient = (*countingBlob)(nil)
+
+// A node that accepts a read and then sits on it must not set the latency of
+// every object placed on it. With RS(2,1) the parity shard is a complete
+// answer, so the read should finish in about the hedge delay rather than
+// waiting out the stall — twice, which is what it used to do.
+func TestReadObjectDoesNotWaitOutAStalledNode(t *testing.T) {
+	t.Parallel()
+
+	const stall = 4 * time.Second
+	f := newWriteFixture(2, 1)
+	want := randomBytes(t, 1<<16)
+
+	ctx := context.Background()
+	objectHash := model.ObjectHash("b", "k")
+	_, err := writeObject(ctx, f.bc, f.ring, f.cfg, bytes.NewReader(want), int64(len(want)), objectHash)
+	require.NoError(t, err)
+
+	place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(want)))
+	require.NoError(t, err)
+
+	stalled := &downBlob{fakeBlob: f.bc, down: place.DataShardNodes[0], delay: stall}
+
+	start := time.Now()
+	got, err := readObject(ctx, stalled, f.cfg, "b", "k", place, place.Size)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "the parity shard makes this object readable")
+	assert.Equal(t, want, got, "the reconstructed object must be byte-identical")
+	assert.Lessf(t, elapsed, stall,
+		"the read took %v, so it waited for the stalled node", elapsed)
+	assert.Equal(t, int64(1), stalled.touched.Load(),
+		"the stalled node must be asked once, not once per read pass")
+}
+
+// A healthy read has no reason to fetch the parity shard, which at RS(2,1)
+// would be half again as much blob traffic for nothing.
+func TestReadObjectDoesNotFetchParityWhenTheDataShardsAnswer(t *testing.T) {
+	t.Parallel()
+
+	f := newWriteFixture(2, 1)
+	want := randomBytes(t, 1<<16)
+
+	ctx := context.Background()
+	objectHash := model.ObjectHash("b", "k")
+	_, err := writeObject(ctx, f.bc, f.ring, f.cfg, bytes.NewReader(want), int64(len(want)), objectHash)
+	require.NoError(t, err)
+
+	place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(want)))
+	require.NoError(t, err)
+
+	counting := newCountingBlob(f.bc)
+	got, err := readObject(ctx, counting, f.cfg, "b", "k", place, place.Size)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+
+	for _, node := range place.ParityShardNodes {
+		assert.Zerof(t, counting.count(node),
+			"parity node %d was read on a healthy object", node)
+	}
+	for _, node := range place.DataShardNodes {
+		assert.Equalf(t, 1, counting.count(node),
+			"data node %d was read more than once", node)
+	}
+}
