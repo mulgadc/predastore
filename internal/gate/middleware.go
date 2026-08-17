@@ -199,6 +199,11 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), auth.ContextKeyAccessKeyID, accessKey)
 		ctx = context.WithValue(ctx, auth.ContextKeyAccountID, credResult.AccountID)
 		ctx = context.WithValue(ctx, auth.ContextKeyServiceAccount, credResult.SkipPolicyCheck)
+		// The transaction span opens before authentication, so the account it
+		// resolved to can only be named here. One cluster serves many accounts
+		// and S3 is where a tenant's data lives, so an unattributed request is
+		// one nobody can be asked about.
+		annotateSpanAccount(ctx, credResult.AccountID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
