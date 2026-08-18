@@ -13,7 +13,7 @@ require (
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	github.com/klauspost/reedsolomon v1.14.1
 	github.com/minio/crc64nvme v1.1.1
-	github.com/mulgadc/bluebottle v1.16.1-0.20260812012137-683e88e465e3
+	github.com/mulgadc/bluebottle v1.17.0
 	github.com/nats-io/nats.go v1.53.1
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/quic-go/quic-go v0.61.0
