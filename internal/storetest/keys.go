@@ -18,6 +18,7 @@ var TestMasterKey = bytes.Repeat([]byte{0x42}, 32)
 func TestAEAD() cipher.AEAD {
 	aead, err := masterkey.NewAEAD(TestMasterKey)
 	if err != nil {
+		//nolint:forbidigo // The fixed 32-byte AES key must always produce a valid AEAD.
 		panic(err)
 	}
 	return aead

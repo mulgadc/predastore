@@ -132,6 +132,7 @@ func (p *ConnPool) Dial(ctx context.Context, remote config.NodeID) (transport.Co
 		}
 		conn, ok := res.Val.(transport.Conn)
 		if !ok {
+			//nolint:forbidigo // Temporary until ConnPool returns a sentinel error for this invariant violation.
 			panic("singleflight did not return a valid Conn")
 		}
 		return conn, nil
