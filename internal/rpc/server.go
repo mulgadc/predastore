@@ -276,9 +276,10 @@ func (s *Server) serveConn(
 	err := s.acceptStreams(acceptCtx, handlerCtx, conn, &streams)
 	streams.Wait()
 
+	// acceptStreams only ever returns by wrapping an accept failure, so err is
+	// never nil here and the benign terminations are the whole quiet set.
 	switch {
-	case err == nil,
-		errors.Is(err, context.Canceled),
+	case errors.Is(err, context.Canceled),
 		errors.Is(err, transport.ErrListenerClosed),
 		errors.Is(err, transport.ErrConnClosed):
 	default:
