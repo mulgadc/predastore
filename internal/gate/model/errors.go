@@ -148,8 +148,7 @@ func (e *S3Error) WithResource(resource string) *S3Error {
 
 // IsS3Error checks if an error is an S3Error and returns it.
 func IsS3Error(err error) (*S3Error, bool) {
-	var s3err *S3Error
-	if errors.As(err, &s3err) {
+	if s3err, ok := errors.AsType[*S3Error](err); ok {
 		return s3err, true
 	}
 	return nil, false

@@ -238,8 +238,7 @@ func Load(path string) (*Config, error) {
 	dec.DisallowUnknownFields()
 	cfg := &Config{}
 	if err := dec.Decode(cfg); err != nil {
-		var unknown *toml.StrictMissingError
-		if errors.As(err, &unknown) {
+		if unknown, ok := errors.AsType[*toml.StrictMissingError](err); ok {
 			return nil, fmt.Errorf("parse %s: unknown key %q", path, strings.Join(unknown.Errors[0].Key(), "."))
 		}
 		return nil, fmt.Errorf("parse %s: %w", path, err)

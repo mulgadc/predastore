@@ -133,8 +133,7 @@ func TestStreamConnCloseSignalsDoneAndPeer(t *testing.T) {
 		if !errors.Is(err, io.EOF) {
 			// Abort-before-close can surface as a StreamError instead of
 			// EOF; either way the read must not hang.
-			var se *StreamError
-			if !errors.As(err, &se) {
+			if _, ok := errors.AsType[*StreamError](err); !ok {
 				t.Fatalf("peer read: %v", err)
 			}
 		}
