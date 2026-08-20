@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
@@ -27,7 +27,7 @@ func CreateMultipartUpload(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
-		uploadID := uuid.New().String()
+		uploadID := uuid.NewV4().String()
 		metadata := model.UploadMetadata{
 			UploadID:    uploadID,
 			Bucket:      bucket,

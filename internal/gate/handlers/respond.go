@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/mulgadc/bluebottle/pkg/otelsetup"
 	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/gate/auth"
@@ -80,7 +80,7 @@ func WriteS3Error(w http.ResponseWriter, r *http.Request, statusCode int, code, 
 	s3error := S3Error{
 		Code:      code,
 		Message:   message,
-		RequestId: uuid.NewString(),
+		RequestId: uuid.NewV4().String(),
 		HostId:    r.Host,
 	}
 	otelsetup.SetRequestErrorCode(r.Context(), code)
@@ -128,7 +128,7 @@ func HandleError(w http.ResponseWriter, r *http.Request, err error) {
 		}
 	}
 
-	s3error.RequestId = uuid.NewString()
+	s3error.RequestId = uuid.NewV4().String()
 	s3error.HostId = r.Host
 	otelsetup.SetRequestErrorCode(r.Context(), s3error.Code)
 
