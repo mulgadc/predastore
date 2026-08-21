@@ -2,6 +2,9 @@ package telemetry
 
 import (
 	"context"
+	"maps"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -123,14 +126,14 @@ func TestRecordMultipartUploadTracksActiveAndRejectionLeavesItOpen(t *testing.T)
 	RecordMultipartUpload(ctx, UploadCompleted)
 
 	m := collect(t, reader)
-	if got := sumFor(t, m["predastore.multipart.uploads.active"], nil); got != 1 {
-		t.Errorf("active uploads = %d, want 1", got)
+	if got := sumFor(t, m["predastore.multipart.sessions"], nil); got != 1 {
+		t.Errorf("open sessions = %d, want 1", got)
 	}
 
 	RecordMultipartUpload(ctx, UploadAborted)
 	m = collect(t, reader)
-	if got := sumFor(t, m["predastore.multipart.uploads.active"], nil); got != 0 {
-		t.Errorf("active uploads after abort = %d, want 0", got)
+	if got := sumFor(t, m["predastore.multipart.sessions"], nil); got != 0 {
+		t.Errorf("open sessions after abort = %d, want 0", got)
 	}
 }
 
@@ -144,7 +147,7 @@ func TestRecordMultipartPartCountsPartsAndBytes(t *testing.T) {
 	RecordMultipartPart(ctx, 0)
 
 	m := collect(t, reader)
-	if got := sumFor(t, m["predastore.multipart.parts"], nil); got != 3 {
+	if got := sumFor(t, m["predastore.multipart.part.count"], nil); got != 3 {
 		t.Errorf("parts = %d, want 3", got)
 	}
 	if got := sumFor(t, m["predastore.multipart.part.bytes"], nil); got != 12<<20 {
@@ -162,7 +165,7 @@ func TestRecordMultipartPartFetchSeparatesOutcomes(t *testing.T) {
 	RecordMultipartPartFetch(ctx, FetchReasonMetaMissing)
 
 	m := collect(t, reader)
-	data := m["predastore.multipart.part_fetches"]
+	data := m["predastore.multipart.part.fetches"]
 	if got := sumFor(t, data, map[string]string{"outcome": "success"}); got != 1 {
 		t.Errorf("successful fetches = %d, want 1", got)
 	}
@@ -343,6 +346,40 @@ func TestRegisterRaftGaugesUnregisterStopsObservation(t *testing.T) {
 	if data, ok := m["predastore.meta.raft.term"]; ok {
 		if _, found := gaugeFor(t, data, map[string]string{"node": "5"}); found {
 			t.Error("term still observed after unregister")
+		}
+	}
+}
+
+// Elasticsearch maps a dotted metric name as a path, so a name that is also
+// another name's prefix would have to be both a leaf and an object. The second
+// one to arrive is rejected and its series are lost. Exercising every recorder
+// and then comparing the names that actually reached the reader keeps this
+// honest as instruments are added.
+func TestNoMetricNameIsAnotherPrefix(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordMultipartUpload(ctx, UploadCreated)
+	RecordMultipartPart(ctx, 1)
+	RecordMultipartPartFetch(ctx, "")
+	RecordShardError(ctx, "read", ShardReasonNotFound)
+	unregister, err := RegisterRaftGauges(func() RaftSnapshot {
+		return RaftSnapshot{NodeID: "1", State: "Leader", LeaderKnown: true, Term: "1", CommitIndex: "2", AppliedIndex: "1"}
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	defer func() { _ = unregister() }()
+
+	names := slices.Collect(maps.Keys(collect(t, reader)))
+	if len(names) == 0 {
+		t.Fatal("no metrics collected")
+	}
+	for _, outer := range names {
+		for _, inner := range names {
+			if outer != inner && strings.HasPrefix(inner, outer+".") {
+				t.Errorf("%q is a prefix of %q: Elasticsearch cannot map it as both a leaf and an object", outer, inner)
+			}
 		}
 	}
 }

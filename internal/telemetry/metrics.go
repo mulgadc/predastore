@@ -29,11 +29,11 @@ var (
 	raftAppliedLag   metric.Int64ObservableGauge
 	raftLeaderKnown  metric.Int64ObservableGauge
 
-	multipartUploads       metric.Int64Counter
-	multipartActiveUploads metric.Int64UpDownCounter
-	multipartParts         metric.Int64Counter
-	multipartPartBytes     metric.Int64Counter
-	multipartPartFetches   metric.Int64Counter
+	multipartUploads     metric.Int64Counter
+	multipartSessions    metric.Int64UpDownCounter
+	multipartPartCount   metric.Int64Counter
+	multipartPartBytes   metric.Int64Counter
+	multipartPartFetches metric.Int64Counter
 
 	shardErrors metric.Int64Counter
 )
@@ -83,19 +83,24 @@ func instruments() {
 			otel.Handle(err)
 		}
 
+		// No metric name may also be another's prefix: Elasticsearch would
+		// have to map the same field as both a leaf and an object, and the
+		// second one to arrive is rejected. So "part" is a namespace only
+		// (count/bytes/fetches siblings), and the open-session gauge is a
+		// sibling of "uploads" rather than a child of it.
 		multipartUploads, err = meter.Int64Counter("predastore.multipart.uploads",
 			metric.WithDescription("Multipart uploads by outcome: created, completed, aborted or rejected."),
 			metric.WithUnit("{upload}"))
 		if err != nil {
 			otel.Handle(err)
 		}
-		multipartActiveUploads, err = meter.Int64UpDownCounter("predastore.multipart.uploads.active",
+		multipartSessions, err = meter.Int64UpDownCounter("predastore.multipart.sessions",
 			metric.WithDescription("Multipart uploads created but not yet completed or aborted. A floor that rises across runs is leaked upload state."),
 			metric.WithUnit("{upload}"))
 		if err != nil {
 			otel.Handle(err)
 		}
-		multipartParts, err = meter.Int64Counter("predastore.multipart.parts",
+		multipartPartCount, err = meter.Int64Counter("predastore.multipart.part.count",
 			metric.WithDescription("Parts stored for multipart uploads."),
 			metric.WithUnit("{part}"))
 		if err != nil {
@@ -107,7 +112,7 @@ func instruments() {
 		if err != nil {
 			otel.Handle(err)
 		}
-		multipartPartFetches, err = meter.Int64Counter("predastore.multipart.part_fetches",
+		multipartPartFetches, err = meter.Int64Counter("predastore.multipart.part.fetches",
 			metric.WithDescription("Part read-backs during completion, by outcome and failure reason."),
 			metric.WithUnit("{fetch}"))
 		if err != nil {
@@ -223,30 +228,30 @@ const (
 )
 
 // RecordMultipartUpload counts one upload reaching outcome, and keeps the
-// active-upload count in step: created opens one, completed and aborted each
-// close one. rejected leaves the upload open, because it is still there.
+// open-session count in step: created opens one, completed and aborted each
+// close one. rejected leaves the session open, because it is still there.
 func RecordMultipartUpload(ctx context.Context, outcome string) {
 	instruments()
 	opt := metric.WithAttributeSet(attribute.NewSet(attribute.String("outcome", outcome)))
 	if multipartUploads != nil {
 		multipartUploads.Add(ctx, 1, opt)
 	}
-	if multipartActiveUploads == nil {
+	if multipartSessions == nil {
 		return
 	}
 	switch outcome {
 	case UploadCreated:
-		multipartActiveUploads.Add(ctx, 1)
+		multipartSessions.Add(ctx, 1)
 	case UploadCompleted, UploadAborted:
-		multipartActiveUploads.Add(ctx, -1)
+		multipartSessions.Add(ctx, -1)
 	}
 }
 
 // RecordMultipartPart counts one part stored, and the bytes it carried.
 func RecordMultipartPart(ctx context.Context, size int64) {
 	instruments()
-	if multipartParts != nil {
-		multipartParts.Add(ctx, 1)
+	if multipartPartCount != nil {
+		multipartPartCount.Add(ctx, 1)
 	}
 	if multipartPartBytes != nil && size > 0 {
 		multipartPartBytes.Add(ctx, size)
