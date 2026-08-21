@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 // AbortMultipartUpload serves DELETE /{bucket}/{key}?uploadId=X: it discards an
@@ -46,6 +47,7 @@ func AbortMultipartUpload(mc MetaClient, bc BlobClient, cache *BucketCache) http
 			slog.WarnContext(ctx, "Failed to cleanup multipart upload", "uploadID", uploadID, "error", err)
 		}
 
+		telemetry.RecordMultipartUpload(ctx, telemetry.UploadAborted)
 		slog.DebugContext(ctx, "Multipart upload aborted", "bucket", bucket, "key", key, "uploadID", uploadID)
 
 		w.WriteHeader(http.StatusNoContent)

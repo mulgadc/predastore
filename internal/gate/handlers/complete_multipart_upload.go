@@ -12,6 +12,7 @@ import (
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 // maxParallelPartFetches bounds the read-back fan-out while assembling an
@@ -74,6 +75,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		if err := model.ValidatePartsForCompletion(parts, storedParts); err != nil {
 			// A rejected completion is a client-visible 400 and nothing else,
 			// so without this the upload simply disappears from the logs.
+			telemetry.RecordMultipartUpload(ctx, telemetry.UploadRejected)
 			slog.WarnContext(ctx, "Multipart completion rejected",
 				"uploadID", uploadID, "requested", len(parts), "stored", len(storedParts), "error", err)
 			HandleError(w, r, err)
@@ -131,6 +133,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			slog.WarnContext(ctx, "Failed to cleanup multipart upload", "uploadID", uploadID, "error", err)
 		}
 
+		telemetry.RecordMultipartUpload(ctx, telemetry.UploadCompleted)
 		slog.DebugContext(ctx, "Multipart upload completed", "bucket", bucket, "key", key, "uploadID", uploadID, "parts", len(parts))
 
 		if err := writeXML(w, http.StatusOK, CompleteMultipartUploadResult{
@@ -220,13 +223,21 @@ func streamParts(
 func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, bucket, key, uploadID string, partNumber int) ([]byte, error) {
 	data, err := metaGet(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber))
 	if err != nil {
+		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonMetaMissing)
 		return nil, fmt.Errorf("part not found: uploadID=%s part=%d", uploadID, partNumber)
 	}
 
 	var place ObjectToShardNodes
 	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&place); err != nil {
+		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonPlacementDecode)
 		return nil, err
 	}
 
-	return readObject(ctx, bc, cfg, bucket, partObjectKey(key, uploadID, partNumber), place, place.Size)
+	part, err := readObject(ctx, bc, cfg, bucket, partObjectKey(key, uploadID, partNumber), place, place.Size)
+	if err != nil {
+		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonShardRead)
+		return nil, err
+	}
+	telemetry.RecordMultipartPartFetch(ctx, "")
+	return part, nil
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/mulgadc/predastore/internal/rpc"
+	"github.com/mulgadc/predastore/internal/telemetry"
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
@@ -44,6 +45,10 @@ type Server struct {
 	fsm       *FSM
 	badgerDB  *badger.DB
 	bolt      *raftboltdb.BoltStore
+
+	// unregisterMetrics detaches the raft gauge callback. It is nil until
+	// raft exists, since the callback reads it on every collection.
+	unregisterMetrics func() error
 }
 
 // New validates cfg and applies its defaults. It creates no directory, opens
@@ -159,12 +164,35 @@ func (s *Server) open() (*rpc.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create raft: %w", err)
 	}
+	// Consensus state is only observable once raft exists. A failure to
+	// register loses the gauges, not the replica, so it is logged and left.
+	unregister, err := telemetry.RegisterRaftGauges(s.raftSnapshot)
+	if err != nil {
+		slog.Warn("failed to register raft metrics", "node", s.cfg.NodeID, "error", err)
+	} else {
+		s.unregisterMetrics = unregister
+	}
+
 	if s.cfg.Bootstrap {
 		if err := s.bootstrap(); err != nil {
 			return nil, fmt.Errorf("bootstrap cluster: %w", err)
 		}
 	}
 	return srv, nil
+}
+
+// raftSnapshot adapts this replica's status to the shape the gauges observe.
+// It is called on every metric collection, so it reads local state only.
+func (s *Server) raftSnapshot() telemetry.RaftSnapshot {
+	st := s.status()
+	return telemetry.RaftSnapshot{
+		NodeID:       st.NodeID,
+		State:        st.State,
+		LeaderKnown:  st.Leader != "",
+		Term:         st.Term,
+		CommitIndex:  st.CommitIndex,
+		AppliedIndex: st.AppliedIndex,
+	}
 }
 
 // raftConfig applies this replica's identity and tuning over raft's own
@@ -250,6 +278,15 @@ func (s *Server) watchLeader(ctx context.Context) {
 func (s *Server) shutdown() error {
 	slog.Info("starting shutdown")
 	var errs []error
+
+	// Detached before raft goes away, so a collection landing mid-shutdown
+	// cannot read a replica that is already tearing itself down.
+	if s.unregisterMetrics != nil {
+		if err := s.unregisterMetrics(); err != nil {
+			errs = append(errs, fmt.Errorf("unregister raft metrics: %w", err))
+		}
+		s.unregisterMetrics = nil
+	}
 
 	// Closing the transport first stops all network activity: it prevents
 	// election loops when peers have already stopped, and turns their calls
