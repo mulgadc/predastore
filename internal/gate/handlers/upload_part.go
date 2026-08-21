@@ -11,6 +11,7 @@ import (
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 // UploadPart serves PUT /{bucket}/{key}?partNumber=N&uploadId=X. A part is
@@ -104,6 +105,7 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			return
 		}
 
+		telemetry.RecordMultipartPart(ctx, partSize)
 		slog.DebugContext(ctx, "Part uploaded", "uploadID", uploadID, "partNumber", partNumber, "size", partSize, "etag", etag)
 
 		w.Header().Set("ETag", etag)

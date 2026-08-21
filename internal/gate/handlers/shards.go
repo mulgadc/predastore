@@ -17,6 +17,7 @@ import (
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 // ObjectToShardNodes maps an object to its shard locations.
@@ -321,6 +322,7 @@ func readShard(ctx context.Context, bc BlobClient, objectHash [32]byte, node con
 		Index:      uint32(index), //nolint:gosec // G115: index bounded by shard count (small uint).
 	})
 	if err != nil {
+		recordShardReadError(ctx, err)
 		return nil, err
 	}
 	data, err := io.ReadAll(reader)
@@ -328,9 +330,21 @@ func readShard(ctx context.Context, bc BlobClient, objectHash [32]byte, node con
 		slog.DebugContext(ctx, "Failed to close shard stream reader", "node", node, "error", closeErr)
 	}
 	if err != nil {
+		recordShardReadError(ctx, err)
 		return nil, err
 	}
 	return data, nil
+}
+
+// recordShardReadError counts a failed shard read under a bounded reason. The
+// error text names a node and a key, so only the classification is recorded:
+// a node that answered without the shard, or anything else.
+func recordShardReadError(ctx context.Context, err error) {
+	reason := telemetry.ShardReasonTransport
+	if errors.Is(err, blob.ErrNotFound) {
+		reason = telemetry.ShardReasonNotFound
+	}
+	telemetry.RecordShardError(ctx, "read", reason)
 }
 
 // shardBytes reads an object's shards, concurrently, tolerantly and hedged.

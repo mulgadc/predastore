@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/mulgadc/predastore/internal/gate/model"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 // CreateMultipartUpload serves POST /{bucket}/{key} without an uploadId: it
@@ -49,6 +50,7 @@ func CreateMultipartUpload(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
+		telemetry.RecordMultipartUpload(ctx, telemetry.UploadCreated)
 		slog.DebugContext(ctx, "Multipart upload created", "bucket", bucket, "key", key, "uploadID", uploadID)
 
 		w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
