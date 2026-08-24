@@ -13,6 +13,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// A legacy session record with an empty principal_type resolves as assumed-role
+// everywhere else, so it must not read as an IAM user here either — that would
+// hand aws:username the caller-chosen RoleSessionName.
+func TestCredentialResult_IsIAMUser(t *testing.T) {
+	for principalType, want := range map[string]bool{
+		principalTypeUser:        true,
+		principalTypeAssumedRole: false,
+		"":                       false,
+		"federated":              false,
+	} {
+		cred := &CredentialResult{UserName: "alice", PrincipalType: principalType}
+		assert.Equal(t, want, cred.IsIAMUser(), "principalType %q", principalType)
+	}
+}
+
 // --- ConfigProvider tests ---
 
 func TestConfigProvider_Found(t *testing.T) {

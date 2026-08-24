@@ -152,7 +152,7 @@ func TestConditionKeys_PopulatesEverySupportedKey(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/my-bucket?prefix=home/alice/", nil)
 	r.RemoteAddr = "10.4.1.9:52344"
 	r.TLS = &tls.ConnectionState{}
-	cred := &auth.CredentialResult{AccountID: "000000000001", UserName: "alice"}
+	cred := &auth.CredentialResult{AccountID: "000000000001", UserName: "alice", PrincipalType: "user"}
 
 	keys := conditionKeys(r, "s3:ListBucket", cred)
 
@@ -163,6 +163,37 @@ func TestConditionKeys_PopulatesEverySupportedKey(t *testing.T) {
 		iampolicy.KeyPrincipalAccount: "000000000001",
 		iampolicy.KeyS3Prefix:         "home/alice/",
 	}, keys)
+}
+
+// RoleSessionName is chosen by the caller of AssumeRole and lands in UserName
+// for a session, so aws:username must stay absent — otherwise anyone permitted
+// to assume the role satisfies the condition just by naming their session.
+func TestConditionKeys_OmitsUsernameForAssumedRole(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/my-bucket/obj", nil)
+	r.RemoteAddr = "10.4.1.9:52344"
+	cred := &auth.CredentialResult{
+		AccountID:     "000000000001",
+		UserName:      "alice",
+		PrincipalType: "assumed-role",
+	}
+
+	keys := conditionKeys(r, "s3:GetObject", cred)
+
+	assert.NotContains(t, keys, iampolicy.KeyUsername)
+	assert.Equal(t, "000000000001", keys[iampolicy.KeyPrincipalAccount])
+}
+
+// An empty value would compare as a real value that matches nothing, which on a
+// Deny widens access instead of narrowing it. Absent is the only safe reading.
+func TestConditionKeys_OmitsEmptyValues(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/my-bucket/obj", nil)
+	r.RemoteAddr = ""
+
+	keys := conditionKeys(r, "s3:GetObject", &auth.CredentialResult{PrincipalType: "user"})
+
+	assert.NotContains(t, keys, iampolicy.KeySourceIP)
+	assert.NotContains(t, keys, iampolicy.KeyUsername)
+	assert.NotContains(t, keys, iampolicy.KeyPrincipalAccount)
 }
 
 // s3:prefix exists only for a bucket listing; on any other action the key must

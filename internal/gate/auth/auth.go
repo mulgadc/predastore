@@ -35,6 +35,16 @@ type CredentialResult struct {
 	// Adding an [[auth]] entry to predastore.toml therefore grants god-mode.
 	SkipPolicyCheck bool
 	PolicyDocuments []iampolicy.PolicyDocument // resolved policies (only for NATS-sourced credentials)
+	// PrincipalType is "user" or "assumed-role", mirroring the session record.
+	// Empty for config-based credentials, which skip policy evaluation entirely.
+	PrincipalType string
+}
+
+// IsIAMUser reports whether the credential resolves to a real IAM user rather
+// than a role session. aws:username is user-only: a session's UserName is the
+// caller-chosen RoleSessionName and must never gate authorization.
+func (c *CredentialResult) IsIAMUser() bool {
+	return c.PrincipalType == principalTypeUser
 }
 
 // CredentialProvider looks up credentials by access key ID.
@@ -516,6 +526,7 @@ func (p *NATSIAMProvider) lookupSessionCredentials(ctx context.Context, accessKe
 		UserName:        cred.SessionName,
 		SkipPolicyCheck: false,
 		PolicyDocuments: policies,
+		PrincipalType:   cred.PrincipalType,
 	}, nil
 }
 
@@ -635,6 +646,7 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 		UserName:        ak.UserName,
 		SkipPolicyCheck: false,
 		PolicyDocuments: policies,
+		PrincipalType:   principalTypeUser,
 	}
 
 	// Cache the result
