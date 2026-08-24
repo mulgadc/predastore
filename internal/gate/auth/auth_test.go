@@ -222,7 +222,7 @@ func TestResolveRolePolicies_InlineAllow(t *testing.T) {
 	docs, err := p.resolveRolePolicies(context.Background(), inlineTestAccount, "InlineRole")
 	require.NoError(t, err)
 	require.Len(t, docs, 1)
-	assert.Equal(t, iampolicy.Allow, iampolicy.Evaluate("s3:ListBucket", "arn:aws:s3:::any", docs), "inline Allow must be honoured")
+	assert.Equal(t, iampolicy.Allow, iampolicy.EvaluateWithKeys("s3:ListBucket", "arn:aws:s3:::any", docs, nil), "inline Allow must be honoured")
 }
 
 // TestResolveRolePolicies_InlineDenyOverridesManagedAllow proves inline and
@@ -251,7 +251,7 @@ func TestResolveRolePolicies_InlineDenyOverridesManagedAllow(t *testing.T) {
 	docs, err := p.resolveRolePolicies(context.Background(), inlineTestAccount, "DenyRole")
 	require.NoError(t, err)
 	require.Len(t, docs, 2, "managed Allow and inline Deny must both resolve")
-	assert.Equal(t, iampolicy.Deny, iampolicy.Evaluate("s3:ListBucket", "arn:aws:s3:::any", docs), "inline Deny must override managed Allow")
+	assert.Equal(t, iampolicy.Deny, iampolicy.EvaluateWithKeys("s3:ListBucket", "arn:aws:s3:::any", docs, nil), "inline Deny must override managed Allow")
 }
 
 // TestResolveRolePolicies_InlineMalformed proves a corrupt inline document fails
@@ -276,7 +276,7 @@ func TestResolveRolePolicies_InlineMalformed(t *testing.T) {
 // allowed reports whether the S3 action on resource is permitted by the
 // resolved policies.
 func allowed(action, resource string, policies []iampolicy.PolicyDocument) bool {
-	return iampolicy.Evaluate(action, resource, policies) == iampolicy.Allow
+	return iampolicy.EvaluateWithKeys(action, resource, policies, nil) == iampolicy.Allow
 }
 
 // A Bool condition leaf is an AWS-routine shape. If it failed to unmarshal, the

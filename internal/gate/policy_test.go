@@ -75,7 +75,7 @@ func doc(effect, action, resource string) iampolicy.PolicyDocument {
 
 // allowed reports whether the S3 action on resource is permitted.
 func allowed(action, resource string, policies []iampolicy.PolicyDocument) bool {
-	return iampolicy.Evaluate(action, resource, policies) == iampolicy.Allow
+	return iampolicy.EvaluateWithKeys(action, resource, policies, nil) == iampolicy.Allow
 }
 
 func TestEvaluateS3Access_DefaultDeny(t *testing.T) {
@@ -154,7 +154,7 @@ func TestConditionKeys_PopulatesEverySupportedKey(t *testing.T) {
 	r.TLS = &tls.ConnectionState{}
 	cred := &auth.CredentialResult{AccountID: "000000000001", UserName: "alice"}
 
-	keys := conditionKeys(r, actionListBucket, cred)
+	keys := conditionKeys(r, "s3:ListBucket", cred)
 
 	assert.Equal(t, iampolicy.ConditionKeys{
 		iampolicy.KeySourceIP:         "10.4.1.9",
@@ -178,9 +178,21 @@ func TestConditionKeys_PrefixOnlyForListBucket(t *testing.T) {
 	assert.Equal(t, "false", keys[iampolicy.KeySecureTransport])
 }
 
-func TestClientIP(t *testing.T) {
-	assert.Equal(t, "10.4.1.9", clientIP("10.4.1.9:52344"))
-	assert.Equal(t, "2001:db8::1", clientIP("[2001:db8::1]:443"))
-	// No port to strip — pass the address through rather than dropping it.
-	assert.Equal(t, "10.4.1.9", clientIP("10.4.1.9"))
+func TestConditionKeys_SourceIPForms(t *testing.T) {
+	tests := map[string]string{
+		"10.4.1.9:52344":    "10.4.1.9",
+		"[2001:db8::1]:443": "2001:db8::1",
+		// No port to strip — pass the address through rather than dropping it.
+		"10.4.1.9": "10.4.1.9",
+	}
+	for remoteAddr, want := range tests {
+		t.Run(remoteAddr, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/my-bucket/obj", nil)
+			r.RemoteAddr = remoteAddr
+
+			keys := conditionKeys(r, "s3:GetObject", &auth.CredentialResult{})
+
+			assert.Equal(t, want, keys[iampolicy.KeySourceIP])
+		})
+	}
 }

@@ -10,9 +10,6 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
-// actionListBucket is the only S3 action AWS supplies s3:prefix for.
-const actionListBucket = "s3:ListBucket"
-
 // bucketAccessAllowed enforces the S3 default-deny ownership invariant on top
 // of an already-allowed IAM policy decision. Same-account callers pass; the
 // public flag opens read-only anonymous access (GET/HEAD only — never writes);
@@ -48,12 +45,12 @@ func s3Action(method, bucket, key string) string {
 		if hasKey {
 			return "s3:GetObject"
 		}
-		return actionListBucket
+		return "s3:ListBucket"
 	case http.MethodHead:
 		if hasKey {
 			return "s3:GetObject"
 		}
-		return actionListBucket
+		return "s3:ListBucket"
 	case http.MethodPut:
 		if hasKey {
 			return "s3:PutObject"
@@ -88,24 +85,19 @@ func s3Resource(bucket, key string) string {
 // s3:prefix is set only for a bucket listing, matching AWS: on any other action
 // the key is absent, which evaluates a condition on it false.
 func conditionKeys(r *http.Request, action string, cred *auth.CredentialResult) iampolicy.ConditionKeys {
+	// A RemoteAddr with no port is passed through rather than dropped.
+	sourceIP := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		sourceIP = host
+	}
 	keys := iampolicy.ConditionKeys{
-		iampolicy.KeySourceIP:         clientIP(r.RemoteAddr),
+		iampolicy.KeySourceIP:         sourceIP,
 		iampolicy.KeySecureTransport:  strconv.FormatBool(r.TLS != nil),
 		iampolicy.KeyUsername:         cred.UserName,
 		iampolicy.KeyPrincipalAccount: cred.AccountID,
 	}
-	if action == actionListBucket {
+	if action == "s3:ListBucket" {
 		keys[iampolicy.KeyS3Prefix] = r.URL.Query().Get("prefix")
 	}
 	return keys
-}
-
-// clientIP strips the port from a RemoteAddr, leaving the bare address that
-// aws:SourceIp compares against.
-func clientIP(remoteAddr string) string {
-	host, _, err := net.SplitHostPort(remoteAddr)
-	if err != nil {
-		return remoteAddr
-	}
-	return host
 }
