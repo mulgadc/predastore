@@ -1,9 +1,13 @@
 package gate
 
 import (
+	"crypto/tls"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
+	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -71,7 +75,7 @@ func doc(effect, action, resource string) iampolicy.PolicyDocument {
 
 // allowed reports whether the S3 action on resource is permitted.
 func allowed(action, resource string, policies []iampolicy.PolicyDocument) bool {
-	return iampolicy.Evaluate(action, resource, policies) == iampolicy.Allow
+	return iampolicy.EvaluateWithKeys(action, resource, policies, nil) == iampolicy.Allow
 }
 
 func TestEvaluateS3Access_DefaultDeny(t *testing.T) {
@@ -140,4 +144,86 @@ func TestEvaluateS3Access_CaseInsensitiveAction(t *testing.T) {
 		doc("Allow", "S3:GetObject", "*"),
 	}
 	assert.True(t, allowed("s3:GetObject", "*", policies))
+}
+
+// --- conditionKeys tests ---
+
+func TestConditionKeys_PopulatesEverySupportedKey(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/my-bucket?prefix=home/alice/", nil)
+	r.RemoteAddr = "10.4.1.9:52344"
+	r.TLS = &tls.ConnectionState{}
+	cred := &auth.CredentialResult{AccountID: "000000000001", UserName: "alice", PrincipalType: "user"}
+
+	keys := conditionKeys(r, "s3:ListBucket", cred)
+
+	assert.Equal(t, iampolicy.ConditionKeys{
+		iampolicy.KeySourceIP:         "10.4.1.9",
+		iampolicy.KeySecureTransport:  "true",
+		iampolicy.KeyUsername:         "alice",
+		iampolicy.KeyPrincipalAccount: "000000000001",
+		iampolicy.KeyS3Prefix:         "home/alice/",
+	}, keys)
+}
+
+// RoleSessionName is chosen by the caller of AssumeRole and lands in UserName
+// for a session, so aws:username must stay absent — otherwise anyone permitted
+// to assume the role satisfies the condition just by naming their session.
+func TestConditionKeys_OmitsUsernameForAssumedRole(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/my-bucket/obj", nil)
+	r.RemoteAddr = "10.4.1.9:52344"
+	cred := &auth.CredentialResult{
+		AccountID:     "000000000001",
+		UserName:      "alice",
+		PrincipalType: "assumed-role",
+	}
+
+	keys := conditionKeys(r, "s3:GetObject", cred)
+
+	assert.NotContains(t, keys, iampolicy.KeyUsername)
+	assert.Equal(t, "000000000001", keys[iampolicy.KeyPrincipalAccount])
+}
+
+// An empty value would compare as a real value that matches nothing, which on a
+// Deny widens access instead of narrowing it. Absent is the only safe reading.
+func TestConditionKeys_OmitsEmptyValues(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/my-bucket/obj", nil)
+	r.RemoteAddr = ""
+
+	keys := conditionKeys(r, "s3:GetObject", &auth.CredentialResult{PrincipalType: "user"})
+
+	assert.NotContains(t, keys, iampolicy.KeySourceIP)
+	assert.NotContains(t, keys, iampolicy.KeyUsername)
+	assert.NotContains(t, keys, iampolicy.KeyPrincipalAccount)
+}
+
+// s3:prefix exists only for a bucket listing; on any other action the key must
+// be absent, so a condition on it evaluates false rather than matching "".
+func TestConditionKeys_PrefixOnlyForListBucket(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/my-bucket/obj?prefix=home/", nil)
+	r.RemoteAddr = "10.4.1.9:52344"
+	cred := &auth.CredentialResult{AccountID: "000000000001", UserName: "alice"}
+
+	keys := conditionKeys(r, "s3:GetObject", cred)
+
+	assert.NotContains(t, keys, iampolicy.KeyS3Prefix)
+	assert.Equal(t, "false", keys[iampolicy.KeySecureTransport])
+}
+
+func TestConditionKeys_SourceIPForms(t *testing.T) {
+	tests := map[string]string{
+		"10.4.1.9:52344":    "10.4.1.9",
+		"[2001:db8::1]:443": "2001:db8::1",
+		// No port to strip — pass the address through rather than dropping it.
+		"10.4.1.9": "10.4.1.9",
+	}
+	for remoteAddr, want := range tests {
+		t.Run(remoteAddr, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/my-bucket/obj", nil)
+			r.RemoteAddr = remoteAddr
+
+			keys := conditionKeys(r, "s3:GetObject", &auth.CredentialResult{})
+
+			assert.Equal(t, want, keys[iampolicy.KeySourceIP])
+		})
+	}
 }

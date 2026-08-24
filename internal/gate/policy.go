@@ -1,8 +1,12 @@
 package gate
 
 import (
+	"net"
 	"net/http"
+	"strconv"
 
+	"github.com/mulgadc/bluebottle/pkg/iampolicy"
+	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
@@ -75,4 +79,38 @@ func s3Resource(bucket, key string) string {
 		return "arn:aws:s3:::" + bucket
 	}
 	return "arn:aws:s3:::" + bucket + "/" + key
+}
+
+// conditionKeys resolves the IAM condition context keys for one S3 request.
+// s3:prefix is set only for a bucket listing, matching AWS: on any other action
+// the key is absent, which evaluates a condition on it false.
+//
+// Every key is omitted rather than set empty when unknown: an empty value reads
+// as a real value that matches nothing, and on a Deny that silently widens
+// access instead of narrowing it.
+func conditionKeys(r *http.Request, action string, cred *auth.CredentialResult) iampolicy.ConditionKeys {
+	// A RemoteAddr with no port is passed through rather than dropped.
+	sourceIP := r.RemoteAddr
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		sourceIP = host
+	}
+	keys := iampolicy.ConditionKeys{
+		iampolicy.KeySecureTransport: strconv.FormatBool(r.TLS != nil),
+	}
+	if sourceIP != "" {
+		keys[iampolicy.KeySourceIP] = sourceIP
+	}
+	// aws:username is user-only in AWS. A role session's UserName is the
+	// caller-chosen RoleSessionName, so gating authorization on it here would
+	// let any principal that may assume the role satisfy the condition at will.
+	if cred.IsIAMUser() && cred.UserName != "" {
+		keys[iampolicy.KeyUsername] = cred.UserName
+	}
+	if cred.AccountID != "" {
+		keys[iampolicy.KeyPrincipalAccount] = cred.AccountID
+	}
+	if action == "s3:ListBucket" {
+		keys[iampolicy.KeyS3Prefix] = r.URL.Query().Get("prefix")
+	}
+	return keys
 }
