@@ -1,10 +1,17 @@
 package gate
 
 import (
+	"net"
 	"net/http"
+	"strconv"
 
+	"github.com/mulgadc/bluebottle/pkg/iampolicy"
+	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
+
+// actionListBucket is the only S3 action AWS supplies s3:prefix for.
+const actionListBucket = "s3:ListBucket"
 
 // bucketAccessAllowed enforces the S3 default-deny ownership invariant on top
 // of an already-allowed IAM policy decision. Same-account callers pass; the
@@ -41,12 +48,12 @@ func s3Action(method, bucket, key string) string {
 		if hasKey {
 			return "s3:GetObject"
 		}
-		return "s3:ListBucket"
+		return actionListBucket
 	case http.MethodHead:
 		if hasKey {
 			return "s3:GetObject"
 		}
-		return "s3:ListBucket"
+		return actionListBucket
 	case http.MethodPut:
 		if hasKey {
 			return "s3:PutObject"
@@ -75,4 +82,30 @@ func s3Resource(bucket, key string) string {
 		return "arn:aws:s3:::" + bucket
 	}
 	return "arn:aws:s3:::" + bucket + "/" + key
+}
+
+// conditionKeys resolves the IAM condition context keys for one S3 request.
+// s3:prefix is set only for a bucket listing, matching AWS: on any other action
+// the key is absent, which evaluates a condition on it false.
+func conditionKeys(r *http.Request, action string, cred *auth.CredentialResult) iampolicy.ConditionKeys {
+	keys := iampolicy.ConditionKeys{
+		iampolicy.KeySourceIP:         clientIP(r.RemoteAddr),
+		iampolicy.KeySecureTransport:  strconv.FormatBool(r.TLS != nil),
+		iampolicy.KeyUsername:         cred.UserName,
+		iampolicy.KeyPrincipalAccount: cred.AccountID,
+	}
+	if action == actionListBucket {
+		keys[iampolicy.KeyS3Prefix] = r.URL.Query().Get("prefix")
+	}
+	return keys
+}
+
+// clientIP strips the port from a RemoteAddr, leaving the bare address that
+// aws:SourceIp compares against.
+func clientIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
 }

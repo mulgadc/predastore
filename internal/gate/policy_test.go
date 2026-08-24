@@ -1,9 +1,13 @@
 package gate
 
 import (
+	"crypto/tls"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
+	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -140,4 +144,43 @@ func TestEvaluateS3Access_CaseInsensitiveAction(t *testing.T) {
 		doc("Allow", "S3:GetObject", "*"),
 	}
 	assert.True(t, allowed("s3:GetObject", "*", policies))
+}
+
+// --- conditionKeys tests ---
+
+func TestConditionKeys_PopulatesEverySupportedKey(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/my-bucket?prefix=home/alice/", nil)
+	r.RemoteAddr = "10.4.1.9:52344"
+	r.TLS = &tls.ConnectionState{}
+	cred := &auth.CredentialResult{AccountID: "000000000001", UserName: "alice"}
+
+	keys := conditionKeys(r, actionListBucket, cred)
+
+	assert.Equal(t, iampolicy.ConditionKeys{
+		iampolicy.KeySourceIP:         "10.4.1.9",
+		iampolicy.KeySecureTransport:  "true",
+		iampolicy.KeyUsername:         "alice",
+		iampolicy.KeyPrincipalAccount: "000000000001",
+		iampolicy.KeyS3Prefix:         "home/alice/",
+	}, keys)
+}
+
+// s3:prefix exists only for a bucket listing; on any other action the key must
+// be absent, so a condition on it evaluates false rather than matching "".
+func TestConditionKeys_PrefixOnlyForListBucket(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/my-bucket/obj?prefix=home/", nil)
+	r.RemoteAddr = "10.4.1.9:52344"
+	cred := &auth.CredentialResult{AccountID: "000000000001", UserName: "alice"}
+
+	keys := conditionKeys(r, "s3:GetObject", cred)
+
+	assert.NotContains(t, keys, iampolicy.KeyS3Prefix)
+	assert.Equal(t, "false", keys[iampolicy.KeySecureTransport])
+}
+
+func TestClientIP(t *testing.T) {
+	assert.Equal(t, "10.4.1.9", clientIP("10.4.1.9:52344"))
+	assert.Equal(t, "2001:db8::1", clientIP("[2001:db8::1]:443"))
+	// No port to strip — pass the address through rather than dropping it.
+	assert.Equal(t, "10.4.1.9", clientIP("10.4.1.9"))
 }

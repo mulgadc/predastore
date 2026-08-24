@@ -278,3 +278,33 @@ func TestResolveRolePolicies_InlineMalformed(t *testing.T) {
 func allowed(action, resource string, policies []iampolicy.PolicyDocument) bool {
 	return iampolicy.Evaluate(action, resource, policies) == iampolicy.Allow
 }
+
+// A Bool condition leaf is an AWS-routine shape. If it failed to unmarshal, the
+// whole principal's policy load would fail and read as "no policies" — a total
+// denial reported far from its cause.
+func TestResolveRolePolicies_BoolConditionLeafResolves(t *testing.T) {
+	const conditioned = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*",
+	 "Resource":"*","Condition":{"Bool":{"aws:SecureTransport":true}}}]}`
+	roles := map[string][]byte{
+		inlineTestAccount + ".TLSRole": mustMarshal(t, iamRole{
+			RoleName:       "TLSRole",
+			AccountID:      inlineTestAccount,
+			InlinePolicies: map[string]string{"TLSOnly": conditioned},
+		}),
+	}
+	p := &NATSIAMProvider{
+		rolesBucket:    &fakeKV{data: roles},
+		policiesBucket: &fakeKV{data: map[string][]byte{}},
+	}
+
+	docs, err := p.resolveRolePolicies(context.Background(), inlineTestAccount, "TLSRole")
+	require.NoError(t, err)
+	require.Len(t, docs, 1)
+
+	keys := iampolicy.ConditionKeys{iampolicy.KeySecureTransport: "true"}
+	assert.Equal(t, iampolicy.Allow,
+		iampolicy.EvaluateWithKeys("s3:ListBucket", "arn:aws:s3:::any", docs, keys))
+	assert.Equal(t, iampolicy.Deny,
+		iampolicy.EvaluateWithKeys("s3:ListBucket", "arn:aws:s3:::any", docs,
+			iampolicy.ConditionKeys{iampolicy.KeySecureTransport: "false"}))
+}

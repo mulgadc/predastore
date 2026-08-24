@@ -156,7 +156,8 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 				slog.DebugContext(r.Context(), "No policies resolved for user, implicit deny",
 					"accessKeyID", accessKey, "accountID", credResult.AccountID)
 			}
-			if iampolicy.Evaluate(action, resource, credResult.PolicyDocuments) == iampolicy.Deny {
+			keys := conditionKeys(r, action, credResult)
+			if iampolicy.EvaluateWithKeys(action, resource, credResult.PolicyDocuments, keys) == iampolicy.Deny {
 				slog.DebugContext(r.Context(), "S3 access denied by policy",
 					"action", action, "resource", resource,
 					"accessKeyID", accessKey, "policyCount", len(credResult.PolicyDocuments))
