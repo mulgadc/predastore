@@ -24,27 +24,52 @@ const (
 
 // verifiedPut returns a PUT whose body has passed SigV4 verification, signed over the digest
 // of signedBody while carrying sentBody — the on-path rewrite a payload check must catch.
-func verifiedPut(t *testing.T, signedBody, sentBody []byte) *http.Request {
-	t.Helper()
-
-	req, err := http.NewRequest(http.MethodPut, "https://bucket.example.com/object.txt", bytes.NewReader(sentBody))
-	require.NoError(t, err)
-	req.ContentLength = int64(len(sentBody))
+func verifiedPut(tb testing.TB, signedBody, sentBody []byte) *http.Request {
+	tb.Helper()
 
 	sum := sha256.Sum256(signedBody)
-	payloadHash := hex.EncodeToString(sum[:])
+
+	return signedPut(tb, sentBody, hex.EncodeToString(sum[:]))
+}
+
+// signedPut returns a PUT of sentBody that has passed SigV4 verification with payloadHash as
+// x-amz-content-sha256, which is a digest to bind the body or a sentinel to leave it unbound.
+func signedPut(tb testing.TB, sentBody []byte, payloadHash string) *http.Request {
+	tb.Helper()
+
+	req := signPut(tb, sentBody, payloadHash)
+	require.NoError(tb, verifyPut(req))
+
+	return req
+}
+
+// signPut returns a signed but unverified PUT, so a caller can time the verification.
+func signPut(tb testing.TB, sentBody []byte, payloadHash string) *http.Request {
+	tb.Helper()
+
+	req, err := http.NewRequest(http.MethodPut, "https://bucket.example.com/object.txt", bytes.NewReader(sentBody))
+	require.NoError(tb, err)
+	req.ContentLength = int64(len(sentBody))
 	req.Header.Set("X-Amz-Content-Sha256", payloadHash)
 
 	signer := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
 	creds := aws.Credentials{AccessKeyID: payloadTestKey, SecretAccessKey: payloadTestSecret}
-	require.NoError(t, signer.SignHTTP(context.Background(), creds, req, payloadHash, "s3", "ap-southeast-2", time.Now().UTC()))
-
-	signed, err := sigv4.Parse(req)
-	require.NoError(t, err)
-	_, err = signed.Verify(payloadTestSecret, "ap-southeast-2", "s3")
-	require.NoError(t, err)
+	require.NoError(tb, signer.SignHTTP(context.Background(), creds, req, payloadHash, "s3", "ap-southeast-2", time.Now().UTC()))
 
 	return req
+}
+
+// verifyPut runs the gate's SigV4 check over req, binding its body when the signed
+// x-amz-content-sha256 is a digest.
+func verifyPut(req *http.Request) error {
+	signed, err := sigv4.Parse(req)
+	if err != nil {
+		return err
+	}
+
+	_, err = signed.Verify(payloadTestSecret, "ap-southeast-2", "s3")
+
+	return err
 }
 
 // TestFinishPayload covers the write path's payload check for a body too large for sigv4 to
