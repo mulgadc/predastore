@@ -3,11 +3,13 @@ package handlers
 import (
 	"bytes"
 	"encoding/gob"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 
+	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/gate/chunked"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
@@ -45,6 +47,13 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
+		// Shards are written but nothing references them until the placement lands
+		// below, so a body that fails its payload check leaves no readable object.
+		if err := finishPayload(r); err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		place, err := placeShards(ring, cfg, objectHash, size)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
@@ -77,6 +86,26 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		w.Header().Set("ETag", model.ObjectETag(bucket, key))
 		w.WriteHeader(http.StatusOK)
 	})
+}
+
+// finishPayload completes the SigV4 payload check on a body large enough that sigv4
+// verifies it as it streams: the signed digest is only compared at EOF, and the write
+// path stops at the declared length. Draining the remainder forces the comparison, so a
+// rewritten body is caught before the write is committed to global state.
+func finishPayload(r *http.Request) error {
+	if r.Body == nil {
+		return nil
+	}
+
+	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+		if errors.Is(err, sigv4.ErrContentSHA256Mismatch) {
+			return model.ErrContentSHA256MismatchError
+		}
+
+		return model.NewS3Error(model.ErrInternalError, "Failed to read the request body", 500)
+	}
+
+	return nil
 }
 
 // decodeBody unwraps aws-chunked framing when the client used it, so the rest

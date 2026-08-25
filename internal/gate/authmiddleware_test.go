@@ -1,6 +1,8 @@
 package gate
 
 import (
+	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -181,6 +183,69 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 				assert.False(t, nextCalled, "Failing auth must not invoke next handler")
 				assert.Equal(t, tt.expectStatus, rr.Code)
 			}
+		})
+	}
+}
+
+// TestSigV4AuthMiddleware_PayloadBinding asserts that a body rewritten after signing, and an
+// x-amz-content-sha256 that is neither digest nor sentinel, are rejected with the S3 error
+// codes AWS returns rather than a generic AccessDenied.
+func TestSigV4AuthMiddleware_PayloadBinding(t *testing.T) {
+	s3Config := Config{
+		Region:  "ap-southeast-2",
+		Buckets: []handlers.BucketConfig{{Name: "test-bucket01", Region: "ap-southeast-2"}},
+		Auth: []auth.Entry{{
+			AccessKeyID:     "TESTACCESSKEY",
+			SecretAccessKey: "TESTSECRETKEY",
+			Policy:          []auth.PolicyRule{{Bucket: "test-bucket01", Actions: []string{"s3:PutObject"}}},
+		}},
+	}
+
+	signed := []byte("the body the client signed")
+
+	tests := []struct {
+		name       string
+		setup      func(t *testing.T, req *http.Request)
+		expectCode string
+	}{
+		{
+			name: "rewritten body",
+			setup: func(t *testing.T, req *http.Request) {
+				signTestReq(t, req, signed, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3")
+				// Same length, so content-length still matches what was signed.
+				req.Body = io.NopCloser(bytes.NewReader([]byte("the body an attacker swapped")[:len(signed)]))
+			},
+			expectCode: "XAmzContentSHA256Mismatch",
+		},
+		{
+			name: "invented payload sentinel",
+			setup: func(t *testing.T, req *http.Request) {
+				signTestReq(t, req, signed, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3")
+				req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED")
+			},
+			expectCode: "InvalidRequest",
+		},
+	}
+
+	server := newTestGate(t, s3Config)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/test-bucket01/object.txt", bytes.NewReader(signed))
+			tt.setup(t, req)
+
+			nextCalled := false
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nextCalled = true
+				w.WriteHeader(http.StatusOK)
+			})
+
+			rr := httptest.NewRecorder()
+			resolveRouter(next, server.sigV4AuthMiddleware).ServeHTTP(rr, req)
+
+			assert.False(t, nextCalled, "An unbound payload must not reach the handler")
+			assert.Equal(t, http.StatusBadRequest, rr.Code)
+			assert.Contains(t, rr.Body.String(), tt.expectCode)
 		})
 	}
 }

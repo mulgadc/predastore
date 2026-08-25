@@ -70,6 +70,13 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, mapPutErr(err))
 			return
 		}
+		// The part is only reachable once its metadata lands below, so a failed
+		// payload check here leaves nothing CompleteMultipartUpload can assemble.
+		if err := finishPayload(r); err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		etag := model.PartETagFrom(digest)
 
 		partMeta := model.PartMetadata{

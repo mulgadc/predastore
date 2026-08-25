@@ -47,6 +47,19 @@ func RespondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string
 		WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Missing required header: X-Amz-Date")
 	case errors.Is(err, sigv4.ErrMissingContentSHA256):
 		WriteS3Error(w, r, http.StatusBadRequest, "InvalidRequest", "Missing required header: X-Amz-Content-Sha256")
+	case errors.Is(err, sigv4.ErrInvalidContentSHA256):
+		WriteS3Error(w, r, http.StatusBadRequest, "InvalidRequest", "Invalid X-Amz-Content-Sha256 header: it must be a SHA-256 digest or a supported payload sentinel")
+	case errors.Is(err, sigv4.ErrContentSHA256Mismatch):
+		slog.WarnContext(r.Context(), "Request body does not match the signed payload hash",
+			"accessKeyID", claimedKey,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"payloadHashHeader", r.Header.Get("X-Amz-Content-Sha256"),
+			"contentLength", r.Header.Get("Content-Length"),
+			"remoteAddr", r.RemoteAddr,
+		)
+		WriteS3Error(w, r, http.StatusBadRequest, string(model.ErrContentSHA256Mismatch),
+			"The provided 'x-amz-content-sha256' header does not match what was computed")
 	case errors.Is(err, sigv4.ErrRequestTimeTooSkewed):
 		slog.DebugContext(r.Context(), "Request timestamp outside allowed skew", "timestamp", r.Header.Get("X-Amz-Date"))
 		WriteS3Error(w, r, http.StatusForbidden, "RequestTimeTooSkewed",

@@ -27,6 +27,7 @@ const (
 	ErrInvalidBucketName       S3ErrorCode = "InvalidBucketName"
 	ErrMissingParameter        S3ErrorCode = "MissingParameter"
 	ErrChecksumMismatch        S3ErrorCode = "XAmzContentChecksumMismatch"
+	ErrContentSHA256Mismatch   S3ErrorCode = "XAmzContentSHA256Mismatch"
 	ErrInsufficientStorage     S3ErrorCode = "InsufficientStorage"
 	ErrMissingContentLength    S3ErrorCode = "MissingContentLength"
 	ErrInvalidArgument         S3ErrorCode = "InvalidArgument"
@@ -114,6 +115,14 @@ var (
 		Code:       ErrInsufficientStorage,
 		Message:    "The storage pool is at capacity and cannot accept new writes",
 		StatusCode: http.StatusInsufficientStorage,
+	}
+
+	// ErrContentSHA256MismatchError is returned when the body of a signed write
+	// does not hash to the digest the client signed in x-amz-content-sha256.
+	ErrContentSHA256MismatchError = &S3Error{
+		Code:       ErrContentSHA256Mismatch,
+		Message:    "The provided 'x-amz-content-sha256' header does not match what was computed",
+		StatusCode: http.StatusBadRequest,
 	}
 
 	// ErrMissingContentLengthError is returned when a write carries a body of
