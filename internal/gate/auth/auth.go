@@ -24,6 +24,11 @@ import (
 // ErrKeyNotFound is returned when an access key does not exist in the provider.
 var ErrKeyNotFound = errors.New("access key not found")
 
+// ErrPrincipalConfig is returned when a principal's stored IAM records are
+// unusable — a malformed or foreign-account attached policy ARN. It is a
+// permanent config fault, so it denies (403) rather than inviting an SDK retry.
+var ErrPrincipalConfig = errors.New("principal IAM configuration is invalid")
+
 // CredentialResult is the result of a credential lookup.
 type CredentialResult struct {
 	SecretAccessKey string
@@ -701,7 +706,7 @@ func (p *NATSIAMProvider) resolveUserPolicies(ctx context.Context, accountID, us
 		return nil, fmt.Errorf("unmarshal user: %w", err)
 	}
 
-	docs, err := p.resolveManagedPolicies(ctx, accountID, user.AttachedPolicies)
+	docs, err := p.resolveManagedPolicies(ctx, accountID, "user "+userName, user.AttachedPolicies)
 	if err != nil {
 		return nil, err
 	}
@@ -775,7 +780,7 @@ func (p *NATSIAMProvider) resolveGroupPolicies(ctx context.Context, accountID, u
 			return nil, fmt.Errorf("unmarshal group %s: %w", groupName, err)
 		}
 
-		managed, err := p.resolveManagedPolicies(ctx, accountID, group.AttachedPolicies)
+		managed, err := p.resolveManagedPolicies(ctx, accountID, "group "+groupName, group.AttachedPolicies)
 		if err != nil {
 			return nil, err // fail closed (mirrors direct-policy handling)
 		}
@@ -805,7 +810,7 @@ func (p *NATSIAMProvider) resolveRolePolicies(ctx context.Context, accountID, ro
 		return nil, fmt.Errorf("unmarshal role: %w", err)
 	}
 
-	docs, err := p.resolveManagedPolicies(ctx, accountID, role.AttachedPolicies)
+	docs, err := p.resolveManagedPolicies(ctx, accountID, "role "+roleName, role.AttachedPolicies)
 	if err != nil {
 		return nil, err
 	}
@@ -833,26 +838,30 @@ func resolveInlinePolicies(inline map[string]string, label string) ([]iampolicy.
 }
 
 // resolveManagedPolicies resolves a list of managed-policy ARNs into parsed
-// policy documents from policiesBucket. Shared by the user and role resolvers;
-// the role resolver appends its inline-policy walk separately.
-func (p *NATSIAMProvider) resolveManagedPolicies(ctx context.Context, accountID string, arns []string) ([]iampolicy.PolicyDocument, error) {
+// policy documents from policiesBucket. label names the principal holding the
+// attachment ("group Admins") so a fault points at the record to fix.
+func (p *NATSIAMProvider) resolveManagedPolicies(ctx context.Context, accountID, label string, arns []string) ([]iampolicy.PolicyDocument, error) {
 	var docs []iampolicy.PolicyDocument
 	for _, arn := range arns {
 		// AWS-managed policies have no document in this stack: resolve them to no
 		// grant, matching spinifex's deny for an unmodeled managed policy.
 		if iamarn.IsAWSManagedPolicyARN(arn) {
-			slog.Debug("Skipping AWS-managed policy ARN", "arn", arn, "accountID", accountID)
+			slog.Debug("Skipping AWS-managed policy ARN", "arn", arn, "accountID", accountID, "principal", label)
 			continue
 		}
 
 		arnAccount, policyName, err := iamarn.ParsePolicyARN(arn)
 		if err != nil {
-			return nil, fmt.Errorf("parse attached policy ARN %q: %w", arn, err)
+			slog.Error("Attached policy ARN is unparseable — failing closed",
+				"accountID", accountID, "principal", label, "arn", arn, "err", err)
+			return nil, fmt.Errorf("%w: %s attached policy ARN %q: %w", ErrPrincipalConfig, label, arn, err)
 		}
 		// Scoping a foreign ARN's name to this account would load an unrelated
 		// same-named policy; there is no correct grant to return for it.
 		if arnAccount != accountID {
-			return nil, fmt.Errorf("attached policy ARN %q is not in account %s", arn, accountID)
+			slog.Error("Attached policy ARN names a foreign account — failing closed",
+				"accountID", accountID, "principal", label, "arn", arn, "arnAccountID", arnAccount)
+			return nil, fmt.Errorf("%w: %s attached policy ARN %q is not in account %s", ErrPrincipalConfig, label, arn, accountID)
 		}
 
 		policyKey := accountID + "." + policyName

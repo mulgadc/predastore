@@ -25,6 +25,15 @@ func RespondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string
 				"The AWS Access Key Id you provided does not exist in our records")
 			return
 		}
+		// A permanent fault in the principal's IAM records: deny rather than
+		// return a 500 the SDK would retry against a record only an operator
+		// can fix. The offending ARN is logged, never returned to the client.
+		if errors.Is(lookupErr, auth.ErrPrincipalConfig) {
+			slog.ErrorContext(r.Context(), "Principal IAM configuration is invalid — denying",
+				"accessKeyID", claimedKey, "error", lookupErr, "remoteAddr", r.RemoteAddr)
+			WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
+			return
+		}
 		slog.ErrorContext(r.Context(), "Credential lookup infrastructure error",
 			"accessKeyID", claimedKey, "error", lookupErr, "remoteAddr", r.RemoteAddr)
 		WriteS3Error(w, r, http.StatusInternalServerError, "InternalError",
