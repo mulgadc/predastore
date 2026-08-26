@@ -228,6 +228,10 @@ func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg C
 		parityWG.Add(1)
 		go func(localParityIdx int, shardIdx int, r *io.PipeReader) {
 			defer parityWG.Done()
+			// enc.Encode runs on the caller's goroutine and writes into this
+			// pipe. Abandoning the read side on an early return would block it
+			// forever, and io.Pipe does not observe ctx.
+			defer func() { _ = r.Close() }()
 
 			nodeNum := shardNodes[shardIdx]
 

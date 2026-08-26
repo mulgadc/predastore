@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
@@ -313,6 +314,50 @@ func TestWriteObjectSingleShardReportsPoolPressure(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, poolNearFull)
+}
+
+// A parity shard is streamed through an io.Pipe that enc.Encode writes into on
+// this goroutine. A Put that gives up without draining it used to leave the
+// write side blocked forever, and io.Pipe does not observe ctx.
+func TestWriteObjectReturnsWhenParityPutAbandonsItsBody(t *testing.T) {
+	t.Parallel()
+
+	f := newWriteFixture(2, 1)
+	bc := &parityRejectingBlob{fakeBlob: f.bc, dataShards: f.cfg.DataShards}
+	body := randomBytes(t, 64*1024)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := writeObject(
+			context.Background(), bc, f.ring, f.cfg,
+			bytes.NewReader(body), int64(len(body)), model.ObjectHash("b", "k"),
+		)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "a rejected parity shard has to fail the write")
+	case <-time.After(10 * time.Second):
+		t.Fatal("writeObject blocked: the parity pipe was left without a reader")
+	}
+}
+
+// parityRejectingBlob refuses every parity shard without consuming its body,
+// which is how a node that stalls mid-transfer looks to the gate.
+type parityRejectingBlob struct {
+	*fakeBlob
+
+	dataShards int
+}
+
+func (p *parityRejectingBlob) Put(
+	ctx context.Context, id config.NodeID, req blob.PutRequest, body io.Reader,
+) (*blob.PutResponse, error) {
+	if int(req.Index) >= p.dataShards {
+		return nil, errors.New("node stalled")
+	}
+	return p.fakeBlob.Put(ctx, id, req, body)
 }
 
 // nearFullBlob answers every put with pressure set.
