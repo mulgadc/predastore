@@ -362,33 +362,128 @@ func TestLookupSession_AssumedRolePolicyKVError(t *testing.T) {
 	assert.Contains(t, err.Error(), "resolve session policies")
 }
 
-// TestLookupSession_AssumedRoleSkipsUnparseablePolicyARN: an unparseable entry in
-// the role's attached policies is skipped (logged), not treated as an error — the
-// remaining valid policies still resolve.
-func TestLookupSession_AssumedRoleSkipsUnparseablePolicyARN(t *testing.T) {
-	k := loadTestKey(t)
-	roles := map[string][]byte{
+// roleAttaching builds the roles KV record for testSessionRole attaching the
+// given verbatim policy ARNs, so a test can name a malformed or foreign one.
+func roleAttaching(t *testing.T, arns ...string) map[string][]byte {
+	t.Helper()
+	return map[string][]byte{
 		testSessionAccount + "." + testSessionRole: mustMarshal(t, iamRole{
-			RoleName:  testSessionRole,
-			AccountID: testSessionAccount,
-			AttachedPolicies: []string{
-				"not-an-arn",
-				"arn:aws:iam::" + testSessionAccount + ":policy/S3FullAccess",
-			},
+			RoleName:         testSessionRole,
+			AccountID:        testSessionAccount,
+			AttachedPolicies: arns,
 		}),
 	}
-	policies := map[string][]byte{
-		testSessionAccount + ".S3FullAccess": mustMarshal(t, iamPolicy{
-			PolicyName:     "S3FullAccess",
-			PolicyDocument: allowAllS3Policy,
+}
+
+// seededPolicy builds a policies KV record for a single same-account policy.
+func seededPolicy(t *testing.T, policyName, policyDoc string) map[string][]byte {
+	t.Helper()
+	return map[string][]byte{
+		testSessionAccount + "." + policyName: mustMarshal(t, iamPolicy{
+			PolicyName:     policyName,
+			PolicyDocument: policyDoc,
 		}),
 	}
+}
+
+// TestLookupSession_AttachedPolicyARNForeignAccount is the regression test: an
+// attached ARN naming another account's policy must fail the resolution, never
+// alias onto the same-named policy in the caller's own account.
+func TestLookupSession_AttachedPolicyARNForeignAccount(t *testing.T) {
+	k := loadTestKey(t)
+	roles := roleAttaching(t, "arn:aws:iam::999999999999:policy/AdministratorAccess")
+	policies := seededPolicy(t, "AdministratorAccess", allowAllS3Policy)
 	sessions := assumedRoleSession(t, k, "secret", testSessionRoleARN, time.Now().UTC().Add(time.Hour))
 	p := newSessionProvider(k, sessions, nil, roles, policies)
 
 	res, err := p.LookupCredentials(testSessionAKID)
-	require.NoError(t, err, "an unparseable ARN must be skipped, not error the whole lookup")
-	require.Len(t, res.PolicyDocuments, 1, "only the one valid attached policy resolves")
+	require.Error(t, err, "a foreign-account policy ARN must fail the resolution")
+	assert.Nil(t, res, "the same-named local policy must never be substituted")
+}
+
+// TestLookupSession_AttachedPolicyARNAWSManaged: an AWS-managed ARN has no
+// backing document here, so it resolves to no grant — skipped, not substituted
+// by a same-named local policy, and not an error.
+func TestLookupSession_AttachedPolicyARNAWSManaged(t *testing.T) {
+	k := loadTestKey(t)
+	roles := roleAttaching(t, "arn:aws:iam::aws:policy/AdministratorAccess")
+	policies := seededPolicy(t, "AdministratorAccess", allowAllS3Policy)
+	sessions := assumedRoleSession(t, k, "secret", testSessionRoleARN, time.Now().UTC().Add(time.Hour))
+	p := newSessionProvider(k, sessions, nil, roles, policies)
+
+	res, err := p.LookupCredentials(testSessionAKID)
+	require.NoError(t, err, "an AWS-managed ARN is expected in normal operation, not a fault")
+	assert.Empty(t, res.PolicyDocuments, "an AWS-managed ARN resolves to no grant")
+	assert.False(t, allowed("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments))
+}
+
+// TestLookupSession_AttachedPolicyARNNearMiss: a resource prefix that merely
+// starts with "policy" (":policy-backup/") is not a policy ARN and must not
+// resolve off its trailing segment.
+func TestLookupSession_AttachedPolicyARNNearMiss(t *testing.T) {
+	k := loadTestKey(t)
+	roles := roleAttaching(t, "arn:aws:iam::"+testSessionAccount+":policy-backup/AdministratorAccess")
+	policies := seededPolicy(t, "AdministratorAccess", allowAllS3Policy)
+	sessions := assumedRoleSession(t, k, "secret", testSessionRoleARN, time.Now().UTC().Add(time.Hour))
+	p := newSessionProvider(k, sessions, nil, roles, policies)
+
+	res, err := p.LookupCredentials(testSessionAKID)
+	require.Error(t, err, "a :policy-backup/ ARN must not parse as a policy ARN")
+	assert.Nil(t, res, "the same-named local policy must never be substituted")
+}
+
+// TestLookupSession_AttachedPolicyARNMalformed: an unparseable entry in a
+// principal's attachment list is a data-integrity fault, so it fails the whole
+// resolution rather than being skipped with a warning.
+func TestLookupSession_AttachedPolicyARNMalformed(t *testing.T) {
+	k := loadTestKey(t)
+	roles := roleAttaching(t,
+		"not-an-arn",
+		"arn:aws:iam::"+testSessionAccount+":policy/S3FullAccess",
+	)
+	policies := seededPolicy(t, "S3FullAccess", allowAllS3Policy)
+	sessions := assumedRoleSession(t, k, "secret", testSessionRoleARN, time.Now().UTC().Add(time.Hour))
+	p := newSessionProvider(k, sessions, nil, roles, policies)
+
+	res, err := p.LookupCredentials(testSessionAKID)
+	require.Error(t, err, "an unparseable attached ARN must fail the resolution")
+	assert.Nil(t, res)
+}
+
+// TestLookupSession_AttachedPolicyARNMalformedDenyNotDropped: skipping a
+// malformed ARN used to drop the Deny it named, leaving an inherited Allow
+// standing. The resolution must fail instead of returning the allow-only set.
+func TestLookupSession_AttachedPolicyARNMalformedDenyNotDropped(t *testing.T) {
+	k := loadTestKey(t)
+	roles := roleAttaching(t,
+		"arn:aws:iam::"+testSessionAccount+":policy/S3FullAccess",
+		"arn:aws:iam::"+testSessionAccount+":policy-backup/S3Deny",
+	)
+	policies := seededPolicy(t, "S3FullAccess", allowAllS3Policy)
+	policies[testSessionAccount+".S3Deny"] = mustMarshal(t, iamPolicy{
+		PolicyName:     "S3Deny",
+		PolicyDocument: denyAllS3Policy,
+	})
+	sessions := assumedRoleSession(t, k, "secret", testSessionRoleARN, time.Now().UTC().Add(time.Hour))
+	p := newSessionProvider(k, sessions, nil, roles, policies)
+
+	res, err := p.LookupCredentials(testSessionAKID)
+	require.Error(t, err, "a dropped Deny must fail the request, not resolve to the Allow alone")
+	assert.Nil(t, res, "the Allow must not be returned without the Deny that overrode it")
+}
+
+// TestLookupSession_AttachedPolicyARNWithPath: a path-bearing same-account ARN
+// resolves off its final segment.
+func TestLookupSession_AttachedPolicyARNWithPath(t *testing.T) {
+	k := loadTestKey(t)
+	roles := roleAttaching(t, "arn:aws:iam::"+testSessionAccount+":policy/team/S3FullAccess")
+	policies := seededPolicy(t, "S3FullAccess", allowAllS3Policy)
+	sessions := assumedRoleSession(t, k, "secret", testSessionRoleARN, time.Now().UTC().Add(time.Hour))
+	p := newSessionProvider(k, sessions, nil, roles, policies)
+
+	res, err := p.LookupCredentials(testSessionAKID)
+	require.NoError(t, err)
+	require.Len(t, res.PolicyDocuments, 1, "the path-bearing ARN must resolve off its final segment")
 	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments))
 }
 

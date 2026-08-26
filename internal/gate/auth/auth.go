@@ -838,10 +838,21 @@ func resolveInlinePolicies(inline map[string]string, label string) ([]iampolicy.
 func (p *NATSIAMProvider) resolveManagedPolicies(ctx context.Context, accountID string, arns []string) ([]iampolicy.PolicyDocument, error) {
 	var docs []iampolicy.PolicyDocument
 	for _, arn := range arns {
-		policyName := iamarn.ExtractPolicyName(arn)
-		if policyName == "" {
-			slog.Warn("Skipping unparseable policy ARN", "arn", arn, "accountID", accountID)
+		// AWS-managed policies have no document in this stack: resolve them to no
+		// grant, matching spinifex's deny for an unmodeled managed policy.
+		if iamarn.IsAWSManagedPolicyARN(arn) {
+			slog.Debug("Skipping AWS-managed policy ARN", "arn", arn, "accountID", accountID)
 			continue
+		}
+
+		arnAccount, policyName, err := iamarn.ParsePolicyARN(arn)
+		if err != nil {
+			return nil, fmt.Errorf("parse attached policy ARN %q: %w", arn, err)
+		}
+		// Scoping a foreign ARN's name to this account would load an unrelated
+		// same-named policy; there is no correct grant to return for it.
+		if arnAccount != accountID {
+			return nil, fmt.Errorf("attached policy ARN %q is not in account %s", arn, accountID)
 		}
 
 		policyKey := accountID + "." + policyName
