@@ -399,6 +399,7 @@ func TestLookupSession_AttachedPolicyARNRejected(t *testing.T) {
 	}{
 		{"foreign account", []string{"arn:aws:iam::999999999999:policy/AdministratorAccess"}, "AdministratorAccess"},
 		{"policy-backup near miss", []string{local + ":policy-backup/AdministratorAccess"}, "AdministratorAccess"},
+		{"malformed AWS managed", []string{"arn:aws:iam::aws:policy/", local + ":policy/S3FullAccess"}, "S3FullAccess"},
 		{"malformed", []string{"not-an-arn", local + ":policy/S3FullAccess"}, "S3FullAccess"},
 		// A skipped ARN used to drop whatever it named — a Deny among them — and
 		// leave the sibling Allow standing. Fail rather than narrow the set.
