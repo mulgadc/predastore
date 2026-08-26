@@ -66,7 +66,7 @@ const (
 // Client performs value operations against blob nodes over rpc streams,
 // addressed by node id.
 type Client struct {
-	rpc             *rpc.Client
+	rpc             *rpc.Endpoint
 	envelopeTimeout time.Duration
 	idleTimeout     time.Duration
 }
@@ -74,7 +74,7 @@ type Client struct {
 type ClientConfig struct {
 	// Client carries the streams; it owns the mapping from node id to
 	// address, so this client only ever names nodes by id.
-	Client *rpc.Client
+	Client *rpc.Endpoint
 	// EnvelopeTimeout bounds the fixed exchanges either side of a body:
 	// opening the stream, the half-close, and reading the response envelope.
 	// These are small and their size is known, so a total cap fits them. It

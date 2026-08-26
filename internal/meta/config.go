@@ -19,7 +19,7 @@ type Config struct {
 	Bootstrap bool            // Whether to bootstrap the cluster on start.
 
 	Listeners []transport.Listener // The bound listeners the replica answers rpc on.
-	Resolver  *rpc.Resolver        // Turns a peer id into a route to dial. Required.
+	Resolver  *rpc.Cluster         // Turns a peer id into a route to dial. Required.
 
 	// OnLeader is called once, as soon as a leader is observed or
 	// LeaderTimeout expires: a slow election must still release a caller that

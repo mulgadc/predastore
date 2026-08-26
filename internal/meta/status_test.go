@@ -66,7 +66,7 @@ func startStatusReplica(t *testing.T, bootstrap bool) *meta.Client {
 	t.Cleanup(func() { clientTr.Close() })
 	clientRes, err := rpc.NewResolver(cfg, 2, clientTr)
 	require.NoError(t, err)
-	connPool := rpc.NewConnPool(2, clientRes)
+	connPool := rpc.NewPool(2, clientRes)
 	t.Cleanup(func() { connPool.Close() })
 
 	cli, err := meta.NewClient(meta.ClientConfig{

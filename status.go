@@ -66,7 +66,7 @@ func NodeStatus(ctx context.Context, cfg *Config, node NodeID, rootCAs *x509.Cer
 		return Status{}, fmt.Errorf("build status resolver: %w", err)
 	}
 
-	connPool := rpc.NewConnPool(node, res)
+	connPool := rpc.NewPool(node, res)
 	defer connPool.Close()
 
 	cli, err := meta.NewClient(meta.ClientConfig{

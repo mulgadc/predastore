@@ -2,85 +2,95 @@ package transport
 
 import (
 	"context"
-	"errors"
-	"io"
-	"net"
+	"sync"
+
+	"github.com/mulgadc/predastore/internal/transport/driver"
+	"golang.org/x/sync/singleflight"
 )
 
-var ErrMissingAddr = errors.New("missing address")
-var ErrAddrAlreadyInUse = errors.New("address already in use")
-var ErrTransportClosed = errors.New("transport closed")
-var ErrListenerClosed = errors.New("listener closed")
-var ErrConnClosed = errors.New("connection closed")
-var ErrNoListener = errors.New("no listener")
-
-type UnknownNetworkError string
-
-func (e UnknownNetworkError) Error() string { return "unknown network " + string(e) }
-
-type Network string
-
-// Addr names one endpoint: the network carrying it and the host:port that
-// selects it there. Both transports address their endpoints this way.
-type Addr struct {
-	network  Network
-	hostPort string
+type Peer interface {
+	ID() string
+	Dial(ctx context.Context) (driver.Conn, error)
 }
 
-func NewAddr(network Network, hostPort string) *Addr {
-	return &Addr{network: network, hostPort: hostPort}
+type PeerResolver interface {
+	LookupID(id string) (Peer, error)
 }
 
-func (a *Addr) Network() string { return string(a.network) }
-func (a *Addr) String() string  { return a.hostPort }
+type Transport struct {
+	id    string
+	peers PeerResolver
+	lns   []driver.Listener
 
-// Transport carries streams over one network for one node: it owns a single
-// endpoint, bound at construction, that it both dials from and listens on.
-type Transport interface {
-	// Network names the network this transport serves, matching the Network()
-	// of every address it accepts.
-	Network() string
-	Dial(ctx context.Context, remote net.Addr) (Conn, error)
-	// Listen serves this transport's own endpoint. It may be called once.
-	Listen() (Listener, error)
-	// Addr is the endpoint the transport bound, which differs from the one
-	// requested when the request named port 0.
-	Addr() net.Addr
-	Close() error
+	mu    sync.RWMutex
+	conns map[string]*Conn
+	sf    singleflight.Group
 }
 
-type Listener interface {
-	// Accept returns new connections. It should be called in a loop.
-	Accept(ctx context.Context) (Conn, error)
-	// Addr returns the local network address that the server is listening on.
-	Addr() net.Addr
-	// Close closes the listener. Accept will return ErrListenerClosed as soon as
-	// all connections in the accept queue have been accepted. Already established
-	// (accepted) connections will be unaffected.
-	Close() error
+func New(id string, peers PeerResolver, lns ...driver.Listener) *Transport {
+	return &Transport{
+		id:    id,
+		peers: peers,
+		lns:   lns,
+		conns: make(map[string]*Conn),
+	}
 }
 
-// ConnErrorCode is reported to the peer when a connection is closed with a
-// reason. ConnCodeShutdown is the only one a transport sends.
-type ConnErrorCode uint64
+func (t *Transport) Dial(ctx context.Context, peerID string) (*Conn, error) {
+	peer, err := t.peers.LookupID(peerID)
+	if err != nil {
+		return nil, err
+	}
 
-type Conn interface {
-	AcceptStream(ctx context.Context) (Stream, error)
-	OpenStream(ctx context.Context) (Stream, error)
-	LocalAddr() net.Addr
-	RemoteAddr() net.Addr
-	Context() context.Context
-	Close() error // Idempotent
+	if conn, ok := t.fetch(peer.ID()); ok {
+		return conn, nil
+	}
+
+	sh := t.sf.DoChan(peer.ID(), func() (any, error) {
+		if conn, ok := t.fetch(peer.ID()); ok {
+			return conn, nil
+		}
+
+		dConn, err := peer.Dial(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		return nil, nil
+	})
+
+	return nil, nil
 }
 
-type StreamErrorCode uint64
+func (t *Transport) fetch(peer string) (*Conn, bool) {
+	t.mu.RLock()
+	conn, ok := t.conns[peer]
+	t.mu.RUnlock()
 
-type Stream interface {
-	io.ReadWriteCloser
-	io.ReaderFrom
-	io.WriterTo
-	CancelRead(code StreamErrorCode)
-	CancelWrite(code StreamErrorCode)
-	LocalAddr() net.Addr
-	RemoteAddr() net.Addr
+	if ok && conn.Context().Err() == nil {
+		return conn, true
+	}
+
+	return nil, false
 }
+
+func (t *Transport) register(peer PeerID, dConn driver.Conn) (*Conn, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if old, ok := t.conns[peer]; ok {
+		switch t.tiebreak(old.ID, peer) {
+		case old.ID:
+
+		}
+	}
+}
+
+type Conn struct {
+	dialed bool
+	ctx    context.Context
+}
+
+func (c *Conn) Context() context.Context { return c.ctx }
+
+type Stream = driver.Stream
+type StreamErrorCode = driver.StreamErrorCode

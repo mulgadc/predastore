@@ -34,7 +34,7 @@ type Item struct {
 // Reads try the cached leader then every replica; writes follow not-leader
 // redirects and cache the leader they land on.
 type Client struct {
-	rpc        *rpc.Client
+	rpc        *rpc.Endpoint
 	replicas   []config.NodeID
 	timeout    time.Duration
 	maxRetries int
@@ -47,7 +47,7 @@ type Client struct {
 type ClientConfig struct {
 	// Client carries the streams; it owns the mapping from node id to
 	// address, so this client only ever names replicas by id.
-	Client *rpc.Client
+	Client *rpc.Endpoint
 	// Replicas lists the meta replica node ids.
 	Replicas []config.NodeID
 	// Timeout is a fallback deadline layered on the caller's context, so an

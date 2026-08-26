@@ -37,7 +37,7 @@ const (
 type Server struct {
 	cfg Config
 
-	pool      *rpc.ConnPool
+	pool      *rpc.Pool
 	layer     *RPCStreamLayer
 	transport *raft.NetworkTransport
 	raft      *raft.Raft
@@ -113,7 +113,7 @@ func (s *Server) open() (*rpc.Server, error) {
 	// One pool serves both directions: the client dials peers from it and the
 	// rpc server donates the connections it accepts back to it, so a
 	// connection carries raft traffic whichever end opened it.
-	s.pool = rpc.NewConnPool(s.cfg.NodeID, s.cfg.Resolver)
+	s.pool = rpc.NewPool(s.cfg.NodeID, s.cfg.Resolver)
 	s.layer = NewRPCStreamLayer(RaftAddress(s.cfg.NodeID), raftDial(rpc.NewClient(s.pool)))
 
 	mux := rpc.NewMux()
@@ -204,7 +204,7 @@ func (s *Server) bootstrap() error {
 // raftDial opens a raft connection through this replica's own client. Raft
 // advertises node keys as addresses, so dialing one is parsing out the node id
 // and opening a stream to it.
-func raftDial(cli *rpc.Client) RaftDialFunc {
+func raftDial(cli *rpc.Endpoint) RaftDialFunc {
 	return func(ctx context.Context, address raft.ServerAddress) (transport.Stream, error) {
 		target, err := ParseRaftAddress(string(address))
 		if err != nil {

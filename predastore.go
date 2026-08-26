@@ -13,7 +13,9 @@ package predastore
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
+	"net"
 	"slices"
 	"sync"
 	"time"
@@ -117,148 +119,71 @@ func Run(ctx context.Context, opts Options) error {
 	return g.Wait()
 }
 
-// buildNode builds one node of this host: the transports it is reached over,
-// the rpc plumbing around them and the service it runs. Nothing listens or
-// dials until run is called, and cleanup releases what run does not.
-func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier leaderBarrier) (
-	run func(context.Context) error, cleanup func(), err error,
-) {
-	// A gate's port is its S3 port, so its rpc sockets bind ephemerally.
-	port := n.Port
-	if n.Role == RoleGate {
-		port = 0
-	}
+type node interface {
+	Run(ctx context.Context) error
+	Close() error
+}
 
-	// The pipe carries traffic between colocated nodes and the QUIC socket
-	// traffic to other hosts, so each exists only when the cluster puts a peer
-	// on the other end of it. Both are the cluster plane and bind the host's
-	// address; only the gate's S3 listener may be given a public one.
-	var trs []transport.Transport
-	if len(host.Nodes) > 1 {
-		trs = append(trs, transport.NewPipeTransport(host.Addr, port))
-	}
-	if hasRemoteNodes(cfg, host.ID) {
-		quic, qerr := transport.NewQUICTransport(config.HostBindAddr(host), port, host.TLSCert, host.TLSKey)
-		if qerr != nil {
-			return nil, nil, fmt.Errorf("node %d quic transport: %w", n.ID, qerr)
+func buildNode(cfg *Config, hCfg HostConfig, nCfg NodeConfig, barrier leaderBarrier) (node, error) {
+	transports := make([]rpc.Transport, 0, 2)
+	if len(hCfg.Nodes) > 1 {
+		tr, err := rpc.NewPipeTransport(hCfg.BindAddr, nCfg.Port)
+		if err != nil {
+			return nil, err
 		}
-		trs = append(trs, quic)
+		transports = append(transports, tr)
 	}
-
-	// pool is set by the gate, the one role that dials without running a
-	// server of its own; closing it and the transports is all a node leaves
-	// behind, since every service releases what it opened.
-	var pool *rpc.ConnPool
-	cleanup = func() {
-		if pool != nil {
-			_ = pool.Close()
+	if len(cfg.Hosts) > 1 {
+		tr, err := rpc.NewQUICTransport(
+			hCfg.BindAddr, nCfg.Port,
+			hCfg.TLSCert, hCfg.TLSKey,
+		)
+		if err != nil {
+			return nil, err
 		}
-		for _, tr := range trs {
-			_ = tr.Close()
-		}
+		transports = append(transports, tr)
 	}
 
-	res, err := rpc.NewResolver(cfg, n.ID, trs...)
-	if err != nil {
-		cleanup()
-		return nil, nil, err
-	}
+	resolver := rpc.NewResolver(hCfg.ID, nCfg.ID)
 
-	// Nothing dials a gate, so it listens on nothing: the S3 frontend is
-	// its only listener.
-	var lns []transport.Listener
-	if n.Role != RoleGate {
-		for _, tr := range trs {
-			ln, lerr := tr.Listen()
-			if lerr != nil {
-				cleanup()
-				return nil, nil, fmt.Errorf("node %d listen on %s: %w", n.ID, tr.Network(), lerr)
+	for _, host := range cfg.Hosts {
+		for _, node := range host.Nodes {
+			if node.ID != nCfg.ID {
+				var dialer rpc.Dialer
+				if host.ID == hCfg.ID {
+					// Pipe for same host.
+					dialer = transports[0]
+				} else {
+					// QUIC for cross host.
+					dialer = transports[1]
+				}
+				resolver.RegisterPeer(host.ID, node.ID, dialer)
 			}
-			lns = append(lns, ln)
 		}
 	}
 
-	dir := config.NodeDataDir(host, n)
-	var serve func(context.Context) error
-
-	switch n.Role {
+	switch nCfg.Role {
 	case RoleGate:
-		// The pool is private: a gate dials but is never dialed, so it has
-		// nothing to share one with.
-		pool = rpc.NewConnPool(n.ID, res)
-		cli := rpc.NewClient(pool)
-		metaClient, cerr := meta.NewClient(meta.ClientConfig{
-			Client:   cli,
-			Replicas: nodeIDs(nodesByRole(cfg, RoleMeta)),
-		})
-		if cerr != nil {
-			cleanup()
-			return nil, nil, fmt.Errorf("create s3 gate: %w", cerr)
+		gate, err := gate.New(resolver, transports)
+		if err != nil {
+			return nil, err
 		}
-		blobClient, cerr := blob.NewClient(blob.ClientConfig{Client: cli})
-		if cerr != nil {
-			cleanup()
-			return nil, nil, fmt.Errorf("create s3 gate: %w", cerr)
-		}
-		gw, gerr := gate.New(gateConfig(cfg, host, n, metaClient, blobClient))
-		if gerr != nil {
-			cleanup()
-			return nil, nil, fmt.Errorf("create s3 gate: %w", gerr)
-		}
-		serve = func(ctx context.Context) error {
-			select {
-			case <-barrier.wait:
-			case <-ctx.Done():
-			}
-			return gw.Run(ctx)
-		}
-
-	case RoleBlob:
-		// The node owns its store: it creates the directory, opens the engine
-		// and closes it again, so no failure here can leak one.
-		svc, berr := blob.New(blob.Config{
-			NodeID:     n.ID,
-			DataDir:    dir,
-			AEAD:       opts.MasterKey.AEAD,
-			Compaction: time.Duration(cfg.Compaction.IntervalSeconds) * time.Second,
-			Listeners:  lns,
-		})
-		if berr != nil {
-			cleanup()
-			return nil, nil, fmt.Errorf("create blob node %d: %w", n.ID, berr)
-		}
-		serve = svc.Run
+		return gate, nil
 
 	case RoleMeta:
-		// The replica owns its raft node and the pool it is both dialed
-		// through and dials its peers with, so no failure here can leak one.
-		// The barrier opens however the election goes: a slow one still
-		// releases the gate rather than never serving.
-		svc, merr := meta.New(meta.Config{
-			NodeID:    n.ID,
-			DataDir:   dir,
-			Peers:     nodeIDs(nodesByRole(cfg, RoleMeta)),
-			Bootstrap: true,
-			Listeners: lns,
-			Resolver:  res,
-			OnLeader:  barrier.open,
-		})
-		if merr != nil {
-			cleanup()
-			return nil, nil, fmt.Errorf("create meta replica %d: %w", n.ID, merr)
+		meta, err := meta.New(resolver, transports)
+		if err != nil {
+			return nil, err
 		}
-		serve = svc.Run
+		return meta, nil
 
-	default:
-		cleanup()
-		return nil, nil, fmt.Errorf("node %d has unknown role %q", n.ID, n.Role)
+	case RoleBlob:
+		blob, err := blob.New(resolver, transports)
+		if err != nil {
+			return nil, err
+		}
+		return blob, nil
 	}
 
-	run = func(ctx context.Context) error {
-		if err := serve(ctx); err != nil {
-			return fmt.Errorf("node %d: %w", n.ID, err)
-		}
-		return nil
-	}
-	return run, cleanup, nil
+	return nil, nil
 }

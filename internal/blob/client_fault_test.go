@@ -58,7 +58,7 @@ func startHostile(t *testing.T, cfg hostile.Config) (*blob.Client, *hostile.Serv
 
 	serverRes, err := rpc.NewResolver(clusterCfg, 1, serverTr)
 	require.NoError(t, err)
-	serverPool := rpc.NewConnPool(1, serverRes)
+	serverPool := rpc.NewPool(1, serverRes)
 
 	node := hostile.New(cfg)
 	srv, err := rpc.NewServer(node.Mux(), []transport.Listener{ln}, serverPool,
@@ -81,7 +81,7 @@ func startHostile(t *testing.T, cfg hostile.Config) (*blob.Client, *hostile.Serv
 	require.NoError(t, err)
 
 	client, err := blob.NewClient(blob.ClientConfig{
-		Client:          rpc.NewClient(rpc.NewConnPool(2, clientRes)),
+		Client:          rpc.NewClient(rpc.NewPool(2, clientRes)),
 		EnvelopeTimeout: testEnvelopeTimeout,
 		IdleTimeout:     testIdleTimeout,
 	})
