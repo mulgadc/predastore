@@ -14,6 +14,9 @@
 #   ./scripts/bench/e2e-stress.sh          # or: make e2e-stress
 #
 # Environment:
+#   STRESS_SCENARIO    "freeze" (default), "partial-put" or "torn-overwrite".
+#                      freeze is the rejoin test described above; the other two
+#                      are write-path faults and return before the load phase.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -28,6 +31,8 @@
 #   STRESS_KEEP_WORK   1 to keep the cluster work directory after the run
 #   STRESS_PORT_OFFSET Added to every node port, so a run does not collide
 #                      with a cluster already on the defaults (default: 10000)
+#   STRESS_TORN_LINES  Records in the torn-overwrite state document, which sets
+#                      its size (default: 16384, about 1MiB)
 #   WARP               Path to the warp binary (default: bin/tools/warp)
 #
 
@@ -476,6 +481,201 @@ if [ "${STRESS_SCENARIO:-freeze}" = partial-put ]; then
     echo "Stress results: $RUN_DIR"
     [ "$FAILURES" -eq 0 ] || fail "partial-put scenario failed $FAILURES of $CASES_RUN assertions"
     log "partial-put scenario passed"
+    exit 0
+fi
+
+# --- Scenario: torn-overwrite ---
+#
+# An overwrite is not atomic across an object's shards. writeObject sends every
+# shard concurrently and each blob node commits its own the moment that shard
+# lands, so a fault that reaches one shard node and not the others leaves the
+# object holding some shards from the new write and the rest from the old one.
+# The PUT fails and the metadata record is never updated, so nothing anywhere
+# records that the object is now a mixture — the next GET reads it back as if
+# it were whole.
+#
+# SIGSTOP on one host is the fault, for the same reason the freeze scenario
+# uses it: the node stays dialable and answers nothing, which is what a stalled
+# peer looks like to the write path. One host is enough and two would prove
+# less, because stopping two of four takes raft's quorum with it and the
+# failure would then be ordinary loss of quorum rather than this.
+#
+# Which host to stop is not a guess. Placement follows the object hash, which
+# is derived from bucket and key alone, so shardplace resolves the exact host
+# holding a named shard of a named key before the object is written.
+if [ "${STRESS_SCENARIO:-freeze}" = torn-overwrite ]; then
+    SHARD_PROBE="$WORK_DIR/shardplace"
+    go build -o "$SHARD_PROBE" "$REPO_DIR/scripts/bench/shardplace"
+
+    BUCKET="stress-torn-${RUN_ID}"
+    LINES="${STRESS_TORN_LINES:-16384}"
+    V1="$WORK_DIR/state-v1.json"
+    V2="$WORK_DIR/state-v2.json"
+
+    # A state document rather than random bytes, because the objects this
+    # destroyed in production were volume state: every record carries the
+    # generation that wrote it, so a mixture is legible in the file itself
+    # rather than only as a checksum that no longer matches. Both generations
+    # are byte-for-byte the same length, which is what an in-place rewrite of
+    # a state document looks like and what keeps the stored size honest.
+    make_state() {
+        awk -v gen="$1" -v n="$LINES" 'BEGIN {
+            printf "{\n  \"v\": 1,\n  \"generation\": \"%s\",\n", gen
+            for (i = 1; i <= n; i++)
+                printf "  \"extent_%06d\": \"%s-%06d-0123456789abcdef0123456789abcdef\",\n", i, gen, i
+            printf "  \"trailer\": \"%s\"\n}\n", gen
+        }' > "$2"
+    }
+
+    make_state v1 "$V1"
+    make_state v2 "$V2"
+    [ "$(wc -c < "$V1")" -eq "$(wc -c < "$V2")" ] \
+        || fail "the two generations differ in length, which is not the overwrite under test"
+    log "torn-overwrite scenario: state document is $(wc -c < "$V1") bytes over $LINES records"
+
+    # shard_host names the host holding a given shard role of a given key, and
+    # survivor_gate a gate that is not on it. The PUT has to be issued through
+    # a gate that is still running, or what stalls is the frontend rather than
+    # the shard write.
+    shard_host() {
+        "$SHARD_PROBE" -config "$CONFIG_FILE" -bucket "$BUCKET" -key "$1" \
+            | awk -v r="role=$2" '$2 == r { sub(/^host=/, "", $4); print $4; exit }'
+    }
+    survivor_gate() {
+        parse_hosts "$CONFIG_FILE" | awk -v h="$1" '$1 != h && $3 != "" { print "https://" $2 ":" $3; exit }'
+    }
+
+    FIRST_GATE="https://$(gate_endpoints "$CONFIG_FILE" | head -1)"
+    aws_s3 "$FIRST_GATE" s3 mb "s3://$BUCKET" >/dev/null
+
+    FAILURES=0
+    CASES_RUN=0
+
+    # generation_of classifies what came back. Neither generation intact is
+    # the finding: a spliced object is one the reader cannot detect and the
+    # writer never knew it made.
+    generation_of() {
+        local got="$1"
+        if cmp -s "$V1" "$got"; then
+            echo v1
+        elif cmp -s "$V2" "$got"; then
+            echo v2
+        else
+            echo "spliced(v1_records=$(grep -c '"v1-' "$got" || true) v2_records=$(grep -c '"v2-' "$got" || true))"
+        fi
+    }
+
+    # freeze_and_overwrite stores v1, stops the host holding one named shard of
+    # that key, overwrites with v2, and thaws. The PUT is expected to fail: one
+    # shard node is unreachable and the write path fails on any shard error.
+    # What the run is here to establish is the state it leaves behind.
+    freeze_and_overwrite() {
+        local name="$1" role="$2"
+        local key="state-${name}.json"
+        local got="$WORK_DIR/got-${name}.json"
+        local host gate pid rc
+
+        host="$(shard_host "$key" "$role")"
+        [ -n "$host" ] || fail "$name: shardplace named no $role shard host for $key"
+        gate="$(survivor_gate "$host")"
+        [ -n "$gate" ] || fail "$name: no gate survives stopping host $host"
+        pid="$(cat "$PID_DIR/host-${host}.pid")"
+        kill -0 "$pid" 2>/dev/null || fail "$name: host $host is not running"
+
+        log "$name: $role shard of $key is on host $host (pid $pid); writing through $gate"
+        "$SHARD_PROBE" -config "$CONFIG_FILE" -bucket "$BUCKET" -key "$key" | tee -a "$EVENTS"
+
+        aws_s3 "$gate" s3api put-object --bucket "$BUCKET" --key "$key" --body "$V1" >/dev/null
+        aws_s3 "$gate" s3 cp "s3://$BUCKET/$key" "$got" --only-show-errors
+        cmp -s "$V1" "$got" || fail "$name: baseline object did not round trip"
+        log "$name: v1 stored and verified"
+
+        kill -STOP "$pid"
+        log "$name: SIGSTOP host $host, overwriting with v2"
+        rc=0
+        aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 180 \
+            s3api put-object --bucket "$BUCKET" --key "$key" --body "$V2" >/dev/null 2>>"$EVENTS" || rc=$?
+        kill -CONT "$pid"
+        log "$name: SIGCONT host $host, overwriting PUT exited $rc"
+
+        if [ "$rc" -eq 0 ]; then
+            log "$name: FAIL the overwrite reported success with a shard node stopped"
+            FAILURES=$(( FAILURES + 1 ))
+        fi
+        CASES_RUN=$(( CASES_RUN + 1 ))
+
+        # Long enough for the thawed host to answer again, so the GET below is
+        # reading the cluster's settled state rather than racing the thaw.
+        sleep 10
+
+        local seen
+        aws_s3 "$gate" s3 cp "s3://$BUCKET/$key" "$got" --only-show-errors 2>>"$EVENTS" || true
+        seen="$(generation_of "$got")"
+        cp "$got" "$RUN_DIR/torn-overwrite-${name}.json"
+
+        # The assertion, and it does not depend on knowing the mechanism: the
+        # overwrite failed, so the object still has to be exactly what it was.
+        if [ "$seen" = v1 ]; then
+            log "$name: pass, the failed overwrite left v1 intact"
+        else
+            log "$name: FAIL a failed overwrite left the object as $seen"
+            FAILURES=$(( FAILURES + 1 ))
+        fi
+        CASES_RUN=$(( CASES_RUN + 1 ))
+        TORN_KEY="$key"
+    }
+
+    # A data shard, where the mixture is served straight back: the reader takes
+    # the data shards in order and joins them, so an object whose shards
+    # disagree reads as one generation's bytes followed by another's.
+    freeze_and_overwrite data-shard data
+
+    # The parity shard, which is the quieter half of the same defect. Both data
+    # shards take the new write and only parity is left behind, so an ordinary
+    # GET returns the object the failed PUT was not supposed to store, and the
+    # parity that is meant to rebuild it belongs to the generation before.
+    freeze_and_overwrite parity-shard parity
+    PARITY_KEY="$TORN_KEY"
+
+    # What that stale parity is worth, which a healthy read never asks. One
+    # data shard's host is stopped so the read has to reconstruct, and the
+    # parity it reconstructs from is the older generation's.
+    RECON_HOST="$(shard_host "$PARITY_KEY" data)"
+    RECON_GATE="$(survivor_gate "$RECON_HOST")"
+    RECON_PID="$(cat "$PID_DIR/host-${RECON_HOST}.pid")"
+    RECON_GOT="$WORK_DIR/got-reconstructed.json"
+
+    log "reconstruction: stopping host $RECON_HOST to force $PARITY_KEY to rebuild from parity"
+    kill -STOP "$RECON_PID"
+    RECON_RC=0
+    aws_s3 "$RECON_GATE" --cli-connect-timeout 10 --cli-read-timeout 120 \
+        s3 cp "s3://$BUCKET/$PARITY_KEY" "$RECON_GOT" --only-show-errors 2>>"$EVENTS" || RECON_RC=$?
+    kill -CONT "$RECON_PID"
+
+    if [ "$RECON_RC" -ne 0 ]; then
+        log "reconstruction: GET failed with $RECON_RC, so the object is unreadable one node down"
+        FAILURES=$(( FAILURES + 1 ))
+    else
+        cp "$RECON_GOT" "$RUN_DIR/torn-overwrite-reconstructed.json"
+        RECON_SEEN="$(generation_of "$RECON_GOT")"
+        if [ "$RECON_SEEN" = v1 ]; then
+            log "reconstruction: pass, rebuilt v1 from parity"
+        else
+            log "reconstruction: FAIL rebuilt $RECON_SEEN from parity"
+            FAILURES=$(( FAILURES + 1 ))
+        fi
+    fi
+    CASES_RUN=$(( CASES_RUN + 1 ))
+    sleep 10
+
+    log "raft state after the scenario"
+    meta_status "${META_ALL[@]}" | tee -a "$EVENTS"
+
+    aws_s3 "$FIRST_GATE" s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true
+
+    echo "Stress results: $RUN_DIR"
+    [ "$FAILURES" -eq 0 ] || fail "torn-overwrite scenario failed $FAILURES of $CASES_RUN assertions"
+    log "torn-overwrite scenario passed"
     exit 0
 fi
 
