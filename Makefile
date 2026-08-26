@@ -120,6 +120,12 @@ e2e-performance-compare: warp-install
 # stops sending mid-body. That one is not about the cluster surviving a host,
 # it is about a stalled upload neither running forever nor damaging the object
 # it is overwriting.
+#
+# STRESS_SCENARIO=torn-overwrite stops the one host holding a named shard and
+# overwrites the object while it is down. The write fails, as it must with a
+# shard node unreachable, and the run then asks what the object is afterwards.
+# It currently fails: an overwrite has no commit point across its shards, so a
+# failed one leaves the object part new and part old.
 STRESS_CONFIG   ?= 4host
 STRESS_FREEZE   ?= 90
 STRESS_HOST     ?= follower
