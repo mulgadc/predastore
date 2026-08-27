@@ -20,13 +20,18 @@ import (
 )
 
 // The blob engine's on-disk shapes, restated here because they are not
-// exported. A shard key is objectHash ‖ shardIndex and a tombstone key is a
-// prefix byte ‖ segment ‖ offset, so length alone separates them.
+// exported. A shard key is objectHash ‖ shardIndex, a prepared key is a prefix
+// byte ahead of that, and a tombstone key is a prefix byte ‖ segment ‖ offset,
+// so length alone separates all three.
 const (
-	shardKeySize     = 36
-	extentSize       = 32
-	tombstoneKeySize = 17
-	tombstonePrefix  = 'd'
+	shardKeySize      = 36
+	preparedKeySize   = 37
+	extentSize        = 32
+	indexValueSize    = extentSize + 8
+	preparedValueSize = indexValueSize + 8
+	tombstoneKeySize  = 17
+	tombstonePrefix   = 'd'
+	preparedPrefix    = 'p'
 )
 
 // The meta store's placement record header, restated for the same reason.
@@ -147,8 +152,14 @@ func formatPlacement(v []byte) (string, bool) {
 // below is indexed within a length the compiler can see.
 func formatBlob(k, v []byte) string {
 	switch {
-	case len(k) == shardKeySize && len(v) == extentSize:
-		return formatShardRow([shardKeySize]byte(k), [extentSize]byte(v))
+	case len(k) == shardKeySize && len(v) == indexValueSize:
+		return formatShardRow("shard ", [shardKeySize]byte(k), v)
+	case len(k) == preparedKeySize && len(v) == preparedValueSize && k[0] == preparedPrefix:
+		// A prepared row is a durable shard its writer has not published, so
+		// it is reported with the age that decides when it is reaped.
+		return fmt.Sprintf("%s prepared_at=%d",
+			formatShardRow("prep  ", [shardKeySize]byte(k[1:]), v),
+			binary.BigEndian.Uint64(v[indexValueSize:]))
 	case len(k) == tombstoneKeySize && len(v) == 8 && k[0] == tombstonePrefix:
 		return formatTombstoneRow([tombstoneKeySize]byte(k), [8]byte(v))
 	default:
@@ -159,10 +170,11 @@ func formatBlob(k, v []byte) string {
 // formatShardRow prints the extent one shard of one object occupies. Offsets
 // and sizes are shown unsigned, as the bytes hold them, so a corrupt row reads
 // as an implausible number rather than as a plausible negative one.
-func formatShardRow(k [shardKeySize]byte, v [extentSize]byte) string {
+func formatShardRow(kind string, k [shardKeySize]byte, v []byte) string {
 	hash := hex.EncodeToString(k[:32])
-	return fmt.Sprintf("shard  key=%s.. index=%d  extent{seg=%d off=%d psize=%d lsize=%d}",
-		hash[:16], binary.BigEndian.Uint32(k[32:]),
+	return fmt.Sprintf("%s key=%s.. index=%d  epoch=%016x  extent{seg=%d off=%d psize=%d lsize=%d}",
+		kind, hash[:16], binary.BigEndian.Uint32(k[32:]),
+		binary.BigEndian.Uint64(v[extentSize:indexValueSize]),
 		binary.BigEndian.Uint64(v[0:8]), binary.BigEndian.Uint64(v[8:16]),
 		binary.BigEndian.Uint64(v[16:24]), binary.BigEndian.Uint64(v[24:32]))
 }

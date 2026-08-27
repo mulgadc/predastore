@@ -16,22 +16,43 @@ func shardKey(hash [32]byte, index uint32) []byte {
 	return k
 }
 
-func extent(seg, off, psize, lsize uint64) []byte {
-	v := make([]byte, extentSize)
+// indexValue is a live row: the extent followed by the write epoch.
+func indexValue(seg, off, psize, lsize, epoch uint64) []byte {
+	v := make([]byte, indexValueSize)
 	binary.BigEndian.PutUint64(v[0:8], seg)
 	binary.BigEndian.PutUint64(v[8:16], off)
 	binary.BigEndian.PutUint64(v[16:24], psize)
 	binary.BigEndian.PutUint64(v[24:32], lsize)
+	binary.BigEndian.PutUint64(v[extentSize:], epoch)
 	return v
 }
 
 func TestFormatBlobDecodesAShardRow(t *testing.T) {
 	hash := model.ObjectHash("demo", "sample1.json")
-	got := formatBlob(shardKey(hash, 1), extent(0, 2109454, 2109440, 2097152))
+	got := formatBlob(shardKey(hash, 1), indexValue(0, 2109454, 2109440, 2097152, 0x0123456789abcdef))
 
 	for _, want := range []string{
-		"shard", "key=f8c152e3aab9f63a..", "index=1",
+		"shard", "key=f8c152e3aab9f63a..", "index=1", "epoch=0123456789abcdef",
 		"seg=0", "off=2109454", "psize=2109440", "lsize=2097152",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("formatBlob() = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+// A prepared row is a durable shard its writer never published. It is reported
+// as its own kind: read as a live one it would claim the object holds bytes no
+// reader can reach.
+func TestFormatBlobDecodesAPreparedRow(t *testing.T) {
+	hash := model.ObjectHash("demo", "sample1.json")
+	k := append([]byte{preparedPrefix}, shardKey(hash, 2)...)
+	v := append(indexValue(1, 64, 128, 100, 0xdeadbeefcafef00d), make([]byte, 8)...)
+	binary.BigEndian.PutUint64(v[indexValueSize:], 1724800000000000000)
+
+	got := formatBlob(k, v)
+	for _, want := range []string{
+		"prep", "index=2", "epoch=deadbeefcafef00d", "prepared_at=1724800000000000000",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("formatBlob() = %q, want it to contain %q", got, want)
