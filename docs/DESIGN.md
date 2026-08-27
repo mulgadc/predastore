@@ -471,7 +471,7 @@ The master key is one 32-byte AES-256 key per cluster, loaded once at startup by
 
 Every node in a cluster must be given the same key file. Fragments sealed under one master cannot be opened under another. Rotation is out of scope for the current implementation (see §15).
 
-Binaries are built with `GOFIPS140=v1.0.0`, and `internal/fipsboot` panics at startup if FIPS mode was turned off at runtime via `GODEBUG`.
+Binaries are built with `GOFIPS140=v1.0.0`, and `bluebottle/pkg/fipsboot` panics at startup if FIPS mode was turned off at runtime via `GODEBUG`.
 
 ---
 
