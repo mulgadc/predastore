@@ -61,9 +61,46 @@ func mintEpoch() (uint64, error) {
 // shardWriteOutcome captures the result of writing a shard to a blob node.
 type shardWriteOutcome struct {
 	shardIndex   int
-	shardSize    int64
 	poolNearFull bool // mirrors PutResponse.PoolNearFull for this shard's node.
 	err          error
+}
+
+// writeResult is what a write left on the cluster. It carries the landed set
+// rather than a count because commit, abort and the degraded signal each need
+// to know which positions, not how many: committing a shard that was never
+// prepared is noise, and aborting one is a request to discard something else's
+// work.
+type writeResult struct {
+	poolNearFull bool
+	landed       []bool
+	missing      []config.NodeID
+}
+
+func (r writeResult) landedCount() int {
+	n := 0
+	for _, ok := range r.landed {
+		if ok {
+			n++
+		}
+	}
+
+	return n
+}
+
+// degraded reports whether the write went out at less than full width. The
+// object is durable either way; what is reduced is how many further losses it
+// survives until repair restores the missing shards.
+func (r writeResult) degraded() bool { return len(r.missing) > 0 }
+
+// fullWidth is the result of a write with no shards to place, which is an empty
+// object: nothing is missing because nothing was owed.
+func fullWidth(total int) writeResult {
+	landed := make([]bool, total)
+	for i := range landed {
+		landed[i] = true
+	}
+
+	return writeResult{landed: landed}
 }
 
 // bytesBufferWriter wraps a byte slice pointer for use as io.Writer.
@@ -132,17 +169,18 @@ func (c *countingReader) Read(p []byte) (int, error) {
 func writeSingleShard(
 	ctx context.Context, bc BlobClient, node config.NodeID, body io.Reader, size int64,
 	objectHash [32]byte, epoch uint64,
-) (poolNearFull bool, err error) {
+) (writeResult, error) {
 	counted := &countingReader{r: body}
 
 	resp, err := bc.Put(ctx, node, blob.PutRequest{Key: objectHash, Size: size, Index: 0, Epoch: epoch}, counted)
 	if err != nil {
-		return false, err
+		return writeResult{landed: []bool{false}, missing: []config.NodeID{node}}, err
 	}
 	if counted.n != size {
-		return false, fmt.Errorf("body delivered %d bytes, declared %d", counted.n, size)
+		return writeResult{landed: []bool{true}}, fmt.Errorf("body delivered %d bytes, declared %d", counted.n, size)
 	}
-	return resp.PoolNearFull, nil
+
+	return writeResult{poolNearFull: resp.PoolNearFull, landed: []bool{true}}, nil
 }
 
 // writeObject splits body into RS shards and sends each to the appropriate
@@ -153,11 +191,11 @@ func writeSingleShard(
 //
 // The stream encoder is constructed per request; hoisting it into the gate
 // belongs with the streaming refactor, not here.
-func writeObject(ctx context.Context, bc BlobClient, cfg Config, body io.Reader, size int64, objectHash [32]byte, place ObjectToShardNodes) (poolNearFull bool, err error) {
+func writeObject(ctx context.Context, bc BlobClient, cfg Config, body io.Reader, size int64, objectHash [32]byte, place ObjectToShardNodes) (writeResult, error) {
 	// An empty object has no shard to write: the blob protocol rejects a
 	// zero-length value, and recorded placement is enough to serve the GET.
 	if size == 0 {
-		return false, nil
+		return fullWidth(cfg.TotalShards()), nil
 	}
 
 	// The nodes come from the placement that will be published, not from a
@@ -173,158 +211,137 @@ func writeObject(ctx context.Context, bc BlobClient, cfg Config, body io.Reader,
 		return writeSingleShard(ctx, bc, shardNodes[0], body, size, objectHash, epoch)
 	}
 
-	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
+	shards, err := encodeShards(cfg, body, size)
 	if err != nil {
-		return false, err
+		return writeResult{landed: make([]bool, cfg.TotalShards())}, err
 	}
 
-	// Calculate shard size
+	return putShards(ctx, bc, cfg, objectHash, epoch, shardNodes, shards)
+}
+
+// encodeShards splits the body into its data shards and encodes the parity
+// from them, all in memory.
+//
+// The parity used to be streamed to its nodes through pipes fed by the
+// encoder, which coupled the shards to each other: one parity node refusing
+// closed its pipe, failed the encode, and took every other parity shard down
+// with it. Under degraded writes that is the difference between losing one
+// shard and losing all the redundancy at once. The data shards were already
+// buffered whole to encode from, so holding the parity too costs m/k more.
+func encodeShards(cfg Config, body io.Reader, size int64) ([][]byte, error) {
+	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
+	if err != nil {
+		return nil, err
+	}
+
 	ds := int64(cfg.DataShards)
 	shardSize := int((size + ds - 1) / ds)
 
-	// Step 1: Split the body into data shard buffers (in memory)
-	// This allows us to both send to the blob nodes and use for parity encoding
-	dataShardBuffers := make([][]byte, cfg.DataShards)
+	shards := make([][]byte, cfg.TotalShards())
 	dataWriters := make([]io.Writer, cfg.DataShards)
-	for i := 0; i < cfg.DataShards; i++ {
-		dataShardBuffers[i] = make([]byte, 0, shardSize)
-		dataWriters[i] = &bytesBufferWriter{buf: &dataShardBuffers[i]}
+	for i := range cfg.DataShards {
+		shards[i] = make([]byte, 0, shardSize)
+		dataWriters[i] = &bytesBufferWriter{buf: &shards[i]}
 	}
-
 	if splitErr := enc.Split(body, dataWriters, size); splitErr != nil {
-		return false, splitErr
+		return nil, splitErr
 	}
 
-	// Step 2: Send data shards to their nodes
-	dataCh := make(chan shardWriteOutcome, cfg.DataShards)
-	var dataWG sync.WaitGroup
-
-	for i := 0; i < cfg.DataShards; i++ {
-		dataWG.Add(1)
-		go func(idx int, shardData []byte) {
-			defer dataWG.Done()
-
-			nodeNum := shardNodes[idx]
-
-			putReq := blob.PutRequest{
-				Key:   objectHash,
-				Size:  int64(len(shardData)),
-				Index: uint32(idx), //nolint:gosec // G115: idx bounded by DataShards (small uint).
-				Epoch: epoch,
-			}
-
-			resp, putErr := bc.Put(ctx, nodeNum, putReq, bytes.NewReader(shardData))
-			if putErr != nil {
-				slog.Error("writeObject: put failed", "node", nodeNum, "error", putErr)
-				dataCh <- shardWriteOutcome{shardIndex: idx, err: putErr}
-				return
-			}
-
-			dataCh <- shardWriteOutcome{shardIndex: idx, shardSize: resp.Size, poolNearFull: resp.PoolNearFull}
-		}(i, dataShardBuffers[i])
-	}
-
-	go func() {
-		dataWG.Wait()
-		close(dataCh)
-	}()
-
-	var firstErr error
-	for outcome := range dataCh {
-		if outcome.err != nil && firstErr == nil {
-			firstErr = outcome.err
-		}
-		if outcome.poolNearFull {
-			poolNearFull = true
-		}
-	}
-	if firstErr != nil {
-		return false, firstErr
-	}
-
-	// Step 3: Encode parity shards using the buffered data shards. Zero parity
-	// has nothing to encode, and the encoder would read every data shard back
-	// to produce nothing, so stop at the data shards.
 	if cfg.ParityShards == 0 {
-		return poolNearFull, nil
+		return shards, nil
 	}
 
 	dataReaders := make([]io.Reader, cfg.DataShards)
-	for i := 0; i < cfg.DataShards; i++ {
-		dataReaders[i] = bytes.NewReader(dataShardBuffers[i])
+	for i := range cfg.DataShards {
+		dataReaders[i] = bytes.NewReader(shards[i])
+	}
+	parityWriters := make([]io.Writer, cfg.ParityShards)
+	for i := range cfg.ParityShards {
+		idx := cfg.DataShards + i
+		shards[idx] = make([]byte, 0, shardSize)
+		parityWriters[i] = &bytesBufferWriter{buf: &shards[idx]}
+	}
+	if encodeErr := enc.Encode(dataReaders, parityWriters); encodeErr != nil {
+		return nil, encodeErr
 	}
 
-	parityWriters := make([]io.Writer, cfg.ParityShards)
-	parityPipeWriters := make([]*io.PipeWriter, cfg.ParityShards)
-	parityCh := make(chan shardWriteOutcome, cfg.ParityShards)
-	var parityWG sync.WaitGroup
+	return shards, nil
+}
 
-	for i := 0; i < cfg.ParityShards; i++ {
-		pr, pw := io.Pipe()
-		parityPipeWriters[i] = pw
-		parityWriters[i] = pw
-
-		parityIdx := cfg.DataShards + i
-		parityWG.Add(1)
-		go func(localParityIdx int, shardIdx int, r *io.PipeReader) {
-			defer parityWG.Done()
-			// enc.Encode runs on the caller's goroutine and writes into this
-			// pipe. Abandoning the read side on an early return would block it
-			// forever, and io.Pipe does not observe ctx.
-			defer func() { _ = r.Close() }()
-
-			nodeNum := shardNodes[shardIdx]
-
+// putShards prepares every shard on its node concurrently and reports which
+// landed. A node that refuses is not fatal on its own: the write is acceptable
+// once cfg.MinShards() of the stripe are durable, because any DataShards of
+// them reconstruct the object. Below that the write fails and names the nodes
+// that were missing.
+func putShards(
+	ctx context.Context, bc BlobClient, cfg Config,
+	objectHash [32]byte, epoch uint64, shardNodes []config.NodeID, shards [][]byte,
+) (writeResult, error) {
+	outcomes := make(chan shardWriteOutcome, len(shards))
+	var wg sync.WaitGroup
+	for i, shardData := range shards {
+		node := shardNodes[i]
+		wg.Go(func() {
 			putReq := blob.PutRequest{
 				Key:   objectHash,
-				Size:  int64(shardSize),
-				Index: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards + ParityShards (small uint).
+				Size:  int64(len(shardData)),
+				Index: uint32(i), //nolint:gosec // G115: i bounded by DataShards + ParityShards (small uint).
 				Epoch: epoch,
 			}
-
-			resp, putErr := bc.Put(ctx, nodeNum, putReq, r)
+			resp, putErr := bc.Put(ctx, node, putReq, bytes.NewReader(shardData))
 			if putErr != nil {
-				slog.Error("writeObject: put parity failed", "node", nodeNum, "error", putErr)
-				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, err: putErr}
+				outcomes <- shardWriteOutcome{shardIndex: i, err: putErr}
 				return
 			}
-
-			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, shardSize: resp.Size, poolNearFull: resp.PoolNearFull}
-		}(i, parityIdx, pr)
+			outcomes <- shardWriteOutcome{shardIndex: i, poolNearFull: resp.PoolNearFull}
+		})
 	}
+	wg.Wait()
+	close(outcomes)
 
-	encodeErr := enc.Encode(dataReaders, parityWriters)
+	result := writeResult{landed: make([]bool, len(shards))}
+	var firstErr error
+	for outcome := range outcomes {
+		if outcome.err != nil {
+			if firstErr == nil {
+				firstErr = outcome.err
+			}
+			node := shardNodes[outcome.shardIndex]
+			result.missing = append(result.missing, node)
+			logShardWriteFailure(ctx, node, outcome.shardIndex, outcome.err)
 
-	for i := 0; i < cfg.ParityShards; i++ {
-		if encodeErr != nil {
-			_ = parityPipeWriters[i].CloseWithError(encodeErr)
-		} else {
-			_ = parityPipeWriters[i].Close()
+			continue
 		}
-	}
-
-	go func() {
-		parityWG.Wait()
-		close(parityCh)
-	}()
-
-	firstErr = nil
-	for outcome := range parityCh {
-		if outcome.err != nil && firstErr == nil {
-			firstErr = outcome.err
-		}
+		result.landed[outcome.shardIndex] = true
 		if outcome.poolNearFull {
-			poolNearFull = true
+			result.poolNearFull = true
 		}
 	}
-	if encodeErr != nil && firstErr == nil {
-		firstErr = encodeErr
-	}
-	if firstErr != nil {
-		return false, firstErr
+
+	if landed := result.landedCount(); landed < cfg.MinShards() {
+		return result, fmt.Errorf("%w: %d of %d shards durable, nodes %v unreachable: %w",
+			errShardWriteFloor, landed, cfg.MinShards(), result.missing, firstErr)
 	}
 
-	return poolNearFull, nil
+	return result, nil
+}
+
+// errShardWriteFloor reports a write that could not place enough shards to be
+// acknowledged, as distinct from one that placed enough but not all.
+var errShardWriteFloor = errors.New("too few shards durable")
+
+// logShardWriteFailure reports one shard a write could not place, sampled per
+// node and reason for the same reason a read failure is: a node down makes
+// every write degraded, so an unsampled line floods exactly when the logs are
+// being read.
+func logShardWriteFailure(ctx context.Context, node config.NodeID, index int, err error) {
+	reason := shardErrorReason(err)
+	telemetry.RecordShardError(ctx, "write", reason)
+	if !shardLogSampler.allow(node, reason) {
+		return
+	}
+	slog.WarnContext(ctx, "Shard write failed; the stripe is short one holder",
+		"node", node, "index", index, "reason", reason, "err", err)
 }
 
 // commitShards publishes every prepared shard, after the placement record
@@ -335,8 +352,8 @@ func writeObject(ctx context.Context, bc BlobClient, cfg Config, body io.Reader,
 // a reader asking for that epoch completes the commit itself. It is reported
 // because a node failing to commit is worth seeing, not because the object is
 // in doubt.
-func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes) {
-	forEachShard(place, func(index int, node config.NodeID) {
+func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, landed []bool) {
+	forEachShard(place, landed, func(index int, node config.NodeID) {
 		err := bc.Commit(ctx, node, blob.CommitRequest{
 			Key:   objectHash,
 			Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
@@ -353,8 +370,8 @@ func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place
 // abortShards discards shards prepared for a write that will not be published,
 // releasing their space now rather than leaving the nodes to age them out.
 // Nothing references them either way, so a failure is logged and not returned.
-func abortShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes) {
-	forEachShard(place, func(index int, node config.NodeID) {
+func abortShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, landed []bool) {
+	forEachShard(place, landed, func(index int, node config.NodeID) {
 		err := bc.Abort(ctx, node, blob.CommitRequest{
 			Key:   objectHash,
 			Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
@@ -368,10 +385,16 @@ func abortShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place 
 	})
 }
 
-// forEachShard runs fn against every shard position concurrently and waits.
-func forEachShard(place ObjectToShardNodes, fn func(index int, node config.NodeID)) {
+// forEachShard runs fn concurrently against every shard position that landed,
+// and waits. A position whose put never succeeded has nothing prepared on its
+// node, so committing it would be told so and aborting it would ask the node to
+// discard whatever generation it does hold.
+func forEachShard(place ObjectToShardNodes, landed []bool, fn func(index int, node config.NodeID)) {
 	var wg sync.WaitGroup
 	for i, node := range place.AllNodes() {
+		if i < len(landed) && !landed[i] {
+			continue
+		}
 		wg.Go(func() { fn(i, node) })
 	}
 	wg.Wait()

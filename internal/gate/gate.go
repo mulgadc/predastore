@@ -15,6 +15,10 @@ import (
 type RS struct {
 	Data   int
 	Parity int
+
+	// DegradedWrites acknowledges a write once Data shards are durable rather
+	// than requiring the full stripe.
+	DegradedWrites bool
 }
 
 // Config is everything one S3 gate runs on: its slice of the product
@@ -75,9 +79,10 @@ type Config struct {
 // handlerConfig is the slice of the config the handlers read.
 func (s3 *Config) handlerConfig() handlers.Config {
 	return handlers.Config{
-		Region:       s3.Region,
-		DataShards:   s3.RS.Data,
-		ParityShards: s3.RS.Parity,
-		Buckets:      s3.Buckets,
+		Region:         s3.Region,
+		DataShards:     s3.RS.Data,
+		ParityShards:   s3.RS.Parity,
+		DegradedWrites: s3.RS.DegradedWrites,
+		Buckets:        s3.Buckets,
 	}
 }

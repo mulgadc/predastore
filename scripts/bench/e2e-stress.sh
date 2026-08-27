@@ -18,10 +18,10 @@
 #   ./scripts/bench/e2e-stress.sh          # or: make e2e-stress
 #
 # Environment:
-#   STRESS_SCENARIO    Narrows the run to one test: "torn-overwrite", "freeze",
-#                      or "partial-put" — a client that stops sending mid-body,
-#                      which is not in a default run. Unset runs
-#                      torn-overwrite and then freeze.
+#   STRESS_SCENARIO    Narrows the run to one test: "torn-overwrite",
+#                      "stale-shard", "freeze", or "partial-put" — a client
+#                      that stops sending mid-body, which is not in a default
+#                      run. Unset runs torn-overwrite, stale-shard and freeze.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -38,6 +38,8 @@
 #                      with a cluster already on the defaults (default: 10000)
 #   STRESS_TORN_LINES  Records in the torn-overwrite state document, which sets
 #                      its size (default: 16384, about 1MiB)
+#   STRESS_STALE_KEYS  Objects the stale-shard scenario overwrites with a host
+#                      frozen (default: 12)
 #   WARP               Path to the warp binary (default: bin/tools/warp)
 #
 
@@ -60,12 +62,13 @@ OBJECTS="${STRESS_OBJECTS:-32}"
 OBJ_SIZE="${STRESS_OBJ_SIZE:-8MiB}"
 CONCURRENT="${STRESS_CONCURRENT:-8}"
 PORT_OFFSET="${STRESS_PORT_OFFSET:-10000}"
+STALE_KEYS="${STRESS_STALE_KEYS:-12}"
 
 # Validated rather than defaulted, so a typo runs nothing instead of quietly
 # running everything and reporting a pass for a test that was never named.
 SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
-    all|freeze|partial-put|torn-overwrite) ;;
+    all|freeze|partial-put|torn-overwrite|stale-shard) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
 
@@ -525,67 +528,96 @@ fi
 TORN_FAILURES=0
 TORN_CASES=0
 
-run_torn_overwrite() {
-    SHARD_PROBE="$WORK_DIR/shardplace"
-    go build -o "$SHARD_PROBE" "$REPO_DIR/scripts/bench/shardplace"
+# Placement follows the object hash, which is derived from bucket and key
+# alone, so the exact host holding a named shard of a named key is resolvable
+# before the object is written. Both fault scenarios below aim their SIGSTOP
+# with it rather than guessing.
+SHARD_PROBE="$WORK_DIR/shardplace"
+go build -o "$SHARD_PROBE" "$REPO_DIR/scripts/bench/shardplace"
 
+# shard_host names the host holding a given shard role of a given key, and
+# survivor_gate a gate that is not on it. A PUT has to be issued through a gate
+# that is still running, or what stalls is the frontend rather than the shard
+# write.
+shard_host() {
+    "$SHARD_PROBE" -config "$CONFIG_FILE" -bucket "$1" -key "$2" \
+        | awk -v r="role=$3" '$2 == r { sub(/^host=/, "", $4); print $4; exit }'
+}
+survivor_gate() {
+    parse_hosts "$CONFIG_FILE" | awk -v h="$1" '$1 != h && $3 != "" { print "https://" $2 ":" $3; exit }'
+}
+
+# A host that was SIGSTOPped keeps the connections that died under it, and the
+# pool only evicts one after three stalls of five seconds each — long enough
+# that a client's whole retry budget can land inside the window. Reading
+# through such a gate measures that recovery rather than the shard generations
+# either scenario is asking about, so the gate is driven with the cluster whole
+# until it serves, and how long that took is recorded rather than hidden.
+warm_gate() {
+    local gate="$1" bucket="$2" key="$3" label="$4"
+    local scratch="$WORK_DIR/warm.bin" started attempt
+    started="$(date +%s)"
+    for attempt in $(seq 1 12); do
+        if aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 30 \
+            s3 cp "s3://$bucket/$key" "$scratch" --only-show-errors >/dev/null 2>&1; then
+            if [ "$attempt" -gt 1 ]; then
+                log "$label: thawed gate served on attempt $attempt after $(( $(date +%s) - started ))s"
+            fi
+            return 0
+        fi
+        sleep 3
+    done
+    log "$label: thawed gate never served in $(( $(date +%s) - started ))s"
+
+    return 1
+}
+
+# A state document rather than random bytes, because the objects this destroyed
+# in production were volume state: every record carries the generation that
+# wrote it, so a mixture is legible in the file itself rather than only as a
+# checksum that no longer matches. Both generations are byte-for-byte the same
+# length, which is what an in-place rewrite of a state document looks like and
+# what keeps the stored size honest.
+make_state() {
+    awk -v gen="$1" -v n="$3" 'BEGIN {
+        printf "{\n  \"v\": 1,\n  \"generation\": \"%s\",\n", gen
+        for (i = 1; i <= n; i++)
+            printf "  \"extent_%06d\": \"%s-%06d-0123456789abcdef0123456789abcdef\",\n", i, gen, i
+        printf "  \"trailer\": \"%s\"\n}\n", gen
+    }' > "$2"
+}
+
+# generation_of classifies what came back against the $V1 and $V2 the calling
+# scenario built. Neither generation intact is the finding: a spliced object is
+# one the reader cannot detect and the writer never knew it made.
+generation_of() {
+    local got="$1"
+    if cmp -s "$V1" "$got"; then
+        echo v1
+    elif cmp -s "$V2" "$got"; then
+        echo v2
+    else
+        echo "spliced(v1_records=$(grep -c '"v1-' "$got" || true) v2_records=$(grep -c '"v2-' "$got" || true))"
+    fi
+}
+
+run_torn_overwrite() {
     BUCKET="stress-torn-${RUN_ID}"
     LINES="${STRESS_TORN_LINES:-16384}"
     V1="$WORK_DIR/state-v1.json"
     V2="$WORK_DIR/state-v2.json"
 
-    # A state document rather than random bytes, because the objects this
-    # destroyed in production were volume state: every record carries the
-    # generation that wrote it, so a mixture is legible in the file itself
-    # rather than only as a checksum that no longer matches. Both generations
-    # are byte-for-byte the same length, which is what an in-place rewrite of
-    # a state document looks like and what keeps the stored size honest.
-    make_state() {
-        awk -v gen="$1" -v n="$LINES" 'BEGIN {
-            printf "{\n  \"v\": 1,\n  \"generation\": \"%s\",\n", gen
-            for (i = 1; i <= n; i++)
-                printf "  \"extent_%06d\": \"%s-%06d-0123456789abcdef0123456789abcdef\",\n", i, gen, i
-            printf "  \"trailer\": \"%s\"\n}\n", gen
-        }' > "$2"
-    }
-
-    make_state v1 "$V1"
-    make_state v2 "$V2"
+    make_state v1 "$V1" "$LINES"
+    make_state v2 "$V2" "$LINES"
     [ "$(wc -c < "$V1")" -eq "$(wc -c < "$V2")" ] \
         || fail "the two generations differ in length, which is not the overwrite under test"
     log "torn-overwrite scenario: state document is $(wc -c < "$V1") bytes over $LINES records"
-
-    # shard_host names the host holding a given shard role of a given key, and
-    # survivor_gate a gate that is not on it. The PUT has to be issued through
-    # a gate that is still running, or what stalls is the frontend rather than
-    # the shard write.
-    shard_host() {
-        "$SHARD_PROBE" -config "$CONFIG_FILE" -bucket "$BUCKET" -key "$1" \
-            | awk -v r="role=$2" '$2 == r { sub(/^host=/, "", $4); print $4; exit }'
-    }
-    survivor_gate() {
-        parse_hosts "$CONFIG_FILE" | awk -v h="$1" '$1 != h && $3 != "" { print "https://" $2 ":" $3; exit }'
-    }
 
     FIRST_GATE="https://$(gate_endpoints "$CONFIG_FILE" | head -1)"
     aws_s3 "$FIRST_GATE" s3 mb "s3://$BUCKET" >/dev/null
 
     TORN_FAILURES=0
     TORN_CASES=0
-
-    # generation_of classifies what came back. Neither generation intact is
-    # the finding: a spliced object is one the reader cannot detect and the
-    # writer never knew it made.
-    generation_of() {
-        local got="$1"
-        if cmp -s "$V1" "$got"; then
-            echo v1
-        elif cmp -s "$V2" "$got"; then
-            echo v2
-        else
-            echo "spliced(v1_records=$(grep -c '"v1-' "$got" || true) v2_records=$(grep -c '"v2-' "$got" || true))"
-        fi
-    }
 
     # freeze_and_overwrite stores v1, stops the host holding one named shard of
     # that key, overwrites with v2, and thaws. The PUT is expected to fail: one
@@ -597,7 +629,7 @@ run_torn_overwrite() {
         local got="$WORK_DIR/got-${name}.json"
         local host gate pid rc
 
-        host="$(shard_host "$key" "$role")"
+        host="$(shard_host "$BUCKET" "$key" "$role")"
         [ -n "$host" ] || fail "$name: shardplace named no $role shard host for $key"
         gate="$(survivor_gate "$host")"
         [ -n "$gate" ] || fail "$name: no gate survives stopping host $host"
@@ -662,10 +694,13 @@ run_torn_overwrite() {
     # What that stale parity is worth, which a healthy read never asks. One
     # data shard's host is stopped so the read has to reconstruct, and the
     # parity it reconstructs from is the older generation's.
-    RECON_HOST="$(shard_host "$PARITY_KEY" data)"
+    RECON_HOST="$(shard_host "$BUCKET" "$PARITY_KEY" data)"
     RECON_GATE="$(survivor_gate "$RECON_HOST")"
     RECON_PID="$(cat "$PID_DIR/host-${RECON_HOST}.pid")"
     RECON_GOT="$WORK_DIR/got-reconstructed.json"
+
+    warm_gate "$RECON_GATE" "$BUCKET" "$PARITY_KEY" reconstruction \
+        || fail "the read gate never recovered from its own freeze, so reconstruction is untestable"
 
     log "reconstruction: stopping host $RECON_HOST to force $PARITY_KEY to rebuild from parity"
     kill -STOP "$RECON_PID"
@@ -722,6 +757,183 @@ if [ "$SCENARIO" = all ] || [ "$SCENARIO" = torn-overwrite ]; then
     log "round trip after torn-overwrite, before the freeze test"
     round_trip "https://$(gate_endpoints "$CONFIG_FILE" | head -1)" post-torn \
         || fail "the cluster did not take writes after the torn-overwrite scenario"
+fi
+
+# --- Scenario: stale-shard ---
+#
+# torn-overwrite asks the question on two objects and one overwrite each. This
+# asks it at width and after the fault has cleared: one host is frozen for a
+# whole batch of concurrent overwrites, thawed, and then every object is read
+# back. A generation that survived on two objects and not on the other ten is
+# the shape a two-object test misses.
+#
+# The assertion is not "everything is v1". It is that every object reads back
+# as exactly the generation its own PUT reported, which is what makes this
+# scenario outlive the phase it was written in: today a write with a shard node
+# down fails and the answer is v1 for all of them, and once degraded writes
+# land the answer becomes v2 for the ones that were accepted. Either way a
+# spliced object, or a v2 the client was told had failed, is a failure.
+#
+# It is read four times over. Once with the cluster whole, which takes the data
+# shards straight, and then once with each of the three other hosts stopped in
+# turn. With three shards spread over three of four hosts, stopping any single
+# peer of the thawed host forces its own shard to be read and the missing one
+# rebuilt from parity — so the sweep is what reaches the shards a healthy read
+# never touches, and a stale one hiding in parity is only ever found there.
+STALE_FAILURES=0
+STALE_CASES=0
+
+run_stale_shard() {
+    BUCKET="stress-stale-${RUN_ID}"
+    LINES="${STRESS_STALE_LINES:-2048}"
+    V1="$WORK_DIR/stale-v1.json"
+    V2="$WORK_DIR/stale-v2.json"
+    GOT="$WORK_DIR/stale-got.json"
+
+    make_state v1 "$V1" "$LINES"
+    make_state v2 "$V2" "$LINES"
+    [ "$(wc -c < "$V1")" -eq "$(wc -c < "$V2")" ] \
+        || fail "the two generations differ in length, which is not the overwrite under test"
+
+    STALE_FAILURES=0
+    STALE_CASES=0
+
+    local keys=() key i
+    for i in $(seq 1 "$STALE_KEYS"); do
+        keys+=("$(printf 'state-stale-%03d.json' "$i")")
+    done
+
+    # expect_dir records what each PUT reported, one file per key, because the
+    # overwrites run concurrently and a subshell cannot write back into an array.
+    local expect_dir="$WORK_DIR/stale-expect"
+    mkdir -p "$expect_dir"
+
+    local first_gate
+    first_gate="https://$(gate_endpoints "$CONFIG_FILE" | head -1)"
+    aws_s3 "$first_gate" s3 mb "s3://$BUCKET" >/dev/null
+
+    # The host to freeze is any host, but how much of the corpus it actually
+    # holds is counted rather than assumed: freezing a host that carries no
+    # shard of any key would inject no fault and still report a pass.
+    local frozen on_frozen=0
+    frozen="$(parse_hosts "$CONFIG_FILE" | awk 'NR == 1 { print $1 }')"
+    for key in "${keys[@]}"; do
+        if "$SHARD_PROBE" -config "$CONFIG_FILE" -bucket "$BUCKET" -key "$key" \
+            | awk -v h="host=$frozen" '$4 == h { found = 1 } END { exit !found }'; then
+            on_frozen=$(( on_frozen + 1 ))
+        fi
+    done
+    [ "$on_frozen" -gt 0 ] \
+        || fail "no key in the corpus places a shard on host $frozen, so freezing it proves nothing"
+    log "stale-shard: $on_frozen of $STALE_KEYS keys hold a shard on host $frozen"
+
+    for key in "${keys[@]}"; do
+        aws_s3 "$first_gate" s3api put-object --bucket "$BUCKET" --key "$key" --body "$V1" >/dev/null
+        echo v1 > "$expect_dir/$key"
+    done
+    log "stale-shard: $STALE_KEYS objects of $(wc -c < "$V1") bytes stored as v1"
+
+    local gate pid p pids=()
+    gate="$(survivor_gate "$frozen")"
+    [ -n "$gate" ] || fail "no gate survives stopping host $frozen"
+    pid="$(cat "$PID_DIR/host-${frozen}.pid")"
+    kill -0 "$pid" 2>/dev/null || fail "host $frozen is not running"
+
+    # Concurrently, so the freeze window is one write's worth of timeout rather
+    # than one per key. It is also the more honest shape: a host does not go
+    # away between requests, it goes away during all of them.
+    kill -STOP "$pid"
+    log "stale-shard: SIGSTOP host $frozen, overwriting all $STALE_KEYS objects with v2 through $gate"
+    for key in "${keys[@]}"; do
+        (
+            if aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 180 \
+                s3api put-object --bucket "$BUCKET" --key "$key" --body "$V2" \
+                >/dev/null 2>>"$RUN_DIR/stale-shard-puts.txt"; then
+                echo v2 > "$expect_dir/$key"
+            fi
+        ) &
+        pids+=("$!")
+    done
+    for p in "${pids[@]}"; do wait "$p" || true; done
+    kill -CONT "$pid"
+
+    local accepted=0
+    for key in "${keys[@]}"; do
+        if [ "$(cat "$expect_dir/$key")" = v2 ]; then accepted=$(( accepted + 1 )); fi
+    done
+    log "stale-shard: SIGCONT host $frozen; $accepted of $STALE_KEYS overwrites were accepted"
+
+    # Long enough for the thawed host to answer again, so the reads below are
+    # of the cluster's settled state rather than racing the thaw.
+    sleep 15
+
+    # check_all reads every key through one gate and holds each to the
+    # generation its own PUT reported.
+    check_all() {
+        local read_gate="$1" label="$2" seen bad=0
+        for key in "${keys[@]}"; do
+            if ! aws_s3 "$read_gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+                s3 cp "s3://$BUCKET/$key" "$GOT" --only-show-errors 2>>"$EVENTS"; then
+                log "stale-shard: $label FAIL GET errored for $key"
+                bad=$(( bad + 1 ))
+                continue
+            fi
+            seen="$(generation_of "$GOT")"
+            if [ "$seen" != "$(cat "$expect_dir/$key")" ]; then
+                log "stale-shard: $label FAIL $key is $seen, but its PUT reported $(cat "$expect_dir/$key")"
+                cp "$GOT" "$RUN_DIR/stale-shard-${label}-${key}"
+                bad=$(( bad + 1 ))
+            fi
+        done
+        STALE_CASES=$(( STALE_CASES + ${#keys[@]} ))
+        if [ "$bad" -eq 0 ]; then
+            log "stale-shard: $label pass, all ${#keys[@]} objects match what their PUT reported"
+        else
+            STALE_FAILURES=$(( STALE_FAILURES + bad ))
+        fi
+    }
+
+    warm_gate "$first_gate" "$BUCKET" "${keys[0]}" stale-shard \
+        || fail "no gate served after the thaw, so nothing below can be attributed"
+    check_all "$first_gate" whole
+
+    # Each of the thawed host's peers in turn, which is what forces its own
+    # shards to be read and the missing one rebuilt from parity.
+    local other opid ogate
+    for other in $(parse_hosts "$CONFIG_FILE" | awk -v h="$frozen" '$1 != h { print $1 }'); do
+        opid="$(cat "$PID_DIR/host-${other}.pid")"
+        ogate="$(survivor_gate "$other")"
+        warm_gate "$ogate" "$BUCKET" "${keys[0]}" "host-${other}-down" \
+            || fail "the read gate did not serve before host $other was stopped"
+        log "stale-shard: stopping host $other so every object rebuilds, reading through $ogate"
+        kill -STOP "$opid"
+        check_all "$ogate" "host-${other}-down"
+        kill -CONT "$opid"
+        sleep 10
+    done
+
+    aws_s3 "$first_gate" s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true
+
+    if [ "$STALE_FAILURES" -eq 0 ]; then
+        log "stale-shard: passed $STALE_CASES assertions"
+    else
+        log "stale-shard: FAILED $STALE_FAILURES of $STALE_CASES assertions"
+    fi
+}
+
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = stale-shard ]; then
+    run_stale_shard
+
+    if [ "$SCENARIO" = stale-shard ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$STALE_FAILURES" -eq 0 ] \
+            || fail "stale-shard failed $STALE_FAILURES of $STALE_CASES assertions"
+        exit 0
+    fi
+
+    log "round trip after stale-shard, before the freeze test"
+    round_trip "https://$(gate_endpoints "$CONFIG_FILE" | head -1)" post-stale \
+        || fail "the cluster did not take writes after the stale-shard scenario"
 fi
 
 # --- Topology ---
@@ -950,6 +1162,13 @@ log "Warp completed with no errors"
     else
         echo "torn_overwrite=fail ($TORN_FAILURES of $TORN_CASES)"
     fi
+    if [ "$STALE_CASES" -eq 0 ]; then
+        echo "stale_shard=skipped"
+    elif [ "$STALE_FAILURES" -eq 0 ]; then
+        echo "stale_shard=pass"
+    else
+        echo "stale_shard=fail ($STALE_FAILURES of $STALE_CASES)"
+    fi
     echo
     echo "Timeline"
     echo "--------"
@@ -964,3 +1183,5 @@ echo "Stress results: $RUN_DIR"
 # not rejoin.
 [ "$TORN_FAILURES" -eq 0 ] \
     || fail "torn-overwrite failed $TORN_FAILURES of $TORN_CASES assertions"
+[ "$STALE_FAILURES" -eq 0 ] \
+    || fail "stale-shard failed $STALE_FAILURES of $STALE_CASES assertions"

@@ -133,6 +133,12 @@ func NodeBindAddr(h Host, n Node) string {
 type RS struct {
 	Data   int `toml:"data"`
 	Parity int `toml:"parity"`
+
+	// DegradedWrites acknowledges a write once Data shards are durable rather
+	// than requiring the full stripe, so one node down does not refuse writes.
+	// It opens a redundancy window that only repair closes, so it is off unless
+	// the operator turns it on.
+	DegradedWrites bool `toml:"degraded_writes"`
 }
 
 // Compaction tunes the shard store's background compactor. A zero interval

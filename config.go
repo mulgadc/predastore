@@ -176,7 +176,7 @@ func gateConfig(
 ) gate.Config {
 	return gate.Config{
 		Region:      c.Region,
-		RS:          gate.RS{Data: c.RS.Data, Parity: c.RS.Parity},
+		RS:          gate.RS{Data: c.RS.Data, Parity: c.RS.Parity, DegradedWrites: c.RS.DegradedWrites},
 		Buckets:     bucketConfigs(c),
 		Auth:        authEntries(c),
 		IAM:         iamConfig(c),

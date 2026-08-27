@@ -101,6 +101,7 @@ type fakeBlob struct {
 	commitCalls  atomic.Int64
 	abortCalls   atomic.Int64
 	declaring    func(size int64) error
+	failPutOn    func(index uint32) bool
 	failCommitOn func(index uint32) bool
 }
 
@@ -123,6 +124,9 @@ func (b *fakeBlob) Put(_ context.Context, _ config.NodeID, req blob.PutRequest, 
 		if err := b.declaring(req.Size); err != nil {
 			return nil, err
 		}
+	}
+	if b.failPutOn != nil && b.failPutOn(req.Index) {
+		return nil, fmt.Errorf("node holding shard %d is not answering", req.Index)
 	}
 
 	// Mirror the node: never read past the declared size, and observe the
@@ -239,18 +243,18 @@ var _ BlobClient = (*fakeBlob)(nil)
 // mint its epoch, prepare every shard, then publish. The placement it returns
 // is the one the shards carry, so it is what a read has to name — deriving a
 // second one would mint a different epoch and match nothing.
-func (f writeFixture) write(ctx context.Context, objectHash [32]byte, body io.Reader, size int64) (ObjectToShardNodes, bool, error) {
+func (f writeFixture) write(ctx context.Context, objectHash [32]byte, body io.Reader, size int64) (ObjectToShardNodes, writeResult, error) {
 	place, err := placeShards(f.ring, f.cfg, objectHash, size)
 	if err != nil {
-		return place, false, err
+		return place, writeResult{}, err
 	}
-	poolNearFull, err := writeObject(ctx, f.bc, f.cfg, body, size, objectHash, place)
+	written, err := writeObject(ctx, f.bc, f.cfg, body, size, objectHash, place)
 	if err != nil {
-		return place, poolNearFull, err
+		return place, written, err
 	}
-	commitShards(ctx, f.bc, objectHash, place)
+	commitShards(ctx, f.bc, objectHash, place, written.landed)
 
-	return place, poolNearFull, nil
+	return place, written, nil
 }
 
 // writeFixture is a gate write path at one erasure width.
@@ -401,18 +405,20 @@ func TestWriteObjectSingleShardReportsPoolPressure(t *testing.T) {
 	place, err := placeShards(f.ring, f.cfg, objectHash, 7)
 	require.NoError(t, err)
 
-	poolNearFull, err := writeObject(
+	written, err := writeObject(
 		context.Background(), nearFull, f.cfg,
 		bytes.NewReader([]byte("payload")), 7, objectHash, place,
 	)
 
 	require.NoError(t, err)
-	assert.True(t, poolNearFull)
+	assert.True(t, written.poolNearFull)
 }
 
-// A parity shard is streamed through an io.Pipe that enc.Encode writes into on
-// this goroutine. A Put that gives up without draining it used to leave the
-// write side blocked forever, and io.Pipe does not observe ctx.
+// A parity shard used to be streamed through an io.Pipe that enc.Encode wrote
+// into on this goroutine, so a Put that gave up without draining it left the
+// write side blocked forever and io.Pipe does not observe ctx. The parity is
+// buffered now and the deadlock cannot recur, but a node refusing its body must
+// still return rather than hang, which is what this holds.
 func TestWriteObjectReturnsWhenParityPutAbandonsItsBody(t *testing.T) {
 	t.Parallel()
 
@@ -435,9 +441,9 @@ func TestWriteObjectReturnsWhenParityPutAbandonsItsBody(t *testing.T) {
 
 	select {
 	case err := <-done:
-		require.Error(t, err, "a rejected parity shard has to fail the write")
+		require.Error(t, err, "a rejected parity shard has to fail the write at full width")
 	case <-time.After(10 * time.Second):
-		t.Fatal("writeObject blocked: the parity pipe was left without a reader")
+		t.Fatal("writeObject blocked rather than reporting the refused shard")
 	}
 }
 

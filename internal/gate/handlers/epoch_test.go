@@ -137,11 +137,14 @@ func TestEachWriteMintsItsOwnEpoch(t *testing.T) {
 
 // A write that fails before its record lands must leave nothing pending on the
 // nodes: the space is released now rather than waiting out the node's reaper.
+// One shard refusing is what fails it here, because with degraded writes off
+// the floor is the full stripe, and it leaves two shards prepared that the
+// abort has to find.
 func TestFailedWriteAbortsItsPreparedShards(t *testing.T) {
 	t.Parallel()
 
 	f := newWriteFixture(2, 1)
-	f.bc.declaring = func(int64) error { return errShardRefused }
+	f.bc.failPutOn = func(index uint32) bool { return index == 2 }
 
 	w := httptest.NewRecorder()
 	PutObject(f.mc, f.bc, f.ring, testCache(), f.cfg).ServeHTTP(w, objectPut("k", randomBytes(t, 100)))
@@ -152,7 +155,23 @@ func TestFailedWriteAbortsItsPreparedShards(t *testing.T) {
 	defer f.bc.mu.Unlock()
 	assert.Empty(t, f.bc.prepared, "a failed write left shards prepared on the nodes")
 	assert.Empty(t, f.bc.shards, "a failed write published a shard")
-	assert.Positive(t, f.bc.abortCalls.Load(), "the write path must abort what it prepared")
+	assert.Equal(t, int64(2), f.bc.abortCalls.Load(),
+		"the two shards that did prepare must be aborted, and the one that never did left alone")
+}
+
+// A write that placed nothing has nothing to abort, and asking a node to
+// discard a shard it never prepared would name a generation it does not hold.
+func TestWriteThatPlacedNothingAbortsNothing(t *testing.T) {
+	t.Parallel()
+
+	f := newWriteFixture(2, 1)
+	f.bc.declaring = func(int64) error { return errShardRefused }
+
+	w := httptest.NewRecorder()
+	PutObject(f.mc, f.bc, f.ring, testCache(), f.cfg).ServeHTTP(w, objectPut("k", randomBytes(t, 100)))
+
+	require.NotEqual(t, http.StatusOK, w.Code, "the write must fail")
+	assert.Zero(t, f.bc.abortCalls.Load(), "nothing prepared, so nothing to discard")
 }
 
 var errShardRefused = fmt.Errorf("node refused the shard")

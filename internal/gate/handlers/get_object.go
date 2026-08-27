@@ -159,6 +159,11 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 // an error signal: the response is a complete, correct object either way.
 const degradedHeader = "X-Spx-Degraded"
 
+// degradedWriteHeader reports how many shards a PUT could not place. Also not
+// an error signal: the object is durable, but it survives fewer further losses
+// than a full-width write until repair restores the missing shards.
+const degradedWriteHeader = "X-Spx-Degraded-Write"
+
 // readRange serves a byte range. Reed-Solomon splits data sequentially across
 // the data shards, so a range inside one shard is a single ranged shard read;
 // anything wider falls back to reconstructing the object and slicing it.

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
@@ -106,25 +107,26 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			return
 		}
 
-		if _, err := writeObject(ctx, bc, cfg, assembled, finalSize, objectHash, place); err != nil {
+		written, err := writeObject(ctx, bc, cfg, assembled, finalSize, objectHash, place)
+		if err != nil {
 			slog.ErrorContext(ctx, "Failed to store final object", "uploadID", uploadID, "error", err)
-			abortShards(ctx, bc, objectHash, place)
+			abortShards(ctx, bc, objectHash, place, written.landed)
 			HandleError(w, r, mapPutErr(err))
 			return
 		}
 
 		shardRecord, err := encodePlacement(place)
 		if err != nil {
-			abortShards(ctx, bc, objectHash, place)
+			abortShards(ctx, bc, objectHash, place, written.landed)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
 			return
 		}
 		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), shardRecord); err != nil {
-			abortShards(ctx, bc, objectHash, place)
+			abortShards(ctx, bc, objectHash, place, written.landed)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store object metadata", 500))
 			return
 		}
-		commitShards(ctx, bc, objectHash, place)
+		commitShards(ctx, bc, objectHash, place, written.landed)
 
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store ARN mapping", 500))
@@ -139,6 +141,10 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 
 		telemetry.RecordMultipartUpload(ctx, telemetry.UploadCompleted)
 		slog.DebugContext(ctx, "Multipart upload completed", "bucket", bucket, "key", key, "uploadID", uploadID, "parts", len(parts))
+
+		if written.degraded() {
+			w.Header().Set(degradedWriteHeader, strconv.Itoa(len(written.missing)))
+		}
 
 		if err := writeXML(w, http.StatusOK, CompleteMultipartUploadResult{
 			Location: fmt.Sprintf("https://%s/%s/%s", r.Host, bucket, key),

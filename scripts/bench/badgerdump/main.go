@@ -157,9 +157,10 @@ func formatBlob(k, v []byte) string {
 	case len(k) == preparedKeySize && len(v) == preparedValueSize && k[0] == preparedPrefix:
 		// A prepared row is a durable shard its writer has not published, so
 		// it is reported with the age that decides when it is reaped.
+		value := [preparedValueSize]byte(v)
 		return fmt.Sprintf("%s prepared_at=%d",
 			formatShardRow("prep  ", [shardKeySize]byte(k[1:]), v),
-			binary.BigEndian.Uint64(v[indexValueSize:]))
+			binary.BigEndian.Uint64(value[indexValueSize:]))
 	case len(k) == tombstoneKeySize && len(v) == 8 && k[0] == tombstonePrefix:
 		return formatTombstoneRow([tombstoneKeySize]byte(k), [8]byte(v))
 	default:

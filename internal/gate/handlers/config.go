@@ -18,6 +18,12 @@ type Config struct {
 	DataShards   int
 	ParityShards int
 
+	// DegradedWrites accepts a write once DataShards of the stripe are durable
+	// rather than requiring every shard, so one node down does not refuse
+	// writes. It opens a redundancy window that only repair closes, so it is
+	// off unless the operator turns it on.
+	DegradedWrites bool
+
 	// Buckets are the config-defined buckets: static, known at startup, and
 	// never removed.
 	Buckets []BucketConfig
@@ -25,6 +31,18 @@ type Config struct {
 
 // TotalShards is the number of nodes an object is spread across.
 func (c Config) TotalShards() int { return c.DataShards + c.ParityShards }
+
+// MinShards is how many of a stripe's shards have to be durable before the
+// write is acknowledged. Any DataShards of the stripe reconstruct the object,
+// so that is the floor; requiring one more cannot buy redundancy at RS(2,1)
+// and would block three quarters of writes with a single node down.
+func (c Config) MinShards() int {
+	if c.DegradedWrites {
+		return c.DataShards
+	}
+
+	return c.TotalShards()
+}
 
 // BucketConfig is a bucket declared in the configuration rather than created
 // through the API.

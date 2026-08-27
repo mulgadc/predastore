@@ -47,10 +47,10 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
-		poolNearFull, err := writeObject(ctx, bc, cfg, body, size, objectHash, place)
+		written, err := writeObject(ctx, bc, cfg, body, size, objectHash, place)
 		if err != nil {
 			slog.ErrorContext(ctx, "putObject: shard distribution failed", "error", err)
-			abortShards(ctx, bc, objectHash, place)
+			abortShards(ctx, bc, objectHash, place, written.landed)
 			HandleError(w, r, mapPutErr(err))
 			return
 		}
@@ -58,14 +58,14 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// Shards are prepared but invisible until the placement lands below, so a
 		// body that fails its payload check leaves the previous object intact.
 		if err := finishPayload(r); err != nil {
-			abortShards(ctx, bc, objectHash, place)
+			abortShards(ctx, bc, objectHash, place, written.landed)
 			HandleError(w, r, err)
 			return
 		}
 
 		record, err := encodePlacement(place)
 		if err != nil {
-			abortShards(ctx, bc, objectHash, place)
+			abortShards(ctx, bc, objectHash, place, written.landed)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
@@ -74,12 +74,12 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// point: before it the write is invisible, after it the epoch it names
 		// is what every read will demand, and the shards already carry it.
 		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), record); err != nil {
-			abortShards(ctx, bc, objectHash, place)
+			abortShards(ctx, bc, objectHash, place, written.landed)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 
-		commitShards(ctx, bc, objectHash, place)
+		commitShards(ctx, bc, objectHash, place, written.landed)
 
 		// Listing key -> object hash, for ListObjects.
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
@@ -89,8 +89,14 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		// Nearfull writes still succeed; the header lets clients back off before
 		// hitting the hard 507 rejection.
-		if poolNearFull {
+		if written.poolNearFull {
 			w.Header().Set("X-Predastore-Pool-Pressure", "nearfull")
+		}
+		// The write is durable and correct; what it is short of is redundancy,
+		// until repair restores the shards that did not land. A caller writing
+		// something it cannot reproduce deserves to know that.
+		if written.degraded() {
+			w.Header().Set(degradedWriteHeader, strconv.Itoa(len(written.missing)))
 		}
 		w.Header().Set("ETag", model.ObjectETag(bucket, key))
 		w.WriteHeader(http.StatusOK)
