@@ -1,8 +1,6 @@
 package handlers
 
 import (
-	"bytes"
-	"encoding/gob"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -91,8 +89,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			var objectSize int64
 			if len(item.Value) == 32 {
 				if meta, err := metaGet(ctx, mc, model.TableObjects, string(item.Value)); err == nil && len(meta) > 0 {
-					var placement ObjectToShardNodes
-					if err := gob.NewDecoder(bytes.NewReader(meta)).Decode(&placement); err == nil {
+					if placement, err := decodePlacement(meta); err == nil {
 						objectSize = placement.Size
 					}
 				}

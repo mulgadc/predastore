@@ -3,12 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/gob"
 	"strings"
 	"testing"
 
-	"github.com/mulgadc/predastore/internal/config"
-	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
@@ -83,29 +80,53 @@ func TestFormatBlobRejectsAShardKeyWithAShortValue(t *testing.T) {
 	}
 }
 
+// placementRecord builds the fixed binary record the meta store holds, so the
+// dumper is exercised against the bytes rather than against a struct.
+func placementRecord(size, epoch uint64, k int, ids ...uint64) []byte {
+	v := make([]byte, placementFixedSize)
+	v[0] = placementMagic
+	v[1] = placementVersion
+	v[2] = byte(k)
+	binary.BigEndian.PutUint64(v[3:11], size)
+	binary.BigEndian.PutUint64(v[11:19], epoch)
+	for _, id := range ids {
+		v = binary.AppendUvarint(v, id)
+	}
+	return v
+}
+
 func TestFormatMetaDecodesThePlacementRecord(t *testing.T) {
 	hash := model.ObjectHash("demo", "sample1.json")
-	var buf bytes.Buffer
-	rec := handlers.ObjectToShardNodes{
-		Object:           hash,
-		Size:             4194304,
-		DataShardNodes:   []config.NodeID{6, 12},
-		ParityShardNodes: []config.NodeID{3},
-	}
-	if err := gob.NewEncoder(&buf).Encode(rec); err != nil {
-		t.Fatalf("encode placement: %v", err)
-	}
-
 	key := append([]byte("objects/"), hash[:]...)
-	got := formatMeta(key, buf.Bytes())
+	got := formatMeta(key, placementRecord(4194304, 0x0123456789abcdef, 2, 6, 12, 3))
 
 	for _, want := range []string{
 		"placement", "size=4194304", "data=[6 12]", "parity=[3]",
-		"object=f8c152e3aab9f63a..",
+		"epoch=0123456789abcdef",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("formatMeta() = %q, want it to contain %q", got, want)
 		}
+	}
+}
+
+// A record whose header does not check out is not a placement record, and
+// printing one as if it were would invent fields out of whatever was there.
+func TestFormatMetaRejectsABadPlacementHeader(t *testing.T) {
+	tests := []struct {
+		name string
+		v    []byte
+	}{
+		{"wrong magic", append([]byte{0x01}, placementRecord(1, 1, 1, 3)[1:]...)},
+		{"unknown version", append([]byte{0x00, 0x09}, placementRecord(1, 1, 1, 3)[2:]...)},
+		{"fewer ids than k", placementRecord(1, 1, 3, 6)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if strings.Contains(formatMeta([]byte("buckets/demo"), tt.v), "placement") {
+				t.Errorf("formatMeta(%x) claimed a placement record", tt.v)
+			}
+		})
 	}
 }
 

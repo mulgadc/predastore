@@ -11,15 +11,12 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/gob"
 	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/dgraph-io/badger/v4"
-	"github.com/mulgadc/predastore/internal/gate/handlers"
 )
 
 // The blob engine's on-disk shapes, restated here because they are not
@@ -30,6 +27,13 @@ const (
 	extentSize       = 32
 	tombstoneKeySize = 17
 	tombstonePrefix  = 'd'
+)
+
+// The meta store's placement record header, restated for the same reason.
+const (
+	placementMagic     = 0x00
+	placementVersion   = 0x01
+	placementFixedSize = 19
 )
 
 func main() {
@@ -101,18 +105,40 @@ func isText(b []byte) bool {
 // terms and anything else falls back to a hex preview.
 func formatMeta(k, v []byte) string {
 	name := printable(k)
-	if strings.HasPrefix(name, "objects/<") && len(v) > 32 {
-		var p handlers.ObjectToShardNodes
-		if err := gob.NewDecoder(bytes.NewReader(v)).Decode(&p); err == nil {
-			return fmt.Sprintf("%-80s  %d bytes  placement object=%s size=%d data=%v parity=%v",
-				name, len(v), hex.EncodeToString(p.Object[:8])+"..", p.Size,
-				p.DataShardNodes, p.ParityShardNodes)
-		}
+	if placement, ok := formatPlacement(v); ok {
+		return fmt.Sprintf("%-80s  %d bytes  %s", name, len(v), placement)
 	}
 	if len(v) == 32 {
 		return fmt.Sprintf("%-80s  %d bytes  -> objecthash %s", name, len(v), hex.EncodeToString(v))
 	}
 	return fmt.Sprintf("%-80s  %d bytes  %s", name, len(v), preview(v))
+}
+
+// formatPlacement decodes a placement record from its bytes rather than
+// through the handlers package, so the dumper reports the layout that is on
+// disk instead of whatever the current struct happens to say.
+func formatPlacement(v []byte) (string, bool) {
+	if len(v) < placementFixedSize || v[0] != placementMagic || v[1] != placementVersion {
+		return "", false
+	}
+	k := int(v[2])
+	size := binary.BigEndian.Uint64(v[3:11])
+	epoch := binary.BigEndian.Uint64(v[11:19])
+
+	var ids []uint64
+	for rest := v[placementFixedSize:]; len(rest) > 0; {
+		id, n := binary.Uvarint(rest)
+		if n <= 0 {
+			return "", false
+		}
+		ids = append(ids, id)
+		rest = rest[n:]
+	}
+	if len(ids) < k {
+		return "", false
+	}
+	return fmt.Sprintf("placement size=%d epoch=%016x data=%v parity=%v",
+		size, epoch, ids[:k], ids[k:]), true
 }
 
 // formatBlob renders one row of a blob node's private index. The two kinds of

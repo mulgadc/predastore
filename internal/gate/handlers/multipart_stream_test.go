@@ -3,7 +3,6 @@ package handlers
 import (
 	"bytes"
 	"context"
-	"encoding/gob"
 	"fmt"
 	"io"
 	"sync/atomic"
@@ -32,9 +31,9 @@ func (f writeFixture) storePart(t *testing.T, bucket, key, uploadID string, part
 	place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(data)))
 	require.NoError(t, err)
 
-	var shardBuf bytes.Buffer
-	require.NoError(t, gob.NewEncoder(&shardBuf).Encode(place))
-	require.NoError(t, metaPut(ctx, f.mc, model.TableObjects, partShardKey(uploadID, partNumber), shardBuf.Bytes()))
+	record, err := encodePlacement(place)
+	require.NoError(t, err)
+	require.NoError(t, metaPut(ctx, f.mc, model.TableObjects, partShardKey(uploadID, partNumber), record))
 }
 
 // completedParts names parts 1..n, which is the order S3 requires.

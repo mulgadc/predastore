@@ -1,9 +1,7 @@
 package handlers
 
 import (
-	"bytes"
 	"context"
-	"encoding/gob"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -113,12 +111,12 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to get shard placement", 500))
 			return
 		}
-		var shardBuf bytes.Buffer
-		if err := gob.NewEncoder(&shardBuf).Encode(place); err != nil {
+		shardRecord, err := encodePlacement(place)
+		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
 			return
 		}
-		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), shardBuf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), shardRecord); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store object metadata", 500))
 			return
 		}
@@ -227,8 +225,8 @@ func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, 
 		return nil, fmt.Errorf("part not found: uploadID=%s part=%d", uploadID, partNumber)
 	}
 
-	var place ObjectToShardNodes
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&place); err != nil {
+	place, err := decodePlacement(data)
+	if err != nil {
 		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonPlacementDecode)
 		return nil, err
 	}

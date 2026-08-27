@@ -1,8 +1,6 @@
 package handlers
 
 import (
-	"bytes"
-	"encoding/gob"
 	"errors"
 	"io"
 	"log/slog"
@@ -60,14 +58,14 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
-		var buf bytes.Buffer
-		if err := gob.NewEncoder(&buf).Encode(place); err != nil {
+		record, err := encodePlacement(place)
+		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 
 		// Object hash -> shard placement, for retrieval.
-		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), record); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}

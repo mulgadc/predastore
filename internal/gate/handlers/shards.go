@@ -3,7 +3,6 @@ package handlers
 import (
 	"bytes"
 	"context"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
@@ -20,10 +19,13 @@ import (
 	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
-// ObjectToShardNodes maps an object to its shard locations.
+// ObjectToShardNodes maps an object to its shard locations. The node ids are
+// the record of where the shards physically went, not a cache of what the ring
+// would derive today: the read path dials these, so they are what survives a
+// ring whose tuning changed under them.
 type ObjectToShardNodes struct {
-	Object           [32]byte
 	Size             int64
+	WriteEpoch       uint64
 	DataShardNodes   []config.NodeID
 	ParityShardNodes []config.NodeID
 }
@@ -66,7 +68,6 @@ func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int
 	}
 
 	return ObjectToShardNodes{
-		Object:           objectHash,
 		Size:             size,
 		DataShardNodes:   append([]config.NodeID(nil), nodes[:cfg.DataShards]...),
 		ParityShardNodes: append([]config.NodeID(nil), nodes[cfg.DataShards:]...),
@@ -300,11 +301,8 @@ func loadPlacement(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg
 		return ObjectToShardNodes{}, 0, err
 	}
 
-	var objectToShardNodes ObjectToShardNodes
-	r := bytes.NewReader(data)
-	dec := gob.NewDecoder(r)
-
-	if err := dec.Decode(&objectToShardNodes); err != nil {
+	objectToShardNodes, err := decodePlacement(data)
+	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}
 

@@ -101,12 +101,12 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to get shard placement", 500))
 			return
 		}
-		var shardBuf bytes.Buffer
-		if err := gob.NewEncoder(&shardBuf).Encode(place); err != nil {
+		shardRecord, err := encodePlacement(place)
+		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
 			return
 		}
-		if err := metaPut(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber), shardBuf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber), shardRecord); err != nil {
 			slog.ErrorContext(ctx, "Failed to store part shard metadata", "uploadID", uploadID, "part", partNumber, "error", err)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store part shard metadata", 500))
 			return
