@@ -18,10 +18,11 @@
 #   ./scripts/bench/e2e-stress.sh          # or: make e2e-stress
 #
 # Environment:
-#   STRESS_SCENARIO    Narrows the run to one test: "torn-overwrite",
-#                      "stale-shard", "freeze", or "partial-put" — a client
-#                      that stops sending mid-body, which is not in a default
-#                      run. Unset runs torn-overwrite, stale-shard and freeze.
+#   STRESS_SCENARIO    Narrows the run to one test: "repair",
+#                      "torn-overwrite", "stale-shard", "freeze", or
+#                      "partial-put" — a client that stops sending mid-body,
+#                      which is not in a default run. Unset runs repair,
+#                      torn-overwrite, stale-shard and freeze.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -40,6 +41,11 @@
 #                      its size (default: 16384, about 1MiB)
 #   STRESS_STALE_KEYS  Objects the stale-shard scenario overwrites with a host
 #                      frozen (default: 12)
+#   STRESS_REPAIR_KEYS Objects the repair scenario writes with a host down
+#                      (default: 12)
+#   STRESS_REPAIR_DEADLINE
+#                      Seconds allowed for the sweep to restore them
+#                      (default: 180)
 #   WARP               Path to the warp binary (default: bin/tools/warp)
 #
 
@@ -68,7 +74,7 @@ STALE_KEYS="${STRESS_STALE_KEYS:-12}"
 # running everything and reporting a pass for a test that was never named.
 SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
-    all|freeze|partial-put|torn-overwrite|stale-shard) ;;
+    all|freeze|partial-put|torn-overwrite|stale-shard|repair) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
 
@@ -76,7 +82,7 @@ ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
 SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 REGION="ap-southeast-2"
 
-for command in aws awk diff git go openssl; do
+for command in aws awk curl diff git go openssl; do
     command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 1; }
 done
 [ -x "$WARP" ] || { echo "Warp not executable: $WARP (run make warp-install)" >&2; exit 1; }
@@ -123,24 +129,15 @@ log() {
 
 fail() { log "FAIL: $*"; exit 1; }
 
-# A stopped process never handles SIGTERM, so stop.sh would leave it behind.
-# Continuing it first is what makes the teardown reliable rather than a race
-# against a signal that cannot be delivered. A node is then confirmed gone
-# rather than assumed: one that outlives the run holds its ports and fails
-# the next one somewhere unrelated.
-cleanup() {
-    if [ -n "$WARP_PID" ] && kill -0 "$WARP_PID" 2>/dev/null; then
-        kill "$WARP_PID" 2>/dev/null || true
-        wait "$WARP_PID" 2>/dev/null || true
-    fi
-    if [ -n "$FROZEN_PID" ] && kill -0 "$FROZEN_PID" 2>/dev/null; then
-        kill -CONT "$FROZEN_PID" 2>/dev/null || true
-    fi
-    # stop.sh removes each pidfile as it signals, so the handles are taken
-    # before it runs rather than looked for afterwards.
+# stop_clusters takes down every cluster under PREDA_DIR and confirms each node
+# is gone rather than assuming the signal landed: one that outlives the run
+# holds its ports and fails the next one somewhere unrelated. stop.sh removes
+# each pidfile as it signals, so the handles are taken before it runs rather
+# than looked for afterwards.
+stop_clusters() {
     local pidfile pid waited
     local pids=()
-    for pidfile in "$PID_DIR"/*.pid; do
+    for pidfile in "$PREDA_DIR"/*/pids/*.pid; do
         [ -e "$pidfile" ] || continue
         pid="$(cat "$pidfile" 2>/dev/null)" || continue
         [ -n "$pid" ] && pids+=("$pid")
@@ -159,6 +156,22 @@ cleanup() {
             kill -KILL "$pid" 2>/dev/null || true
         fi
     done
+}
+
+# A stopped process never handles SIGTERM, so stop.sh would leave it behind.
+# Continuing it first is what makes the teardown reliable rather than a race
+# against a signal that cannot be delivered. A node is then confirmed gone
+# rather than assumed: one that outlives the run holds its ports and fails
+# the next one somewhere unrelated.
+cleanup() {
+    if [ -n "$WARP_PID" ] && kill -0 "$WARP_PID" 2>/dev/null; then
+        kill "$WARP_PID" 2>/dev/null || true
+        wait "$WARP_PID" 2>/dev/null || true
+    fi
+    if [ -n "$FROZEN_PID" ] && kill -0 "$FROZEN_PID" 2>/dev/null; then
+        kill -CONT "$FROZEN_PID" 2>/dev/null || true
+    fi
+    stop_clusters
     if [ -d "$PREDA_DIR/$CONFIG_NAME/logs" ]; then
         cp -R "$PREDA_DIR/$CONFIG_NAME/logs/." "$RUN_DIR/logs/" 2>/dev/null || true
     fi
@@ -212,6 +225,295 @@ round_trip() {
     diff -q "$src" "$dst" >/dev/null
     aws_s3 "$endpoint" s3 rb "s3://$bucket" --force >/dev/null
 }
+
+# Placement follows the object hash, which is derived from bucket and key
+# alone, so the exact host holding a named shard of a named key is resolvable
+# before the object is written. Both fault scenarios below aim their SIGSTOP
+# with it rather than guessing.
+SHARD_PROBE="$WORK_DIR/shardplace"
+go build -o "$SHARD_PROBE" "$REPO_DIR/scripts/bench/shardplace"
+
+# shard_host names the host holding a given shard role of a given key, and
+# survivor_gate a gate that is not on it. A PUT has to be issued through a gate
+# that is still running, or what stalls is the frontend rather than the shard
+# write.
+# Both take the profile as their first argument: the repair scenario below runs
+# its own cluster from its own file, and a helper that closed over the shared
+# one would silently answer for the wrong cluster.
+shard_host() {
+    "$SHARD_PROBE" -config "$1" -bucket "$2" -key "$3" \
+        | awk -v r="role=$4" '$2 == r { sub(/^host=/, "", $4); print $4; exit }'
+}
+survivor_gate() {
+    parse_hosts "$1" | awk -v h="$2" '$1 != h && $3 != "" { print "https://" $2 ":" $3; exit }'
+}
+
+# A host that was SIGSTOPped keeps the connections that died under it, and the
+# pool only evicts one after three stalls of five seconds each — long enough
+# that a client's whole retry budget can land inside the window. Reading
+# through such a gate measures that recovery rather than the shard generations
+# either scenario is asking about, so the gate is driven with the cluster whole
+# until it serves, and how long that took is recorded rather than hidden.
+warm_gate() {
+    local gate="$1" bucket="$2" key="$3" label="$4"
+    local scratch="$WORK_DIR/warm.bin" started attempt
+    started="$(date +%s)"
+    for attempt in $(seq 1 12); do
+        if aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 30 \
+            s3 cp "s3://$bucket/$key" "$scratch" --only-show-errors >/dev/null 2>&1; then
+            if [ "$attempt" -gt 1 ]; then
+                log "$label: thawed gate served on attempt $attempt after $(( $(date +%s) - started ))s"
+            fi
+            return 0
+        fi
+        sleep 3
+    done
+    log "$label: thawed gate never served in $(( $(date +%s) - started ))s"
+
+    return 1
+}
+
+# --- Scenario: repair ---
+#
+# The user-visible claim: a host is down, writes land anyway, it comes back,
+# and what it missed is restored — after which reading an object whose data
+# shard it holds costs no reconstruction, and the parity it holds rebuilds a
+# lost data shard correctly.
+#
+# It runs its own cluster because it is the one scenario needing different
+# settings. Degraded writes accept a PUT at k shards, which is what lets a write
+# land with a host down; torn-overwrite asserts the exact opposite, that such a
+# write is refused. Both are right under their own configuration and neither can
+# be run against the other's, so this one is started and stopped before the
+# shared cluster that carries the rest of the run.
+
+REPAIR_CLUSTER="${CONFIG_NAME}-repair"
+REPAIR_CONFIG="$PREDA_CONFIG_DIR/$REPAIR_CLUSTER.toml"
+REPAIR_PID_DIR="$PREDA_DIR/$REPAIR_CLUSTER/pids"
+# Fixed rather than run-scoped: the bucket is declared in the profile, which is
+# what makes it public, and the cluster is built fresh for each run anyway.
+REPAIR_BUCKET="stress-repair"
+REPAIR_KEYS="${STRESS_REPAIR_KEYS:-12}"
+REPAIR_DEADLINE="${STRESS_REPAIR_DEADLINE:-180}"
+REPAIR_FAILURES=0
+REPAIR_CASES=0
+
+# render_repair_profile is the shared profile with three additions: degraded
+# writes, the sweep on a short interval, and a public bucket so an unsigned GET
+# can read the header that says what a read cost. Ports are shifted further so
+# nothing here can collide with the cluster the rest of the run uses.
+render_repair_profile() {
+    render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$REPAIR_CONFIG" "$(( PORT_OFFSET + 100 ))"
+    awk '/^\[rs\]$/ { print; print "degraded_writes = true"; next } { print }' \
+        "$REPAIR_CONFIG" > "$REPAIR_CONFIG.tmp"
+    mv "$REPAIR_CONFIG.tmp" "$REPAIR_CONFIG"
+    cat >> "$REPAIR_CONFIG" <<EOF
+
+[repair]
+enabled = true
+interval_seconds = 5
+page_size = 64
+
+[[bucket]]
+name = "$REPAIR_BUCKET"
+region = "$REGION"
+public = true
+account_id = "123456789012"
+EOF
+    grep -q '^degraded_writes = true$' "$REPAIR_CONFIG" \
+        || fail "repair: degraded_writes was not written into $REPAIR_CONFIG"
+    cp "$REPAIR_CONFIG" "$RUN_DIR/$REPAIR_CLUSTER.toml"
+}
+
+# degraded_read fetches an object unsigned — the bucket is public — and prints
+# how many shards the gate had to reconstruct to answer. The header is absent
+# from a read that cost nothing, which is the state this scenario waits for.
+degraded_read() {
+    local gate="$1" key="$2" out="$3"
+    local headers="$WORK_DIR/repair-headers.txt" status
+    curl -sk --max-time 120 -o "$out" -D "$headers" "$gate/$REPAIR_BUCKET/$key" || return 1
+    status="$(awk 'NR == 1 { print $2; exit }' "$headers")"
+    if [ "$status" != 200 ]; then
+        echo "http-$status"
+        return 1
+    fi
+    awk 'tolower($1) == "x-spx-degraded:" { gsub(/\r/, "", $2); print $2; found = 1 }
+         END { if (!found) print 0 }' "$headers"
+}
+
+# repair_check records one assertion, so the verdict counts what ran rather
+# than what was expected to run.
+repair_check() {
+    local ok="$1" message="$2"
+    REPAIR_CASES=$(( REPAIR_CASES + 1 ))
+    if [ "$ok" = true ]; then
+        log "repair: pass, $message"
+    else
+        log "repair: FAIL $message"
+        REPAIR_FAILURES=$(( REPAIR_FAILURES + 1 ))
+    fi
+}
+
+run_repair() {
+    local src="$WORK_DIR/repair-src.bin" got="$WORK_DIR/repair-got.bin"
+    local keys=() data_keys=() parity_keys=()
+    local key i role frozen gate fpid frozen_gate
+
+    render_repair_profile
+    log "repair: starting $REPAIR_CLUSTER with degraded writes and the sweep on a 5s interval"
+    "$SCRIPTS_DIR/start.sh" -w "$REPAIR_CLUSTER"
+
+    openssl rand -out "$src" 2097152
+    for i in $(seq 1 "$REPAIR_KEYS"); do
+        keys+=("$(printf 'repair-%03d.bin' "$i")")
+    done
+
+    frozen="$(parse_hosts "$REPAIR_CONFIG" | awk 'NR == 1 { print $1 }')"
+    gate="$(survivor_gate "$REPAIR_CONFIG" "$frozen")"
+    [ -n "$gate" ] || fail "repair: no gate survives stopping host $frozen"
+    frozen_gate="$(parse_hosts "$REPAIR_CONFIG" \
+        | awk -v h="$frozen" '$1 == h && $3 != "" { print "https://" $2 ":" $3; exit }')"
+    [ -n "$frozen_gate" ] || fail "repair: host $frozen runs no gate, so nothing repairs its blob node"
+
+    # Which role each key places on the host about to go down. Both are needed
+    # and neither is guaranteed by a hash, so they are counted rather than
+    # assumed: a corpus that put no data shard there would prove nothing and
+    # still pass.
+    for key in "${keys[@]}"; do
+        role="$("$SHARD_PROBE" -config "$REPAIR_CONFIG" -bucket "$REPAIR_BUCKET" -key "$key" \
+            | awk -v h="host=$frozen" '$4 == h { sub(/^role=/, "", $2); print $2; exit }')"
+        case "$role" in
+            data) data_keys+=("$key") ;;
+            parity) parity_keys+=("$key") ;;
+        esac
+    done
+    [ "${#data_keys[@]}" -gt 0 ] \
+        || fail "repair: no key places a data shard on host $frozen, so the no-reconstruction check proves nothing"
+    [ "${#parity_keys[@]}" -gt 0 ] \
+        || fail "repair: no key places a parity shard on host $frozen, so the parity check proves nothing"
+    log "repair: host $frozen holds a data shard of ${#data_keys[@]} keys and a parity shard of ${#parity_keys[@]}"
+
+    fpid="$(cat "$REPAIR_PID_DIR/host-${frozen}.pid")"
+    kill -0 "$fpid" 2>/dev/null || fail "repair: host $frozen is not running"
+
+    local accepted=0
+    kill -STOP "$fpid"
+    log "repair: SIGSTOP host $frozen, writing $REPAIR_KEYS objects through $gate"
+    for key in "${keys[@]}"; do
+        if aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+            s3api put-object --bucket "$REPAIR_BUCKET" --key "$key" --body "$src" \
+            >/dev/null 2>>"$RUN_DIR/repair-puts.txt"; then
+            accepted=$(( accepted + 1 ))
+        fi
+    done
+    kill -CONT "$fpid"
+    log "repair: SIGCONT host $frozen; $accepted of $REPAIR_KEYS writes were accepted with it down"
+
+    # The premise of everything below. Without it there is no redundancy gap,
+    # and a sweep that found nothing to do would pass every check that follows.
+    repair_check "$([ "$accepted" -eq "$REPAIR_KEYS" ] && echo true || echo false)" \
+        "all $REPAIR_KEYS writes landed at k shards with host $frozen down"
+    [ "$accepted" -eq "$REPAIR_KEYS" ] \
+        || fail "repair: degraded writes are not in force, so the rest of the scenario is not attributable"
+
+    # The gate that repairs the thawed host's blob node is the one in its own
+    # process, so it has to be serving before the wait below means anything.
+    warm_gate "$frozen_gate" "$REPAIR_BUCKET" "${keys[0]}" repair \
+        || fail "repair: the thawed host's gate never served, so its sweep cannot be observed"
+
+    # Only the keys whose data shard is on the thawed host can answer this: an
+    # ordinary GET reads the data shards and never touches parity, so a parity
+    # key reports no reconstruction whether or not it was ever repaired.
+    local started deadline settled=false pending=0 seen first=""
+    started="$(date +%s)"
+    deadline=$(( started + REPAIR_DEADLINE ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        pending=0
+        for key in "${data_keys[@]}"; do
+            seen="$(degraded_read "$gate" "$key" "$got" 2>/dev/null || true)"
+            [ "$seen" = 0 ] || pending=$(( pending + 1 ))
+        done
+        # Recorded, not asserted: the sweep runs every five seconds and may
+        # already have finished while the thawed gate was being warmed. What a
+        # stopped host could not have taken is settled by the write count above.
+        if [ -z "$first" ]; then
+            first="$pending"
+            log "repair: at the first read after the thaw, $pending of ${#data_keys[@]} objects still reconstructed"
+        fi
+        if [ "$pending" -eq 0 ]; then
+            settled=true
+            break
+        fi
+        sleep 5
+    done
+    if [ "$settled" = true ]; then
+        repair_check true \
+            "all ${#data_keys[@]} data shards were restored in $(( $(date +%s) - started ))s, and reading them costs no reconstruction"
+    else
+        repair_check false \
+            "$pending of ${#data_keys[@]} objects still reconstruct after ${REPAIR_DEADLINE}s, so the sweep did not restore them"
+    fi
+
+    # Restored is not the same as restored correctly, and a rebuilt shard that
+    # reads back as the wrong bytes would satisfy every count above.
+    local bad=0
+    for key in "${keys[@]}"; do
+        if ! aws_s3 "$gate" s3 cp "s3://$REPAIR_BUCKET/$key" "$got" --only-show-errors 2>>"$EVENTS"; then
+            log "repair: GET errored for $key"
+            bad=$(( bad + 1 ))
+            continue
+        fi
+        cmp -s "$src" "$got" || { log "repair: $key does not match what was written"; bad=$(( bad + 1 )); }
+    done
+    repair_check "$([ "$bad" -eq 0 ] && echo true || echo false)" \
+        "all $REPAIR_KEYS objects read back byte for byte"
+
+    # What the restored parity is worth, which no healthy read asks. One data
+    # shard's host is stopped, so the read has to rebuild from the parity the
+    # sweep wrote — bytes that were never on that node until it repaired them.
+    local pkey phost ppid pgate
+    pkey="${parity_keys[0]}"
+    phost="$(shard_host "$REPAIR_CONFIG" "$REPAIR_BUCKET" "$pkey" data)"
+    if [ -z "$phost" ] || [ "$phost" = "$frozen" ]; then
+        fail "repair: no data shard of $pkey sits off host $frozen, so nothing forces its parity to be read"
+    fi
+    pgate="$(survivor_gate "$REPAIR_CONFIG" "$phost")"
+    ppid="$(cat "$REPAIR_PID_DIR/host-${phost}.pid")"
+
+    warm_gate "$pgate" "$REPAIR_BUCKET" "$pkey" repair-parity \
+        || fail "repair: the read gate did not serve before host $phost was stopped"
+    log "repair: stopping host $phost so $pkey rebuilds from the parity restored on host $frozen"
+    kill -STOP "$ppid"
+    seen="$(degraded_read "$pgate" "$pkey" "$got" 2>/dev/null || true)"
+    kill -CONT "$ppid"
+
+    if [ "$seen" = 0 ] || [ -z "$seen" ]; then
+        repair_check false \
+            "the read of $pkey reported '$seen' shards reconstructed, so it did not go through parity and proves nothing"
+    else
+        repair_check "$(cmp -s "$src" "$got" && echo true || echo false)" \
+            "$pkey rebuilt correctly from $seen reconstructed shard(s), so the restored parity is sound"
+    fi
+
+    log "repair: stopping $REPAIR_CLUSTER"
+    stop_clusters
+    if [ "$REPAIR_FAILURES" -eq 0 ]; then
+        log "repair: passed $REPAIR_CASES assertions"
+    else
+        log "repair: FAILED $REPAIR_FAILURES of $REPAIR_CASES assertions"
+    fi
+}
+
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = repair ]; then
+    run_repair
+
+    if [ "$SCENARIO" = repair ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$REPAIR_FAILURES" -eq 0 ] \
+            || fail "repair failed $REPAIR_FAILURES of $REPAIR_CASES assertions"
+        exit 0
+    fi
+fi
 
 # --- Start ---
 
@@ -528,50 +830,6 @@ fi
 TORN_FAILURES=0
 TORN_CASES=0
 
-# Placement follows the object hash, which is derived from bucket and key
-# alone, so the exact host holding a named shard of a named key is resolvable
-# before the object is written. Both fault scenarios below aim their SIGSTOP
-# with it rather than guessing.
-SHARD_PROBE="$WORK_DIR/shardplace"
-go build -o "$SHARD_PROBE" "$REPO_DIR/scripts/bench/shardplace"
-
-# shard_host names the host holding a given shard role of a given key, and
-# survivor_gate a gate that is not on it. A PUT has to be issued through a gate
-# that is still running, or what stalls is the frontend rather than the shard
-# write.
-shard_host() {
-    "$SHARD_PROBE" -config "$CONFIG_FILE" -bucket "$1" -key "$2" \
-        | awk -v r="role=$3" '$2 == r { sub(/^host=/, "", $4); print $4; exit }'
-}
-survivor_gate() {
-    parse_hosts "$CONFIG_FILE" | awk -v h="$1" '$1 != h && $3 != "" { print "https://" $2 ":" $3; exit }'
-}
-
-# A host that was SIGSTOPped keeps the connections that died under it, and the
-# pool only evicts one after three stalls of five seconds each — long enough
-# that a client's whole retry budget can land inside the window. Reading
-# through such a gate measures that recovery rather than the shard generations
-# either scenario is asking about, so the gate is driven with the cluster whole
-# until it serves, and how long that took is recorded rather than hidden.
-warm_gate() {
-    local gate="$1" bucket="$2" key="$3" label="$4"
-    local scratch="$WORK_DIR/warm.bin" started attempt
-    started="$(date +%s)"
-    for attempt in $(seq 1 12); do
-        if aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 30 \
-            s3 cp "s3://$bucket/$key" "$scratch" --only-show-errors >/dev/null 2>&1; then
-            if [ "$attempt" -gt 1 ]; then
-                log "$label: thawed gate served on attempt $attempt after $(( $(date +%s) - started ))s"
-            fi
-            return 0
-        fi
-        sleep 3
-    done
-    log "$label: thawed gate never served in $(( $(date +%s) - started ))s"
-
-    return 1
-}
-
 # A state document rather than random bytes, because the objects this destroyed
 # in production were volume state: every record carries the generation that
 # wrote it, so a mixture is legible in the file itself rather than only as a
@@ -629,9 +887,9 @@ run_torn_overwrite() {
         local got="$WORK_DIR/got-${name}.json"
         local host gate pid rc
 
-        host="$(shard_host "$BUCKET" "$key" "$role")"
+        host="$(shard_host "$CONFIG_FILE" "$BUCKET" "$key" "$role")"
         [ -n "$host" ] || fail "$name: shardplace named no $role shard host for $key"
-        gate="$(survivor_gate "$host")"
+        gate="$(survivor_gate "$CONFIG_FILE" "$host")"
         [ -n "$gate" ] || fail "$name: no gate survives stopping host $host"
         pid="$(cat "$PID_DIR/host-${host}.pid")"
         kill -0 "$pid" 2>/dev/null || fail "$name: host $host is not running"
@@ -694,8 +952,8 @@ run_torn_overwrite() {
     # What that stale parity is worth, which a healthy read never asks. One
     # data shard's host is stopped so the read has to reconstruct, and the
     # parity it reconstructs from is the older generation's.
-    RECON_HOST="$(shard_host "$BUCKET" "$PARITY_KEY" data)"
-    RECON_GATE="$(survivor_gate "$RECON_HOST")"
+    RECON_HOST="$(shard_host "$CONFIG_FILE" "$BUCKET" "$PARITY_KEY" data)"
+    RECON_GATE="$(survivor_gate "$CONFIG_FILE" "$RECON_HOST")"
     RECON_PID="$(cat "$PID_DIR/host-${RECON_HOST}.pid")"
     RECON_GOT="$WORK_DIR/got-reconstructed.json"
 
@@ -834,7 +1092,7 @@ run_stale_shard() {
     log "stale-shard: $STALE_KEYS objects of $(wc -c < "$V1") bytes stored as v1"
 
     local gate pid p pids=()
-    gate="$(survivor_gate "$frozen")"
+    gate="$(survivor_gate "$CONFIG_FILE" "$frozen")"
     [ -n "$gate" ] || fail "no gate survives stopping host $frozen"
     pid="$(cat "$PID_DIR/host-${frozen}.pid")"
     kill -0 "$pid" 2>/dev/null || fail "host $frozen is not running"
@@ -902,7 +1160,7 @@ run_stale_shard() {
     local other opid ogate
     for other in $(parse_hosts "$CONFIG_FILE" | awk -v h="$frozen" '$1 != h { print $1 }'); do
         opid="$(cat "$PID_DIR/host-${other}.pid")"
-        ogate="$(survivor_gate "$other")"
+        ogate="$(survivor_gate "$CONFIG_FILE" "$other")"
         warm_gate "$ogate" "$BUCKET" "${keys[0]}" "host-${other}-down" \
             || fail "the read gate did not serve before host $other was stopped"
         log "stale-shard: stopping host $other so every object rebuilds, reading through $ogate"
@@ -1155,6 +1413,13 @@ log "Warp completed with no errors"
     echo "frozen_replica_caught_up=pass"
     echo "thawed_host_took_writes=pass"
     echo "warp_error_free=pass"
+    if [ "$REPAIR_CASES" -eq 0 ]; then
+        echo "repair=skipped"
+    elif [ "$REPAIR_FAILURES" -eq 0 ]; then
+        echo "repair=pass"
+    else
+        echo "repair=fail ($REPAIR_FAILURES of $REPAIR_CASES)"
+    fi
     if [ "$TORN_CASES" -eq 0 ]; then
         echo "torn_overwrite=skipped"
     elif [ "$TORN_FAILURES" -eq 0 ]; then
@@ -1185,3 +1450,5 @@ echo "Stress results: $RUN_DIR"
     || fail "torn-overwrite failed $TORN_FAILURES of $TORN_CASES assertions"
 [ "$STALE_FAILURES" -eq 0 ] \
     || fail "stale-shard failed $STALE_FAILURES of $STALE_CASES assertions"
+[ "$REPAIR_FAILURES" -eq 0 ] \
+    || fail "repair failed $REPAIR_FAILURES of $REPAIR_CASES assertions"

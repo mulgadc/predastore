@@ -267,9 +267,11 @@ A blob node knows nothing about S3. Its vocabulary is a **key** (32 opaque bytes
 
 ## Wire protocol
 
-`Request` is the JSON header: key, index, size for puts, and `RangeStart`/`RangeEnd` for gets where `-1` means unset. `Response` is a newline-terminated JSON envelope; a get streams `BodyLen` body bytes after it. Two error codes carry protocol meaning — `not-found` and `store-full` — and anything else in `Err` is an opaque message. `store-full` is translated back into the engine's own `ErrStoreFull` on the client side, so capacity backoff upstream matches the same error either side of the wire.
+`Request` is the JSON header: key, index, size for puts, `RangeStart`/`RangeEnd` for gets where `-1` means unset, and a **write epoch** naming which generation of the value the caller means. `Response` is a newline-terminated JSON envelope; a get streams `BodyLen` body bytes after it. Three error codes carry protocol meaning — `not-found`, `store-full` and `not-prepared` — and anything else in `Err` is an opaque message. `store-full` is translated back into the engine's own `ErrStoreFull` on the client side, so capacity backoff upstream matches the same error either side of the wire.
 
 A put also reports `PoolNearFull` on success, so callers can back off before a write is ever outright rejected.
+
+**A write is two operations.** `Put` makes the value durable but invisible; `Commit` publishes it and `Abort` discards it. A get names the epoch it wants, and a node holding another generation answers `epoch-mismatch` rather than bytes — see §8. `Stat` answers what generation a node holds without its body, which is what repair asks of every position it owns.
 
 ## The engine
 
@@ -387,11 +389,19 @@ The first save also locks in a freshly generated `storeID` before any fragment c
 
 The gate authenticates, resolves the bucket, unwraps `aws-chunked` framing if the client used it, and takes the object size from `Content-Length` or `X-Amz-Decoded-Content-Length`. A request that declares no length is rejected with `MissingContentLength`: the splitter needs the size up front, and it is what placement records.
 
-The body is split into `K` data shard buffers in memory and each is streamed to its node in parallel. Parity is encoded from those same buffers and streamed through pipes to the parity nodes. Zero parity stops after the data shards, since the encoder would otherwise read every data shard back to produce nothing.
+Every PUT draws a **write epoch**: eight bytes from `crypto/rand`, compared only for equality, with zero reserved as invalid. It is stamped on every shard of the stripe and into the placement record, so the record names one generation and a shard either belongs to it or does not.
 
-Once every shard has committed, two keys go to the meta plane — placement under the object hash, then the object hash under the listing ARN — and the client gets a 200 with an ETag. If any node reported nearfull pressure, the response also carries `X-Predastore-Pool-Pressure: nearfull`; a node that rejected outright surfaces as 507 `InsufficientStorage`.
+The body is split into `K` data shard buffers in memory and each is streamed to its node in parallel. Parity is encoded into buffers of its own and written from those. It is deliberately not piped from a single encoder: one parity node refusing would close its pipe, fail the encode and take every other parity write down with it, losing all redundancy at once rather than one shard of it.
 
-**Ordering matters.** Shards land before metadata. A crash between the two leaves shards nothing points at (reclaimed by compaction only once something tombstones them — see §15); a crash the other way round would leave metadata pointing at data that was never written.
+**The write is two-phase.** Each shard put makes the bytes durable and invisible. The placement record landing in raft is the commit point — the moment the object's new generation exists — and the shards are published only afterwards. A reader that finds a prepared-but-unpublished shard at the record's epoch completes the commit itself, so an interrupted writer costs a round trip rather than the object.
+
+By default the write is acknowledged only at full width. With `rs.degraded_writes` on it is acknowledged once `K` shards are durable, so one node down does not refuse writes; the response then carries `X-Spx-Degraded-Write: <n>`. `K` is the floor and not `K+1`, because any `K` of the `K+M` reconstruct — at RS(2,1) one more buys no redundancy and would refuse three quarters of writes with a single node down. The gap it opens is closed by repair, below.
+
+Only the shards that actually prepared are committed or aborted. Committing a shard that never prepared is refused, and aborting one would ask a node to discard the generation it is still serving.
+
+If any node reported nearfull pressure, the response also carries `X-Predastore-Pool-Pressure: nearfull`; a node that rejected outright surfaces as 507 `InsufficientStorage`.
+
+**Ordering matters.** Shards are durable before metadata. A crash between the two leaves shards nothing points at (reclaimed by compaction only once something tombstones them — see §15); a crash the other way round would leave metadata pointing at data that was never written.
 
 ## GET
 
@@ -399,7 +409,9 @@ Once every shard has committed, two keys go to the meta plane — placement unde
   <img src="assets/get-path.svg" alt="Predastore GET object path: the gate reads the recorded placement from the Raft metadata plane, fetches the data shards from their blob nodes in parallel, joins them, and falls back to fetching parity and Reed-Solomon reconstruction when a shard is missing or fails its integrity check" width="900">
 </p>
 
-The gate reads the recorded placement — which carries the object size the join needs — fetches the data shards, and joins them. Only if the join fails does it refetch including parity and reconstruct. Parity is never touched on the happy path.
+The gate reads the recorded placement — which carries the object size and the write epoch the join needs — fetches the data shards, and joins them. Only if the join fails does it refetch including parity and reconstruct. Parity is never touched on the happy path.
+
+Every shard read names the record's epoch, and a node holding another generation answers `epoch-mismatch`. **The gate counts that exactly as a missing shard.** This is what makes a half-completed overwrite a reconstruction rather than an object spliced from two generations: the stale shards are not eligible to be joined, so the read either rebuilds the object the record names or fails, and never returns plausible nonsense. A read that had to reconstruct says so in `X-Spx-Degraded: <n>`, which is a cost report and not an error.
 
 A `Range` request takes a fast path when the whole range lands inside one data shard, since Reed–Solomon splits data sequentially: that is a single ranged shard read. Anything wider falls back to reconstructing the object and slicing it.
 
@@ -442,6 +454,28 @@ The ring is a concrete implementation, not a pluggable strategy. Every gate in a
 | Load factor | 1.25 |
 
 The gate records the resolved placement rather than relying on the ring alone at read time, so a ring that has since changed shape does not lose objects placed under the old one. It does check that the recorded shard count still matches the ring's width.
+
+## Repair
+
+`internal/gate/repair` restores shards a blob node owns but does not hold at the generation its object's record names. It is off unless `[repair] enabled` is set; it exists to close the redundancy window degraded writes open, and a cluster running neither is in the state it has always been in.
+
+**It carries no correctness weight.** A read compares each shard's epoch against the record it has already loaded and discards a stale one whether or not repair has ever run. What repair restores is redundancy — the number of further losses an object survives — and never the object.
+
+**It is a sweep, not a subscription.** Every pass pages through the placement records from the beginning, keeps the ring positions belonging to the nodes it repairs for, asks each holder which generation it has, and rebuilds the ones that disagree. Nothing is derived from a log window: the meta FSM applies commands into Badger without retaining the index that carried them, so there is no index-to-command history to walk and no cheaper question to ask than the records themselves.
+
+| Property | Choice |
+|---|---|
+| Coordinator | The gate, for the blob nodes in its own process |
+| State | An in-memory scan cursor and counters — nothing durable |
+| Cheap path | Publish a shard the node already prepared, one round trip |
+| Rebuild | `Reconstruct` from `K` peers, streamed into the put |
+| Source shards | All demanded at the record's epoch, never a mixture |
+
+Repairing only the nodes sharing its process settles ownership deterministically: every blob node has exactly one coordinator and nothing has to elect one. Keeping no durable state is affordable because every rebuild is idempotent against the record's epoch — a crash repeats a page rather than losing work, and a durable cursor would need its own consistency argument against a table being written underneath it.
+
+Before publishing, the record is re-read and the rebuilt shard discarded if the epoch has moved, so a write that lands mid-repair is not demoted to the generation before it. That window is narrowed rather than closed; what survives it is a shard the next read discards and the next pass rebuilds, which is a wasted repair and not a wrong object.
+
+If fewer than `K` peers hold the record's generation, the rebuild fails and says so. Inventing a shard from a mixture of generations would replace a detectable loss with an undetectable one, which is the defect this whole design exists to remove.
 
 ---
 
@@ -514,6 +548,13 @@ region  = "ap-southeast-2"      # required; the credential scope requests are co
 [rs]
 data   = 2
 parity = 1
+# degraded_writes = false       # accept a write at K shards rather than K+M; see §8
+
+# [repair]                      # restore shards held at a stale generation; see §9
+# enabled          = false
+# workers          = 0          # concurrent rebuilds; zero derives one from the CPU count
+# page_size        = 0          # placement records per scan request; zero defaults to 512
+# interval_seconds = 0          # gap between passes; zero defaults to 300
 
 # [compaction]
 # interval_seconds = 300        # zero uses the engine default; compaction is never off
