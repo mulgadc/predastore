@@ -25,10 +25,7 @@ func (f writeFixture) storePart(t *testing.T, bucket, key, uploadID string, part
 	partKey := partObjectKey(key, uploadID, partNumber)
 	objectHash := model.ObjectHash(bucket, partKey)
 
-	_, err := writeObject(ctx, f.bc, f.ring, f.cfg, bytes.NewReader(data), int64(len(data)), objectHash)
-	require.NoError(t, err)
-
-	place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(data)))
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(data), int64(len(data)))
 	require.NoError(t, err)
 
 	record, err := encodePlacement(place)
@@ -175,14 +172,11 @@ func TestMultipartAssemblyRoundTrips(t *testing.T) {
 			objectHash := model.ObjectHash("b", "k")
 
 			assembled := streamParts(ctx, f.mc, f.bc, f.cfg, "b", "k", "upload-1", completedParts(parts))
-			_, err := writeObject(ctx, f.bc, f.ring, f.cfg, assembled, finalSize, objectHash)
+			place, _, err := f.write(ctx, objectHash, assembled, finalSize)
 			require.NoError(t, err)
 			require.NoError(t, assembled.Close())
 
-			place, err := placeShards(f.ring, f.cfg, objectHash, finalSize)
-			require.NoError(t, err)
-
-			got, err := readObject(ctx, f.bc, f.cfg, "b", "k", place, place.Size)
+			got, _, err := readObject(ctx, f.bc, f.cfg, "b", "k", place, place.Size)
 			require.NoError(t, err)
 			assert.Equal(t, want, got)
 		})

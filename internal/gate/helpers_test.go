@@ -95,6 +95,14 @@ func (fakeBlob) Delete(context.Context, config.NodeID, blob.DeleteRequest) (*blo
 	return nil, errors.New("no blob nodes")
 }
 
+func (fakeBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) error {
+	return errors.New("no blob nodes")
+}
+
+func (fakeBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error {
+	return errors.New("no blob nodes")
+}
+
 // newTestGate builds a gate through the production constructor, filling in
 // what New requires and a test rarely cares about: a loadable TLS pair and the
 // two cluster clients. Whatever cfg already sets is left alone.

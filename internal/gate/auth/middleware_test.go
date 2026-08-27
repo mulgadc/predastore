@@ -63,6 +63,9 @@ func (noBlob) Delete(context.Context, config.NodeID, blob.DeleteRequest) (*blob.
 	return nil, errNoCluster
 }
 
+func (noBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) error { return errNoCluster }
+func (noBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error  { return errNoCluster }
+
 // sessionGate builds a gate whose only bucket is config-defined and owned
 // by the session's account, so authorization is the only thing under test.
 func sessionGate(t *testing.T, p auth.CredentialProvider) http.Handler {

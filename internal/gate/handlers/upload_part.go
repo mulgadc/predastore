@@ -64,15 +64,24 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		digest := model.NewPartETagHasher()
 
 		// Placement comes from the part's own object hash, so a retried part
-		// lands on the same nodes without anything deterministic on disk.
-		if _, err := writeObject(ctx, bc, ring, cfg, io.TeeReader(body, digest), partSize, objectHash); err != nil {
+		// lands on the same nodes without anything deterministic on disk. Its
+		// epoch is its own: a part is an object and follows the same rules.
+		place, err := placeShards(ring, cfg, objectHash, partSize)
+		if err != nil {
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to get shard placement", 500))
+			return
+		}
+
+		if _, err := writeObject(ctx, bc, cfg, io.TeeReader(body, digest), partSize, objectHash, place); err != nil {
 			slog.ErrorContext(ctx, "Failed to store part", "uploadID", uploadID, "part", partNumber, "error", err)
+			abortShards(ctx, bc, objectHash, place)
 			HandleError(w, r, mapPutErr(err))
 			return
 		}
 		// The part is only reachable once its metadata lands below, so a failed
 		// payload check here leaves nothing CompleteMultipartUpload can assemble.
 		if err := finishPayload(r); err != nil {
+			abortShards(ctx, bc, objectHash, place)
 			HandleError(w, r, err)
 			return
 		}
@@ -87,30 +96,31 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		}
 		var partBuf bytes.Buffer
 		if err := gob.NewEncoder(&partBuf).Encode(partMeta); err != nil {
+			abortShards(ctx, bc, objectHash, place)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode part metadata", 500))
 			return
 		}
 		if err := metaPut(ctx, mc, model.TableParts, multipartPartKey(uploadID, partNumber), partBuf.Bytes()); err != nil {
 			slog.ErrorContext(ctx, "Failed to store part metadata", "uploadID", uploadID, "part", partNumber, "error", err)
+			abortShards(ctx, bc, objectHash, place)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store part metadata", 500))
 			return
 		}
 
-		place, err := placeShards(ring, cfg, objectHash, partSize)
-		if err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to get shard placement", 500))
-			return
-		}
 		shardRecord, err := encodePlacement(place)
 		if err != nil {
+			abortShards(ctx, bc, objectHash, place)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
 			return
 		}
 		if err := metaPut(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber), shardRecord); err != nil {
 			slog.ErrorContext(ctx, "Failed to store part shard metadata", "uploadID", uploadID, "part", partNumber, "error", err)
+			abortShards(ctx, bc, objectHash, place)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store part shard metadata", 500))
 			return
 		}
+
+		commitShards(ctx, bc, objectHash, place)
 
 		telemetry.RecordMultipartPart(ctx, partSize)
 		slog.DebugContext(ctx, "Part uploaded", "uploadID", uploadID, "partNumber", partNumber, "size", partSize, "etag", etag)

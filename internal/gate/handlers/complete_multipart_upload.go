@@ -100,26 +100,32 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		defer assembled.Close()
 
 		objectHash := model.ObjectHash(bucket, key)
-		if _, err := writeObject(ctx, bc, ring, cfg, assembled, finalSize, objectHash); err != nil {
-			slog.ErrorContext(ctx, "Failed to store final object", "uploadID", uploadID, "error", err)
-			HandleError(w, r, mapPutErr(err))
-			return
-		}
-
 		place, err := placeShards(ring, cfg, objectHash, finalSize)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to get shard placement", 500))
 			return
 		}
+
+		if _, err := writeObject(ctx, bc, cfg, assembled, finalSize, objectHash, place); err != nil {
+			slog.ErrorContext(ctx, "Failed to store final object", "uploadID", uploadID, "error", err)
+			abortShards(ctx, bc, objectHash, place)
+			HandleError(w, r, mapPutErr(err))
+			return
+		}
+
 		shardRecord, err := encodePlacement(place)
 		if err != nil {
+			abortShards(ctx, bc, objectHash, place)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
 			return
 		}
 		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), shardRecord); err != nil {
+			abortShards(ctx, bc, objectHash, place)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store object metadata", 500))
 			return
 		}
+		commitShards(ctx, bc, objectHash, place)
+
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store ARN mapping", 500))
 			return
@@ -231,7 +237,7 @@ func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, 
 		return nil, err
 	}
 
-	part, err := readObject(ctx, bc, cfg, bucket, partObjectKey(key, uploadID, partNumber), place, place.Size)
+	part, _, err := readObject(ctx, bc, cfg, bucket, partObjectKey(key, uploadID, partNumber), place, place.Size)
 	if err != nil {
 		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonShardRead)
 		return nil, err

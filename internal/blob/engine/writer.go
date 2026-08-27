@@ -15,6 +15,7 @@ type writer struct {
 	store   *Store
 	key     [32]byte
 	index   uint32
+	epoch   uint64
 	storeID uint32
 
 	seg *segment
@@ -105,10 +106,11 @@ func (w *writer) ReadFrom(r io.Reader) (total int64, err error) {
 	return total, nil
 }
 
-// Close flushes, makes the data durable, then commits the extent to the index —
-// so a failure before that last step leaves the value's previous data intact.
-// Must be called exactly once; it is what releases the segment reference Append
-// took.
+// Close flushes, makes the data durable, then records the extent as prepared.
+// It does not publish it: the value keeps serving its previous data until
+// Store.Commit runs, which is what makes an overwrite spanning several shards
+// abortable rather than half-applied. Must be called exactly once; it is what
+// releases the segment reference Append took.
 func (w *writer) Close() (err error) {
 	if w.closed {
 		return ErrClosedWriter
@@ -134,7 +136,7 @@ func (w *writer) Close() (err error) {
 		return fmt.Errorf("sync idx %d: %w", w.ext.SegNum, err)
 	}
 
-	return w.store.commitExtent(w.key, w.index, w.ext)
+	return w.store.prepareExtent(w.key, w.index, w.ext, w.epoch)
 }
 
 // flush seals each buffered fragment in place under aead, then writes the

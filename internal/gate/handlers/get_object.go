@@ -44,19 +44,26 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		var body []byte
 		var contentRange string
+		var degraded int
 		status := http.StatusOK
 
 		if rangeStart >= 0 || rangeEnd >= 0 {
-			body, contentRange, err = readRange(ctx, bc, cfg, bucket, key, place, size, rangeStart, rangeEnd)
+			body, contentRange, degraded, err = readRange(ctx, bc, cfg, bucket, key, place, size, rangeStart, rangeEnd)
 			status = http.StatusPartialContent
 		} else {
-			body, err = readObject(ctx, bc, cfg, bucket, key, place, size)
+			body, degraded, err = readObject(ctx, bc, cfg, bucket, key, place, size)
 		}
 		if err != nil {
 			HandleError(w, r, err)
 			return
 		}
 
+		// The read succeeded and the bytes are correct; this only says what it
+		// cost. Unknown headers are ignored by every AWS SDK, so it is free for
+		// clients that do not want it and visible to those that do.
+		if degraded > 0 {
+			w.Header().Set(degradedHeader, strconv.Itoa(degraded))
+		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		w.Header().Set("ETag", model.ObjectETag(bucket, key))
@@ -96,18 +103,18 @@ func parseRangeHeader(header string) (start, end int64) {
 
 // readObject reconstructs the complete object from its data shards, falling
 // back to parity reconstruction when the data shards alone will not join.
-func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64) ([]byte, error) {
+func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64) ([]byte, int, error) {
 	// An empty object has no shards to read: the write path stores none, since
 	// the blob protocol has no zero-length value to store.
 	if size == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 
 	// The stream encoder is constructed per request; hoisting it into the
 	// gate belongs with the streaming refactor, not here.
 	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
 	if err != nil {
-		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
+		return nil, 0, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 
 	objectHash := model.ObjectHash(bucket, key)
@@ -115,9 +122,10 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	// A failed shard read is what parity is for. Reconstruction is attempted
 	// whenever a data shard is missing, not only when the join fails, so that
 	// losing one node does not make every object on it unreadable.
-	shards, readErr := shardBytes(ctx, bc, objectHash, place)
+	start := time.Now()
+	shards, failures, readErr := shardBytes(ctx, bc, objectHash, place)
 	if readErr != nil {
-		return nil, model.NewS3Error(model.ErrInternalError,
+		return nil, 0, model.NewS3Error(model.ErrInternalError,
 			fmt.Sprintf("reconstruction failed: %v", readErr), 500)
 	}
 	missing := missingShards(shards, len(place.DataShardNodes))
@@ -126,12 +134,10 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	if missing == 0 {
 		err := enc.Join(&out, shardReadersOf(shards), size)
 		if err == nil {
-			return out.Bytes(), nil
+			reportDegradedRead(ctx, bucket, key, failures, 0, time.Since(start))
+			return out.Bytes(), 0, nil
 		}
 		slog.WarnContext(ctx, "Initial join failed, attempting reconstruction", "err", err)
-	} else {
-		slog.WarnContext(ctx, "Data shards incomplete, reconstructing from parity",
-			"missing", missing, "of", len(place.DataShardNodes))
 	}
 
 	// Reconstruction works from the shards already in hand. Re-reading them
@@ -141,16 +147,22 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	out.Reset()
 	reconstructed, err := reconstructObject(enc, shards, size)
 	if err != nil {
-		return nil, model.NewS3Error(model.ErrInternalError,
+		return nil, 0, model.NewS3Error(model.ErrInternalError,
 			fmt.Sprintf("reconstruction failed: %v", err), 500)
 	}
-	return reconstructed.Bytes(), nil
+	reportDegradedRead(ctx, bucket, key, failures, missing, time.Since(start))
+
+	return reconstructed.Bytes(), missing, nil
 }
+
+// degradedHeader reports how many shards a GET had to reconstruct. It is not
+// an error signal: the response is a complete, correct object either way.
+const degradedHeader = "X-Spx-Degraded"
 
 // readRange serves a byte range. Reed-Solomon splits data sequentially across
 // the data shards, so a range inside one shard is a single ranged shard read;
 // anything wider falls back to reconstructing the object and slicing it.
-func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, totalSize, reqStart, reqEnd int64) (data []byte, contentRange string, err error) {
+func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, totalSize, reqStart, reqEnd int64) (data []byte, contentRange string, degraded int, err error) {
 	start, end := reqStart, reqEnd
 	if start < 0 {
 		start = 0
@@ -159,7 +171,7 @@ func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key strin
 		end = totalSize - 1
 	}
 	if start > end || start >= totalSize {
-		return nil, "", model.ErrInvalidRangeError
+		return nil, "", 0, model.ErrInvalidRangeError
 	}
 
 	shardSize := (totalSize + int64(cfg.DataShards) - 1) / int64(cfg.DataShards)
@@ -170,15 +182,15 @@ func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key strin
 		objectHash := model.ObjectHash(bucket, key)
 		data, err := readRangeFromSingleShard(ctx, bc, cfg, objectHash, place, startShardIdx, start, end, shardSize, totalSize)
 		if err == nil {
-			return data, fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize), nil
+			return data, fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize), 0, nil
 		}
 		slog.WarnContext(ctx, "Single shard range read failed, falling back to full reconstruction", "err", err)
 	}
 
-	full, err := readObject(ctx, bc, cfg, bucket, key, place, totalSize)
+	full, degraded, err := readObject(ctx, bc, cfg, bucket, key, place, totalSize)
 	if err != nil {
 		slog.ErrorContext(ctx, "Full object reconstruction failed", "err", err)
-		return nil, "", err
+		return nil, "", 0, err
 	}
 
 	if end >= int64(len(full)) {
@@ -186,10 +198,10 @@ func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key strin
 	}
 	if start >= int64(len(full)) {
 		slog.ErrorContext(ctx, "Start position beyond data", "start", start, "dataLen", len(full))
-		return nil, "", model.ErrInvalidRangeError
+		return nil, "", 0, model.ErrInvalidRangeError
 	}
 
-	return full[start : end+1], fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize), nil
+	return full[start : end+1], fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize), degraded, nil
 }
 
 // readRangeFromSingleShard reads a byte range from one data shard: the fast
@@ -221,6 +233,7 @@ func readRangeFromSingleShard(ctx context.Context, bc BlobClient, cfg Config, ob
 		Index:      uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards (small uint).
 		RangeStart: offsetInShard,
 		RangeEnd:   endInShard,
+		Epoch:      place.WriteEpoch,
 	}
 
 	reader, err := bc.Get(ctx, nodeNum, objectRequest)

@@ -38,37 +38,48 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
-		poolNearFull, err := writeObject(ctx, bc, ring, cfg, body, size, objectHash)
-		if err != nil {
-			slog.ErrorContext(ctx, "putObject: shard distribution failed", "error", err)
-			HandleError(w, r, mapPutErr(err))
-			return
-		}
-
-		// Shards are written but nothing references them until the placement lands
-		// below, so a body that fails its payload check leaves no readable object.
-		if err := finishPayload(r); err != nil {
-			HandleError(w, r, err)
-			return
-		}
-
+		// Placement, and the write epoch every shard is stamped with, are fixed
+		// before the first byte moves: the record the read path will dial has to
+		// be the same list the shards were written to.
 		place, err := placeShards(ring, cfg, objectHash, size)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 
+		poolNearFull, err := writeObject(ctx, bc, cfg, body, size, objectHash, place)
+		if err != nil {
+			slog.ErrorContext(ctx, "putObject: shard distribution failed", "error", err)
+			abortShards(ctx, bc, objectHash, place)
+			HandleError(w, r, mapPutErr(err))
+			return
+		}
+
+		// Shards are prepared but invisible until the placement lands below, so a
+		// body that fails its payload check leaves the previous object intact.
+		if err := finishPayload(r); err != nil {
+			abortShards(ctx, bc, objectHash, place)
+			HandleError(w, r, err)
+			return
+		}
+
 		record, err := encodePlacement(place)
 		if err != nil {
+			abortShards(ctx, bc, objectHash, place)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 
-		// Object hash -> shard placement, for retrieval.
+		// Object hash -> shard placement, for retrieval. This is the commit
+		// point: before it the write is invisible, after it the epoch it names
+		// is what every read will demand, and the shards already carry it.
 		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), record); err != nil {
+			abortShards(ctx, bc, objectHash, place)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
+
+		commitShards(ctx, bc, objectHash, place)
 
 		// Listing key -> object hash, for ListObjects.
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {

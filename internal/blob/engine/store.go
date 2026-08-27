@@ -85,6 +85,9 @@ type Reader interface {
 	io.WriterTo
 
 	Size() int64
+
+	// Epoch is the write epoch the value was stored under.
+	Epoch() uint64
 }
 
 type Writer interface {
@@ -100,6 +103,12 @@ var (
 	// ErrStoreFull is returned by Append when free space has dropped below
 	// the full watermark (see WithFreeSpaceWatermark).
 	ErrStoreFull = errors.New("store full")
+
+	// ErrNotPrepared is returned by Commit when the key holds no prepared
+	// extent under that epoch: the prepare never landed, it was aborted, or it
+	// was aged out. It is distinct from a store error because the caller's
+	// answer is to rewrite the shard, not to retry the commit.
+	ErrNotPrepared = errors.New("no prepared extent under that epoch")
 )
 
 // Option configures a Store at Open time. Options may fail (e.g. invalid key
@@ -239,7 +248,7 @@ func (store *Store) Lookup(key [32]byte, index uint32) (Reader, error) {
 		return nil, fmt.Errorf("get extent: %w", err)
 	}
 
-	ext, err := decodeExtent(data)
+	ext, epoch, err := decodeIndexValue(data)
 	if err != nil {
 		return nil, fmt.Errorf("decode extent: %w", err)
 	}
@@ -256,6 +265,7 @@ func (store *Store) Lookup(key [32]byte, index uint32) (Reader, error) {
 	return &reader{
 		key:     key,
 		index:   index,
+		epoch:   epoch,
 		storeID: store.storeID,
 		aead:    store.aead,
 		seg:     seg,
@@ -265,9 +275,12 @@ func (store *Store) Lookup(key [32]byte, index uint32) (Reader, error) {
 }
 
 // Append reserves space for a value of the given logical size and returns a
-// writer. The value reaches the index only when that writer is closed, so an
-// overwrite keeps serving its previous data until then.
-func (store *Store) Append(key [32]byte, index uint32, size int64) (Writer, error) {
+// writer. Closing that writer prepares the extent rather than publishing it,
+// so an overwrite keeps serving its previous data until Commit is called.
+//
+// epoch is opaque here: the engine stores it, returns it on Lookup and matches
+// it on Commit, and never orders or interprets it.
+func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64) (Writer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("negative size %d", size)
 	}
@@ -329,6 +342,7 @@ func (store *Store) Append(key [32]byte, index uint32, size int64) (Writer, erro
 		store:    store,
 		key:      key,
 		index:    index,
+		epoch:    epoch,
 		storeID:  store.storeID,
 		seg:      seg,
 		ext:      ext,
@@ -396,58 +410,164 @@ func (store *Store) reserveExtent(fragCount uint64) (*segment, int64, error) {
 	return seg, off, nil
 }
 
-// commitExtent points a key at ext, tombstoning any extent it supersedes.
-// Called from writer.Close once the data is durable; takes no store.mutex.
-func (store *Store) commitExtent(key [32]byte, index uint32, ext extent) error {
+// prepareExtent records a durable extent that is not yet the value's data.
+// Called from writer.Close; takes no store.mutex.
+//
+// The row goes into badger rather than being left implicit, and that is the
+// whole point: compaction decides a .idx row is dead when no badger key points
+// at it, so an extent held only in memory between prepare and commit would be
+// dropped out from under the commit. A prepared row makes it live enough to be
+// relocated instead.
+func (store *Store) prepareExtent(key [32]byte, index uint32, ext extent, epoch uint64) error {
+	value := encodePreparedValue(ext, epoch, time.Now().UnixNano())
+	if err := store.index.Update(func(txn *badger.Txn) error {
+		return txn.Set(preparedKey(MakeKey(key, index)), value)
+	}); err != nil {
+		return fmt.Errorf("prepare: %w", err)
+	}
+	return nil
+}
+
+// Commit publishes a prepared extent as the value's data, tombstoning whatever
+// it supersedes. It is idempotent against the epoch: a retry after the row has
+// already been published finds the live row already at epoch and reports
+// success rather than failing a write that did land.
+//
+// A prepared row under a different epoch is left alone. Two writers racing the
+// same key each prepare under their own epoch, and neither may commit the
+// other's bytes.
+func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) error {
 	idxKey := MakeKey(key, index)
+	prepKey := preparedKey(idxKey)
 
 	for {
 		err := store.index.Update(func(txn *badger.Txn) error {
-			old, err := readExtent(txn, idxKey)
+			raw, err := readRaw(txn, prepKey)
 			switch {
-			// A first write supersedes nothing.
 			case errors.Is(err, badger.ErrKeyNotFound):
+				// Nothing prepared. Either this is a duplicate commit of a row
+				// already published, which is success, or the prepare never
+				// happened, which is not.
+				live, liveEpoch, liveErr := readIndexValue(txn, idxKey)
+				if liveErr == nil && liveEpoch == epoch {
+					_ = live
+					return nil
+				}
+				return ErrNotPrepared
+			case err != nil:
+				return err
+			}
+
+			ext, prepared, err := decodeIndexValue(raw)
+			if err != nil {
+				return fmt.Errorf("decode prepared: %w", err)
+			}
+			if prepared != epoch {
+				return ErrNotPrepared
+			}
+
+			// The superseded extent dies at this commit and nowhere else, so its
+			// hint rides the same txn and can neither precede nor outlive it.
+			old, _, err := readIndexValue(txn, idxKey)
+			switch {
+			case errors.Is(err, badger.ErrKeyNotFound): // a first write supersedes nothing
 			case err != nil:
 				return err
 			default:
-				// The old extent dies at this commit and nowhere else, so its hint
-				// rides the same txn and can neither precede nor outlive it.
 				if err := txn.Set(tombstoneKey(old.SegNum, old.Off), tombstoneValue(old.PSize)); err != nil {
 					return fmt.Errorf("put tombstone: %w", err)
 				}
 			}
 
-			return txn.Set(idxKey, ext.encode())
+			if err := txn.Set(idxKey, encodeIndexValue(ext, epoch)); err != nil {
+				return err
+			}
+			return txn.Delete(prepKey)
 		})
 
-		// The read above puts this txn under badger's conflict detection, which a
+		// The reads above put this txn under badger's conflict detection, which a
 		// compactor relocating the same key trips.
 		if errors.Is(err, badger.ErrConflict) {
 			continue
 		}
 		if err != nil {
+			if errors.Is(err, ErrNotPrepared) {
+				return err
+			}
 			return fmt.Errorf("commit: %w", err)
 		}
 		return nil
 	}
 }
 
-// readExtent decodes the extent a key currently points at, propagating
-// badger.ErrKeyNotFound unwrapped so callers can branch on a missing key.
-func readExtent(txn *badger.Txn, key []byte) (extent, error) {
+// Abort discards a prepared extent. The tombstone is what makes the dead space
+// advertise itself: candidateSegments ranks by summed tombstone bytes, so an
+// abort that wrote none would leave the space unreclaimed until something else
+// happened to die in the same segment.
+//
+// Aborting something never prepared is not an error: the caller is telling the
+// store to make sure nothing is pending, and it is not.
+func (store *Store) Abort(key [32]byte, index uint32, epoch uint64) error {
+	return store.dropPrepared(preparedKey(MakeKey(key, index)), func(prepared uint64) bool {
+		return prepared == epoch
+	})
+}
+
+// dropPrepared removes a prepared row when want accepts its epoch, tombstoning
+// the extent it reserved.
+func (store *Store) dropPrepared(prepKey []byte, want func(epoch uint64) bool) error {
+	for {
+		err := store.index.Update(func(txn *badger.Txn) error {
+			raw, err := readRaw(txn, prepKey)
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			ext, prepared, err := decodeIndexValue(raw)
+			if err != nil {
+				return fmt.Errorf("decode prepared: %w", err)
+			}
+			if !want(prepared) {
+				return nil
+			}
+			if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
+				return fmt.Errorf("put tombstone: %w", err)
+			}
+			return txn.Delete(prepKey)
+		})
+		if errors.Is(err, badger.ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("abort: %w", err)
+		}
+		return nil
+	}
+}
+
+// readRaw returns a key's value bytes, propagating badger.ErrKeyNotFound
+// unwrapped so callers can branch on a missing key.
+func readRaw(txn *badger.Txn, key []byte) ([]byte, error) {
 	item, err := txn.Get(key)
 	if err != nil {
-		return extent{}, err
+		return nil, err
 	}
 	raw, err := item.ValueCopy(nil)
 	if err != nil {
-		return extent{}, fmt.Errorf("copy extent: %w", err)
+		return nil, fmt.Errorf("copy value: %w", err)
 	}
-	ext, err := decodeExtent(raw)
+	return raw, nil
+}
+
+// readIndexValue decodes the extent and epoch a key currently points at.
+func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
+	raw, err := readRaw(txn, key)
 	if err != nil {
-		return extent{}, fmt.Errorf("decode extent: %w", err)
+		return extent{}, 0, err
 	}
-	return ext, nil
+	return decodeIndexValue(raw)
 }
 
 // Delete removes a key's index entry and tombstones its extent, in one
@@ -465,7 +585,24 @@ func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
 	idxKey := MakeKey(key, index)
 	deleted := false
 	err := store.index.Update(func(txn *badger.Txn) error {
-		ext, err := readExtent(txn, idxKey)
+		// A prepared row for this key would otherwise survive the delete and
+		// resurrect the value on a later commit.
+		if raw, perr := readRaw(txn, preparedKey(idxKey)); perr == nil {
+			pext, _, derr := decodeIndexValue(raw)
+			if derr != nil {
+				return fmt.Errorf("delete: decode prepared: %w", derr)
+			}
+			if err := txn.Set(tombstoneKey(pext.SegNum, pext.Off), tombstoneValue(pext.PSize)); err != nil {
+				return fmt.Errorf("delete: tombstone prepared: %w", err)
+			}
+			if err := txn.Delete(preparedKey(idxKey)); err != nil {
+				return err
+			}
+		} else if !errors.Is(perr, badger.ErrKeyNotFound) {
+			return fmt.Errorf("delete: read prepared: %w", perr)
+		}
+
+		ext, _, err := readIndexValue(txn, idxKey)
 		if errors.Is(err, badger.ErrKeyNotFound) {
 			return nil
 		}
@@ -555,6 +692,18 @@ func tombstoneValue(psize int64) []byte {
 	v := make([]byte, 8)
 	binary.BigEndian.PutUint64(v, uint64(psize)) //nolint:gosec // PSize is a non-negative on-disk byte count.
 	return v
+}
+
+// Prepared extents live at p ‖ MakeKey(...), 37 bytes against the live row's
+// 36 and the tombstone namespace's 17, so all three are told apart by width
+// alone — the same discrimination the rest of the index already makes.
+const preparedPrefix = 'p'
+
+const preparedKeySize = 37
+
+func preparedKey(idxKey []byte) []byte {
+	key := make([]byte, 0, preparedKeySize)
+	return append(append(key, preparedPrefix), idxKey...)
 }
 
 // MakeKey builds a 36-byte index key: the 32-byte key || 4-byte big-endian index.

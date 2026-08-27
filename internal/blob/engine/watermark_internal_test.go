@@ -14,7 +14,7 @@ import (
 func TestAppendRejectsWhenFull(t *testing.T) {
 	st, _ := openTestStore(t, WithFreeSpaceWatermark(0.9999, 0.9999))
 
-	_, err := st.Append([32]byte{0x1}, 0, 16)
+	_, err := st.Append([32]byte{0x1}, 0, 16, nextTestEpoch())
 	if !errors.Is(err, ErrStoreFull) {
 		t.Fatalf("Append err = %v, want ErrStoreFull", err)
 	}
@@ -24,7 +24,7 @@ func TestAppendRejectsWhenFull(t *testing.T) {
 func TestAppendAcceptsWhenPermissive(t *testing.T) {
 	st, _ := openTestStore(t, WithFreeSpaceWatermark(0, 0))
 
-	w, err := st.Append([32]byte{0x2}, 0, 16)
+	w, err := st.Append([32]byte{0x2}, 0, 16, nextTestEpoch())
 	if err != nil {
 		t.Fatalf("Append err = %v, want nil", err)
 	}
@@ -42,7 +42,7 @@ func TestAppendNotFullByDefaultOnDevDisk(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	w, err := st.Append([32]byte{0x3}, 0, 16)
+	w, err := st.Append([32]byte{0x3}, 0, 16, nextTestEpoch())
 	if err != nil {
 		t.Fatalf("Append err = %v, want nil (dev disk should not be at the 5%% free default)", err)
 	}
@@ -143,7 +143,7 @@ func TestFreeSpaceFractionRefreshesAfterByteThreshold(t *testing.T) {
 func TestAppendAccumulatesBytesSinceStatfs(t *testing.T) {
 	st, _ := openTestStore(t)
 
-	w, err := st.Append([32]byte{0x7}, 0, 16)
+	w, err := st.Append([32]byte{0x7}, 0, 16, nextTestEpoch())
 	if err != nil {
 		t.Fatalf("Append err = %v", err)
 	}
@@ -201,7 +201,7 @@ func TestAppendKicksCompactorOnNearfullButAccepts(t *testing.T) {
 	st, _ := openTestStore(t, WithFreeSpaceWatermark(0.9999, 0))
 	st.compactor = &compactor{store: st, done: make(chan struct{}), kick: make(chan struct{}, 1)}
 
-	w, err := st.Append([32]byte{0x4}, 0, 16)
+	w, err := st.Append([32]byte{0x4}, 0, 16, nextTestEpoch())
 	if err != nil {
 		t.Fatalf("Append err = %v, want nil (nearfull must still accept)", err)
 	}
@@ -220,7 +220,7 @@ func TestAppendDoesNotKickCompactorWhenPermissive(t *testing.T) {
 	st, _ := openTestStore(t, WithFreeSpaceWatermark(0, 0))
 	st.compactor = &compactor{store: st, done: make(chan struct{}), kick: make(chan struct{}, 1)}
 
-	w, err := st.Append([32]byte{0x5}, 0, 16)
+	w, err := st.Append([32]byte{0x5}, 0, 16, nextTestEpoch())
 	if err != nil {
 		t.Fatalf("Append err = %v, want nil", err)
 	}

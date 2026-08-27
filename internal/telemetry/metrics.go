@@ -294,6 +294,9 @@ const (
 	ShardReasonNotFound = "not_found"
 	// ShardReasonTransport is any other failure reaching or reading the node.
 	ShardReasonTransport = "transport"
+	// ShardReasonStaleEpoch is a node holding the shard under a different
+	// write epoch than the placement record names: up, answering, and wrong.
+	ShardReasonStaleEpoch = "stale_epoch"
 )
 
 // RecordShardError counts one failed shard operation. op is "read"; reason is

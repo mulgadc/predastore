@@ -51,10 +51,7 @@ func TestShardBytesSnapshotsAgainstALateShard(t *testing.T) {
 
 	ctx := context.Background()
 	objectHash := model.ObjectHash("b", "k")
-	_, err := writeObject(ctx, f.bc, f.ring, f.cfg, bytes.NewReader(want), int64(len(want)), objectHash)
-	require.NoError(t, err)
-
-	place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(want)))
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), int64(len(want)))
 	require.NoError(t, err)
 
 	// The second data shard arrives long after the parity shard has already
@@ -62,7 +59,7 @@ func TestShardBytesSnapshotsAgainstALateShard(t *testing.T) {
 	slow := &lateBlob{fakeBlob: f.bc, slow: place.DataShardNodes[1], delay: late, landed: make(chan struct{})}
 
 	start := time.Now()
-	shards, err := shardBytes(ctx, slow, objectHash, place)
+	shards, _, err := shardBytes(ctx, slow, objectHash, place)
 	require.NoError(t, err)
 	require.Less(t, time.Since(start), late,
 		"the hedge must return before the late shard lands, or this proves nothing")

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"time"
 
@@ -22,8 +23,10 @@ import (
 // Store is the value store a node serves. The engine is the production
 // implementation; Config.Store is the seam a test substitutes through.
 type Store interface {
-	Append(key [32]byte, index uint32, size int64) (engine.Writer, error)
+	Append(key [32]byte, index uint32, size int64, epoch uint64) (engine.Writer, error)
 	Lookup(key [32]byte, index uint32) (engine.Reader, error)
+	Commit(key [32]byte, index uint32, epoch uint64) error
+	Abort(key [32]byte, index uint32, epoch uint64) error
 	Delete(key [32]byte, index uint32) (bool, error)
 	NearFull() bool
 	Close() error
@@ -100,6 +103,8 @@ func (s *Server) Run(ctx context.Context) error {
 	rpc.RegisterHandler(mux, OpGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpPut, s.handlePut)
 	rpc.RegisterHandler(mux, OpDelete, s.handleDelete)
+	rpc.RegisterHandler(mux, OpCommit, s.handleCommit)
+	rpc.RegisterHandler(mux, OpAbort, s.handleAbort)
 	srv, err := rpc.NewServer(mux, s.cfg.Listeners, nil)
 	if err != nil {
 		return errors.Join(err, s.store.Close())
@@ -119,13 +124,21 @@ func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stre
 	if h.Size <= 0 {
 		return respond(stream, &Response{Err: "no size specified"})
 	}
+	// Zero is reserved as "invalid", so a caller that forgot the epoch is
+	// refused rather than storing a shard nothing can ever match.
+	if h.Epoch == 0 {
+		if derr := drainBody(stream, h.Size); derr != nil {
+			return derr
+		}
+		return respond(stream, &Response{Err: "no write epoch specified"})
+	}
 
-	writer, err := st.Append(h.Key, h.Index, h.Size)
+	writer, err := st.Append(h.Key, h.Index, h.Size, h.Epoch)
 	if err != nil {
 		// Drain the client's in-flight body so the reply is carried
 		// instead of racing a stream reset.
-		if _, derr := io.Copy(io.Discard, io.LimitReader(stream, h.Size)); derr != nil {
-			return fmt.Errorf("drain body after append error: %w", derr)
+		if derr := drainBody(stream, h.Size); derr != nil {
+			return derr
 		}
 		if errors.Is(err, engine.ErrStoreFull) {
 			return respond(stream, &Response{Err: ErrCodeStoreFull})
@@ -136,13 +149,58 @@ func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stre
 	if _, err := writer.ReadFrom(io.LimitReader(stream, h.Size)); err != nil {
 		return respond(stream, &Response{Err: fmt.Sprintf("write: %v", err)})
 	}
+	// Closing prepares the extent rather than publishing it: the shard is
+	// durable here and invisible until the caller commits, which is what lets
+	// an overwrite keep serving its previous generation until the whole stripe
+	// is in place.
 	if err := writer.Close(); err != nil {
-		return respond(stream, &Response{Err: fmt.Sprintf("commit: %v", err)})
+		return respond(stream, &Response{Err: fmt.Sprintf("prepare: %v", err)})
 	}
 
 	// Surface nearfull pressure on success too, so callers can back off
 	// before a write is ever outright rejected.
-	return respond(stream, &Response{Size: h.Size, PoolNearFull: st.NearFull()})
+	return respond(stream, &Response{Size: h.Size, PoolNearFull: st.NearFull(), Epoch: h.Epoch})
+}
+
+// drainBody consumes a rejected put's in-flight body so the reply is carried
+// instead of racing a stream reset.
+func drainBody(stream transport.Stream, size int64) error {
+	if size <= 0 {
+		return nil
+	}
+	if _, err := io.Copy(io.Discard, io.LimitReader(stream, size)); err != nil {
+		return fmt.Errorf("drain rejected body: %w", err)
+	}
+	return nil
+}
+
+// handleCommit publishes a prepared shard. It is the second half of the write
+// and is driven by whoever holds the published placement record, so a retry of
+// one already applied has to succeed rather than report a write that did land
+// as failed; the engine makes that idempotent against the epoch.
+func (s *Server) handleCommit(ctx context.Context, h Request, stream transport.Stream) error {
+	if h.Epoch == 0 {
+		return respond(stream, &Response{Err: "no write epoch specified"})
+	}
+	if err := s.store.Commit(h.Key, h.Index, h.Epoch); err != nil {
+		if errors.Is(err, engine.ErrNotPrepared) {
+			return respond(stream, &Response{Err: ErrCodeNotPrepared})
+		}
+		return respond(stream, &Response{Err: fmt.Sprintf("commit: %v", err)})
+	}
+	return respond(stream, &Response{Epoch: h.Epoch})
+}
+
+// handleAbort discards a prepared shard. Aborting something never prepared is
+// success: the caller is asking that nothing be left pending, and nothing is.
+func (s *Server) handleAbort(ctx context.Context, h Request, stream transport.Stream) error {
+	if h.Epoch == 0 {
+		return respond(stream, &Response{Err: "no write epoch specified"})
+	}
+	if err := s.store.Abort(h.Key, h.Index, h.Epoch); err != nil {
+		return respond(stream, &Response{Err: fmt.Sprintf("abort: %v", err)})
+	}
+	return respond(stream, &Response{Epoch: h.Epoch})
 }
 
 func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stream) error {
@@ -151,6 +209,13 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 	reader, err := st.Lookup(h.Key, h.Index)
 	if err != nil {
 		return respond(stream, &Response{Err: ErrCodeNotFound})
+	}
+	if h.Epoch != 0 && reader.Epoch() != h.Epoch {
+		held := reader.Epoch()
+		reader, err = s.resolveEpoch(h, reader)
+		if err != nil {
+			return respond(stream, &Response{Err: ErrCodeEpochMismatch, Epoch: held})
+		}
 	}
 	defer reader.Close()
 
@@ -178,6 +243,36 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 		return fmt.Errorf("stream body: %w", err)
 	}
 	return nil
+}
+
+// resolveEpoch answers a get whose live shard is the wrong generation. A
+// prepared extent under the requested epoch means a writer published the
+// placement record and died before committing, so the record already names
+// this generation and completing the commit is the only outcome that can be
+// right. Anything else is a genuine mismatch and the caller reconstructs.
+//
+// It takes ownership of the reader it is given: on either path that reader is
+// closed and the caller keeps only what comes back.
+func (s *Server) resolveEpoch(h Request, stale engine.Reader) (engine.Reader, error) {
+	if err := stale.Close(); err != nil {
+		return nil, fmt.Errorf("close stale reader: %w", err)
+	}
+	if err := s.store.Commit(h.Key, h.Index, h.Epoch); err != nil {
+		return nil, err
+	}
+	reader, err := s.store.Lookup(h.Key, h.Index)
+	if err != nil {
+		return nil, err
+	}
+	// A concurrent overwrite could have moved it on again between the commit
+	// and this lookup, and serving the wrong generation is the one thing this
+	// path exists to prevent.
+	if reader.Epoch() != h.Epoch {
+		return nil, errors.Join(engine.ErrNotPrepared, reader.Close())
+	}
+	slog.Info("completed a shard commit abandoned by its writer",
+		"node", s.cfg.NodeID, "index", h.Index, "epoch", fmt.Sprintf("%016x", h.Epoch))
+	return reader, nil
 }
 
 func (s *Server) handleDelete(ctx context.Context, h Request, stream transport.Stream) error {

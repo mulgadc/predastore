@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
@@ -37,9 +38,22 @@ func openTestStore(t *testing.T, opts ...Option) (*Store, string) {
 	return st, dir
 }
 
+// putValue writes and publishes a value. Every epoch here is distinct, which
+// is what a real overwrite does; a test that needs a specific one calls
+// prepareValue and Commit itself.
 func putValue(t *testing.T, st *Store, oh [32]byte, idx uint32, body []byte) {
 	t.Helper()
-	w, err := st.Append(oh, idx, int64(len(body)))
+	epoch := prepareValue(t, st, oh, idx, body)
+	if err := st.Commit(oh, idx, epoch); err != nil {
+		t.Fatalf("commit (%x,%d): %v", oh[0], idx, err)
+	}
+}
+
+// prepareValue writes a value without publishing it and returns its epoch.
+func prepareValue(t *testing.T, st *Store, oh [32]byte, idx uint32, body []byte) uint64 {
+	t.Helper()
+	epoch := nextTestEpoch()
+	w, err := st.Append(oh, idx, int64(len(body)), epoch)
 	if err != nil {
 		t.Fatalf("append (%x,%d): %v", oh[0], idx, err)
 	}
@@ -49,7 +63,14 @@ func putValue(t *testing.T, st *Store, oh [32]byte, idx uint32, body []byte) {
 	if err := w.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
+	return epoch
 }
+
+// testEpochs hands out distinct non-zero epochs. Zero is reserved as invalid,
+// so a counter starting at one is enough.
+var testEpochs atomic.Uint64
+
+func nextTestEpoch() uint64 { return testEpochs.Add(1) }
 
 func readValue(t *testing.T, st *Store, oh [32]byte, idx uint32) []byte {
 	t.Helper()
@@ -71,7 +92,7 @@ func extentOf(t *testing.T, st *Store, oh [32]byte, idx uint32) extent {
 	if err != nil {
 		t.Fatalf("index get: %v", err)
 	}
-	ext, err := decodeExtent(raw)
+	ext, _, err := decodeIndexValue(raw)
 	if err != nil {
 		t.Fatalf("decode extent: %v", err)
 	}
@@ -304,29 +325,23 @@ func TestTombstoneLandsAtCommitNotAppend(t *testing.T) {
 	putValue(t, st, oh, 0, body)
 	old := extentOf(t, st, oh, 0)
 
-	// Reserve and fill an overwrite, but hold it short of Close.
-	w, err := st.Append(oh, 0, int64(len(body)))
-	if err != nil {
-		t.Fatalf("append: %v", err)
-	}
-	if _, err := w.Write(bytes.Repeat([]byte{0xee}, 12*KiB)); err != nil {
-		t.Fatalf("write: %v", err)
-	}
+	// Prepare an overwrite. Closing the writer makes it durable but does not
+	// publish it, so nothing about the readable value may change yet.
+	epoch := prepareValue(t, st, oh, 0, bytes.Repeat([]byte{0xee}, 12*KiB))
 
 	if found := tombstones(t, st); len(found) != 0 {
-		t.Fatalf("uncommitted append produced %d tombstone(s): %v", len(found), found)
+		t.Fatalf("prepared append produced %d tombstone(s): %v", len(found), found)
 	}
 	if got := extentOf(t, st, oh, 0); slotOf(got) != slotOf(old) {
-		t.Fatalf("uncommitted append moved the index off %v to %v", slotOf(old), slotOf(got))
+		t.Fatalf("prepared append moved the index off %v to %v", slotOf(old), slotOf(got))
 	}
 	if got := readValue(t, st, oh, 0); !bytes.Equal(got, body) {
-		t.Fatalf("uncommitted append changed the readable body")
+		t.Fatalf("prepared append changed the readable body")
 	}
 
-	// Committing is what supersedes the old extent — and it also releases the
-	// segment ref Append took, which Store.Close waits on.
-	if err := w.Close(); err != nil {
-		t.Fatalf("close writer: %v", err)
+	// Committing is what supersedes the old extent.
+	if err := st.Commit(oh, 0, epoch); err != nil {
+		t.Fatalf("commit: %v", err)
 	}
 	if _, ok := tombstones(t, st)[slotOf(old)]; !ok {
 		t.Fatalf("commit did not tombstone superseded slot %v", slotOf(old))

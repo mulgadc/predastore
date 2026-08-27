@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"maps"
 	"slices"
+	"sync/atomic"
 
 	"github.com/mulgadc/predastore/internal/blob/engine"
 )
@@ -14,9 +15,19 @@ func RemoveAll(dir string) {
 	delete(fs, dir)
 }
 
+// refValue is a stored shard: its bytes and the epoch it was written under.
+type refValue struct {
+	data  []byte
+	epoch uint64
+}
+
 type RefStore struct {
-	state  map[[36]byte][]byte
-	closed bool
+	state map[[36]byte]refValue
+	// prepared holds shards written but not yet published, mirroring the
+	// engine's prepared namespace so a lookup sees the previous generation
+	// until a commit lands.
+	prepared map[[36]byte]refValue
+	closed   bool
 }
 
 func Open(dir string) *RefStore {
@@ -29,7 +40,8 @@ func Open(dir string) *RefStore {
 	}
 
 	st := &RefStore{
-		state: make(map[[36]byte][]byte),
+		state:    make(map[[36]byte]refValue),
+		prepared: make(map[[36]byte]refValue),
 	}
 
 	fs[dir] = st
@@ -48,12 +60,13 @@ func (st *RefStore) Lookup(key [32]byte, index uint32) (r engine.Reader, err err
 	}
 
 	return &refReader{
-		Reader: bytes.NewReader(value),
+		Reader: bytes.NewReader(value.data),
+		epoch:  value.epoch,
 		closed: false,
 	}, nil
 }
 
-func (st *RefStore) Append(key [32]byte, index uint32, size int64) (w engine.Writer, err error) {
+func (st *RefStore) Append(key [32]byte, index uint32, size int64, epoch uint64) (w engine.Writer, err error) {
 	if st.closed {
 		return nil, engine.ErrClosedStore
 	}
@@ -63,8 +76,45 @@ func (st *RefStore) Append(key [32]byte, index uint32, size int64) (w engine.Wri
 		st:     st,
 		key:    [36]byte(engine.MakeKey(key, index)),
 		size:   size,
+		epoch:  epoch,
 		closed: false,
 	}, nil
+}
+
+// Commit publishes a prepared value, idempotently against the epoch: a commit
+// of one already published is success rather than a failed write that landed.
+func (st *RefStore) Commit(key [32]byte, index uint32, epoch uint64) error {
+	if st.closed {
+		return engine.ErrClosedStore
+	}
+
+	idxKey := [36]byte(engine.MakeKey(key, index))
+	if prepared, ok := st.prepared[idxKey]; ok && prepared.epoch == epoch {
+		st.state[idxKey] = prepared
+		delete(st.prepared, idxKey)
+
+		return nil
+	}
+	if live, ok := st.state[idxKey]; ok && live.epoch == epoch {
+		return nil
+	}
+
+	return engine.ErrNotPrepared
+}
+
+// Abort discards a prepared value. Aborting one that was never prepared is
+// success: the caller asked that nothing be left pending, and nothing is.
+func (st *RefStore) Abort(key [32]byte, index uint32, epoch uint64) error {
+	if st.closed {
+		return engine.ErrClosedStore
+	}
+
+	idxKey := [36]byte(engine.MakeKey(key, index))
+	if prepared, ok := st.prepared[idxKey]; ok && prepared.epoch == epoch {
+		delete(st.prepared, idxKey)
+	}
+
+	return nil
 }
 
 func (st *RefStore) Delete(key [32]byte, index uint32) (bool, error) {
@@ -75,6 +125,8 @@ func (st *RefStore) Delete(key [32]byte, index uint32) (bool, error) {
 	idxKey := [36]byte(engine.MakeKey(key, index))
 	_, existed := st.state[idxKey]
 	delete(st.state, idxKey)
+	// A surviving prepared value would resurrect the shard on a later commit.
+	delete(st.prepared, idxKey)
 
 	return existed, nil
 }
@@ -113,8 +165,11 @@ func (st *RefStore) IsClosed() bool { return st.closed }
 type refReader struct {
 	*bytes.Reader
 
+	epoch  uint64
 	closed bool
 }
+
+func (r *refReader) Epoch() uint64 { return r.epoch }
 
 func (r *refReader) Close() error {
 	if r.closed {
@@ -132,6 +187,7 @@ type refWriter struct {
 	st     *RefStore
 	key    [36]byte
 	size   int64
+	epoch  uint64
 	closed bool
 }
 
@@ -143,8 +199,14 @@ func (w *refWriter) Close() error {
 	w.closed = true
 
 	if int64(w.Len()) == w.size {
-		w.st.state[w.key] = w.Bytes()
+		w.st.prepared[w.key] = refValue{data: w.Bytes(), epoch: w.epoch}
 	}
 
 	return nil
 }
+
+// NextEpoch hands out distinct non-zero write epochs for tests. Zero is
+// reserved as invalid, so a counter starting at one is enough.
+func NextEpoch() uint64 { return testEpochs.Add(1) }
+
+var testEpochs atomic.Uint64
