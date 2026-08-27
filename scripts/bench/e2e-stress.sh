@@ -1,22 +1,27 @@
 #!/usr/bin/env bash
 #
-# e2e-stress.sh - Freeze a host under live S3 load and prove it rejoins.
+# e2e-stress.sh - Fault-inject a four-host cluster and assert what survives.
 #
-# A four-host cluster is put under Warp GET load, one host is stopped with
-# SIGSTOP, and the run asserts that the survivors keep serving throughout and
-# that the frozen host rejoins raft and takes writes again once it is
-# continued. SIGSTOP is the fault worth injecting because it is the one a
-# healthy transport cannot distinguish from a slow peer: the process stays
-# dialable and its sockets stay open while it answers nothing, which is
-# exactly the state a connection pool can sit on indefinitely.
+# A default run is two tests, in order. The first overwrites an object with the
+# one host holding a named shard of it stopped, and asserts the failed write
+# left the object exactly as it was. The second puts the cluster under Warp GET
+# load, stops a host with SIGSTOP, and asserts the survivors keep serving
+# throughout and that the frozen host rejoins raft and takes writes again once
+# it is continued.
+#
+# SIGSTOP is the fault worth injecting because it is the one a healthy
+# transport cannot distinguish from a slow peer: the process stays dialable and
+# its sockets stay open while it answers nothing, which is exactly the state a
+# connection pool can sit on indefinitely.
 #
 # Usage:
 #   ./scripts/bench/e2e-stress.sh          # or: make e2e-stress
 #
 # Environment:
-#   STRESS_SCENARIO    "freeze" (default), "partial-put" or "torn-overwrite".
-#                      freeze is the rejoin test described above; the other two
-#                      are write-path faults and return before the load phase.
+#   STRESS_SCENARIO    Narrows the run to one test: "torn-overwrite", "freeze",
+#                      or "partial-put" — a client that stops sending mid-body,
+#                      which is not in a default run. Unset runs
+#                      torn-overwrite and then freeze.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -55,6 +60,14 @@ OBJECTS="${STRESS_OBJECTS:-32}"
 OBJ_SIZE="${STRESS_OBJ_SIZE:-8MiB}"
 CONCURRENT="${STRESS_CONCURRENT:-8}"
 PORT_OFFSET="${STRESS_PORT_OFFSET:-10000}"
+
+# Validated rather than defaulted, so a typo runs nothing instead of quietly
+# running everything and reporting a pass for a test that was never named.
+SCENARIO="${STRESS_SCENARIO:-all}"
+case "$SCENARIO" in
+    all|freeze|partial-put|torn-overwrite) ;;
+    *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
+esac
 
 ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
 SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
@@ -219,7 +232,7 @@ meta_status "${META_ALL[@]}" | tee -a "$EVENTS"
 # it a data-loss bug rather than a leak is that the shards of the object being
 # overwritten have already been replaced with the truncated ones, while the
 # metadata record still describes the object that was there before.
-if [ "${STRESS_SCENARIO:-freeze}" = partial-put ]; then
+if [ "$SCENARIO" = partial-put ]; then
     PARTIAL_PROBE="$WORK_DIR/partialput"
     go build -o "$PARTIAL_PROBE" "$REPO_DIR/scripts/bench/partialput"
 
@@ -503,7 +516,16 @@ fi
 # Which host to stop is not a guess. Placement follows the object hash, which
 # is derived from bucket and key alone, so shardplace resolves the exact host
 # holding a named shard of a named key before the object is written.
-if [ "${STRESS_SCENARIO:-freeze}" = torn-overwrite ]; then
+#
+# This runs on every invocation rather than only when asked for. It is silent
+# data loss on the ordinary overwrite path, so a run that skipped it would be
+# reporting on a narrower cluster than the one being shipped. It costs about
+# three minutes and needs no load, and its failures are recorded rather than
+# fatal so the freeze test below still runs while this one is red.
+TORN_FAILURES=0
+TORN_CASES=0
+
+run_torn_overwrite() {
     SHARD_PROBE="$WORK_DIR/shardplace"
     go build -o "$SHARD_PROBE" "$REPO_DIR/scripts/bench/shardplace"
 
@@ -548,8 +570,8 @@ if [ "${STRESS_SCENARIO:-freeze}" = torn-overwrite ]; then
     FIRST_GATE="https://$(gate_endpoints "$CONFIG_FILE" | head -1)"
     aws_s3 "$FIRST_GATE" s3 mb "s3://$BUCKET" >/dev/null
 
-    FAILURES=0
-    CASES_RUN=0
+    TORN_FAILURES=0
+    TORN_CASES=0
 
     # generation_of classifies what came back. Neither generation intact is
     # the finding: a spliced object is one the reader cannot detect and the
@@ -600,9 +622,9 @@ if [ "${STRESS_SCENARIO:-freeze}" = torn-overwrite ]; then
 
         if [ "$rc" -eq 0 ]; then
             log "$name: FAIL the overwrite reported success with a shard node stopped"
-            FAILURES=$(( FAILURES + 1 ))
+            TORN_FAILURES=$(( TORN_FAILURES + 1 ))
         fi
-        CASES_RUN=$(( CASES_RUN + 1 ))
+        TORN_CASES=$(( TORN_CASES + 1 ))
 
         # Long enough for the thawed host to answer again, so the GET below is
         # reading the cluster's settled state rather than racing the thaw.
@@ -619,9 +641,9 @@ if [ "${STRESS_SCENARIO:-freeze}" = torn-overwrite ]; then
             log "$name: pass, the failed overwrite left v1 intact"
         else
             log "$name: FAIL a failed overwrite left the object as $seen"
-            FAILURES=$(( FAILURES + 1 ))
+            TORN_FAILURES=$(( TORN_FAILURES + 1 ))
         fi
-        CASES_RUN=$(( CASES_RUN + 1 ))
+        TORN_CASES=$(( TORN_CASES + 1 ))
         TORN_KEY="$key"
     }
 
@@ -654,7 +676,7 @@ if [ "${STRESS_SCENARIO:-freeze}" = torn-overwrite ]; then
 
     if [ "$RECON_RC" -ne 0 ]; then
         log "reconstruction: GET failed with $RECON_RC, so the object is unreadable one node down"
-        FAILURES=$(( FAILURES + 1 ))
+        TORN_FAILURES=$(( TORN_FAILURES + 1 ))
     else
         cp "$RECON_GOT" "$RUN_DIR/torn-overwrite-reconstructed.json"
         RECON_SEEN="$(generation_of "$RECON_GOT")"
@@ -662,10 +684,10 @@ if [ "${STRESS_SCENARIO:-freeze}" = torn-overwrite ]; then
             log "reconstruction: pass, rebuilt v1 from parity"
         else
             log "reconstruction: FAIL rebuilt $RECON_SEEN from parity"
-            FAILURES=$(( FAILURES + 1 ))
+            TORN_FAILURES=$(( TORN_FAILURES + 1 ))
         fi
     fi
-    CASES_RUN=$(( CASES_RUN + 1 ))
+    TORN_CASES=$(( TORN_CASES + 1 ))
     sleep 10
 
     log "raft state after the scenario"
@@ -673,10 +695,33 @@ if [ "${STRESS_SCENARIO:-freeze}" = torn-overwrite ]; then
 
     aws_s3 "$FIRST_GATE" s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true
 
-    echo "Stress results: $RUN_DIR"
-    [ "$FAILURES" -eq 0 ] || fail "torn-overwrite scenario failed $FAILURES of $CASES_RUN assertions"
-    log "torn-overwrite scenario passed"
-    exit 0
+    if [ "$TORN_FAILURES" -eq 0 ]; then
+        log "torn-overwrite: passed $TORN_CASES assertions"
+    else
+        log "torn-overwrite: FAILED $TORN_FAILURES of $TORN_CASES assertions"
+    fi
+}
+
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = torn-overwrite ]; then
+    run_torn_overwrite
+
+    # Asked for on its own, the scenario is the whole run and its result is the
+    # exit status. Otherwise it is one part of a longer run and the verdict
+    # waits until the end, so a red torn-overwrite does not cost the freeze
+    # coverage.
+    if [ "$SCENARIO" = torn-overwrite ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$TORN_FAILURES" -eq 0 ] \
+            || fail "torn-overwrite failed $TORN_FAILURES of $TORN_CASES assertions"
+        exit 0
+    fi
+
+    # The freeze test needs every shard node, and the scenario above stopped
+    # two hosts and continued them. Proving the cluster is whole again here
+    # keeps a leftover from it out of the freeze test's own assertions.
+    log "round trip after torn-overwrite, before the freeze test"
+    round_trip "https://$(gate_endpoints "$CONFIG_FILE" | head -1)" post-torn \
+        || fail "the cluster did not take writes after the torn-overwrite scenario"
 fi
 
 # --- Topology ---
@@ -898,6 +943,13 @@ log "Warp completed with no errors"
     echo "frozen_replica_caught_up=pass"
     echo "thawed_host_took_writes=pass"
     echo "warp_error_free=pass"
+    if [ "$TORN_CASES" -eq 0 ]; then
+        echo "torn_overwrite=skipped"
+    elif [ "$TORN_FAILURES" -eq 0 ]; then
+        echo "torn_overwrite=pass"
+    else
+        echo "torn_overwrite=fail ($TORN_FAILURES of $TORN_CASES)"
+    fi
     echo
     echo "Timeline"
     echo "--------"
@@ -905,3 +957,10 @@ log "Warp completed with no errors"
 } > "$RUN_DIR/run-info.txt"
 
 echo "Stress results: $RUN_DIR"
+
+# Held to the end so the freeze test ran and reported. The run is red either
+# way: an overwrite that failed and did not leave the object alone is data loss
+# on the ordinary write path, which is not a lesser result than a host that did
+# not rejoin.
+[ "$TORN_FAILURES" -eq 0 ] \
+    || fail "torn-overwrite failed $TORN_FAILURES of $TORN_CASES assertions"

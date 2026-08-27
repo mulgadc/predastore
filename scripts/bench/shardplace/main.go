@@ -26,6 +26,64 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/placement"
 )
 
+// shardPlacement is one shard of one object: which node holds it, which host
+// runs that node, and whether it carries data or parity.
+type shardPlacement struct {
+	Index int
+	Role  string
+	Node  config.NodeID
+	Host  config.HostID
+}
+
+func (s shardPlacement) String() string {
+	return fmt.Sprintf("shard=%d role=%s node=%d host=%d", s.Index, s.Role, s.Node, s.Host)
+}
+
+// blobRing is the placement ring the gate builds, rebuilt here from the same
+// file. Node ids ascending is what makes it the same ring: the gate takes its
+// members from the config in that order, and any other order would name the
+// wrong host for every shard.
+func blobRing(cfg *predastore.Config) ([]config.NodeID, map[config.NodeID]config.HostID) {
+	ids := make([]config.NodeID, 0, len(cfg.Hosts))
+	hostOf := make(map[config.NodeID]config.HostID, len(cfg.Hosts))
+	for _, h := range cfg.Hosts {
+		for _, n := range h.Nodes {
+			if n.Role == config.RoleBlob {
+				ids = append(ids, n.ID)
+				hostOf[n.ID] = h.ID
+			}
+		}
+	}
+	slices.Sort(ids)
+	return ids, hostOf
+}
+
+// resolveShards answers where bucket/key's shards live, in the order the gate
+// writes them: data shards first, then parity.
+func resolveShards(cfg *predastore.Config, bucket, key string) ([]shardPlacement, error) {
+	ids, hostOf := blobRing(cfg)
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("config has no blob node")
+	}
+
+	total := cfg.RS.Data + cfg.RS.Parity
+	nodes, err := placement.NewRing(ids).Nodes(model.ObjectHash(bucket, key), total)
+	if err != nil {
+		return nil, fmt.Errorf("place %s/%s: %w", bucket, key, err)
+	}
+
+	out := make([]shardPlacement, 0, len(nodes))
+	for i, node := range nodes {
+		role := "data"
+		if i >= cfg.RS.Data {
+			role = "parity"
+		}
+		out = append(out, shardPlacement{Index: i, Role: role, Node: node, Host: hostOf[node]})
+	}
+	slices.SortFunc(out, func(a, b shardPlacement) int { return cmp.Compare(a.Index, b.Index) })
+	return out, nil
+}
+
 func main() {
 	configPath := flag.String("config", "", "cluster config file")
 	bucket := flag.String("bucket", "", "bucket holding the object")
@@ -43,46 +101,13 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Sorted by node id to match the ring the gate builds, which takes its
-	// members from the config in that order. A different order here would
-	// name the wrong host for every shard.
-	type blobNode struct {
-		node config.NodeID
-		host config.HostID
-	}
-	var blobs []blobNode
-	for _, h := range cfg.Hosts {
-		for _, n := range h.Nodes {
-			if n.Role == config.RoleBlob {
-				blobs = append(blobs, blobNode{node: n.ID, host: h.ID})
-			}
-		}
-	}
-	slices.SortFunc(blobs, func(a, b blobNode) int { return cmp.Compare(a.node, b.node) })
-	if len(blobs) == 0 {
-		fmt.Fprintln(os.Stderr, "config has no blob node")
-		os.Exit(2)
-	}
-
-	ids := make([]config.NodeID, 0, len(blobs))
-	hostOf := make(map[config.NodeID]config.HostID, len(blobs))
-	for _, b := range blobs {
-		ids = append(ids, b.node)
-		hostOf[b.node] = b.host
-	}
-
-	total := cfg.RS.Data + cfg.RS.Parity
-	nodes, err := placement.NewRing(ids).Nodes(model.ObjectHash(*bucket, *key), total)
+	shards, err := resolveShards(cfg, *bucket, *key)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "place %s/%s: %v\n", *bucket, *key, err)
+		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
 
-	for i, node := range nodes {
-		role := "data"
-		if i >= cfg.RS.Data {
-			role = "parity"
-		}
-		fmt.Printf("shard=%d role=%s node=%d host=%d\n", i, role, node, hostOf[node])
+	for _, s := range shards {
+		fmt.Println(s)
 	}
 }

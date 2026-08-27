@@ -108,30 +108,32 @@ e2e-performance-compare: warp-install
 	@test -n "$(PERF_AFTER)" || { echo "PERF_AFTER is required" >&2; exit 2; }
 	@WARP="$(WARP)" ./scripts/bench/compare-performance.sh "$(PERF_BEFORE)" "$(PERF_AFTER)"
 
-# Fault injection under live load: a four-host cluster has one host frozen
-# with SIGSTOP and is asserted to keep serving and then to rejoin. This is a
-# liveness test, not a benchmark, so it takes roughly four minutes regardless
+# Fault injection on a four-host cluster. Two tests, both run by default, and
+# neither is a benchmark: together they take roughly seven minutes regardless
 # of how fast the machine is.
 #
-# The default freezes a follower. STRESS_HOST=leader freezes whichever host
-# raft elected instead, which currently fails: a gate keeps the frozen node
-# first in its meta read order and pays the full client timeout per key, so
-# listing slows in proportion to the number of objects.
+# torn-overwrite stops the one host holding a named shard and overwrites the
+# object while it is down. The write fails, as it must with a shard node
+# unreachable, and the run then asks what the object is afterwards. **It
+# currently fails**: an overwrite has no commit point across its shards, so a
+# failed one leaves the object part new and part old, served as a 200 with the
+# right length and ETag. That is silent data loss on the ordinary write path,
+# which is why it runs every time rather than on request.
 #
-# STRESS_SCENARIO=partial-put runs a different fault entirely: a client that
-# stops sending mid-body. That one is not about the cluster surviving a host,
-# it is about a stalled upload neither running forever nor damaging the object
-# it is overwriting.
+# The freeze test then puts the cluster under load, freezes a follower with
+# SIGSTOP and asserts it keeps serving and rejoins. STRESS_HOST=leader freezes
+# whichever host raft elected instead, which also fails: a gate keeps the
+# frozen node first in its meta read order and pays the full client timeout per
+# key, so listing slows in proportion to the number of objects.
 #
-# STRESS_SCENARIO=torn-overwrite stops the one host holding a named shard and
-# overwrites the object while it is down. The write fails, as it must with a
-# shard node unreachable, and the run then asks what the object is afterwards.
-# It currently fails: an overwrite has no commit point across its shards, so a
-# failed one leaves the object part new and part old.
+# STRESS_SCENARIO narrows a run to one test. STRESS_SCENARIO=partial-put is a
+# third fault, not in a default run: a client that stops sending mid-body,
+# which is about a stalled upload neither running forever nor damaging the
+# object it is overwriting.
 STRESS_CONFIG   ?= 4host
 STRESS_FREEZE   ?= 90
 STRESS_HOST     ?= follower
-STRESS_SCENARIO ?= freeze
+STRESS_SCENARIO ?=
 e2e-stress: build certs warp-install
 	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
 		STRESS_HOST="$(STRESS_HOST)" STRESS_SCENARIO="$(STRESS_SCENARIO)" \
