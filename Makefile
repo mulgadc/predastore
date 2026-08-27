@@ -1,6 +1,8 @@
 GO_PROJECT_NAME := s3d
 SHELL := /bin/bash
 
+export GOFIPS140 := v1.0.0
+
 # Quiet-mode filters (active when QUIET=1, set by preflight via recursive make)
 # Note: grep pipelines use PIPESTATUS[0] so the exit status of `go test`
 # propagates through the filter — otherwise a test failure is swallowed by
@@ -29,7 +31,7 @@ build:
 # GO commands
 go_build:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
-	GOFIPS140=v1.0.0 go build -ldflags "-s -w" -o ./bin/s3d ./cmd/s3d
+	go build -ldflags "-s -w" -o ./bin/s3d ./cmd/s3d
 
 # Preflight — runs the same checks as GitHub Actions (lint + security + tests).
 # Use this before committing to catch CI failures locally.
