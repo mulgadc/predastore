@@ -15,6 +15,10 @@ const (
 	OpDelete rpc.Opcode = 0x2003
 	OpCommit rpc.Opcode = 0x2004
 	OpAbort  rpc.Opcode = 0x2005
+	// OpStat reports what generation of a shard a node holds, without its body.
+	// Repair asks this of every position it owns, so answering it with a get
+	// would move the whole store across the network to learn one number.
+	OpStat rpc.Opcode = 0x2006
 )
 
 // Response error codes with protocol meaning; anything else in Err is an

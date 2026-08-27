@@ -77,7 +77,7 @@ func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport
 	// surfacing an error to the client.
 	errScanLimit := errors.New("scan limit reached")
 	var items []ScanItem
-	err := s.scan(string(h.Key), func(key string, value []byte) error {
+	err := s.scan(string(h.Key), string(h.After), func(key string, value []byte) error {
 		if h.Limit > 0 && len(items) >= h.Limit {
 			return errScanLimit
 		}

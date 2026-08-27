@@ -34,10 +34,10 @@ const (
 var errPlacementFormat = errors.New(
 	"placement record predates the fixed binary format; this store must be rebuilt")
 
-// encodePlacement renders a placement record. The object hash is not stored:
+// EncodePlacement renders a placement record. The object hash is not stored:
 // the caller knows it — it is the key for whole objects, and derivable from
 // the part name for multipart parts — so keeping a copy is pure duplication.
-func encodePlacement(p ObjectToShardNodes) ([]byte, error) {
+func EncodePlacement(p ObjectToShardNodes) ([]byte, error) {
 	k := len(p.DataShardNodes)
 	if k > maxDataShards {
 		return nil, fmt.Errorf("data shard count %d exceeds %d", k, maxDataShards)
@@ -62,9 +62,9 @@ func encodePlacement(p ObjectToShardNodes) ([]byte, error) {
 	return buf, nil
 }
 
-// decodePlacement parses a placement record, rejecting anything it cannot
+// DecodePlacement parses a placement record, rejecting anything it cannot
 // account for byte by byte rather than returning a partially populated record.
-func decodePlacement(b []byte) (ObjectToShardNodes, error) {
+func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
 	if len(b) < placementFixedSize {
 		return ObjectToShardNodes{}, fmt.Errorf("placement record is %d bytes, want at least %d",
 			len(b), placementFixedSize)

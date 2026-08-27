@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -139,5 +140,35 @@ func TestValidate_NodeBindAddr(t *testing.T) {
 		c.Hosts[0].Nodes[0].BindAddr = "0.0.0.0"
 
 		require.NoError(t, c.Validate())
+	})
+}
+
+// TestLoad_RepairTable proves the sweep's settings survive the file, and that a
+// file saying nothing about repair leaves it off.
+func TestLoad_RepairTable(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "s3d.toml")
+		require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+		return path
+	}
+	const base = "version = 1\nregion = \"ap-southeast-2\"\n\n[rs]\ndata = 2\nparity = 1\n"
+
+	t.Run("set", func(t *testing.T) {
+		cfg, err := Load(write(t, base+`
+[repair]
+enabled = true
+workers = 4
+page_size = 256
+interval_seconds = 120
+`))
+		require.NoError(t, err)
+		assert.Equal(t, Repair{Enabled: true, Workers: 4, PageSize: 256, IntervalSeconds: 120}, cfg.Repair)
+	})
+
+	t.Run("absent", func(t *testing.T) {
+		cfg, err := Load(write(t, base))
+		require.NoError(t, err)
+		assert.Equal(t, Repair{}, cfg.Repair, "repair is opt-in")
 	})
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -113,16 +114,27 @@ func (f *fakeMeta) Delete(_ context.Context, key string) error {
 	return nil
 }
 
-func (f *fakeMeta) Scan(_ context.Context, prefix string, limit int) ([]meta.Item, error) {
+func (f *fakeMeta) Scan(ctx context.Context, prefix string, limit int) ([]meta.Item, error) {
+	return f.ScanFrom(ctx, prefix, "", limit)
+}
+
+// ScanFrom sorts, because a cursor is only meaningful over an ordered
+// enumeration and the real store iterates in key order.
+func (f *fakeMeta) ScanFrom(_ context.Context, prefix, after string, limit int) ([]meta.Item, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
-	items := make([]meta.Item, 0, len(f.rows))
-	for k, v := range f.rows {
-		if !strings.HasPrefix(k, prefix) {
-			continue
+	keys := make([]string, 0, len(f.rows))
+	for k := range f.rows {
+		if strings.HasPrefix(k, prefix) && k > after {
+			keys = append(keys, k)
 		}
-		items = append(items, meta.Item{Key: k, Value: v})
+	}
+	slices.Sort(keys)
+
+	items := make([]meta.Item, 0, len(keys))
+	for _, k := range keys {
+		items = append(items, meta.Item{Key: k, Value: f.rows[k]})
 		if limit > 0 && len(items) == limit {
 			break
 		}

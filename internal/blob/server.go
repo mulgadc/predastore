@@ -105,6 +105,7 @@ func (s *Server) Run(ctx context.Context) error {
 	rpc.RegisterHandler(mux, OpDelete, s.handleDelete)
 	rpc.RegisterHandler(mux, OpCommit, s.handleCommit)
 	rpc.RegisterHandler(mux, OpAbort, s.handleAbort)
+	rpc.RegisterHandler(mux, OpStat, s.handleStat)
 	srv, err := rpc.NewServer(mux, s.cfg.Listeners, nil)
 	if err != nil {
 		return errors.Join(err, s.store.Close())
@@ -201,6 +202,23 @@ func (s *Server) handleAbort(ctx context.Context, h Request, stream transport.St
 		return respond(stream, &Response{Err: fmt.Sprintf("abort: %v", err)})
 	}
 	return respond(stream, &Response{Epoch: h.Epoch})
+}
+
+// handleStat reports the generation and size of the shard a node holds,
+// without its body. It never completes an abandoned commit the way a get does:
+// the caller is asking what is there, and publishing something as a side effect
+// of being asked would make the answer a thing the question caused.
+func (s *Server) handleStat(ctx context.Context, h Request, stream transport.Stream) error {
+	reader, err := s.store.Lookup(h.Key, h.Index)
+	if err != nil {
+		return respond(stream, &Response{Err: ErrCodeNotFound})
+	}
+	resp := Response{Epoch: reader.Epoch(), Size: reader.Size()}
+	if closeErr := reader.Close(); closeErr != nil {
+		return respond(stream, &Response{Err: fmt.Sprintf("stat: %v", closeErr)})
+	}
+
+	return respond(stream, &resp)
 }
 
 func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stream) error {

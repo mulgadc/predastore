@@ -28,7 +28,7 @@ func (f writeFixture) storePart(t *testing.T, bucket, key, uploadID string, part
 	place, _, err := f.write(ctx, objectHash, bytes.NewReader(data), int64(len(data)))
 	require.NoError(t, err)
 
-	record, err := encodePlacement(place)
+	record, err := EncodePlacement(place)
 	require.NoError(t, err)
 	require.NoError(t, metaPut(ctx, f.mc, model.TableObjects, partShardKey(uploadID, partNumber), record))
 }

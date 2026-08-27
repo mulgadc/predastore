@@ -40,13 +40,13 @@ func TestPlacementRecordRoundTrips(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			encoded, err := encodePlacement(tt.rec)
+			encoded, err := EncodePlacement(tt.rec)
 			if err != nil {
-				t.Fatalf("encodePlacement() error = %v", err)
+				t.Fatalf("EncodePlacement() error = %v", err)
 			}
-			got, err := decodePlacement(encoded)
+			got, err := DecodePlacement(encoded)
 			if err != nil {
-				t.Fatalf("decodePlacement() error = %v", err)
+				t.Fatalf("DecodePlacement() error = %v", err)
 			}
 			if got.Size != tt.rec.Size || got.WriteEpoch != tt.rec.WriteEpoch {
 				t.Errorf("size/epoch = %d/%d, want %d/%d",
@@ -95,9 +95,9 @@ func TestPlacementRecordSize(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			encoded, err := encodePlacement(tt.rec)
+			encoded, err := EncodePlacement(tt.rec)
 			if err != nil {
-				t.Fatalf("encodePlacement() error = %v", err)
+				t.Fatalf("EncodePlacement() error = %v", err)
 			}
 			if len(encoded) != tt.want {
 				t.Errorf("record is %d bytes, want %d", len(encoded), tt.want)
@@ -125,17 +125,17 @@ func TestPlacementRecordRejectsAGobRecord(t *testing.T) {
 		t.Fatalf("a gob stream began with the magic byte, so it cannot discriminate")
 	}
 
-	if _, err := decodePlacement(buf.Bytes()); !errors.Is(err, errPlacementFormat) {
-		t.Errorf("decodePlacement(gob) error = %v, want errPlacementFormat", err)
+	if _, err := DecodePlacement(buf.Bytes()); !errors.Is(err, errPlacementFormat) {
+		t.Errorf("DecodePlacement(gob) error = %v, want errPlacementFormat", err)
 	}
 }
 
 func TestPlacementRecordRejectsMalformedInput(t *testing.T) {
-	good, err := encodePlacement(ObjectToShardNodes{
+	good, err := EncodePlacement(ObjectToShardNodes{
 		Size: 1, DataShardNodes: []config.NodeID{3, 6}, ParityShardNodes: []config.NodeID{9},
 	})
 	if err != nil {
-		t.Fatalf("encodePlacement() error = %v", err)
+		t.Fatalf("EncodePlacement() error = %v", err)
 	}
 
 	truncatedIDs := append([]byte(nil), good[:placementFixedSize+1]...)
@@ -158,8 +158,8 @@ func TestPlacementRecordRejectsMalformedInput(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := decodePlacement(tt.input); err == nil {
-				t.Errorf("decodePlacement(%x) succeeded, want an error", tt.input)
+			if _, err := DecodePlacement(tt.input); err == nil {
+				t.Errorf("DecodePlacement(%x) succeeded, want an error", tt.input)
 			}
 		})
 	}
@@ -168,15 +168,15 @@ func TestPlacementRecordRejectsMalformedInput(t *testing.T) {
 // The parity slice shares its backing array with the data slice, so appending
 // to one must not reach into the other.
 func TestPlacementRecordSlicesDoNotAlias(t *testing.T) {
-	encoded, err := encodePlacement(ObjectToShardNodes{
+	encoded, err := EncodePlacement(ObjectToShardNodes{
 		Size: 1, DataShardNodes: []config.NodeID{3, 6}, ParityShardNodes: []config.NodeID{9},
 	})
 	if err != nil {
-		t.Fatalf("encodePlacement() error = %v", err)
+		t.Fatalf("EncodePlacement() error = %v", err)
 	}
-	got, err := decodePlacement(encoded)
+	got, err := DecodePlacement(encoded)
 	if err != nil {
-		t.Fatalf("decodePlacement() error = %v", err)
+		t.Fatalf("DecodePlacement() error = %v", err)
 	}
 
 	got.DataShardNodes = append(got.DataShardNodes, 99)
@@ -186,25 +186,25 @@ func TestPlacementRecordSlicesDoNotAlias(t *testing.T) {
 }
 
 func TestPlacementRecordRejectsUnencodableValues(t *testing.T) {
-	if _, err := encodePlacement(ObjectToShardNodes{Size: -1}); err == nil {
-		t.Error("encodePlacement(negative size) succeeded, want an error")
+	if _, err := EncodePlacement(ObjectToShardNodes{Size: -1}); err == nil {
+		t.Error("EncodePlacement(negative size) succeeded, want an error")
 	}
-	if _, err := encodePlacement(ObjectToShardNodes{
+	if _, err := EncodePlacement(ObjectToShardNodes{
 		DataShardNodes: make([]config.NodeID, maxDataShards+1),
 	}); err == nil {
-		t.Error("encodePlacement(256 data shards) succeeded, want an error")
+		t.Error("EncodePlacement(256 data shards) succeeded, want an error")
 	}
 }
 
 // The header is a wire format: its field offsets are asserted directly so a
 // reordering that still round-trips through this package cannot pass silently.
 func TestPlacementRecordHeaderLayout(t *testing.T) {
-	encoded, err := encodePlacement(ObjectToShardNodes{
+	encoded, err := EncodePlacement(ObjectToShardNodes{
 		Size: 0x0102030405060708, WriteEpoch: 0x1112131415161718,
 		DataShardNodes: []config.NodeID{6, 12}, ParityShardNodes: []config.NodeID{3},
 	})
 	if err != nil {
-		t.Fatalf("encodePlacement() error = %v", err)
+		t.Fatalf("EncodePlacement() error = %v", err)
 	}
 
 	if encoded[0] != placementMagic || encoded[1] != placementVersion {

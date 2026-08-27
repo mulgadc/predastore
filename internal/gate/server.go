@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -17,6 +18,7 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/gate/repair"
 )
 
 const (
@@ -45,6 +47,10 @@ type Server struct {
 	// Handler dependencies, shared by the route table and the auth middleware.
 	handlerCfg handlers.Config
 	buckets    *handlers.BucketCache // config-defined buckets, plus those created since startup
+
+	// repairer is nil unless repair is enabled and this gate has local blob
+	// nodes to repair for.
+	repairer *repair.Service
 }
 
 var _ http.Handler = (*Server)(nil)
@@ -102,9 +108,41 @@ func New(cfg Config) (*Server, error) {
 		s.throttler = ratelimit.New(cfg.RateLimit)
 	}
 
+	ring := placement.NewRing(cfg.BlobNodeIDs)
+	if s.repairer, err = newRepairer(cfg, ring); err != nil {
+		return nil, err
+	}
+
 	s.setupMiddleware()
-	s.setupRoutes(placement.NewRing(cfg.BlobNodeIDs))
+	s.setupRoutes(ring)
 	return s, nil
+}
+
+// newRepairer builds the background sweep, or returns nil when there is nothing
+// for it to do. A gate with no colocated blob nodes is not a failure to
+// configure: it repairs for the nodes sharing its process, and a gate-only host
+// legitimately has none.
+func newRepairer(cfg Config, ring *placement.Ring) (*repair.Service, error) {
+	if !cfg.Repair.Enabled || len(cfg.LocalBlobNodeIDs) == 0 {
+		return nil, nil
+	}
+
+	svc, err := repair.New(repair.Config{
+		Nodes:        cfg.LocalBlobNodeIDs,
+		Ring:         ring,
+		Meta:         cfg.Meta,
+		Blob:         cfg.Blob,
+		DataShards:   cfg.RS.Data,
+		ParityShards: cfg.RS.Parity,
+		Workers:      cfg.Repair.Workers,
+		PageSize:     cfg.Repair.PageSize,
+		Interval:     cfg.Repair.Interval,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to build the repair sweep: %w", err)
+	}
+
+	return svc, nil
 }
 
 // ServeHTTP routes one S3 request through the middleware chain. Run serves
@@ -212,6 +250,23 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		<-serveErr
 	}()
+
+	// The sweep is scoped to Run so no goroutine outlives it, and it is stopped
+	// before the listener drains: a rebuild in flight holds streams to peers
+	// that the drain would otherwise wait behind.
+	if s.repairer != nil {
+		repairCtx, stopRepair := context.WithCancel(ctx)
+		var repairDone sync.WaitGroup
+		repairDone.Go(func() {
+			if err := s.repairer.Run(repairCtx); err != nil {
+				slog.Error("Repair sweep stopped", "error", err)
+			}
+		})
+		defer func() {
+			stopRepair()
+			repairDone.Wait()
+		}()
+	}
 
 	slog.Info("Starting S3 gate", "addr", addr, "http2", s.cfg.EnableHTTP2)
 

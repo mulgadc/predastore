@@ -115,7 +115,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			return
 		}
 
-		shardRecord, err := encodePlacement(place)
+		shardRecord, err := EncodePlacement(place)
 		if err != nil {
 			abortShards(ctx, bc, objectHash, place, written.landed)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
@@ -237,7 +237,7 @@ func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, 
 		return nil, fmt.Errorf("part not found: uploadID=%s part=%d", uploadID, partNumber)
 	}
 
-	place, err := decodePlacement(data)
+	place, err := DecodePlacement(data)
 	if err != nil {
 		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonPlacementDecode)
 		return nil, err

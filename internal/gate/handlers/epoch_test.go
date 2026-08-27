@@ -273,7 +273,7 @@ func objectPut(key string, body []byte) *http.Request {
 // so a read can find the object and the epoch it names.
 func (f writeFixture) publish(t *testing.T, objectHash [32]byte, place ObjectToShardNodes) {
 	t.Helper()
-	record, err := encodePlacement(place)
+	record, err := EncodePlacement(place)
 	require.NoError(t, err)
 	require.NoError(t, metaPut(context.Background(), f.mc, model.TableObjects, string(objectHash[:]), record))
 }

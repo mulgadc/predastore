@@ -45,6 +45,9 @@ type noMeta struct{}
 func (noMeta) Get(context.Context, string) ([]byte, error) { return nil, errNoCluster }
 func (noMeta) Put(context.Context, string, []byte) error   { return errNoCluster }
 func (noMeta) Delete(context.Context, string) error        { return errNoCluster }
+func (noMeta) ScanFrom(context.Context, string, string, int) ([]meta.Item, error) {
+	return nil, errNoCluster
+}
 func (noMeta) Scan(context.Context, string, int) ([]meta.Item, error) {
 	return nil, errNoCluster
 }
@@ -60,6 +63,10 @@ func (noBlob) Get(context.Context, config.NodeID, blob.GetRequest) (io.ReadClose
 }
 
 func (noBlob) Delete(context.Context, config.NodeID, blob.DeleteRequest) (*blob.DeleteResponse, error) {
+	return nil, errNoCluster
+}
+
+func (noBlob) Stat(context.Context, config.NodeID, blob.StatRequest) (*blob.StatResponse, error) {
 	return nil, errNoCluster
 }
 

@@ -79,6 +79,19 @@ type CommitRequest struct {
 	Epoch uint64
 }
 
+// StatRequest asks which generation of a shard a node holds. It names no epoch
+// because the answer is the epoch.
+type StatRequest struct {
+	Key   [32]byte
+	Index uint32
+}
+
+// StatResponse is what the node holds at that position.
+type StatResponse struct {
+	Epoch uint64
+	Size  int64
+}
+
 // DeleteResponse reports whether the node held the value.
 type DeleteResponse struct {
 	Deleted bool
@@ -282,6 +295,43 @@ func (c *Client) Delete(ctx context.Context, nodeID config.NodeID, req DeleteReq
 		return nil, fmt.Errorf("delete on node %d: %s", nodeID, resp.Err)
 	}
 	return &DeleteResponse{Deleted: resp.Deleted}, nil
+}
+
+// Stat reports which generation of a shard the node holds, and how large it
+// is, without moving the body. Repair asks it of every position it owns, so a
+// get would move the whole store across the network to learn one number.
+//
+// ErrNotFound is an answer, not a failure: a node that holds nothing for a
+// position is exactly what repair is looking for.
+func (c *Client) Stat(ctx context.Context, nodeID config.NodeID, req StatRequest) (*StatResponse, error) {
+	stream, err := c.openBounded(ctx, nodeID, OpStat, &Request{
+		Key:        req.Key,
+		Index:      req.Index,
+		RangeStart: -1,
+		RangeEnd:   -1,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := stream.Close(); err != nil {
+		abortStream(stream)
+
+		return nil, fmt.Errorf("half-close stat stream: %w", err)
+	}
+	resp, err := c.awaitEnvelope(ctx, stream, bufio.NewReader(stream))
+	if err != nil {
+		stream.CancelRead(0)
+
+		return nil, fmt.Errorf("stat on node %d: %w", nodeID, err)
+	}
+	switch resp.Err {
+	case "":
+		return &StatResponse{Epoch: resp.Epoch, Size: resp.Size}, nil
+	case ErrCodeNotFound:
+		return nil, fmt.Errorf("stat on node %d: %w", nodeID, ErrNotFound)
+	default:
+		return nil, fmt.Errorf("stat on node %d: %s", nodeID, resp.Err)
+	}
 }
 
 // Commit publishes a shard the node prepared under the same epoch. It is

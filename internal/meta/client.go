@@ -190,9 +190,24 @@ func (c *Client) Exists(ctx context.Context, key string) (bool, error) {
 // leader for freshness but accepting any replica. A limit of zero or less
 // returns every match. Keys come back exactly as stored.
 func (c *Client) Scan(ctx context.Context, prefix string, limit int) ([]Item, error) {
+	return c.ScanFrom(ctx, prefix, "", limit)
+}
+
+// ScanFrom lists up to limit key-value pairs with the prefix that sort strictly
+// after the cursor, which is how a caller pages through a prefix too large to
+// ask for at once. Passing back the last key of a page continues from it; an
+// empty cursor starts at the beginning.
+//
+// Pages are not a consistent snapshot: the table is written while a scan runs,
+// so a key inserted behind the cursor is missed and one deleted ahead of it is
+// never seen. Every caller so far treats a pass as a sweep to be repeated
+// rather than an inventory, which is what makes that acceptable.
+func (c *Client) ScanFrom(ctx context.Context, prefix, after string, limit int) ([]Item, error) {
 	var lastErr error
 	for _, id := range c.readOrder() {
-		resp, err := c.call(ctx, id, OpMetaScan, request(prefix, limit), nil)
+		req := request(prefix, limit)
+		req.After = []byte(after)
+		resp, err := c.call(ctx, id, OpMetaScan, req, nil)
 		if err != nil {
 			lastErr = err
 			continue

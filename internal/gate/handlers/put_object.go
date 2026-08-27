@@ -63,7 +63,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
-		record, err := encodePlacement(place)
+		record, err := EncodePlacement(place)
 		if err != nil {
 			abortShards(ctx, bc, objectHash, place, written.landed)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))

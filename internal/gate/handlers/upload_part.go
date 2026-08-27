@@ -108,7 +108,7 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			return
 		}
 
-		shardRecord, err := encodePlacement(place)
+		shardRecord, err := EncodePlacement(place)
 		if err != nil {
 			abortShards(ctx, bc, objectHash, place, written.landed)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))

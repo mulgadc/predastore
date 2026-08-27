@@ -141,6 +141,21 @@ type RS struct {
 	DegradedWrites bool `toml:"degraded_writes"`
 }
 
+// Repair tunes the background sweep that restores shards a blob node owns but
+// does not hold at the generation its object's record names. It is off by
+// default: it exists to close the redundancy window degraded writes open, and a
+// cluster running neither is in the state it has always been in.
+type Repair struct {
+	Enabled bool `toml:"enabled"`
+
+	// Workers bounds concurrent shard rebuilds, PageSize how many placement
+	// records a scan asks for at a time, and IntervalSeconds the gap between
+	// passes. Zero takes the sweep's own default for each.
+	Workers         int `toml:"workers"`
+	PageSize        int `toml:"page_size"`
+	IntervalSeconds int `toml:"interval_seconds"`
+}
+
 // Compaction tunes the shard store's background compactor. A zero interval
 // falls back to the store's default; compaction itself is never off, because
 // without it overwrite and delete churn never reclaims dead shards.
@@ -214,6 +229,8 @@ type Config struct {
 	// TLS identity and the nodes pinned to it. Everything per-node derives
 	// from the host base and the node id.
 	Hosts []Host `toml:"host"`
+
+	Repair Repair `toml:"repair"`
 
 	Compaction Compaction `toml:"compaction"`
 

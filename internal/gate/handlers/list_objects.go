@@ -89,7 +89,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			var objectSize int64
 			if len(item.Value) == 32 {
 				if meta, err := metaGet(ctx, mc, model.TableObjects, string(item.Value)); err == nil && len(meta) > 0 {
-					if placement, err := decodePlacement(meta); err == nil {
+					if placement, err := DecodePlacement(meta); err == nil {
 						objectSize = placement.Size
 					}
 				}

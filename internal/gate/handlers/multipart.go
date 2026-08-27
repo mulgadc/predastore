@@ -23,10 +23,13 @@ func multipartPartsPrefix(uploadID string) string {
 	return uploadID + ":"
 }
 
+// partKeyPrefix starts the key a part's shard placement is recorded under.
+const partKeyPrefix = "part:"
+
 // partShardKey is where a part's shard placement is recorded, in the object
 // table alongside whole objects.
 func partShardKey(uploadID string, partNumber int) string {
-	return fmt.Sprintf("part:%s:%05d", uploadID, partNumber)
+	return fmt.Sprintf("%s%s:%05d", partKeyPrefix, uploadID, partNumber)
 }
 
 // partObjectKey is the object name a part's shards are hashed under. Parts live
@@ -103,7 +106,7 @@ func cleanupMultipartUpload(ctx context.Context, mc MetaClient, bc BlobClient, b
 		if data, err := metaGet(ctx, mc, model.TableObjects, shardKey); err != nil {
 			slog.WarnContext(ctx, "cleanup: part shard map missing, skipping shard delete", "uploadID", uploadID, "part", part.PartNumber)
 		} else {
-			nodes, err := decodePlacement(data)
+			nodes, err := DecodePlacement(data)
 			if err != nil {
 				slog.WarnContext(ctx, "cleanup: part shard map corrupt, skipping shard delete", "uploadID", uploadID, "part", part.PartNumber, "error", err)
 			} else {

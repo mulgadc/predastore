@@ -414,7 +414,7 @@ func loadPlacement(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg
 		return ObjectToShardNodes{}, 0, err
 	}
 
-	objectToShardNodes, err := decodePlacement(data)
+	objectToShardNodes, err := DecodePlacement(data)
 	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}

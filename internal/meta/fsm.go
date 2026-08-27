@@ -238,6 +238,14 @@ func (f *FSM) Get(key string) ([]byte, error) {
 // Scan iterates over every key with the given prefix, passing each stored key
 // through verbatim. Namespacing keys is the caller's business.
 func (f *FSM) Scan(prefix string, fn func(key string, value []byte) error) error {
+	return f.ScanFrom(prefix, "", fn)
+}
+
+// ScanFrom iterates over keys with the prefix that sort strictly after the
+// cursor. Badger iterates in key order, so seeking past the last key a page
+// returned is the whole of the continuation: an empty cursor starts at the
+// beginning of the prefix.
+func (f *FSM) ScanFrom(prefix, after string, fn func(key string, value []byte) error) error {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
@@ -247,7 +255,19 @@ func (f *FSM) Scan(prefix string, fn func(key string, value []byte) error) error
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
-		for it.Rewind(); it.Valid(); it.Next() {
+		// Seek lands on the cursor itself when it still exists, so the first
+		// key is skipped explicitly rather than by seeking to a successor this
+		// would have to synthesise.
+		if after != "" {
+			it.Seek([]byte(after))
+			if it.Valid() && string(it.Item().Key()) == after {
+				it.Next()
+			}
+		} else {
+			it.Rewind()
+		}
+
+		for ; it.Valid(); it.Next() {
 			item := it.Item()
 			key := string(item.Key())
 

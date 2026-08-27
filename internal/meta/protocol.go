@@ -81,6 +81,10 @@ type MetaRequest struct {
 	// to U+FFFD, so a string key would not survive the wire.
 	Key   []byte `json:"key"`
 	Limit int    `json:"limit,omitempty"`
+	// After resumes a scan past a key already seen, so a caller can page
+	// through a prefix rather than asking for the first N matches forever. It
+	// is exclusive, and empty starts at the beginning of the prefix.
+	After []byte `json:"after,omitempty"`
 }
 
 func (h *MetaRequest) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
