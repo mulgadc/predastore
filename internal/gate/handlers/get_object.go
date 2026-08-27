@@ -15,6 +15,7 @@ import (
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 // GetObject serves GET /{bucket}/{key}, reconstructing the object from its
@@ -100,8 +101,13 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	// An empty object has no shards to read: the write path stores none, since
 	// the blob protocol has no zero-length value to store.
 	if size == 0 {
+		telemetry.RecordObjectRead(ctx, telemetry.ReadPathDirect)
 		return nil, nil
 	}
+
+	// The shards and the joined object are both held whole, so the payload is
+	// resident for the length of the read and concurrency multiplies it.
+	defer telemetry.EnterGateInflight(ctx, telemetry.GateOpGet, size)()
 
 	// The stream encoder is constructed per request; hoisting it into the
 	// gate belongs with the streaming refactor, not here.
@@ -126,6 +132,7 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	if missing == 0 {
 		err := enc.Join(&out, shardReadersOf(shards), size)
 		if err == nil {
+			telemetry.RecordObjectRead(ctx, telemetry.ReadPathDirect)
 			return out.Bytes(), nil
 		}
 		slog.WarnContext(ctx, "Initial join failed, attempting reconstruction", "err", err)
@@ -144,6 +151,7 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 		return nil, model.NewS3Error(model.ErrInternalError,
 			fmt.Sprintf("reconstruction failed: %v", err), 500)
 	}
+	telemetry.RecordObjectRead(ctx, telemetry.ReadPathReconstructed)
 	return reconstructed.Bytes(), nil
 }
 
@@ -170,6 +178,7 @@ func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key strin
 		objectHash := model.ObjectHash(bucket, key)
 		data, err := readRangeFromSingleShard(ctx, bc, cfg, objectHash, place, startShardIdx, start, end, shardSize, totalSize)
 		if err == nil {
+			telemetry.RecordObjectRead(ctx, telemetry.ReadPathDirect)
 			return data, fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize), nil
 		}
 		slog.WarnContext(ctx, "Single shard range read failed, falling back to full reconstruction", "err", err)
@@ -194,7 +203,7 @@ func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key strin
 
 // readRangeFromSingleShard reads a byte range from one data shard: the fast
 // path when the whole range lands inside it.
-func readRangeFromSingleShard(ctx context.Context, bc BlobClient, cfg Config, objectHash [32]byte, place ObjectToShardNodes, shardIdx int, globalStart, globalEnd, shardSize, totalSize int64) ([]byte, error) {
+func readRangeFromSingleShard(ctx context.Context, bc BlobClient, cfg Config, objectHash [32]byte, place ObjectToShardNodes, shardIdx int, globalStart, globalEnd, shardSize, totalSize int64) (data []byte, err error) {
 	if shardIdx >= len(place.DataShardNodes) {
 		return nil, fmt.Errorf("shard index %d out of range", shardIdx)
 	}
@@ -223,13 +232,16 @@ func readRangeFromSingleShard(ctx context.Context, bc BlobClient, cfg Config, ob
 		RangeEnd:   endInShard,
 	}
 
+	start := time.Now()
+	defer func() { recordShardOutcome(ctx, telemetry.ShardOpRead, nodeNum, start, err) }()
+
 	reader, err := bc.Get(ctx, nodeNum, objectRequest)
 	if err != nil {
 		return nil, fmt.Errorf("get range from node %d: %w", nodeNum, err)
 	}
 	defer reader.Close() // CRITICAL: Close to release the stream back to the pool
 
-	data, err := io.ReadAll(reader)
+	data, err = io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("read range data: %w", err)
 	}

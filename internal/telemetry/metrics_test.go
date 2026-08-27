@@ -181,17 +181,209 @@ func TestRecordShardErrorSeparatesReasons(t *testing.T) {
 	reader := withManualReader(t)
 	ctx := context.Background()
 
-	RecordShardError(ctx, "read", ShardReasonNotFound)
-	RecordShardError(ctx, "read", ShardReasonNotFound)
-	RecordShardError(ctx, "read", ShardReasonTransport)
+	RecordShardError(ctx, ShardOpRead, ShardReasonNotFound, 5)
+	RecordShardError(ctx, ShardOpRead, ShardReasonNotFound, 5)
+	RecordShardError(ctx, ShardOpRead, ShardReasonTransport, 5)
 
 	m := collect(t, reader)
 	data := m["predastore.shard.errors"]
-	if got := sumFor(t, data, map[string]string{"op": "read", "reason": ShardReasonNotFound}); got != 2 {
+	if got := sumFor(t, data, map[string]string{"op": ShardOpRead, "reason": ShardReasonNotFound}); got != 2 {
 		t.Errorf("not-found shard errors = %d, want 2", got)
 	}
-	if got := sumFor(t, data, map[string]string{"op": "read", "reason": ShardReasonTransport}); got != 1 {
+	if got := sumFor(t, data, map[string]string{"op": ShardOpRead, "reason": ShardReasonTransport}); got != 1 {
 		t.Errorf("transport shard errors = %d, want 1", got)
+	}
+}
+
+// A failing node is only actionable if the counter names it. mulga-fnsp1 was
+// one blob node stalling writes for two days while the cluster read fine, and
+// an unattributed error rate would not have separated it from the others.
+func TestRecordShardErrorSeparatesNodes(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordShardError(ctx, ShardOpWrite, ShardReasonTransport, 5)
+	RecordShardError(ctx, ShardOpWrite, ShardReasonTransport, 5)
+	RecordShardError(ctx, ShardOpWrite, ShardReasonTransport, 6)
+
+	data := collect(t, reader)["predastore.shard.errors"]
+	if got := sumFor(t, data, map[string]string{"node": "5"}); got != 2 {
+		t.Errorf("node 5 write errors = %d, want 2", got)
+	}
+	if got := sumFor(t, data, map[string]string{"node": "6"}); got != 1 {
+		t.Errorf("node 6 write errors = %d, want 1", got)
+	}
+}
+
+// The error counter needs a denominator: a rising error count on a busier node
+// is not the same as a rising error rate.
+func TestRecordShardOpCountsAttemptsAndDuration(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordShardOp(ctx, ShardOpRead, OutcomeSuccess, 5, 0.01)
+	RecordShardOp(ctx, ShardOpRead, OutcomeSuccess, 5, 0.02)
+	RecordShardOp(ctx, ShardOpRead, OutcomeError, 5, 5.0)
+
+	m := collect(t, reader)
+	ops := m["predastore.shard.ops"]
+	if got := sumFor(t, ops, map[string]string{"op": ShardOpRead, "outcome": OutcomeSuccess, "node": "5"}); got != 2 {
+		t.Errorf("successful reads = %d, want 2", got)
+	}
+	if got := sumFor(t, ops, map[string]string{"op": ShardOpRead, "outcome": OutcomeError, "node": "5"}); got != 1 {
+		t.Errorf("failed reads = %d, want 1", got)
+	}
+
+	hist, ok := m["predastore.shard.duration"].(metricdata.Histogram[float64])
+	if !ok {
+		t.Fatalf("duration aggregation is %T, want Histogram[float64]", m["predastore.shard.duration"])
+	}
+	// Every attempt is timed, and the histogram carries op and node but not
+	// outcome: a slow failure is part of the node's latency, not a separate
+	// series to go looking for.
+	var count uint64
+	for _, dp := range hist.DataPoints {
+		if attrsMatch(dp.Attributes, map[string]string{"op": ShardOpRead, "node": "5"}) {
+			count += dp.Count
+			if _, hasOutcome := dp.Attributes.Value(attribute.Key("outcome")); hasOutcome {
+				t.Error("duration histogram carries an outcome attribute")
+			}
+		}
+	}
+	if count != 3 {
+		t.Errorf("timed shard reads = %d, want 3", count)
+	}
+}
+
+// The degraded-read rate is the whole point: a reconstructed read means parity
+// was consumed to answer it, which is the only in-band evidence that a blob
+// node is losing data.
+func TestRecordObjectReadSeparatesDegradedReads(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordObjectRead(ctx, ReadPathDirect)
+	RecordObjectRead(ctx, ReadPathDirect)
+	RecordObjectRead(ctx, ReadPathDirect)
+	RecordObjectRead(ctx, ReadPathReconstructed)
+
+	data := collect(t, reader)["predastore.object.reads"]
+	if got := sumFor(t, data, map[string]string{"path": ReadPathDirect}); got != 3 {
+		t.Errorf("direct reads = %d, want 3", got)
+	}
+	if got := sumFor(t, data, map[string]string{"path": ReadPathReconstructed}); got != 1 {
+		t.Errorf("reconstructed reads = %d, want 1", got)
+	}
+}
+
+func TestRecordObjectWriteSeparatesOutcomes(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordObjectWrite(ctx, WriteOutcomeSuccess, "")
+	RecordObjectWrite(ctx, WriteOutcomeFailed, WriteReasonStoreFull)
+	RecordObjectWrite(ctx, WriteOutcomeFailed, WriteReasonShardWrite)
+	RecordObjectWrite(ctx, WriteOutcomeFailed, WriteReasonShardWrite)
+
+	data := collect(t, reader)["predastore.object.writes"]
+	if got := sumFor(t, data, map[string]string{"outcome": WriteOutcomeSuccess}); got != 1 {
+		t.Errorf("successful writes = %d, want 1", got)
+	}
+	if got := sumFor(t, data, map[string]string{"outcome": WriteOutcomeFailed, "reason": WriteReasonShardWrite}); got != 2 {
+		t.Errorf("shard-write failures = %d, want 2", got)
+	}
+	if got := sumFor(t, data, map[string]string{"outcome": WriteOutcomeFailed, "reason": WriteReasonStoreFull}); got != 1 {
+		t.Errorf("store-full failures = %d, want 1", got)
+	}
+}
+
+// A success carries no reason, so the successful series must not be split by
+// an empty-string reason attribute nobody would think to filter on.
+func TestRecordObjectWriteOmitsReasonOnSuccess(t *testing.T) {
+	reader := withManualReader(t)
+	RecordObjectWrite(context.Background(), WriteOutcomeSuccess, "")
+
+	sum, ok := collect(t, reader)["predastore.object.writes"].(metricdata.Sum[int64])
+	if !ok {
+		t.Fatal("object writes is not a Sum[int64]")
+	}
+	for _, dp := range sum.DataPoints {
+		if _, has := dp.Attributes.Value(attribute.Key("reason")); has {
+			t.Error("a successful write carries a reason attribute")
+		}
+	}
+}
+
+// The release must take back exactly what was added, or the gauge floor climbs
+// and the in-flight reading stops meaning anything across a long run.
+func TestEnterGateInflightReleasesWhatItTook(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	releaseA := EnterGateInflight(ctx, GateOpPut, 4<<20)
+	releaseB := EnterGateInflight(ctx, GateOpPut, 1<<20)
+
+	m := collect(t, reader)
+	put := map[string]string{"op": GateOpPut}
+	if got := sumFor(t, m["predastore.gate.inflight.bytes"], put); got != 5<<20 {
+		t.Errorf("in-flight bytes = %d, want %d", got, 5<<20)
+	}
+	if got := sumFor(t, m["predastore.gate.inflight.requests"], put); got != 2 {
+		t.Errorf("in-flight requests = %d, want 2", got)
+	}
+
+	releaseA()
+	releaseB()
+
+	m = collect(t, reader)
+	if got := sumFor(t, m["predastore.gate.inflight.bytes"], put); got != 0 {
+		t.Errorf("in-flight bytes after release = %d, want 0", got)
+	}
+	if got := sumFor(t, m["predastore.gate.inflight.requests"], put); got != 0 {
+		t.Errorf("in-flight requests after release = %d, want 0", got)
+	}
+}
+
+// Per-shard recorders run K+M times per object, so an attribute set built per
+// call would allocate on every shard of every request. The cache is what makes
+// them free; this is the test that keeps it that way.
+//
+// It measures the recorder itself with the global meter left at its no-op
+// default, which is the caller-side cost the hot path pays. What the SDK does
+// with a live provider is the SDK's own budget.
+func TestPerShardRecordersDoNotAllocate(t *testing.T) {
+	ctx := context.Background()
+
+	// Prime the caches: the first call for a given key builds its set, and it
+	// is every call after it that must be free.
+	RecordShardOp(ctx, ShardOpRead, OutcomeSuccess, 7, 0.01)
+	RecordShardError(ctx, ShardOpRead, ShardReasonNotFound, 7)
+
+	if got := testing.AllocsPerRun(100, func() {
+		RecordShardOp(ctx, ShardOpRead, OutcomeSuccess, 7, 0.01)
+	}); got != 0 {
+		t.Errorf("RecordShardOp allocations = %v, want 0", got)
+	}
+	if got := testing.AllocsPerRun(100, func() {
+		RecordShardError(ctx, ShardOpRead, ShardReasonNotFound, 7)
+	}); got != 0 {
+		t.Errorf("RecordShardError allocations = %v, want 0", got)
+	}
+}
+
+// The attribute cache is keyed by bounded fields only, so it must hand back the
+// identical option rather than an equal one: a cache that rebuilt on every call
+// would still pass a behavioural test while allocating on every shard.
+func TestShardAttrsAreCached(t *testing.T) {
+	first := cachedShardAttrs(shardOpAttrs, "outcome", ShardOpRead, OutcomeSuccess, 11)
+	second := cachedShardAttrs(shardOpAttrs, "outcome", ShardOpRead, OutcomeSuccess, 11)
+	if &first.add[0] != &second.add[0] {
+		t.Error("shard attribute option was rebuilt rather than cached")
+	}
+
+	other := cachedShardAttrs(shardOpAttrs, "outcome", ShardOpRead, OutcomeSuccess, 12)
+	if &first.add[0] == &other.add[0] {
+		t.Error("two nodes share one attribute option")
 	}
 }
 
@@ -356,22 +548,7 @@ func TestRegisterRaftGaugesUnregisterStopsObservation(t *testing.T) {
 // and then comparing the names that actually reached the reader keeps this
 // honest as instruments are added.
 func TestNoMetricNameIsAnotherPrefix(t *testing.T) {
-	reader := withManualReader(t)
-	ctx := context.Background()
-
-	RecordMultipartUpload(ctx, UploadCreated)
-	RecordMultipartPart(ctx, 1)
-	RecordMultipartPartFetch(ctx, "")
-	RecordShardError(ctx, "read", ShardReasonNotFound)
-	unregister, err := RegisterRaftGauges(func() RaftSnapshot {
-		return RaftSnapshot{NodeID: "1", State: "Leader", LeaderKnown: true, Term: "1", CommitIndex: "2", AppliedIndex: "1"}
-	})
-	if err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	defer func() { _ = unregister() }()
-
-	names := slices.Collect(maps.Keys(collect(t, reader)))
+	names := slices.Collect(maps.Keys(recordEveryInstrument(t)))
 	if len(names) == 0 {
 		t.Fatal("no metrics collected")
 	}
@@ -382,4 +559,48 @@ func TestNoMetricNameIsAnotherPrefix(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The prefix invariant is only as good as its coverage: an instrument nothing
+// exercises escapes it and fails in the sink instead. metricNames is the
+// declared set, so anything added there without a recorder here fails now.
+func TestEveryDeclaredMetricIsExercised(t *testing.T) {
+	collected := recordEveryInstrument(t)
+	for _, name := range metricNames {
+		if _, ok := collected[name]; !ok {
+			t.Errorf("%q is declared but no recorder in recordEveryInstrument emits it", name)
+		}
+	}
+	for name := range collected {
+		if !slices.Contains(metricNames, name) {
+			t.Errorf("%q was emitted but is not declared in metricNames", name)
+		}
+	}
+}
+
+// recordEveryInstrument drives one observation through every instrument the
+// package registers and returns what reached the reader.
+func recordEveryInstrument(t *testing.T) map[string]metricdata.Aggregation {
+	t.Helper()
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordMultipartUpload(ctx, UploadCreated)
+	RecordMultipartPart(ctx, 1)
+	RecordMultipartPartFetch(ctx, "")
+	RecordShardError(ctx, ShardOpRead, ShardReasonNotFound, 1)
+	RecordShardOp(ctx, ShardOpRead, OutcomeSuccess, 1, 0.01)
+	RecordObjectRead(ctx, ReadPathDirect)
+	RecordObjectWrite(ctx, WriteOutcomeSuccess, "")
+	EnterGateInflight(ctx, GateOpPut, 1)()
+
+	unregister, err := RegisterRaftGauges(func() RaftSnapshot {
+		return RaftSnapshot{NodeID: "1", State: "Leader", LeaderKnown: true, Term: "1", CommitIndex: "2", AppliedIndex: "1"}
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { _ = unregister() })
+
+	return collect(t, reader)
 }

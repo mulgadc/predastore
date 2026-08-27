@@ -104,6 +104,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		objectHash := model.ObjectHash(bucket, key)
 		if _, err := writeObject(ctx, bc, ring, cfg, assembled, finalSize, objectHash); err != nil {
 			slog.ErrorContext(ctx, "Failed to store final object", "uploadID", uploadID, "error", err)
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, writeFailureReason(err))
 			HandleError(w, r, mapPutErr(err))
 			return
 		}
@@ -119,13 +120,19 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			return
 		}
 		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), shardBuf.Bytes()); err != nil {
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store object metadata", 500))
 			return
 		}
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store ARN mapping", 500))
 			return
 		}
+
+		// An object assembled from parts is an object write like any other, so
+		// the counter means objects created rather than single-shot PUTs only.
+		telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeSuccess, "")
 
 		// Cleanup is best-effort: the object is already durable, so a failed part
 		// delete must not fail the request.

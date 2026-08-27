@@ -13,6 +13,7 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/chunked"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 // PutObject serves PUT /{bucket}/{key}: the body is erasure coded across the
@@ -43,6 +44,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		poolNearFull, err := writeObject(ctx, bc, ring, cfg, body, size, objectHash)
 		if err != nil {
 			slog.ErrorContext(ctx, "putObject: shard distribution failed", "error", err)
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, writeFailureReason(err))
 			HandleError(w, r, mapPutErr(err))
 			return
 		}
@@ -68,15 +70,21 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		// Object hash -> shard placement, for retrieval.
 		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 
 		// Listing key -> object hash, for ListObjects.
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
+
+		// Counted only once both keys have landed: until then the shards exist
+		// but nothing references them, which is not an object.
+		telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeSuccess, "")
 
 		// Nearfull writes still succeed; the header lets clients back off before
 		// hitting the hard 507 rejection.
