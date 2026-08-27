@@ -19,7 +19,7 @@ import (
 	"github.com/mulgadc/bluebottle/pkg/otelsetup"
 	"github.com/mulgadc/predastore"
 
-	_ "github.com/mulgadc/predastore/internal/fipsboot"
+	_ "github.com/mulgadc/bluebottle/pkg/fipsboot"
 )
 
 func main() {
