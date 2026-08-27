@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mulgadc/predastore/internal/tlsconfig"
+	"github.com/mulgadc/bluebottle/pkg/tlsconfig"
 	"github.com/quic-go/quic-go"
 )
 
