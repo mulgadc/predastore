@@ -186,125 +186,48 @@ var (
 func instruments() {
 	instrumentsOnce.Do(func() {
 		meter = otel.Meter(meterName)
-		var err error
 
-		raftState, err = meter.Int64ObservableGauge(metricRaftState,
-			metric.WithDescription("Constant 1 carrying the replica's own raft.State() as an attribute."),
-			metric.WithUnit("{replica}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		raftTerm, err = meter.Int64ObservableGauge(metricRaftTerm,
-			metric.WithDescription("Current raft term. A term climbing while no leader is observed is an election storm."),
-			metric.WithUnit("{term}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		raftCommitIndex, err = meter.Int64ObservableGauge(metricRaftCommitIndex,
-			metric.WithDescription("Last raft log index committed by this replica."),
-			metric.WithUnit("{index}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		raftAppliedIndex, err = meter.Int64ObservableGauge(metricRaftAppliedIndex,
-			metric.WithDescription("Last raft log index applied to this replica's FSM."),
-			metric.WithUnit("{index}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		raftAppliedLag, err = meter.Int64ObservableGauge(metricRaftAppliedLag,
-			metric.WithDescription("Committed minus applied index. A lag that does not drain is a stalled FSM."),
-			metric.WithUnit("{index}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		raftLeaderKnown, err = meter.Int64ObservableGauge(metricRaftLeaderKnown,
-			metric.WithDescription("1 when this replica observes a leader, 0 when it does not. Zero on every replica beyond an election timeout is a livelock."),
-			metric.WithUnit("{replica}"))
-		if err != nil {
-			otel.Handle(err)
-		}
+		raftState = int64Gauge(metricRaftState,
+			"Constant 1 carrying the replica's own raft.State() as an attribute.", "{replica}")
+		raftTerm = int64Gauge(metricRaftTerm,
+			"Current raft term. A term climbing while no leader is observed is an election storm.", "{term}")
+		raftCommitIndex = int64Gauge(metricRaftCommitIndex,
+			"Last raft log index committed by this replica.", "{index}")
+		raftAppliedIndex = int64Gauge(metricRaftAppliedIndex,
+			"Last raft log index applied to this replica's FSM.", "{index}")
+		raftAppliedLag = int64Gauge(metricRaftAppliedLag,
+			"Committed minus applied index. A lag that does not drain is a stalled FSM.", "{index}")
+		raftLeaderKnown = int64Gauge(metricRaftLeaderKnown,
+			"1 when this replica observes a leader, 0 when it does not. Zero on every replica beyond an election timeout is a livelock.", "{replica}")
 
-		multipartUploads, err = meter.Int64Counter(metricMultipartUploads,
-			metric.WithDescription("Multipart uploads by outcome: created, completed, aborted or rejected."),
-			metric.WithUnit("{upload}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		multipartSessions, err = meter.Int64UpDownCounter(metricMultipartSessions,
-			metric.WithDescription("Multipart uploads created but not yet completed or aborted. A floor that rises across runs is leaked upload state."),
-			metric.WithUnit("{upload}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		multipartPartCount, err = meter.Int64Counter(metricMultipartPartCount,
-			metric.WithDescription("Parts stored for multipart uploads."),
-			metric.WithUnit("{part}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		multipartPartBytes, err = meter.Int64Counter(metricMultipartPartBytes,
-			metric.WithDescription("Bytes stored as multipart upload parts."),
-			metric.WithUnit("By"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		multipartPartFetches, err = meter.Int64Counter(metricMultipartPartFetches,
-			metric.WithDescription("Part read-backs during completion, by outcome and failure reason."),
-			metric.WithUnit("{fetch}"))
-		if err != nil {
-			otel.Handle(err)
-		}
+		multipartUploads = int64Counter(metricMultipartUploads,
+			"Multipart uploads by outcome: created, completed, aborted or rejected.", "{upload}")
+		multipartSessions = int64UpDownCounter(metricMultipartSessions,
+			"Multipart uploads created but not yet completed or aborted. A floor that rises across runs is leaked upload state.", "{upload}")
+		multipartPartCount = int64Counter(metricMultipartPartCount,
+			"Parts stored for multipart uploads.", "{part}")
+		multipartPartBytes = int64Counter(metricMultipartPartBytes,
+			"Bytes stored as multipart upload parts.", "By")
+		multipartPartFetches = int64Counter(metricMultipartPartFetches,
+			"Part read-backs during completion, by outcome and failure reason.", "{fetch}")
 
-		shardErrors, err = meter.Int64Counter(metricShardErrors,
-			metric.WithDescription("Shard operations that failed, by op, node and reason. Reads are tolerated by parity, so a rate here separates routine reconstruction from a node losing data."),
-			metric.WithUnit("{error}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		shardOps, err = meter.Int64Counter(metricShardOps,
-			metric.WithDescription("Shard operations attempted, by op, node and outcome. The denominator the error counter is read against."),
-			metric.WithUnit("{operation}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		shardDuration, err = meter.Float64Histogram(metricShardDuration,
-			metric.WithDescription("Duration of one shard operation against one node. A per-node tail is what separates a single sick node from a slow cluster."),
-			metric.WithUnit("s"),
-			metric.WithExplicitBucketBoundaries(secondsBuckets...))
-		if err != nil {
-			otel.Handle(err)
-		}
+		shardErrors = int64Counter(metricShardErrors,
+			"Shard operations that failed, by op, node and reason. Reads are tolerated by parity, so a rate here separates routine reconstruction from a node losing data.", "{error}")
+		shardOps = int64Counter(metricShardOps,
+			"Shard operations attempted, by op, node and outcome. The denominator the error counter is read against.", "{operation}")
+		shardDuration = secondsHistogram(metricShardDuration,
+			"Duration of one shard operation against one node. A per-node tail is what separates a single sick node from a slow cluster.")
 
-		objectReads, err = meter.Int64Counter(metricObjectReads,
-			metric.WithDescription("Object reads served, by path. A reconstructed read consumed parity to answer, and is the only in-band evidence that a blob node is losing data."),
-			metric.WithUnit("{read}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		objectWrites, err = meter.Int64Counter(metricObjectWrites,
-			metric.WithDescription("Object writes by outcome and failure reason."),
-			metric.WithUnit("{write}"))
-		if err != nil {
-			otel.Handle(err)
-		}
+		objectReads = int64Counter(metricObjectReads,
+			"Object reads served, by path. A reconstructed read consumed parity to answer, and is the only in-band evidence that a blob node is losing data.", "{read}")
+		objectWrites = int64Counter(metricObjectWrites,
+			"Object writes by outcome and failure reason.", "{write}")
 
-		gateInflightBytes, err = meter.Int64UpDownCounter(metricGateInflightBytes,
-			metric.WithDescription("Object payload bytes currently resident in gate memory. Declared object size rather than a heap measurement: concurrency multiplying object size is what exhausts a gate."),
-			metric.WithUnit("By"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		gateInflightRequests, err = meter.Int64UpDownCounter(metricGateInflightRequests,
-			metric.WithDescription("Object requests currently holding a payload buffer in gate memory."),
-			metric.WithUnit("{request}"))
-		if err != nil {
-			otel.Handle(err)
-		}
+		gateInflightBytes = int64UpDownCounter(metricGateInflightBytes,
+			"Object payload bytes currently resident in gate memory. Declared object size rather than a heap measurement: concurrency multiplying object size is what exhausts a gate.", "By")
+		gateInflightRequests = int64UpDownCounter(metricGateInflightRequests,
+			"Object requests currently holding a payload buffer in gate memory.", "{request}")
 
-		// The blob store's instruments are all observed from one snapshot, so
-		// they are built through helpers rather than repeating the error check
-		// sixteen times.
 		blobFreeFrac = float64Gauge(metricBlobFreeFrac,
 			"Free fraction of the filesystem backing this node's store, as of the last measurement the write path took.", "1")
 		blobFreeBytes = int64Gauge(metricBlobFreeBytes,
@@ -328,45 +251,27 @@ func instruments() {
 		blobLiveFrac = float64Gauge(metricBlobLiveFrac,
 			"Live share of on-disk bytes. A falling value with a flat reclaim rate is space compaction is not getting back.", "1")
 
-		blobCompactionCycles = int64Counter(metricBlobCompactionCycles,
+		blobCompactionCycles = int64ObservableCounter(metricBlobCompactionCycles,
 			"Compaction cycles run, by outcome. No cycles at all on a busy node is a compactor that is not running.", "{cycle}")
-		blobCompactionSegments = int64Counter(metricBlobCompactionSegments,
+		blobCompactionSegments = int64ObservableCounter(metricBlobCompactionSegments,
 			"Segments compaction has scanned and dropped.", "{segment}")
-		blobCompactionBytes = int64Counter(metricBlobCompactionBytes,
+		blobCompactionBytes = int64ObservableCounter(metricBlobCompactionBytes,
 			"Bytes compaction has relocated and reclaimed. Reclaimed is the only measure of space actually returned.", "By")
 		blobCompactionLastDuration = float64Gauge(metricBlobCompactionLastDuration,
 			"Duration of the last completed compaction cycle. Approaching the cycle interval means compaction never rests.", "s")
 
-		blobIntegrityFailures = int64Counter(metricBlobIntegrityFailures,
+		blobIntegrityFailures = int64ObservableCounter(metricBlobIntegrityFailures,
 			"Fragments that failed their GCM tag. Any non-zero value is corruption: bytes on disk no longer authenticate.", "{fragment}")
 
-		objectPhaseDuration, err = meter.Float64Histogram(metricObjectPhaseDuration,
-			metric.WithDescription("Time one phase of an object request took, by phase and op. Where a slow PUT or GET actually goes."),
-			metric.WithUnit("s"),
-			metric.WithExplicitBucketBoundaries(secondsBuckets...))
-		if err != nil {
-			otel.Handle(err)
-		}
+		objectPhaseDuration = secondsHistogram(metricObjectPhaseDuration,
+			"Time one phase of an object request took, by phase and op. Where a slow PUT or GET actually goes.")
 
-		metaClientOps, err = meter.Int64Counter(metricMetaClientOps,
-			metric.WithDescription("Meta store operations attempted by this gate, by op and outcome."),
-			metric.WithUnit("{operation}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		metaClientDuration, err = meter.Float64Histogram(metricMetaClientDuration,
-			metric.WithDescription("Time one meta operation took, including every replica it had to try. Two of these sit on every PUT."),
-			metric.WithUnit("s"),
-			metric.WithExplicitBucketBoundaries(secondsBuckets...))
-		if err != nil {
-			otel.Handle(err)
-		}
-		metaClientRedirects, err = meter.Int64Counter(metricMetaClientRedirects,
-			metric.WithDescription("Write attempts that did not land on a leader, by reason. A sustained rate is an election that is not settling."),
-			metric.WithUnit("{redirect}"))
-		if err != nil {
-			otel.Handle(err)
-		}
+		metaClientOps = int64Counter(metricMetaClientOps,
+			"Meta store operations attempted by this gate, by op and outcome.", "{operation}")
+		metaClientDuration = secondsHistogram(metricMetaClientDuration,
+			"Time one meta operation took, including every replica it had to try. Two of these sit on every PUT.")
+		metaClientRedirects = int64Counter(metricMetaClientRedirects,
+			"Write attempts that did not land on a leader, by reason. A sustained rate is an election that is not settling.", "{redirect}")
 
 		metaFSMLSMBytes = int64Gauge(metricMetaFSMLSMBytes,
 			"On-disk size of this replica's LSM tree, where badger keeps metadata values under its default threshold. The single raft group's ceiling, visible before it is reached.", "By")
@@ -379,23 +284,16 @@ func instruments() {
 
 		rpcConnections = int64Gauge(metricRPCConnections,
 			"Connections this node's pool currently holds, one per peer it is in contact with.", "{connection}")
-		rpcEvictions, err = meter.Int64Counter(metricRPCEvictions,
-			metric.WithDescription("Connections dropped from the pool, by peer and reason. A peer evicted repeatedly is the one at fault."),
-			metric.WithUnit("{eviction}"))
-		if err != nil {
-			otel.Handle(err)
-		}
-		rpcStreamsOpen, err = meter.Int64UpDownCounter(metricRPCStreamsOpen,
-			metric.WithDescription("Streams this node has open to a peer. Bounded by the transport's per-connection cap, which is otherwise invisible."),
-			metric.WithUnit("{stream}"))
-		if err != nil {
-			otel.Handle(err)
-		}
+		rpcEvictions = int64Counter(metricRPCEvictions,
+			"Connections dropped from the pool, by peer and reason. A peer evicted repeatedly is the one at fault.", "{eviction}")
+		rpcStreamsOpen = int64UpDownCounter(metricRPCStreamsOpen,
+			"Streams this node has open to a peer. Bounded by the transport's per-connection cap, which is otherwise invisible.", "{stream}")
 	})
 }
 
-// int64Gauge, float64Gauge and int64Counter build one observable instrument,
-// reporting a construction failure the same way the instruments above do.
+// Every instrument is built through one of the helpers below, so a construction
+// failure is reported the same way wherever it happens. The meter is set by
+// instruments() before any of them is called.
 func int64Gauge(name, description, unit string) metric.Int64ObservableGauge {
 	g, err := meter.Int64ObservableGauge(name,
 		metric.WithDescription(description), metric.WithUnit(unit))
@@ -414,13 +312,44 @@ func float64Gauge(name, description, unit string) metric.Float64ObservableGauge 
 	return g
 }
 
-func int64Counter(name, description, unit string) metric.Int64ObservableCounter {
+func int64ObservableCounter(name, description, unit string) metric.Int64ObservableCounter {
 	c, err := meter.Int64ObservableCounter(name,
 		metric.WithDescription(description), metric.WithUnit(unit))
 	if err != nil {
 		otel.Handle(err)
 	}
 	return c
+}
+
+func int64Counter(name, description, unit string) metric.Int64Counter {
+	c, err := meter.Int64Counter(name,
+		metric.WithDescription(description), metric.WithUnit(unit))
+	if err != nil {
+		otel.Handle(err)
+	}
+	return c
+}
+
+func int64UpDownCounter(name, description, unit string) metric.Int64UpDownCounter {
+	c, err := meter.Int64UpDownCounter(name,
+		metric.WithDescription(description), metric.WithUnit(unit))
+	if err != nil {
+		otel.Handle(err)
+	}
+	return c
+}
+
+// secondsHistogram fixes the unit and the bucket boundaries together, so a new
+// duration histogram cannot be declared in seconds and left on the SDK's
+// millisecond-scale defaults.
+func secondsHistogram(name, description string) metric.Float64Histogram {
+	h, err := meter.Float64Histogram(name,
+		metric.WithDescription(description), metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(secondsBuckets...))
+	if err != nil {
+		otel.Handle(err)
+	}
+	return h
 }
 
 // RaftSnapshot is one meta replica's consensus state at collection time.
