@@ -110,6 +110,13 @@ var metricNames = []string{
 	metricRPCConnections, metricRPCEvictions, metricRPCStreamsOpen,
 }
 
+// secondsBuckets bounds the duration histograms. The SDK default boundaries
+// run 0..10000 and only make sense for milliseconds: every second-valued
+// sample lands in the first bucket and every percentile reads back as 2.5.
+var secondsBuckets = []float64{
+	0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
+}
+
 var (
 	instrumentsOnce sync.Once
 	meter           metric.Meter
@@ -261,7 +268,8 @@ func instruments() {
 		}
 		shardDuration, err = meter.Float64Histogram(metricShardDuration,
 			metric.WithDescription("Duration of one shard operation against one node. A per-node tail is what separates a single sick node from a slow cluster."),
-			metric.WithUnit("s"))
+			metric.WithUnit("s"),
+			metric.WithExplicitBucketBoundaries(secondsBuckets...))
 		if err != nil {
 			otel.Handle(err)
 		}
@@ -332,7 +340,8 @@ func instruments() {
 
 		objectPhaseDuration, err = meter.Float64Histogram(metricObjectPhaseDuration,
 			metric.WithDescription("Time one phase of an object request took, by phase and op. Where a slow PUT or GET actually goes."),
-			metric.WithUnit("s"))
+			metric.WithUnit("s"),
+			metric.WithExplicitBucketBoundaries(secondsBuckets...))
 		if err != nil {
 			otel.Handle(err)
 		}
@@ -345,7 +354,8 @@ func instruments() {
 		}
 		metaClientDuration, err = meter.Float64Histogram(metricMetaClientDuration,
 			metric.WithDescription("Time one meta operation took, including every replica it had to try. Two of these sit on every PUT."),
-			metric.WithUnit("s"))
+			metric.WithUnit("s"),
+			metric.WithExplicitBucketBoundaries(secondsBuckets...))
 		if err != nil {
 			otel.Handle(err)
 		}

@@ -255,6 +255,35 @@ func TestRecordShardOpCountsAttemptsAndDuration(t *testing.T) {
 	}
 }
 
+// The SDK default boundaries stop at 10000 and start at 5, which is a
+// millisecond scale. Left alone, every duration below five seconds shares one
+// bucket and every percentile reads back as the same 2.5.
+func TestDurationHistogramsUseSecondScaleBuckets(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordShardOp(ctx, ShardOpRead, OutcomeSuccess, 5, 0.01)
+	RecordObjectPhase(ctx, GateOpPut, PhaseShardFanout, 0.01)
+	RecordMetaClientOp(ctx, MetaOpGet, OutcomeSuccess, 0.01)
+
+	m := collect(t, reader)
+	for _, name := range []string{
+		"predastore.shard.duration",
+		"predastore.object.phase.duration",
+		"predastore.meta.client.duration",
+	} {
+		hist, ok := m[name].(metricdata.Histogram[float64])
+		if !ok {
+			t.Fatalf("%s aggregation is %T, want Histogram[float64]", name, m[name])
+		}
+		for _, dp := range hist.DataPoints {
+			if !slices.Equal(dp.Bounds, secondsBuckets) {
+				t.Errorf("%s bounds = %v, want %v", name, dp.Bounds, secondsBuckets)
+			}
+		}
+	}
+}
+
 // The degraded-read rate is the whole point: a reconstructed read means parity
 // was consumed to answer it, which is the only in-band evidence that a blob
 // node is losing data.
