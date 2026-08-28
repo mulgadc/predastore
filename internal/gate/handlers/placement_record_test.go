@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"errors"
+	"slices"
 	"testing"
 
 	"github.com/mulgadc/predastore/internal/config"
@@ -84,14 +85,14 @@ func TestPlacementRecordSize(t *testing.T) {
 	}{
 		{"RS(2,1)", ObjectToShardNodes{
 			DataShardNodes: []config.NodeID{6, 12}, ParityShardNodes: []config.NodeID{3},
-		}, 22},
+		}, 30},
 		{"RS(7,3)", ObjectToShardNodes{
 			DataShardNodes:   []config.NodeID{1, 2, 3, 4, 5, 6, 7},
 			ParityShardNodes: []config.NodeID{8, 9, 10},
-		}, 29},
+		}, 37},
 		{"RS(17,3)", ObjectToShardNodes{
 			DataShardNodes: make([]config.NodeID, 17), ParityShardNodes: make([]config.NodeID, 3),
-		}, 39},
+		}, 47},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -141,7 +142,7 @@ func TestPlacementRecordRejectsMalformedInput(t *testing.T) {
 	truncatedIDs := append([]byte(nil), good[:placementFixedSize+1]...)
 
 	unknownVersion := append([]byte(nil), good...)
-	unknownVersion[1] = 0x02
+	unknownVersion[1] = 0x03
 
 	malformedUvarint := append([]byte(nil), good[:placementFixedSize]...)
 	malformedUvarint = append(malformedUvarint, 0x80) // continuation bit with nothing after it
@@ -201,6 +202,7 @@ func TestPlacementRecordRejectsUnencodableValues(t *testing.T) {
 func TestPlacementRecordHeaderLayout(t *testing.T) {
 	encoded, err := EncodePlacement(ObjectToShardNodes{
 		Size: 0x0102030405060708, WriteEpoch: 0x1112131415161718,
+		BlockSize:      0x2122232425262728,
 		DataShardNodes: []config.NodeID{6, 12}, ParityShardNodes: []config.NodeID{3},
 	})
 	if err != nil {
@@ -220,7 +222,37 @@ func TestPlacementRecordHeaderLayout(t *testing.T) {
 	if got := binary.BigEndian.Uint64(encoded[11:19]); got != 0x1112131415161718 {
 		t.Errorf("epoch at offset 11 = %#x", got)
 	}
-	if want := []byte{6, 12, 3}; !bytes.Equal(encoded[19:], want) {
-		t.Errorf("node ids = %v, want %v", encoded[19:], want)
+	if got := binary.BigEndian.Uint64(encoded[19:27]); got != 0x2122232425262728 {
+		t.Errorf("block size at offset 19 = %#x", got)
+	}
+	if want := []byte{6, 12, 3}; !bytes.Equal(encoded[27:], want) {
+		t.Errorf("node ids = %v, want %v", encoded[27:], want)
+	}
+}
+
+// Objects written before the gate streamed have no block size in their record
+// and each of their shards is contiguous. Decoding must keep saying so, or
+// every one of them reads back as scrambled bytes.
+func TestAVersionOneRecordDecodesWithNoBlockSize(t *testing.T) {
+	v1 := []byte{placementMagic, 0x01, 2}
+	v1 = binary.BigEndian.AppendUint64(v1, 4096)
+	v1 = binary.BigEndian.AppendUint64(v1, 0x1112131415161718)
+	v1 = append(v1, 6, 12, 3)
+
+	decoded, err := DecodePlacement(v1)
+	if err != nil {
+		t.Fatalf("DecodePlacement(version 1) error = %v", err)
+	}
+	if decoded.BlockSize != 0 {
+		t.Errorf("block size = %d, want 0 so the layout reads as contiguous", decoded.BlockSize)
+	}
+	if decoded.Size != 4096 || decoded.WriteEpoch != 0x1112131415161718 {
+		t.Errorf("size = %d epoch = %#x", decoded.Size, decoded.WriteEpoch)
+	}
+	if want := []config.NodeID{6, 12}; !slices.Equal(decoded.DataShardNodes, want) {
+		t.Errorf("data shard nodes = %v, want %v", decoded.DataShardNodes, want)
+	}
+	if want := []config.NodeID{3}; !slices.Equal(decoded.ParityShardNodes, want) {
+		t.Errorf("parity shard nodes = %v, want %v", decoded.ParityShardNodes, want)
 	}
 }

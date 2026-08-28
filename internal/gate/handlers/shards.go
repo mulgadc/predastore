@@ -29,6 +29,7 @@ import (
 type ObjectToShardNodes struct {
 	Size             int64
 	WriteEpoch       uint64
+	BlockSize        int64
 	DataShardNodes   []config.NodeID
 	ParityShardNodes []config.NodeID
 }
@@ -118,16 +119,6 @@ func fullWidth(total int) writeResult {
 	return writeResult{landed: landed}
 }
 
-// bytesBufferWriter wraps a byte slice pointer for use as io.Writer.
-type bytesBufferWriter struct {
-	buf *[]byte
-}
-
-func (w *bytesBufferWriter) Write(p []byte) (n int, err error) {
-	*w.buf = append(*w.buf, p...)
-	return len(p), nil
-}
-
 // mapPutErr translates a shard-write error into the S3 error returned to the
 // client. A pool-full shard write must surface as 507, not the generic 500
 // other failures get.
@@ -158,6 +149,7 @@ func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int
 	return ObjectToShardNodes{
 		Size:             size,
 		WriteEpoch:       epoch,
+		BlockSize:        writeLayout(cfg.DataShards, size).blockSize,
 		DataShardNodes:   append([]config.NodeID(nil), nodes[:cfg.DataShards]...),
 		ParityShardNodes: append([]config.NodeID(nil), nodes[cfg.DataShards:]...),
 	}, nil
@@ -205,9 +197,6 @@ func writeSingleShard(
 // up front, and it is what placement records, so a body that does not deliver
 // exactly that many bytes is an error rather than a short object.
 // poolNearFull is set if any shard's target node reported pressure.
-//
-// The stream encoder is constructed per request; hoisting it into the gate
-// belongs with the streaming refactor, not here.
 func writeObject(ctx context.Context, bc BlobClient, cfg Config, ring *placement.Ring, body io.Reader, size int64, objectHash [32]byte, place ObjectToShardNodes) (writeResult, error) {
 	// An empty object has no shard to write: the blob protocol rejects a
 	// zero-length value, and recorded placement is enough to serve the GET.
@@ -228,127 +217,284 @@ func writeObject(ctx context.Context, bc BlobClient, cfg Config, ring *placement
 		return writeSingleShard(ctx, bc, shardNodes[0], body, size, objectHash, epoch)
 	}
 
-	shards, err := encodeShards(cfg, body, size)
-	if err != nil {
-		return writeResult{landed: make([]bool, cfg.TotalShards())}, err
-	}
-
-	return putShards(ctx, bc, cfg, objectHash, epoch, shardNodes, shards,
+	return streamShards(ctx, bc, cfg, objectHash, epoch, shardNodes, body,
+		newLayout(cfg.DataShards, size, place.BlockSize), size,
 		handoffNode(ring, cfg, objectHash))
 }
 
-// encodeShards splits the body into its data shards and encodes the parity
-// from them, all in memory.
+// streamBlockSize is how much of each shard the gate holds at once. The whole
+// working set is TotalShards blocks of it, so it sets the memory a write costs
+// and nothing else does: the object itself is never resident.
 //
-// The parity used to be streamed to its nodes through pipes fed by the
-// encoder, which coupled the shards to each other: one parity node refusing
-// closed its pipe, failed the encode, and took every other parity shard down
-// with it. Under degraded writes that is the difference between losing one
-// shard and losing all the redundancy at once. The data shards were already
-// buffered whole to encode from, so holding the parity too costs m/k more.
-func encodeShards(cfg Config, body io.Reader, size int64) ([][]byte, error) {
-	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
-	if err != nil {
-		return nil, err
-	}
+// 4 MiB matches the encoder's own streaming block, which is where the
+// throughput of the underlying Encode was tuned.
+const streamBlockSize = 4 << 20
 
-	ds := int64(cfg.DataShards)
-	shardSize := int((size + ds - 1) / ds)
+// zeroPadding supplies the tail of the last stripe. Reed-Solomon needs every
+// shard the same length and an object rarely divides evenly into k of them, so
+// the shortfall is zeros the reader never asks for: placement records the real
+// size, and the read path stops there.
+type zeroPadding struct{}
 
-	shards := make([][]byte, cfg.TotalShards())
-	dataWriters := make([]io.Writer, cfg.DataShards)
-	for i := range cfg.DataShards {
-		shards[i] = make([]byte, 0, shardSize)
-		dataWriters[i] = &bytesBufferWriter{buf: &shards[i]}
-	}
-	if splitErr := enc.Split(body, dataWriters, size); splitErr != nil {
-		return nil, splitErr
-	}
+func (zeroPadding) Read(p []byte) (int, error) {
+	clear(p)
 
-	if cfg.ParityShards == 0 {
-		return shards, nil
-	}
-
-	dataReaders := make([]io.Reader, cfg.DataShards)
-	for i := range cfg.DataShards {
-		dataReaders[i] = bytes.NewReader(shards[i])
-	}
-	parityWriters := make([]io.Writer, cfg.ParityShards)
-	for i := range cfg.ParityShards {
-		idx := cfg.DataShards + i
-		shards[idx] = make([]byte, 0, shardSize)
-		parityWriters[i] = &bytesBufferWriter{buf: &shards[idx]}
-	}
-	if encodeErr := enc.Encode(dataReaders, parityWriters); encodeErr != nil {
-		return nil, encodeErr
-	}
-
-	return shards, nil
+	return len(p), nil
 }
 
-// putShards prepares every shard on its node concurrently and reports which
-// landed. A node that refuses is not fatal on its own: the write is acceptable
-// once cfg.MinShards() of the stripe are durable, because any DataShards of
-// them reconstruct the object. Below that the write fails and names the nodes
-// that were missing.
+// streamShards encodes the body a stripe at a time and carries each shard to
+// its node as it is produced, so the gate holds TotalShards blocks rather than
+// the object.
 //
-// A refused shard is offered to handoff, if there is one, before it is counted
-// as missing. That turns a short stripe into a complete one stored somewhere
-// else, which is the difference between a write that is durable and a write
-// that is also still redundant.
-func putShards(
+// A shard whose node stops taking bytes does not fail the write. Its stream is
+// abandoned and the loop keeps going, which leaves that position undurable and
+// nothing else disturbed — the same missing shard degraded writes, handoff and
+// repair already deal with. Failing the encode instead is what the buffered
+// version had to avoid by holding every shard whole.
+func streamShards(
 	ctx context.Context, bc BlobClient, cfg Config,
-	objectHash [32]byte, epoch uint64, shardNodes []config.NodeID, shards [][]byte,
-	handoff config.NodeID,
+	objectHash [32]byte, epoch uint64, shardNodes []config.NodeID,
+	body io.Reader, lay layout, size int64, handoff config.NodeID,
 ) (writeResult, error) {
-	outcomes := make(chan shardWriteOutcome, len(shards))
-	var wg sync.WaitGroup
-	for i, shardData := range shards {
-		node := shardNodes[i]
-		wg.Go(func() {
-			putReq := blob.PutRequest{
-				Key:   objectHash,
-				Size:  int64(len(shardData)),
-				Index: uint32(i), //nolint:gosec // G115: i bounded by DataShards + ParityShards (small uint).
-				Epoch: epoch,
+	total := cfg.TotalShards()
+	shardSize, blockSize := lay.shardSize, lay.blockSize
+
+	enc, err := reedsolomon.New(cfg.DataShards, cfg.ParityShards)
+	if err != nil {
+		return writeResult{landed: make([]bool, total)}, err
+	}
+
+	block := make([][]byte, total)
+	stripe := make([][]byte, total)
+	for i := range block {
+		block[i] = make([]byte, blockSize)
+	}
+
+	streams := make([]*shardStream, total)
+	for i := range total {
+		streams[i] = startShardStream(ctx, bc, objectHash, epoch, i, shardNodes[i], shardSize)
+	}
+
+	// The body is padded so a short last stripe still encodes, and counted so a
+	// body that does not deliver what it declared is an error rather than an
+	// object with zeros on the end.
+	counted := &countingReader{r: body}
+	padded := io.MultiReader(counted, zeroPadding{})
+
+	result := writeResult{landed: make([]bool, total), holders: make([]config.NodeID, total)}
+	for offset := int64(0); offset < shardSize; offset += blockSize {
+		n := min(blockSize, shardSize-offset)
+		for i := range cfg.DataShards {
+			stripe[i] = block[i][:n]
+			if _, readErr := io.ReadFull(padded, stripe[i]); readErr != nil {
+				closeStreams(streams)
+				return result, fmt.Errorf("read object body: %w", readErr)
 			}
-			resp, putErr := bc.Put(ctx, node, putReq, bytes.NewReader(shardData))
-			if putErr != nil {
-				outcomes <- shardWriteOutcome{shardIndex: i, err: putErr}
+		}
+		for i := cfg.DataShards; i < total; i++ {
+			stripe[i] = block[i][:n]
+		}
+		if encErr := enc.Encode(stripe); encErr != nil {
+			closeStreams(streams)
+			return result, fmt.Errorf("encode parity: %w", encErr)
+		}
+
+		refused := writeStripe(streams, stripe)
+		if offset == 0 {
+			handOff(ctx, bc, objectHash, epoch, streams, stripe, refused, handoff, shardSize)
+		}
+	}
+
+	if counted.n != size {
+		closeStreams(streams)
+
+		return result, fmt.Errorf("body delivered %d bytes, declared %d", counted.n, size)
+	}
+
+	return collectStreams(ctx, cfg, streams, result)
+}
+
+// shardStream carries one shard to one node while the encoder is still
+// producing the rest of it. The pipe is unbuffered, so a write to it is a
+// write onto the wire, and the shards advance together rather than one
+// completing before the next begins.
+type shardStream struct {
+	index  int
+	owner  config.NodeID
+	holder config.NodeID
+	pw     *io.PipeWriter
+	done   chan shardWriteOutcome
+	failed bool
+}
+
+func startShardStream(
+	ctx context.Context, bc BlobClient, objectHash [32]byte, epoch uint64,
+	index int, node config.NodeID, shardSize int64,
+) *shardStream {
+	pr, pw := io.Pipe()
+	s := &shardStream{
+		index: index, owner: node, holder: node,
+		pw: pw, done: make(chan shardWriteOutcome, 1),
+	}
+
+	go func() {
+		resp, err := bc.Put(ctx, node, blob.PutRequest{
+			Key:   objectHash,
+			Size:  shardSize,
+			Index: uint32(index), //nolint:gosec // G115: index bounded by the shard count.
+			Epoch: epoch,
+		}, pr)
+		// Closing the read side is what releases a producer still writing into
+		// a stream whose node has gone: io.Pipe has no buffer and does not
+		// observe ctx, so without this the whole write hangs on one dead node.
+		_ = pr.CloseWithError(io.ErrClosedPipe)
+
+		if err != nil {
+			s.done <- shardWriteOutcome{shardIndex: index, err: err}
+
+			return
+		}
+		s.done <- shardWriteOutcome{shardIndex: index, poolNearFull: resp.PoolNearFull}
+	}()
+
+	return s
+}
+
+// write sends one block, reporting whether the stream is still alive. A stream
+// that has already failed is a no-op rather than an error: the position is
+// recorded once, and the encode carries on for the shards that remain.
+func (s *shardStream) write(p []byte) bool {
+	if s.failed {
+		return false
+	}
+	if _, err := s.pw.Write(p); err != nil {
+		s.failed = true
+		_ = s.pw.CloseWithError(err)
+
+		return false
+	}
+
+	return true
+}
+
+func (s *shardStream) abandon() {
+	if !s.failed {
+		s.failed = true
+		_ = s.pw.CloseWithError(io.ErrClosedPipe)
+	}
+}
+
+// writeStripe sends one block of every shard at once and names the positions
+// whose node would not take it. Concurrently, because each write blocks until
+// its node reads: in sequence, the slowest node would set the rate for all of
+// them and the shards would no longer advance together.
+func writeStripe(streams []*shardStream, stripe [][]byte) []int {
+	var (
+		mu      sync.Mutex
+		refused []int
+		wg      sync.WaitGroup
+	)
+	for i, s := range streams {
+		if s.failed {
+			continue
+		}
+		wg.Go(func() {
+			if s.write(stripe[i]) {
 				return
 			}
-			outcomes <- shardWriteOutcome{shardIndex: i, poolNearFull: resp.PoolNearFull}
+			mu.Lock()
+			refused = append(refused, i)
+			mu.Unlock()
 		})
 	}
 	wg.Wait()
-	close(outcomes)
 
-	result := writeResult{
-		landed:  make([]bool, len(shards)),
-		holders: slices.Clone(shardNodes),
+	// Sorted so the handoff list and the log are in shard order rather than in
+	// whichever order the concurrent writes happened to fail.
+	slices.Sort(refused)
+
+	return refused
+}
+
+// handOff restarts the shards their owner refused against the one node off the
+// end of the stripe.
+//
+// It is only ever called for the first block, and that is the whole of what
+// makes it possible: nothing is buffered, so a shard can only be re-aimed
+// while none of it has been sent yet. A node that stops taking bytes part way
+// through leaves that position missing, for repair to restore — which is the
+// case handoff used to cover and now does not.
+func handOff(
+	ctx context.Context, bc BlobClient, objectHash [32]byte, epoch uint64,
+	streams []*shardStream, stripe [][]byte, refused []int,
+	handoff config.NodeID, shardSize int64,
+) {
+	if handoff == 0 {
+		return
 	}
+	for _, i := range refused {
+		if streams[i].owner == handoff {
+			continue
+		}
+		alt := startShardStream(ctx, bc, objectHash, epoch, i, handoff, shardSize)
+		alt.owner = streams[i].owner
+		if !alt.write(stripe[i]) {
+			<-alt.done
+			logShardWriteFailure(ctx, handoff, i, io.ErrClosedPipe)
+
+			continue
+		}
+
+		// The refused stream is already closed, so its outcome is waiting and
+		// has to be taken or the goroutine holding it never retires.
+		<-streams[i].done
+		streams[i] = alt
+		slog.InfoContext(ctx, "Shard handed off; its owner would not take it",
+			"owner", alt.owner, "holder", handoff, "index", i,
+			"epoch", fmt.Sprintf("%016x", epoch))
+	}
+}
+
+// closeStreams abandons every stream and waits for its put to retire, so a
+// write that gives up leaves no goroutine holding a pipe.
+func closeStreams(streams []*shardStream) {
+	for _, s := range streams {
+		s.abandon()
+		<-s.done
+	}
+}
+
+// collectStreams closes the live streams, waits for every put to report, and
+// assembles what the write left on the cluster.
+func collectStreams(ctx context.Context, cfg Config, streams []*shardStream, result writeResult) (writeResult, error) {
+	for _, s := range streams {
+		if !s.failed {
+			_ = s.pw.Close()
+		}
+	}
+
 	var firstErr error
-	var refused []int
-	for outcome := range outcomes {
+	for i, s := range streams {
+		result.holders[i] = s.holder
+		outcome := <-s.done
 		if outcome.err != nil {
 			if firstErr == nil {
 				firstErr = outcome.err
 			}
-			refused = append(refused, outcome.shardIndex)
-			logShardWriteFailure(ctx, shardNodes[outcome.shardIndex], outcome.shardIndex, outcome.err)
+			result.holders[i] = s.owner
+			result.missing = append(result.missing, s.owner)
+			logShardWriteFailure(ctx, s.holder, i, outcome.err)
 
 			continue
 		}
-		result.landed[outcome.shardIndex] = true
+		result.landed[i] = true
+		if s.holder != s.owner {
+			result.handoff = append(result.handoff, i)
+		}
 		if outcome.poolNearFull {
 			result.poolNearFull = true
 		}
 	}
-
-	// Sorted so the retries, the handoff list and the log are in shard order
-	// rather than in whichever order the concurrent puts happened to fail.
-	slices.Sort(refused)
-	handOff(ctx, bc, objectHash, epoch, shards, handoff, refused, &result, shardNodes)
 
 	if landed := result.landedCount(); landed < cfg.MinShards() {
 		return result, fmt.Errorf("%w: %d of %d shards durable, nodes %v unreachable: %w",
@@ -356,45 +502,6 @@ func putShards(
 	}
 
 	return result, nil
-}
-
-// handOff writes the shards their owners refused to the one node off the end of
-// the stripe, and records where each went. A position that fails there too is
-// missing outright, which is what the write floor is then measured against.
-//
-// They go one at a time: the handoff node is taking work it was not placed for,
-// on behalf of a cluster that is already one node short, and firing a whole
-// stripe at it concurrently is how a fallback becomes the next failure.
-func handOff(
-	ctx context.Context, bc BlobClient, objectHash [32]byte, epoch uint64, shards [][]byte,
-	handoff config.NodeID, refused []int, result *writeResult, shardNodes []config.NodeID,
-) {
-	for _, index := range refused {
-		if handoff == 0 {
-			result.missing = append(result.missing, shardNodes[index])
-
-			continue
-		}
-		_, err := bc.Put(ctx, handoff, blob.PutRequest{
-			Key:   objectHash,
-			Size:  int64(len(shards[index])),
-			Index: uint32(index), //nolint:gosec // G115: bounded by the shard count.
-			Epoch: epoch,
-		}, bytes.NewReader(shards[index]))
-		if err != nil {
-			logShardWriteFailure(ctx, handoff, index, err)
-			result.missing = append(result.missing, shardNodes[index])
-
-			continue
-		}
-
-		result.landed[index] = true
-		result.holders[index] = handoff
-		result.handoff = append(result.handoff, index)
-		slog.InfoContext(ctx, "Shard handed off; its owner would not take it",
-			"owner", shardNodes[index], "holder", handoff, "index", index,
-			"epoch", fmt.Sprintf("%016x", epoch))
-	}
 }
 
 // handoffNode is the node one step off the end of the stripe on the ring: where
@@ -520,7 +627,16 @@ func loadPlacement(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg
 // readShard fetches one shard whole and buffers it. The data is read into
 // memory before the stream is closed, so the caller never reads from a closed
 // connection.
+//
+// Only the open is bounded by a deadline. The body that follows is bounded by
+// progress, in the blob client's idle guard: a total cap cannot distinguish a
+// node that has stopped sending from a shard that is simply large, and at a
+// gigabyte a shard it fails every read of a healthy cluster.
 func readShard(ctx context.Context, bc BlobClient, objectHash [32]byte, node config.NodeID, index int, epoch uint64) ([]byte, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	opening := time.AfterFunc(shardOpenTimeout, cancel)
 	reader, err := bc.Get(ctx, node, blob.GetRequest{
 		Key:        objectHash,
 		RangeStart: -1, // -1 means full shard (no range)
@@ -528,6 +644,7 @@ func readShard(ctx context.Context, bc BlobClient, objectHash [32]byte, node con
 		Index:      uint32(index), //nolint:gosec // G115: index bounded by shard count (small uint).
 		Epoch:      epoch,
 	})
+	opening.Stop()
 	if err != nil {
 		recordShardReadError(ctx, err)
 		return nil, err
@@ -606,13 +723,10 @@ func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place O
 	var enoughOnce, failedOnce sync.Once
 
 	read := func(index int, node config.NodeID) {
-		shardCtx, shardCancel := context.WithTimeout(ctx, shardReadTimeout)
-		defer shardCancel()
-
 		start := time.Now()
-		data, err := readShard(shardCtx, bc, objectHash, node, index, place.WriteEpoch)
+		data, err := readShard(ctx, bc, objectHash, node, index, place.WriteEpoch)
 		if err != nil && handoff != 0 && handoff != node {
-			if held, hErr := readShard(shardCtx, bc, objectHash, handoff, index, place.WriteEpoch); hErr == nil {
+			if held, hErr := readShard(ctx, bc, objectHash, handoff, index, place.WriteEpoch); hErr == nil {
 				slog.InfoContext(ctx, "Shard served from its handoff holder",
 					"owner", node, "holder", handoff, "index", index)
 				data, err = held, nil
@@ -774,10 +888,15 @@ func reportDegradedRead(ctx context.Context, bucket, key string, failures []shar
 // node for. A degrading node should be visible before it takes something down.
 const slowShardThreshold = 2 * time.Second
 
-// shardReadTimeout caps a single shard read regardless of how much budget the
-// caller had. A node that accepts a stream and never answers otherwise spends
-// the whole request on itself, and a generous caller is punished hardest.
-const shardReadTimeout = 5 * time.Second
+// shardOpenTimeout caps the request and response envelope of a shard read.
+// Those are small and fixed, so a total bound is the right one for them: a
+// node that accepts a stream and never answers otherwise spends the whole
+// request on itself, and a generous caller is punished hardest.
+//
+// It deliberately does not cover the body. The shard that follows is bounded
+// by progress instead, which is the only bound that a 16 GiB shard and a
+// stalled node can both be measured against.
+const shardOpenTimeout = 5 * time.Second
 
 // hedgeDelay is how long the data shards get before the parity shards are
 // fetched as well. Comfortably above a healthy shard read, and far below
@@ -818,7 +937,7 @@ func missingShards(shards [][]byte, n int) int {
 // one object wrote and deleted the same paths underneath each other. Keeping
 // them in memory also removes a second read of every shard, since the encoder
 // consumes the readers it is given.
-func reconstructObject(enc reedsolomon.StreamEncoder, shards [][]byte, size int64) (*bytes.Buffer, error) {
+func reconstructObject(enc reedsolomon.StreamEncoder, lay layout, shards [][]byte, size int64) (*bytes.Buffer, error) {
 	recovered := make([]*bytes.Buffer, len(shards))
 	writers := make([]io.Writer, len(shards))
 	for i := range shards {
@@ -838,7 +957,7 @@ func reconstructObject(enc reedsolomon.StreamEncoder, shards [][]byte, size int6
 	}
 
 	var out bytes.Buffer
-	if err := enc.Join(&out, shardReadersOf(shards), size); err != nil {
+	if err := lay.join(&out, shards, size); err != nil {
 		return nil, fmt.Errorf("join after reconstruction failed: %w", err)
 	}
 	return &out, nil

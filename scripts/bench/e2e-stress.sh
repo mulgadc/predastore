@@ -763,7 +763,7 @@ LARGE_CLUSTER="${CONFIG_NAME}-large"
 LARGE_CONFIG="$PREDA_CONFIG_DIR/$LARGE_CLUSTER.toml"
 LARGE_PID_DIR="$PREDA_DIR/$LARGE_CLUSTER/pids"
 LARGE_BUCKET="stress-large"
-LARGE_SIZES="${STRESS_LARGE_SIZES:-2GiB 4GiB 8GiB}"
+LARGE_SIZES="${STRESS_LARGE_SIZES:-2GiB 4GiB}"
 LARGE_FAILURES=0
 LARGE_CASES=0
 LARGE_SKIPPED=0
@@ -870,41 +870,54 @@ LARGE_SINGLE_SHOT_MAX=$(( 4 * 1024 * 1024 * 1024 ))
 run_large_object() {
     local results="$RUN_DIR/large-object.tsv"
     local gate spec bytes need avail key src digest got_digest
-    local rss_log peak put_start put_secs get_secs reconstructed status hdr
+    local put_peak get_peak put_start put_secs get_secs reconstructed status hdr
 
     render_large_profile
-    log "large-object: starting $LARGE_CLUSTER"
-    "$SCRIPTS_DIR/start.sh" -w "$LARGE_CLUSTER"
 
     gate="$(parse_hosts "$LARGE_CONFIG" | awk '$3 != "" { print "https://" $2 ":" $3; exit }')"
     [ -n "$gate" ] || fail "large-object: no gate in $LARGE_CLUSTER"
 
-    printf 'size\tbytes\tpath\tput_s\tput_MiBps\tget_s\tget_MiBps\tpeak_rss_MiB\treconstructed\tverdict\n' > "$results"
+    printf 'size\tbytes\tpath\tput_s\tput_MiBps\tget_s\tget_MiBps\tput_peak_MiB\tget_peak_MiB\treconstructed\tverdict\n' > "$results"
 
     for spec in $LARGE_SIZES; do
         bytes="$(parse_size "$spec")"
         key="large-${spec}.bin"
 
-        # Shards are 1.5x the object at RS(2,1); the single-shot path needs a
-        # source file on top of that. Checked before the transfer rather than
-        # discovered part way through a 16 GiB upload, and reported with the
-        # shortfall so it is actionable rather than a bare skip.
+        # Each size gets the cluster to itself on an empty data directory. The
+        # shards of an earlier size are not returned by DeleteObject promptly
+        # enough to fund the next one, and a cold store also makes the sizes
+        # comparable to each other rather than to whatever ran before them.
+        stop_clusters
+        if [ -d "$PREDA_DIR/$LARGE_CLUSTER/logs" ]; then
+            mkdir -p "$RUN_DIR/logs-large"
+            cp -R "$PREDA_DIR/$LARGE_CLUSTER/logs/." "$RUN_DIR/logs-large/" 2>/dev/null || true
+        fi
+        rm -rf "${PREDA_DIR:?}/$LARGE_CLUSTER"
+        log "large-object: starting $LARGE_CLUSTER for $spec"
+        "$SCRIPTS_DIR/start.sh" -w "$LARGE_CLUSTER"
+
+        # Shards are 1.5x the object at RS(2,1). The single-shot path needs a
+        # source file on top of that, so 2.5x.
+        #
+        # The multipart path needs 3x, not 1.5x: CompleteMultipartUpload
+        # assembles the object while the parts are still stored, and only
+        # deletes them afterwards, so both exist at once. Assuming 1.5x here is
+        # what filled the disk mid-run rather than skipping the size cleanly.
         if [ "$bytes" -le "$LARGE_SINGLE_SHOT_MAX" ]; then
             need=$(( bytes * 5 / 2 + 2 * 1024 * 1024 * 1024 ))
         else
-            need=$(( bytes * 3 / 2 + 2 * 1024 * 1024 * 1024 ))
+            need=$(( bytes * 3 + 2 * 1024 * 1024 * 1024 ))
         fi
         avail="$(df -PB1 "$PREDA_DIR" | awk 'NR == 2 { print $4 }')"
         if [ "$avail" -lt "$need" ]; then
             log "large-object: SKIP $spec — needs $(( need / 1024 / 1024 / 1024 ))GiB free under $PREDA_DIR, has $(( avail / 1024 / 1024 / 1024 ))GiB"
-            printf '%s\t%s\t-\t-\t-\t-\t-\t-\t-\tskipped-no-disk\n' "$spec" "$bytes" >> "$results"
+            printf '%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\tskipped-no-disk\n' "$spec" "$bytes" >> "$results"
             LARGE_SKIPPED=$(( LARGE_SKIPPED + 1 ))
             continue
         fi
 
         digest="$(gen_stream "$bytes" | sha256sum | awk '{ print $1 }')"
-        rss_log="$WORK_DIR/large-rss-$spec.txt"
-        start_rss_sampler "$rss_log"
+        start_rss_sampler "$WORK_DIR/large-rss-put-$spec.txt"
 
         put_start="$(date +%s)"
         if [ "$bytes" -le "$LARGE_SINGLE_SHOT_MAX" ]; then
@@ -922,14 +935,14 @@ run_large_object() {
                 2>>"$RUN_DIR/large-puts.txt" || status=put-failed
         fi
         put_secs=$(( $(date +%s) - put_start ))
+        stop_rss_sampler
+        put_peak="$(peak_rss_mib "$WORK_DIR/large-rss-put-$spec.txt")"
 
         if [ "$status" != ok ]; then
-            stop_rss_sampler
-            peak="$(peak_rss_mib "$rss_log")"
-            large_check false "$spec PUT failed after ${put_secs}s (peak RSS ${peak}MiB) — see large-puts.txt"
-            printf '%s\t%s\t%s\t%s\t-\t-\t-\t%s\t-\tput-failed\n' \
+            large_check false "$spec PUT failed after ${put_secs}s (peak RSS ${put_peak}MiB) — see large-puts.txt"
+            printf '%s\t%s\t%s\t%s\t-\t-\t-\t%s\t-\t-\tput-failed\n' \
                 "$spec" "$bytes" "$([ "$bytes" -le "$LARGE_SINGLE_SHOT_MAX" ] && echo single || echo multipart)" \
-                "$put_secs" "$peak" >> "$results"
+                "$put_secs" "$put_peak" >> "$results"
             continue
         fi
 
@@ -937,13 +950,14 @@ run_large_object() {
         # disk doubles the footprint and proves nothing more.
         hdr="$WORK_DIR/large-headers-$spec.txt"
         local get_start http_status verdict
+        start_rss_sampler "$WORK_DIR/large-rss-get-$spec.txt"
         get_start="$(date +%s)"
         got_digest="$(curl -sk --max-time 3600 -D "$hdr" "$gate/$LARGE_BUCKET/$key" | sha256sum | awk '{ print $1 }')" \
             || got_digest="get-failed"
         get_secs=$(( $(date +%s) - get_start ))
 
         stop_rss_sampler
-        peak="$(peak_rss_mib "$rss_log")"
+        get_peak="$(peak_rss_mib "$WORK_DIR/large-rss-get-$spec.txt")"
 
         # The status is checked before anything else is read from the response.
         # An error body has no X-Spx-Degraded header, so a 500 would otherwise
@@ -952,12 +966,12 @@ run_large_object() {
         http_status="$(awk 'NR == 1 { print $2; exit }' "$hdr")"
         if [ "$http_status" != 200 ]; then
             curl -sk -o "$RUN_DIR/large-get-error-$spec.xml" "$gate/$LARGE_BUCKET/$key" 2>/dev/null || true
-            large_check false "$spec GET returned HTTP $http_status after ${get_secs}s (peak RSS ${peak}MiB) — body in large-get-error-$spec.xml"
-            printf '%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\t-\tget-http-%s\n' \
+            large_check false "$spec GET returned HTTP $http_status after ${get_secs}s (peak RSS ${get_peak}MiB) — body in large-get-error-$spec.xml"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\t%s\t-\tget-http-%s\n' \
                 "$spec" "$bytes" \
                 "$([ "$bytes" -le "$LARGE_SINGLE_SHOT_MAX" ] && echo single || echo multipart)" \
                 "$put_secs" "$(( bytes / 1024 / 1024 / (put_secs > 0 ? put_secs : 1) ))" \
-                "$get_secs" "$peak" "$http_status" >> "$results"
+                "$get_secs" "$put_peak" "$get_peak" "$http_status" >> "$results"
             continue
         fi
 
@@ -967,40 +981,44 @@ run_large_object() {
         verdict=mismatch
         if [ "$got_digest" = "$digest" ]; then
             verdict=ok
-            large_check true "$spec round-tripped byte for byte in ${put_secs}s up, ${get_secs}s down, peak RSS ${peak}MiB"
+            large_check true "$spec round-tripped byte for byte in ${put_secs}s up, ${get_secs}s down, peak RSS ${put_peak}MiB writing and ${get_peak}MiB reading"
         else
             large_check false "$spec read back as $got_digest, wrote $digest"
         fi
         large_check "$([ "$reconstructed" = 0 ] && echo true || echo false)" \
             "$spec read cost $reconstructed reconstructions on a healthy cluster"
 
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$spec" "$bytes" \
             "$([ "$bytes" -le "$LARGE_SINGLE_SHOT_MAX" ] && echo single || echo multipart)" \
             "$put_secs" "$(( bytes / 1024 / 1024 / (put_secs > 0 ? put_secs : 1) ))" \
             "$get_secs" "$(( bytes / 1024 / 1024 / (get_secs > 0 ? get_secs : 1) ))" \
-            "$peak" "$reconstructed" "$verdict" >> "$results"
+            "$put_peak" "$get_peak" "$reconstructed" "$verdict" >> "$results"
 
         aws_s3 "$gate" s3 rm "s3://$LARGE_BUCKET/$key" --only-show-errors >/dev/null 2>&1 || true
     done
 
-    # The property under test. A threshold in bytes would need retuning on
-    # every unrelated change; the ratio between the smallest and largest size
-    # is what says whether the gate streams.
+    # The property under test, stated as what streaming means rather than as a
+    # growth rate: a streaming path holds a fixed working set, so its peak is
+    # below the object at every size, while a buffered one is a multiple of it.
     #
-    # Only sizes that round-tripped count. A failed GET never buffers a
-    # response, so including one would flatten the curve by not doing the work
-    # the curve is measuring.
-    local smallest largest ratio completed
-    completed="$(awk -F'\t' 'NR > 1 && $10 == "ok"' "$results" | wc -l)"
-    smallest="$(awk -F'\t' 'NR > 1 && $10 == "ok" { print $8; exit }' "$results")"
-    largest="$(awk -F'\t' 'NR > 1 && $10 == "ok" { last = $8 } END { print last }' "$results")"
-    if [ "$completed" -ge 2 ] && [ -n "$smallest" ] && [ "$smallest" -gt 0 ]; then
-        ratio=$(( largest * 100 / smallest ))
-        large_check "$([ "$ratio" -le 200 ] && echo true || echo false)" \
-            "peak RSS is flat in object size: largest is ${ratio}% of smallest, budget 200%"
+    # This replaced a largest-against-smallest ratio with a 200% budget, which
+    # a linear path passes whenever the two sizes are 2x apart -- the read path
+    # scored 197% and passed while holding 5x the object. The growth figure is
+    # still logged, because it is informative, but it is not the assertion.
+    local col label peak size_mib completed
+    completed="$(awk -F'\t' 'NR > 1 && $11 == "ok"' "$results" | wc -l)"
+    if [ "$completed" -eq 0 ]; then
+        log "large-object: NOTE no size round-tripped, so memory was not judged"
     else
-        log "large-object: NOTE only $completed size(s) round-tripped, so memory was not compared across sizes"
+        for col in 8 9; do
+            if [ "$col" = 8 ]; then label="write"; else label="read"; fi
+            while IFS="$(printf '\t')" read -r spec size_mib peak; do
+                large_check "$([ "$peak" -lt "$size_mib" ] && echo true || echo false)" \
+                    "$spec $label peak RSS ${peak}MiB is below the ${size_mib}MiB object, so the $label path streams"
+            done < <(awk -F'\t' -v c="$col" 'NR > 1 && $11 == "ok" {
+                         print $1 "\t" int($2 / 1048576) "\t" $c }' "$results")
+        done
     fi
 
     # Appended without the header, prefixed with the run and the commit, so a

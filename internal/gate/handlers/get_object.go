@@ -132,9 +132,11 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	}
 	missing := missingShards(shards, len(place.DataShardNodes))
 
+	lay := newLayout(cfg.DataShards, size, place.BlockSize)
+
 	var out bytes.Buffer
 	if missing == 0 {
-		err := enc.Join(&out, shardReadersOf(shards), size)
+		err := lay.join(&out, shards, size)
 		if err == nil {
 			reportDegradedRead(ctx, bucket, key, failures, 0, time.Since(start))
 			return out.Bytes(), 0, nil
@@ -147,7 +149,7 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	// unresponsive node cost every reader twenty seconds rather than one
 	// reconstruction.
 	out.Reset()
-	reconstructed, err := reconstructObject(enc, shards, size)
+	reconstructed, err := reconstructObject(enc, lay, shards, size)
 	if err != nil {
 		return nil, 0, model.NewS3Error(model.ErrInternalError,
 			fmt.Sprintf("reconstruction failed: %v", err), 500)
@@ -187,13 +189,12 @@ func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key strin
 		return nil, "", 0, model.ErrInvalidRangeError
 	}
 
-	shardSize := (totalSize + int64(cfg.DataShards) - 1) / int64(cfg.DataShards)
-	startShardIdx := min(int(start/shardSize), cfg.DataShards-1)
-	endShardIdx := min(int(end/shardSize), cfg.DataShards-1)
+	lay := newLayout(cfg.DataShards, totalSize, place.BlockSize)
 
-	if startShardIdx == endShardIdx {
+	if lay.contiguous(start, end) {
+		shardIdx, at := lay.locate(start)
 		objectHash := model.ObjectHash(bucket, key)
-		data, err := readRangeFromSingleShard(ctx, bc, cfg, objectHash, place, startShardIdx, start, end, shardSize, totalSize)
+		data, err := readRangeFromSingleShard(ctx, bc, objectHash, place, shardIdx, at, end-start+1)
 		if err == nil {
 			return data, fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize), 0, nil
 		}
@@ -217,35 +218,20 @@ func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key strin
 	return full[start : end+1], fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize), degraded, nil
 }
 
-// readRangeFromSingleShard reads a byte range from one data shard: the fast
-// path when the whole range lands inside it.
-func readRangeFromSingleShard(ctx context.Context, bc BlobClient, cfg Config, objectHash [32]byte, place ObjectToShardNodes, shardIdx int, globalStart, globalEnd, shardSize, totalSize int64) ([]byte, error) {
+// readRangeFromSingleShard reads length bytes from one data shard starting at
+// at: the fast path when the whole range lands inside one block. The layout
+// has already resolved where that is, so there is no shard arithmetic here.
+func readRangeFromSingleShard(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, shardIdx int, at, length int64) ([]byte, error) {
 	if shardIdx >= len(place.DataShardNodes) {
 		return nil, fmt.Errorf("shard index %d out of range", shardIdx)
-	}
-
-	shardStart := int64(shardIdx) * shardSize
-	offsetInShard := globalStart - shardStart
-	endInShard := globalEnd - shardStart
-
-	// The last shard is short whenever the object does not divide evenly.
-	actualShardSize := shardSize
-	if shardIdx == cfg.DataShards-1 {
-		actualShardSize = totalSize - shardStart
-		if actualShardSize <= 0 {
-			return nil, fmt.Errorf("invalid shard size calculation")
-		}
-	}
-	if endInShard >= actualShardSize {
-		endInShard = actualShardSize - 1
 	}
 
 	nodeNum := place.DataShardNodes[shardIdx]
 	objectRequest := blob.GetRequest{
 		Key:        objectHash,
 		Index:      uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards (small uint).
-		RangeStart: offsetInShard,
-		RangeEnd:   endInShard,
+		RangeStart: at,
+		RangeEnd:   at + length - 1,
 		Epoch:      place.WriteEpoch,
 	}
 

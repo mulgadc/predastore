@@ -16,15 +16,20 @@ import (
 //	2    1     k, the data shard count; m is len(nodes) - k
 //	3    8     object size, uint64 big-endian
 //	11   8     write epoch, uint64 big-endian
-//	19   var   k+m node ids as uvarints, data shards first then parity
+//	19   8     block size, uint64 big-endian (version 2 only)
+//	var  var   k+m node ids as uvarints, data shards first then parity
 //
 // gob spent 217 bytes on a 66-byte payload because it emits a type descriptor
-// with every value. This spends 19 plus one byte per node id.
+// with every value. This spends 27 plus one byte per node id.
+//
+// Version 1 has no block size and its objects are laid out with each shard
+// contiguous, which is what the gate wrote before it could stream a write.
 const (
-	placementMagic     = 0x00
-	placementVersion   = 0x01
-	placementFixedSize = 19
-	maxDataShards      = 255
+	placementMagic       = 0x00
+	placementVersion     = 0x02
+	placementFixedSizeV1 = 19
+	placementFixedSize   = 27
+	maxDataShards        = 255
 )
 
 // errPlacementFormat rejects a record written before the cutover. A gob stream
@@ -45,6 +50,9 @@ func EncodePlacement(p ObjectToShardNodes) ([]byte, error) {
 	if p.Size < 0 {
 		return nil, fmt.Errorf("negative object size %d", p.Size)
 	}
+	if p.BlockSize < 0 {
+		return nil, fmt.Errorf("negative block size %d", p.BlockSize)
+	}
 
 	buf := make([]byte, placementFixedSize, placementFixedSize+k+len(p.ParityShardNodes))
 	buf[0] = placementMagic
@@ -52,6 +60,7 @@ func EncodePlacement(p ObjectToShardNodes) ([]byte, error) {
 	buf[2] = byte(k)
 	binary.BigEndian.PutUint64(buf[3:11], uint64(p.Size))
 	binary.BigEndian.PutUint64(buf[11:19], p.WriteEpoch)
+	binary.BigEndian.PutUint64(buf[19:27], uint64(p.BlockSize))
 
 	for _, id := range p.DataShardNodes {
 		buf = binary.AppendUvarint(buf, uint64(id))
@@ -65,14 +74,26 @@ func EncodePlacement(p ObjectToShardNodes) ([]byte, error) {
 // DecodePlacement parses a placement record, rejecting anything it cannot
 // account for byte by byte rather than returning a partially populated record.
 func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
-	if len(b) < placementFixedSize {
+	if len(b) < placementFixedSizeV1 {
 		return ObjectToShardNodes{}, fmt.Errorf("placement record is %d bytes, want at least %d",
-			len(b), placementFixedSize)
+			len(b), placementFixedSizeV1)
 	}
 	if b[0] != placementMagic {
 		return ObjectToShardNodes{}, errPlacementFormat
 	}
-	if b[1] != placementVersion {
+
+	// A version 1 record carries no block size, and zero is what the read path
+	// reads as the contiguous layout those objects were written with.
+	fixed := placementFixedSize
+	switch b[1] {
+	case 0x01:
+		fixed = placementFixedSizeV1
+	case placementVersion:
+		if len(b) < placementFixedSize {
+			return ObjectToShardNodes{}, fmt.Errorf("placement record is %d bytes, want at least %d",
+				len(b), placementFixedSize)
+		}
+	default:
 		return ObjectToShardNodes{}, fmt.Errorf("unknown placement record version %d", b[1])
 	}
 
@@ -81,9 +102,12 @@ func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
 		Size:       int64(binary.BigEndian.Uint64(b[3:11])), //nolint:gosec // round-trips bit-for-bit from encode.
 		WriteEpoch: binary.BigEndian.Uint64(b[11:19]),
 	}
+	if fixed == placementFixedSize {
+		p.BlockSize = int64(binary.BigEndian.Uint64(b[19:27])) //nolint:gosec // round-trips bit-for-bit from encode.
+	}
 
 	ids := make([]config.NodeID, 0, k)
-	for rest := b[placementFixedSize:]; len(rest) > 0; {
+	for rest := b[fixed:]; len(rest) > 0; {
 		v, n := binary.Uvarint(rest)
 		if n <= 0 {
 			return ObjectToShardNodes{}, errors.New("placement record has a malformed node id")
