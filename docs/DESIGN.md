@@ -569,6 +569,11 @@ parity = 1
 # [compaction]
 # interval_seconds = 300        # zero uses the engine default; compaction is never off
 
+# [meta]                        # raft log retention on the metadata plane
+# snapshot_interval_seconds = 0 # zero defaults to 120
+# snapshot_threshold        = 0 # zero defaults to 8192
+# trailing_logs             = 0 # zero defaults to 10240; decides replay vs snapshot install
+
 [[host]]
 id   = 1
 addr = "10.11.12.1"             # what peers dial; no port — nodes carry those

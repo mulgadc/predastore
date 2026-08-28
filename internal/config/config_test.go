@@ -172,6 +172,26 @@ interval_seconds = 120
 		assert.Equal(t, Repair{}, cfg.Repair, "repair is opt-in")
 	})
 
+	// The retention boundary decides whether a returning node replays the log
+	// or takes a whole snapshot. A profile that says nothing has to keep taking
+	// the replica's defaults, or every existing cluster changes behaviour on
+	// upgrade; a profile that pins it small is how a test reaches the snapshot
+	// path in a dozen writes rather than five thousand.
+	t.Run("meta table", func(t *testing.T) {
+		cfg, err := Load(write(t, base+`
+[meta]
+snapshot_interval_seconds = 1
+snapshot_threshold = 4
+trailing_logs = 8
+`))
+		require.NoError(t, err)
+		assert.Equal(t, Meta{SnapshotIntervalSeconds: 1, SnapshotThreshold: 4, TrailingLogs: 8}, cfg.Meta)
+
+		absent, err := Load(write(t, base))
+		require.NoError(t, err)
+		assert.Equal(t, Meta{}, absent.Meta, "an absent [meta] leaves every knob at the replica's default")
+	})
+
 	t.Run("rs availability settings", func(t *testing.T) {
 		cfg, err := Load(write(t, base+"degraded_writes = true\nhinted_handoff = true\n"))
 		require.NoError(t, err)

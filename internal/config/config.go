@@ -168,6 +168,20 @@ type Compaction struct {
 	IntervalSeconds int `toml:"interval_seconds"`
 }
 
+// Meta tunes the metadata plane's raft log retention. Every zero takes the
+// replica's own default, so a profile that says nothing behaves as before.
+//
+// TrailingLogs is the one that decides how a returning node catches up: within
+// it the leader replays log entries, past it the node takes a whole snapshot.
+// It is configuration rather than a constant because a test needs to cross
+// that boundary in a dozen writes and production needs it not to be crossed at
+// all.
+type Meta struct {
+	SnapshotIntervalSeconds int    `toml:"snapshot_interval_seconds"`
+	SnapshotThreshold       uint64 `toml:"snapshot_threshold"`
+	TrailingLogs            uint64 `toml:"trailing_logs"`
+}
+
 // S3 tunes the gate's HTTP surface, as opposed to the S3 semantics above it.
 type S3 struct {
 	// EnableHTTP2 advertises h2 ahead of http/1.1 over ALPN. Unset means on:
@@ -238,6 +252,8 @@ type Config struct {
 	Repair Repair `toml:"repair"`
 
 	Compaction Compaction `toml:"compaction"`
+
+	Meta Meta `toml:"meta"`
 
 	S3 S3 `toml:"s3"`
 

@@ -242,6 +242,10 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 			Listeners: lns,
 			Resolver:  res,
 			OnLeader:  barrier.open,
+
+			SnapshotInterval:  time.Duration(cfg.Meta.SnapshotIntervalSeconds) * time.Second,
+			SnapshotThreshold: cfg.Meta.SnapshotThreshold,
+			TrailingLogs:      cfg.Meta.TrailingLogs,
 		})
 		if merr != nil {
 			cleanup()
