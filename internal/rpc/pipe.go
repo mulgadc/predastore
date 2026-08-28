@@ -7,7 +7,8 @@ import (
 	"sync"
 )
 
-var ErrNoRegistry = errors.New("no registry provided")
+var ErrInvalidAddr = errors.New("invalid address")
+var ErrNoRegistry = errors.New("no registry")
 var ErrAddrInUse = errors.New("address already in use")
 var ErrConnRefused = errors.New("connection refused")
 
@@ -26,8 +27,8 @@ func (pr *PipeRegistry) put(new *PipeTransport) bool {
 
 	key := new.addr.String()
 
-	old, ok := pr.trs[key]
-	if ok && old != nil {
+	_, ok := pr.trs[key]
+	if ok {
 		return false
 	}
 
@@ -59,6 +60,10 @@ type PipeTransport struct {
 }
 
 func NewPipeTransport(addr net.Addr, reg *PipeRegistry) (*PipeTransport, error) {
+	if addr == nil {
+		return nil, ErrInvalidAddr
+	}
+
 	if reg == nil {
 		return nil, ErrNoRegistry
 	}
@@ -90,12 +95,15 @@ func (pt *PipeTransport) Accept() (net.Conn, error) {
 func (pt *PipeTransport) Addr() net.Addr { return pt.addr }
 
 func (pt *PipeTransport) Close() error {
+	err := net.ErrClosed
+
 	pt.once.Do(func() {
 		pt.registry.delete(pt.addr)
 		close(pt.done)
+		err = nil
 	})
 
-	return nil
+	return err
 }
 
 func (pt *PipeTransport) Dial(ctx context.Context, addr net.Addr) (net.Conn, error) {
