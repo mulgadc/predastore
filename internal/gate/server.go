@@ -185,6 +185,29 @@ func alpnProtocols(enableHTTP2 bool) []string {
 // httpProtocols mirrors alpnProtocols for the server's own wiring. Both are
 // needed: Serve installs the h2 handler whenever TLSConfig mentions h2, so
 // leaving this unset would contradict the ALPN list above.
+// newHTTPServer builds the S3 listener's server.
+//
+// It sets no ReadTimeout or WriteTimeout deliberately. Both are whole-body
+// bounds by construction, so neither can express "the peer is still sending"
+// and either would cap an object at whatever transfers inside it — a 60s
+// WriteTimeout is a few gigabytes and no more. requestDeadlineMiddleware
+// applies the equivalent per request and releases it for object data, whose
+// bodies are bounded by progress instead.
+//
+// The bounds that remain are the ones on fixed-size work: the header
+// exchange, and an idle connection nobody is using.
+func newHTTPServer(addr string, handler http.Handler, tlsCfg *tls.Config, protocols *http.Protocols) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		TLSConfig:         tlsCfg,
+		Protocols:         protocols,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+}
+
 func httpProtocols(enableHTTP2 bool) *http.Protocols {
 	var p http.Protocols
 	p.SetHTTP1(true)
@@ -216,17 +239,7 @@ func (s *Server) Run(ctx context.Context) error {
 	protocols := httpProtocols(s.cfg.EnableHTTP2)
 
 	addr := net.JoinHostPort(s.cfg.Addr, strconv.Itoa(s.cfg.Port))
-	httpSrv := &http.Server{
-		Addr:              addr,
-		Handler:           s.router,
-		TLSConfig:         tlsCfg,
-		Protocols:         protocols,
-		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,
-		MaxHeaderBytes:    1 << 20,
-	}
+	httpSrv := newHTTPServer(addr, s.router, tlsCfg, protocols)
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

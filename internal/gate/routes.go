@@ -60,15 +60,19 @@ func (s *Server) setupRoutes(ring *placement.Ring) {
 		r.Use(resolveObject)
 		s.useRequestChain(r)
 
+		// bulkBody marks the four handlers that move object data. They share a
+		// method and pattern with cheap ones, so the choice is made here rather
+		// than by route: a request deadline that applies to a body caps the
+		// object at whatever fits in it.
 		r.Method(http.MethodHead, "/{bucket}/*", handlers.HeadObject(mc, ring, cache, cfg))
 		r.Method(http.MethodGet, "/{bucket}/*", byQuery("uploadId",
 			handlers.ListParts(mc, cache),
-			handlers.GetObject(mc, bc, ring, cache, cfg)))
+			bulkBody(handlers.GetObject(mc, bc, ring, cache, cfg))))
 		r.Method(http.MethodPut, "/{bucket}/*", byQuery("partNumber",
-			handlers.UploadPart(mc, bc, ring, cache, cfg),
-			handlers.PutObject(mc, bc, ring, cache, cfg)))
+			bulkBody(handlers.UploadPart(mc, bc, ring, cache, cfg)),
+			bulkBody(handlers.PutObject(mc, bc, ring, cache, cfg))))
 		r.Method(http.MethodPost, "/{bucket}/*", byQuery("uploadId",
-			handlers.CompleteMultipartUpload(mc, bc, ring, cache, cfg),
+			bulkBody(handlers.CompleteMultipartUpload(mc, bc, ring, cache, cfg)),
 			handlers.CreateMultipartUpload(mc, cache)))
 		r.Method(http.MethodDelete, "/{bucket}/*", byQuery("uploadId",
 			handlers.AbortMultipartUpload(mc, bc, cache),

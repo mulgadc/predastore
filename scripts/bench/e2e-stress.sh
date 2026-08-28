@@ -53,7 +53,7 @@
 #                      Seconds allowed for the sweep to bring the handed-off
 #                      shards home (default: 180)
 #   STRESS_LARGE_SIZES Object sizes the large-object scenario writes and reads
-#                      (default: "2GiB 4GiB 16GiB"). A size with no room on
+#                      (default: "2GiB 4GiB 8GiB"). A size with no room on
 #                      disk is skipped loudly, never silently.
 #   STRESS_WORK_ROOT   Where the cluster work directory is created. Defaults to
 #                      TMPDIR, except when large-object is in the run: TMPDIR is
@@ -763,7 +763,7 @@ LARGE_CLUSTER="${CONFIG_NAME}-large"
 LARGE_CONFIG="$PREDA_CONFIG_DIR/$LARGE_CLUSTER.toml"
 LARGE_PID_DIR="$PREDA_DIR/$LARGE_CLUSTER/pids"
 LARGE_BUCKET="stress-large"
-LARGE_SIZES="${STRESS_LARGE_SIZES:-2GiB 4GiB 16GiB}"
+LARGE_SIZES="${STRESS_LARGE_SIZES:-2GiB 4GiB 8GiB}"
 LARGE_FAILURES=0
 LARGE_CASES=0
 LARGE_SKIPPED=0

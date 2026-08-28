@@ -21,20 +21,77 @@ import (
 // independent of the region they are configured for or the endpoint they target.
 const globalSigningRegion = "us-east-1"
 
-// requestDeadline bounds the work one request may do. It sits below the
-// server's WriteTimeout so the gate wins the race and can answer with an error
-// naming the fault, instead of the connection being reset with no explanation
-// logged on either side.
+// requestDeadline bounds the work one request may do, so the gate answers with
+// an error naming the fault instead of the connection being reset with no
+// explanation logged on either side.
+//
+// It is a bound on the fixed exchanges, not on object data. A body is bounded
+// by progress instead: see bulkBody.
 const requestDeadline = 50 * time.Second
 
-// requestDeadlineMiddleware puts requestDeadline on the request context, so
-// every context-aware call below inherits a bound rather than relying on the
-// transport to eventually give up.
+type deadlineStopperKey struct{}
+
+// deadlineStopper releases the request deadline. It is carried in the context
+// rather than applied per route because the bulk handlers share a method and
+// pattern with cheap ones, so which of them is running is not known until
+// after routing has picked between them.
+type deadlineStopper struct{ stop func() }
+
+// requestDeadlineMiddleware bounds a request by requestDeadline, at the
+// context and at the connection, and gives the handler a way to release it.
+//
+// The timer is separate from the context so it can be stopped without
+// cancelling: a bulk handler needs the cancellation, which is how a client
+// going away stops the work, and not the deadline.
 func requestDeadlineMiddleware(next http.Handler) http.Handler {
+	return deadlineMiddleware(requestDeadline, next)
+}
+
+func deadlineMiddleware(within time.Duration, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, cancel := context.WithTimeout(r.Context(), requestDeadline)
+		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
-		next.ServeHTTP(w, r.WithContext(ctx))
+
+		timer := time.AfterFunc(within, cancel)
+		defer timer.Stop()
+
+		rc := http.NewResponseController(w)
+		setConnDeadlines(r.Context(), rc, time.Now().Add(within))
+
+		stopper := &deadlineStopper{stop: func() {
+			timer.Stop()
+			setConnDeadlines(r.Context(), rc, time.Time{})
+		}}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(ctx, deadlineStopperKey{}, stopper)))
+	})
+}
+
+// setConnDeadlines applies a read and write deadline to the connection, or
+// clears both when t is zero. A protocol that does not support them is not an
+// error: the context bound still applies, and h2 streams are already bounded
+// by the server's own limits.
+func setConnDeadlines(ctx context.Context, rc *http.ResponseController, t time.Time) {
+	if err := rc.SetReadDeadline(t); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		slog.DebugContext(ctx, "set read deadline", "err", err)
+	}
+	if err := rc.SetWriteDeadline(t); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		slog.DebugContext(ctx, "set write deadline", "err", err)
+	}
+}
+
+// bulkBody releases the request deadline for the handlers that move object
+// data. Those bodies are bounded by progress instead, by the blob client's
+// idle guard, because a total cap cannot express "still sending" and a
+// multi-gigabyte transfer is legitimately slow.
+//
+// Cancellation survives, so a client that disconnects still stops the work,
+// and the deadline was in force for everything before the handler ran.
+func bulkBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if stopper, ok := r.Context().Value(deadlineStopperKey{}).(*deadlineStopper); ok {
+			stopper.stop()
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
