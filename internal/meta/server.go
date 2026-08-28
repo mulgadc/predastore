@@ -147,6 +147,7 @@ func (s *Server) open() (*rpc.Server, error) {
 		return nil, fmt.Errorf("open badger: %w", err)
 	}
 	s.fsm = NewFSM(s.badgerDB)
+	s.fsm.node = s.cfg.NodeID
 
 	s.bolt, err = raftboltdb.NewBoltStore(filepath.Join(s.cfg.DataDir, "raft.db"))
 	if err != nil {
@@ -164,6 +165,10 @@ func (s *Server) open() (*rpc.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create raft: %w", err)
 	}
+	// NewRaft replays any local snapshot before it returns, so every restore
+	// from here on is one a leader sent because this replica fell outside the
+	// log it retains. That is the difference the FSM cannot see for itself.
+	s.fsm.serving.Store(true)
 	// Consensus state is only observable once raft exists. A failure to
 	// register loses the gauges, not the replica, so it is logged and left.
 	unregister, err := telemetry.RegisterRaftGauges(s.raftSnapshot)

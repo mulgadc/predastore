@@ -8,9 +8,12 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/hashicorp/raft"
+	"github.com/mulgadc/predastore/internal/config"
 )
 
 // CommandType represents the type of operation.
@@ -32,6 +35,20 @@ type Command struct {
 type FSM struct {
 	mu sync.RWMutex
 	db *badger.DB
+
+	// node labels the snapshot lifecycle logs, which are otherwise
+	// indistinguishable between the replicas colocated in one process.
+	node config.NodeID
+
+	// applied is the last index Apply saw. raft does not tell Snapshot which
+	// index it is capturing, so a snapshot log line can only name one if the
+	// FSM tracks it.
+	applied atomic.Uint64
+
+	// serving separates the restore raft performs while it is being
+	// constructed from one a leader sends afterwards. Only the second is a
+	// node catching up, and it is the one worth an alarm.
+	serving atomic.Bool
 }
 
 // NewFSM creates a new FSM with the given Badger database.
@@ -42,6 +59,8 @@ func NewFSM(db *badger.DB) *FSM {
 // Apply is called once a log entry is committed by Raft
 // It applies the command to the Badger database.
 func (f *FSM) Apply(log *raft.Log) any {
+	f.applied.Store(log.Index)
+
 	var cmd Command
 	if err := json.Unmarshal(log.Data, &cmd); err != nil {
 		return fmt.Errorf("failed to unmarshal command: %w", err)
@@ -75,7 +94,14 @@ func (f *FSM) applyDelete(key string) error {
 }
 
 // Snapshot returns an FSMSnapshot for creating a point-in-time snapshot.
+//
+// The capture is timed in microseconds rather than milliseconds on purpose.
+// raft's contract is that this returns immediately and the cost falls in
+// Persist, so a healthy capture is tens of microseconds and Milliseconds would
+// truncate every one of them to zero.
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
+	started := time.Now()
+
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
@@ -102,7 +128,12 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 		return nil, err
 	}
 
-	return &FSMSnapshot{data: data}, nil
+	index := f.applied.Load()
+	slog.Info("meta: snapshot captured",
+		"node", f.node, "index", index, "entries", len(data),
+		"duration_us", time.Since(started).Microseconds())
+
+	return &FSMSnapshot{node: f.node, index: index, data: data}, nil
 }
 
 // snapshotEntry is one key/value pair read from a snapshot stream.
@@ -118,6 +149,17 @@ type snapshotEntry struct{ key, value []byte }
 // format.
 func (f *FSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
+
+	started := time.Now()
+
+	// A restore before the replica serves is raft rebuilding local state on
+	// start. One after it is a leader sending a snapshot because this node
+	// fell outside the log it retains, which is the event an operator wants
+	// to know about and the one a test asserts the path on.
+	if f.serving.Load() {
+		slog.Warn("meta: catching up by snapshot install", "node", f.node)
+	}
+	slog.Info("meta: restoring from snapshot", "node", f.node, "install", f.serving.Load())
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -163,6 +205,14 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	if err := wb.Flush(); err != nil {
 		return fmt.Errorf("restore: flush batch: %w", err)
 	}
+
+	// The store was dropped and rewritten, so every entry counts as written and
+	// there is nothing to report as unchanged. Restoring by merge is what makes
+	// those counts meaningful, and it adds them here when it lands.
+	slog.Info("meta: snapshot restored",
+		"node", f.node, "entries", len(entries),
+		"duration_ms", time.Since(started).Milliseconds())
+
 	return nil
 }
 
@@ -286,7 +336,9 @@ func (f *FSM) ScanFrom(prefix, after string, fn func(key string, value []byte) e
 
 // FSMSnapshot implements raft.FSMSnapshot.
 type FSMSnapshot struct {
-	data map[string][]byte
+	node  config.NodeID
+	index uint64
+	data  map[string][]byte
 }
 
 // Persist writes the snapshot to the given sink as a stream of length-prefixed
@@ -297,10 +349,14 @@ type FSMSnapshot struct {
 // silently rewrites those bytes to U+FFFD and loses the row on restore, so the
 // wire format must preserve keys byte-for-byte.
 func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
+	started := time.Now()
+	var written int64
+
 	err := func() error {
 		w := bufio.NewWriter(sink)
 		var lenBuf [4]byte
 		for k, v := range s.data {
+			written += int64(8 + len(k) + len(v))
 			binary.BigEndian.PutUint32(lenBuf[:], uint32(len(k))) //nolint:gosec // key length is bounded by badger's key-size limit.
 			if _, err := w.Write(lenBuf[:]); err != nil {
 				return err
@@ -326,8 +382,14 @@ func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
 		if cerr := sink.Cancel(); cerr != nil {
 			slog.Warn("Failed to cancel snapshot sink", "error", cerr)
 		}
+		return err
 	}
-	return err
+
+	slog.Info("meta: snapshot persisted",
+		"node", s.node, "index", s.index, "entries", len(s.data), "bytes", written,
+		"duration_ms", time.Since(started).Milliseconds())
+
+	return nil
 }
 
 // Release is called when the snapshot is no longer needed.
