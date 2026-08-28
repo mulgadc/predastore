@@ -778,7 +778,10 @@ func TestRegisterMetaGaugesReportsStorageState(t *testing.T) {
 	reader := withManualReader(t)
 
 	unregister, err := RegisterMetaGauges(func() MetaSnapshot {
-		return MetaSnapshot{NodeID: "2", FSMBytes: 4096, SnapshotIndex: 100, LastLogIndex: 175}
+		// The vlog figure is badger's own preallocated file size on env13,
+		// where it read a constant 2147483646 bytes on a node whose real
+		// metadata was tiny — the reason the two gauges were split apart.
+		return MetaSnapshot{NodeID: "2", FSMLSMBytes: 4096, FSMVLogBytes: 2147483646, SnapshotIndex: 100, LastLogIndex: 175}
 	})
 	if err != nil {
 		t.Fatalf("register: %v", err)
@@ -787,8 +790,11 @@ func TestRegisterMetaGaugesReportsStorageState(t *testing.T) {
 
 	m := collect(t, reader)
 	node := map[string]string{"node": "2"}
-	if got, _ := gaugeFor(t, m["predastore.meta.fsm.size_bytes"], node); got != 4096 {
-		t.Errorf("fsm size = %d, want 4096", got)
+	if got, _ := gaugeFor(t, m["predastore.meta.fsm.lsm_bytes"], node); got != 4096 {
+		t.Errorf("fsm lsm size = %d, want 4096", got)
+	}
+	if got, _ := gaugeFor(t, m["predastore.meta.fsm.vlog_bytes"], node); got != 2147483646 {
+		t.Errorf("fsm vlog size = %d, want 2147483646", got)
 	}
 	if got, _ := gaugeFor(t, m["predastore.meta.snapshot.index"], node); got != 100 {
 		t.Errorf("snapshot index = %d, want 100", got)
@@ -813,9 +819,11 @@ func TestRegisterMetaGaugesOmitsUnreadableFSMSize(t *testing.T) {
 	t.Cleanup(func() { _ = unregister() })
 
 	m := collect(t, reader)
-	if data, ok := m["predastore.meta.fsm.size_bytes"]; ok {
-		if g, isGauge := data.(metricdata.Gauge[int64]); isGauge && len(g.DataPoints) > 0 {
-			t.Errorf("fsm size emitted %d datapoints with no size to report, want none", len(g.DataPoints))
+	for _, name := range []string{"predastore.meta.fsm.lsm_bytes", "predastore.meta.fsm.vlog_bytes"} {
+		if data, ok := m[name]; ok {
+			if g, isGauge := data.(metricdata.Gauge[int64]); isGauge && len(g.DataPoints) > 0 {
+				t.Errorf("%s emitted %d datapoints with no size to report, want none", name, len(g.DataPoints))
+			}
 		}
 	}
 }
@@ -1060,7 +1068,7 @@ func recordEveryInstrument(t *testing.T) map[string]metricdata.Aggregation {
 
 	// A populated FSM size, since an unread one is deliberately not observed.
 	unregisterMeta, err := RegisterMetaGauges(func() MetaSnapshot {
-		return MetaSnapshot{NodeID: "1", FSMBytes: 1024, SnapshotIndex: 10, LastLogIndex: 20}
+		return MetaSnapshot{NodeID: "1", FSMLSMBytes: 1024, FSMVLogBytes: 2048, SnapshotIndex: 10, LastLogIndex: 20}
 	})
 	if err != nil {
 		t.Fatalf("register meta: %v", err)

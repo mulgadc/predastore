@@ -79,7 +79,8 @@ const (
 	metricMetaClientDuration  = "predastore.meta.client.duration"
 	metricMetaClientRedirects = "predastore.meta.client.redirects"
 
-	metricMetaFSMSizeBytes  = "predastore.meta.fsm.size_bytes"
+	metricMetaFSMLSMBytes   = "predastore.meta.fsm.lsm_bytes"
+	metricMetaFSMVLogBytes  = "predastore.meta.fsm.vlog_bytes"
 	metricMetaSnapshotIndex = "predastore.meta.snapshot.index"
 	metricMetaLogTrailing   = "predastore.meta.log.trailing"
 
@@ -106,7 +107,7 @@ var metricNames = []string{
 	metricBlobCompactionLastDuration, metricBlobIntegrityFailures,
 	metricObjectPhaseDuration,
 	metricMetaClientOps, metricMetaClientDuration, metricMetaClientRedirects,
-	metricMetaFSMSizeBytes, metricMetaSnapshotIndex, metricMetaLogTrailing,
+	metricMetaFSMLSMBytes, metricMetaFSMVLogBytes, metricMetaSnapshotIndex, metricMetaLogTrailing,
 	metricRPCConnections, metricRPCEvictions, metricRPCStreamsOpen,
 }
 
@@ -169,7 +170,8 @@ var (
 	metaClientDuration  metric.Float64Histogram
 	metaClientRedirects metric.Int64Counter
 
-	metaFSMSizeBytes  metric.Int64ObservableGauge
+	metaFSMLSMBytes   metric.Int64ObservableGauge
+	metaFSMVLogBytes  metric.Int64ObservableGauge
 	metaSnapshotIndex metric.Int64ObservableGauge
 	metaLogTrailing   metric.Int64ObservableGauge
 
@@ -366,8 +368,10 @@ func instruments() {
 			otel.Handle(err)
 		}
 
-		metaFSMSizeBytes = int64Gauge(metricMetaFSMSizeBytes,
-			"On-disk size of this replica's state machine. The single raft group's ceiling, visible before it is reached.", "By")
+		metaFSMLSMBytes = int64Gauge(metricMetaFSMLSMBytes,
+			"On-disk size of this replica's LSM tree, where badger keeps metadata values under its default threshold. The single raft group's ceiling, visible before it is reached.", "By")
+		metaFSMVLogBytes = int64Gauge(metricMetaFSMVLogBytes,
+			"On-disk size of this replica's badger value log file. Badger preallocates this file, so it steps between fixed sizes rather than growing with the state machine.", "By")
 		metaSnapshotIndex = int64Gauge(metricMetaSnapshotIndex,
 			"Raft log index of this replica's last snapshot.", "{index}")
 		metaLogTrailing = int64Gauge(metricMetaLogTrailing,
@@ -1012,9 +1016,12 @@ func EnterRPCStream(ctx context.Context, node uint64) func() {
 type MetaSnapshot struct {
 	NodeID string
 
-	// FSMBytes is the state machine's on-disk size, or zero when it could not
-	// be read, which is reported as no observation rather than as an empty FSM.
-	FSMBytes int64
+	// FSMLSMBytes is the LSM tree's on-disk size, or zero when it could not be
+	// read, reported as no observation rather than as an empty state machine.
+	FSMLSMBytes int64
+	// FSMVLogBytes is the value log's on-disk size, or zero when it could not
+	// be read. Badger preallocates this file, so it steps rather than grows.
+	FSMVLogBytes int64
 
 	SnapshotIndex int64
 	LastLogIndex  int64
@@ -1034,8 +1041,11 @@ func RegisterMetaGauges(snapshot func() MetaSnapshot) (func() error, error) {
 		func(_ context.Context, o metric.Observer) error {
 			s := snapshot()
 			node := metric.WithAttributeSet(attribute.NewSet(attribute.String(nodeAttrKey, s.NodeID)))
-			if s.FSMBytes > 0 {
-				o.ObserveInt64(metaFSMSizeBytes, s.FSMBytes, node)
+			if s.FSMLSMBytes > 0 {
+				o.ObserveInt64(metaFSMLSMBytes, s.FSMLSMBytes, node)
+			}
+			if s.FSMVLogBytes > 0 {
+				o.ObserveInt64(metaFSMVLogBytes, s.FSMVLogBytes, node)
 			}
 			o.ObserveInt64(metaSnapshotIndex, s.SnapshotIndex, node)
 			// Trailing entries are what a snapshot would truncate. Clamped
@@ -1044,7 +1054,7 @@ func RegisterMetaGauges(snapshot func() MetaSnapshot) (func() error, error) {
 			o.ObserveInt64(metaLogTrailing, max(s.LastLogIndex-s.SnapshotIndex, 0), node)
 			return nil
 		},
-		metaFSMSizeBytes, metaSnapshotIndex, metaLogTrailing,
+		metaFSMLSMBytes, metaFSMVLogBytes, metaSnapshotIndex, metaLogTrailing,
 	)
 	if err != nil {
 		return nil, err

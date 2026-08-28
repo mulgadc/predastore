@@ -214,11 +214,13 @@ func (s *Server) metaSnapshot() telemetry.MetaSnapshot {
 		LastLogIndex:  parseRaftStat(stats["last_log_index"]),
 	}
 
-	// Size is the LSM tree plus the value log, which is what the FSM actually
-	// occupies on disk. Both are figures badger already maintains.
+	// The LSM tree and the value log are reported separately: badger
+	// preallocates the value log file, so its size steps rather than grows,
+	// and only the LSM tree tracks the state machine's real size on disk.
 	if s.badgerDB != nil {
 		lsm, vlog := s.badgerDB.Size()
-		snap.FSMBytes = lsm + vlog
+		snap.FSMLSMBytes = lsm
+		snap.FSMVLogBytes = vlog
 	}
 	return snap
 }
