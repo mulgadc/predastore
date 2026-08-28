@@ -74,13 +74,29 @@ func New(cfg Config) (*Server, error) {
 	cfg.HeartbeatTimeout = orDefault(cfg.HeartbeatTimeout, 1000*time.Millisecond)
 	cfg.ElectionTimeout = orDefault(cfg.ElectionTimeout, 1000*time.Millisecond)
 	cfg.CommitTimeout = orDefault(cfg.CommitTimeout, 50*time.Millisecond)
+	// raft's own defaults are 8192 and 10240, which covers about 5,100 object
+	// writes: any outage longer than that took a whole snapshot install.
+	// Retaining a million writes instead costs about 566 MB of bolt log, and
+	// bolt files never shrink, so this is a floor rather than a peak.
 	cfg.SnapshotInterval = orDefault(cfg.SnapshotInterval, 120*time.Second)
-	cfg.SnapshotThreshold = orDefault(cfg.SnapshotThreshold, uint64(8192))
-	cfg.TrailingLogs = orDefault(cfg.TrailingLogs, uint64(10240))
+	cfg.SnapshotThreshold = orDefault(cfg.SnapshotThreshold, snapshotThreshold)
+	cfg.TrailingLogs = orDefault(cfg.TrailingLogs, trailingLogs)
 	cfg.LeaderLeaseTimeout = orDefault(cfg.LeaderLeaseTimeout, 500*time.Millisecond)
 
 	return &Server{cfg: cfg}, nil
 }
+
+const (
+	// trailingLogs is how far back a replica can fall and still catch up by
+	// replaying the log instead of taking the whole keyspace.
+	trailingLogs = 2_000_000
+
+	// snapshotThreshold is set to the same figure on purpose. A snapshot
+	// writes the whole store, so taking one every T entries costs each write
+	// an amortised store/T on top of itself: a threshold well under the row
+	// count is write amplification. See the sizing rule in DESIGN.md.
+	snapshotThreshold = 2_000_000
+)
 
 // orDefault replaces an unset value with the default for its field.
 func orDefault[T comparable](v, def T) T {

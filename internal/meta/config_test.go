@@ -55,6 +55,6 @@ func TestUnsetRaftTuningTakesTheDefaults(t *testing.T) {
 	got := tunedServer(t, Config{})
 
 	assert.Equal(t, 120*time.Second, got.SnapshotInterval)
-	assert.Equal(t, uint64(8192), got.SnapshotThreshold)
-	assert.Equal(t, uint64(10240), got.TrailingLogs)
+	assert.Equal(t, uint64(2_000_000), got.SnapshotThreshold)
+	assert.Equal(t, uint64(2_000_000), got.TrailingLogs)
 }

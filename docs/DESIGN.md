@@ -228,7 +228,11 @@ One pool serves both directions: the client dials peers from it and the rpc serv
 
 Bolt stores *how to build the state*; badger stores *the state*. That split is what the Raft protocol requires.
 
-Snapshots are a stream of length-prefixed frames: big-endian `uint32` key length, key, big-endian `uint32` value length, value. Text encodings are unusable here, because object rows are keyed by a raw sha256 and JSON rewrites every byte that is not valid UTF-8 to U+FFFD, silently losing the row on restore. The legacy JSON map format is still read on restore (the first byte disambiguates) so a node upgraded on top of an old store still starts; new snapshots are always written as frames. Restore drops the FSM with badger's own bulk clear and rewrites through a `WriteBatch`, because a single transaction is capped and a metadata set that outgrew that cap used to make every snapshot permanently unrestorable — on every replica at once.
+Snapshots are a stream of length-prefixed frames in key order, behind a four-byte marker: big-endian `uint32` key length, key, big-endian `uint32` value length, value. Text encodings are unusable here, because object rows are keyed by a raw sha256 and JSON rewrites every byte that is not valid UTF-8 to U+FFFD, silently losing the row on restore.
+
+Capturing a snapshot takes a badger read transaction and returns, so it costs microseconds and does not block `Apply`; the store walk happens in `Persist`, which raft runs on its own goroutine. Restoring merge-joins the stream against the local store and writes only what differs, so a replica never passes through an empty window and an interrupted restore converges when it is re-run. Snapshot wins every comparison, which needs no policy behind it: a snapshot is a prefix of the committed log, and raft truncates any divergent suffix before `Restore` is called.
+
+Two older formats still restore, by clearing the store and rewriting it — the legacy JSON map, and an unsorted frame stream from before the marker existed — so a node upgraded on top of an old store still starts and a follower can take a snapshot from a leader on the previous version. That path clears with badger's own bulk clear and rewrites through a `WriteBatch`, because a single transaction is capped and a metadata set that outgrew that cap used to make every snapshot permanently unrestorable, on every replica at once.
 
 Commands are JSON: a type (put or delete), a key and a value, all binary-safe.
 
@@ -247,11 +251,21 @@ HeartbeatTimeout:   1000 * time.Millisecond
 ElectionTimeout:    1000 * time.Millisecond
 CommitTimeout:      50 * time.Millisecond
 SnapshotInterval:   120 * time.Second
-SnapshotThreshold:  8192
-TrailingLogs:       10240
+SnapshotThreshold:  2_000_000
+TrailingLogs:       2_000_000
 LeaderLeaseTimeout: 500 * time.Millisecond
 LeaderTimeout:      30 * time.Second   // how long the gate barrier waits
 ```
+
+### Sizing the snapshot knobs
+
+`TrailingLogs` is how far a replica may fall behind and still catch up by replaying the log rather than taking the whole keyspace. raft's default of 10240 covers about 5,100 object writes, so almost any real outage became a full snapshot install. Two million covers roughly a million object writes for about 566 MB of bolt log — and bolt files never shrink, so that is a permanent floor on `raft.db`, not a peak.
+
+`SnapshotInterval` is a *check* interval, not a snapshot frequency. `runSnapshots` wakes on a randomised 120–240s timer and only takes one when `lastIndex - lastSnapshotIndex >= SnapshotThreshold`. At the default threshold a cluster writing 100 objects a second snapshots about every five and a half hours.
+
+**`SnapshotThreshold` is the knob that decides cost, and it should be set to about the row count.** A snapshot writes the whole store, so at `N` rows of `r` bytes it costs `N × r` and is taken once per `T` entries: each write carries an amortised `N × r / T` on top of its own `r`, making write amplification `N / T`. A threshold well below the row count is amplification; one well above it is a longer replay after a restart, which is far cheaper. The default suits the few-million-object clusters this is built for. **A store an order of magnitude larger needs it raised** — at a billion rows, a threshold of two million is roughly 500× amplification against a store of a few hundred GB.
+
+The log peaks at `TrailingLogs + SnapshotThreshold` entries before compaction, so the defaults imply about 1.1 GB. The snapshot store retains two (`NewFileSnapshotStore(..., 2, ...)`), so a large store also costs twice its size on disk in snapshots.
 
 Bootstrap is attempted by every replica. The peer set is identical across them, so the attempt is idempotent and an already-bootstrapped cluster reports `ErrCantBootstrap`, which is ignored.
 
@@ -571,8 +585,8 @@ parity = 1
 
 # [meta]                        # raft log retention on the metadata plane
 # snapshot_interval_seconds = 0 # zero defaults to 120
-# snapshot_threshold        = 0 # zero defaults to 8192
-# trailing_logs             = 0 # zero defaults to 10240; decides replay vs snapshot install
+# snapshot_threshold        = 0 # zero defaults to 2000000; size it to the row count
+# trailing_logs             = 0 # zero defaults to 2000000; decides replay vs snapshot install
 
 [[host]]
 id   = 1
