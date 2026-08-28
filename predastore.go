@@ -13,12 +13,18 @@ package predastore
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"slices"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
+	"github.com/mulgadc/predastore/internal/admin"
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate"
@@ -94,20 +100,29 @@ func Run(ctx context.Context, opts Options) error {
 
 	// Every node is built before any of them starts. A node that dialed a
 	// colocated peer first would otherwise find no listener registered for it.
-	runs := make([]func(context.Context) error, 0, len(host.Nodes))
+	runs := make([]func(context.Context) error, 0, len(host.Nodes)+1)
 	cleanups := make([]func(), 0, len(host.Nodes))
+	var checks []admin.Check
 	defer func() {
 		for _, cleanup := range cleanups {
 			cleanup()
 		}
 	}()
 	for _, n := range host.Nodes {
-		run, cleanup, err := buildNode(cfg, host, n, opts, barrier)
+		built, err := buildNode(cfg, host, n, opts, barrier)
 		if err != nil {
 			return err
 		}
-		runs = append(runs, run)
-		cleanups = append(cleanups, cleanup)
+		runs = append(runs, built.run)
+		cleanups = append(cleanups, built.cleanup)
+		checks = append(checks, built.checks...)
+	}
+
+	// The admin listener binds the cluster plane, never the gate's S3 address:
+	// health is operator traffic and that address is public by design.
+	if host.AdminPort != 0 {
+		addr := net.JoinHostPort(config.HostBindAddr(host), strconv.Itoa(host.AdminPort))
+		runs = append(runs, admin.New(addr, checks).Run)
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -117,11 +132,107 @@ func Run(ctx context.Context, opts Options) error {
 	return g.Wait()
 }
 
+// probeKey is a key nothing writes. A probe wants an answer rather than data,
+// and "no such object" is an answer only a working node can give.
+const probeKey = "predastore/readyz-probe"
+
+var probeShardKey [32]byte
+
+// probeReader is the meta read a readiness probe needs, and shardProber the
+// blob one. Both are narrowed to what the check calls so a probe can be tested
+// without a cluster behind it.
+type probeReader interface {
+	Get(ctx context.Context, key string) ([]byte, error)
+}
+
+type leaderReporter interface {
+	LeaderKnown() bool
+}
+
+type shardProber interface {
+	Get(ctx context.Context, node NodeID, req blob.GetRequest) (io.ReadCloser, error)
+}
+
+// leaderObserved fails while this replica sees no leader. Writes cannot commit
+// without one, so a gate in front of it would accept requests it cannot serve.
+func leaderObserved(svc leaderReporter) admin.Check {
+	return admin.Check{
+		Name: "meta_leader",
+		Probe: func(context.Context) error {
+			if !svc.LeaderKnown() {
+				return errors.New("no raft leader observed")
+			}
+			return nil
+		},
+	}
+}
+
+// metaReachable asks the meta plane for a key that is not there. A missing key
+// is the healthy answer: the read reached a replica and came back.
+func metaReachable(mc probeReader) admin.Check {
+	return admin.Check{
+		Name: "meta_reachable",
+		Probe: func(ctx context.Context) error {
+			if _, err := mc.Get(ctx, probeKey); err != nil && !errors.Is(err, meta.ErrNotFound) {
+				return err
+			}
+			return nil
+		},
+	}
+}
+
+// blobNodesReachable fails when fewer than the data-shard count answer. Losing
+// parity nodes degrades reads; losing more than parity ends them, so the
+// threshold is the number of shards a read cannot be reconstructed without.
+func blobNodesReachable(bc shardProber, nodes []NodeID, need int) admin.Check {
+	return admin.Check{
+		Name: "blob_nodes",
+		Probe: func(ctx context.Context) error {
+			var reached atomic.Int64
+			var wg sync.WaitGroup
+			for _, id := range nodes {
+				wg.Go(func() {
+					if blobAnswers(ctx, bc, id) {
+						reached.Add(1)
+					}
+				})
+			}
+			wg.Wait()
+
+			if got := int(reached.Load()); got < need {
+				return fmt.Errorf("%d of %d blob nodes answered, need %d", got, len(nodes), need)
+			}
+			return nil
+		},
+	}
+}
+
+// blobAnswers reports whether a blob node served a read at all. A node that
+// says the shard is missing has opened its store and answered, which is the
+// whole question.
+func blobAnswers(ctx context.Context, bc shardProber, id NodeID) bool {
+	body, err := bc.Get(ctx, id, blob.GetRequest{Key: probeShardKey, RangeStart: -1, RangeEnd: -1})
+	if err == nil {
+		_ = body.Close()
+		return true
+	}
+	return errors.Is(err, blob.ErrNotFound)
+}
+
+// builtNode is one node's lifecycle and the readiness questions it can answer.
+// A node contributes only what it holds a client or a replica for, so a probe
+// describes the process it reached rather than the cluster as a whole.
+type builtNode struct {
+	run     func(context.Context) error
+	cleanup func()
+	checks  []admin.Check
+}
+
 // buildNode builds one node of this host: the transports it is reached over,
 // the rpc plumbing around them and the service it runs. Nothing listens or
 // dials until run is called, and cleanup releases what run does not.
 func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier leaderBarrier) (
-	run func(context.Context) error, cleanup func(), err error,
+	built builtNode, err error,
 ) {
 	// A gate's port is its S3 port, so its rpc sockets bind ephemerally.
 	port := n.Port
@@ -140,7 +251,7 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 	if hasRemoteNodes(cfg, host.ID) {
 		quic, qerr := transport.NewQUICTransport(config.HostBindAddr(host), port, host.TLSCert, host.TLSKey)
 		if qerr != nil {
-			return nil, nil, fmt.Errorf("node %d quic transport: %w", n.ID, qerr)
+			return builtNode{}, fmt.Errorf("node %d quic transport: %w", n.ID, qerr)
 		}
 		trs = append(trs, quic)
 	}
@@ -149,7 +260,7 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 	// server of its own; closing it and the transports is all a node leaves
 	// behind, since every service releases what it opened.
 	var pool *rpc.ConnPool
-	cleanup = func() {
+	cleanup := func() {
 		if pool != nil {
 			_ = pool.Close()
 		}
@@ -161,7 +272,7 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 	res, err := rpc.NewResolver(cfg, n.ID, trs...)
 	if err != nil {
 		cleanup()
-		return nil, nil, err
+		return builtNode{}, err
 	}
 
 	// Nothing dials a gate, so it listens on nothing: the S3 frontend is
@@ -172,7 +283,7 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 			ln, lerr := tr.Listen()
 			if lerr != nil {
 				cleanup()
-				return nil, nil, fmt.Errorf("node %d listen on %s: %w", n.ID, tr.Network(), lerr)
+				return builtNode{}, fmt.Errorf("node %d listen on %s: %w", n.ID, tr.Network(), lerr)
 			}
 			lns = append(lns, ln)
 		}
@@ -180,6 +291,7 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 
 	dir := config.NodeDataDir(host, n)
 	var serve func(context.Context) error
+	var checks []admin.Check
 
 	switch n.Role {
 	case RoleGate:
@@ -193,17 +305,17 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		})
 		if cerr != nil {
 			cleanup()
-			return nil, nil, fmt.Errorf("create s3 gate: %w", cerr)
+			return builtNode{}, fmt.Errorf("create s3 gate: %w", cerr)
 		}
 		blobClient, cerr := blob.NewClient(blob.ClientConfig{Client: cli})
 		if cerr != nil {
 			cleanup()
-			return nil, nil, fmt.Errorf("create s3 gate: %w", cerr)
+			return builtNode{}, fmt.Errorf("create s3 gate: %w", cerr)
 		}
 		gw, gerr := gate.New(gateConfig(cfg, host, n, metaClient, blobClient))
 		if gerr != nil {
 			cleanup()
-			return nil, nil, fmt.Errorf("create s3 gate: %w", gerr)
+			return builtNode{}, fmt.Errorf("create s3 gate: %w", gerr)
 		}
 		serve = func(ctx context.Context) error {
 			select {
@@ -212,6 +324,11 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 			}
 			return gw.Run(ctx)
 		}
+		// The gate is the one role holding a client for each plane, so it is
+		// where reaching them can be asked about at all.
+		checks = append(checks,
+			metaReachable(metaClient),
+			blobNodesReachable(blobClient, nodeIDs(nodesByRole(cfg, RoleBlob)), cfg.RS.Data))
 
 	case RoleBlob:
 		// The node owns its store: it creates the directory, opens the engine
@@ -225,7 +342,7 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		})
 		if berr != nil {
 			cleanup()
-			return nil, nil, fmt.Errorf("create blob node %d: %w", n.ID, berr)
+			return builtNode{}, fmt.Errorf("create blob node %d: %w", n.ID, berr)
 		}
 		serve = svc.Run
 
@@ -245,20 +362,21 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		})
 		if merr != nil {
 			cleanup()
-			return nil, nil, fmt.Errorf("create meta replica %d: %w", n.ID, merr)
+			return builtNode{}, fmt.Errorf("create meta replica %d: %w", n.ID, merr)
 		}
 		serve = svc.Run
+		checks = append(checks, leaderObserved(svc))
 
 	default:
 		cleanup()
-		return nil, nil, fmt.Errorf("node %d has unknown role %q", n.ID, n.Role)
+		return builtNode{}, fmt.Errorf("node %d has unknown role %q", n.ID, n.Role)
 	}
 
-	run = func(ctx context.Context) error {
+	run := func(ctx context.Context) error {
 		if err := serve(ctx); err != nil {
 			return fmt.Errorf("node %d: %w", n.ID, err)
 		}
 		return nil
 	}
-	return run, cleanup, nil
+	return builtNode{run: run, cleanup: cleanup, checks: checks}, nil
 }

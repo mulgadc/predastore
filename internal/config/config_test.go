@@ -141,3 +141,58 @@ func TestValidate_NodeBindAddr(t *testing.T) {
 		require.NoError(t, c.Validate())
 	})
 }
+
+// TestValidate_AdminPort covers the admin listener's port: it shares the host's
+// cluster plane with the nodes, so it collides with theirs the same way, and a
+// host that names none simply runs no listener.
+func TestValidate_AdminPort(t *testing.T) {
+	cfg := func(port int) *Config {
+		return &Config{
+			Version: Version,
+			Region:  "ap-southeast-2",
+			RS:      RS{Data: 1, Parity: 0},
+			Hosts: []Host{{
+				ID:        1,
+				Addr:      "10.0.0.1",
+				AdminPort: port,
+				Nodes: []Node{
+					{ID: 1, Role: RoleGate, Port: 8443},
+					{ID: 2, Role: RoleBlob, Port: 9991, DataDir: "/var/lib/predastore/blob"},
+				},
+			}},
+		}
+	}
+
+	t.Run("absent runs no listener", func(t *testing.T) {
+		require.NoError(t, cfg(0).Validate())
+	})
+
+	t.Run("accepted on a free port", func(t *testing.T) {
+		require.NoError(t, cfg(9100).Validate())
+	})
+
+	t.Run("rejected on a node's port", func(t *testing.T) {
+		err := cfg(9991).Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "already used by node 2")
+	})
+
+	// The S3 port is the one it must never take: answering health there would
+	// put it on the public interface, which is the whole reason it is separate.
+	t.Run("rejected on the gate's S3 port", func(t *testing.T) {
+		err := cfg(8443).Validate()
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "already used by node 1")
+	})
+
+	t.Run("rejected when it is not a port", func(t *testing.T) {
+		for _, port := range []int{-1, 70000} {
+			err := cfg(port).Validate()
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "is not a port")
+		}
+	})
+}

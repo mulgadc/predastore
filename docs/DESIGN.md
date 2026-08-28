@@ -522,6 +522,7 @@ parity = 1
 id   = 1
 addr = "10.11.12.1"             # what peers dial; no port — nodes carry those
 # bind_addr      = "10.11.12.1" # where raft and blob listen; defaults to addr
+# admin_port     = 9100         # /healthz and /readyz on bind_addr; absent runs neither
 # data_dir       = "/var/lib/predastore"
 # encryption_key = "/etc/predastore/master.key"
 # tls_cert       = "/etc/predastore/server.pem"
@@ -583,9 +584,17 @@ On a multi-homed machine the host binds a private address and the gate binds `0.
 
 The defaults are the safe direction: a host that says nothing puts the cluster plane on `addr`, which is by construction the address peers dial and nothing wider.
 
+## The admin listener
+
+`admin_port` puts `/healthz` and `/readyz` on the cluster plane. Health is operator traffic and the S3 port is public, so it never shares one; the port is validated against the host's node ports the same way theirs are against each other, which is what stops it landing on the S3 port. It is a property of the process rather than a role, so it is written on `[[host]]` rather than becoming a fourth node role, and a host that names none runs no listener at all.
+
+`/healthz` is liveness: reaching the handler is the whole check, and a process whose cluster is broken still answers 200. Restarting it would not help.
+
+`/readyz` is what this process can serve, assembled from the roles the host runs. A meta replica contributes whether it observes a leader; a gate contributes a meta read and a probe of every blob node, and fails when fewer than `data` of them answer — below that a read cannot be reconstructed at all. Both probes ask for a key that does not exist, because a missing key is an answer only a working node can give. The response names each check and whether it passed, and nothing else: the port is unauthenticated, and a check's error carries addresses and object names.
+
 ## What validation rejects
 
-Version mismatch, missing region, an erasure code that is absent or invalid, `parity = 0` at any width but 1, `data + parity` exceeding the blob node count, duplicate host or node ids, an unknown role, a missing or duplicated port within a host, a port on a host or node address, a wildcard `addr`, a relative path anywhere, a `data_dir` on a gate, a `bind_addr` on anything but a gate, two gates on one host, two nodes deriving the same data directory, and two nodes at the same address. A malformed bucket name is dropped with a warning rather than being fatal, since the rest of the config is still serviceable.
+Version mismatch, missing region, an erasure code that is absent or invalid, `parity = 0` at any width but 1, `data + parity` exceeding the blob node count, duplicate host or node ids, an unknown role, a missing or duplicated port within a host, an `admin_port` that is out of range or already a node's, a port on a host or node address, a wildcard `addr`, a relative path anywhere, a `data_dir` on a gate, a `bind_addr` on anything but a gate, two gates on one host, two nodes deriving the same data directory, and two nodes at the same address. A malformed bucket name is dropped with a warning rather than being fatal, since the rest of the config is still serviceable.
 
 ## Dev profiles
 

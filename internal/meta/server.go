@@ -432,6 +432,13 @@ func (s *Server) leaderAddr() string {
 	return string(addr)
 }
 
+// LeaderKnown reports whether this replica currently observes a leader. It
+// reads local raft state only, so a replica partitioned from the cluster
+// answers false rather than blocking on a peer it cannot reach.
+func (s *Server) LeaderKnown() bool {
+	return s.raft.Leader() != ""
+}
+
 // status reports this replica's own view of the cluster: its raft state, the
 // leader it currently observes and where that leader would be dialed, and
 // its log position. It reads only local raft state, so it always succeeds —
