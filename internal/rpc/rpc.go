@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"net"
@@ -8,6 +9,11 @@ import (
 )
 
 const DefaultReadOpcodeTimeout = 2 * time.Second
+
+type Transport interface {
+	net.Listener
+	Dial(ctx context.Context, addr net.Addr) (net.Conn, error)
+}
 
 type Opcode uint16
 

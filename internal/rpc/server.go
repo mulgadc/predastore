@@ -3,19 +3,43 @@ package rpc
 import (
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 var ErrServerClosed = errors.New("server closed")
 
-type HandlerFunc func(ctx context.Context, conn io.ReadWriter)
+type HandleFunc func(ctx context.Context, conn net.Conn)
+
+type Mux struct {
+	mu  sync.RWMutex
+	fns map[Opcode]HandleFunc
+}
+
+func NewMux() *Mux {
+	return &Mux{fns: make(map[Opcode]HandleFunc)}
+}
+
+func (m *Mux) Handle(code Opcode, fn HandleFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fns[code] = fn
+}
+
+func (m *Mux) lookup(code Opcode) (HandleFunc, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	fn, ok := m.fns[code]
+	return fn, ok
+}
 
 type Server struct {
+	mux *Mux
+
 	acceptCtx     context.Context
 	cancelAccepts context.CancelFunc
 	listeners     sync.WaitGroup
@@ -27,53 +51,42 @@ type Server struct {
 	drainOnce sync.Once
 	drainDone chan struct{}
 
-	mu     sync.RWMutex
-	fns    map[Opcode]HandlerFunc
-	closed bool
+	closed atomic.Bool
 }
 
-func NewServer() *Server {
+type ServerConfig struct {
+	Mux *Mux
+}
+
+func NewServer(cfg *ServerConfig) *Server {
 	acceptCtx, cancelAccepts := context.WithCancel(context.Background())
 	handlersCtx, cancelHandlers := context.WithCancel(context.Background())
 
-	return &Server{
-		fns:            make(map[Opcode]HandlerFunc),
+	s := &Server{
+		mux:            NewMux(),
 		acceptCtx:      acceptCtx,
 		cancelAccepts:  cancelAccepts,
 		handlersCtx:    handlersCtx,
 		cancelHandlers: cancelHandlers,
 		drainDone:      make(chan struct{}),
 	}
-}
 
-func (s *Server) RegisterOpcode(code Opcode, fn HandlerFunc) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.fns[code] = fn
+	if cfg != nil {
+		if cfg.Mux != nil {
+			s.mux = cfg.Mux
+		}
+	}
+
+	return s
 }
 
 func (s *Server) Serve(l net.Listener) error {
-	closeListener := func() {
-		if err := l.Close(); err != nil {
-			slog.Error("rpc: server: failed to close listener", "error", err)
-		}
-	}
-
-	stop := context.AfterFunc(s.acceptCtx, func() { closeListener() })
-	defer func() {
-		if stop() {
-			closeListener()
-		}
-	}()
-
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
+	if s.closed.Load() {
 		return ErrServerClosed
 	}
+
 	s.listeners.Add(1)
 	defer s.listeners.Done()
-	s.mu.Unlock()
 
 	var delay time.Duration
 	for {
@@ -133,9 +146,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 		return
 	}
 
-	s.mu.RLock()
-	fn, ok := s.fns[code]
-	s.mu.RUnlock()
+	fn, ok := s.mux.lookup(code)
 	if !ok {
 		slog.Error("rpc: server: no matching handler found", "opcode", code)
 		return
@@ -147,36 +158,26 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) Close() error {
-	s.setClosed()
+	s.closed.Store(true)
 
 	s.cancelHandlers()
 	<-s.drain()
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	return nil
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	s.setClosed()
+	s.closed.Store(true)
 
 	select {
 	case <-s.drain():
 		s.cancelHandlers()
 
-		s.mu.RLock()
-		defer s.mu.RUnlock()
 		return nil
 
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-}
-
-func (s *Server) setClosed() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.closed = true
 }
 
 func (s *Server) drain() <-chan struct{} {
