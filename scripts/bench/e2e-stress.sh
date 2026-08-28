@@ -87,7 +87,7 @@ STALE_KEYS="${STRESS_STALE_KEYS:-12}"
 # running everything and reporting a pass for a test that was never named.
 SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
-    all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff|large-object) ;;
+    all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff|large-object|multipart-upload) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
 
@@ -97,7 +97,7 @@ esac
 # the memory figure the scenario exists to measure.
 WORK_ROOT="${TMPDIR:-/tmp}"
 case "$SCENARIO" in
-    all|large-object) WORK_ROOT="$HOME/.cache/predastore-e2e" ;;
+    all|large-object|multipart-upload) WORK_ROOT="$HOME/.cache/predastore-e2e" ;;
 esac
 WORK_ROOT="${STRESS_WORK_ROOT:-$WORK_ROOT}"
 mkdir -p "$WORK_ROOT"
@@ -1053,6 +1053,201 @@ run_large_object() {
         log "large-object: FAILED $LARGE_FAILURES of $LARGE_CASES assertions"
     fi
 }
+
+# --- Scenario: multipart-upload ---
+#
+# Multipart is the path large writes actually take: above 4 GiB there is no
+# single-shot option, and the AWS CLI switches to it at 8 MiB by default. The
+# fault it is here to measure is a working set bounded by how *many* parts are
+# held rather than by how much, so the part size is the variable and the part
+# count is held fixed.
+#
+# The parts are driven explicitly rather than through `aws s3 cp`, because the
+# window that matters is completion alone. Folded into the upload it would be
+# hidden by whichever of the two is larger, which is exactly how a 28x
+# improvement in the write path first showed up as 17%.
+
+MP_BUCKET="stress-multipart"
+MP_PARTS="${STRESS_MULTIPART_PARTS:-64MiB 256MiB 1GiB}"
+MP_PART_COUNT="${STRESS_MULTIPART_COUNT:-8}"
+MP_FAILURES=0
+MP_CASES=0
+MP_SKIPPED=0
+
+mp_check() {
+    local ok="$1" message="$2"
+    MP_CASES=$(( MP_CASES + 1 ))
+    if [ "$ok" = true ]; then
+        log "multipart-upload: pass, $message"
+    else
+        log "multipart-upload: FAIL $message"
+        MP_FAILURES=$(( MP_FAILURES + 1 ))
+    fi
+}
+
+# Each part gets its own IV, so the parts differ from each other. Identical
+# parts would let an assembly that dropped or reordered one still digest
+# correctly, which is the bug most worth catching here.
+gen_part() {
+    head -c "$2" /dev/zero \
+        | openssl enc -aes-256-ctr -K "$LARGE_KEY" -iv "$(printf '%032x' "$1")" -nosalt 2>/dev/null
+}
+
+run_multipart_upload() {
+    local results="$RUN_DIR/multipart-upload.tsv"
+    local gate spec part_bytes total need avail key digest got_digest
+    local upload_id up_peak done_peak get_peak up_secs done_secs get_secs
+    local reconstructed verdict two_parts i etag partfile hdr
+    local up_start done_start get_start
+
+    render_large_profile
+    printf '\n[[bucket]]\nname = "%s"\nregion = "%s"\npublic = true\naccount_id = "123456789012"\n' \
+        "$MP_BUCKET" "$REGION" >> "$LARGE_CONFIG"
+    cp "$LARGE_CONFIG" "$RUN_DIR/$LARGE_CLUSTER.toml"
+
+    gate="$(parse_hosts "$LARGE_CONFIG" | awk '$3 != "" { print "https://" $2 ":" $3; exit }')"
+    [ -n "$gate" ] || fail "multipart-upload: no gate in $LARGE_CLUSTER"
+
+    printf 'part\tparts\tbytes\tupload_s\tupload_MiBps\tcomplete_s\tget_s\tget_MiBps\tupload_peak_MiB\tcomplete_peak_MiB\tget_peak_MiB\treconstructed\tverdict\n' > "$results"
+
+    for spec in $MP_PARTS; do
+        part_bytes="$(parse_size "$spec")"
+        total=$(( part_bytes * MP_PART_COUNT ))
+        key="multipart-${spec}x${MP_PART_COUNT}.bin"
+
+        # Parts and the assembled object coexist until cleanupMultipartUpload
+        # runs, so completion transiently needs 3x the object in shards. One
+        # staged part on top of that, plus headroom.
+        need=$(( total * 3 + part_bytes + 2 * 1024 * 1024 * 1024 ))
+        avail="$(df -PB1 "$PREDA_DIR" | awk 'NR == 2 { print $4 }')"
+        if [ "$avail" -lt "$need" ]; then
+            log "multipart-upload: SKIP ${spec}x${MP_PART_COUNT} — needs $(( need / 1024 / 1024 / 1024 ))GiB free under $PREDA_DIR, has $(( avail / 1024 / 1024 / 1024 ))GiB"
+            printf '%s\t%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\tskipped-no-disk\n' \
+                "$spec" "$MP_PART_COUNT" "$total" >> "$results"
+            MP_SKIPPED=$(( MP_SKIPPED + 1 ))
+            continue
+        fi
+
+        # A cold store per part size, so the sizes are comparable to each other
+        # rather than to whatever ran before them.
+        "$SCRIPTS_DIR/stop.sh" -w "$LARGE_CLUSTER" >/dev/null 2>&1 || true
+        rm -rf "${PREDA_DIR:?}/$LARGE_CLUSTER/data"
+        log "multipart-upload: starting $LARGE_CLUSTER for ${spec}x${MP_PART_COUNT}"
+        "$SCRIPTS_DIR/start.sh" -w "$LARGE_CLUSTER"
+
+        digest="$(for i in $(seq 1 "$MP_PART_COUNT"); do gen_part "$i" "$part_bytes"; done | sha256sum | awk '{ print $1 }')"
+
+        upload_id="$(aws_s3 "$gate" s3api create-multipart-upload \
+            --bucket "$MP_BUCKET" --key "$key" --query UploadId --output text)" \
+            || { mp_check false "${spec}x${MP_PART_COUNT} create-multipart-upload failed"; continue; }
+
+        : > "$WORK_DIR/mp-parts-$spec.json.parts"
+        partfile="$WORK_DIR/mp-part.bin"
+        start_rss_sampler "$WORK_DIR/mp-rss-upload-$spec.txt"
+        up_start=$(date +%s)
+        for i in $(seq 1 "$MP_PART_COUNT"); do
+            gen_part "$i" "$part_bytes" > "$partfile"
+            etag="$(aws_s3 "$gate" s3api upload-part --bucket "$MP_BUCKET" --key "$key" \
+                --upload-id "$upload_id" --part-number "$i" --body "$partfile" \
+                --query ETag --output text)" || etag=""
+            [ -n "$etag" ] || { mp_check false "${spec}x${MP_PART_COUNT} part $i failed to upload"; break; }
+            printf '{"ETag":%s,"PartNumber":%d}\n' "$etag" "$i" >> "$WORK_DIR/mp-parts-$spec.json.parts"
+        done
+        up_secs=$(( $(date +%s) - up_start ))
+        stop_rss_sampler
+        rm -f "$partfile"
+        up_peak="$(peak_rss_mib "$WORK_DIR/mp-rss-upload-$spec.txt")"
+
+        if [ "$(wc -l < "$WORK_DIR/mp-parts-$spec.json.parts")" -ne "$MP_PART_COUNT" ]; then
+            aws_s3 "$gate" s3api abort-multipart-upload --bucket "$MP_BUCKET" --key "$key" \
+                --upload-id "$upload_id" >/dev/null 2>&1 || true
+            continue
+        fi
+        printf '{"Parts":[%s]}' "$(paste -sd, "$WORK_DIR/mp-parts-$spec.json.parts")" \
+            > "$WORK_DIR/mp-parts-$spec.json"
+
+        # The window this scenario exists for.
+        start_rss_sampler "$WORK_DIR/mp-rss-complete-$spec.txt"
+        done_start=$(date +%s)
+        aws_s3 "$gate" s3api complete-multipart-upload --bucket "$MP_BUCKET" --key "$key" \
+            --upload-id "$upload_id" \
+            --multipart-upload "file://$WORK_DIR/mp-parts-$spec.json" >/dev/null \
+            || mp_check false "${spec}x${MP_PART_COUNT} complete-multipart-upload failed"
+        done_secs=$(( $(date +%s) - done_start ))
+        stop_rss_sampler
+        done_peak="$(peak_rss_mib "$WORK_DIR/mp-rss-complete-$spec.txt")"
+
+        hdr="$WORK_DIR/mp-get-$spec.hdr"
+        start_rss_sampler "$WORK_DIR/mp-rss-get-$spec.txt"
+        get_start=$(date +%s)
+        got_digest="$(curl -sk --max-time 3600 -D "$hdr" "$gate/$MP_BUCKET/$key" | sha256sum | awk '{ print $1 }')" \
+            || got_digest="get-failed"
+        get_secs=$(( $(date +%s) - get_start ))
+        stop_rss_sampler
+        get_peak="$(peak_rss_mib "$WORK_DIR/mp-rss-get-$spec.txt")"
+
+        reconstructed="$(awk 'tolower($1) == "x-spx-degraded:" { gsub(/\r/, "", $2); print $2; found = 1 }
+                              END { if (!found) print 0 }' "$hdr")"
+
+        verdict=mismatch
+        if [ "$got_digest" = "$digest" ]; then
+            verdict=ok
+            mp_check true "${spec}x${MP_PART_COUNT} ($(( total / 1024 / 1024 ))MiB) round-tripped byte for byte: ${up_secs}s up, ${done_secs}s to complete, ${get_secs}s down"
+        else
+            mp_check false "${spec}x${MP_PART_COUNT} read back as $got_digest, wrote $digest"
+        fi
+
+        # The property, stated in bytes rather than in parts: assembling an
+        # object must cost a working set set by the block size, not by the part
+        # size the client happened to choose. Measured as growth over the upload
+        # phase, because total RSS carries a process floor that no part size
+        # explains -- and because Go hands the heap back to the OS lazily, so a
+        # buffering completion stays resident and an absolute bound would read
+        # the floor rather than the object. Two parts' worth is a generous
+        # ceiling that buffering a whole object still fails at every size.
+        two_parts=$(( part_bytes * 2 / 1024 / 1024 ))
+        mp_check "$([ $(( done_peak - up_peak )) -lt "$two_parts" ] && echo true || echo false)" \
+            "${spec}x${MP_PART_COUNT} completion grew RSS by $(( done_peak - up_peak ))MiB (${up_peak}->${done_peak}), under two parts (${two_parts}MiB), so completion streams"
+        mp_check "$([ "$reconstructed" = 0 ] && echo true || echo false)" \
+            "${spec}x${MP_PART_COUNT} read cost $reconstructed reconstructions on a healthy cluster"
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$spec" "$MP_PART_COUNT" "$total" \
+            "$up_secs" "$(( total / 1024 / 1024 / (up_secs > 0 ? up_secs : 1) ))" \
+            "$done_secs" \
+            "$get_secs" "$(( total / 1024 / 1024 / (get_secs > 0 ? get_secs : 1) ))" \
+            "$up_peak" "$done_peak" "$get_peak" "$reconstructed" "$verdict" >> "$results"
+
+        aws_s3 "$gate" s3 rm "s3://$MP_BUCKET/$key" --only-show-errors >/dev/null 2>&1 || true
+    done
+
+    log "multipart-upload: results in $results"
+    log "multipart-upload: stopping $LARGE_CLUSTER"
+    "$SCRIPTS_DIR/stop.sh" -w "$LARGE_CLUSTER" >/dev/null 2>&1 || true
+    if [ -d "$PREDA_DIR/$LARGE_CLUSTER/logs" ]; then
+        mkdir -p "$RUN_DIR/logs-multipart"
+        cp -R "$PREDA_DIR/$LARGE_CLUSTER/logs/." "$RUN_DIR/logs-multipart/" 2>/dev/null || true
+    fi
+    if [ "$MP_SKIPPED" -gt 0 ]; then
+        log "multipart-upload: $MP_SKIPPED part size(s) skipped for want of disk — the run does not cover them"
+    fi
+    if [ "$MP_FAILURES" -eq 0 ]; then
+        log "multipart-upload: passed $MP_CASES assertions"
+    else
+        log "multipart-upload: FAILED $MP_FAILURES of $MP_CASES assertions"
+    fi
+}
+
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = multipart-upload ]; then
+    run_multipart_upload
+
+    if [ "$SCENARIO" = multipart-upload ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$MP_FAILURES" -eq 0 ] \
+            || fail "multipart-upload failed $MP_FAILURES of $MP_CASES assertions"
+        exit 0
+    fi
+fi
 
 if [ "$SCENARIO" = all ] || [ "$SCENARIO" = large-object ]; then
     run_large_object

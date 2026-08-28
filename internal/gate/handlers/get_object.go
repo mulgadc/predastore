@@ -197,14 +197,8 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	}
 	defer reader.close(ctx)
 
-	first, n, err := reader.next(ctx)
-	if err != nil {
-		return nil, 0, model.NewS3Error(model.ErrInternalError,
-			fmt.Sprintf("reconstruction failed: %v", err), 500)
-	}
-
 	out := bytes.NewBuffer(make([]byte, 0, size))
-	if err := drain(ctx, reader, out, first, n, size); err != nil {
+	if err := pipeObject(ctx, reader, out, size); err != nil {
 		return nil, 0, model.NewS3Error(model.ErrInternalError,
 			fmt.Sprintf("reconstruction failed: %v", err), 500)
 	}

@@ -14,9 +14,16 @@ import (
 	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
-// maxParallelPartFetches bounds the read-back fan-out while assembling an
-// upload, so completing a many-part object cannot saturate the blob nodes.
-const maxParallelPartFetches = 10
+// multipartReadAhead bounds how far ahead of the writer the parts are resolved.
+//
+// It counts *placements*, not parts of data and not open streams. A placement
+// is a KV get and a small struct, so the window costs nothing and is the same
+// size whether the client chose 5 MiB parts or 5 GiB ones. Holding parts here
+// instead is what made completion cost ten times whatever part size the client
+// picked; holding open streams instead would risk the blob client's idle
+// timeout, because a 5 GiB part takes half a minute to drain and a stream
+// waiting its turn is an idle stream.
+const multipartReadAhead = 8
 
 // CompleteMultipartUpload serves POST /{bucket}/{key}?uploadId=X: it reads the
 // parts back, concatenates them, and stores the result as one object.
@@ -161,9 +168,9 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 }
 
 // streamParts reads the parts back and writes them, in order, to the returned
-// reader. Parts are fetched concurrently but only a bounded number are held at
-// once: a fetch cannot start until the writer has consumed an earlier part, so
-// completion stays parallel without ever holding the whole object.
+// reader. Each part is streamed from its shards straight into the pipe rather
+// than assembled first, so completion holds a block per shard however large the
+// client made its parts.
 //
 // The caller must Close the reader. Closing it unblocks the writer and cancels
 // any fetch still in flight, which is what stops an abandoned completion from
@@ -172,56 +179,42 @@ func streamParts(
 	ctx context.Context, mc MetaClient, bc BlobClient, ring *placement.Ring, cfg Config,
 	bucket, key, uploadID string, parts []model.CompletedPart,
 ) *io.PipeReader {
-	type fetched struct {
-		data []byte
-		err  error
-	}
-
 	pr, pw := io.Pipe()
 
 	go func() {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		// One slot per part in flight. The writer returns a slot after it has
-		// consumed a part, which is what bounds the window.
-		slots := make(chan struct{}, maxParallelPartFetches)
-		results := make([]chan fetched, len(parts))
-		for i := range results {
-			results[i] = make(chan fetched, 1)
-		}
-
+		// Placements are resolved ahead of the writer so the meta lookup of the
+		// next part overlaps the streaming of the current one. Only the lookup
+		// is ahead; the shards are opened when the part's turn comes.
+		located := make(chan locatedPart, multipartReadAhead)
 		go func() {
-			for i, part := range parts {
+			defer close(located)
+			for _, part := range parts {
+				found := locatePart(ctx, mc, bucket, key, uploadID, part.PartNumber)
 				select {
-				case slots <- struct{}{}:
+				case located <- found:
 				case <-ctx.Done():
 					return
 				}
-				go func(idx, partNumber int) {
-					data, err := getPartData(ctx, mc, bc, ring, cfg, bucket, key, uploadID, partNumber)
-					results[idx] <- fetched{data: data, err: err}
-				}(i, part.PartNumber)
+				if found.err != nil {
+					return
+				}
 			}
 		}()
 
-		for i := range parts {
-			var res fetched
-			select {
-			case res = <-results[i]:
-			case <-ctx.Done():
-				_ = pw.CloseWithError(ctx.Err())
+		for found := range located {
+			if found.err != nil {
+				_ = pw.CloseWithError(found.err)
+
 				return
 			}
-			if res.err != nil {
-				_ = pw.CloseWithError(res.err)
-				return
-			}
-			if _, err := pw.Write(res.data); err != nil {
+			if err := pipePart(ctx, bc, ring, cfg, bucket, found, pw); err != nil {
 				_ = pw.CloseWithError(err)
+
 				return
 			}
-			<-slots
 		}
 		_ = pw.Close()
 	}()
@@ -229,30 +222,59 @@ func streamParts(
 	return pr
 }
 
-// getPartData reads one part back from its shards. A part is an object under a
-// hidden key, so it is read exactly as GET reads one: the data shards are
-// joined directly, and parity is only pulled in if that join fails. Going
-// straight to reconstruction would read every shard twice for every part.
-func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, ring *placement.Ring, cfg Config, bucket, key, uploadID string, partNumber int) ([]byte, error) {
+// locatedPart is a part's placement record, or the reason it could not be read.
+type locatedPart struct {
+	key   string
+	place ObjectToShardNodes
+	err   error
+}
+
+// locatePart resolves where one part's shards are. A part is an object under a
+// hidden key, so this is the same lookup a GET does.
+func locatePart(
+	ctx context.Context, mc MetaClient, bucket, key, uploadID string, partNumber int,
+) locatedPart {
 	data, err := metaGet(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber))
 	if err != nil {
 		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonMetaMissing)
-		return nil, fmt.Errorf("part not found: uploadID=%s part=%d", uploadID, partNumber)
+
+		return locatedPart{err: fmt.Errorf("part not found: uploadID=%s part=%d", uploadID, partNumber)}
 	}
 
 	place, err := DecodePlacement(data)
 	if err != nil {
 		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonPlacementDecode)
-		return nil, err
+
+		return locatedPart{err: err}
 	}
 
-	partKey := partObjectKey(key, uploadID, partNumber)
-	part, _, err := readObject(ctx, bc, cfg, bucket, partKey, place, place.Size,
-		handoffNode(ring, cfg, model.ObjectHash(bucket, partKey)))
+	return locatedPart{key: partObjectKey(key, uploadID, partNumber), place: place}
+}
+
+// pipePart streams one part's shards into the assembled object. The reader is
+// opened here rather than with the placement, so a part waiting its turn holds
+// no stream: the blob client aborts one left idle, and the largest parts are
+// exactly the ones that would wait longest.
+func pipePart(
+	ctx context.Context, bc BlobClient, ring *placement.Ring, cfg Config,
+	bucket string, found locatedPart, dst io.Writer,
+) error {
+	objectHash := model.ObjectHash(bucket, found.key)
+	reader, err := newStripeReader(ctx, bc, cfg, objectHash, found.place,
+		handoffNode(ring, cfg, objectHash))
 	if err != nil {
 		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonShardRead)
-		return nil, err
+
+		return err
+	}
+	defer reader.close(ctx)
+
+	if err := pipeObject(ctx, reader, dst, found.place.Size); err != nil {
+		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonShardRead)
+
+		return fmt.Errorf("read part %s: %w", found.key, err)
 	}
 	telemetry.RecordMultipartPartFetch(ctx, "")
-	return part, nil
+
+	return nil
 }

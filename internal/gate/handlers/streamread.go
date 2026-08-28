@@ -467,6 +467,21 @@ func (r *stripeReader) reportShard(ctx context.Context, index int, node config.N
 	}
 }
 
+// pipeObject streams a whole object from an open stripe reader. It is the
+// shape both whole-object callers share: read the first stripe, then drain the
+// rest behind it.
+func pipeObject(ctx context.Context, r *stripeReader, dst io.Writer, size int64) error {
+	if size == 0 {
+		return nil
+	}
+	first, n, err := r.next(ctx)
+	if err != nil {
+		return err
+	}
+
+	return drain(ctx, r, dst, first, n, size)
+}
+
 // windowWriter serves a byte range out of a whole-object stream: it drops the
 // first skip bytes and stops after limit. A negative limit means no limit.
 //

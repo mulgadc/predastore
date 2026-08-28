@@ -69,11 +69,13 @@ func TestStreamPartsConcatenatesInOrder(t *testing.T) {
 }
 
 // The whole point of streaming completion is that the object is never held at
-// once. This bounds what the pipeline holds while the reader is slow.
-func TestStreamPartsHoldsOnlyABoundedWindow(t *testing.T) {
+// once. The pipeline reads ahead in placements, which cost nothing, and opens
+// a part's shards only when its turn comes -- so what is in flight is the part
+// being written and at most the next one starting, whatever the part size.
+func TestStreamPartsFetchesOnlyThePartItIsWriting(t *testing.T) {
 	t.Parallel()
 
-	const parts = maxParallelPartFetches * 4
+	const parts = multipartReadAhead * 4
 	f := newWriteFixture(1, 0)
 	for i := 1; i <= parts; i++ {
 		f.storePart(t, "b", "k", "upload-1", i, randomBytes(t, 1024))
@@ -83,15 +85,16 @@ func TestStreamPartsHoldsOnlyABoundedWindow(t *testing.T) {
 	r := streamParts(context.Background(), f.mc, counting, nil, f.cfg, "b", "k", "upload-1", completedParts(parts))
 	defer r.Close()
 
-	// Read one part's worth, then let any runnable fetch make progress. Only
-	// the window may have been fetched: an unbounded pipeline would have
-	// pulled every part by now.
+	// Read one part's worth, then let any runnable fetch make progress. At
+	// RS(1,0) a part is one shard, so this counts parts: an unbounded pipeline
+	// would have pulled every part by now, and the previous bound would have
+	// pulled multipartReadAhead of them.
 	_, err := io.ReadFull(r, make([]byte, 1024))
 	require.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 
-	assert.LessOrEqual(t, counting.gets.Load(), int64(maxParallelPartFetches+1),
-		"completion fetched ahead without bound")
+	assert.LessOrEqual(t, counting.gets.Load(), int64(2),
+		"completion opened more than the part it is writing and the one behind it")
 }
 
 // An abandoned completion must not leave the fetchers running: closing the
@@ -99,7 +102,7 @@ func TestStreamPartsHoldsOnlyABoundedWindow(t *testing.T) {
 func TestStreamPartsCloseStopsTheFetchers(t *testing.T) {
 	t.Parallel()
 
-	const parts = maxParallelPartFetches * 4
+	const parts = multipartReadAhead * 4
 	f := newWriteFixture(1, 0)
 	for i := 1; i <= parts; i++ {
 		f.storePart(t, "b", "k", "upload-1", i, randomBytes(t, 1024))
@@ -127,7 +130,7 @@ func TestStreamPartsCloseStopsTheFetchers(t *testing.T) {
 	}
 
 	assert.Equal(t, settled, counting.gets.Load(), "fetches continued after the reader was closed")
-	assert.LessOrEqual(t, settled, int64(maxParallelPartFetches+1),
+	assert.LessOrEqual(t, settled, int64(2),
 		"the whole upload was fetched, so closing the reader stopped nothing")
 }
 
@@ -193,4 +196,76 @@ func TestMultipartAssemblyRoundTrips(t *testing.T) {
 			assert.Equal(t, want, got)
 		})
 	}
+}
+
+// gatedReader delivers a prefix, then waits to be released before delivering
+// the rest. It is how a test can observe a part that has not finished arriving.
+type gatedReader struct {
+	io.ReadCloser
+
+	prefix  int64
+	sent    int64
+	release <-chan struct{}
+}
+
+func (r *gatedReader) Read(p []byte) (int, error) {
+	if r.sent >= r.prefix {
+		<-r.release
+	} else if int64(len(p)) > r.prefix-r.sent {
+		p = p[:r.prefix-r.sent]
+	}
+	n, err := r.ReadCloser.Read(p)
+	r.sent += int64(n)
+
+	return n, err
+}
+
+// gatingBlob gates every shard it serves.
+type gatingBlob struct {
+	*fakeBlob
+
+	prefix  int64
+	release chan struct{}
+}
+
+func (b *gatingBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
+	rc, err := b.fakeBlob.Get(ctx, node, req)
+	if err != nil {
+		return nil, err
+	}
+
+	return &gatedReader{ReadCloser: rc, prefix: b.prefix, release: b.release}, nil
+}
+
+var _ BlobClient = (*gatingBlob)(nil)
+
+// The property the part count could not express: a part is streamed into the
+// assembled object as it arrives, so its head is readable before its tail has
+// been fetched. Buffering the part whole -- which is what a bound in parts
+// forces -- would deliver nothing until the last byte of it had landed.
+func TestAPartIsStreamedRatherThanBuffered(t *testing.T) {
+	t.Parallel()
+
+	const partSize = 4 * streamBlockSize
+	f := newWriteFixture(1, 0)
+	f.storePart(t, "b", "k", "upload-1", 1, randomBytes(t, partSize))
+
+	gate := &gatingBlob{fakeBlob: f.bc, prefix: partSize / 2, release: make(chan struct{})}
+	r := streamParts(context.Background(), f.mc, gate, nil, f.cfg, "b", "k", "upload-1", completedParts(1))
+	defer r.Close()
+
+	// A quarter of the part, which is well inside the half the shard has
+	// delivered, and impossible to serve from a part not yet fully read.
+	head := make([]byte, partSize/4)
+	done := make(chan error, 1)
+	go func() { _, readErr := io.ReadFull(r, head); done <- readErr }()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		close(gate.release)
+		t.Fatal("completion delivered nothing until the whole part had arrived, so it is buffering it")
+	}
+	close(gate.release)
 }
