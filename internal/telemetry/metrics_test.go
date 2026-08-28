@@ -371,6 +371,47 @@ func TestPerShardRecordersDoNotAllocate(t *testing.T) {
 	}
 }
 
+// Phases and meta calls run several times per request, and both take their
+// attributes from bounded sets, so the same cache that makes the shard
+// recorders free applies to them.
+func TestPerRequestRecordersDoNotAllocate(t *testing.T) {
+	ctx := context.Background()
+
+	RecordObjectPhase(ctx, GateOpPut, PhaseShardFanout, 0.01)
+	RecordMetaClientOp(ctx, MetaOpGet, OutcomeSuccess, 0.01)
+	RecordMetaRedirect(ctx, RedirectNotLeader)
+
+	if got := testing.AllocsPerRun(100, func() {
+		RecordObjectPhase(ctx, GateOpPut, PhaseShardFanout, 0.01)
+	}); got != 0 {
+		t.Errorf("RecordObjectPhase allocations = %v, want 0", got)
+	}
+	if got := testing.AllocsPerRun(100, func() {
+		RecordMetaClientOp(ctx, MetaOpGet, OutcomeSuccess, 0.01)
+	}); got != 0 {
+		t.Errorf("RecordMetaClientOp allocations = %v, want 0", got)
+	}
+	if got := testing.AllocsPerRun(100, func() {
+		RecordMetaRedirect(ctx, RedirectNotLeader)
+	}); got != 0 {
+		t.Errorf("RecordMetaRedirect allocations = %v, want 0", got)
+	}
+}
+
+// A node's attribute set is built once per peer, not once per stream: a stream
+// is opened per shard, and the id has to be formatted to build one.
+func TestNodeAttrsAreCached(t *testing.T) {
+	first := nodeAttrs(9)
+	second := nodeAttrs(9)
+	if &first.add[0] != &second.add[0] {
+		t.Error("node attribute option was rebuilt rather than cached")
+	}
+
+	if got := testing.AllocsPerRun(100, func() { _ = nodeAttrs(9) }); got != 0 {
+		t.Errorf("nodeAttrs allocations = %v, want 0", got)
+	}
+}
+
 // The attribute cache is keyed by bounded fields only, so it must hand back the
 // identical option rather than an equal one: a cache that rebuilt on every call
 // would still pass a behavioural test while allocating on every shard.
@@ -561,6 +602,236 @@ func TestNoMetricNameIsAnotherPrefix(t *testing.T) {
 	}
 }
 
+func TestRecordObjectPhaseSeparatesPhasesAndOps(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordObjectPhase(ctx, GateOpPut, PhaseShardFanout, 0.4)
+	RecordObjectPhase(ctx, GateOpPut, PhaseMetaPlacement, 0.01)
+	RecordObjectPhase(ctx, GateOpGet, PhaseShardFanout, 0.2)
+
+	m := collect(t, reader)
+	h, ok := m["predastore.object.phase.duration"].(metricdata.Histogram[float64])
+	if !ok {
+		t.Fatalf("phase duration is %T, want Histogram[float64]", m["predastore.object.phase.duration"])
+	}
+
+	// A PUT's fanout and a GET's fanout share a phase name, so only the op
+	// separates them; conflating the two would hide which side is slow.
+	for _, want := range []struct {
+		attrs map[string]string
+		sum   float64
+	}{
+		{attrs: map[string]string{"op": GateOpPut, "phase": PhaseShardFanout}, sum: 0.4},
+		{attrs: map[string]string{"op": GateOpPut, "phase": PhaseMetaPlacement}, sum: 0.01},
+		{attrs: map[string]string{"op": GateOpGet, "phase": PhaseShardFanout}, sum: 0.2},
+	} {
+		found := false
+		for _, dp := range h.DataPoints {
+			if !attrsMatch(dp.Attributes, want.attrs) {
+				continue
+			}
+			found = true
+			if dp.Count != 1 || dp.Sum != want.sum {
+				t.Errorf("phase %v: count=%d sum=%v, want 1 and %v", want.attrs, dp.Count, dp.Sum, want.sum)
+			}
+		}
+		if !found {
+			t.Errorf("no datapoint for %v", want.attrs)
+		}
+	}
+}
+
+// Not-found is the answer to a question, not a failure. Counting it as an
+// error would make a HEAD of a missing object look like a broken meta plane.
+func TestRecordMetaClientOpKeepsNotFoundSeparateFromError(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordMetaClientOp(ctx, MetaOpGet, OutcomeSuccess, 0.01)
+	RecordMetaClientOp(ctx, MetaOpGet, MetaOutcomeNotFound, 0.02)
+	RecordMetaClientOp(ctx, MetaOpGet, MetaOutcomeNotFound, 0.02)
+	RecordMetaClientOp(ctx, MetaOpPut, OutcomeError, 0.5)
+
+	m := collect(t, reader)
+	ops := m["predastore.meta.client.ops"]
+	if got := sumFor(t, ops, map[string]string{"op": MetaOpGet, "outcome": OutcomeSuccess}); got != 1 {
+		t.Errorf("successful gets = %d, want 1", got)
+	}
+	if got := sumFor(t, ops, map[string]string{"op": MetaOpGet, "outcome": MetaOutcomeNotFound}); got != 2 {
+		t.Errorf("not-found gets = %d, want 2", got)
+	}
+	if got := sumFor(t, ops, map[string]string{"op": MetaOpPut, "outcome": OutcomeError}); got != 1 {
+		t.Errorf("failed puts = %d, want 1", got)
+	}
+
+	// The duration carries op but not outcome: a slow failure is part of the
+	// operation's latency, not a separate series.
+	h, ok := m["predastore.meta.client.duration"].(metricdata.Histogram[float64])
+	if !ok {
+		t.Fatalf("meta duration is %T, want Histogram[float64]", m["predastore.meta.client.duration"])
+	}
+	for _, dp := range h.DataPoints {
+		if _, has := dp.Attributes.Value("outcome"); has {
+			t.Errorf("meta duration carries an outcome attribute, want op only")
+		}
+	}
+}
+
+func TestRecordMetaRedirectSeparatesReasons(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordMetaRedirect(ctx, RedirectNotLeader)
+	RecordMetaRedirect(ctx, RedirectNotLeader)
+	RecordMetaRedirect(ctx, RedirectNoLeader)
+	RecordMetaRedirect(ctx, RedirectRetryExhausted)
+
+	m := collect(t, reader)
+	redirects := m["predastore.meta.client.redirects"]
+	for reason, want := range map[string]int64{
+		RedirectNotLeader:      2,
+		RedirectNoLeader:       1,
+		RedirectRetryExhausted: 1,
+	} {
+		if got := sumFor(t, redirects, map[string]string{"reason": reason}); got != want {
+			t.Errorf("%s redirects = %d, want %d", reason, got, want)
+		}
+	}
+}
+
+// The gauge must come back to zero when streams are released, and hold what is
+// still open — a leaked stream is exactly what it is there to show.
+func TestEnterRPCStreamTracksOpenStreams(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	releaseA := EnterRPCStream(ctx, 1)
+	releaseB := EnterRPCStream(ctx, 1)
+	release2 := EnterRPCStream(ctx, 2)
+	releaseA()
+
+	m := collect(t, reader)
+	if got := sumFor(t, m["predastore.rpc.streams.open"], map[string]string{"node": "1"}); got != 1 {
+		t.Errorf("open streams to node 1 = %d, want 1", got)
+	}
+	if got := sumFor(t, m["predastore.rpc.streams.open"], map[string]string{"node": "2"}); got != 1 {
+		t.Errorf("open streams to node 2 = %d, want 1", got)
+	}
+
+	releaseB()
+	release2()
+	m = collect(t, reader)
+	if got := sumFor(t, m["predastore.rpc.streams.open"], map[string]string{"node": "1"}); got != 0 {
+		t.Errorf("open streams to node 1 after release = %d, want 0", got)
+	}
+}
+
+func TestRecordRPCEvictionSeparatesPeersAndReasons(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordRPCEviction(ctx, 3, EvictionStall)
+	RecordRPCEviction(ctx, 3, EvictionStall)
+	RecordRPCEviction(ctx, 4, EvictionError)
+
+	m := collect(t, reader)
+	evictions := m["predastore.rpc.evictions"]
+	if got := sumFor(t, evictions, map[string]string{"node": "3", "reason": EvictionStall}); got != 2 {
+		t.Errorf("stall evictions of node 3 = %d, want 2", got)
+	}
+	if got := sumFor(t, evictions, map[string]string{"node": "4", "reason": EvictionError}); got != 1 {
+		t.Errorf("error evictions of node 4 = %d, want 1", got)
+	}
+}
+
+func TestRegisterMetaGaugesReportsStorageState(t *testing.T) {
+	reader := withManualReader(t)
+
+	unregister, err := RegisterMetaGauges(func() MetaSnapshot {
+		return MetaSnapshot{NodeID: "2", FSMBytes: 4096, SnapshotIndex: 100, LastLogIndex: 175}
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { _ = unregister() })
+
+	m := collect(t, reader)
+	node := map[string]string{"node": "2"}
+	if got, _ := gaugeFor(t, m["predastore.meta.fsm.size_bytes"], node); got != 4096 {
+		t.Errorf("fsm size = %d, want 4096", got)
+	}
+	if got, _ := gaugeFor(t, m["predastore.meta.snapshot.index"], node); got != 100 {
+		t.Errorf("snapshot index = %d, want 100", got)
+	}
+	// The trailing log is what a snapshot would truncate: 175 - 100.
+	if got, _ := gaugeFor(t, m["predastore.meta.log.trailing"], node); got != 75 {
+		t.Errorf("trailing entries = %d, want 75", got)
+	}
+}
+
+// A size that could not be read is reported as no observation. Zero would read
+// as an empty state machine, which is a legitimate and very different state.
+func TestRegisterMetaGaugesOmitsUnreadableFSMSize(t *testing.T) {
+	reader := withManualReader(t)
+
+	unregister, err := RegisterMetaGauges(func() MetaSnapshot {
+		return MetaSnapshot{NodeID: "2", SnapshotIndex: 5, LastLogIndex: 5}
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { _ = unregister() })
+
+	m := collect(t, reader)
+	if data, ok := m["predastore.meta.fsm.size_bytes"]; ok {
+		if g, isGauge := data.(metricdata.Gauge[int64]); isGauge && len(g.DataPoints) > 0 {
+			t.Errorf("fsm size emitted %d datapoints with no size to report, want none", len(g.DataPoints))
+		}
+	}
+}
+
+// A snapshot index above the last log index is a torn read of two raft fields,
+// not a negative backlog.
+func TestRegisterMetaGaugesClampsTrailingLog(t *testing.T) {
+	reader := withManualReader(t)
+
+	unregister, err := RegisterMetaGauges(func() MetaSnapshot {
+		return MetaSnapshot{NodeID: "2", SnapshotIndex: 200, LastLogIndex: 100}
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { _ = unregister() })
+
+	m := collect(t, reader)
+	if got, _ := gaugeFor(t, m["predastore.meta.log.trailing"], map[string]string{"node": "2"}); got != 0 {
+		t.Errorf("trailing entries = %d, want 0", got)
+	}
+}
+
+func TestRegisterPoolGaugesReportsHeldConnections(t *testing.T) {
+	reader := withManualReader(t)
+
+	held := int64(3)
+	unregister, err := RegisterPoolGauges(7, func() int64 { return held })
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { _ = unregister() })
+
+	m := collect(t, reader)
+	if got, _ := gaugeFor(t, m["predastore.rpc.connections"], map[string]string{"node": "7"}); got != 3 {
+		t.Errorf("connections = %d, want 3", got)
+	}
+
+	held = 1
+	m = collect(t, reader)
+	if got, _ := gaugeFor(t, m["predastore.rpc.connections"], map[string]string{"node": "7"}); got != 1 {
+		t.Errorf("connections after a peer dropped = %d, want 1", got)
+	}
+}
+
 func TestRegisterStoreGaugesReportsTheSnapshot(t *testing.T) {
 	reader := withManualReader(t)
 
@@ -733,6 +1004,11 @@ func recordEveryInstrument(t *testing.T) map[string]metricdata.Aggregation {
 	RecordObjectRead(ctx, ReadPathDirect)
 	RecordObjectWrite(ctx, WriteOutcomeSuccess, "")
 	EnterGateInflight(ctx, GateOpPut, 1)()
+	RecordObjectPhase(ctx, GateOpPut, PhaseShardFanout, 0.01)
+	RecordMetaClientOp(ctx, MetaOpGet, OutcomeSuccess, 0.01)
+	RecordMetaRedirect(ctx, RedirectNotLeader)
+	RecordRPCEviction(ctx, 1, EvictionStall)
+	EnterRPCStream(ctx, 1)()
 
 	unregister, err := RegisterRaftGauges(func() RaftSnapshot {
 		return RaftSnapshot{NodeID: "1", State: "Leader", LeaderKnown: true, Term: "1", CommitIndex: "2", AppliedIndex: "1"}
@@ -752,6 +1028,21 @@ func recordEveryInstrument(t *testing.T) map[string]metricdata.Aggregation {
 		t.Fatalf("register store: %v", err)
 	}
 	t.Cleanup(func() { _ = unregisterStore() })
+
+	// A populated FSM size, since an unread one is deliberately not observed.
+	unregisterMeta, err := RegisterMetaGauges(func() MetaSnapshot {
+		return MetaSnapshot{NodeID: "1", FSMBytes: 1024, SnapshotIndex: 10, LastLogIndex: 20}
+	})
+	if err != nil {
+		t.Fatalf("register meta: %v", err)
+	}
+	t.Cleanup(func() { _ = unregisterMeta() })
+
+	unregisterPool, err := RegisterPoolGauges(1, func() int64 { return 2 })
+	if err != nil {
+		t.Fatalf("register pool: %v", err)
+	}
+	t.Cleanup(func() { _ = unregisterPool() })
 
 	return collect(t, reader)
 }

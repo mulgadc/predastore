@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/internal/config"
+	"github.com/mulgadc/predastore/internal/telemetry"
 	"github.com/mulgadc/predastore/internal/transport"
 	"golang.org/x/sync/singleflight"
 )
@@ -57,6 +58,10 @@ type ConnPool struct {
 	conns  map[config.NodeID]pooled
 	serve  func(transport.Conn)
 	closed bool
+
+	// unregisterMetrics detaches the connection gauge when the pool closes, so
+	// a collection never observes a pool that is gone.
+	unregisterMetrics func() error
 }
 
 func NewConnPool(source config.NodeID, res *Resolver, opts ...PoolOption) *ConnPool {
@@ -70,7 +75,24 @@ func NewConnPool(source config.NodeID, res *Resolver, opts ...PoolOption) *ConnP
 	for _, opt := range opts {
 		opt(p)
 	}
+
+	// Reporting is not worth failing a node over: it carries traffic either way.
+	unregister, err := telemetry.RegisterPoolGauges(uint64(source), p.heldCount)
+	if err != nil {
+		slog.Warn("failed to register connection pool metrics", "node", source, "error", err)
+	} else {
+		p.unregisterMetrics = unregister
+	}
 	return p
+}
+
+// heldCount is how many peers the pool is currently in contact with. Read on
+// every metrics collection, so it takes the lock and counts a map bounded by
+// the size of the cluster, and does nothing else.
+func (p *ConnPool) heldCount() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return int64(len(p.conns))
 }
 
 // OnDial registers what the pool hands each connection it dials to, so that
@@ -244,6 +266,7 @@ func (p *ConnPool) noteStall(c transport.Conn) {
 	delete(p.conns, remote)
 	p.mu.Unlock()
 
+	telemetry.RecordRPCEviction(context.Background(), uint64(remote), telemetry.EvictionStall)
 	slog.Warn("evicting unresponsive connection",
 		"node", remote,
 		"addr", c.RemoteAddr(),
@@ -289,10 +312,22 @@ func (p *ConnPool) entry(c transport.Conn) (config.NodeID, pooled, bool) {
 // release one through here.
 func (p *ConnPool) Evict(c transport.Conn) {
 	p.mu.Lock()
-	if remote, _, ok := p.entry(c); ok {
+	remote, _, held := p.entry(c)
+	if held {
 		delete(p.conns, remote)
 	}
 	p.mu.Unlock()
+
+	// Only a connection the pool was holding is an eviction. Closing one it
+	// never had is the caller tidying up, and counting it would report peers
+	// dropping that never were.
+	if held {
+		reason := telemetry.EvictionClosed
+		if c.Context().Err() != nil {
+			reason = telemetry.EvictionError
+		}
+		telemetry.RecordRPCEviction(context.Background(), uint64(remote), reason)
+	}
 	c.Close()
 }
 
@@ -306,8 +341,16 @@ func (p *ConnPool) Close() error {
 	}
 	p.closed = true
 	conns := p.conns
+	unregister := p.unregisterMetrics
+	p.unregisterMetrics = nil
 	p.conns = make(map[config.NodeID]pooled)
 	p.mu.Unlock()
+
+	if unregister != nil {
+		if err := unregister(); err != nil {
+			slog.Warn("failed to unregister connection pool metrics", "node", p.source, "error", err)
+		}
+	}
 
 	errs := make([]error, 0, len(conns))
 	for _, e := range conns {

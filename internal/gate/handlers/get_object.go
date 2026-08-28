@@ -32,16 +32,19 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// -1 for both ends means "no Range header"; any value >= 0 is a range request.
 		rangeStart, rangeEnd := parseRangeHeader(r.Header.Get("Range"))
 
+		phase := time.Now()
 		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
+		phase = recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseBucketCheck, phase)
 
 		place, size, err := loadPlacement(ctx, mc, ring, cfg, bucket, key)
 		if err != nil {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
+		recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseMetaPlacement, phase)
 
 		var body []byte
 		var contentRange string
@@ -121,7 +124,9 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	// A failed shard read is what parity is for. Reconstruction is attempted
 	// whenever a data shard is missing, not only when the join fails, so that
 	// losing one node does not make every object on it unreadable.
+	phase := time.Now()
 	shards, readErr := shardBytes(ctx, bc, objectHash, place)
+	phase = recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseShardFanout, phase)
 	if readErr != nil {
 		return nil, model.NewS3Error(model.ErrInternalError,
 			fmt.Sprintf("reconstruction failed: %v", readErr), 500)
@@ -147,6 +152,7 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	// reconstruction.
 	out.Reset()
 	reconstructed, err := reconstructObject(enc, shards, size)
+	recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseReconstruct, phase)
 	if err != nil {
 		return nil, model.NewS3Error(model.ErrInternalError,
 			fmt.Sprintf("reconstruction failed: %v", err), 500)

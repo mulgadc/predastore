@@ -72,6 +72,20 @@ const (
 	metricBlobCompactionLastDuration = "predastore.blob.compaction.last_duration_seconds"
 
 	metricBlobIntegrityFailures = "predastore.blob.integrity.failures"
+
+	metricObjectPhaseDuration = "predastore.object.phase.duration"
+
+	metricMetaClientOps       = "predastore.meta.client.ops"
+	metricMetaClientDuration  = "predastore.meta.client.duration"
+	metricMetaClientRedirects = "predastore.meta.client.redirects"
+
+	metricMetaFSMSizeBytes  = "predastore.meta.fsm.size_bytes"
+	metricMetaSnapshotIndex = "predastore.meta.snapshot.index"
+	metricMetaLogTrailing   = "predastore.meta.log.trailing"
+
+	metricRPCConnections = "predastore.rpc.connections"
+	metricRPCEvictions   = "predastore.rpc.evictions"
+	metricRPCStreamsOpen = "predastore.rpc.streams.open"
 )
 
 // metricNames is every name this package registers. Only the tests read it:
@@ -90,6 +104,10 @@ var metricNames = []string{
 	metricBlobLiveBytes, metricBlobDeadBytes, metricBlobLiveFrac,
 	metricBlobCompactionCycles, metricBlobCompactionSegments, metricBlobCompactionBytes,
 	metricBlobCompactionLastDuration, metricBlobIntegrityFailures,
+	metricObjectPhaseDuration,
+	metricMetaClientOps, metricMetaClientDuration, metricMetaClientRedirects,
+	metricMetaFSMSizeBytes, metricMetaSnapshotIndex, metricMetaLogTrailing,
+	metricRPCConnections, metricRPCEvictions, metricRPCStreamsOpen,
 }
 
 var (
@@ -137,6 +155,20 @@ var (
 	blobCompactionLastDuration metric.Float64ObservableGauge
 
 	blobIntegrityFailures metric.Int64ObservableCounter
+
+	objectPhaseDuration metric.Float64Histogram
+
+	metaClientOps       metric.Int64Counter
+	metaClientDuration  metric.Float64Histogram
+	metaClientRedirects metric.Int64Counter
+
+	metaFSMSizeBytes  metric.Int64ObservableGauge
+	metaSnapshotIndex metric.Int64ObservableGauge
+	metaLogTrailing   metric.Int64ObservableGauge
+
+	rpcConnections metric.Int64ObservableGauge
+	rpcEvictions   metric.Int64Counter
+	rpcStreamsOpen metric.Int64UpDownCounter
 )
 
 // instruments lazily creates the shared instruments. The global meter
@@ -297,6 +329,54 @@ func instruments() {
 
 		blobIntegrityFailures = int64Counter(metricBlobIntegrityFailures,
 			"Fragments that failed their GCM tag. Any non-zero value is corruption: bytes on disk no longer authenticate.", "{fragment}")
+
+		objectPhaseDuration, err = meter.Float64Histogram(metricObjectPhaseDuration,
+			metric.WithDescription("Time one phase of an object request took, by phase and op. Where a slow PUT or GET actually goes."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		metaClientOps, err = meter.Int64Counter(metricMetaClientOps,
+			metric.WithDescription("Meta store operations attempted by this gate, by op and outcome."),
+			metric.WithUnit("{operation}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		metaClientDuration, err = meter.Float64Histogram(metricMetaClientDuration,
+			metric.WithDescription("Time one meta operation took, including every replica it had to try. Two of these sit on every PUT."),
+			metric.WithUnit("s"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		metaClientRedirects, err = meter.Int64Counter(metricMetaClientRedirects,
+			metric.WithDescription("Write attempts that did not land on a leader, by reason. A sustained rate is an election that is not settling."),
+			metric.WithUnit("{redirect}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+
+		metaFSMSizeBytes = int64Gauge(metricMetaFSMSizeBytes,
+			"On-disk size of this replica's state machine. The single raft group's ceiling, visible before it is reached.", "By")
+		metaSnapshotIndex = int64Gauge(metricMetaSnapshotIndex,
+			"Raft log index of this replica's last snapshot.", "{index}")
+		metaLogTrailing = int64Gauge(metricMetaLogTrailing,
+			"Log entries written since the last snapshot. A number that only climbs is snapshotting that has stopped.", "{entry}")
+
+		rpcConnections = int64Gauge(metricRPCConnections,
+			"Connections this node's pool currently holds, one per peer it is in contact with.", "{connection}")
+		rpcEvictions, err = meter.Int64Counter(metricRPCEvictions,
+			metric.WithDescription("Connections dropped from the pool, by peer and reason. A peer evicted repeatedly is the one at fault."),
+			metric.WithUnit("{eviction}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		rpcStreamsOpen, err = meter.Int64UpDownCounter(metricRPCStreamsOpen,
+			metric.WithDescription("Streams this node has open to a peer. Bounded by the transport's per-connection cap, which is otherwise invisible."),
+			metric.WithUnit("{stream}"))
+		if err != nil {
+			otel.Handle(err)
+		}
 	})
 }
 
@@ -776,6 +856,213 @@ func RecordShardError(ctx context.Context, op, reason string, node uint64) {
 		return
 	}
 	shardErrors.Add(ctx, 1, cachedShardAttrs(shardErrAttrs, "reason", op, reason, node).add...)
+}
+
+// Object request phases. Bounded, and the only values the phase attribute may
+// take. A PUT and a GET share the names where they share the work.
+const (
+	// PhaseBucketCheck is the meta read that resolves the bucket.
+	PhaseBucketCheck = "bucket_check"
+	// PhaseShardFanout is splitting or joining the object across every blob
+	// node holding a shard of it.
+	PhaseShardFanout = "shard_fanout"
+	// PhaseMetaPlacement is the placement record: written on PUT, read on GET.
+	PhaseMetaPlacement = "meta_placement"
+	// PhaseMetaListing is the second write a PUT makes, the listing key that
+	// points at the object hash.
+	PhaseMetaListing = "meta_listing"
+	// PhaseReconstruct is rebuilding an object from parity.
+	PhaseReconstruct = "reconstruct"
+)
+
+// RecordObjectPhase records how long one phase of an object request took. op is
+// a GateOp constant and phase a Phase constant. Called a handful of times per
+// request, never per shard, so the attribute set comes from the cache.
+func RecordObjectPhase(ctx context.Context, op, phase string, seconds float64) {
+	instruments()
+	if objectPhaseDuration == nil {
+		return
+	}
+	objectPhaseDuration.Record(ctx, seconds, objectAttrs("op", op, "phase", phase).record...)
+}
+
+// Meta client operations, naming the wire op rather than the method: Exists is
+// a Get and ListKeys is a Scan, and counting them separately would report two
+// operations where one crossed the network.
+const (
+	MetaOpGet    = "get"
+	MetaOpScan   = "scan"
+	MetaOpPut    = "put"
+	MetaOpDelete = "delete"
+	MetaOpStatus = "status"
+)
+
+// MetaOutcomeNotFound is a read every replica answered, none of which held the
+// key. It is not an error: it is the answer, and counting it as a failure would
+// make a HEAD of a missing object look like a broken meta plane.
+const MetaOutcomeNotFound = "not_found"
+
+// RecordMetaClientOp counts one meta operation and how long it took, including
+// every replica it had to try. Two of these sit on every PUT.
+func RecordMetaClientOp(ctx context.Context, op, outcome string, seconds float64) {
+	instruments()
+	if metaClientOps != nil {
+		metaClientOps.Add(ctx, 1, objectAttrs("op", op, "outcome", outcome).add...)
+	}
+	if metaClientDuration != nil {
+		metaClientDuration.Record(ctx, seconds, objectAttrs("op", op, "", "").record...)
+	}
+}
+
+// Meta write redirect reasons.
+const (
+	// RedirectNotLeader is a replica that refused the write and named the
+	// leader, so the next attempt goes straight there.
+	RedirectNotLeader = "not_leader"
+	// RedirectNoLeader is a replica that refused and could name no leader,
+	// which means an election is still settling.
+	RedirectNoLeader = "no_leader"
+	// RedirectRetryExhausted is a write that ran out of attempts without ever
+	// finding a leader. The write failed.
+	RedirectRetryExhausted = "retry_exhausted"
+)
+
+// RecordMetaRedirect counts one write attempt that did not land on a leader.
+func RecordMetaRedirect(ctx context.Context, reason string) {
+	instruments()
+	if metaClientRedirects == nil {
+		return
+	}
+	metaClientRedirects.Add(ctx, 1, objectAttrs("reason", reason, "", "").add...)
+}
+
+// Connection eviction reasons.
+const (
+	// EvictionStall is a connection that opened streams and answered nothing
+	// on a run of them. It was alive at the transport and useless above it.
+	EvictionStall = "stall"
+	// EvictionError is a connection that could not carry a stream at all.
+	EvictionError = "error"
+	// EvictionClosed is a connection dropped by an explicit eviction, which
+	// includes a peer that closed it.
+	EvictionClosed = "closed"
+)
+
+// RecordRPCEviction counts one connection dropped from the pool. node is the
+// peer that was on the other end. An eviction is rare — per peer, not per
+// request — so this formats its node id rather than reading a cache.
+func RecordRPCEviction(ctx context.Context, node uint64, reason string) {
+	instruments()
+	if rpcEvictions == nil {
+		return
+	}
+	rpcEvictions.Add(ctx, 1, objectAttrs(nodeAttrKey, strconv.FormatUint(node, 10), "reason", reason).add...)
+}
+
+// nodeOnlyAttrs caches the attribute set carrying nothing but a node id, for
+// the stream gauge: one entry per peer, built once.
+var (
+	nodeAttrMu    sync.RWMutex
+	nodeAttrCache = map[uint64]attrOpts{}
+)
+
+func nodeAttrs(node uint64) attrOpts {
+	nodeAttrMu.RLock()
+	opts, ok := nodeAttrCache[node]
+	nodeAttrMu.RUnlock()
+	if ok {
+		return opts
+	}
+
+	opts = newAttrOpts(attribute.String(nodeAttrKey, strconv.FormatUint(node, 10)))
+
+	nodeAttrMu.Lock()
+	nodeAttrCache[node] = opts
+	nodeAttrMu.Unlock()
+	return opts
+}
+
+// EnterRPCStream counts one stream opened to a peer and returns the function
+// that counts it closed. Returning the release rather than exposing a pair is
+// deliberate: an unbalanced gauge is worse than no gauge, and a stream that is
+// never released is a leak this is meant to show.
+func EnterRPCStream(ctx context.Context, node uint64) func() {
+	instruments()
+	if rpcStreamsOpen == nil {
+		return func() {}
+	}
+	opts := nodeAttrs(node)
+	rpcStreamsOpen.Add(ctx, 1, opts.add...)
+	return func() { rpcStreamsOpen.Add(context.WithoutCancel(ctx), -1, opts.add...) }
+}
+
+// MetaSnapshot is one meta replica's storage state at collection time,
+// alongside the consensus state RaftSnapshot carries. Every field comes from
+// figures raft and badger already hold, so a collection reads no files.
+type MetaSnapshot struct {
+	NodeID string
+
+	// FSMBytes is the state machine's on-disk size, or zero when it could not
+	// be read, which is reported as no observation rather than as an empty FSM.
+	FSMBytes int64
+
+	SnapshotIndex int64
+	LastLogIndex  int64
+}
+
+// RegisterMetaGauges observes one replica's storage state on every collection.
+// Separate from RegisterRaftGauges because the two answer different questions:
+// one is whether consensus is healthy, this is whether the single raft group is
+// running out of room.
+func RegisterMetaGauges(snapshot func() MetaSnapshot) (func() error, error) {
+	instruments()
+	if meter == nil {
+		return func() error { return nil }, nil
+	}
+
+	reg, err := meter.RegisterCallback(
+		func(_ context.Context, o metric.Observer) error {
+			s := snapshot()
+			node := metric.WithAttributeSet(attribute.NewSet(attribute.String(nodeAttrKey, s.NodeID)))
+			if s.FSMBytes > 0 {
+				o.ObserveInt64(metaFSMSizeBytes, s.FSMBytes, node)
+			}
+			o.ObserveInt64(metaSnapshotIndex, s.SnapshotIndex, node)
+			// Trailing entries are what a snapshot would truncate. Clamped
+			// because the two indexes are read from separate raft fields and a
+			// negative gap is a torn read, not a real state.
+			o.ObserveInt64(metaLogTrailing, max(s.LastLogIndex-s.SnapshotIndex, 0), node)
+			return nil
+		},
+		metaFSMSizeBytes, metaSnapshotIndex, metaLogTrailing,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return reg.Unregister, nil
+}
+
+// RegisterPoolGauges observes how many connections one node's pool holds.
+func RegisterPoolGauges(node uint64, held func() int64) (func() error, error) {
+	instruments()
+	if meter == nil {
+		return func() error { return nil }, nil
+	}
+
+	attrs := metric.WithAttributeSet(attribute.NewSet(
+		attribute.String(nodeAttrKey, strconv.FormatUint(node, 10)),
+	))
+	reg, err := meter.RegisterCallback(
+		func(_ context.Context, o metric.Observer) error {
+			o.ObserveInt64(rpcConnections, held(), attrs)
+			return nil
+		},
+		rpcConnections,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return reg.Unregister, nil
 }
 
 // objectAttrKey identifies one pre-built object-level attribute set. These
