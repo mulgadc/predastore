@@ -37,11 +37,11 @@ func (b *lateBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequ
 
 var _ BlobClient = (*lateBlob)(nil)
 
-// The hedge returns once enough shards have landed, leaving the slower reads
-// running. They must not write into the slice the caller is reconstructing
-// from: the encoder decides what to rebuild by which entries are nil, so a
-// shard appearing mid-flight changes that answer underneath it.
-func TestShardBytesSnapshotsAgainstALateShard(t *testing.T) {
+// The hedge abandons the slower shard and reconstructs from parity, leaving
+// that read still running. It must not write into the buffers the encoder is
+// reconstructing into: a block appearing mid-flight would change the answer
+// underneath it, and the object served would be neither shard's bytes.
+func TestALateShardDoesNotDisturbTheReadThatGaveUpOnIt(t *testing.T) {
 	t.Parallel()
 
 	const late = 750 * time.Millisecond
@@ -54,24 +54,22 @@ func TestShardBytesSnapshotsAgainstALateShard(t *testing.T) {
 	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), int64(len(want)))
 	require.NoError(t, err)
 
-	// The second data shard arrives long after the parity shard has already
-	// made the read answerable, so it is still outstanding on return.
+	// The second data shard arrives long after parity has already made the read
+	// answerable, so it is still outstanding when the object is served.
 	slow := &lateBlob{fakeBlob: f.bc, slow: place.DataShardNodes[1], delay: late, landed: make(chan struct{})}
 
 	start := time.Now()
-	shards, _, err := shardBytes(ctx, slow, objectHash, place, 0)
+	got, degraded, err := readObject(ctx, slow, f.cfg, "b", "k", place, place.Size, 0)
 	require.NoError(t, err)
 	require.Less(t, time.Since(start), late,
 		"the hedge must return before the late shard lands, or this proves nothing")
-
-	missingOnReturn := missingShards(shards, len(place.DataShardNodes))
-	require.Positive(t, missingOnReturn, "the late shard should be absent on return")
+	assert.Equal(t, 1, degraded, "the abandoned shard should have been rebuilt from parity")
+	assert.Equal(t, want, got)
 
 	<-slow.landed
 	// The write follows the read the fake just answered; the race detector is
 	// what catches the overlap, this margin is for the value assertion below.
 	time.Sleep(100 * time.Millisecond)
 
-	assert.Equal(t, missingOnReturn, missingShards(shards, len(place.DataShardNodes)),
-		"a shard that arrived after the read returned mutated the caller's slice")
+	assert.Equal(t, want, got, "a shard that arrived after the read returned mutated its buffers")
 }

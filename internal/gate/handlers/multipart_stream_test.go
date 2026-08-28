@@ -112,11 +112,23 @@ func TestStreamPartsCloseStopsTheFetchers(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, r.Close())
 
-	time.Sleep(50 * time.Millisecond)
+	// A fetch already past the cancel check still finishes, so the count settles
+	// rather than stopping dead. Waiting for it to settle keeps the assertion on
+	// the property -- that it settles at all, and below the window -- instead of
+	// on how quickly a loaded machine gets there.
 	settled := counting.gets.Load()
-	time.Sleep(50 * time.Millisecond)
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(50 * time.Millisecond)
+		if now := counting.gets.Load(); now == settled {
+			break
+		} else {
+			settled = now
+		}
+	}
 
 	assert.Equal(t, settled, counting.gets.Load(), "fetches continued after the reader was closed")
+	assert.LessOrEqual(t, settled, int64(maxParallelPartFetches+1),
+		"the whole upload was fetched, so closing the reader stopped nothing")
 }
 
 // A part that cannot be read has to fail the completion rather than silently

@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -624,42 +623,6 @@ func loadPlacement(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg
 	return objectToShardNodes, objectToShardNodes.Size, nil
 }
 
-// readShard fetches one shard whole and buffers it. The data is read into
-// memory before the stream is closed, so the caller never reads from a closed
-// connection.
-//
-// Only the open is bounded by a deadline. The body that follows is bounded by
-// progress, in the blob client's idle guard: a total cap cannot distinguish a
-// node that has stopped sending from a shard that is simply large, and at a
-// gigabyte a shard it fails every read of a healthy cluster.
-func readShard(ctx context.Context, bc BlobClient, objectHash [32]byte, node config.NodeID, index int, epoch uint64) ([]byte, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	opening := time.AfterFunc(shardOpenTimeout, cancel)
-	reader, err := bc.Get(ctx, node, blob.GetRequest{
-		Key:        objectHash,
-		RangeStart: -1, // -1 means full shard (no range)
-		RangeEnd:   -1,
-		Index:      uint32(index), //nolint:gosec // G115: index bounded by shard count (small uint).
-		Epoch:      epoch,
-	})
-	opening.Stop()
-	if err != nil {
-		recordShardReadError(ctx, err)
-		return nil, err
-	}
-	data, err := io.ReadAll(reader)
-	if closeErr := reader.Close(); closeErr != nil {
-		slog.DebugContext(ctx, "Failed to close shard stream reader", "node", node, "error", closeErr)
-	}
-	if err != nil {
-		recordShardReadError(ctx, err)
-		return nil, err
-	}
-	return data, nil
-}
-
 // recordShardReadError counts a failed shard read under a bounded reason. The
 // error text names a node and a key, so only the classification is recorded:
 // a node that answered without the shard, or anything else.
@@ -680,136 +643,6 @@ func shardErrorReason(err error) string {
 	default:
 		return telemetry.ShardReasonTransport
 	}
-}
-
-// shardBytes reads an object's shards, concurrently, tolerantly and hedged.
-//
-// Concurrently, because reading them one after another makes an object's read
-// latency the sum of its shards rather than the slowest of them, so one slow
-// node stalls every read that touches it.
-//
-// Tolerantly, because a shard that cannot be read is exactly what the parity
-// exists for. A failed shard leaves a nil entry for the caller to reconstruct
-// from; an error is returned only when too few shards survive for any
-// reconstruction to be possible.
-//
-// Hedged, because the read is complete once enough shards have arrived, and
-// waiting for the rest hands a stalled node the power to set every reader's
-// latency. The data shards go first, so a healthy read never fetches a parity
-// shard it does not need; the parity shards follow only if the data shards have
-// not all landed shortly after, or one of them has already failed.
-//
-// A shard its owner cannot serve is looked for on the handoff node before it is
-// counted as failed, since a write that could not reach the owner will have put
-// it there. That is one fetch against k fetches and a decode, so it is worth
-// asking even though the usual answer is no.
-func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, handoff config.NodeID) ([][]byte, []shardFailure, error) {
-	need := len(place.DataShardNodes)
-	shards := make([][]byte, need+len(place.ParityShardNodes))
-	if need == 0 {
-		return shards, nil, nil
-	}
-
-	// Cancelled on return, which abandons whatever is still outstanding: a
-	// shard that arrives after the object has been served is wasted work.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var mu sync.Mutex
-	available := 0
-	var failures []shardFailure
-	enough := make(chan struct{})
-	dataFailed := make(chan struct{})
-	var enoughOnce, failedOnce sync.Once
-
-	read := func(index int, node config.NodeID) {
-		start := time.Now()
-		data, err := readShard(ctx, bc, objectHash, node, index, place.WriteEpoch)
-		if err != nil && handoff != 0 && handoff != node {
-			if held, hErr := readShard(ctx, bc, objectHash, handoff, index, place.WriteEpoch); hErr == nil {
-				slog.InfoContext(ctx, "Shard served from its handoff holder",
-					"owner", node, "holder", handoff, "index", index)
-				data, err = held, nil
-			}
-		}
-		if err != nil {
-			mu.Lock()
-			failures = append(failures, shardFailure{index: index, node: node, reason: shardErrorReason(err)})
-			mu.Unlock()
-			logShardFailure(ctx, node, index, err, time.Since(start))
-			if index < need {
-				failedOnce.Do(func() { close(dataFailed) })
-			}
-			return
-		}
-		if elapsed := time.Since(start); elapsed >= slowShardThreshold {
-			slog.WarnContext(ctx, "Shard read slow",
-				"node", node, "index", index, "duration_ms", elapsed.Milliseconds())
-		}
-
-		mu.Lock()
-		defer mu.Unlock()
-		// Indices are distinct, but the lock still guards the slice itself: the
-		// caller snapshots it once enough shards land, while slower reads are
-		// still outstanding and may yet write their own entry.
-		shards[index] = data
-		available++
-		if available >= need {
-			enoughOnce.Do(func() { close(enough) })
-		}
-	}
-
-	// Every goroutine is registered before anything waits on them, so the
-	// parity reads wait for their cue rather than being started later.
-	var wg sync.WaitGroup
-	for i, node := range place.DataShardNodes {
-		wg.Go(func() { read(i, node) })
-	}
-	for i, node := range place.ParityShardNodes {
-		wg.Go(func() {
-			hedge := time.NewTimer(hedgeDelay)
-			defer hedge.Stop()
-			select {
-			case <-enough:
-				return // the data shards were enough on their own
-			case <-ctx.Done():
-				return
-			case <-dataFailed:
-			case <-hedge.C:
-			}
-			select {
-			case <-enough:
-				return
-			default:
-			}
-			read(need+i, node)
-		})
-	}
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-enough:
-	case <-done:
-	}
-
-	// The hedge returns as soon as enough shards have landed, so the slower
-	// reads are still running. Hand back a snapshot: a straggler writing its
-	// entry must not mutate the slice the caller is reconstructing from.
-	mu.Lock()
-	defer mu.Unlock()
-	snapshot := make([][]byte, len(shards))
-	copy(snapshot, shards)
-	failed := slices.Clone(failures)
-	if available < need {
-		return snapshot, failed, fmt.Errorf("%w: %d of %d shards available",
-			errInsufficientShards, available, need)
-	}
-	return snapshot, failed, nil
 }
 
 // shardFailure records one shard the read could not use, and why. It is what
@@ -898,70 +731,10 @@ const slowShardThreshold = 2 * time.Second
 // stalled node can both be measured against.
 const shardOpenTimeout = 5 * time.Second
 
-// hedgeDelay is how long the data shards get before the parity shards are
-// fetched as well. Comfortably above a healthy shard read, and far below
-// anything a client would notice.
+// hedgeDelay is how long a shard gets, measured from the moment a peer
+// answered, before parity is fetched in its place. Comfortably above a healthy
+// block read, and far below anything a client would notice.
 const hedgeDelay = 250 * time.Millisecond
-
-// errInsufficientShards reports that too few shards survived to rebuild the
-// object, as distinct from some shards being missing but recoverable.
-var errInsufficientShards = errors.New("insufficient shards to reconstruct")
-
-// shardReadersOf turns shard bytes into readers, leaving a nil for every
-// shard that could not be read so the encoder knows to rebuild it.
-func shardReadersOf(shards [][]byte) []io.Reader {
-	readers := make([]io.Reader, len(shards))
-	for i, s := range shards {
-		if s != nil {
-			readers[i] = bytes.NewReader(s)
-		}
-	}
-	return readers
-}
-
-// missingShards counts the first n shards the read could not fill.
-func missingShards(shards [][]byte, n int) int {
-	missing := 0
-	for i := 0; i < n && i < len(shards); i++ {
-		if shards[i] == nil {
-			missing++
-		}
-	}
-	return missing
-}
-
-// reconstructObject rebuilds an object from its parity shards.
-//
-// Recovered shards are held in memory. They used to be written to temp files
-// named only for the object hash and shard index, so two concurrent reads of
-// one object wrote and deleted the same paths underneath each other. Keeping
-// them in memory also removes a second read of every shard, since the encoder
-// consumes the readers it is given.
-func reconstructObject(enc reedsolomon.StreamEncoder, lay layout, shards [][]byte, size int64) (*bytes.Buffer, error) {
-	recovered := make([]*bytes.Buffer, len(shards))
-	writers := make([]io.Writer, len(shards))
-	for i := range shards {
-		if shards[i] == nil {
-			recovered[i] = &bytes.Buffer{}
-			writers[i] = recovered[i]
-		}
-	}
-
-	if err := enc.Reconstruct(shardReadersOf(shards), writers); err != nil {
-		return nil, fmt.Errorf("reconstruction failed: %w", err)
-	}
-	for i := range shards {
-		if shards[i] == nil && recovered[i] != nil {
-			shards[i] = recovered[i].Bytes()
-		}
-	}
-
-	var out bytes.Buffer
-	if err := lay.join(&out, shards, size); err != nil {
-		return nil, fmt.Errorf("join after reconstruction failed: %w", err)
-	}
-	return &out, nil
-}
 
 // deleteObject sends DELETE requests to all shard nodes.
 func deleteObject(ctx context.Context, bc BlobClient, bucket, key string, objectHash [32]byte, place ObjectToShardNodes) error {

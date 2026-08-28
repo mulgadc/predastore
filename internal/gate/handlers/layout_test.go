@@ -9,6 +9,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/klauspost/reedsolomon"
@@ -16,6 +19,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// shardReadersOf feeds shards to the stream encoder, which is the only thing
+// left that wants them as readers: the reference Join this file checks against.
+func shardReadersOf(shards [][]byte) []io.Reader {
+	readers := make([]io.Reader, len(shards))
+	for i, s := range shards {
+		readers[i] = bytes.NewReader(s)
+	}
+
+	return readers
+}
 
 // split lays an object out the way the layout says, which is the write path's
 // arithmetic expressed once more so the join is checked against something.
@@ -161,6 +175,7 @@ func TestRangedReadsAgreeWithTheWholeObject(t *testing.T) {
 	objectHash := model.ObjectHash("b", "k")
 	place, _, err := f.write(ctx, objectHash, bytes.NewReader(body), size)
 	require.NoError(t, err)
+	f.publish(t, objectHash, place)
 
 	ranges := []struct{ start, end int64 }{
 		{0, 0},
@@ -175,11 +190,16 @@ func TestRangedReadsAgreeWithTheWholeObject(t *testing.T) {
 	for _, r := range ranges {
 		t.Run(fmt.Sprintf("%d-%d", r.start, r.end), func(t *testing.T) {
 			t.Parallel()
-			got, contentRange, _, rangeErr := readRange(
-				ctx, f.bc, f.cfg, "b", "k", place, size, r.start, r.end, 0)
-			require.NoError(t, rangeErr)
-			assert.Equal(t, fmt.Sprintf("bytes %d-%d/%d", r.start, r.end, size), contentRange)
-			assert.Equal(t, body[r.start:r.end+1], got)
+			req := objectRequest(http.MethodGet, "k", "")
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", r.start, r.end))
+
+			w := httptest.NewRecorder()
+			GetObject(f.mc, f.bc, f.ring, testCache(), f.cfg).ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusPartialContent, w.Code)
+			assert.Equal(t, fmt.Sprintf("bytes %d-%d/%d", r.start, r.end, size),
+				w.Header().Get("Content-Range"))
+			assert.Equal(t, body[r.start:r.end+1], w.Body.Bytes())
 		})
 	}
 }
