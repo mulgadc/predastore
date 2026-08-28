@@ -18,11 +18,11 @@
 #   ./scripts/bench/e2e-stress.sh          # or: make e2e-stress
 #
 # Environment:
-#   STRESS_SCENARIO    Narrows the run to one test: "repair",
+#   STRESS_SCENARIO    Narrows the run to one test: "repair", "handoff",
 #                      "torn-overwrite", "stale-shard", "freeze", or
 #                      "partial-put" — a client that stops sending mid-body,
 #                      which is not in a default run. Unset runs repair,
-#                      torn-overwrite, stale-shard and freeze.
+#                      handoff, torn-overwrite, stale-shard and freeze.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -46,6 +46,11 @@
 #   STRESS_REPAIR_DEADLINE
 #                      Seconds allowed for the sweep to restore them
 #                      (default: 180)
+#   STRESS_HANDOFF_KEYS Objects the handoff scenario writes at full width with
+#                      a host down (default: 12)
+#   STRESS_HANDOFF_DEADLINE
+#                      Seconds allowed for the sweep to bring the handed-off
+#                      shards home (default: 180)
 #   WARP               Path to the warp binary (default: bin/tools/warp)
 #
 
@@ -74,7 +79,7 @@ STALE_KEYS="${STRESS_STALE_KEYS:-12}"
 # running everything and reporting a pass for a test that was never named.
 SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
-    all|freeze|partial-put|torn-overwrite|stale-shard|repair) ;;
+    all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
 
@@ -329,9 +334,9 @@ EOF
 # how many shards the gate had to reconstruct to answer. The header is absent
 # from a read that cost nothing, which is the state this scenario waits for.
 degraded_read() {
-    local gate="$1" key="$2" out="$3"
-    local headers="$WORK_DIR/repair-headers.txt" status
-    curl -sk --max-time 120 -o "$out" -D "$headers" "$gate/$REPAIR_BUCKET/$key" || return 1
+    local gate="$1" bucket="$2" key="$3" out="$4"
+    local headers="$WORK_DIR/degraded-headers.txt" status
+    curl -sk --max-time 120 -o "$out" -D "$headers" "$gate/$bucket/$key" || return 1
     status="$(awk 'NR == 1 { print $2; exit }' "$headers")"
     if [ "$status" != 200 ]; then
         echo "http-$status"
@@ -430,7 +435,7 @@ run_repair() {
     while [ "$(date +%s)" -lt "$deadline" ]; do
         pending=0
         for key in "${data_keys[@]}"; do
-            seen="$(degraded_read "$gate" "$key" "$got" 2>/dev/null || true)"
+            seen="$(degraded_read "$gate" "$REPAIR_BUCKET" "$key" "$got" 2>/dev/null || true)"
             [ "$seen" = 0 ] || pending=$(( pending + 1 ))
         done
         # Recorded, not asserted: the sweep runs every five seconds and may
@@ -484,7 +489,7 @@ run_repair() {
         || fail "repair: the read gate did not serve before host $phost was stopped"
     log "repair: stopping host $phost so $pkey rebuilds from the parity restored on host $frozen"
     kill -STOP "$ppid"
-    seen="$(degraded_read "$pgate" "$pkey" "$got" 2>/dev/null || true)"
+    seen="$(degraded_read "$pgate" "$REPAIR_BUCKET" "$pkey" "$got" 2>/dev/null || true)"
     kill -CONT "$ppid"
 
     if [ "$seen" = 0 ] || [ -z "$seen" ]; then
@@ -511,6 +516,210 @@ if [ "$SCENARIO" = all ] || [ "$SCENARIO" = repair ]; then
         echo "Stress results: $RUN_DIR"
         [ "$REPAIR_FAILURES" -eq 0 ] \
             || fail "repair failed $REPAIR_FAILURES of $REPAIR_CASES assertions"
+        exit 0
+    fi
+fi
+
+# --- Scenario: handoff ---
+#
+# The user-visible claim: with a host down, writes still land at full width —
+# every shard on a node, none given up on — and the object stays exactly as
+# redundant as one written with the cluster whole. When the host returns, the
+# shards it never received come home.
+#
+# Degraded writes are deliberately left off here. A write acknowledged with a
+# host down is then attributable to handoff and to nothing else: without it the
+# floor is the whole stripe and the write is refused, which is what the
+# torn-overwrite scenario asserts on the shared cluster.
+#
+# Like repair it runs its own cluster, for the same reason and on ports of its
+# own.
+
+HANDOFF_CLUSTER="${CONFIG_NAME}-handoff"
+HANDOFF_CONFIG="$PREDA_CONFIG_DIR/$HANDOFF_CLUSTER.toml"
+HANDOFF_PID_DIR="$PREDA_DIR/$HANDOFF_CLUSTER/pids"
+HANDOFF_BUCKET="stress-handoff"
+HANDOFF_KEYS="${STRESS_HANDOFF_KEYS:-12}"
+HANDOFF_DEADLINE="${STRESS_HANDOFF_DEADLINE:-180}"
+HANDOFF_FAILURES=0
+HANDOFF_CASES=0
+
+# render_handoff_profile turns handoff on and leaves degraded writes alone, so
+# the write floor stays the full stripe. Repair is on so the shards can be
+# watched coming home, and the bucket is public so an unsigned GET can read the
+# header saying what a read cost.
+render_handoff_profile() {
+    render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$HANDOFF_CONFIG" "$(( PORT_OFFSET + 200 ))"
+    awk '/^\[rs\]$/ { print; print "hinted_handoff = true"; next } { print }' \
+        "$HANDOFF_CONFIG" > "$HANDOFF_CONFIG.tmp"
+    mv "$HANDOFF_CONFIG.tmp" "$HANDOFF_CONFIG"
+    cat >> "$HANDOFF_CONFIG" <<EOF
+
+[repair]
+enabled = true
+interval_seconds = 5
+page_size = 64
+
+[[bucket]]
+name = "$HANDOFF_BUCKET"
+region = "$REGION"
+public = true
+account_id = "123456789012"
+EOF
+    grep -q '^hinted_handoff = true$' "$HANDOFF_CONFIG" \
+        || fail "handoff: hinted_handoff was not written into $HANDOFF_CONFIG"
+    if grep -q '^degraded_writes' "$HANDOFF_CONFIG"; then
+        fail "handoff: degraded writes are on, so an accepted write proves nothing about handoff"
+    fi
+    cp "$HANDOFF_CONFIG" "$RUN_DIR/$HANDOFF_CLUSTER.toml"
+}
+
+handoff_check() {
+    local ok="$1" message="$2"
+    HANDOFF_CASES=$(( HANDOFF_CASES + 1 ))
+    if [ "$ok" = true ]; then
+        log "handoff: pass, $message"
+    else
+        log "handoff: FAIL $message"
+        HANDOFF_FAILURES=$(( HANDOFF_FAILURES + 1 ))
+    fi
+}
+
+run_handoff() {
+    local src="$WORK_DIR/handoff-src.bin" got="$WORK_DIR/handoff-got.bin"
+    local keys=() data_keys=()
+    local key i role frozen gate fpid frozen_gate
+
+    render_handoff_profile
+    log "handoff: starting $HANDOFF_CLUSTER with hinted handoff on and the full stripe as the write floor"
+    "$SCRIPTS_DIR/start.sh" -w "$HANDOFF_CLUSTER"
+
+    openssl rand -out "$src" 2097152
+    for i in $(seq 1 "$HANDOFF_KEYS"); do
+        keys+=("$(printf 'handoff-%03d.bin' "$i")")
+    done
+
+    frozen="$(parse_hosts "$HANDOFF_CONFIG" | awk 'NR == 1 { print $1 }')"
+    gate="$(survivor_gate "$HANDOFF_CONFIG" "$frozen")"
+    [ -n "$gate" ] || fail "handoff: no gate survives stopping host $frozen"
+    frozen_gate="$(parse_hosts "$HANDOFF_CONFIG" \
+        | awk -v h="$frozen" '$1 == h && $3 != "" { print "https://" $2 ":" $3; exit }')"
+    [ -n "$frozen_gate" ] || fail "handoff: host $frozen runs no gate, so nothing repairs its blob node"
+
+    # Only a key whose data shard sits on the stopped host can say anything
+    # about the read path: an ordinary GET reads the data shards and never
+    # touches parity.
+    for key in "${keys[@]}"; do
+        role="$("$SHARD_PROBE" -config "$HANDOFF_CONFIG" -bucket "$HANDOFF_BUCKET" -key "$key" \
+            | awk -v h="host=$frozen" '$4 == h { sub(/^role=/, "", $2); print $2; exit }')"
+        if [ "$role" = data ]; then
+            data_keys+=("$key")
+        fi
+    done
+    [ "${#data_keys[@]}" -gt 0 ] \
+        || fail "handoff: no key places a data shard on host $frozen, so the read check proves nothing"
+    log "handoff: host $frozen holds a data shard of ${#data_keys[@]} of the $HANDOFF_KEYS keys"
+
+    fpid="$(cat "$HANDOFF_PID_DIR/host-${frozen}.pid")"
+    kill -0 "$fpid" 2>/dev/null || fail "handoff: host $frozen is not running"
+
+    local accepted=0
+    kill -STOP "$fpid"
+    log "handoff: SIGSTOP host $frozen, writing $HANDOFF_KEYS objects through $gate"
+    for key in "${keys[@]}"; do
+        if aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+            s3api put-object --bucket "$HANDOFF_BUCKET" --key "$key" --body "$src" \
+            >/dev/null 2>>"$RUN_DIR/handoff-puts.txt"; then
+            accepted=$(( accepted + 1 ))
+        fi
+    done
+    kill -CONT "$fpid"
+    log "handoff: SIGCONT host $frozen; $accepted of $HANDOFF_KEYS writes were accepted with it down"
+
+    # The whole claim in one number. The floor is the full stripe, so a write
+    # acknowledged with a host down placed every shard somewhere, and the only
+    # somewhere available was the node off the end of the ring.
+    handoff_check "$([ "$accepted" -eq "$HANDOFF_KEYS" ] && echo true || echo false)" \
+        "all $HANDOFF_KEYS writes landed at full width with host $frozen down"
+    [ "$accepted" -eq "$HANDOFF_KEYS" ] \
+        || fail "handoff: writes were refused with a host down, so nothing below is attributable"
+
+    warm_gate "$frozen_gate" "$HANDOFF_BUCKET" "${keys[0]}" handoff \
+        || fail "handoff: the thawed host's gate never served, so its sweep cannot be observed"
+
+    # What the shards are worth. A handed-off object has to read back with no
+    # reconstruction: the bytes are on a node the record does not name, and a
+    # gate that could not find them there would be serving a stripe that is
+    # complete only on paper.
+    local bad=0 seen
+    for key in "${data_keys[@]}"; do
+        seen="$(degraded_read "$gate" "$HANDOFF_BUCKET" "$key" "$got" 2>/dev/null || true)"
+        [ "$seen" = 0 ] || bad=$(( bad + 1 ))
+    done
+    handoff_check "$([ "$bad" -eq 0 ] && echo true || echo false)" \
+        "reading the ${#data_keys[@]} objects whose data shard was handed off costs no reconstruction ($bad did)"
+
+    # Home is where the record says. Stopping the holder is what tells the two
+    # apart: until repair returns the shard, the only copy is on the node about
+    # to be stopped and the read has to rebuild it from parity.
+    local hkey holder hgate hpid started deadline settled=false
+    hkey="${data_keys[0]}"
+    holder="$(shard_host "$HANDOFF_CONFIG" "$HANDOFF_BUCKET" "$hkey" handoff)"
+    [ -n "$holder" ] || fail "handoff: $hkey has no handoff holder, so the cluster has no node to spare"
+    if [ "$holder" = "$frozen" ]; then
+        fail "handoff: the holder of $hkey is the host that was down, which cannot have taken its shard"
+    fi
+    hgate="$(survivor_gate "$HANDOFF_CONFIG" "$holder")"
+    hpid="$(cat "$HANDOFF_PID_DIR/host-${holder}.pid")"
+    warm_gate "$hgate" "$HANDOFF_BUCKET" "$hkey" handoff-home \
+        || fail "handoff: the read gate did not serve before host $holder was stopped"
+
+    log "handoff: waiting for the sweep to return $hkey's shard from host $holder to host $frozen"
+    started="$(date +%s)"
+    deadline=$(( started + HANDOFF_DEADLINE ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        kill -STOP "$hpid"
+        seen="$(degraded_read "$hgate" "$HANDOFF_BUCKET" "$hkey" "$got" 2>/dev/null || true)"
+        kill -CONT "$hpid"
+        if [ "$seen" = 0 ] && cmp -s "$src" "$got"; then
+            settled=true
+            break
+        fi
+        sleep 5
+    done
+    handoff_check "$settled" \
+        "$hkey reads without reconstruction while its holder is stopped, so the shard is back on host $frozen"
+
+    # Restored is not the same as restored correctly, and every count above
+    # would be satisfied by a shard that reads back as the wrong bytes.
+    bad=0
+    for key in "${keys[@]}"; do
+        if ! aws_s3 "$gate" s3 cp "s3://$HANDOFF_BUCKET/$key" "$got" --only-show-errors 2>>"$EVENTS"; then
+            log "handoff: GET errored for $key"
+            bad=$(( bad + 1 ))
+            continue
+        fi
+        cmp -s "$src" "$got" || { log "handoff: $key does not match what was written"; bad=$(( bad + 1 )); }
+    done
+    handoff_check "$([ "$bad" -eq 0 ] && echo true || echo false)" \
+        "all $HANDOFF_KEYS objects read back byte for byte"
+
+    log "handoff: stopping $HANDOFF_CLUSTER"
+    stop_clusters
+    if [ "$HANDOFF_FAILURES" -eq 0 ]; then
+        log "handoff: passed $HANDOFF_CASES assertions"
+    else
+        log "handoff: FAILED $HANDOFF_FAILURES of $HANDOFF_CASES assertions"
+    fi
+}
+
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = handoff ]; then
+    run_handoff
+
+    if [ "$SCENARIO" = handoff ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$HANDOFF_FAILURES" -eq 0 ] \
+            || fail "handoff failed $HANDOFF_FAILURES of $HANDOFF_CASES assertions"
         exit 0
     fi
 fi
@@ -1420,6 +1629,13 @@ log "Warp completed with no errors"
     else
         echo "repair=fail ($REPAIR_FAILURES of $REPAIR_CASES)"
     fi
+    if [ "$HANDOFF_CASES" -eq 0 ]; then
+        echo "handoff=skipped"
+    elif [ "$HANDOFF_FAILURES" -eq 0 ]; then
+        echo "handoff=pass"
+    else
+        echo "handoff=fail ($HANDOFF_FAILURES of $HANDOFF_CASES)"
+    fi
     if [ "$TORN_CASES" -eq 0 ]; then
         echo "torn_overwrite=skipped"
     elif [ "$TORN_FAILURES" -eq 0 ]; then
@@ -1452,3 +1668,5 @@ echo "Stress results: $RUN_DIR"
     || fail "stale-shard failed $STALE_FAILURES of $STALE_CASES assertions"
 [ "$REPAIR_FAILURES" -eq 0 ] \
     || fail "repair failed $REPAIR_FAILURES of $REPAIR_CASES assertions"
+[ "$HANDOFF_FAILURES" -eq 0 ] \
+    || fail "handoff failed $HANDOFF_FAILURES of $HANDOFF_CASES assertions"

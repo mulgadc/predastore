@@ -189,8 +189,11 @@ func gateConfig(
 	c *Config, host HostConfig, n NodeConfig, mc gate.MetaClient, bc gate.BlobClient,
 ) gate.Config {
 	return gate.Config{
-		Region:      c.Region,
-		RS:          gate.RS{Data: c.RS.Data, Parity: c.RS.Parity, DegradedWrites: c.RS.DegradedWrites},
+		Region: c.Region,
+		RS: gate.RS{
+			Data: c.RS.Data, Parity: c.RS.Parity,
+			DegradedWrites: c.RS.DegradedWrites, HintedHandoff: c.RS.HintedHandoff,
+		},
 		Buckets:     bucketConfigs(c),
 		Auth:        authEntries(c),
 		IAM:         iamConfig(c),

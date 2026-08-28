@@ -50,7 +50,7 @@ type fakeBlob struct {
 	// repair that is already in flight.
 	onPut func()
 
-	stats, gets, puts, commits, aborts atomic.Int64
+	stats, gets, puts, commits, aborts, deletes atomic.Int64
 }
 
 func newFakeBlob() *fakeBlob {
@@ -199,6 +199,23 @@ func (f *fakeBlob) Abort(_ context.Context, node config.NodeID, req blob.CommitR
 	delete(f.prepared, shardAddr{node, req.Key, req.Index})
 
 	return nil
+}
+
+func (f *fakeBlob) Delete(
+	_ context.Context, node config.NodeID, req blob.DeleteRequest,
+) (*blob.DeleteResponse, error) {
+	f.deletes.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.down[node] {
+		return nil, errNodeDown
+	}
+	addr := shardAddr{node, req.Key, req.Index}
+	_, held := f.committed[addr]
+	delete(f.committed, addr)
+	delete(f.prepared, addr)
+
+	return &blob.DeleteResponse{Deleted: held}, nil
 }
 
 type fakeMeta struct {

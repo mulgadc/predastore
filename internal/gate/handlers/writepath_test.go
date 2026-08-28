@@ -248,11 +248,11 @@ func (f writeFixture) write(ctx context.Context, objectHash [32]byte, body io.Re
 	if err != nil {
 		return place, writeResult{}, err
 	}
-	written, err := writeObject(ctx, f.bc, f.cfg, body, size, objectHash, place)
+	written, err := writeObject(ctx, f.bc, f.cfg, f.ring, body, size, objectHash, place)
 	if err != nil {
 		return place, written, err
 	}
-	commitShards(ctx, f.bc, objectHash, place, written.landed)
+	commitShards(ctx, f.bc, objectHash, place, written)
 
 	return place, written, nil
 }
@@ -288,7 +288,7 @@ func (f writeFixture) roundTrip(t *testing.T, bucket, key string, body []byte) [
 	place, _, err := f.write(ctx, objectHash, bytes.NewReader(body), int64(len(body)))
 	require.NoError(t, err)
 
-	got, _, err := readObject(ctx, f.bc, f.cfg, bucket, key, place, place.Size)
+	got, _, err := readObject(ctx, f.bc, f.cfg, bucket, key, place, place.Size, 0)
 	require.NoError(t, err)
 	return got
 }
@@ -406,7 +406,7 @@ func TestWriteObjectSingleShardReportsPoolPressure(t *testing.T) {
 	require.NoError(t, err)
 
 	written, err := writeObject(
-		context.Background(), nearFull, f.cfg,
+		context.Background(), nearFull, f.cfg, f.ring,
 		bytes.NewReader([]byte("payload")), 7, objectHash, place,
 	)
 
@@ -433,7 +433,7 @@ func TestWriteObjectReturnsWhenParityPutAbandonsItsBody(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, err := writeObject(
-			context.Background(), bc, f.cfg,
+			context.Background(), bc, f.cfg, f.ring,
 			bytes.NewReader(body), int64(len(body)), objectHash, place,
 		)
 		done <- err

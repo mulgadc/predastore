@@ -51,7 +51,7 @@ func TestDegradedWriteSucceedsWithANodeDown(t *testing.T) {
 
 				// The object is what matters: it has to read back exactly,
 				// rebuilding the shard that never landed.
-				got, _, err := readObject(ctx, f.bc, f.cfg, "b", "k", place, place.Size)
+				got, _, err := readObject(ctx, f.bc, f.cfg, "b", "k", place, place.Size, 0)
 				require.NoError(t, err)
 				assert.Equal(t, want, got)
 			})
@@ -168,7 +168,7 @@ func TestOneParityNodeDownDoesNotCostTheOtherParityShard(t *testing.T) {
 	// And it is worth what parity is worth: with two more shards gone the
 	// object still rebuilds.
 	bc := &staleBlob{fakeBlob: f.bc, stale: map[int]bool{0: true}}
-	got, _, err := readObject(ctx, bc, f.cfg, "b", "k", place, place.Size)
+	got, _, err := readObject(ctx, bc, f.cfg, "b", "k", place, place.Size, 0)
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 }

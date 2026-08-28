@@ -60,7 +60,7 @@ func TestStreamPartsConcatenatesInOrder(t *testing.T) {
 		want = append(want, data...)
 	}
 
-	r := streamParts(context.Background(), f.mc, f.bc, f.cfg, "b", "k", "upload-1", completedParts(parts))
+	r := streamParts(context.Background(), f.mc, f.bc, nil, f.cfg, "b", "k", "upload-1", completedParts(parts))
 	defer r.Close()
 
 	got, err := io.ReadAll(r)
@@ -80,7 +80,7 @@ func TestStreamPartsHoldsOnlyABoundedWindow(t *testing.T) {
 	}
 
 	counting := &countingGets{BlobClient: f.bc}
-	r := streamParts(context.Background(), f.mc, counting, f.cfg, "b", "k", "upload-1", completedParts(parts))
+	r := streamParts(context.Background(), f.mc, counting, nil, f.cfg, "b", "k", "upload-1", completedParts(parts))
 	defer r.Close()
 
 	// Read one part's worth, then let any runnable fetch make progress. Only
@@ -106,7 +106,7 @@ func TestStreamPartsCloseStopsTheFetchers(t *testing.T) {
 	}
 
 	counting := &countingGets{BlobClient: f.bc}
-	r := streamParts(context.Background(), f.mc, counting, f.cfg, "b", "k", "upload-1", completedParts(parts))
+	r := streamParts(context.Background(), f.mc, counting, nil, f.cfg, "b", "k", "upload-1", completedParts(parts))
 
 	_, err := io.ReadFull(r, make([]byte, 1024))
 	require.NoError(t, err)
@@ -128,7 +128,7 @@ func TestStreamPartsSurfacesAFetchError(t *testing.T) {
 	f.storePart(t, "b", "k", "upload-1", 1, randomBytes(t, 1024))
 	// Part 2 is never stored, so its placement lookup fails.
 
-	r := streamParts(context.Background(), f.mc, f.bc, f.cfg, "b", "k", "upload-1", completedParts(2))
+	r := streamParts(context.Background(), f.mc, f.bc, nil, f.cfg, "b", "k", "upload-1", completedParts(2))
 	defer r.Close()
 
 	_, err := io.ReadAll(r)
@@ -171,12 +171,12 @@ func TestMultipartAssemblyRoundTrips(t *testing.T) {
 			ctx := context.Background()
 			objectHash := model.ObjectHash("b", "k")
 
-			assembled := streamParts(ctx, f.mc, f.bc, f.cfg, "b", "k", "upload-1", completedParts(parts))
+			assembled := streamParts(ctx, f.mc, f.bc, nil, f.cfg, "b", "k", "upload-1", completedParts(parts))
 			place, _, err := f.write(ctx, objectHash, assembled, finalSize)
 			require.NoError(t, err)
 			require.NoError(t, assembled.Close())
 
-			got, _, err := readObject(ctx, f.bc, f.cfg, "b", "k", place, place.Size)
+			got, _, err := readObject(ctx, f.bc, f.cfg, "b", "k", place, place.Size, 0)
 			require.NoError(t, err)
 			assert.Equal(t, want, got)
 		})

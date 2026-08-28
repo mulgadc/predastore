@@ -73,7 +73,18 @@ type shardWriteOutcome struct {
 type writeResult struct {
 	poolNearFull bool
 	landed       []bool
-	missing      []config.NodeID
+
+	// holders is where shard i actually went — its placement node, or the
+	// handoff node when the owner would not take it. Commit and abort follow
+	// this rather than the record, because a shard handed off is not on the
+	// node the record names.
+	holders []config.NodeID
+
+	// missing names the owners whose shard landed nowhere at all, and handoff
+	// the positions that landed away from home. A position is in one or the
+	// other or neither, never both.
+	missing []config.NodeID
+	handoff []int
 }
 
 func (r writeResult) landedCount() int {
@@ -90,10 +101,14 @@ func (r writeResult) landedCount() int {
 // degraded reports whether the write went out at less than full width. The
 // object is durable either way; what is reduced is how many further losses it
 // survives until repair restores the missing shards.
+//
+// A shard that was handed off is not missing: the stripe is complete, just not
+// where the record says, and both the read path and repair look there.
 func (r writeResult) degraded() bool { return len(r.missing) > 0 }
 
 // fullWidth is the result of a write with no shards to place, which is an empty
-// object: nothing is missing because nothing was owed.
+// object: nothing is missing because nothing was owed, and there is nothing on
+// any node to commit or abort.
 func fullWidth(total int) writeResult {
 	landed := make([]bool, total)
 	for i := range landed {
@@ -176,11 +191,13 @@ func writeSingleShard(
 	if err != nil {
 		return writeResult{landed: []bool{false}, missing: []config.NodeID{node}}, err
 	}
+	holders := []config.NodeID{node}
 	if counted.n != size {
-		return writeResult{landed: []bool{true}}, fmt.Errorf("body delivered %d bytes, declared %d", counted.n, size)
+		return writeResult{landed: []bool{true}, holders: holders},
+			fmt.Errorf("body delivered %d bytes, declared %d", counted.n, size)
 	}
 
-	return writeResult{poolNearFull: resp.PoolNearFull, landed: []bool{true}}, nil
+	return writeResult{poolNearFull: resp.PoolNearFull, landed: []bool{true}, holders: holders}, nil
 }
 
 // writeObject splits body into RS shards and sends each to the appropriate
@@ -191,7 +208,7 @@ func writeSingleShard(
 //
 // The stream encoder is constructed per request; hoisting it into the gate
 // belongs with the streaming refactor, not here.
-func writeObject(ctx context.Context, bc BlobClient, cfg Config, body io.Reader, size int64, objectHash [32]byte, place ObjectToShardNodes) (writeResult, error) {
+func writeObject(ctx context.Context, bc BlobClient, cfg Config, ring *placement.Ring, body io.Reader, size int64, objectHash [32]byte, place ObjectToShardNodes) (writeResult, error) {
 	// An empty object has no shard to write: the blob protocol rejects a
 	// zero-length value, and recorded placement is enough to serve the GET.
 	if size == 0 {
@@ -216,7 +233,8 @@ func writeObject(ctx context.Context, bc BlobClient, cfg Config, body io.Reader,
 		return writeResult{landed: make([]bool, cfg.TotalShards())}, err
 	}
 
-	return putShards(ctx, bc, cfg, objectHash, epoch, shardNodes, shards)
+	return putShards(ctx, bc, cfg, objectHash, epoch, shardNodes, shards,
+		handoffNode(ring, cfg, objectHash))
 }
 
 // encodeShards splits the body into its data shards and encodes the parity
@@ -273,9 +291,15 @@ func encodeShards(cfg Config, body io.Reader, size int64) ([][]byte, error) {
 // once cfg.MinShards() of the stripe are durable, because any DataShards of
 // them reconstruct the object. Below that the write fails and names the nodes
 // that were missing.
+//
+// A refused shard is offered to handoff, if there is one, before it is counted
+// as missing. That turns a short stripe into a complete one stored somewhere
+// else, which is the difference between a write that is durable and a write
+// that is also still redundant.
 func putShards(
 	ctx context.Context, bc BlobClient, cfg Config,
 	objectHash [32]byte, epoch uint64, shardNodes []config.NodeID, shards [][]byte,
+	handoff config.NodeID,
 ) (writeResult, error) {
 	outcomes := make(chan shardWriteOutcome, len(shards))
 	var wg sync.WaitGroup
@@ -299,16 +323,19 @@ func putShards(
 	wg.Wait()
 	close(outcomes)
 
-	result := writeResult{landed: make([]bool, len(shards))}
+	result := writeResult{
+		landed:  make([]bool, len(shards)),
+		holders: slices.Clone(shardNodes),
+	}
 	var firstErr error
+	var refused []int
 	for outcome := range outcomes {
 		if outcome.err != nil {
 			if firstErr == nil {
 				firstErr = outcome.err
 			}
-			node := shardNodes[outcome.shardIndex]
-			result.missing = append(result.missing, node)
-			logShardWriteFailure(ctx, node, outcome.shardIndex, outcome.err)
+			refused = append(refused, outcome.shardIndex)
+			logShardWriteFailure(ctx, shardNodes[outcome.shardIndex], outcome.shardIndex, outcome.err)
 
 			continue
 		}
@@ -318,12 +345,73 @@ func putShards(
 		}
 	}
 
+	// Sorted so the retries, the handoff list and the log are in shard order
+	// rather than in whichever order the concurrent puts happened to fail.
+	slices.Sort(refused)
+	handOff(ctx, bc, objectHash, epoch, shards, handoff, refused, &result, shardNodes)
+
 	if landed := result.landedCount(); landed < cfg.MinShards() {
 		return result, fmt.Errorf("%w: %d of %d shards durable, nodes %v unreachable: %w",
 			errShardWriteFloor, landed, cfg.MinShards(), result.missing, firstErr)
 	}
 
 	return result, nil
+}
+
+// handOff writes the shards their owners refused to the one node off the end of
+// the stripe, and records where each went. A position that fails there too is
+// missing outright, which is what the write floor is then measured against.
+//
+// They go one at a time: the handoff node is taking work it was not placed for,
+// on behalf of a cluster that is already one node short, and firing a whole
+// stripe at it concurrently is how a fallback becomes the next failure.
+func handOff(
+	ctx context.Context, bc BlobClient, objectHash [32]byte, epoch uint64, shards [][]byte,
+	handoff config.NodeID, refused []int, result *writeResult, shardNodes []config.NodeID,
+) {
+	for _, index := range refused {
+		if handoff == 0 {
+			result.missing = append(result.missing, shardNodes[index])
+
+			continue
+		}
+		_, err := bc.Put(ctx, handoff, blob.PutRequest{
+			Key:   objectHash,
+			Size:  int64(len(shards[index])),
+			Index: uint32(index), //nolint:gosec // G115: bounded by the shard count.
+			Epoch: epoch,
+		}, bytes.NewReader(shards[index]))
+		if err != nil {
+			logShardWriteFailure(ctx, handoff, index, err)
+			result.missing = append(result.missing, shardNodes[index])
+
+			continue
+		}
+
+		result.landed[index] = true
+		result.holders[index] = handoff
+		result.handoff = append(result.handoff, index)
+		slog.InfoContext(ctx, "Shard handed off; its owner would not take it",
+			"owner", shardNodes[index], "holder", handoff, "index", index,
+			"epoch", fmt.Sprintf("%016x", epoch))
+	}
+}
+
+// handoffNode is the node one step off the end of the stripe on the ring: where
+// a shard goes when its owner will not take it. It is derived and never
+// recorded, which is what lets the read path and repair find it later without a
+// hint to store. Zero means there is none — handoff is off, or the cluster has
+// no node to spare.
+func handoffNode(ring *placement.Ring, cfg Config, objectHash [32]byte) config.NodeID {
+	if !cfg.HintedHandoff || ring == nil {
+		return 0
+	}
+	nodes, err := ring.Nodes(objectHash, cfg.TotalShards()+1)
+	if err != nil || len(nodes) <= cfg.TotalShards() {
+		return 0
+	}
+
+	return nodes[cfg.TotalShards()]
 }
 
 // errShardWriteFloor reports a write that could not place enough shards to be
@@ -352,8 +440,8 @@ func logShardWriteFailure(ctx context.Context, node config.NodeID, index int, er
 // a reader asking for that epoch completes the commit itself. It is reported
 // because a node failing to commit is worth seeing, not because the object is
 // in doubt.
-func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, landed []bool) {
-	forEachShard(place, landed, func(index int, node config.NodeID) {
+func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written writeResult) {
+	forEachShard(written, func(index int, node config.NodeID) {
 		err := bc.Commit(ctx, node, blob.CommitRequest{
 			Key:   objectHash,
 			Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
@@ -370,8 +458,8 @@ func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place
 // abortShards discards shards prepared for a write that will not be published,
 // releasing their space now rather than leaving the nodes to age them out.
 // Nothing references them either way, so a failure is logged and not returned.
-func abortShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, landed []bool) {
-	forEachShard(place, landed, func(index int, node config.NodeID) {
+func abortShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written writeResult) {
+	forEachShard(written, func(index int, node config.NodeID) {
 		err := bc.Abort(ctx, node, blob.CommitRequest{
 			Key:   objectHash,
 			Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
@@ -386,13 +474,16 @@ func abortShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place 
 }
 
 // forEachShard runs fn concurrently against every shard position that landed,
-// and waits. A position whose put never succeeded has nothing prepared on its
-// node, so committing it would be told so and aborting it would ask the node to
-// discard whatever generation it does hold.
-func forEachShard(place ObjectToShardNodes, landed []bool, fn func(index int, node config.NodeID)) {
+// at the node it actually landed on, and waits.
+//
+// A position whose put never succeeded has nothing prepared anywhere, so
+// committing it would be told so and aborting it would ask a node to discard
+// whatever generation it does hold. A position that was handed off is prepared
+// on the holder and nowhere else, so both have to be addressed there.
+func forEachShard(written writeResult, fn func(index int, node config.NodeID)) {
 	var wg sync.WaitGroup
-	for i, node := range place.AllNodes() {
-		if i < len(landed) && !landed[i] {
+	for i, node := range written.holders {
+		if i < len(written.landed) && !written.landed[i] {
 			continue
 		}
 		wg.Go(func() { fn(i, node) })
@@ -490,7 +581,12 @@ func shardErrorReason(err error) string {
 // latency. The data shards go first, so a healthy read never fetches a parity
 // shard it does not need; the parity shards follow only if the data shards have
 // not all landed shortly after, or one of them has already failed.
-func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes) ([][]byte, []shardFailure, error) {
+//
+// A shard its owner cannot serve is looked for on the handoff node before it is
+// counted as failed, since a write that could not reach the owner will have put
+// it there. That is one fetch against k fetches and a decode, so it is worth
+// asking even though the usual answer is no.
+func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, handoff config.NodeID) ([][]byte, []shardFailure, error) {
 	need := len(place.DataShardNodes)
 	shards := make([][]byte, need+len(place.ParityShardNodes))
 	if need == 0 {
@@ -515,6 +611,13 @@ func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place O
 
 		start := time.Now()
 		data, err := readShard(shardCtx, bc, objectHash, node, index, place.WriteEpoch)
+		if err != nil && handoff != 0 && handoff != node {
+			if held, hErr := readShard(shardCtx, bc, objectHash, handoff, index, place.WriteEpoch); hErr == nil {
+				slog.InfoContext(ctx, "Shard served from its handoff holder",
+					"owner", node, "holder", handoff, "index", index)
+				data, err = held, nil
+			}
+		}
 		if err != nil {
 			mu.Lock()
 			failures = append(failures, shardFailure{index: index, node: node, reason: shardErrorReason(err)})

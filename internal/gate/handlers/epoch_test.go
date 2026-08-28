@@ -53,7 +53,7 @@ func TestReadObjectReconstructsAroundAStaleShard(t *testing.T) {
 				require.NoError(t, err)
 
 				bc := &staleBlob{fakeBlob: f.bc, stale: map[int]bool{stale: true}}
-				got, degraded, err := readObject(ctx, bc, f.cfg, "b", "k", place, place.Size)
+				got, degraded, err := readObject(ctx, bc, f.cfg, "b", "k", place, place.Size, 0)
 
 				require.NoError(t, err, "one stale shard is what the parity is for")
 				assert.Equal(t, want, got, "the object must be the generation the record names")
@@ -84,7 +84,7 @@ func TestReadObjectFailsWhenTooManyShardsAreStale(t *testing.T) {
 
 	// RS(2,1) survives one loss; two is past what the parity covers.
 	bc := &staleBlob{fakeBlob: f.bc, stale: map[int]bool{0: true, 1: true}}
-	_, _, err = readObject(ctx, bc, f.cfg, "b", "k", place, place.Size)
+	_, _, err = readObject(ctx, bc, f.cfg, "b", "k", place, place.Size, 0)
 
 	require.Error(t, err, "losing more than the parity covers must fail loudly")
 }
@@ -232,7 +232,7 @@ func TestReadShardDemandsTheRecordEpoch(t *testing.T) {
 	require.NoError(t, err)
 
 	bc := &epochRecordingBlob{fakeBlob: f.bc}
-	_, _, err = readObject(ctx, bc, f.cfg, "b", "k", place, place.Size)
+	_, _, err = readObject(ctx, bc, f.cfg, "b", "k", place, place.Size, 0)
 	require.NoError(t, err)
 
 	require.NotEmpty(t, bc.seen)

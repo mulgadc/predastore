@@ -10,6 +10,7 @@ import (
 
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/internal/blob"
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
@@ -32,7 +33,77 @@ func (s *Service) repairShard(ctx context.Context, t task) error {
 		return fmt.Errorf("publish prepared shard: %w", err)
 	}
 
+	if err := s.pullFromHandoff(ctx, t); err == nil {
+		return nil
+	} else if !errors.Is(err, errNoHandoff) {
+		return err
+	}
+
 	return s.rebuildShard(ctx, t)
+}
+
+// errNoHandoff reports that the handoff holder has nothing for this position,
+// which is the ordinary case and not a failure.
+var errNoHandoff = errors.New("no shard on the handoff holder")
+
+// pullFromHandoff moves a handed-off shard back to the node that owns it.
+//
+// A write whose owner refused puts the shard one step along the ring, and that
+// node is derived rather than recorded, so it can be asked without a hint
+// having been stored anywhere. Streaming those bytes back is one transfer and
+// no decode, against k transfers and a decode to rebuild the same shard, so it
+// is worth asking even though the usual answer is no.
+func (s *Service) pullFromHandoff(ctx context.Context, t task) error {
+	holder := s.handoffNode(t.hash)
+	if holder == 0 || holder == t.node {
+		return errNoHandoff
+	}
+
+	body, err := s.cfg.Blob.Get(ctx, holder, blob.GetRequest{
+		Key: t.hash, Index: uint32(t.index), //nolint:gosec // G115: bounded by the shard count.
+		RangeStart: -1, RangeEnd: -1, Epoch: t.place.WriteEpoch,
+	})
+	if err != nil {
+		return errNoHandoff
+	}
+	defer body.Close()
+
+	shardSize := (t.place.Size + int64(s.cfg.DataShards) - 1) / int64(s.cfg.DataShards)
+	if _, err := s.cfg.Blob.Put(ctx, t.node, blob.PutRequest{
+		Key: t.hash, Index: uint32(t.index), //nolint:gosec // G115: bounded by the shard count.
+		Size: shardSize, Epoch: t.place.WriteEpoch,
+	}, body); err != nil {
+		return fmt.Errorf("return handed-off shard to its owner: %w", err)
+	}
+	if err := s.publish(ctx, t); err != nil {
+		return err
+	}
+
+	// Only once the owner holds it. A holder emptied before that would turn a
+	// failed return into the loss the handoff existed to prevent.
+	if _, err := s.cfg.Blob.Delete(ctx, holder, blob.DeleteRequest{
+		Key: t.hash, Index: uint32(t.index), //nolint:gosec // G115: bounded by the shard count.
+	}); err != nil {
+		slog.WarnContext(ctx, "Handed-off shard returned but not released on its holder",
+			"holder", holder, "owner", t.node, "index", t.index, "err", err)
+	}
+	slog.InfoContext(ctx, "Handed-off shard returned to its owner",
+		"holder", holder, "owner", t.node, "index", t.index)
+
+	return nil
+}
+
+// handoffNode derives where a write would have put a shard its owner refused:
+// one step off the end of the stripe on the ring, the same position the write
+// path and the read path compute. Zero means the cluster has no node to spare.
+func (s *Service) handoffNode(hash [32]byte) config.NodeID {
+	total := s.cfg.DataShards + s.cfg.ParityShards
+	nodes, err := s.cfg.Ring.Nodes(hash, total+1)
+	if err != nil || len(nodes) <= total {
+		return 0
+	}
+
+	return nodes[total]
 }
 
 // rebuildShard reconstructs the shard from its peers and writes it back.

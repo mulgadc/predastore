@@ -59,7 +59,7 @@ func TestShardBytesSnapshotsAgainstALateShard(t *testing.T) {
 	slow := &lateBlob{fakeBlob: f.bc, slow: place.DataShardNodes[1], delay: late, landed: make(chan struct{})}
 
 	start := time.Now()
-	shards, _, err := shardBytes(ctx, slow, objectHash, place)
+	shards, _, err := shardBytes(ctx, slow, objectHash, place, 0)
 	require.NoError(t, err)
 	require.Less(t, time.Since(start), late,
 		"the hedge must return before the late shard lands, or this proves nothing")

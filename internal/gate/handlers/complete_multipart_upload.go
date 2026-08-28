@@ -97,7 +97,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 
 		// The parts are streamed into the write path in order, so the assembled
 		// object is erasure coded as it is read back rather than staged whole.
-		assembled := streamParts(ctx, mc, bc, cfg, bucket, key, uploadID, parts)
+		assembled := streamParts(ctx, mc, bc, ring, cfg, bucket, key, uploadID, parts)
 		defer assembled.Close()
 
 		objectHash := model.ObjectHash(bucket, key)
@@ -107,26 +107,26 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			return
 		}
 
-		written, err := writeObject(ctx, bc, cfg, assembled, finalSize, objectHash, place)
+		written, err := writeObject(ctx, bc, cfg, ring, assembled, finalSize, objectHash, place)
 		if err != nil {
 			slog.ErrorContext(ctx, "Failed to store final object", "uploadID", uploadID, "error", err)
-			abortShards(ctx, bc, objectHash, place, written.landed)
+			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, mapPutErr(err))
 			return
 		}
 
 		shardRecord, err := EncodePlacement(place)
 		if err != nil {
-			abortShards(ctx, bc, objectHash, place, written.landed)
+			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
 			return
 		}
 		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), shardRecord); err != nil {
-			abortShards(ctx, bc, objectHash, place, written.landed)
+			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store object metadata", 500))
 			return
 		}
-		commitShards(ctx, bc, objectHash, place, written.landed)
+		commitShards(ctx, bc, objectHash, place, written)
 
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store ARN mapping", 500))
@@ -144,6 +144,9 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 
 		if written.degraded() {
 			w.Header().Set(degradedWriteHeader, strconv.Itoa(len(written.missing)))
+		}
+		if len(written.handoff) > 0 {
+			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))
 		}
 
 		if err := writeXML(w, http.StatusOK, CompleteMultipartUploadResult{
@@ -166,7 +169,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 // any fetch still in flight, which is what stops an abandoned completion from
 // leaking goroutines.
 func streamParts(
-	ctx context.Context, mc MetaClient, bc BlobClient, cfg Config,
+	ctx context.Context, mc MetaClient, bc BlobClient, ring *placement.Ring, cfg Config,
 	bucket, key, uploadID string, parts []model.CompletedPart,
 ) *io.PipeReader {
 	type fetched struct {
@@ -196,7 +199,7 @@ func streamParts(
 					return
 				}
 				go func(idx, partNumber int) {
-					data, err := getPartData(ctx, mc, bc, cfg, bucket, key, uploadID, partNumber)
+					data, err := getPartData(ctx, mc, bc, ring, cfg, bucket, key, uploadID, partNumber)
 					results[idx] <- fetched{data: data, err: err}
 				}(i, part.PartNumber)
 			}
@@ -230,7 +233,7 @@ func streamParts(
 // hidden key, so it is read exactly as GET reads one: the data shards are
 // joined directly, and parity is only pulled in if that join fails. Going
 // straight to reconstruction would read every shard twice for every part.
-func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, bucket, key, uploadID string, partNumber int) ([]byte, error) {
+func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, ring *placement.Ring, cfg Config, bucket, key, uploadID string, partNumber int) ([]byte, error) {
 	data, err := metaGet(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber))
 	if err != nil {
 		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonMetaMissing)
@@ -243,7 +246,9 @@ func getPartData(ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, 
 		return nil, err
 	}
 
-	part, _, err := readObject(ctx, bc, cfg, bucket, partObjectKey(key, uploadID, partNumber), place, place.Size)
+	partKey := partObjectKey(key, uploadID, partNumber)
+	part, _, err := readObject(ctx, bc, cfg, bucket, partKey, place, place.Size,
+		handoffNode(ring, cfg, model.ObjectHash(bucket, partKey)))
 	if err != nil {
 		telemetry.RecordMultipartPartFetch(ctx, telemetry.FetchReasonShardRead)
 		return nil, err

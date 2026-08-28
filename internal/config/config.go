@@ -139,6 +139,11 @@ type RS struct {
 	// It opens a redundancy window that only repair closes, so it is off unless
 	// the operator turns it on.
 	DegradedWrites bool `toml:"degraded_writes"`
+
+	// HintedHandoff sends a shard its owner will not take to the next node
+	// along the ring, so the stripe is complete when the write is acknowledged
+	// rather than only durable. Repair returns it to its owner afterwards.
+	HintedHandoff bool `toml:"hinted_handoff"`
 }
 
 // Repair tunes the background sweep that restores shards a blob node owns but

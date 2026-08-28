@@ -171,4 +171,16 @@ interval_seconds = 120
 		require.NoError(t, err)
 		assert.Equal(t, Repair{}, cfg.Repair, "repair is opt-in")
 	})
+
+	t.Run("rs availability settings", func(t *testing.T) {
+		cfg, err := Load(write(t, base+"degraded_writes = true\nhinted_handoff = true\n"))
+		require.NoError(t, err)
+		assert.True(t, cfg.RS.DegradedWrites)
+		assert.True(t, cfg.RS.HintedHandoff)
+
+		off, err := Load(write(t, base))
+		require.NoError(t, err)
+		assert.False(t, off.RS.DegradedWrites, "degraded writes are opt-in")
+		assert.False(t, off.RS.HintedHandoff, "handoff is opt-in")
+	})
 }

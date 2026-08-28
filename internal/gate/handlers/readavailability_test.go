@@ -70,7 +70,7 @@ func TestReadObjectSurvivesOneNodeDown(t *testing.T) {
 			// loss is on the path a read uses rather than a spare.
 			broken := &downBlob{fakeBlob: f.bc, down: place.DataShardNodes[0]}
 
-			got, _, err := readObject(ctx, broken, f.cfg, "b", "k", place, place.Size)
+			got, _, err := readObject(ctx, broken, f.cfg, "b", "k", place, place.Size, 0)
 			require.NoError(t, err, "an object must still read with one node down")
 			assert.Equal(t, want, got, "the reconstructed object must be byte-identical")
 			assert.Positive(t, broken.touched.Load(), "the down node should have been tried")
@@ -95,7 +95,7 @@ func TestReadObjectFailsBeyondParity(t *testing.T) {
 	broken := &downBlob{fakeBlob: f.bc, down: place.DataShardNodes[0]}
 	worse := &twoDownBlob{downBlob: broken, alsoDown: place.DataShardNodes[1]}
 
-	_, _, err = readObject(ctx, worse, f.cfg, "b", "k", place, place.Size)
+	_, _, err = readObject(ctx, worse, f.cfg, "b", "k", place, place.Size, 0)
 	require.Error(t, err, "losing more than the parity covers must fail loudly")
 }
 
@@ -130,7 +130,7 @@ func TestReadObjectReadsShardsConcurrently(t *testing.T) {
 
 	slow := &slowBlob{fakeBlob: f.bc, delay: delay}
 	start := time.Now()
-	got, _, err := readObject(ctx, slow, f.cfg, "b", "k", place, place.Size)
+	got, _, err := readObject(ctx, slow, f.cfg, "b", "k", place, place.Size, 0)
 	elapsed := time.Since(start)
 
 	require.NoError(t, err)
@@ -204,7 +204,7 @@ func TestReadObjectDoesNotWaitOutAStalledNode(t *testing.T) {
 	stalled := &downBlob{fakeBlob: f.bc, down: place.DataShardNodes[0], delay: stall}
 
 	start := time.Now()
-	got, _, err := readObject(ctx, stalled, f.cfg, "b", "k", place, place.Size)
+	got, _, err := readObject(ctx, stalled, f.cfg, "b", "k", place, place.Size, 0)
 	elapsed := time.Since(start)
 
 	require.NoError(t, err, "the parity shard makes this object readable")
@@ -229,7 +229,7 @@ func TestReadObjectDoesNotFetchParityWhenTheDataShardsAnswer(t *testing.T) {
 	require.NoError(t, err)
 
 	counting := newCountingBlob(f.bc)
-	got, _, err := readObject(ctx, counting, f.cfg, "b", "k", place, place.Size)
+	got, _, err := readObject(ctx, counting, f.cfg, "b", "k", place, place.Size, 0)
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 

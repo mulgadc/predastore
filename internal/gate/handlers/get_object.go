@@ -13,6 +13,7 @@ import (
 
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/internal/blob"
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 )
@@ -47,11 +48,12 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		var degraded int
 		status := http.StatusOK
 
+		handoff := handoffNode(ring, cfg, model.ObjectHash(bucket, key))
 		if rangeStart >= 0 || rangeEnd >= 0 {
-			body, contentRange, degraded, err = readRange(ctx, bc, cfg, bucket, key, place, size, rangeStart, rangeEnd)
+			body, contentRange, degraded, err = readRange(ctx, bc, cfg, bucket, key, place, size, rangeStart, rangeEnd, handoff)
 			status = http.StatusPartialContent
 		} else {
-			body, degraded, err = readObject(ctx, bc, cfg, bucket, key, place, size)
+			body, degraded, err = readObject(ctx, bc, cfg, bucket, key, place, size, handoff)
 		}
 		if err != nil {
 			HandleError(w, r, err)
@@ -103,7 +105,7 @@ func parseRangeHeader(header string) (start, end int64) {
 
 // readObject reconstructs the complete object from its data shards, falling
 // back to parity reconstruction when the data shards alone will not join.
-func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64) ([]byte, int, error) {
+func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64, handoff config.NodeID) ([]byte, int, error) {
 	// An empty object has no shards to read: the write path stores none, since
 	// the blob protocol has no zero-length value to store.
 	if size == 0 {
@@ -123,7 +125,7 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	// whenever a data shard is missing, not only when the join fails, so that
 	// losing one node does not make every object on it unreadable.
 	start := time.Now()
-	shards, failures, readErr := shardBytes(ctx, bc, objectHash, place)
+	shards, failures, readErr := shardBytes(ctx, bc, objectHash, place, handoff)
 	if readErr != nil {
 		return nil, 0, model.NewS3Error(model.ErrInternalError,
 			fmt.Sprintf("reconstruction failed: %v", readErr), 500)
@@ -164,10 +166,16 @@ const degradedHeader = "X-Spx-Degraded"
 // than a full-width write until repair restores the missing shards.
 const degradedWriteHeader = "X-Spx-Degraded-Write"
 
+// handoffHeader reports how many shards a PUT placed away from their owner.
+// The stripe is complete and the object is as redundant as a full-width write;
+// what is outstanding is only that the shards are not yet where the record
+// says, which repair settles.
+const handoffHeader = "X-Spx-Handoff"
+
 // readRange serves a byte range. Reed-Solomon splits data sequentially across
 // the data shards, so a range inside one shard is a single ranged shard read;
 // anything wider falls back to reconstructing the object and slicing it.
-func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, totalSize, reqStart, reqEnd int64) (data []byte, contentRange string, degraded int, err error) {
+func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, totalSize, reqStart, reqEnd int64, handoff config.NodeID) (data []byte, contentRange string, degraded int, err error) {
 	start, end := reqStart, reqEnd
 	if start < 0 {
 		start = 0
@@ -192,7 +200,7 @@ func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key strin
 		slog.WarnContext(ctx, "Single shard range read failed, falling back to full reconstruction", "err", err)
 	}
 
-	full, degraded, err := readObject(ctx, bc, cfg, bucket, key, place, totalSize)
+	full, degraded, err := readObject(ctx, bc, cfg, bucket, key, place, totalSize, handoff)
 	if err != nil {
 		slog.ErrorContext(ctx, "Full object reconstruction failed", "err", err)
 		return nil, "", 0, err

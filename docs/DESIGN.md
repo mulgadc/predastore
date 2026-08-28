@@ -397,6 +397,10 @@ The body is split into `K` data shard buffers in memory and each is streamed to 
 
 By default the write is acknowledged only at full width. With `rs.degraded_writes` on it is acknowledged once `K` shards are durable, so one node down does not refuse writes; the response then carries `X-Spx-Degraded-Write: <n>`. `K` is the floor and not `K+1`, because any `K` of the `K+M` reconstruct — at RS(2,1) one more buys no redundancy and would refuse three quarters of writes with a single node down. The gap it opens is closed by repair, below.
 
+**Hinted handoff narrows that gap to nothing.** With `rs.hinted_handoff` on, a shard its owner will not take is written to the node one step off the end of the stripe on the ring instead of being given up on, and the response carries `X-Spx-Handoff: <n>`. The stripe is then complete and the object is as redundant as a full-width write; what is outstanding is only that the shards are not all where the record says. A position is handed off or missing, never both, so `X-Spx-Degraded-Write` still counts exactly the shards that landed nowhere.
+
+The holder is **derived and never recorded**: it is `ring.Nodes(hash, K+M+1)[K+M]`, which the read path and repair both recompute, so there is no hint to store, replicate or lose. Handoff is skipped when the cluster has no node to spare — placing a second shard of one object on a node that already holds one of its shards is not redundancy. Commit and abort follow the shard to wherever it actually landed: committing at the owner would be told the shard was never prepared, and the holder's copy would stay durable, unreferenced and unreadable.
+
 Only the shards that actually prepared are committed or aborted. Committing a shard that never prepared is refused, and aborting one would ask a node to discard the generation it is still serving.
 
 If any node reported nearfull pressure, the response also carries `X-Predastore-Pool-Pressure: nearfull`; a node that rejected outright surfaces as 507 `InsufficientStorage`.
@@ -412,6 +416,8 @@ If any node reported nearfull pressure, the response also carries `X-Predastore-
 The gate reads the recorded placement — which carries the object size and the write epoch the join needs — fetches the data shards, and joins them. Only if the join fails does it refetch including parity and reconstruct. Parity is never touched on the happy path.
 
 Every shard read names the record's epoch, and a node holding another generation answers `epoch-mismatch`. **The gate counts that exactly as a missing shard.** This is what makes a half-completed overwrite a reconstruction rather than an object spliced from two generations: the stale shards are not eligible to be joined, so the read either rebuilds the object the record names or fails, and never returns plausible nonsense. A read that had to reconstruct says so in `X-Spx-Degraded: <n>`, which is a cost report and not an error.
+
+A shard its owner cannot serve is looked for on the handoff node before it is counted as failed, since a write that could not reach the owner will have put it there. That is one fetch against `K` fetches and a decode, so it is worth asking even though the usual answer is no — and without it a handed-off stripe would be complete only on paper, the bytes existing where the gate never looks.
 
 A `Range` request takes a fast path when the whole range lands inside one data shard, since Reed–Solomon splits data sequentially: that is a single ranged shard read. Anything wider falls back to reconstructing the object and slicing it.
 
@@ -468,10 +474,13 @@ The gate records the resolved placement rather than relying on the ring alone at
 | Coordinator | The gate, for the blob nodes in its own process |
 | State | An in-memory scan cursor and counters — nothing durable |
 | Cheap path | Publish a shard the node already prepared, one round trip |
+| Next cheapest | Pull it back from the handoff holder, one transfer and no decode |
 | Rebuild | `Reconstruct` from `K` peers, streamed into the put |
 | Source shards | All demanded at the record's epoch, never a mixture |
 
 Repairing only the nodes sharing its process settles ownership deterministically: every blob node has exactly one coordinator and nothing has to elect one. Keeping no durable state is affordable because every rebuild is idempotent against the record's epoch — a crash repeats a page rather than losing work, and a durable cursor would need its own consistency argument against a table being written underneath it.
+
+A shard that was handed off is returned rather than recomputed. Repair derives the holder the same way the write path did, asks it for the shard at the record's epoch, streams it to its owner and publishes it there — and only then releases the holder's copy. Emptying the holder first would turn a failed return into exactly the loss handoff existed to prevent. A holder that has nothing, or has another generation, refuses, and the rebuild proceeds as it would have.
 
 Before publishing, the record is re-read and the rebuilt shard discarded if the epoch has moved, so a write that lands mid-repair is not demoted to the generation before it. That window is narrowed rather than closed; what survives it is a shard the next read discards and the next pass rebuilds, which is a wasted repair and not a wrong object.
 
@@ -549,6 +558,7 @@ region  = "ap-southeast-2"      # required; the credential scope requests are co
 data   = 2
 parity = 1
 # degraded_writes = false       # accept a write at K shards rather than K+M; see §8
+# hinted_handoff  = false       # place a refused shard on the next node along; see §8
 
 # [repair]                      # restore shards held at a stale generation; see §9
 # enabled          = false

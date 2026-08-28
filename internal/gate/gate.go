@@ -48,6 +48,10 @@ type RS struct {
 	// DegradedWrites acknowledges a write once Data shards are durable rather
 	// than requiring the full stripe.
 	DegradedWrites bool
+
+	// HintedHandoff places a shard its owner refuses on the next node along
+	// the ring instead of leaving the stripe short.
+	HintedHandoff bool
 }
 
 // RepairConfig tunes the background repair sweep. It is off by default: it
@@ -136,6 +140,7 @@ func (s3 *Config) handlerConfig() handlers.Config {
 		DataShards:     s3.RS.Data,
 		ParityShards:   s3.RS.Parity,
 		DegradedWrites: s3.RS.DegradedWrites,
+		HintedHandoff:  s3.RS.HintedHandoff,
 		Buckets:        s3.Buckets,
 	}
 }

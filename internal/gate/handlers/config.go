@@ -24,6 +24,12 @@ type Config struct {
 	// off unless the operator turns it on.
 	DegradedWrites bool
 
+	// HintedHandoff sends a shard its owner will not take to the next node
+	// along the ring, so the stripe is complete rather than short. The holder
+	// is derived from the ring and never recorded, which is what lets both the
+	// read path and repair find it without a hint to store.
+	HintedHandoff bool
+
 	// Buckets are the config-defined buckets: static, known at startup, and
 	// never removed.
 	Buckets []BucketConfig

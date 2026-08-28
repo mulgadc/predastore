@@ -168,6 +168,8 @@ data   = 2    # data shards
 parity = 1    # parity shards; data + parity must not exceed the blob node count
 # degraded_writes = false   # accept a write once `data` shards are durable, so one
                             # node down does not refuse writes; repair closes the gap
+# hinted_handoff  = false   # put a shard its owner refuses on the next node along the
+                            # ring, so the stripe is complete when the write is acked
 
 # [repair]                  # restore shards a node holds at a stale generation
 # enabled          = false

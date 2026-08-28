@@ -54,6 +54,7 @@ type BlobClient interface {
 	Put(ctx context.Context, node config.NodeID, req blob.PutRequest, body io.Reader) (*blob.PutResponse, error)
 	Commit(ctx context.Context, node config.NodeID, req blob.CommitRequest) error
 	Abort(ctx context.Context, node config.NodeID, req blob.CommitRequest) error
+	Delete(ctx context.Context, node config.NodeID, req blob.DeleteRequest) (*blob.DeleteResponse, error)
 }
 
 // Config is everything a repair service runs on.
