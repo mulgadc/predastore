@@ -88,6 +88,7 @@ STALE_KEYS="${STRESS_STALE_KEYS:-12}"
 SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
     all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff|large-object|multipart-upload) ;;
+    node-rejoin|node-resync|node-rebuild) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
 
@@ -745,6 +746,362 @@ if [ "$SCENARIO" = all ] || [ "$SCENARIO" = handoff ]; then
         exit 0
     fi
 fi
+
+# --- Scenarios: node-rejoin, node-resync, node-rebuild ---
+#
+# Every other fault in this file is a SIGSTOP: the host is stalled, and what
+# it holds is still on its disk when it thaws. These three take a host away
+# properly and bring it back, which is the outage an operator actually has,
+# and they differ only in how much state it comes back with.
+#
+#   node-rejoin   the disk survives, and the node is within the retained log,
+#                 so metadata arrives by log replay
+#   node-resync   the disk survives, but the profile pins the retention
+#                 boundary so low that a dozen writes put the node past it,
+#                 so metadata can only arrive by snapshot install
+#   node-rebuild  the data directory is deleted, so there is no log, no
+#                 metadata and no shard to come back to
+#
+# The middle one is the reason the raft knobs are configurable. TrailingLogs
+# defaults to 10240, which is about 5,100 object writes, so reaching the
+# snapshot path by writing to it costs minutes of upload to exercise one
+# branch. Pinned at 8 it happens immediately, over the identical code path.
+
+NODE_KEYS="${STRESS_NODE_KEYS:-12}"
+NODE_DEADLINE="${STRESS_NODE_DEADLINE:-240}"
+NODE_FAILURES=0
+NODE_CASES=0
+
+node_check() {
+    local ok="$1" message="$2"
+    NODE_CASES=$(( NODE_CASES + 1 ))
+    if [ "$ok" = true ]; then
+        log "$NODE_MODE: pass, $message"
+    else
+        log "$NODE_MODE: FAIL $message"
+        NODE_FAILURES=$(( NODE_FAILURES + 1 ))
+    fi
+}
+
+# stop_host takes one host down the way a machine goes down, and waits for the
+# process to be gone rather than for the signal to be sent. A pid that is still
+# alive still holds the ports, and the restart below would fail somewhere
+# unrelated to what is being tested.
+stop_host() {
+    local cluster="$1" host="$2" pidfile pid waited=0
+    pidfile="$PREDA_DIR/$cluster/pids/host-${host}.pid"
+    [ -f "$pidfile" ] || fail "$NODE_MODE: no pidfile for host $host"
+    pid="$(cat "$pidfile")"
+
+    kill -TERM "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 30 ]; do
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null || true
+        sleep 1
+        log "$NODE_MODE: host $host ignored SIGTERM for ${waited}s and was killed"
+    else
+        log "$NODE_MODE: host $host stopped after ${waited}s"
+    fi
+    rm -f "$pidfile"
+}
+
+# start_host relaunches one host with the arguments start.sh gave it. The certs
+# and the master key are cluster-wide and already on disk, so this is the same
+# process the cluster started with rather than a new kind of node.
+start_host() {
+    local cluster="$1" host="$2"
+    local base="$PREDA_DIR/$cluster"
+    local config="$PREDA_CONFIG_DIR/$cluster.toml"
+
+    mkdir -p "$base/host-${host}" "$base/logs" "$base/pids"
+    nohup "$REPO_DIR/bin/s3d" \
+        -config "$config" \
+        -host "$host" \
+        -data-dir "$base/host-${host}" \
+        -tls-cert "$PREDA_DIR/server.pem" \
+        -tls-key "$PREDA_DIR/server.key" \
+        -encryption-key "$PREDA_DIR/master.key" \
+        >> "$base/logs/host-${host}.log" 2>&1 &
+    echo $! > "$base/pids/host-${host}.pid"
+    log "$NODE_MODE: host $host restarted as pid $(cat "$base/pids/host-${host}.pid")"
+}
+
+# render_node_profile is the shared profile with the availability settings the
+# scenario needs, plus — for the two snapshot cases — a retention boundary
+# small enough to cross. snapshot_threshold and snapshot_interval_seconds are
+# pinned with it: a boundary the leader never compacts past is not a boundary.
+render_node_profile() {
+    local target="$1" offset="$2" pin="$3"
+
+    render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$target" "$offset"
+    awk '/^\[rs\]$/ { print; print "degraded_writes = true"; print "hinted_handoff = true"; next } { print }' \
+        "$target" > "$target.tmp"
+    mv "$target.tmp" "$target"
+    cat >> "$target" <<EOF
+
+[repair]
+enabled = true
+interval_seconds = 5
+page_size = 64
+
+[[bucket]]
+name = "$NODE_BUCKET"
+region = "$REGION"
+public = true
+account_id = "123456789012"
+EOF
+    if [ "$pin" = true ]; then
+        cat >> "$target" <<'EOF'
+
+[meta]
+snapshot_interval_seconds = 1
+snapshot_threshold = 4
+trailing_logs = 8
+EOF
+    fi
+    grep -q '^degraded_writes = true$' "$target" \
+        || fail "$NODE_MODE: degraded_writes was not written into $target"
+    cp "$target" "$RUN_DIR/$(basename "$target")"
+}
+
+# installs_seen counts snapshot installs in one host's journal. It reads the
+# warning the FSM emits when a restore arrives after the replica is already
+# serving, which is the only thing that distinguishes a leader sending a
+# snapshot from raft replaying a local one at boot.
+installs_seen() {
+    local cluster="$1" host="$2" logfile
+    logfile="$PREDA_DIR/$cluster/logs/host-${host}.log"
+    [ -f "$logfile" ] || { echo 0; return; }
+    # grep -c prints its zero and then exits 1, so the status is swallowed
+    # rather than answered: an || branch here would print a second count.
+    grep -c 'catching up by snapshot install' "$logfile" 2>/dev/null || true
+}
+
+# node_meta_status probes this scenario's own cluster. meta_status closes over
+# the shared profile, so asking it about a replica of a scenario cluster gets an
+# answer about a different cluster's node of that number, or no answer at all —
+# the same trap shard_host takes its profile as an argument to avoid.
+node_meta_status() {
+    "$META_PROBE" -config "$NODE_CONFIG" -ca "$CA_FILE" "$@" 2>/dev/null || true
+}
+
+# rejoined waits for one replica's applied index to reach the leader's. That is
+# the property, and it is the reason nothing here asserts on a duration: a node
+# that caught up in 40s on a loaded machine is not a failure, and a node that
+# never caught up is not a slow pass.
+rejoined() {
+    local victim_meta="$1" deadline applied leader
+    deadline=$(( $(date +%s) + NODE_DEADLINE ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        leader="$(node_meta_status "${NODE_META_ALL[@]}" \
+            | awk '/is_leader=true/ { for (i = 1; i <= NF; i++) if ($i ~ /^applied=/) { sub(/^applied=/, "", $i); print $i; exit } }')"
+        applied="$(node_meta_status "$victim_meta" \
+            | awk -v n="$victim_meta" '$1 == "node=" n { for (i = 1; i <= NF; i++) if ($i ~ /^applied=/) { sub(/^applied=/, "", $i); print $i } }')"
+        if [ -n "$leader" ] && [ -n "$applied" ] && [ "$applied" -ge "$leader" ]; then
+            echo "$applied"
+            return 0
+        fi
+        sleep 3
+    done
+    echo "${applied:-none}"
+
+    return 1
+}
+
+run_node_recovery() {
+    NODE_MODE="$1"
+    local pin="$2" offset="$3" wipe="$4"
+    local cluster="${CONFIG_NAME}-$NODE_MODE"
+    local config="$PREDA_CONFIG_DIR/$cluster.toml"
+    local src="$WORK_DIR/$NODE_MODE-src.bin" got="$WORK_DIR/$NODE_MODE-got.bin"
+    local keys=() data_keys=() key i victim gate victim_gate victim_meta
+    local before after settled applied
+
+    NODE_BUCKET="stress-$NODE_MODE"
+    NODE_CONFIG="$config"
+    render_node_profile "$config" "$offset" "$pin"
+    log "$NODE_MODE: starting $cluster"
+    "$SCRIPTS_DIR/start.sh" -w "$cluster"
+
+    mapfile -t NODE_META_ALL < <(meta_nodes "$config" | awk '{print $2}')
+
+    # The last host in the profile, so the scenario names one host rather than
+    # whichever the hash happened to favour. It has to be one the cluster can
+    # lose: a majority of meta replicas must survive it, or what is measured is
+    # loss of quorum rather than a replica catching up.
+    victim="$(parse_hosts "$config" | awk 'END { print $1 }')"
+    victim_meta="$(meta_nodes "$config" | awk -v h="$victim" '$1 == h { print $2; exit }')"
+    [ -n "$victim_meta" ] || fail "$NODE_MODE: host $victim runs no meta replica"
+    [ "$(( ${#NODE_META_ALL[@]} - 1 ))" -gt $(( ${#NODE_META_ALL[@]} / 2 )) ] \
+        || fail "$NODE_MODE: losing host $victim leaves no quorum"
+
+    gate="$(survivor_gate "$config" "$victim")"
+    [ -n "$gate" ] || fail "$NODE_MODE: no gate survives losing host $victim"
+    victim_gate="$(parse_hosts "$config" \
+        | awk -v h="$victim" '$1 == h && $3 != "" { print "https://" $2 ":" $3; exit }')"
+    [ -n "$victim_gate" ] || fail "$NODE_MODE: host $victim runs no gate"
+
+    openssl rand -out "$src" 1048576
+    for i in $(seq 1 "$NODE_KEYS"); do
+        keys+=("$(printf '%s-%03d.bin' "$NODE_MODE" "$i")")
+    done
+
+    # Only a key whose data shard the victim owns can answer the
+    # no-reconstruction check: an ordinary GET reads the data shards and never
+    # touches parity, so a parity key reports nothing either way.
+    for key in "${keys[@]}"; do
+        if [ "$("$SHARD_PROBE" -config "$config" -bucket "$NODE_BUCKET" -key "$key" \
+            | awk -v h="host=$victim" '$4 == h { sub(/^role=/, "", $2); print $2; exit }')" = data ]; then
+            data_keys+=("$key")
+        fi
+    done
+    [ "${#data_keys[@]}" -gt 0 ] \
+        || fail "$NODE_MODE: no key places a data shard on host $victim"
+
+    before="$(installs_seen "$cluster" "$victim")"
+    stop_host "$cluster" "$victim"
+
+    local accepted=0
+    log "$NODE_MODE: writing $NODE_KEYS objects through $gate with host $victim gone"
+    for key in "${keys[@]}"; do
+        if aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+            s3api put-object --bucket "$NODE_BUCKET" --key "$key" --body "$src" \
+            >/dev/null 2>>"$RUN_DIR/$NODE_MODE-puts.txt"; then
+            accepted=$(( accepted + 1 ))
+        fi
+    done
+    node_check "$([ "$accepted" -eq "$NODE_KEYS" ] && echo true || echo false)" \
+        "all $NODE_KEYS writes landed with host $victim gone"
+    [ "$accepted" -eq "$NODE_KEYS" ] \
+        || fail "$NODE_MODE: writes did not land, so nothing below is attributable"
+
+    # The two snapshot cases need the leader to have compacted past the
+    # returning node's position. The threshold is 4 and the interval 1s, so a
+    # dozen writes and a few seconds is enough; waiting for the leader to say it
+    # persisted one is better than assuming it.
+    if [ "$pin" = true ]; then
+        local waited=0
+        while [ "$waited" -lt 30 ]; do
+            grep -qh 'meta: snapshot persisted' "$PREDA_DIR/$cluster"/logs/host-*.log 2>/dev/null && break
+            sleep 2
+            waited=$(( waited + 2 ))
+        done
+        log "$NODE_MODE: leader persisted a snapshot after ${waited}s"
+    fi
+
+    if [ "$wipe" = true ]; then
+        rm -rf "${PREDA_DIR:?}/$cluster/host-${victim:?}"
+        log "$NODE_MODE: deleted host $victim data directory — no raft log, no metadata, no shards"
+    fi
+
+    start_host "$cluster" "$victim"
+
+    if applied="$(rejoined "$victim_meta")"; then
+        node_check true "host $victim rejoined and applied index reached the leader at $applied"
+    else
+        node_check false "host $victim never caught up; applied index stuck at $applied"
+    fi
+
+    after="$(installs_seen "$cluster" "$victim")"
+    if [ "$pin" = true ]; then
+        node_check "$([ "$after" -gt "$before" ] && echo true || echo false)" \
+            "host $victim caught up by snapshot install, which is the path the pinned retention forces"
+    else
+        node_check "$([ "$after" -eq "$before" ] && echo true || echo false)" \
+            "host $victim caught up by log replay, with no snapshot install"
+    fi
+
+    # The gate in the returned host's own process has to be serving before its
+    # sweep can be observed, and a gate that never serves would make every
+    # check below pass by reading somewhere else.
+    warm_gate "$victim_gate" "$NODE_BUCKET" "${keys[0]}" "$NODE_MODE" \
+        || fail "$NODE_MODE: the returned host's gate never served"
+
+    local intact=0
+    for key in "${keys[@]}"; do
+        if aws_s3 "$victim_gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+            s3 cp "s3://$NODE_BUCKET/$key" "$got" --only-show-errors >/dev/null 2>&1 \
+            && diff -q "$src" "$got" >/dev/null 2>&1; then
+            intact=$(( intact + 1 ))
+        fi
+    done
+    node_check "$([ "$intact" -eq "$NODE_KEYS" ] && echo true || echo false)" \
+        "all $NODE_KEYS objects read back byte for byte through the returned host"
+
+    # Shards are the other half of catching up, and they come back by repair
+    # rather than by raft. A read that costs no reconstruction is the evidence:
+    # the gate would have hedged to parity and said so if the shard were missing
+    # or at the wrong generation.
+    local deadline pending=0 seen first=""
+    settled=false
+    deadline=$(( $(date +%s) + NODE_DEADLINE ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        pending=0
+        for key in "${data_keys[@]}"; do
+            seen="$(degraded_read "$gate" "$NODE_BUCKET" "$key" "$got" 2>/dev/null || true)"
+            [ "$seen" = 0 ] || pending=$(( pending + 1 ))
+        done
+        if [ -z "$first" ]; then
+            first="$pending"
+            log "$NODE_MODE: at the first read after the restart, $pending of ${#data_keys[@]} objects still reconstructed"
+        fi
+        if [ "$pending" -eq 0 ]; then
+            settled=true
+            break
+        fi
+        sleep 5
+    done
+    node_check "$settled" \
+        "every object whose data shard host $victim owns reads with no reconstruction, so repair restored them"
+
+    # For the node that lost everything, one more: take away the parity as
+    # well. A read then has no way to answer except from the rebuilt shard
+    # itself, so it distinguishes a shard that is really back from a header
+    # that merely says no reconstruction was needed.
+    if [ "$wipe" = true ] && [ "$settled" = true ]; then
+        local proof="${data_keys[0]}" parity_host parity_gate
+        parity_host="$(shard_host "$config" "$NODE_BUCKET" "$proof" parity)"
+        if [ -z "$parity_host" ] || [ "$parity_host" = "$victim" ]; then
+            log "$NODE_MODE: $proof keeps its parity on host $victim, so the parity-down check is not available"
+        else
+            parity_gate="$(parse_hosts "$config" \
+                | awk -v a="$victim" -v b="$parity_host" '$1 != a && $1 != b && $3 != "" { print "https://" $2 ":" $3; exit }')"
+            stop_host "$cluster" "$parity_host"
+            seen="$(degraded_read "$parity_gate" "$NODE_BUCKET" "$proof" "$got" 2>/dev/null || echo failed)"
+            node_check "$([ "$seen" = 0 ] && diff -q "$src" "$got" >/dev/null 2>&1 && echo true || echo false)" \
+                "$proof reads correctly with its parity host $parity_host also down, so host $victim rebuilt the shard itself"
+            start_host "$cluster" "$parity_host"
+        fi
+    fi
+
+    log "$NODE_MODE: stopping $cluster"
+    stop_clusters
+    if [ "$NODE_FAILURES" -eq 0 ]; then
+        log "$NODE_MODE: passed $NODE_CASES assertions"
+    else
+        log "$NODE_MODE: FAILED $NODE_FAILURES of $NODE_CASES assertions"
+    fi
+}
+
+for node_scenario in node-rejoin node-resync node-rebuild; do
+    if [ "$SCENARIO" = all ] || [ "$SCENARIO" = "$node_scenario" ]; then
+        case "$node_scenario" in
+            node-rejoin)  run_node_recovery node-rejoin  false "$(( PORT_OFFSET + 400 ))" false ;;
+            node-resync)  run_node_recovery node-resync  true  "$(( PORT_OFFSET + 500 ))" false ;;
+            node-rebuild) run_node_recovery node-rebuild true  "$(( PORT_OFFSET + 600 ))" true  ;;
+        esac
+
+        if [ "$SCENARIO" = "$node_scenario" ]; then
+            echo "Stress results: $RUN_DIR"
+            [ "$NODE_FAILURES" -eq 0 ] \
+                || fail "$node_scenario failed $NODE_FAILURES of $NODE_CASES assertions"
+            exit 0
+        fi
+    fi
+done
 
 # --- Scenario: large-object ---
 #
