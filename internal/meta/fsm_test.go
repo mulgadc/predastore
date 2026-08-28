@@ -44,6 +44,28 @@ func dbGet(db *badger.DB, key []byte) ([]byte, error) {
 	return value, err
 }
 
+// snapshotOf loads data into a store and persists a real snapshot of it. A
+// snapshot is a transaction over badger rather than a map handed to Persist, so
+// this is now the only way to obtain a stream -- which is the right way round:
+// every test below goes through the code the cluster runs.
+func snapshotOf(t *testing.T, data map[string][]byte) []byte {
+	t.Helper()
+
+	src := newTestDB(t)
+	for k, v := range data {
+		dbSet(t, src, []byte(k), v)
+	}
+
+	snap, err := NewFSM(src).Snapshot()
+	require.NoError(t, err)
+	defer snap.Release()
+
+	sink := &mockSnapshotSink{}
+	require.NoError(t, snap.Persist(sink))
+
+	return sink.buf
+}
+
 func TestFSM_Snapshot(t *testing.T) {
 	db := newTestDB(t)
 	fsm := NewFSM(db)
@@ -54,12 +76,19 @@ func TestFSM_Snapshot(t *testing.T) {
 	snap, err := fsm.Snapshot()
 	require.NoError(t, err)
 	require.NotNil(t, snap)
+	defer snap.Release()
 
-	fsmSnap, ok := snap.(*FSMSnapshot)
-	require.True(t, ok)
-	assert.Len(t, fsmSnap.data, 2)
-	assert.Equal(t, []byte("val1"), fsmSnap.data["t/key1"])
-	assert.Equal(t, []byte("val2"), fsmSnap.data["t/key2"])
+	sink := &mockSnapshotSink{}
+	require.NoError(t, snap.Persist(sink))
+
+	// Read it back into a fresh store, which is what a follower does with it.
+	dst := newTestDB(t)
+	require.NoError(t, NewFSM(dst).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
+	for k, want := range map[string][]byte{"t/key1": []byte("val1"), "t/key2": []byte("val2")} {
+		got, err := dbGet(dst, []byte(k))
+		require.NoError(t, err)
+		assert.Equal(t, want, got)
+	}
 }
 
 func TestFSM_Snapshot_Empty(t *testing.T) {
@@ -68,10 +97,18 @@ func TestFSM_Snapshot_Empty(t *testing.T) {
 
 	snap, err := fsm.Snapshot()
 	require.NoError(t, err)
+	defer snap.Release()
 
-	fsmSnap, ok := snap.(*FSMSnapshot)
-	require.True(t, ok)
-	assert.Empty(t, fsmSnap.data)
+	sink := &mockSnapshotSink{}
+	require.NoError(t, snap.Persist(sink))
+
+	// An empty store persists the marker and nothing else, and restores to an
+	// empty store rather than to an error.
+	dst := newTestDB(t)
+	dbSet(t, dst, []byte("stale"), []byte("v"))
+	require.NoError(t, NewFSM(dst).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
+	_, err = dbGet(dst, []byte("stale"))
+	assert.ErrorIs(t, err, badger.ErrKeyNotFound)
 }
 
 func TestFSM_Restore(t *testing.T) {
@@ -82,15 +119,13 @@ func TestFSM_Restore(t *testing.T) {
 	dbSet(t, db, []byte("old/key"), []byte("old-val"))
 
 	// Build the snapshot stream in the on-wire frame format via Persist.
-	snap := &FSMSnapshot{data: map[string][]byte{
+	stream := snapshotOf(t, map[string][]byte{
 		"new/key1": []byte("new-val1"),
 		"new/key2": []byte("new-val2"),
-	}}
-	sink := &mockSnapshotSink{}
-	require.NoError(t, snap.Persist(sink))
+	})
 
 	// Restore from snapshot
-	require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(sink.buf))))
+	require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(stream))))
 
 	// Old data should be gone
 	_, err := dbGet(db, []byte("old/key"))
@@ -107,23 +142,28 @@ func TestFSM_Restore(t *testing.T) {
 }
 
 func TestFSMSnapshot_Persist(t *testing.T) {
-	snap := &FSMSnapshot{
-		data: map[string][]byte{
-			"key1": []byte("val1"),
-			"key2": []byte("val2"),
-		},
+	want := map[string][]byte{
+		"key1": []byte("val1"),
+		"key2": []byte("val2"),
 	}
 
-	sink := &mockSnapshotSink{}
-	err := snap.Persist(sink)
+	src := newTestDB(t)
+	for k, v := range want {
+		dbSet(t, src, []byte(k), v)
+	}
+	snap, err := NewFSM(src).Snapshot()
 	require.NoError(t, err)
+	defer snap.Release()
+
+	sink := &mockSnapshotSink{}
+	require.NoError(t, snap.Persist(sink))
 	assert.True(t, sink.closed)
 	assert.False(t, sink.cancelled)
 
 	// The stream must round-trip byte-exact through Restore.
 	db := newTestDB(t)
 	require.NoError(t, NewFSM(db).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
-	for k, v := range snap.data {
+	for k, v := range want {
 		got, err := dbGet(db, []byte(k))
 		require.NoError(t, err)
 		assert.Equal(t, v, got)
@@ -183,9 +223,16 @@ func TestFSM_Restore_LegacyJSON(t *testing.T) {
 	assert.Equal(t, []byte("legacy-val"), got)
 }
 
+// Release discards the read transaction the snapshot holds. One that is never
+// released pins every version it can see against compaction, so this is not
+// merely a no-op that must not panic.
 func TestFSMSnapshot_Release(t *testing.T) {
-	snap := &FSMSnapshot{data: map[string][]byte{"k": []byte("v")}}
-	snap.Release() // Should not panic
+	db := newTestDB(t)
+	dbSet(t, db, []byte("k"), []byte("v"))
+
+	snap, err := NewFSM(db).Snapshot()
+	require.NoError(t, err)
+	snap.Release()
 }
 
 // mockSnapshotSink implements raft.SnapshotSink for testing.
