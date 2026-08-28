@@ -768,6 +768,7 @@ fi
 # branch. Pinned at 8 it happens immediately, over the identical code path.
 
 NODE_KEYS="${STRESS_NODE_KEYS:-12}"
+NODE_PREKEYS="${STRESS_NODE_PREKEYS:-4}"
 NODE_DEADLINE="${STRESS_NODE_DEADLINE:-240}"
 NODE_FAILURES=0
 NODE_CASES=0
@@ -961,6 +962,23 @@ run_node_recovery() {
     [ "${#data_keys[@]}" -gt 0 ] \
         || fail "$NODE_MODE: no key places a data shard on host $victim"
 
+    # Objects written while the victim is still up, so its metadata store holds
+    # rows the snapshot will also hold. Without them every row is new on the way
+    # back and the restore cannot show it kept anything.
+    local pre_keys=() pre_accepted=0
+    for i in $(seq 1 "$NODE_PREKEYS"); do
+        pre_keys+=("$(printf '%s-pre-%03d.bin' "$NODE_MODE" "$i")")
+    done
+    for key in "${pre_keys[@]}"; do
+        if aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+            s3api put-object --bucket "$NODE_BUCKET" --key "$key" --body "$src" \
+            >/dev/null 2>>"$RUN_DIR/$NODE_MODE-puts.txt"; then
+            pre_accepted=$(( pre_accepted + 1 ))
+        fi
+    done
+    node_check "$([ "$pre_accepted" -eq "$NODE_PREKEYS" ] && echo true || echo false)" \
+        "all $NODE_PREKEYS objects predating the outage landed while host $victim was up"
+
     before="$(installs_seen "$cluster" "$victim")"
     stop_host "$cluster" "$victim"
 
@@ -1031,6 +1049,29 @@ run_node_recovery() {
     node_check "$([ "$intact" -eq "$NODE_KEYS" ] && echo true || echo false)" \
         "all $NODE_KEYS objects read back byte for byte through the returned host"
 
+    local pre_intact=0
+    for key in "${pre_keys[@]}"; do
+        if aws_s3 "$victim_gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+            s3 cp "s3://$NODE_BUCKET/$key" "$got" --only-show-errors >/dev/null 2>&1 \
+            && diff -q "$src" "$got" >/dev/null 2>&1; then
+            pre_intact=$(( pre_intact + 1 ))
+        fi
+    done
+    node_check "$([ "$pre_intact" -eq "$NODE_PREKEYS" ] && echo true || echo false)" \
+        "all $NODE_PREKEYS objects predating the outage survived the catch-up"
+
+    # A restore onto a store that kept its disk must merge rather than rewrite:
+    # the rows it already held are reported unchanged. Reading zero here would
+    # mean the store was cleared and rebuilt, which is the window this replaced.
+    if [ "$pin" = true ] && [ "$wipe" = false ]; then
+        local unchanged
+        unchanged="$(grep -h 'meta: snapshot restored' \
+            "$PREDA_DIR/$cluster/logs/host-${victim}.log" 2>/dev/null \
+            | tail -1 | grep -oP '"unchanged":\K[0-9]+' || true)"
+        node_check "$([ "${unchanged:-0}" -gt 0 ] && echo true || echo false)" \
+            "the restore kept ${unchanged:-0} rows it already held instead of rewriting the store"
+    fi
+
     # Shards are the other half of catching up, and they come back by repair
     # rather than by raft. A read that costs no reconstruction is the evidence:
     # the gate would have hedged to parity and said so if the shard were missing
@@ -1079,6 +1120,12 @@ run_node_recovery() {
 
     log "$NODE_MODE: stopping $cluster"
     stop_clusters
+
+    # The snapshot lifecycle is only reported in the returning host's log, and
+    # the work directory does not survive the run, so a failure investigated
+    # afterwards has nothing to read unless the logs are copied out here.
+    mkdir -p "$RUN_DIR/logs-$NODE_MODE"
+    cp -R "$PREDA_DIR/$cluster/logs/." "$RUN_DIR/logs-$NODE_MODE/" 2>/dev/null || true
     if [ "$NODE_FAILURES" -eq 0 ]; then
         log "$NODE_MODE: passed $NODE_CASES assertions"
     else
