@@ -241,7 +241,7 @@ func TestTheWorkingSetIsAFixedNumberOfBlocks(t *testing.T) {
 
 			r, err := newStripeReader(ctx, f.bc, f.cfg, objectHash, place, 0)
 			require.NoError(t, err)
-			defer r.close()
+			defer r.close(ctx)
 
 			var resident int64
 			for _, b := range r.block {
@@ -251,4 +251,149 @@ func TestTheWorkingSetIsAFixedNumberOfBlocks(t *testing.T) {
 				"a %d byte object holds %d bytes resident", size, resident)
 		})
 	}
+}
+
+// pacedReader delivers a shard in chunks with a gap between them, and can be
+// told to stop delivering entirely. Closing it unblocks a read waiting on the
+// gap, which is what abandoning the shard has to be able to do.
+type pacedReader struct {
+	io.Reader
+
+	gap    time.Duration
+	after  int64 // bytes delivered before it stops entirely; -1 for never
+	sent   int64
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (r *pacedReader) Read(p []byte) (int, error) {
+	if len(p) > pacedChunk {
+		p = p[:pacedChunk]
+	}
+	if r.after >= 0 && r.sent >= r.after {
+		<-r.closed
+
+		return 0, errors.New("shard stopped delivering")
+	}
+	select {
+	case <-r.closed:
+		return 0, errors.New("shard closed")
+	case <-time.After(r.gap):
+	}
+	n, err := r.Reader.Read(p)
+	r.sent += int64(n)
+
+	return n, err
+}
+
+func (r *pacedReader) Close() error {
+	r.once.Do(func() { close(r.closed) })
+
+	return nil
+}
+
+const pacedChunk = 64 << 10
+
+// pacingBlob paces one node's shard.
+type pacingBlob struct {
+	*fakeBlob
+
+	slow  config.NodeID
+	gap   time.Duration
+	after int64
+}
+
+func (b *pacingBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
+	rc, err := b.fakeBlob.Get(ctx, node, req)
+	if err != nil || node != b.slow {
+		return rc, err
+	}
+
+	return &pacedReader{Reader: rc, gap: b.gap, after: b.after, closed: make(chan struct{})}, nil
+}
+
+var _ BlobClient = (*pacingBlob)(nil)
+
+// The case the whole hedge policy exists to protect. A shard delivering
+// steadily but slowly takes far longer than hedgeDelay to finish a block, and
+// must not be given up on: judged on elapsed time, every shard of a large
+// object looks late and parity is fetched on every read of a healthy cluster.
+func TestASlowButProgressingShardIsNotHedged(t *testing.T) {
+	t.Parallel()
+
+	const size = 2 * streamBlockSize
+	f := newWriteFixture(2, 1)
+	want := randomBytes(t, size)
+
+	ctx := context.Background()
+	objectHash := model.ObjectHash("b", "k")
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), size)
+	require.NoError(t, err)
+
+	// A 4 MiB block in 64 KiB chunks 5 ms apart takes 320 ms, comfortably past
+	// hedgeDelay, while never going idle for more than 5 ms.
+	paced := &pacingBlob{fakeBlob: f.bc, slow: place.DataShardNodes[1], gap: 5 * time.Millisecond, after: -1}
+	watched := &openWatcher{BlobClient: paced}
+
+	start := time.Now()
+	got, degraded, err := readObject(ctx, watched, f.cfg, "b", "k", place, size, 0)
+	elapsed := time.Since(start)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+	require.Greater(t, elapsed, hedgeDelay,
+		"the read finished inside hedgeDelay, so it never entered the regime this is about")
+	assert.Zero(t, degraded, "a shard that kept delivering was given up on")
+
+	for _, req := range watched.seen {
+		assert.Less(t, int(req.Index), f.cfg.DataShards,
+			"parity shard %d was fetched for a read that was only slow", req.Index)
+	}
+}
+
+// A stream that opened and then said nothing is not slow, it is not working.
+// Its peer has already answered, so there is something to judge it against.
+func TestAShardThatDeliversNothingIsHedged(t *testing.T) {
+	t.Parallel()
+
+	const size = 2 * streamBlockSize
+	f := newWriteFixture(2, 1)
+	want := randomBytes(t, size)
+
+	ctx := context.Background()
+	objectHash := model.ObjectHash("b", "k")
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), size)
+	require.NoError(t, err)
+
+	silent := &pacingBlob{fakeBlob: f.bc, slow: place.DataShardNodes[1], after: 0}
+
+	start := time.Now()
+	got, degraded, err := readObject(ctx, silent, f.cfg, "b", "k", place, size, 0)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+	assert.Positive(t, degraded, "a silent shard should have been replaced by parity")
+	assert.Less(t, time.Since(start), shardStallWindow,
+		"a silent shard was waited on for the stall window rather than the first-byte budget")
+}
+
+// A stream that was delivering and then stopped is the case an elapsed-time
+// hedge and a progress hedge disagree about most sharply: it looks healthy
+// right up until it does not.
+func TestAShardThatStopsMidBlockIsHedged(t *testing.T) {
+	t.Parallel()
+
+	const size = 2 * streamBlockSize
+	f := newWriteFixture(2, 1)
+	want := randomBytes(t, size)
+
+	ctx := context.Background()
+	objectHash := model.ObjectHash("b", "k")
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), size)
+	require.NoError(t, err)
+
+	stalling := &pacingBlob{fakeBlob: f.bc, slow: place.DataShardNodes[1], after: pacedChunk}
+
+	got, degraded, err := readObject(ctx, stalling, f.cfg, "b", "k", place, size, 0)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+	assert.Positive(t, degraded, "a shard that stopped delivering should have been replaced")
 }

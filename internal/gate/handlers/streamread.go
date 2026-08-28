@@ -12,11 +12,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 // stripeReader serves an object one stripe at a time from its shard streams.
@@ -38,6 +41,8 @@ type stripeReader struct {
 	src    []io.ReadCloser
 	dead   []bool
 
+	progress []*shardProgress
+
 	offset        int64
 	failures      []shardFailure
 	reconstructed int
@@ -57,13 +62,15 @@ func newStripeReader(
 	r := &stripeReader{
 		bc: bc, objectHash: objectHash, place: place, handoff: handoff,
 		lay: lay, enc: enc, total: total,
-		block:  make([][]byte, total),
-		stripe: make([][]byte, total),
-		src:    make([]io.ReadCloser, total),
-		dead:   make([]bool, total),
+		block:    make([][]byte, total),
+		stripe:   make([][]byte, total),
+		src:      make([]io.ReadCloser, total),
+		dead:     make([]bool, total),
+		progress: make([]*shardProgress, total),
 	}
 	for i := range r.block {
 		r.block[i] = make([]byte, lay.blockSize)
+		r.progress[i] = &shardProgress{}
 	}
 
 	// Only the data shards are opened. Opening parity here would double the
@@ -257,11 +264,11 @@ type blockResult struct {
 // next returns the data blocks of the next stripe. It reports io.EOF once the
 // object is exhausted. The returned slices are reused by the following call.
 //
-// The stripe is hedged: if the data blocks have not all arrived within
-// hedgeDelay, parity is opened to cover the shortfall. At block granularity an
-// absolute delay is the right bound -- a 4 MiB block is tens of milliseconds on
-// a healthy node whatever the object's size -- which is not true of the same
-// constant applied to a whole shard.
+// The stripe is hedged on liveness, not on elapsed time. A shard that keeps
+// delivering is never given up on however slowly it is going; one that opened
+// and sent nothing, or that was delivering and stopped, is. Judged on elapsed
+// time instead, every shard of a large object looks late and parity is fetched
+// on every read of a healthy cluster.
 //
 // A hedged shard is abandoned, not raced. A shard stream is sequential, so
 // skipping one stripe's block would leave it at the wrong offset for the next.
@@ -298,9 +305,11 @@ func (r *stripeReader) next(ctx context.Context) ([][]byte, int64, error) {
 	pending += r.openParity(ctx, n, nodes, inflight, results, k-pending)
 
 	// As with the opens, the hedge is armed by the first block to land, so a
-	// stripe that is slow everywhere is waited out rather than abandoned.
-	var hedge *time.Timer
-	var straggling <-chan time.Time
+	// stripe that is slow everywhere is waited out rather than abandoned. It
+	// then samples liveness repeatedly rather than firing once, because a shard
+	// that is still delivering may stop at any point in the block.
+	var probe *time.Ticker
+	var probing <-chan time.Time
 
 	for pending > 0 {
 		select {
@@ -313,29 +322,29 @@ func (r *stripeReader) next(ctx context.Context) ([][]byte, int64, error) {
 
 				continue
 			}
-			if res.took > slowShardThreshold {
-				slog.WarnContext(ctx, "Shard block was slow but landed",
-					"node", nodes[res.index], "index", res.index,
-					"offset", r.offset, "read_ms", res.took.Milliseconds())
-			}
 			r.stripe[res.index] = r.block[res.index][:n]
 			have++
-			if hedge == nil {
-				hedge = time.NewTimer(hedgeDelay)
-				straggling = hedge.C
-				defer hedge.Stop()
+			if probe == nil {
+				probe = time.NewTicker(hedgeProbeInterval)
+				probing = probe.C
+				defer probe.Stop()
 			}
-		case <-straggling:
-			straggling = nil
-			// Closing the stream unblocks its read, so a straggler arrives back
-			// through the error path and is replaced there like any other loss.
-			// Only as many as parity can still replace are given up on.
+		case at := <-probing:
+			// Closing the stream unblocks its read, so an abandoned shard arrives
+			// back through the error path and is replaced there like any other
+			// loss. Only as many as parity can still replace are given up on.
 			budget := r.spareParity()
 			for i := range k {
-				if inflight[i] && budget > 0 {
-					r.fail(ctx, i, nodes[i], errShardTooSlow, hedgeDelay)
-					budget--
+				if !inflight[i] || budget == 0 {
+					continue
 				}
+				reason, since := r.progress[i].verdict(at)
+				if reason == "" {
+					continue
+				}
+				telemetry.RecordShardHedge(ctx, reason)
+				r.fail(ctx, i, nodes[i], hedgeCause(reason), since)
+				budget--
 			}
 		case <-ctx.Done():
 			return nil, 0, ctx.Err()
@@ -366,14 +375,19 @@ func (r *stripeReader) next(ctx context.Context) ([][]byte, int64, error) {
 	return r.stripe[:k], n, nil
 }
 
-// readBlock pulls one block from a shard. The stream is captured before the
-// goroutine starts, so abandoning the shard closes a reader this call already
-// holds rather than racing a nil.
+// readBlock pulls one block from a shard, recording what it delivers as it
+// arrives so the hedge can tell a slow shard from a stopped one. The stream is
+// captured before the goroutine starts, so abandoning the shard closes a reader
+// this call already holds rather than racing a nil.
 func (r *stripeReader) readBlock(ctx context.Context, index int, n int64, out chan<- blockResult) {
-	src, buf := r.src[index], r.block[index][:n]
+	start := time.Now()
+	p := r.progress[index]
+	p.begin(start)
+	src := &trackedReader{Reader: r.src[index], p: p}
+	buf := r.block[index][:n]
 	go func() {
-		start := time.Now()
 		_, err := io.ReadFull(src, buf)
+		p.finish()
 		select {
 		case out <- blockResult{index: index, err: err, took: time.Since(start)}:
 		case <-ctx.Done():
@@ -413,12 +427,43 @@ func (r *stripeReader) openParity(
 // why it is classified apart from one.
 var errShardTooSlow = errors.New("shard did not deliver its block within the hedge delay")
 
-func (r *stripeReader) close() {
+// close releases the shard streams and reports what each of them delivered.
+// The per-shard record is emitted here rather than per block, because a rate
+// over one 4 MiB block says much less than a rate over the whole object.
+func (r *stripeReader) close(ctx context.Context) {
+	nodes := r.place.AllNodes()
 	for i, rc := range r.src {
 		if rc != nil {
 			_ = rc.Close()
 			r.src[i] = nil
 		}
+		r.reportShard(ctx, i, nodes[i])
+	}
+}
+
+func (r *stripeReader) reportShard(ctx context.Context, index int, node config.NodeID) {
+	p := r.progress[index]
+	bytes, active := p.bytes.Load(), time.Duration(p.active.Load())
+	if bytes == 0 {
+		return
+	}
+	telemetry.RecordShardRead(ctx, telemetry.ShardRead{
+		Node:    strconv.FormatUint(uint64(node), 10),
+		TTFB:    time.Duration(p.ttfb.Load()),
+		Bytes:   bytes,
+		Active:  active,
+		Stalls:  p.stalls.Load(),
+		Longest: time.Duration(p.longest.Load()),
+	})
+
+	if active <= 0 {
+		return
+	}
+	if rate := bytes * int64(time.Second) / int64(active); rate < slowShardFloor {
+		slog.WarnContext(ctx, "Shard delivered below the throughput floor",
+			"node", node, "index", index, "bytes", bytes,
+			"rate_KiBps", rate/1024, "stalls", p.stalls.Load(),
+			"longest_stall_ms", time.Duration(p.longest.Load()).Milliseconds())
 	}
 }
 
@@ -490,3 +535,101 @@ func drain(ctx context.Context, r *stripeReader, dst io.Writer, first [][]byte, 
 		blocks, count = next, n
 	}
 }
+
+// shardProgress is one shard's liveness, written by the goroutine reading it
+// and sampled by the stripe loop. Progress is what the hedge measures: a shard
+// still delivering is never given up on, however slowly it is going.
+type shardProgress struct {
+	// Reset at the start of every block.
+	blockStart atomic.Int64 // UnixNano
+	blockBytes atomic.Int64
+	lastAt     atomic.Int64 // UnixNano of the last read that returned bytes
+	reading    atomic.Bool
+
+	// Accumulated over the object, for the metric emitted when it closes.
+	ttfb    atomic.Int64
+	bytes   atomic.Int64
+	active  atomic.Int64
+	stalls  atomic.Int64
+	longest atomic.Int64
+}
+
+func (p *shardProgress) begin(at time.Time) {
+	p.blockStart.Store(at.UnixNano())
+	p.blockBytes.Store(0)
+	p.lastAt.Store(at.UnixNano())
+	p.reading.Store(true)
+}
+
+func (p *shardProgress) advance(n int64, at time.Time) {
+	gap := at.UnixNano() - p.lastAt.Load()
+	if p.blockBytes.Load() == 0 && p.ttfb.Load() == 0 {
+		p.ttfb.Store(at.UnixNano() - p.blockStart.Load())
+	} else if gap > int64(shardStallWindow) {
+		p.stalls.Add(1)
+		if gap > p.longest.Load() {
+			p.longest.Store(gap)
+		}
+	}
+	p.blockBytes.Add(n)
+	p.bytes.Add(n)
+	p.lastAt.Store(at.UnixNano())
+}
+
+func (p *shardProgress) finish() {
+	p.reading.Store(false)
+	p.active.Add(p.lastAt.Load() - p.blockStart.Load())
+}
+
+// verdict reports why this shard should be given up on, or "" to leave it
+// alone. It is the whole hedge policy: nothing here is a function of how large
+// the object is or how long the read has been going.
+func (p *shardProgress) verdict(at time.Time) (reason string, since time.Duration) {
+	if !p.reading.Load() {
+		return "", 0
+	}
+	if p.blockBytes.Load() == 0 {
+		if idle := at.Sub(time.Unix(0, p.blockStart.Load())); idle > hedgeDelay {
+			return telemetry.HedgeNoTTFB, idle
+		}
+
+		return "", 0
+	}
+	if idle := at.Sub(time.Unix(0, p.lastAt.Load())); idle > shardStallWindow {
+		return telemetry.HedgeStall, idle
+	}
+
+	return "", 0
+}
+
+// trackedReader records bytes as they arrive rather than when the block
+// completes, which is the difference between observing a shard and timing it.
+type trackedReader struct {
+	io.Reader
+
+	p *shardProgress
+}
+
+func (t *trackedReader) Read(p []byte) (int, error) {
+	n, err := t.Reader.Read(p)
+	if n > 0 {
+		t.p.advance(int64(n), time.Now())
+	}
+
+	return n, err
+}
+
+// hedgeCause turns a hedge reason into the error the failure log carries, so
+// the log and the metric name the same thing.
+func hedgeCause(reason string) error {
+	if reason == telemetry.HedgeNoTTFB {
+		return errShardSilent
+	}
+
+	return errShardStalled
+}
+
+var (
+	errShardSilent  = errors.New("shard stream opened but delivered no bytes")
+	errShardStalled = errors.New("shard stream stopped delivering")
+)

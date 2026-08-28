@@ -118,7 +118,7 @@ func serveObject(
 		HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 		return
 	}
-	defer reader.close()
+	defer reader.close(ctx)
 
 	first, n, err := reader.next(ctx)
 	if err != nil {
@@ -195,7 +195,7 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	if err != nil {
 		return nil, 0, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
-	defer reader.close()
+	defer reader.close(ctx)
 
 	first, n, err := reader.next(ctx)
 	if err != nil {

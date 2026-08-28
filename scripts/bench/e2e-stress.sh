@@ -870,7 +870,7 @@ LARGE_SINGLE_SHOT_MAX=$(( 4 * 1024 * 1024 * 1024 ))
 run_large_object() {
     local results="$RUN_DIR/large-object.tsv"
     local gate spec bytes need avail key src digest got_digest
-    local put_peak get_peak put_start put_secs get_secs reconstructed status hdr
+    local put_peak get_peak put_start put_secs get_secs reconstructed hedges status hdr
 
     render_large_profile
 
@@ -978,6 +978,12 @@ run_large_object() {
         reconstructed="$(awk 'tolower($1) == "x-spx-degraded:" { gsub(/\r/, "", $2); print $2; found = 1 }
                               END { if (!found) print 0 }' "$hdr")"
 
+        # The header is written before the second stripe is read, so it reports
+        # the first stripe alone and is a floor rather than a total. The gate's
+        # own log is the authoritative count for everything after that.
+        hedges="$(cat "$PREDA_DIR/$LARGE_CLUSTER/logs"/*.log 2>/dev/null \
+            | grep -c 'Served degraded read\|Shard delivered below the throughput floor')" || hedges=0
+
         verdict=mismatch
         if [ "$got_digest" = "$digest" ]; then
             verdict=ok
@@ -987,6 +993,8 @@ run_large_object() {
         fi
         large_check "$([ "$reconstructed" = 0 ] && echo true || echo false)" \
             "$spec read cost $reconstructed reconstructions on a healthy cluster"
+        large_check "$([ "$hedges" = 0 ] && echo true || echo false)" \
+            "$spec read fetched k shards and never fell back to parity ($hedges gate log entries say otherwise)"
 
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$spec" "$bytes" \

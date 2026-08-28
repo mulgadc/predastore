@@ -8,6 +8,7 @@ import (
 	"context"
 	"strconv"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -35,7 +36,13 @@ var (
 	multipartPartBytes   metric.Int64Counter
 	multipartPartFetches metric.Int64Counter
 
-	shardErrors metric.Int64Counter
+	shardErrors  metric.Int64Counter
+	shardHedges  metric.Int64Counter
+	shardTTFB    metric.Int64Histogram
+	shardBytes   metric.Int64Counter
+	shardStalls  metric.Int64Counter
+	shardLongest metric.Int64Histogram
+	shardRate    metric.Int64Histogram
 )
 
 // instruments lazily creates the shared instruments. The global meter
@@ -122,6 +129,42 @@ func instruments() {
 		shardErrors, err = meter.Int64Counter("predastore.shard.errors",
 			metric.WithDescription("Shard operations that failed, by op and reason. Reads are tolerated by parity, so a rate here separates routine reconstruction from a node losing data."),
 			metric.WithUnit("{error}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		shardHedges, err = meter.Int64Counter("predastore.shard.hedges",
+			metric.WithDescription("Shard reads given up on in favour of parity, by reason. Without the reason there is no telling a cluster hedging usefully from one hedging on every request."),
+			metric.WithUnit("{hedge}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		shardTTFB, err = meter.Int64Histogram("predastore.shard.ttfb",
+			metric.WithDescription("Time from opening a shard stream to its first byte. A node that accepts a connection and then says nothing shows up here and nowhere else."),
+			metric.WithUnit("ms"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		shardBytes, err = meter.Int64Counter("predastore.shard.read.bytes",
+			metric.WithDescription("Bytes delivered by shard reads, by node."),
+			metric.WithUnit("By"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		shardStalls, err = meter.Int64Counter("predastore.shard.stalls",
+			metric.WithDescription("Gaps in a shard stream long enough to count as a stall. A shard that keeps delivering is never hedged, so this is what separates slow from stopped."),
+			metric.WithUnit("{stall}"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		shardLongest, err = meter.Int64Histogram("predastore.shard.stall.longest",
+			metric.WithDescription("The longest gap in a single shard stream."),
+			metric.WithUnit("ms"))
+		if err != nil {
+			otel.Handle(err)
+		}
+		shardRate, err = meter.Int64Histogram("predastore.shard.throughput",
+			metric.WithDescription("Delivered rate of a shard read over the time it spent reading. The floor a slow shard is judged against, in place of an absolute duration that is a throughput floor in disguise."),
+			metric.WithUnit("KiBy/s"))
 		if err != nil {
 			otel.Handle(err)
 		}
@@ -310,4 +353,61 @@ func RecordShardError(ctx context.Context, op, reason string) {
 		attribute.String("op", op),
 		attribute.String("reason", reason),
 	)))
+}
+
+// Hedge reasons, as a bounded label set. A shard that keeps delivering is
+// never hedged, so there is deliberately no reason for "slow".
+const (
+	// HedgeHardFail is a refused, closed, missing or wrong-epoch shard: it is
+	// not coming, so parity starts immediately rather than after a delay.
+	HedgeHardFail = "hard_fail"
+	// HedgeNoTTFB is a stream that opened and then sent nothing within the
+	// budget, while a peer had already delivered.
+	HedgeNoTTFB = "no_ttfb"
+	// HedgeStall is a stream that was delivering and then stopped.
+	HedgeStall = "stall"
+)
+
+// ShardRead is what one shard delivered over the course of one object read.
+type ShardRead struct {
+	Node string
+	// TTFB is zero when the shard never delivered a byte.
+	TTFB    time.Duration
+	Bytes   int64
+	Active  time.Duration
+	Stalls  int64
+	Longest time.Duration
+}
+
+// RecordShardHedge counts one shard given up on, by reason.
+func RecordShardHedge(ctx context.Context, reason string) {
+	instruments()
+	if shardHedges == nil {
+		return
+	}
+	shardHedges.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(
+		attribute.String("reason", reason),
+	)))
+}
+
+// RecordShardRead records what one shard delivered. Rate is reported over the
+// time spent reading rather than wall time, so a shard waiting its turn behind
+// a stripe is not counted as slow.
+func RecordShardRead(ctx context.Context, r ShardRead) {
+	instruments()
+	if shardBytes == nil {
+		return
+	}
+	node := metric.WithAttributeSet(attribute.NewSet(attribute.String("node", r.Node)))
+	shardBytes.Add(ctx, r.Bytes, node)
+	if r.TTFB > 0 {
+		shardTTFB.Record(ctx, r.TTFB.Milliseconds(), node)
+	}
+	if r.Stalls > 0 {
+		shardStalls.Add(ctx, r.Stalls, node)
+		shardLongest.Record(ctx, r.Longest.Milliseconds(), node)
+	}
+	if r.Active > 0 && r.Bytes > 0 {
+		shardRate.Record(ctx, r.Bytes*int64(time.Second)/int64(r.Active)/1024, node)
+	}
 }

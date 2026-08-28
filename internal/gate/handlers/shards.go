@@ -717,9 +717,21 @@ func reportDegradedRead(ctx context.Context, bucket, key string, failures []shar
 		"read_ms", took.Milliseconds())
 }
 
-// slowShardThreshold is the point past which a shard read is worth naming its
-// node for. A degrading node should be visible before it takes something down.
-const slowShardThreshold = 2 * time.Second
+// slowShardFloor is the delivered rate below which a shard read is worth naming
+// its node for. A degrading node should be visible before it takes something
+// down, and a rate says that where an absolute duration cannot: two seconds is
+// healthy for a large block and hopeless for a small one.
+const slowShardFloor = 8 << 20 // bytes per second
+
+// hedgeProbeInterval is how often the stripe loop asks whether a shard is still
+// delivering. Fine enough that a stall is caught well inside the delay, coarse
+// enough to cost nothing on a healthy read.
+const hedgeProbeInterval = 25 * time.Millisecond
+
+// shardStallWindow is how long a shard that was delivering may deliver nothing
+// before parity replaces it. Well below the blob client's own idle timeout,
+// which aborts the transfer rather than routing around it.
+const shardStallWindow = time.Second
 
 // shardOpenTimeout caps the request and response envelope of a shard read.
 // Those are small and fixed, so a total bound is the right one for them: a
@@ -731,9 +743,10 @@ const slowShardThreshold = 2 * time.Second
 // stalled node can both be measured against.
 const shardOpenTimeout = 5 * time.Second
 
-// hedgeDelay is how long a shard gets, measured from the moment a peer
-// answered, before parity is fetched in its place. Comfortably above a healthy
-// block read, and far below anything a client would notice.
+// hedgeDelay is how long a shard gets to produce its first byte, measured from
+// the moment a peer answered, before parity is fetched in its place. It bounds
+// only silence: a shard delivering steadily is never hedged, whatever it is
+// delivering at.
 const hedgeDelay = 250 * time.Millisecond
 
 // deleteObject sends DELETE requests to all shard nodes.
