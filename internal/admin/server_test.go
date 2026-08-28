@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func probe(t *testing.T, h http.Handler, path string) (int, map[string]any) {
@@ -31,6 +33,15 @@ func failing(name string, err error) Check {
 	return Check{Name: name, Probe: func(context.Context) error { return err }}
 }
 
+// sampled builds a Server and runs one probe cycle synchronously, standing in
+// for the background sampler so a test can assert on readyz without waiting
+// on a ticker.
+func sampled(checks []Check) *Server {
+	s := New("", checks)
+	s.runCycle(context.Background())
+	return s
+}
+
 // Liveness is not readiness: a process whose cluster is broken is still alive,
 // and answering 503 to /healthz would have an orchestrator restart a node that
 // is waiting for its peers.
@@ -48,7 +59,7 @@ func TestHealthzAnswersWhileChecksFail(t *testing.T) {
 }
 
 func TestReadyzReportsEveryCheck(t *testing.T) {
-	h := New("", []Check{ok("meta_leader"), ok("meta_reachable"), ok("blob_nodes")}).Handler()
+	h := sampled([]Check{ok("meta_leader"), ok("meta_reachable"), ok("blob_nodes")}).Handler()
 
 	status, body := probe(t, h, "/readyz")
 
@@ -73,7 +84,7 @@ func TestReadyzReportsEveryCheck(t *testing.T) {
 // code, so a body that named the failure while returning 200 would still send
 // traffic to a node that cannot serve it.
 func TestReadyzIsUnreadyWhenAnyCheckFails(t *testing.T) {
-	h := New("", []Check{ok("meta_reachable"), failing("blob_nodes", errors.New("1 of 4 blob nodes answered, need 2"))}).Handler()
+	h := sampled([]Check{ok("meta_reachable"), failing("blob_nodes", errors.New("1 of 4 blob nodes answered, need 2"))}).Handler()
 
 	status, body := probe(t, h, "/readyz")
 
@@ -96,7 +107,7 @@ func TestReadyzIsUnreadyWhenAnyCheckFails(t *testing.T) {
 // node ids and object names. The reason belongs in the log, not the response.
 func TestReadyzBodyCarriesNoFailureDetail(t *testing.T) {
 	secret := "meta node 7 at 10.0.0.4:6660 rejected key tenant-acme/secrets"
-	h := New("", []Check{failing("meta_reachable", errors.New(secret))}).Handler()
+	h := sampled([]Check{failing("meta_reachable", errors.New(secret))}).Handler()
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
@@ -118,13 +129,13 @@ func TestReadyzRunsEveryCheckAfterAFailure(t *testing.T) {
 			return err
 		}}
 	}
-	h := New("", []Check{
+	s := sampled([]Check{
 		counting("first", errors.New("down")),
 		counting("second", nil),
 		counting("third", errors.New("down")),
-	}).Handler()
+	})
 
-	probe(t, h, "/readyz")
+	probe(t, s.Handler(), "/readyz")
 
 	if got := ran.Load(); got != 3 {
 		t.Errorf("checks run = %d, want 3", got)
@@ -135,7 +146,7 @@ func TestReadyzRunsEveryCheckAfterAFailure(t *testing.T) {
 // for either plane, and reporting it unready forever would take it out of
 // service for a question it was never able to answer.
 func TestReadyzWithNoChecksIsReady(t *testing.T) {
-	h := New("", nil).Handler()
+	h := sampled(nil).Handler()
 
 	status, body := probe(t, h, "/readyz")
 
@@ -182,6 +193,95 @@ func TestReadyzRejectsNonGET(t *testing.T) {
 	}
 }
 
+// A request arriving before the sampler's first cycle completes must not be
+// told the process is ready: there is no information yet to base that on.
+func TestReadyzUnreadyBeforeFirstCycle(t *testing.T) {
+	release := make(chan struct{})
+	s := New("127.0.0.1:0", []Check{{Name: "slow", Probe: func(context.Context) error {
+		<-release
+		return nil
+	}}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	status, body := probe(t, s.Handler(), "/readyz")
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("readyz status before first cycle = %d, want %d", status, http.StatusServiceUnavailable)
+	}
+	if body["status"] != "unready" {
+		t.Errorf("readyz status field before first cycle = %v, want unready", body["status"])
+	}
+	checks, isMap := body["checks"].(map[string]any)
+	if !isMap || len(checks) != 0 {
+		t.Errorf("readyz checks before first cycle = %v, want an empty object", body["checks"])
+	}
+
+	close(release)
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Run returned %v, want nil after cancellation", err)
+	}
+}
+
+// readyz always reflects the sampler's latest cycle, including a check that
+// recovers after failing.
+func TestReadyzReflectsLatestCycle(t *testing.T) {
+	var broken atomic.Bool
+	s := sampled([]Check{{Name: "flaky", Probe: func(context.Context) error {
+		if broken.Load() {
+			return errors.New("down")
+		}
+		return nil
+	}}})
+	h := s.Handler()
+
+	if _, body := probe(t, h, "/readyz"); body["status"] != "ready" {
+		t.Fatalf("initial readyz status = %v, want ready", body["status"])
+	}
+
+	broken.Store(true)
+	s.runCycle(context.Background())
+	if _, body := probe(t, h, "/readyz"); body["status"] != "unready" {
+		t.Fatalf("readyz status after the check broke = %v, want unready", body["status"])
+	}
+
+	broken.Store(false)
+	s.runCycle(context.Background())
+	if _, body := probe(t, h, "/readyz"); body["status"] != "ready" {
+		t.Fatalf("readyz status after the check recovered = %v, want ready", body["status"])
+	}
+}
+
+// The whole point of sampling in the background is that a request never runs
+// a check: hammering the endpoint must not run the checks any more than the
+// cycles that actually happened did.
+func TestReadyzHammeringDoesNotReprobe(t *testing.T) {
+	var ran atomic.Int64
+	s := sampled([]Check{{Name: "counted", Probe: func(context.Context) error {
+		ran.Add(1)
+		return nil
+	}}})
+	h := s.Handler()
+
+	// t.Fatalf inside probe is only safe from the test goroutine, so the
+	// workers below hit the handler directly rather than sharing that helper.
+	const requests = 500
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Go(func() {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		})
+	}
+	wg.Wait()
+
+	if got := ran.Load(); got != 1 {
+		t.Errorf("checks ran %d times across %d requests, want 1", got, requests)
+	}
+}
+
 func TestRunStopsWithTheContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	srv := New("127.0.0.1:0", nil)
@@ -200,5 +300,37 @@ func TestRunReportsAnUnusableAddress(t *testing.T) {
 
 	if err == nil {
 		t.Fatal("Run returned nil for an address it cannot bind")
+	}
+}
+
+// The sampler is a goroutine of its own, and it must not survive the ctx that
+// governs it: a cancelled context stops the next cycle from ever starting.
+func TestSampleLoopStopsWithContext(t *testing.T) {
+	var ran atomic.Int64
+	s := New("", []Check{{Name: "counted", Probe: func(context.Context) error {
+		ran.Add(1)
+		return nil
+	}}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.sampleLoop(ctx)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for ran.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if ran.Load() == 0 {
+		t.Fatal("sampleLoop did not run its immediate cycle")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("sampleLoop did not stop after its context was cancelled")
 	}
 }

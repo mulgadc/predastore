@@ -199,6 +199,8 @@ S3 is a public service and replication is not, so the two bind separately on a m
 
 `admin_port` puts `/healthz` and `/readyz` on the host's `bind_addr`, alongside the cluster plane and never on the S3 port. `/healthz` answers 200 once the process is listening. `/readyz` answers 200 when this process can serve: a meta replica observes a leader, the meta plane answers a read, and at least `data` blob nodes answer one — whichever of those the roles on the host can be asked. It answers 503 otherwise, with a body naming which check failed and nothing else. A host that names no `admin_port` runs no admin listener.
 
+A background sampler runs those checks on a fixed interval and `/readyz` only ever serves its last result, so answering a request costs nothing beyond reading it — hammering the endpoint does not add load to the meta plane or the blob nodes. The answer can lag reality by up to one sampling interval, and a request arriving before the first cycle completes gets 503 rather than an unfounded 200.
+
 Write every node under one `[[host]]` and the cluster runs in one process over the in-process pipe. Spread them across hosts and each process is launched separately with its own `-host` id. Nothing else changes.
 
 `config/` holds three ready-made profiles — see [Run a Development Cluster](#run-a-development-cluster).
