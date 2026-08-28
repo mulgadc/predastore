@@ -53,6 +53,25 @@ const (
 
 	metricGateInflightBytes    = "predastore.gate.inflight.bytes"
 	metricGateInflightRequests = "predastore.gate.inflight.requests"
+
+	metricBlobFreeFrac   = "predastore.blob.free_frac"
+	metricBlobFreeBytes  = "predastore.blob.free_bytes"
+	metricBlobTotalBytes = "predastore.blob.total_bytes"
+	metricBlobPressure   = "predastore.blob.pressure"
+	metricBlobSegments   = "predastore.blob.segments"
+	metricBlobSegNum     = "predastore.blob.seg_num"
+	metricBlobValueNum   = "predastore.blob.value_num"
+	metricBlobFragNum    = "predastore.blob.frag_num"
+	metricBlobLiveBytes  = "predastore.blob.live_bytes"
+	metricBlobDeadBytes  = "predastore.blob.dead_bytes"
+	metricBlobLiveFrac   = "predastore.blob.live_frac"
+
+	metricBlobCompactionCycles       = "predastore.blob.compaction.cycles"
+	metricBlobCompactionSegments     = "predastore.blob.compaction.segments"
+	metricBlobCompactionBytes        = "predastore.blob.compaction.bytes"
+	metricBlobCompactionLastDuration = "predastore.blob.compaction.last_duration_seconds"
+
+	metricBlobIntegrityFailures = "predastore.blob.integrity.failures"
 )
 
 // metricNames is every name this package registers. Only the tests read it:
@@ -66,6 +85,11 @@ var metricNames = []string{
 	metricShardErrors, metricShardOps, metricShardDuration,
 	metricObjectReads, metricObjectWrites,
 	metricGateInflightBytes, metricGateInflightRequests,
+	metricBlobFreeFrac, metricBlobFreeBytes, metricBlobTotalBytes, metricBlobPressure,
+	metricBlobSegments, metricBlobSegNum, metricBlobValueNum, metricBlobFragNum,
+	metricBlobLiveBytes, metricBlobDeadBytes, metricBlobLiveFrac,
+	metricBlobCompactionCycles, metricBlobCompactionSegments, metricBlobCompactionBytes,
+	metricBlobCompactionLastDuration, metricBlobIntegrityFailures,
 }
 
 var (
@@ -94,6 +118,25 @@ var (
 
 	gateInflightBytes    metric.Int64UpDownCounter
 	gateInflightRequests metric.Int64UpDownCounter
+
+	blobFreeFrac   metric.Float64ObservableGauge
+	blobFreeBytes  metric.Int64ObservableGauge
+	blobTotalBytes metric.Int64ObservableGauge
+	blobPressure   metric.Int64ObservableGauge
+	blobSegments   metric.Int64ObservableGauge
+	blobSegNum     metric.Int64ObservableGauge
+	blobValueNum   metric.Int64ObservableGauge
+	blobFragNum    metric.Int64ObservableGauge
+	blobLiveBytes  metric.Int64ObservableGauge
+	blobDeadBytes  metric.Int64ObservableGauge
+	blobLiveFrac   metric.Float64ObservableGauge
+
+	blobCompactionCycles       metric.Int64ObservableCounter
+	blobCompactionSegments     metric.Int64ObservableCounter
+	blobCompactionBytes        metric.Int64ObservableCounter
+	blobCompactionLastDuration metric.Float64ObservableGauge
+
+	blobIntegrityFailures metric.Int64ObservableCounter
 )
 
 // instruments lazily creates the shared instruments. The global meter
@@ -216,7 +259,74 @@ func instruments() {
 		if err != nil {
 			otel.Handle(err)
 		}
+
+		// The blob store's instruments are all observed from one snapshot, so
+		// they are built through helpers rather than repeating the error check
+		// sixteen times.
+		blobFreeFrac = float64Gauge(metricBlobFreeFrac,
+			"Free fraction of the filesystem backing this node's store, as of the last measurement the write path took.", "1")
+		blobFreeBytes = int64Gauge(metricBlobFreeBytes,
+			"Bytes available to the store on its filesystem. A fraction cannot say how long the space lasts; this can.", "By")
+		blobTotalBytes = int64Gauge(metricBlobTotalBytes,
+			"Size of the filesystem backing this node's store.", "By")
+		blobPressure = int64Gauge(metricBlobPressure,
+			"Constant 1 carrying the watermark band the store is in as an attribute: ok, nearfull or full.", "{node}")
+		blobSegments = int64Gauge(metricBlobSegments,
+			"Segment files currently on disk. Climbing while bytes do not is compaction failing to keep up.", "{segment}")
+		blobSegNum = int64Gauge(metricBlobSegNum,
+			"Monotonic segment counter. Its rate is how fast the store rolls segments.", "{segment}")
+		blobValueNum = int64Gauge(metricBlobValueNum,
+			"Monotonic value counter. Its rate is the node's write rate, counted with nothing added to the write path.", "{value}")
+		blobFragNum = int64Gauge(metricBlobFragNum,
+			"Monotonic fragment counter. Its rate against value_num is the average value size in fragments.", "{fragment}")
+		blobLiveBytes = int64Gauge(metricBlobLiveBytes,
+			"On-disk bytes holding live data, as of the last compaction scan.", "By")
+		blobDeadBytes = int64Gauge(metricBlobDeadBytes,
+			"On-disk bytes superseded or deleted and not yet reclaimed, as of the last compaction scan.", "By")
+		blobLiveFrac = float64Gauge(metricBlobLiveFrac,
+			"Live share of on-disk bytes. A falling value with a flat reclaim rate is space compaction is not getting back.", "1")
+
+		blobCompactionCycles = int64Counter(metricBlobCompactionCycles,
+			"Compaction cycles run, by outcome. No cycles at all on a busy node is a compactor that is not running.", "{cycle}")
+		blobCompactionSegments = int64Counter(metricBlobCompactionSegments,
+			"Segments compaction has scanned and dropped.", "{segment}")
+		blobCompactionBytes = int64Counter(metricBlobCompactionBytes,
+			"Bytes compaction has relocated and reclaimed. Reclaimed is the only measure of space actually returned.", "By")
+		blobCompactionLastDuration = float64Gauge(metricBlobCompactionLastDuration,
+			"Duration of the last completed compaction cycle. Approaching the cycle interval means compaction never rests.", "s")
+
+		blobIntegrityFailures = int64Counter(metricBlobIntegrityFailures,
+			"Fragments that failed their GCM tag. Any non-zero value is corruption: bytes on disk no longer authenticate.", "{fragment}")
 	})
+}
+
+// int64Gauge, float64Gauge and int64Counter build one observable instrument,
+// reporting a construction failure the same way the instruments above do.
+func int64Gauge(name, description, unit string) metric.Int64ObservableGauge {
+	g, err := meter.Int64ObservableGauge(name,
+		metric.WithDescription(description), metric.WithUnit(unit))
+	if err != nil {
+		otel.Handle(err)
+	}
+	return g
+}
+
+func float64Gauge(name, description, unit string) metric.Float64ObservableGauge {
+	g, err := meter.Float64ObservableGauge(name,
+		metric.WithDescription(description), metric.WithUnit(unit))
+	if err != nil {
+		otel.Handle(err)
+	}
+	return g
+}
+
+func int64Counter(name, description, unit string) metric.Int64ObservableCounter {
+	c, err := meter.Int64ObservableCounter(name,
+		metric.WithDescription(description), metric.WithUnit(unit))
+	if err != nil {
+		otel.Handle(err)
+	}
+	return c
 }
 
 // RaftSnapshot is one meta replica's consensus state at collection time.
@@ -259,6 +369,142 @@ func RegisterRaftGauges(snapshot func() RaftSnapshot) (func() error, error) {
 		return nil, err
 	}
 	return reg.Unregister, nil
+}
+
+// StoreSnapshot is one blob node's store at collection time. It mirrors what
+// the engine maintains rather than anything it computes on demand: the whole
+// point of the shape is that answering costs a mutex and no I/O.
+//
+// Measured and Scanned distinguish "not yet known" from a real zero. A store
+// that has never been written to has taken no free-space measurement, and one
+// running without compaction has never scanned for dead bytes; reporting either
+// as zero would read as a full disk or a perfectly clean store.
+type StoreSnapshot struct {
+	NodeID string
+
+	Measured   bool
+	FreeFrac   float64
+	FreeBytes  uint64
+	TotalBytes uint64
+	Pressure   string
+
+	SegNum       uint64
+	ValueNum     uint64
+	FragNum      uint64
+	LiveSegments int64
+
+	Scanned   bool
+	LiveBytes int64
+	DeadBytes int64
+
+	CompactionCycles       int64
+	CompactionCyclesFailed int64
+	SegmentsScanned        int64
+	SegmentsDropped        int64
+	BytesRelocated         int64
+	BytesReclaimed         int64
+	LastCycleSeconds       float64
+
+	IntegrityFailures uint64
+}
+
+// RegisterStoreGauges observes one blob node's store on every collection,
+// mirroring RegisterRaftGauges: snapshot is called once per collection and its
+// result feeds every instrument, so the figures are mutually consistent.
+//
+// The returned function unregisters the callback; the caller invokes it when
+// the node shuts down. Several nodes in one process are supported — the
+// instruments are shared and the node attribute separates them.
+func RegisterStoreGauges(snapshot func() StoreSnapshot) (func() error, error) {
+	instruments()
+	if meter == nil {
+		return func() error { return nil }, nil
+	}
+
+	reg, err := meter.RegisterCallback(
+		func(_ context.Context, o metric.Observer) error {
+			observeStore(o, snapshot())
+			return nil
+		},
+		blobFreeFrac, blobFreeBytes, blobTotalBytes, blobPressure,
+		blobSegments, blobSegNum, blobValueNum, blobFragNum,
+		blobLiveBytes, blobDeadBytes, blobLiveFrac,
+		blobCompactionCycles, blobCompactionSegments, blobCompactionBytes,
+		blobCompactionLastDuration, blobIntegrityFailures,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return reg.Unregister, nil
+}
+
+// observeStore emits one snapshot across the blob store instruments.
+func observeStore(o metric.Observer, s StoreSnapshot) {
+	node := metric.WithAttributeSet(attribute.NewSet(attribute.String(nodeAttrKey, s.NodeID)))
+
+	o.ObserveInt64(blobSegNum, int64(s.SegNum), node)     //nolint:gosec // monotonic counters; a store would have to write 9.2e18 values to wrap.
+	o.ObserveInt64(blobValueNum, int64(s.ValueNum), node) //nolint:gosec // as above.
+	o.ObserveInt64(blobFragNum, int64(s.FragNum), node)   //nolint:gosec // as above.
+	o.ObserveInt64(blobSegments, s.LiveSegments, node)
+
+	if s.Measured {
+		o.ObserveFloat64(blobFreeFrac, s.FreeFrac, node)
+		o.ObserveInt64(blobFreeBytes, int64(s.FreeBytes), node)   //nolint:gosec // filesystem sizes are far below the int64 ceiling.
+		o.ObserveInt64(blobTotalBytes, int64(s.TotalBytes), node) //nolint:gosec // as above.
+		o.ObserveInt64(blobPressure, 1, metric.WithAttributeSet(attribute.NewSet(
+			attribute.String(nodeAttrKey, s.NodeID),
+			attribute.String("blob.pressure", s.Pressure),
+		)))
+	}
+
+	if s.Scanned {
+		o.ObserveInt64(blobLiveBytes, s.LiveBytes, node)
+		o.ObserveInt64(blobDeadBytes, s.DeadBytes, node)
+		if total := s.LiveBytes + s.DeadBytes; total > 0 {
+			o.ObserveFloat64(blobLiveFrac, float64(s.LiveBytes)/float64(total), node)
+		}
+	}
+
+	o.ObserveInt64(blobCompactionCycles, s.CompactionCycles-s.CompactionCyclesFailed,
+		outcomeAttrs(s.NodeID, OutcomeSuccess))
+	o.ObserveInt64(blobCompactionCycles, s.CompactionCyclesFailed,
+		outcomeAttrs(s.NodeID, OutcomeError))
+
+	o.ObserveInt64(blobCompactionSegments, s.SegmentsScanned, kindAttrs(s.NodeID, CompactionKindScanned))
+	o.ObserveInt64(blobCompactionSegments, s.SegmentsDropped, kindAttrs(s.NodeID, CompactionKindDropped))
+	o.ObserveInt64(blobCompactionBytes, s.BytesRelocated, kindAttrs(s.NodeID, CompactionKindRelocated))
+	o.ObserveInt64(blobCompactionBytes, s.BytesReclaimed, kindAttrs(s.NodeID, CompactionKindReclaimed))
+	o.ObserveFloat64(blobCompactionLastDuration, s.LastCycleSeconds, node)
+
+	o.ObserveInt64(blobIntegrityFailures, int64(s.IntegrityFailures), node) //nolint:gosec // a count of corrupt fragments cannot realistically reach the int64 ceiling.
+}
+
+// Compaction accounting kinds. Scanned counts candidates a cycle selected and
+// dropped counts those it actually drained, so the gap between them is segments
+// compaction gave up on. Reclaimed is space returned to the filesystem;
+// relocated is live data moved to get at it.
+const (
+	CompactionKindScanned   = "scanned"
+	CompactionKindDropped   = "dropped"
+	CompactionKindRelocated = "relocated"
+	CompactionKindReclaimed = "reclaimed"
+)
+
+// outcomeAttrs and kindAttrs build the per-collection attribute sets for the
+// compaction counters. Built per observation rather than cached: a callback
+// runs once per collection interval, where an allocation is free.
+func outcomeAttrs(node, outcome string) metric.ObserveOption {
+	return metric.WithAttributeSet(attribute.NewSet(
+		attribute.String(nodeAttrKey, node),
+		attribute.String("outcome", outcome),
+	))
+}
+
+func kindAttrs(node, kind string) metric.ObserveOption {
+	return metric.WithAttributeSet(attribute.NewSet(
+		attribute.String(nodeAttrKey, node),
+		attribute.String("kind", kind),
+	))
 }
 
 // observeRaft emits one snapshot across the raft gauges.

@@ -10,12 +10,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/mulgadc/predastore/internal/blob/engine"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/rpc"
+	"github.com/mulgadc/predastore/internal/telemetry"
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
@@ -28,6 +31,16 @@ type Store interface {
 	NearFull() bool
 	Close() error
 }
+
+// SnapshotStore is a Store that can report its capacity and compaction state.
+// Kept separate from Store so a test substitute stays a handful of methods:
+// a store that cannot report simply goes unreported.
+type SnapshotStore interface {
+	Store
+	Snapshot() engine.Snapshot
+}
+
+var _ SnapshotStore = (*engine.Store)(nil)
 
 var _ Store = (*engine.Store)(nil)
 
@@ -96,6 +109,16 @@ func (s *Server) Run(ctx context.Context) error {
 		s.store = st
 	}
 
+	// Reporting is unregistered before the store closes, so a collection can
+	// never land on a store that has already been torn down.
+	if unregister := s.registerStoreGauges(); unregister != nil {
+		defer func() {
+			if err := unregister(); err != nil {
+				slog.Warn("failed to unregister store gauges", "node", s.cfg.NodeID, "error", err)
+			}
+		}()
+	}
+
 	mux := rpc.NewMux()
 	rpc.RegisterHandler(mux, OpGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpPut, s.handlePut)
@@ -106,6 +129,56 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	return errors.Join(srv.Run(ctx), s.store.Close())
+}
+
+// registerStoreGauges publishes this node's store state on every metrics
+// collection, returning the unregister function or nil when there is nothing
+// to publish. The node id is attached here because the engine has no idea
+// which node it backs, and the metrics are useless without it.
+func (s *Server) registerStoreGauges() func() error {
+	store, ok := s.store.(SnapshotStore)
+	if !ok {
+		return nil
+	}
+
+	node := strconv.FormatUint(uint64(s.cfg.NodeID), 10)
+	unregister, err := telemetry.RegisterStoreGauges(func() telemetry.StoreSnapshot {
+		return storeSnapshot(node, store.Snapshot())
+	})
+	if err != nil {
+		// Reporting is not worth failing a node over: it serves data either way.
+		slog.Warn("failed to register store gauges", "node", s.cfg.NodeID, "error", err)
+		return nil
+	}
+	return unregister
+}
+
+// storeSnapshot restates an engine snapshot in the telemetry package's terms,
+// which is what keeps the engine free of any dependency on instrumentation.
+func storeSnapshot(node string, s engine.Snapshot) telemetry.StoreSnapshot {
+	return telemetry.StoreSnapshot{
+		NodeID:                 node,
+		Measured:               s.Measured,
+		FreeFrac:               s.FreeFrac,
+		FreeBytes:              s.FreeBytes,
+		TotalBytes:             s.TotalBytes,
+		Pressure:               s.Pressure,
+		SegNum:                 s.SegNum,
+		ValueNum:               s.ValueNum,
+		FragNum:                s.FragNum,
+		LiveSegments:           s.LiveSegments,
+		Scanned:                s.Scanned,
+		LiveBytes:              s.LiveBytes,
+		DeadBytes:              s.DeadBytes,
+		CompactionCycles:       s.CompactionCycles,
+		CompactionCyclesFailed: s.CompactionCyclesFailed,
+		SegmentsScanned:        s.SegmentsScanned,
+		SegmentsDropped:        s.SegmentsDropped,
+		BytesRelocated:         s.BytesRelocated,
+		BytesReclaimed:         s.BytesReclaimed,
+		LastCycleSeconds:       s.LastCycleSeconds,
+		IntegrityFailures:      s.IntegrityFailures,
+	}
 }
 
 // respond writes the newline-terminated JSON envelope; get responses stream

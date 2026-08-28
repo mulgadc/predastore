@@ -189,6 +189,7 @@ func (store *Store) dropSegment(num uint64) error {
 		return nil
 	}
 	delete(store.segCache, num)
+	store.stats.liveSegments--
 	seg.waitForRefs()
 
 	var errs []error
@@ -207,6 +208,30 @@ func (store *Store) dropSegment(num uint64) error {
 	return errors.Join(errs...)
 }
 
+// countSegments counts the .seg files in dir. Called once at Open to seed the
+// live-segment counter, never on a reporting path.
+func countSegments(dir string) (int64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, err
+	}
+	var n int64
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".seg" {
+			continue
+		}
+		// An empty file is one a crash left between create and header write.
+		// openSegment headers it and reports it as created, so counting it here
+		// as well would count it twice.
+		info, err := e.Info()
+		if err != nil || info.Size() == 0 {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
 // getSegment returns a cached segment or opens it from disk. create selects
 // the append path (fabricate a fresh segment if none exists) versus a read
 // path (report a missing segment as an error). A cache hit ignores create,
@@ -217,9 +242,12 @@ func (store *Store) getSegment(num uint64, create bool) (*segment, error) {
 		return seg, nil
 	}
 
-	seg, err := openSegment(store.dir, num, create)
+	seg, created, err := openSegment(store.dir, num, create)
 	if err != nil {
 		return nil, err
+	}
+	if created {
+		store.stats.liveSegments++
 	}
 
 	store.segCache[num] = seg
@@ -258,12 +286,15 @@ func (store *Store) rollSegment() (*segment, error) {
 	return store.getSegment(store.segNum, true)
 }
 
-func openSegment(dir string, num uint64, create bool) (*segment, error) {
+// openSegment opens or creates segment num. created reports whether the file
+// was brought into existence by this call, which is what the live-segment
+// counter is maintained from.
+func openSegment(dir string, num uint64, create bool) (seg *segment, created bool, err error) {
 	path := filepath.Join(dir, fmt.Sprintf(segFilename, num))
 
 	f, err := openFile(path, create)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	idxFile, err := openFile(filepath.Join(dir, fmt.Sprintf(idxSegFilename, num)), create)
@@ -271,7 +302,7 @@ func openSegment(dir string, num uint64, create bool) (*segment, error) {
 		if closeErr := f.Close(); closeErr != nil {
 			slog.Warn("failed to close segment", "segNum", num, "error", closeErr)
 		}
-		return nil, err
+		return nil, false, err
 	}
 
 	defer func() {
@@ -286,19 +317,21 @@ func openSegment(dir string, num uint64, create bool) (*segment, error) {
 
 	idxInfo, err := idxFile.Stat()
 	if err != nil {
-		return nil, fmt.Errorf("stat idx %d: %w", num, err)
+		return nil, false, fmt.Errorf("stat idx %d: %w", num, err)
 	}
 
 	info, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	seg := &segment{file: f, idx: idxFile, idxSize: idxInfo.Size(), num: num}
+	seg = &segment{file: f, idx: idxFile, idxSize: idxInfo.Size(), num: num}
 
 	switch {
 	// New file: write the segment header.
 	case info.Size() == 0:
+		created = true
+
 		header := make([]byte, segHeaderSize)
 		copy(header[0:4], magic[:])                  // [0:4]  magic
 		binary.BigEndian.PutUint16(header[4:6], v1)  // [4:6]  version
@@ -306,20 +339,20 @@ func openSegment(dir string, num uint64, create bool) (*segment, error) {
 		binary.BigEndian.PutUint32(header[10:14], 0) // [10:14] reserved
 
 		if _, err = f.WriteAt(header, 0); err != nil {
-			return nil, fmt.Errorf("write header: %w", err)
+			return nil, false, fmt.Errorf("write header: %w", err)
 		}
 
 	// Existing file: validate magic and seed the full-flag cache.
 	default:
 		header := make([]byte, segHeaderSize)
 		if _, err = f.ReadAt(header, 0); err != nil {
-			return nil, fmt.Errorf("read header: %w", err)
+			return nil, false, fmt.Errorf("read header: %w", err)
 		}
 
 		var fileMagic [4]byte
 		copy(fileMagic[:], header[0:4])
 		if fileMagic != magic {
-			return nil, fmt.Errorf("segment %s: invalid magic %x: encryption-at-rest format requires a fresh data dir", path, fileMagic)
+			return nil, false, fmt.Errorf("segment %s: invalid magic %x: encryption-at-rest format requires a fresh data dir", path, fileMagic)
 		}
 
 		flags := segmentFlags(binary.BigEndian.Uint32(header[segFlagsOffset : segFlagsOffset+segFlagsSize]))
@@ -328,7 +361,7 @@ func openSegment(dir string, num uint64, create bool) (*segment, error) {
 		}
 	}
 
-	return seg, nil
+	return seg, created, nil
 }
 
 // readFlags returns the segment-header flags word.

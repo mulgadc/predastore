@@ -561,6 +561,146 @@ func TestNoMetricNameIsAnotherPrefix(t *testing.T) {
 	}
 }
 
+func TestRegisterStoreGaugesReportsTheSnapshot(t *testing.T) {
+	reader := withManualReader(t)
+
+	unregister, err := RegisterStoreGauges(fullStoreSnapshot)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { _ = unregister() })
+
+	m := collect(t, reader)
+	node := map[string]string{"node": "1"}
+
+	for _, tc := range []struct {
+		metric string
+		want   int64
+	}{
+		{metric: "predastore.blob.free_bytes", want: 500},
+		{metric: "predastore.blob.total_bytes", want: 1000},
+		{metric: "predastore.blob.segments", want: 2},
+		{metric: "predastore.blob.seg_num", want: 3},
+		{metric: "predastore.blob.value_num", want: 40},
+		{metric: "predastore.blob.frag_num", want: 500},
+		{metric: "predastore.blob.live_bytes", want: 750},
+		{metric: "predastore.blob.dead_bytes", want: 250},
+	} {
+		got, ok := gaugeFor(t, m[tc.metric], node)
+		if !ok {
+			t.Errorf("%s emitted no datapoint for node 1", tc.metric)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("%s = %d, want %d", tc.metric, got, tc.want)
+		}
+	}
+
+	if got, ok := gaugeFor(t, m["predastore.blob.pressure"], map[string]string{"node": "1", "blob.pressure": "ok"}); !ok || got != 1 {
+		t.Errorf("pressure = %d (found=%v), want a constant 1 carrying the band", got, ok)
+	}
+
+	// Corruption is a counter, not a gauge: it must survive a collection where
+	// nothing new failed.
+	if got := sumFor(t, m["predastore.blob.integrity.failures"], node); got != 2 {
+		t.Errorf("integrity failures = %d, want 2", got)
+	}
+}
+
+// The live fraction is derived at observation time rather than carried, so it
+// cannot disagree with the two figures it comes from.
+func TestStoreGaugesDeriveLiveFraction(t *testing.T) {
+	reader := withManualReader(t)
+
+	unregister, err := RegisterStoreGauges(fullStoreSnapshot)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { _ = unregister() })
+
+	m := collect(t, reader)
+	g, ok := m["predastore.blob.live_frac"].(metricdata.Gauge[float64])
+	if !ok {
+		t.Fatalf("live_frac is %T, want Gauge[float64]", m["predastore.blob.live_frac"])
+	}
+	if len(g.DataPoints) != 1 {
+		t.Fatalf("live_frac datapoints = %d, want 1", len(g.DataPoints))
+	}
+	// 750 live of 1000 total.
+	if got := g.DataPoints[0].Value; got != 0.75 {
+		t.Errorf("live_frac = %v, want 0.75", got)
+	}
+}
+
+// A store that has never measured free space or never run a compaction scan
+// must report nothing for those, not a zero: zero free bytes reads as a full
+// disk and zero dead bytes as a perfectly compacted store.
+func TestStoreGaugesOmitWhatHasNotBeenMeasured(t *testing.T) {
+	reader := withManualReader(t)
+
+	unregister, err := RegisterStoreGauges(func() StoreSnapshot {
+		return StoreSnapshot{NodeID: "1", SegNum: 1, LiveSegments: 1}
+	})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { _ = unregister() })
+
+	m := collect(t, reader)
+	for _, name := range []string{
+		"predastore.blob.free_bytes",
+		"predastore.blob.total_bytes",
+		"predastore.blob.live_bytes",
+		"predastore.blob.dead_bytes",
+	} {
+		if data, ok := m[name]; ok {
+			if g, isGauge := data.(metricdata.Gauge[int64]); isGauge && len(g.DataPoints) > 0 {
+				t.Errorf("%s emitted %d datapoints for an unmeasured store, want none", name, len(g.DataPoints))
+			}
+		}
+	}
+	// The maintained counters are always known, so they are always reported.
+	if got, ok := gaugeFor(t, m["predastore.blob.segments"], map[string]string{"node": "1"}); !ok || got != 1 {
+		t.Errorf("segments = %d (found=%v), want 1 even before any measurement", got, ok)
+	}
+}
+
+// Cycles split into succeeded and failed, and the two must add back up to the
+// total: a dashboard reading only "cycles" would otherwise double-count.
+func TestStoreGaugesSplitCompactionOutcomes(t *testing.T) {
+	reader := withManualReader(t)
+
+	unregister, err := RegisterStoreGauges(fullStoreSnapshot)
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { _ = unregister() })
+
+	m := collect(t, reader)
+	cycles := m["predastore.blob.compaction.cycles"]
+	ok := sumFor(t, cycles, map[string]string{"node": "1", "outcome": OutcomeSuccess})
+	failed := sumFor(t, cycles, map[string]string{"node": "1", "outcome": OutcomeError})
+	if ok != 4 || failed != 1 {
+		t.Errorf("cycles succeeded/failed = %d/%d, want 4/1", ok, failed)
+	}
+
+	segments := m["predastore.blob.compaction.segments"]
+	if got := sumFor(t, segments, map[string]string{"node": "1", "kind": CompactionKindScanned}); got != 9 {
+		t.Errorf("segments scanned = %d, want 9", got)
+	}
+	if got := sumFor(t, segments, map[string]string{"node": "1", "kind": CompactionKindDropped}); got != 7 {
+		t.Errorf("segments dropped = %d, want 7", got)
+	}
+
+	bytes := m["predastore.blob.compaction.bytes"]
+	if got := sumFor(t, bytes, map[string]string{"node": "1", "kind": CompactionKindRelocated}); got != 2048 {
+		t.Errorf("bytes relocated = %d, want 2048", got)
+	}
+	if got := sumFor(t, bytes, map[string]string{"node": "1", "kind": CompactionKindReclaimed}); got != 8192 {
+		t.Errorf("bytes reclaimed = %d, want 8192", got)
+	}
+}
+
 // The prefix invariant is only as good as its coverage: an instrument nothing
 // exercises escapes it and fails in the sink instead. metricNames is the
 // declared set, so anything added there without a recorder here fails now.
@@ -602,5 +742,44 @@ func recordEveryInstrument(t *testing.T) map[string]metricdata.Aggregation {
 	}
 	t.Cleanup(func() { _ = unregister() })
 
+	// Measured and Scanned both true, so every conditional observation fires:
+	// a snapshot with either false would leave instruments unexercised and let
+	// them slip past the prefix invariant.
+	unregisterStore, err := RegisterStoreGauges(func() StoreSnapshot {
+		return fullStoreSnapshot()
+	})
+	if err != nil {
+		t.Fatalf("register store: %v", err)
+	}
+	t.Cleanup(func() { _ = unregisterStore() })
+
 	return collect(t, reader)
+}
+
+// fullStoreSnapshot is a snapshot with every field populated, so a collection
+// over it observes every blob instrument.
+func fullStoreSnapshot() StoreSnapshot {
+	return StoreSnapshot{
+		NodeID:                 "1",
+		Measured:               true,
+		FreeFrac:               0.5,
+		FreeBytes:              500,
+		TotalBytes:             1000,
+		Pressure:               "ok",
+		SegNum:                 3,
+		ValueNum:               40,
+		FragNum:                500,
+		LiveSegments:           2,
+		Scanned:                true,
+		LiveBytes:              750,
+		DeadBytes:              250,
+		CompactionCycles:       5,
+		CompactionCyclesFailed: 1,
+		SegmentsScanned:        9,
+		SegmentsDropped:        7,
+		BytesRelocated:         2048,
+		BytesReclaimed:         8192,
+		LastCycleSeconds:       1.5,
+		IntegrityFailures:      2,
+	}
 }
