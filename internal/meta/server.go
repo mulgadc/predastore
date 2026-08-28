@@ -46,9 +46,10 @@ type Server struct {
 	badgerDB  *badger.DB
 	bolt      *raftboltdb.BoltStore
 
-	// unregisterMetrics detaches the raft gauge callback. It is nil until
-	// raft exists, since the callback reads it on every collection.
-	unregisterMetrics func() error
+	// unregisterMetrics detaches the raft and storage gauge callbacks. They are
+	// nil until raft exists, since both read it on every collection.
+	unregisterMetrics     func() error
+	unregisterMetaMetrics func() error
 }
 
 // New validates cfg and applies its defaults. It creates no directory, opens
@@ -172,6 +173,12 @@ func (s *Server) open() (*rpc.Server, error) {
 	} else {
 		s.unregisterMetrics = unregister
 	}
+	unregisterMeta, err := telemetry.RegisterMetaGauges(s.metaSnapshot)
+	if err != nil {
+		slog.Warn("failed to register meta storage metrics", "node", s.cfg.NodeID, "error", err)
+	} else {
+		s.unregisterMetaMetrics = unregisterMeta
+	}
 
 	if s.cfg.Bootstrap {
 		if err := s.bootstrap(); err != nil {
@@ -193,6 +200,39 @@ func (s *Server) raftSnapshot() telemetry.RaftSnapshot {
 		CommitIndex:  st.CommitIndex,
 		AppliedIndex: st.AppliedIndex,
 	}
+}
+
+// metaSnapshot adapts this replica's storage state to the shape the gauges
+// observe. Like raftSnapshot it is called on every collection, so it reads
+// raft's own stats map and badger's cached size and touches no file itself.
+func (s *Server) metaSnapshot() telemetry.MetaSnapshot {
+	stats := s.raft.Stats()
+
+	snap := telemetry.MetaSnapshot{
+		NodeID:        strconv.FormatUint(uint64(s.cfg.NodeID), 10),
+		SnapshotIndex: parseRaftStat(stats["last_snapshot_index"]),
+		LastLogIndex:  parseRaftStat(stats["last_log_index"]),
+	}
+
+	// The LSM tree and the value log are reported separately: badger
+	// preallocates the value log file, so its size steps rather than grows,
+	// and only the LSM tree tracks the state machine's real size on disk.
+	if s.badgerDB != nil {
+		lsm, vlog := s.badgerDB.Size()
+		snap.FSMLSMBytes = lsm
+		snap.FSMVLogBytes = vlog
+	}
+	return snap
+}
+
+// parseRaftStat reads one numeric field out of raft's stats map, reporting an
+// absent or unparseable value as zero.
+func parseRaftStat(v string) int64 {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // raftConfig applies this replica's identity and tuning over raft's own
@@ -286,6 +326,12 @@ func (s *Server) shutdown() error {
 			errs = append(errs, fmt.Errorf("unregister raft metrics: %w", err))
 		}
 		s.unregisterMetrics = nil
+	}
+	if s.unregisterMetaMetrics != nil {
+		if err := s.unregisterMetaMetrics(); err != nil {
+			errs = append(errs, fmt.Errorf("unregister meta storage metrics: %w", err))
+		}
+		s.unregisterMetaMetrics = nil
 	}
 
 	// Closing the transport first stops all network activity: it prevents
@@ -386,6 +432,13 @@ func (s *Server) scan(prefix string, fn func(key string, value []byte) error) er
 func (s *Server) leaderAddr() string {
 	addr, _ := s.raft.LeaderWithID()
 	return string(addr)
+}
+
+// LeaderKnown reports whether this replica currently observes a leader. It
+// reads local raft state only, so a replica partitioned from the cluster
+// answers false rather than blocking on a peer it cannot reach.
+func (s *Server) LeaderKnown() bool {
+	return s.raft.Leader() != ""
 }
 
 // status reports this replica's own view of the cluster: its raft state, the

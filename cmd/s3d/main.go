@@ -38,6 +38,7 @@ func run() error {
 	encryptionKey := flag.String("encryption-key", "", "Path to the 32-byte AES-256 key protecting data at rest (overrides encryption_key)")
 	tlsCert := flag.String("tls-cert", "", "Path to this host's TLS certificate (overrides tls_cert)")
 	tlsKey := flag.String("tls-key", "", "Path to this host's TLS key (overrides tls_key)")
+	adminPort := flag.Int("admin-port", 0, "Port serving /healthz and /readyz on this host's bind address (overrides admin_port); zero runs no admin listener")
 	logLevel := slog.LevelInfo
 	flag.TextVar(&logLevel, "log-level", logLevel, "Minimum log level (debug|info|warn|error)")
 
@@ -96,6 +97,7 @@ func run() error {
 	host.EncryptionKey = cmp.Or(*encryptionKey, host.EncryptionKey)
 	host.TLSCert = cmp.Or(*tlsCert, host.TLSCert)
 	host.TLSKey = cmp.Or(*tlsKey, host.TLSKey)
+	host.AdminPort = cmp.Or(*adminPort, host.AdminPort)
 	if err := validateHost(host); err != nil {
 		return err
 	}
