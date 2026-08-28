@@ -27,6 +27,11 @@ type Config struct {
 	OnLeader      func()
 	LeaderTimeout time.Duration // Zero defaults to 30s.
 
+	// OnKeyChanged is called for every key a snapshot install adds or changes,
+	// which is the enumerated set of objects whose shards may have moved while
+	// this replica was outside the log. See OnKeyChanged in fsm.go.
+	OnKeyChanged func(key, value []byte)
+
 	// Raft tuning. Every zero value is replaced in New, so a zero-valued
 	// Config cannot overwrite raft's own timeouts with zeros.
 	HeartbeatTimeout   time.Duration

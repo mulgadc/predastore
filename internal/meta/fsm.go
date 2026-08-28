@@ -51,11 +51,45 @@ type FSM struct {
 	// constructed from one a leader sends afterwards. Only the second is a
 	// node catching up, and it is the one worth an alarm.
 	serving atomic.Bool
+
+	onKeyChanged func(key, value []byte)
+}
+
+// FSMOption configures an FSM at construction. The FSM stays a pure state
+// machine either way: it reports what changed and never decides what to do
+// about it.
+type FSMOption func(*FSM)
+
+// WithNode labels this replica in the snapshot lifecycle logs, which are
+// otherwise indistinguishable between the replicas colocated in one process.
+func WithNode(id config.NodeID) FSMOption {
+	return func(f *FSM) { f.node = id }
+}
+
+// OnKeyChanged registers a callback for every key a merging restore adds or
+// changes. That set is exactly the objects whose shards may have moved while
+// this node was outside the log, which the repair sweep otherwise has to
+// rediscover by scanning the whole placement table.
+//
+// It is called as the merge encounters each key, before the batch is flushed,
+// because buffering the set until the write commits would cost the memory the
+// streaming restore exists to avoid. So a failed restore may have reported keys
+// it did not commit. That is the safe direction: raft retries the restore, and
+// repairing an object that did not need it costs a read.
+//
+// key and value are valid for the duration of the call only.
+func OnKeyChanged(fn func(key, value []byte)) FSMOption {
+	return func(f *FSM) { f.onKeyChanged = fn }
 }
 
 // NewFSM creates a new FSM with the given Badger database.
-func NewFSM(db *badger.DB) *FSM {
-	return &FSM{db: db}
+func NewFSM(db *badger.DB, opts ...FSMOption) *FSM {
+	f := &FSM{db: db}
+	for _, opt := range opts {
+		opt(f)
+	}
+
+	return f
 }
 
 // Apply is called once a log entry is committed by Raft
@@ -229,6 +263,9 @@ func (f *FSM) restoreByMerge(r *bufio.Reader, started time.Time) error {
 		} else {
 			added++
 		}
+		if f.onKeyChanged != nil {
+			f.onKeyChanged(key, value)
+		}
 
 		return wb.Set(key, value)
 	})
@@ -275,6 +312,14 @@ func (f *FSM) restoreByMerge(r *bufio.Reader, started time.Time) error {
 // DropAll is badger's own bulk clear and is not bounded by a transaction;
 // WriteBatch commits in chunks as it fills.
 func (f *FSM) restoreByReplace(r *bufio.Reader, started time.Time) error {
+	// Every key is rewritten here, so a change set from this path would name
+	// the whole store. Saying so beats reporting nothing, which a consumer
+	// cannot tell from a snapshot that changed nothing.
+	if f.onKeyChanged != nil {
+		slog.Warn("meta: restore reports no change set",
+			"node", f.node, "reason", "unsorted snapshot, restored by replacement")
+	}
+
 	if err := f.db.DropAll(); err != nil {
 		return fmt.Errorf("restore: drop existing data: %w", err)
 	}

@@ -188,6 +188,14 @@ func TestTheCaptureDoesNotScaleWithTheStore(t *testing.T) {
 		})
 	}
 
-	assert.Equal(t, measure(16), measure(4000),
+	small, large := measure(16), measure(4000)
+
+	// Bounded rather than equal: badger's own bookkeeping moves by an
+	// allocation between runs, while the behaviour being ruled out is the old
+	// capture copying every key and value, which would put large in the
+	// thousands.
+	assert.Less(t, large, 32.0,
 		"the capture allocates in proportion to the store, so it is walking it")
+	assert.LessOrEqual(t, large, small+2,
+		"the capture grew with the store, so it is not a point-in-time view")
 }

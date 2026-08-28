@@ -146,8 +146,11 @@ func (s *Server) open() (*rpc.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open badger: %w", err)
 	}
-	s.fsm = NewFSM(s.badgerDB)
-	s.fsm.node = s.cfg.NodeID
+	opts := []FSMOption{WithNode(s.cfg.NodeID)}
+	if s.cfg.OnKeyChanged != nil {
+		opts = append(opts, OnKeyChanged(s.cfg.OnKeyChanged))
+	}
+	s.fsm = NewFSM(s.badgerDB, opts...)
 
 	s.bolt, err = raftboltdb.NewBoltStore(filepath.Join(s.cfg.DataDir, "raft.db"))
 	if err != nil {
