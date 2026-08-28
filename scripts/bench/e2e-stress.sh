@@ -19,10 +19,11 @@
 #
 # Environment:
 #   STRESS_SCENARIO    Narrows the run to one test: "repair", "handoff",
-#                      "torn-overwrite", "stale-shard", "freeze", or
-#                      "partial-put" — a client that stops sending mid-body,
-#                      which is not in a default run. Unset runs repair,
-#                      handoff, torn-overwrite, stale-shard and freeze.
+#                      "large-object", "torn-overwrite", "stale-shard",
+#                      "freeze", or "partial-put" — a client that stops sending
+#                      mid-body, which is not in a default run. Unset runs
+#                      repair, handoff, large-object, torn-overwrite,
+#                      stale-shard and freeze.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -51,6 +52,13 @@
 #   STRESS_HANDOFF_DEADLINE
 #                      Seconds allowed for the sweep to bring the handed-off
 #                      shards home (default: 180)
+#   STRESS_LARGE_SIZES Object sizes the large-object scenario writes and reads
+#                      (default: "2GiB 4GiB 16GiB"). A size with no room on
+#                      disk is skipped loudly, never silently.
+#   STRESS_WORK_ROOT   Where the cluster work directory is created. Defaults to
+#                      TMPDIR, except when large-object is in the run: TMPDIR is
+#                      often tmpfs, which is RAM-backed, so it would both cap
+#                      the sizes and make the memory measurement meaningless.
 #   WARP               Path to the warp binary (default: bin/tools/warp)
 #
 
@@ -79,9 +87,20 @@ STALE_KEYS="${STRESS_STALE_KEYS:-12}"
 # running everything and reporting a pass for a test that was never named.
 SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
-    all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff) ;;
+    all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff|large-object) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
+
+# Shards land under the work directory, and TMPDIR on a developer workstation
+# is commonly tmpfs. For the large-object scenario that is doubly wrong: it
+# caps the sizes at the size of RAM, and it charges the object's own bytes to
+# the memory figure the scenario exists to measure.
+WORK_ROOT="${TMPDIR:-/tmp}"
+case "$SCENARIO" in
+    all|large-object) WORK_ROOT="$HOME/.cache/predastore-e2e" ;;
+esac
+WORK_ROOT="${STRESS_WORK_ROOT:-$WORK_ROOT}"
+mkdir -p "$WORK_ROOT"
 
 ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
 SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
@@ -98,10 +117,10 @@ STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
 RUN_ID="$(printf '%s' "$STAMP" | tr '[:upper:]' '[:lower:]')"
 SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD)"
 RUN_DIR="$RESULTS_ROOT/${STAMP}-${SHA}"
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/predastore-e2e-stress.XXXXXX")"
+WORK_DIR="$(mktemp -d "$WORK_ROOT/predastore-e2e-stress.XXXXXX")"
 
 case "$WORK_DIR" in
-    ""|/|"${TMPDIR:-/tmp}") echo "refusing unsafe work directory: $WORK_DIR" >&2; exit 1 ;;
+    ""|/|"$WORK_ROOT"|"${TMPDIR:-/tmp}") echo "refusing unsafe work directory: $WORK_DIR" >&2; exit 1 ;;
 esac
 
 mkdir -p "$RUN_DIR/logs"
@@ -169,6 +188,9 @@ stop_clusters() {
 # rather than assumed: one that outlives the run holds its ports and fails
 # the next one somewhere unrelated.
 cleanup() {
+    if [ -n "${LARGE_RSS_SAMPLER:-}" ] && kill -0 "$LARGE_RSS_SAMPLER" 2>/dev/null; then
+        kill "$LARGE_RSS_SAMPLER" 2>/dev/null || true
+    fi
     if [ -n "$WARP_PID" ] && kill -0 "$WARP_PID" 2>/dev/null; then
         kill "$WARP_PID" 2>/dev/null || true
         wait "$WARP_PID" 2>/dev/null || true
@@ -720,6 +742,299 @@ if [ "$SCENARIO" = all ] || [ "$SCENARIO" = handoff ]; then
         echo "Stress results: $RUN_DIR"
         [ "$HANDOFF_FAILURES" -eq 0 ] \
             || fail "handoff failed $HANDOFF_FAILURES of $HANDOFF_CASES assertions"
+        exit 0
+    fi
+fi
+
+# --- Scenario: large-object ---
+#
+# Every other scenario in this file writes 8 MiB or less. At RS(2,1) that is a
+# 4 MiB shard: exactly one reedsolomon stream block, and inside every timeout
+# the gate applies. So the whole suite can be green while the gate cannot serve
+# an object larger than about a gigabyte, which is what happened.
+#
+# This scenario writes objects big enough to leave that regime, and records
+# what they cost. The assertion that matters is not a throughput number but a
+# flat memory curve: peak RSS at the largest size must not be materially above
+# peak RSS at the smallest. A gate that streams has a working set set by its
+# block size; a gate that buffers has one set by the object.
+
+LARGE_CLUSTER="${CONFIG_NAME}-large"
+LARGE_CONFIG="$PREDA_CONFIG_DIR/$LARGE_CLUSTER.toml"
+LARGE_PID_DIR="$PREDA_DIR/$LARGE_CLUSTER/pids"
+LARGE_BUCKET="stress-large"
+LARGE_SIZES="${STRESS_LARGE_SIZES:-2GiB 4GiB 16GiB}"
+LARGE_FAILURES=0
+LARGE_CASES=0
+LARGE_SKIPPED=0
+LARGE_RSS_SAMPLER=""
+
+# Deterministic pseudorandom bytes at line rate, from a fixed key over zeros.
+# The object is generated twice — once to digest, once to upload — rather than
+# staged, because staging a copy of a 16 GiB object doubles the disk footprint
+# to prove nothing the digest does not already prove.
+LARGE_KEY="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+LARGE_IV="000102030405060708090a0b0c0d0e0f"
+
+gen_stream() {
+    head -c "$1" /dev/zero | openssl enc -aes-256-ctr -K "$LARGE_KEY" -iv "$LARGE_IV" -nosalt 2>/dev/null
+}
+
+# parse_size turns 2GiB, 512MiB or a bare byte count into bytes. An
+# unrecognised unit is fatal rather than defaulted: a scenario that silently
+# ran at 2 bytes would pass every assertion in it.
+parse_size() {
+    local spec="$1" n unit
+    n="${spec%%[!0-9]*}"
+    unit="${spec#"$n"}"
+    [ -n "$n" ] || fail "large-object: cannot parse size '$spec'"
+    case "$unit" in
+        ""|B) echo "$n" ;;
+        KiB|K) echo $(( n * 1024 )) ;;
+        MiB|M) echo $(( n * 1024 * 1024 )) ;;
+        GiB|G) echo $(( n * 1024 * 1024 * 1024 )) ;;
+        *) fail "large-object: unknown unit in '$spec'" ;;
+    esac
+}
+
+# Peak RSS per node, sampled while the transfer runs. Sampling is the only way
+# to see this: the peak is transient and gone by the time a transfer returns.
+start_rss_sampler() {
+    local out="$1"
+    : > "$out"
+    (
+        while :; do
+            local pidfile pid rss
+            for pidfile in "$LARGE_PID_DIR"/*.pid; do
+                [ -e "$pidfile" ] || continue
+                pid="$(cat "$pidfile" 2>/dev/null || true)"
+                [ -n "$pid" ] || continue
+                rss="$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+                if [ -n "$rss" ]; then
+                    printf '%s %s\n' "$(basename "$pidfile" .pid)" "$rss" >> "$out"
+                fi
+            done
+            sleep 1
+        done
+    ) &
+    LARGE_RSS_SAMPLER=$!
+}
+
+stop_rss_sampler() {
+    if [ -n "$LARGE_RSS_SAMPLER" ] && kill -0 "$LARGE_RSS_SAMPLER" 2>/dev/null; then
+        kill "$LARGE_RSS_SAMPLER" 2>/dev/null || true
+        wait "$LARGE_RSS_SAMPLER" 2>/dev/null || true
+    fi
+    LARGE_RSS_SAMPLER=""
+}
+
+# The largest single node's peak, in MiB. The gate handling the request is one
+# process, so the maximum across nodes is what says whether it held the object;
+# a sum across nodes would blur that with the blob nodes' own buffers.
+peak_rss_mib() {
+    awk '{ if ($2 > peak[$1]) peak[$1] = $2 }
+         END { m = 0; for (h in peak) if (peak[h] > m) m = peak[h]; printf "%d", m / 1024 }' "$1"
+}
+
+render_large_profile() {
+    render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$LARGE_CONFIG" "$(( PORT_OFFSET + 300 ))"
+    cat >> "$LARGE_CONFIG" <<EOF
+
+[[bucket]]
+name = "$LARGE_BUCKET"
+region = "$REGION"
+public = true
+account_id = "123456789012"
+EOF
+    cp "$LARGE_CONFIG" "$RUN_DIR/$LARGE_CLUSTER.toml"
+}
+
+large_check() {
+    local ok="$1" message="$2"
+    LARGE_CASES=$(( LARGE_CASES + 1 ))
+    if [ "$ok" = true ]; then
+        log "large-object: pass, $message"
+    else
+        log "large-object: FAIL $message"
+        LARGE_FAILURES=$(( LARGE_FAILURES + 1 ))
+    fi
+}
+
+# Anything at or below this goes through s3api put-object, which is a single
+# PUT and exercises writeObject directly. Above it the object is streamed from
+# stdin and the CLI makes it multipart, which reaches the same code through
+# CompleteMultipartUpload with the assembled size. Both paths matter and they
+# are not the same path.
+LARGE_SINGLE_SHOT_MAX=$(( 4 * 1024 * 1024 * 1024 ))
+
+run_large_object() {
+    local results="$RUN_DIR/large-object.tsv"
+    local gate spec bytes need avail key src digest got_digest
+    local rss_log peak put_start put_secs get_secs reconstructed status hdr
+
+    render_large_profile
+    log "large-object: starting $LARGE_CLUSTER"
+    "$SCRIPTS_DIR/start.sh" -w "$LARGE_CLUSTER"
+
+    gate="$(parse_hosts "$LARGE_CONFIG" | awk '$3 != "" { print "https://" $2 ":" $3; exit }')"
+    [ -n "$gate" ] || fail "large-object: no gate in $LARGE_CLUSTER"
+
+    printf 'size\tbytes\tpath\tput_s\tput_MiBps\tget_s\tget_MiBps\tpeak_rss_MiB\treconstructed\tverdict\n' > "$results"
+
+    for spec in $LARGE_SIZES; do
+        bytes="$(parse_size "$spec")"
+        key="large-${spec}.bin"
+
+        # Shards are 1.5x the object at RS(2,1); the single-shot path needs a
+        # source file on top of that. Checked before the transfer rather than
+        # discovered part way through a 16 GiB upload, and reported with the
+        # shortfall so it is actionable rather than a bare skip.
+        if [ "$bytes" -le "$LARGE_SINGLE_SHOT_MAX" ]; then
+            need=$(( bytes * 5 / 2 + 2 * 1024 * 1024 * 1024 ))
+        else
+            need=$(( bytes * 3 / 2 + 2 * 1024 * 1024 * 1024 ))
+        fi
+        avail="$(df -PB1 "$PREDA_DIR" | awk 'NR == 2 { print $4 }')"
+        if [ "$avail" -lt "$need" ]; then
+            log "large-object: SKIP $spec — needs $(( need / 1024 / 1024 / 1024 ))GiB free under $PREDA_DIR, has $(( avail / 1024 / 1024 / 1024 ))GiB"
+            printf '%s\t%s\t-\t-\t-\t-\t-\t-\t-\tskipped-no-disk\n' "$spec" "$bytes" >> "$results"
+            LARGE_SKIPPED=$(( LARGE_SKIPPED + 1 ))
+            continue
+        fi
+
+        digest="$(gen_stream "$bytes" | sha256sum | awk '{ print $1 }')"
+        rss_log="$WORK_DIR/large-rss-$spec.txt"
+        start_rss_sampler "$rss_log"
+
+        put_start="$(date +%s)"
+        if [ "$bytes" -le "$LARGE_SINGLE_SHOT_MAX" ]; then
+            src="$WORK_DIR/large-$spec.bin"
+            gen_stream "$bytes" > "$src"
+            status=ok
+            aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 0 \
+                s3api put-object --bucket "$LARGE_BUCKET" --key "$key" --body "$src" \
+                >/dev/null 2>>"$RUN_DIR/large-puts.txt" || status=put-failed
+            rm -f "$src"
+        else
+            status=ok
+            gen_stream "$bytes" | aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 0 \
+                s3 cp - "s3://$LARGE_BUCKET/$key" --expected-size "$bytes" --only-show-errors \
+                2>>"$RUN_DIR/large-puts.txt" || status=put-failed
+        fi
+        put_secs=$(( $(date +%s) - put_start ))
+
+        if [ "$status" != ok ]; then
+            stop_rss_sampler
+            peak="$(peak_rss_mib "$rss_log")"
+            large_check false "$spec PUT failed after ${put_secs}s (peak RSS ${peak}MiB) — see large-puts.txt"
+            printf '%s\t%s\t%s\t%s\t-\t-\t-\t%s\t-\tput-failed\n' \
+                "$spec" "$bytes" "$([ "$bytes" -le "$LARGE_SINGLE_SHOT_MAX" ] && echo single || echo multipart)" \
+                "$put_secs" "$peak" >> "$results"
+            continue
+        fi
+
+        # Read back through the digest rather than to a file: a second copy on
+        # disk doubles the footprint and proves nothing more.
+        hdr="$WORK_DIR/large-headers-$spec.txt"
+        local get_start http_status verdict
+        get_start="$(date +%s)"
+        got_digest="$(curl -sk --max-time 3600 -D "$hdr" "$gate/$LARGE_BUCKET/$key" | sha256sum | awk '{ print $1 }')" \
+            || got_digest="get-failed"
+        get_secs=$(( $(date +%s) - get_start ))
+
+        stop_rss_sampler
+        peak="$(peak_rss_mib "$rss_log")"
+
+        # The status is checked before anything else is read from the response.
+        # An error body has no X-Spx-Degraded header, so a 500 would otherwise
+        # report zero reconstructions and pass the check that exists to prove
+        # the read was clean.
+        http_status="$(awk 'NR == 1 { print $2; exit }' "$hdr")"
+        if [ "$http_status" != 200 ]; then
+            curl -sk -o "$RUN_DIR/large-get-error-$spec.xml" "$gate/$LARGE_BUCKET/$key" 2>/dev/null || true
+            large_check false "$spec GET returned HTTP $http_status after ${get_secs}s (peak RSS ${peak}MiB) — body in large-get-error-$spec.xml"
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t-\t%s\t-\tget-http-%s\n' \
+                "$spec" "$bytes" \
+                "$([ "$bytes" -le "$LARGE_SINGLE_SHOT_MAX" ] && echo single || echo multipart)" \
+                "$put_secs" "$(( bytes / 1024 / 1024 / (put_secs > 0 ? put_secs : 1) ))" \
+                "$get_secs" "$peak" "$http_status" >> "$results"
+            continue
+        fi
+
+        reconstructed="$(awk 'tolower($1) == "x-spx-degraded:" { gsub(/\r/, "", $2); print $2; found = 1 }
+                              END { if (!found) print 0 }' "$hdr")"
+
+        verdict=mismatch
+        if [ "$got_digest" = "$digest" ]; then
+            verdict=ok
+            large_check true "$spec round-tripped byte for byte in ${put_secs}s up, ${get_secs}s down, peak RSS ${peak}MiB"
+        else
+            large_check false "$spec read back as $got_digest, wrote $digest"
+        fi
+        large_check "$([ "$reconstructed" = 0 ] && echo true || echo false)" \
+            "$spec read cost $reconstructed reconstructions on a healthy cluster"
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$spec" "$bytes" \
+            "$([ "$bytes" -le "$LARGE_SINGLE_SHOT_MAX" ] && echo single || echo multipart)" \
+            "$put_secs" "$(( bytes / 1024 / 1024 / (put_secs > 0 ? put_secs : 1) ))" \
+            "$get_secs" "$(( bytes / 1024 / 1024 / (get_secs > 0 ? get_secs : 1) ))" \
+            "$peak" "$reconstructed" "$verdict" >> "$results"
+
+        aws_s3 "$gate" s3 rm "s3://$LARGE_BUCKET/$key" --only-show-errors >/dev/null 2>&1 || true
+    done
+
+    # The property under test. A threshold in bytes would need retuning on
+    # every unrelated change; the ratio between the smallest and largest size
+    # is what says whether the gate streams.
+    #
+    # Only sizes that round-tripped count. A failed GET never buffers a
+    # response, so including one would flatten the curve by not doing the work
+    # the curve is measuring.
+    local smallest largest ratio completed
+    completed="$(awk -F'\t' 'NR > 1 && $10 == "ok"' "$results" | wc -l)"
+    smallest="$(awk -F'\t' 'NR > 1 && $10 == "ok" { print $8; exit }' "$results")"
+    largest="$(awk -F'\t' 'NR > 1 && $10 == "ok" { last = $8 } END { print last }' "$results")"
+    if [ "$completed" -ge 2 ] && [ -n "$smallest" ] && [ "$smallest" -gt 0 ]; then
+        ratio=$(( largest * 100 / smallest ))
+        large_check "$([ "$ratio" -le 200 ] && echo true || echo false)" \
+            "peak RSS is flat in object size: largest is ${ratio}% of smallest, budget 200%"
+    else
+        log "large-object: NOTE only $completed size(s) round-tripped, so memory was not compared across sizes"
+    fi
+
+    # Appended without the header, prefixed with the run and the commit, so a
+    # regression on this path is visible across runs rather than only inside one.
+    awk -F'\t' -v run="$STAMP" -v sha="$SHA" 'NR > 1 { print run "\t" sha "\t" $0 }' "$results" \
+        >> "$RESULTS_ROOT/large-object-history.tsv"
+    log "large-object: results in $results"
+
+    log "large-object: stopping $LARGE_CLUSTER"
+    stop_clusters
+    # Taken here rather than by the exit trap, which only knows about the
+    # shared cluster: without this the evidence for a failure goes with the
+    # work directory.
+    if [ -d "$PREDA_DIR/$LARGE_CLUSTER/logs" ]; then
+        mkdir -p "$RUN_DIR/logs-large"
+        cp -R "$PREDA_DIR/$LARGE_CLUSTER/logs/." "$RUN_DIR/logs-large/" 2>/dev/null || true
+    fi
+    if [ "$LARGE_SKIPPED" -gt 0 ]; then
+        log "large-object: $LARGE_SKIPPED size(s) skipped for want of disk — the run does not cover them"
+    fi
+    if [ "$LARGE_FAILURES" -eq 0 ]; then
+        log "large-object: passed $LARGE_CASES assertions"
+    else
+        log "large-object: FAILED $LARGE_FAILURES of $LARGE_CASES assertions"
+    fi
+}
+
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = large-object ]; then
+    run_large_object
+
+    if [ "$SCENARIO" = large-object ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$LARGE_FAILURES" -eq 0 ] \
+            || fail "large-object failed $LARGE_FAILURES of $LARGE_CASES assertions"
         exit 0
     fi
 fi
@@ -1650,6 +1965,13 @@ log "Warp completed with no errors"
     else
         echo "stale_shard=fail ($STALE_FAILURES of $STALE_CASES)"
     fi
+    if [ "$LARGE_CASES" -eq 0 ]; then
+        echo "large_object=skipped"
+    elif [ "$LARGE_FAILURES" -eq 0 ]; then
+        echo "large_object=pass${LARGE_SKIPPED:+ ($LARGE_SKIPPED size(s) skipped for disk)}"
+    else
+        echo "large_object=fail ($LARGE_FAILURES of $LARGE_CASES)"
+    fi
     echo
     echo "Timeline"
     echo "--------"
@@ -1670,3 +1992,5 @@ echo "Stress results: $RUN_DIR"
     || fail "repair failed $REPAIR_FAILURES of $REPAIR_CASES assertions"
 [ "$HANDOFF_FAILURES" -eq 0 ] \
     || fail "handoff failed $HANDOFF_FAILURES of $HANDOFF_CASES assertions"
+[ "$LARGE_FAILURES" -eq 0 ] \
+    || fail "large-object failed $LARGE_FAILURES of $LARGE_CASES assertions"
