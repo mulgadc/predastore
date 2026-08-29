@@ -36,10 +36,15 @@ type stripeReader struct {
 	enc        reedsolomon.Encoder
 	total      int
 
-	block  [][]byte // the whole working set: total buffers of one block
-	stripe [][]byte // per-stripe view, zero length where a shard is missing
+	blocks *blockSet // the whole working set: total buffers of one block
+	stripe [][]byte  // per-stripe view, zero length where a shard is missing
 	src    []io.ReadCloser
 	dead   []bool
+
+	// reading counts the block reads that may still be writing into the working
+	// set. The buffers are pooled, so they go back only when it is zero: a read
+	// abandoned by a cancelled request must not land in another request's block.
+	reading atomic.Int64
 
 	progress []*shardProgress
 
@@ -62,15 +67,20 @@ func newStripeReader(
 	r := &stripeReader{
 		bc: bc, objectHash: objectHash, place: place, handoff: handoff,
 		lay: lay, enc: enc, total: total,
-		block:    make([][]byte, total),
+		blocks:   newBlockSet(total, lay.blockSize),
 		stripe:   make([][]byte, total),
 		src:      make([]io.ReadCloser, total),
 		dead:     make([]bool, total),
 		progress: make([]*shardProgress, total),
 	}
-	for i := range r.block {
-		r.block[i] = make([]byte, lay.blockSize)
+	for i := range total {
 		r.progress[i] = &shardProgress{}
+	}
+	// Only the data blocks are taken up front. They are needed whether or not
+	// their shard answers, because a lost one is reconstructed back into its own
+	// buffer; a parity block is taken when parity is actually opened.
+	for i := range cfg.DataShards {
+		r.blocks.at(i)
 	}
 
 	// Only the data shards are opened. Opening parity here would double the
@@ -322,7 +332,7 @@ func (r *stripeReader) next(ctx context.Context) ([][]byte, int64, error) {
 
 				continue
 			}
-			r.stripe[res.index] = r.block[res.index][:n]
+			r.stripe[res.index] = r.blocks.at(res.index)[:n]
 			have++
 			if probe == nil {
 				probe = time.NewTicker(hedgeProbeInterval)
@@ -357,7 +367,7 @@ func (r *stripeReader) next(ctx context.Context) ([][]byte, int64, error) {
 	missing := 0
 	for i := range r.total {
 		if r.stripe[i] == nil {
-			r.stripe[i] = r.block[i][:0]
+			r.stripe[i] = r.blocks.spare(i)
 			if i < k {
 				missing++
 			}
@@ -384,9 +394,13 @@ func (r *stripeReader) readBlock(ctx context.Context, index int, n int64, out ch
 	p := r.progress[index]
 	p.begin(start)
 	src := &trackedReader{Reader: r.src[index], p: p}
-	buf := r.block[index][:n]
+	buf := r.blocks.at(index)[:n]
+	r.reading.Add(1)
 	go func() {
 		_, err := io.ReadFull(src, buf)
+		// Dropped before the result is sent, so a caller that sees every read
+		// accounted for knows nothing is still writing into the working set.
+		r.reading.Add(-1)
 		p.finish()
 		select {
 		case out <- blockResult{index: index, err: err, took: time.Since(start)}:
@@ -438,6 +452,13 @@ func (r *stripeReader) close(ctx context.Context) {
 			r.src[i] = nil
 		}
 		r.reportShard(ctx, i, nodes[i])
+	}
+
+	// A cancelled request can leave a read still running, and it holds a slice
+	// of the working set. Those buffers are given up rather than pooled: the
+	// garbage collector can wait for that goroutine and the next request cannot.
+	if r.reading.Load() == 0 {
+		r.blocks.release()
 	}
 }
 

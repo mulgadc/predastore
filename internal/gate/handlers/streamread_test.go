@@ -244,11 +244,18 @@ func TestTheWorkingSetIsAFixedNumberOfBlocks(t *testing.T) {
 			defer r.close(ctx)
 
 			var resident int64
-			for _, b := range r.block {
-				resident += int64(cap(b))
+			for _, b := range r.blocks.held {
+				if b != nil {
+					resident += int64(cap(*b))
+				}
 			}
 			assert.LessOrEqualf(t, resident, int64(f.cfg.TotalShards())*streamBlockSize,
 				"a %d byte object holds %d bytes resident", size, resident)
+
+			// Tighter than the bound above, and the reason for it: a healthy
+			// read opens k shards, so it must not be holding a parity block.
+			assert.LessOrEqualf(t, resident, int64(f.cfg.DataShards)*streamBlockSize,
+				"a healthy %d byte read took a parity block it never opened", size)
 		})
 	}
 }

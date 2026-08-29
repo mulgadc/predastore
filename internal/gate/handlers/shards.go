@@ -252,11 +252,12 @@ func streamShards(
 		return writeResult{landed: make([]bool, total)}, err
 	}
 
-	block := make([][]byte, total)
+	// Every shard is written, so the whole set is taken up front. The pipes the
+	// stripe is handed to are unbuffered, so a write returns only once its bytes
+	// have been read out of the block and the next stripe may overwrite it.
+	blocks := newBlockSet(total, blockSize)
+	defer blocks.release()
 	stripe := make([][]byte, total)
-	for i := range block {
-		block[i] = make([]byte, blockSize)
-	}
 
 	streams := make([]*shardStream, total)
 	for i := range total {
@@ -273,14 +274,14 @@ func streamShards(
 	for offset := int64(0); offset < shardSize; offset += blockSize {
 		n := min(blockSize, shardSize-offset)
 		for i := range cfg.DataShards {
-			stripe[i] = block[i][:n]
+			stripe[i] = blocks.at(i)[:n]
 			if _, readErr := io.ReadFull(padded, stripe[i]); readErr != nil {
 				closeStreams(streams)
 				return result, fmt.Errorf("read object body: %w", readErr)
 			}
 		}
 		for i := cfg.DataShards; i < total; i++ {
-			stripe[i] = block[i][:n]
+			stripe[i] = blocks.at(i)[:n]
 		}
 		if encErr := enc.Encode(stripe); encErr != nil {
 			closeStreams(streams)
