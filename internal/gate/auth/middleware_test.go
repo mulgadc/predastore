@@ -80,6 +80,7 @@ func sessionGate(t *testing.T, p auth.CredentialProvider) http.Handler {
 	cert, key, _ := testcerts.Generate(t)
 	s, err := gate.New(gate.Config{
 		Region: sessionRegion,
+		NodeID: 1,
 		Buckets: []handlers.BucketConfig{{
 			Name: "session-bucket", Region: sessionRegion,
 			Public: false, AccountID: auth.TestSessionAccount,

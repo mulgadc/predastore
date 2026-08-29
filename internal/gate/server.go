@@ -96,6 +96,15 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	handlerCfg := cfg.handlerConfig()
+
+	// One minter per gate process. Building it here rather than in
+	// handlerConfig matters: that method is also called to look a bucket up,
+	// and a second minter for the same node would reissue the same epochs.
+	minter, err := handlers.NewEpochMinter(cfg.NodeID)
+	if err != nil {
+		return nil, err
+	}
+	handlerCfg.Epochs = minter
 	s := &Server{
 		cfg:        cfg,
 		cert:       cert,

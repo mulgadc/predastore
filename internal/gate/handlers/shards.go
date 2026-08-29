@@ -2,8 +2,6 @@ package handlers
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -26,9 +24,15 @@ import (
 // would derive today: the read path dials these, so they are what survives a
 // ring whose tuning changed under them.
 type ObjectToShardNodes struct {
-	Size             int64
-	WriteEpoch       uint64
-	BlockSize        int64
+	Size       int64
+	WriteEpoch uint64
+	BlockSize  int64
+
+	// Timestamped reports whether WriteEpoch carries a time. Version 1 records
+	// hold a random epoch instead, so they have no modification time and never
+	// will.
+	Timestamped bool
+
 	DataShardNodes   []config.NodeID
 	ParityShardNodes []config.NodeID
 }
@@ -40,22 +44,6 @@ func (p ObjectToShardNodes) AllNodes() []config.NodeID {
 	nodes = append(nodes, p.DataShardNodes...)
 
 	return append(nodes, p.ParityShardNodes...)
-}
-
-// mintEpoch draws a write epoch. It is compared only for equality, so it needs
-// uniqueness and nothing else: no ordering, no clock, no counter. Zero is
-// reserved as "invalid", which removes the ambiguity between an absent epoch
-// and a draw that happened to come back zero.
-func mintEpoch() (uint64, error) {
-	var b [8]byte
-	for {
-		if _, err := rand.Read(b[:]); err != nil {
-			return 0, fmt.Errorf("draw write epoch: %w", err)
-		}
-		if e := binary.BigEndian.Uint64(b[:]); e != 0 {
-			return e, nil
-		}
-	}
 }
 
 // shardWriteOutcome captures the result of writing a shard to a blob node.
@@ -140,7 +128,7 @@ func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int
 		return ObjectToShardNodes{}, err
 	}
 
-	epoch, err := mintEpoch()
+	epoch, err := cfg.Epochs.Next()
 	if err != nil {
 		return ObjectToShardNodes{}, err
 	}
@@ -148,6 +136,7 @@ func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int
 	return ObjectToShardNodes{
 		Size:             size,
 		WriteEpoch:       epoch,
+		Timestamped:      true,
 		BlockSize:        writeLayout(cfg.DataShards, size).blockSize,
 		DataShardNodes:   append([]config.NodeID(nil), nodes[:cfg.DataShards]...),
 		ParityShardNodes: append([]config.NodeID(nil), nodes[cfg.DataShards:]...),

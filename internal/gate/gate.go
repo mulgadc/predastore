@@ -75,6 +75,10 @@ type RepairConfig struct {
 type Config struct {
 	Region string
 
+	// NodeID is this gate's own node id. It goes into every write epoch, which
+	// is what keeps two gates minting in the same millisecond apart.
+	NodeID config.NodeID
+
 	RS RS
 
 	// Buckets are the config-defined buckets.

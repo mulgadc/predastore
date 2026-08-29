@@ -274,7 +274,10 @@ func newWriteFixture(data, parity int) writeFixture {
 		mc:   newFakeMeta(),
 		bc:   newFakeBlob(),
 		ring: placement.NewRing(nodes),
-		cfg:  Config{Region: "ap-southeast-2", DataShards: data, ParityShards: parity},
+		cfg: Config{
+			Region: "ap-southeast-2", DataShards: data, ParityShards: parity,
+			Epochs: mustEpochs(1),
+		},
 	}
 }
 

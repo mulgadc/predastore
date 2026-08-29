@@ -121,6 +121,10 @@ func newTestGate(t *testing.T, cfg Config) *Server {
 	if cfg.Blob == nil {
 		cfg.Blob = fakeBlob{}
 	}
+	// Every gate needs an id: it goes into the write epoch, and zero is not one.
+	if cfg.NodeID == 0 {
+		cfg.NodeID = 1
+	}
 	s, err := New(cfg)
 	require.NoError(t, err)
 	return s

@@ -15,6 +15,7 @@ func wired(t *testing.T) Config {
 	cert, key, _ := testcerts.Generate(t)
 	return Config{
 		Region:  "ap-southeast-2",
+		NodeID:  1,
 		TLSCert: cert,
 		TLSKey:  key,
 		Meta:    newFakeMeta(t),

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/mulgadc/predastore/internal/config"
 )
@@ -254,5 +255,49 @@ func TestAVersionOneRecordDecodesWithNoBlockSize(t *testing.T) {
 	}
 	if want := []config.NodeID{3}; !slices.Equal(decoded.ParityShardNodes, want) {
 		t.Errorf("parity shard nodes = %v, want %v", decoded.ParityShardNodes, want)
+	}
+}
+
+// A version 1 epoch is eight random bytes. Reading one as a time gives a date
+// hundreds of millions of years out, so the record has to say it cannot say.
+func TestOnlyAVersion2RecordReportsAModificationTime(t *testing.T) {
+	v1 := []byte{placementMagic, 0x01, 1}
+	v1 = binary.BigEndian.AppendUint64(v1, 4096)
+	v1 = binary.BigEndian.AppendUint64(v1, 0x1112131415161718)
+	v1 = append(v1, 6)
+
+	old, err := DecodePlacement(v1)
+	if err != nil {
+		t.Fatalf("DecodePlacement(version 1) error = %v", err)
+	}
+	if at, ok := old.ModifiedAt(); ok {
+		t.Errorf("version 1 record reported a modification time of %s", at)
+	}
+
+	minter := mustEpochs(3)
+	at := time.UnixMilli(1_800_000_000_123)
+	frozen(minter, at)
+	epoch, err := minter.Next()
+	if err != nil {
+		t.Fatalf("Next() error = %v", err)
+	}
+
+	encoded, err := EncodePlacement(ObjectToShardNodes{
+		Size: 4096, WriteEpoch: epoch, BlockSize: 4096,
+		DataShardNodes: []config.NodeID{6}, ParityShardNodes: []config.NodeID{3},
+	})
+	if err != nil {
+		t.Fatalf("EncodePlacement() error = %v", err)
+	}
+	fresh, err := DecodePlacement(encoded)
+	if err != nil {
+		t.Fatalf("DecodePlacement() error = %v", err)
+	}
+	got, ok := fresh.ModifiedAt()
+	if !ok {
+		t.Fatal("version 2 record reported no modification time")
+	}
+	if !got.Equal(at) {
+		t.Errorf("modification time = %s, want %s", got, at.UTC())
 	}
 }

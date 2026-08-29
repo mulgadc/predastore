@@ -190,6 +190,7 @@ func gateConfig(
 ) gate.Config {
 	return gate.Config{
 		Region: c.Region,
+		NodeID: n.ID,
 		RS: gate.RS{
 			Data: c.RS.Data, Parity: c.RS.Parity,
 			DegradedWrites: c.RS.DegradedWrites, HintedHandoff: c.RS.HintedHandoff,

@@ -33,6 +33,11 @@ type Config struct {
 	// Buckets are the config-defined buckets: static, known at startup, and
 	// never removed.
 	Buckets []BucketConfig
+
+	// Epochs mints the write epoch every object write needs. There is exactly
+	// one per gate process, built in server.New: a second minter for the same
+	// node would issue the same values.
+	Epochs *EpochMinter
 }
 
 // TotalShards is the number of nodes an object is spread across.

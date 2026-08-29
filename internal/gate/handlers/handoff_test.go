@@ -173,6 +173,7 @@ func newHandoffFixture(data, parity, spare int, down ...config.NodeID) handoffFi
 			cfg: Config{
 				Region: "ap-southeast-2", DataShards: data, ParityShards: parity,
 				DegradedWrites: true, HintedHandoff: true,
+				Epochs: mustEpochs(1),
 			},
 		},
 		bc:    bc,

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/mulgadc/predastore/internal/config"
 )
@@ -15,7 +16,7 @@ import (
 //	1    1     format version
 //	2    1     k, the data shard count; m is len(nodes) - k
 //	3    8     object size, uint64 big-endian
-//	11   8     write epoch, uint64 big-endian
+//	11   8     write epoch, uint64 big-endian (version 2 carries a timestamp)
 //	19   8     block size, uint64 big-endian (version 2 only)
 //	var  var   k+m node ids as uvarints, data shards first then parity
 //
@@ -23,7 +24,9 @@ import (
 // with every value. This spends 27 plus one byte per node id.
 //
 // Version 1 has no block size and its objects are laid out with each shard
-// contiguous, which is what the gate wrote before it could stream a write.
+// contiguous, which is what the gate wrote before it could stream a write. Its
+// write epoch is random rather than a timestamp, so objects written under it
+// have no modification time to report.
 const (
 	placementMagic       = 0x00
 	placementVersion     = 0x02
@@ -101,6 +104,11 @@ func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
 	p := ObjectToShardNodes{
 		Size:       int64(binary.BigEndian.Uint64(b[3:11])), //nolint:gosec // round-trips bit-for-bit from encode.
 		WriteEpoch: binary.BigEndian.Uint64(b[11:19]),
+
+		// A version 1 epoch is eight random bytes, so reading it as a time
+		// gives a date hundreds of millions of years out. Only version 2
+		// carries one.
+		Timestamped: b[1] == placementVersion,
 	}
 	if fixed == placementFixedSize {
 		p.BlockSize = int64(binary.BigEndian.Uint64(b[19:27])) //nolint:gosec // round-trips bit-for-bit from encode.
@@ -125,4 +133,14 @@ func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
 	p.DataShardNodes = ids[:k:k]
 	p.ParityShardNodes = ids[k:len(ids):len(ids)]
 	return p, nil
+}
+
+// ModifiedAt reports when the object was written, and whether the record can
+// say. This is the object's S3 LastModified on every surface that serves one.
+func (p ObjectToShardNodes) ModifiedAt() (time.Time, bool) {
+	if !p.Timestamped {
+		return time.Time{}, false
+	}
+
+	return EpochTime(p.WriteEpoch), true
 }
