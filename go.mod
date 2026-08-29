@@ -8,6 +8,7 @@ require (
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dgraph-io/badger/v4 v4.9.6
 	github.com/go-chi/chi/v5 v5.3.1
+	github.com/google/pprof v0.0.0-20260825171938-4d453200e7d9
 	github.com/hashicorp/raft v1.7.3
 	github.com/hashicorp/raft-boltdb/v2 v2.3.1
 	github.com/klauspost/reedsolomon v1.14.2

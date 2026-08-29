@@ -18,6 +18,7 @@ import (
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/bluebottle/pkg/otelsetup"
 	"github.com/mulgadc/predastore"
+	"github.com/mulgadc/predastore/internal/profiling"
 
 	_ "github.com/mulgadc/bluebottle/pkg/fipsboot"
 )
@@ -56,6 +57,19 @@ func run() error {
 	// node services and the S3 gate together.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Before anything else that allocates, and refusing to start rather than
+	// running unprofiled: a run that reports success having produced no
+	// profiles is worse than one that does not start.
+	profCfg, err := profiling.FromEnv()
+	if err != nil {
+		return err
+	}
+	prof, err := profiling.Start(profCfg, *hostID)
+	if err != nil {
+		return err
+	}
+	defer prof.Stop()
 
 	// Telemetry is best-effort: a failed init never blocks the S3 server.
 	otelShutdown, err := otelsetup.Init(ctx, "predastore")
