@@ -138,7 +138,7 @@ func TestParityIsOpenedAtTheOffsetTheReadReached(t *testing.T) {
 		dying: map[config.NodeID]int64{place.DataShardNodes[0]: streamBlockSize}}
 	watched := &openWatcher{BlobClient: dying}
 
-	got, degraded, err := readObject(ctx, watched, f.cfg, "b", "k", place, size, 0)
+	got, degraded, err := readObject(ctx, watched, f.cfg, "b", "k", place, size, 0, frozenClock())
 	require.NoError(t, err)
 	assert.Equal(t, body, got)
 	assert.Positive(t, degraded, "the dying shard should have been rebuilt")
@@ -157,18 +157,42 @@ func TestParityIsOpenedAtTheOffsetTheReadReached(t *testing.T) {
 	assert.Equal(t, 1, parityOpens, "parity should be opened once and then followed")
 }
 
-// uniformlySlowBlob delays every node equally, which is a slow cluster rather
-// than a straggler.
+// uniformlySlowBlob holds every open until all of them have arrived, then bills
+// the whole cluster one delay and releases them together. That is what uniform
+// slowness is: a wait every node spends at the same time, not one after another.
 type uniformlySlowBlob struct {
 	*fakeBlob
 
+	clk   *testClock
 	delay time.Duration
-	gets  atomic.Int64
+	want  int
+
+	mu      sync.Mutex
+	arrived int
+	release chan struct{}
+	gets    atomic.Int64
+}
+
+func newUniformlySlowBlob(inner *fakeBlob, clk *testClock, want int, delay time.Duration) *uniformlySlowBlob {
+	return &uniformlySlowBlob{
+		fakeBlob: inner, clk: clk, delay: delay, want: want, release: make(chan struct{}),
+	}
 }
 
 func (b *uniformlySlowBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
 	b.gets.Add(1)
-	time.Sleep(b.delay)
+	b.mu.Lock()
+	b.arrived++
+	last := b.arrived == b.want
+	b.mu.Unlock()
+	if last {
+		b.clk.Advance(b.delay)
+		close(b.release)
+	}
+	select {
+	case <-b.release:
+	case <-time.After(pacerWait):
+	}
 
 	return b.fakeBlob.Get(ctx, node, req)
 }
@@ -190,8 +214,11 @@ func TestAUniformlySlowClusterIsWaitedOutRatherThanAbandoned(t *testing.T) {
 	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), int64(len(want)))
 	require.NoError(t, err)
 
-	slow := &uniformlySlowBlob{fakeBlob: f.bc, delay: 2 * hedgeDelay}
-	got, degraded, err := readObject(ctx, slow, f.cfg, "b", "k", place, place.Size, 0)
+	// Two hedge delays are spent before any shard answers, so a hedge armed at
+	// the request rather than at the first answer would have fired on all of them.
+	clk := newTestClock()
+	slow := newUniformlySlowBlob(f.bc, clk, f.cfg.DataShards, 2*hedgeDelay)
+	got, degraded, err := readObject(ctx, slow, f.cfg, "b", "k", place, place.Size, 0, withClock(clk))
 
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
@@ -220,7 +247,7 @@ func TestAReadThatCannotAssembleFails(t *testing.T) {
 		place.ParityShardNodes[0]: 0,
 	}}
 
-	_, _, err = readObject(ctx, dying, f.cfg, "b", "k", place, place.Size, 0)
+	_, _, err = readObject(ctx, dying, f.cfg, "b", "k", place, place.Size, 0, frozenClock())
 	require.Error(t, err, "an object that cannot be assembled must not come back short")
 }
 
@@ -231,7 +258,8 @@ func TestTheWorkingSetIsAFixedNumberOfBlocks(t *testing.T) {
 	t.Parallel()
 
 	f := newWriteFixture(2, 1)
-	for _, size := range []int64{1 << 16, 3*streamBlockSize + 11, 9 * streamBlockSize} {
+	sizes := []int64{1 << 16, 1 << 20, 3*streamBlockSize + 11, 9 * streamBlockSize}
+	for _, size := range sizes {
 		t.Run(fmt.Sprintf("size-%d", size), func(t *testing.T) {
 			t.Parallel()
 			ctx := context.Background()
@@ -249,28 +277,189 @@ func TestTheWorkingSetIsAFixedNumberOfBlocks(t *testing.T) {
 					resident += int64(cap(*b))
 				}
 			}
-			assert.LessOrEqualf(t, resident, int64(f.cfg.TotalShards())*streamBlockSize,
-				"a %d byte object holds %d bytes resident", size, resident)
 
-			// Tighter than the bound above, and the reason for it: a healthy
-			// read opens k shards, so it must not be holding a parity block.
-			assert.LessOrEqualf(t, resident, int64(f.cfg.DataShards)*streamBlockSize,
-				"a healthy %d byte read took a parity block it never opened", size)
+			// Exactly a block per data shard, and the block is the object's own,
+			// not the pooled one. A read that took a pooled buffer for a small
+			// object would hold 4 MiB a shard for a few KiB of data, which is how
+			// a hundred concurrent small GETs come to hold a gigabyte.
+			want := int64(f.cfg.DataShards) * r.lay.blockSize
+			assert.Equalf(t, want, resident,
+				"a %d byte object with a %d byte block holds %d bytes resident",
+				size, r.lay.blockSize, resident)
 		})
 	}
 }
 
-// pacedReader delivers a shard in chunks with a gap between them, and can be
-// told to stop delivering entirely. Closing it unblocks a read waiting on the
-// gap, which is what abandoning the shard has to be able to do.
+// The pool is what makes a small object dangerous: a buffer sized for the
+// largest block, taken per shard per request, held for the life of the request.
+// Concurrency multiplies it, so the bound has to hold across requests too.
+func TestConcurrentSmallReadsDoNotHoldPooledBlocks(t *testing.T) {
+	t.Parallel()
+
+	const readers = 64
+	f := newWriteFixture(2, 1)
+	ctx := context.Background()
+
+	for _, size := range []int64{64 << 10, 1 << 20} {
+		t.Run(fmt.Sprintf("size-%d", size), func(t *testing.T) {
+			t.Parallel()
+			objectHash := model.ObjectHash("c", strconv.FormatInt(size, 10))
+			place, _, err := f.write(ctx, objectHash, bytes.NewReader(randomBytes(t, int(size))), size)
+			require.NoError(t, err)
+
+			open := make([]*stripeReader, readers)
+			for i := range open {
+				r, rErr := newStripeReader(ctx, f.bc, f.cfg, objectHash, place, 0)
+				require.NoError(t, rErr)
+				defer r.close(ctx)
+				open[i] = r
+			}
+
+			var resident int64
+			for _, r := range open {
+				for _, b := range r.blocks.held {
+					if b != nil {
+						resident += int64(cap(*b))
+					}
+				}
+			}
+			want := int64(readers*f.cfg.DataShards) * open[0].lay.blockSize
+			assert.Equalf(t, want, resident,
+				"%d concurrent %d byte reads hold %d bytes, not %d",
+				readers, size, resident, want)
+		})
+	}
+}
+
+// holdingBlob answers one node and holds the others open, so a test can cancel
+// a read while it is still gathering its shards.
+type holdingBlob struct {
+	*fakeBlob
+
+	answer config.NodeID
+	opened chan struct{}
+	block  chan struct{}
+	closes atomic.Int64
+}
+
+func (b *holdingBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
+	// Held nodes ignore cancellation deliberately: if they gave up when the
+	// context did, the constructor could collect every open and return a reader
+	// before it noticed, and the path under test would not be taken.
+	if node != b.answer {
+		<-b.block
+
+		return nil, errors.New("node never answered")
+	}
+	rc, err := b.fakeBlob.Get(ctx, node, req)
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case b.opened <- struct{}{}:
+	default:
+	}
+
+	return &countingCloser{ReadCloser: rc, closes: &b.closes}, nil
+}
+
+var _ BlobClient = (*holdingBlob)(nil)
+
+type countingCloser struct {
+	io.ReadCloser
+
+	closes *atomic.Int64
+}
+
+func (c *countingCloser) Close() error {
+	c.closes.Add(1)
+
+	return c.ReadCloser.Close()
+}
+
+// A read cancelled while it is still opening owns streams nobody else will ever
+// see. They have to be closed on the way out, or a client that walked away
+// leaves a shard stream open on a node for as long as the node tolerates it.
+func TestAnOpenCancelledMidFlightClosesWhatItOpened(t *testing.T) {
+	t.Parallel()
+
+	f := newWriteFixture(3, 2)
+	want := randomBytes(t, 1<<16)
+
+	ctx := context.Background()
+	objectHash := model.ObjectHash("b", "k")
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), int64(len(want)))
+	require.NoError(t, err)
+
+	held := &holdingBlob{
+		fakeBlob: f.bc, answer: place.DataShardNodes[0],
+		opened: make(chan struct{}, 1), block: make(chan struct{}),
+	}
+
+	// The clock never moves, so the straggler timer cannot fire and let the
+	// construction succeed: cancellation is the only way this read ends.
+	rctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-held.opened
+		cancel()
+	}()
+
+	_, err = newStripeReader(rctx, held, f.cfg, objectHash, place, 0, withClock(newTestClock()))
+	require.ErrorIs(t, err, context.Canceled)
+	close(held.block)
+
+	assert.Eventually(t, func() bool { return held.closes.Load() == 1 }, time.Second, time.Millisecond,
+		"the one stream that opened was left behind by the cancelled read")
+}
+
+// The other half of giving up: the working set goes back to the pool rather
+// than waiting on a collection, and nothing is left pointing at it.
+func TestAbandoningAReaderGivesBackItsWorkingSet(t *testing.T) {
+	t.Parallel()
+
+	f := newWriteFixture(2, 1)
+	want := randomBytes(t, 1<<16)
+
+	ctx := context.Background()
+	objectHash := model.ObjectHash("b", "k")
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), int64(len(want)))
+	require.NoError(t, err)
+
+	r, err := newStripeReader(ctx, f.bc, f.cfg, objectHash, place, 0)
+	require.NoError(t, err)
+	require.NotNil(t, r.blocks.held[0], "the data blocks are taken up front")
+
+	r.abandon(0, make(chan openResult))
+
+	for i, b := range r.blocks.held {
+		assert.Nilf(t, b, "block %d was still held after abandoning the reader", i)
+	}
+	for i, rc := range r.src {
+		assert.Nilf(t, rc, "stream %d was still open after abandoning the reader", i)
+	}
+}
+
+// pacedReader delivers a shard in chunks against the virtual clock, and can be
+// told to stop delivering entirely. Each chunk costs gap, so the shard's
+// slowness is stated by the test; closing it unblocks a read waiting on a gap,
+// which is what abandoning the shard has to be able to do.
 type pacedReader struct {
 	io.Reader
 
-	gap    time.Duration
-	after  int64 // bytes delivered before it stops entirely; -1 for never
+	pacer *shardPacer
+	index int
+	gap   time.Duration
+	after int64 // bytes delivered before it stops entirely; -1 for never
+
+	// budget caps the virtual time this shard may run the clock forward once it
+	// has stopped, so the move that convicts it can never reach a peer.
+	budget time.Duration
+
 	sent   int64
 	closed chan struct{}
 	once   sync.Once
+	stalls sync.Once
 }
 
 func (r *pacedReader) Read(p []byte) (int, error) {
@@ -278,6 +467,7 @@ func (r *pacedReader) Read(p []byte) (int, error) {
 		p = p[:pacedChunk]
 	}
 	if r.after >= 0 && r.sent >= r.after {
+		r.stalls.Do(r.runOutTheClock)
 		<-r.closed
 
 		return 0, errors.New("shard stopped delivering")
@@ -285,12 +475,32 @@ func (r *pacedReader) Read(p []byte) (int, error) {
 	select {
 	case <-r.closed:
 		return 0, errors.New("shard closed")
-	case <-time.After(r.gap):
+	default:
 	}
+	r.pacer.awaitPeersFed(r.index)
+	r.pacer.clk.Advance(r.gap)
 	n, err := r.Reader.Read(p)
 	r.sent += int64(n)
 
 	return n, err
+}
+
+// runOutTheClock moves time forward while this shard delivers nothing, so the
+// stripe loop's probe fires and judges it. Each step waits for every peer to be
+// between blocks, so the only shard a step can convict is this one.
+func (r *pacedReader) runOutTheClock() {
+	go func() {
+		for spent := time.Duration(0); spent < r.budget; spent += hedgeProbeInterval {
+			select {
+			case <-r.closed:
+				return
+			default:
+			}
+			r.pacer.awaitPeersIdle(r.index)
+			r.pacer.clk.Advance(hedgeProbeInterval)
+			time.Sleep(time.Millisecond)
+		}
+	}()
 }
 
 func (r *pacedReader) Close() error {
@@ -301,13 +511,16 @@ func (r *pacedReader) Close() error {
 
 const pacedChunk = 64 << 10
 
-// pacingBlob paces one node's shard.
+// pacingBlob paces one node's shard. Every other node answers at once, so the
+// only thing that moves the clock is the shard the test is about.
 type pacingBlob struct {
 	*fakeBlob
 
-	slow  config.NodeID
-	gap   time.Duration
-	after int64
+	pacer  *shardPacer
+	slow   config.NodeID
+	gap    time.Duration
+	after  int64
+	budget time.Duration
 }
 
 func (b *pacingBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
@@ -316,7 +529,10 @@ func (b *pacingBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRe
 		return rc, err
 	}
 
-	return &pacedReader{Reader: rc, gap: b.gap, after: b.after, closed: make(chan struct{})}, nil
+	return &pacedReader{
+		Reader: rc, pacer: b.pacer, index: int(req.Index),
+		gap: b.gap, after: b.after, budget: b.budget, closed: make(chan struct{}),
+	}, nil
 }
 
 var _ BlobClient = (*pacingBlob)(nil)
@@ -339,12 +555,17 @@ func TestASlowButProgressingShardIsNotHedged(t *testing.T) {
 
 	// A 4 MiB block in 64 KiB chunks 5 ms apart takes 320 ms, comfortably past
 	// hedgeDelay, while never going idle for more than 5 ms.
-	paced := &pacingBlob{fakeBlob: f.bc, slow: place.DataShardNodes[1], gap: 5 * time.Millisecond, after: -1}
+	pacer := newShardPacer()
+	paced := &pacingBlob{
+		fakeBlob: f.bc, pacer: pacer, slow: place.DataShardNodes[1],
+		gap: 5 * time.Millisecond, after: -1,
+	}
 	watched := &openWatcher{BlobClient: paced}
 
-	start := time.Now()
-	got, degraded, err := readObject(ctx, watched, f.cfg, "b", "k", place, size, 0)
-	elapsed := time.Since(start)
+	start := pacer.clk.Now()
+	got, degraded, err := readObject(ctx, watched, f.cfg, "b", "k", place, size, 0,
+		withClock(pacer.clk), pacer.bind())
+	elapsed := pacer.clk.Now().Sub(start)
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 	require.Greater(t, elapsed, hedgeDelay,
@@ -371,14 +592,22 @@ func TestAShardThatDeliversNothingIsHedged(t *testing.T) {
 	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), size)
 	require.NoError(t, err)
 
-	silent := &pacingBlob{fakeBlob: f.bc, slow: place.DataShardNodes[1], after: 0}
+	// The budget is the whole point of the case: it is under the stall window,
+	// so the read can only finish if the silent shard was convicted on the
+	// first-byte budget instead.
+	pacer := newShardPacer()
+	silent := &pacingBlob{
+		fakeBlob: f.bc, pacer: pacer, slow: place.DataShardNodes[1],
+		after: 0, budget: shardStallWindow - hedgeProbeInterval,
+	}
 
-	start := time.Now()
-	got, degraded, err := readObject(ctx, silent, f.cfg, "b", "k", place, size, 0)
+	start := pacer.clk.Now()
+	got, degraded, err := readObject(ctx, silent, f.cfg, "b", "k", place, size, 0,
+		withClock(pacer.clk), pacer.bind())
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 	assert.Positive(t, degraded, "a silent shard should have been replaced by parity")
-	assert.Less(t, time.Since(start), shardStallWindow,
+	assert.Less(t, pacer.clk.Now().Sub(start), shardStallWindow,
 		"a silent shard was waited on for the stall window rather than the first-byte budget")
 }
 
@@ -397,9 +626,16 @@ func TestAShardThatStopsMidBlockIsHedged(t *testing.T) {
 	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), size)
 	require.NoError(t, err)
 
-	stalling := &pacingBlob{fakeBlob: f.bc, slow: place.DataShardNodes[1], after: pacedChunk}
+	// This one has delivered, so only the stall window can convict it and the
+	// budget has to clear that.
+	pacer := newShardPacer()
+	stalling := &pacingBlob{
+		fakeBlob: f.bc, pacer: pacer, slow: place.DataShardNodes[1],
+		after: pacedChunk, budget: shardStallWindow + 4*hedgeProbeInterval,
+	}
 
-	got, degraded, err := readObject(ctx, stalling, f.cfg, "b", "k", place, size, 0)
+	got, degraded, err := readObject(ctx, stalling, f.cfg, "b", "k", place, size, 0,
+		withClock(pacer.clk), pacer.bind())
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 	assert.Positive(t, degraded, "a shard that stopped delivering should have been replaced")

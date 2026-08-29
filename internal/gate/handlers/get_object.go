@@ -183,7 +183,7 @@ func parseRangeHeader(header string) (start, end int64) {
 // with a buffer on the end of it, kept for the callers that genuinely need the
 // bytes in hand -- a multipart part being written into a pipe -- so there is
 // one read path rather than two that can disagree about a layout.
-func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64, handoff config.NodeID) ([]byte, int, error) {
+func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64, handoff config.NodeID, opts ...stripeOption) ([]byte, int, error) {
 	// An empty object has no shards to read: the write path stores none, since
 	// the blob protocol has no zero-length value to store.
 	if size == 0 {
@@ -191,7 +191,7 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	}
 
 	start := time.Now()
-	reader, err := newStripeReader(ctx, bc, cfg, model.ObjectHash(bucket, key), place, handoff)
+	reader, err := newStripeReader(ctx, bc, cfg, model.ObjectHash(bucket, key), place, handoff, opts...)
 	if err != nil {
 		return nil, 0, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}

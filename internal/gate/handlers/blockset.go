@@ -34,17 +34,18 @@ func newBlockSet(total int, size int64) *blockSet {
 
 // at returns shard i's block, taking one the first time it is asked for.
 //
-// An object recorded with a block larger than the pooled buffer comes from the
-// heap instead. That is the pre-streaming layout, where the block is the whole
-// shard and could be any size; pooling those would keep one arbitrarily large
-// buffer alive for every size ever seen.
+// Only a block of exactly the pooled size is pooled. A larger one is the
+// pre-streaming layout, where the block is the whole shard and pooling it would
+// keep an arbitrarily large buffer alive for every size ever seen. A smaller
+// one is a small object, and handing it a 4 MiB buffer for a 32 KiB shard is
+// how a hundred concurrent small GETs come to hold a gigabyte.
 func (s *blockSet) at(i int) []byte {
 	if s.held[i] == nil {
-		if s.size > streamBlockSize {
+		if s.size == streamBlockSize {
+			s.held[i], _ = blockPool.Get().(*[]byte)
+		} else {
 			b := make([]byte, s.size)
 			s.held[i] = &b
-		} else {
-			s.held[i], _ = blockPool.Get().(*[]byte)
 		}
 	}
 
@@ -63,8 +64,8 @@ func (s *blockSet) spare(i int) []byte {
 	return (*s.held[i])[:0]
 }
 
-// release returns the pooled buffers. Oversized blocks are dropped rather than
-// pooled, for the reason at is careful about them.
+// release returns the pooled buffers. Blocks of any other size are dropped
+// rather than pooled, for the reason at is careful about them.
 func (s *blockSet) release() {
 	for i, b := range s.held {
 		if b != nil && len(*b) == streamBlockSize {

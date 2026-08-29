@@ -40,6 +40,7 @@ type stripeReader struct {
 	stripe [][]byte  // per-stripe view, zero length where a shard is missing
 	src    []io.ReadCloser
 	dead   []bool
+	clk    clock
 
 	// reading counts the block reads that may still be writing into the working
 	// set. The buffers are pooled, so they go back only when it is zero: a read
@@ -53,9 +54,19 @@ type stripeReader struct {
 	reconstructed int
 }
 
+// stripeOption adjusts a reader at construction. It exists for the time source:
+// the hedge policy is the one part of the read whose correctness is a statement
+// about clocks, so it has to be testable without one.
+type stripeOption func(*stripeReader)
+
+func withClock(c clock) stripeOption {
+	return func(r *stripeReader) { r.clk = c }
+}
+
 func newStripeReader(
 	ctx context.Context, bc BlobClient, cfg Config,
 	objectHash [32]byte, place ObjectToShardNodes, handoff config.NodeID,
+	opts ...stripeOption,
 ) (*stripeReader, error) {
 	enc, err := reedsolomon.New(cfg.DataShards, cfg.ParityShards)
 	if err != nil {
@@ -72,9 +83,13 @@ func newStripeReader(
 		src:      make([]io.ReadCloser, total),
 		dead:     make([]bool, total),
 		progress: make([]*shardProgress, total),
+		clk:      wallClock{},
 	}
 	for i := range total {
 		r.progress[i] = &shardProgress{}
+	}
+	for _, opt := range opts {
+		opt(r)
 	}
 	// Only the data blocks are taken up front. They are needed whether or not
 	// their shard answers, because a lost one is reconstructed back into its own
@@ -103,8 +118,8 @@ func newStripeReader(
 	// straggler is only a straggler next to a peer that has already landed;
 	// started at the request, the same delay would abandon every shard of a
 	// uniformly slow cluster and fail a read that was merely going to be slow.
-	var hedge *time.Timer
 	var straggling <-chan time.Time
+	hedging := false
 	opened := make([]bool, cfg.DataShards)
 	waiting := cfg.DataShards
 	for waiting > 0 {
@@ -118,10 +133,11 @@ func newStripeReader(
 				continue
 			}
 			r.src[res.index] = res.rc
-			if hedge == nil {
-				hedge = time.NewTimer(hedgeDelay)
-				straggling = hedge.C
-				defer hedge.Stop()
+			if !hedging {
+				hedging = true
+				var stop func()
+				straggling, stop = r.clk.NewTimer(hedgeDelay)
+				defer stop()
 			}
 		case <-straggling:
 			straggling = nil
@@ -131,6 +147,8 @@ func newStripeReader(
 				waiting = 0
 			}
 		case <-ctx.Done():
+			r.abandon(waiting, opens)
+
 			return nil, ctx.Err()
 		}
 	}
@@ -143,16 +161,39 @@ func newStripeReader(
 				r.fail(ctx, i, nodes[i], errShardTooSlow, hedgeDelay)
 			}
 		}
-		go func() {
-			for range late {
-				if res := <-opens; res.rc != nil {
-					_ = res.rc.Close()
-				}
-			}
-		}()
+		drainOpens(late, opens)
 	}
 
 	return r, nil
+}
+
+// abandon gives up a reader that will never be returned: the streams that did
+// open are closed, the ones still opening are drained, and the working set goes
+// back to the pool rather than waiting on a collection.
+func (r *stripeReader) abandon(late int, opens <-chan openResult) {
+	for i, rc := range r.src {
+		if rc != nil {
+			_ = rc.Close()
+			r.src[i] = nil
+		}
+	}
+	drainOpens(late, opens)
+	r.blocks.release()
+}
+
+// drainOpens closes the streams from opens that nobody is waiting for. It runs
+// in its own goroutine because those opens are what the caller gave up on.
+func drainOpens(late int, opens <-chan openResult) {
+	if late <= 0 {
+		return
+	}
+	go func() {
+		for range late {
+			if res := <-opens; res.rc != nil {
+				_ = res.rc.Close()
+			}
+		}
+	}()
 }
 
 // openResult is one shard's stream, or the reason there is not one.
@@ -318,8 +359,8 @@ func (r *stripeReader) next(ctx context.Context) ([][]byte, int64, error) {
 	// stripe that is slow everywhere is waited out rather than abandoned. It
 	// then samples liveness repeatedly rather than firing once, because a shard
 	// that is still delivering may stop at any point in the block.
-	var probe *time.Ticker
 	var probing <-chan time.Time
+	probed := false
 
 	for pending > 0 {
 		select {
@@ -334,10 +375,11 @@ func (r *stripeReader) next(ctx context.Context) ([][]byte, int64, error) {
 			}
 			r.stripe[res.index] = r.blocks.at(res.index)[:n]
 			have++
-			if probe == nil {
-				probe = time.NewTicker(hedgeProbeInterval)
-				probing = probe.C
-				defer probe.Stop()
+			if !probed {
+				probed = true
+				var stop func()
+				probing, stop = r.clk.NewTicker(hedgeProbeInterval)
+				defer stop()
 			}
 		case at := <-probing:
 			// Closing the stream unblocks its read, so an abandoned shard arrives
@@ -390,10 +432,10 @@ func (r *stripeReader) next(ctx context.Context) ([][]byte, int64, error) {
 // captured before the goroutine starts, so abandoning the shard closes a reader
 // this call already holds rather than racing a nil.
 func (r *stripeReader) readBlock(ctx context.Context, index int, n int64, out chan<- blockResult) {
-	start := time.Now()
+	start := r.clk.Now()
 	p := r.progress[index]
 	p.begin(start)
-	src := &trackedReader{Reader: r.src[index], p: p}
+	src := &trackedReader{Reader: r.src[index], p: p, clk: r.clk}
 	buf := r.blocks.at(index)[:n]
 	r.reading.Add(1)
 	go func() {
@@ -403,7 +445,7 @@ func (r *stripeReader) readBlock(ctx context.Context, index int, n int64, out ch
 		r.reading.Add(-1)
 		p.finish()
 		select {
-		case out <- blockResult{index: index, err: err, took: time.Since(start)}:
+		case out <- blockResult{index: index, err: err, took: r.clk.Now().Sub(start)}:
 		case <-ctx.Done():
 		}
 	}()
@@ -643,13 +685,14 @@ func (p *shardProgress) verdict(at time.Time) (reason string, since time.Duratio
 type trackedReader struct {
 	io.Reader
 
-	p *shardProgress
+	p   *shardProgress
+	clk clock
 }
 
 func (t *trackedReader) Read(p []byte) (int, error) {
 	n, err := t.Reader.Read(p)
 	if n > 0 {
-		t.p.advance(int64(n), time.Now())
+		t.p.advance(int64(n), t.clk.Now())
 	}
 
 	return n, err
