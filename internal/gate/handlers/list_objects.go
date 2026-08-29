@@ -84,20 +84,22 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 				}
 			}
 
-			// The listing row holds the object hash; the size lives with the shard
-			// placement it keys.
+			// The listing row holds the object hash; the size and the write time
+			// live with the shard placement it keys.
 			var objectSize int64
+			var modified time.Time
 			if len(item.Value) == 32 {
 				if meta, err := metaGet(ctx, mc, model.TableObjects, string(item.Value)); err == nil && len(meta) > 0 {
 					if placement, err := DecodePlacement(meta); err == nil {
 						objectSize = placement.Size
+						modified, _ = placement.ModifiedAt()
 					}
 				}
 			}
 
 			contents = append(contents, ListObjectsV2_Contents{
 				Key:          objectKey,
-				LastModified: time.Now(), // TODO: Store actual modification time
+				LastModified: modified,
 				Size:         objectSize,
 				StorageClass: "STANDARD",
 			})

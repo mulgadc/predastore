@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
@@ -89,11 +88,14 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 
 		etag := model.PartETagFrom(digest)
 
+		// The part is dated from its own epoch, so ListParts and the placement
+		// record cannot disagree about when it was written.
+		modified, _ := place.ModifiedAt()
 		partMeta := model.PartMetadata{
 			PartNumber:   partNumber,
 			Size:         partSize,
 			ETag:         etag,
-			LastModified: time.Now(),
+			LastModified: modified,
 		}
 		var partBuf bytes.Buffer
 		if err := gob.NewEncoder(&partBuf).Encode(partMeta); err != nil {

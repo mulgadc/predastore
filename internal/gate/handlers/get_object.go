@@ -80,7 +80,7 @@ func serveObject(
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 		w.Header().Set("ETag", model.ObjectETag(bucket, key))
-		w.Header().Set("Last-Modified", time.Time{}.Format(httpTimeFormat))
+		w.Header().Set("Last-Modified", lastModified(place))
 		if contentRange != "" {
 			w.Header().Set("Content-Range", contentRange)
 		}

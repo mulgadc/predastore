@@ -12,6 +12,18 @@ import (
 // httpTimeFormat is the RFC 1123 form S3 dates its responses with.
 const httpTimeFormat = "Mon, 02 Jan 2006 15:04:05 GMT"
 
+// lastModified dates a response from the placement record. A record too old to
+// carry a time keeps the zero date it has always served: omitting the header
+// breaks clients that require one, and a fresh time is the lie this replaced.
+func lastModified(p ObjectToShardNodes) string {
+	at, ok := p.ModifiedAt()
+	if !ok {
+		return time.Time{}.Format(httpTimeFormat)
+	}
+
+	return at.Format(httpTimeFormat)
+}
+
 // HeadObject serves HEAD /{bucket}/{key}: size and entity tag, no body.
 func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -27,7 +39,7 @@ func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Con
 			return
 		}
 
-		_, size, err := loadPlacement(ctx, mc, ring, cfg, bucket, key)
+		place, size, err := loadPlacement(ctx, mc, ring, cfg, bucket, key)
 		if err != nil {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
@@ -36,7 +48,7 @@ func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Con
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		w.Header().Set("ETag", model.ObjectETag(bucket, key))
-		w.Header().Set("Last-Modified", time.Time{}.Format(httpTimeFormat))
+		w.Header().Set("Last-Modified", lastModified(place))
 		w.WriteHeader(http.StatusOK)
 	})
 }
