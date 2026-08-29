@@ -19,11 +19,11 @@
 #
 # Environment:
 #   STRESS_SCENARIO    Narrows the run to one test: "repair", "handoff",
-#                      "large-object", "torn-overwrite", "stale-shard",
-#                      "freeze", or "partial-put" — a client that stops sending
-#                      mid-body, which is not in a default run. Unset runs
-#                      repair, handoff, large-object, torn-overwrite,
-#                      stale-shard and freeze.
+#                      "large-object", "last-modified", "torn-overwrite",
+#                      "stale-shard", "freeze", or "partial-put" — a client
+#                      that stops sending mid-body, which is not in a default
+#                      run. Unset runs repair, handoff, large-object,
+#                      last-modified, torn-overwrite, stale-shard and freeze.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -88,6 +88,7 @@ STALE_KEYS="${STRESS_STALE_KEYS:-12}"
 SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
     all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff|large-object|multipart-upload) ;;
+    last-modified) ;;
     node-rejoin|node-resync|node-rebuild) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
@@ -1653,6 +1654,222 @@ if [ "$SCENARIO" = all ] || [ "$SCENARIO" = multipart-upload ]; then
     fi
 fi
 
+# --- Scenario: last-modified ---
+#
+# The user-visible claim: every surface that dates an object reports when that
+# object was written, and they all report the same thing. HEAD and GET dated
+# every object 0001-01-01 and ListObjectsV2 answered the time of the listing,
+# so a client that listed a bucket and then headed a key got two answers
+# decades apart and an incremental sync saw every object change on every pass.
+#
+# The date is the write epoch in the placement record, so this is asserted end
+# to end rather than in a handler test: it has to survive being encoded into
+# the record, committed through raft, and decoded again by a different gate
+# from the one that wrote it. Reads are therefore taken from a second gate.
+
+LM_CLUSTER="${CONFIG_NAME}-lastmod"
+LM_CONFIG="$PREDA_CONFIG_DIR/$LM_CLUSTER.toml"
+LM_BUCKET="stress-lastmod"
+LM_FAILURES=0
+LM_CASES=0
+
+lm_check() {
+    local ok="$1" message="$2"
+    LM_CASES=$(( LM_CASES + 1 ))
+    if [ "$ok" = true ]; then
+        log "last-modified: pass, $message"
+    else
+        log "last-modified: FAIL $message"
+        LM_FAILURES=$(( LM_FAILURES + 1 ))
+    fi
+}
+
+render_lastmod_profile() {
+    render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$LM_CONFIG" "$(( PORT_OFFSET + 700 ))"
+    cat >> "$LM_CONFIG" <<EOF
+
+[[bucket]]
+name = "$LM_BUCKET"
+region = "$REGION"
+public = true
+account_id = "123456789012"
+EOF
+    cp "$LM_CONFIG" "$RUN_DIR/$LM_CLUSTER.toml"
+}
+
+# epoch_of parses either date form S3 serves — RFC 1123 in a header, ISO 8601
+# in a listing — into seconds. An unparseable or absent date prints nothing,
+# which every caller below treats as a failure rather than as zero.
+epoch_of() {
+    [ -n "$1" ] || return 0
+    date -u -d "$1" +%s 2>/dev/null || true
+}
+
+# The header is read off the wire rather than from the CLI's parse of it: what
+# was wrong before was a Last-Modified that was present and false, and a client
+# reads exactly these bytes.
+lm_header() {
+    local method="$1" gate="$2" key="$3" args=(-sk --max-time 120)
+    case "$method" in
+        HEAD) args+=(-I) ;;
+        *) args+=(-o /dev/null -D -) ;;
+    esac
+    curl "${args[@]}" "$gate/$LM_BUCKET/$key" \
+        | awk 'tolower($1) == "last-modified:" { sub(/^[^:]*: */, ""); gsub(/\r/, ""); print; exit }'
+}
+
+# within reports whether an epoch falls in the window the write was issued in,
+# with a second of slack at each end for the clocks the two sides read.
+within() {
+    local got="$1" from="$2" to="$3"
+    [ -n "$got" ] && [ "$got" -ge $(( from - 1 )) ] && [ "$got" -le $(( to + 1 )) ]
+}
+
+run_last_modified() {
+    local src="$WORK_DIR/lastmod-src.bin" partfile="$WORK_DIR/lastmod-part.bin"
+    local gate read_gate key before after
+    local head_raw get_raw list_raw head_epoch get_epoch list_epoch
+    local first_epoch second_epoch upload_id etag i
+    local part_raw part_epoch object_epoch complete_before
+
+    render_lastmod_profile
+    log "last-modified: starting $LM_CLUSTER"
+    "$SCRIPTS_DIR/start.sh" -w "$LM_CLUSTER"
+
+    gate="$(parse_hosts "$LM_CONFIG" | awk '$3 != "" { print "https://" $2 ":" $3; exit }')"
+    [ -n "$gate" ] || fail "last-modified: no gate in $LM_CLUSTER"
+    read_gate="$(survivor_gate "$LM_CONFIG" "$(parse_hosts "$LM_CONFIG" | awk 'NR == 1 { print $1 }')")"
+    [ -n "$read_gate" ] || fail "last-modified: $LM_CLUSTER has only one gate, so a read cannot come from another"
+    log "last-modified: writing through $gate, reading through $read_gate"
+
+    # --- A whole-object write ---
+
+    key="lastmod-object.bin"
+    openssl rand -out "$src" 1048576
+    before="$(date -u +%s)"
+    aws_s3 "$gate" s3api put-object --bucket "$LM_BUCKET" --key "$key" --body "$src" >/dev/null \
+        || fail "last-modified: the object could not be written"
+    after="$(date -u +%s)"
+
+    head_raw="$(lm_header HEAD "$read_gate" "$key")"
+    head_epoch="$(epoch_of "$head_raw")"
+    lm_check "$(within "$head_epoch" "$before" "$after" && echo true || echo false)" \
+        "HEAD reports the write time: ${head_raw:-<no Last-Modified header>}"
+
+    get_raw="$(lm_header GET "$read_gate" "$key")"
+    get_epoch="$(epoch_of "$get_raw")"
+    lm_check "$([ -n "$get_epoch" ] && [ "$get_epoch" = "$head_epoch" ] && echo true || echo false)" \
+        "GET and HEAD report the same time: ${get_raw:-<no Last-Modified header>}"
+
+    list_raw="$(aws_s3 "$read_gate" s3api list-objects-v2 --bucket "$LM_BUCKET" \
+        --query "Contents[?Key=='$key'].LastModified" --output text)"
+    list_epoch="$(epoch_of "$list_raw")"
+    lm_check "$([ -n "$list_epoch" ] && [ "$list_epoch" = "$head_epoch" ] && echo true || echo false)" \
+        "ListObjectsV2 agrees with HEAD rather than answering the time of the listing: ${list_raw:-<none>}"
+
+    # The two dates the broken surfaces served. Asserted by name because both
+    # parse as a time and neither is one an object can have been written at.
+    lm_check "$([ "${head_epoch:-0}" -gt 1600000000 ] && echo true || echo false)" \
+        "the reported time is a real write time, not the zero date or the Unix epoch"
+
+    # --- An overwrite ---
+    #
+    # A listing that answered time.Now() passed the window check above and
+    # still told a sync every object had changed. What separates the two is
+    # that the object's time moves when the object does and not otherwise.
+
+    first_epoch="$head_epoch"
+    sleep 2
+    before="$(date -u +%s)"
+    aws_s3 "$gate" s3api put-object --bucket "$LM_BUCKET" --key "$key" --body "$src" >/dev/null \
+        || fail "last-modified: the object could not be overwritten"
+    after="$(date -u +%s)"
+
+    second_epoch="$(epoch_of "$(lm_header HEAD "$read_gate" "$key")")"
+    lm_check "$([ -n "$second_epoch" ] && [ -n "$first_epoch" ] && [ "$second_epoch" -gt "$first_epoch" ] \
+        && echo true || echo false)" \
+        "an overwrite advances the reported time ($first_epoch to ${second_epoch:-unknown})"
+    lm_check "$(within "$second_epoch" "$before" "$after" && echo true || echo false)" \
+        "the overwrite reports its own write time"
+
+    sleep 2
+    lm_check "$([ "$(epoch_of "$(lm_header HEAD "$read_gate" "$key")")" = "$second_epoch" ] \
+        && echo true || echo false)" \
+        "reading again does not move the time"
+
+    # --- A multipart upload ---
+    #
+    # ListParts is the one surface that always served a real time, so it is
+    # asserted as a regression: parts are dated from their own epoch now, and
+    # the assembled object is dated from its completion rather than from the
+    # first part, which is the S3 semantic.
+
+    key="lastmod-multipart.bin"
+    upload_id="$(aws_s3 "$gate" s3api create-multipart-upload \
+        --bucket "$LM_BUCKET" --key "$key" --query UploadId --output text)" \
+        || fail "last-modified: create-multipart-upload failed"
+
+    head -c $(( 5 * 1024 * 1024 )) /dev/urandom > "$partfile"
+    : > "$WORK_DIR/lastmod-parts.txt"
+    before="$(date -u +%s)"
+    for i in 1 2; do
+        etag="$(aws_s3 "$gate" s3api upload-part --bucket "$LM_BUCKET" --key "$key" \
+            --upload-id "$upload_id" --part-number "$i" --body "$partfile" \
+            --query ETag --output text)" || etag=""
+        [ -n "$etag" ] || fail "last-modified: part $i failed to upload"
+        printf '{"ETag":%s,"PartNumber":%d}\n' "$etag" "$i" >> "$WORK_DIR/lastmod-parts.txt"
+    done
+    after="$(date -u +%s)"
+
+    part_raw="$(aws_s3 "$read_gate" s3api list-parts --bucket "$LM_BUCKET" --key "$key" \
+        --upload-id "$upload_id" --query 'Parts[0].LastModified' --output text)"
+    part_epoch="$(epoch_of "$part_raw")"
+    lm_check "$(within "$part_epoch" "$before" "$after" && echo true || echo false)" \
+        "ListParts reports when the part was uploaded: ${part_raw:-<none>}"
+
+    # Held open on purpose: a completion dated from its first part rather than
+    # from itself lands before this sleep ends and fails the check below.
+    sleep 3
+    printf '{"Parts":[%s]}' "$(paste -sd, "$WORK_DIR/lastmod-parts.txt")" \
+        > "$WORK_DIR/lastmod-parts.json"
+    complete_before="$(date -u +%s)"
+    aws_s3 "$gate" s3api complete-multipart-upload --bucket "$LM_BUCKET" --key "$key" \
+        --upload-id "$upload_id" \
+        --multipart-upload "file://$WORK_DIR/lastmod-parts.json" >/dev/null \
+        || fail "last-modified: complete-multipart-upload failed"
+
+    object_epoch="$(epoch_of "$(lm_header HEAD "$read_gate" "$key")")"
+    lm_check "$(within "$object_epoch" "$complete_before" "$(date -u +%s)" && echo true || echo false)" \
+        "a completed multipart object is dated from its completion, not from its first part"
+
+    list_epoch="$(epoch_of "$(aws_s3 "$read_gate" s3api list-objects-v2 --bucket "$LM_BUCKET" \
+        --query "Contents[?Key=='$key'].LastModified" --output text)")"
+    lm_check "$([ -n "$list_epoch" ] && [ "$list_epoch" = "$object_epoch" ] && echo true || echo false)" \
+        "ListObjectsV2 and HEAD agree on the multipart object too"
+
+    rm -f "$src" "$partfile"
+    log "last-modified: stopping $LM_CLUSTER"
+    "$SCRIPTS_DIR/stop.sh" -w "$LM_CLUSTER" >/dev/null 2>&1 || true
+    mkdir -p "$RUN_DIR/logs-lastmod"
+    cp -R "$PREDA_DIR/$LM_CLUSTER/logs/." "$RUN_DIR/logs-lastmod/" 2>/dev/null || true
+    if [ "$LM_FAILURES" -eq 0 ]; then
+        log "last-modified: passed $LM_CASES assertions"
+    else
+        log "last-modified: FAILED $LM_FAILURES of $LM_CASES assertions"
+    fi
+}
+
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = last-modified ]; then
+    run_last_modified
+
+    if [ "$SCENARIO" = last-modified ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$LM_FAILURES" -eq 0 ] \
+            || fail "last-modified failed $LM_FAILURES of $LM_CASES assertions"
+        exit 0
+    fi
+fi
+
 if [ "$SCENARIO" = all ] || [ "$SCENARIO" = large-object ]; then
     run_large_object
 
@@ -2590,6 +2807,13 @@ log "Warp completed with no errors"
     else
         echo "stale_shard=fail ($STALE_FAILURES of $STALE_CASES)"
     fi
+    if [ "$LM_CASES" -eq 0 ]; then
+        echo "last_modified=skipped"
+    elif [ "$LM_FAILURES" -eq 0 ]; then
+        echo "last_modified=pass"
+    else
+        echo "last_modified=fail ($LM_FAILURES of $LM_CASES)"
+    fi
     if [ "$LARGE_CASES" -eq 0 ]; then
         echo "large_object=skipped"
     elif [ "$LARGE_FAILURES" -eq 0 ]; then
@@ -2619,3 +2843,5 @@ echo "Stress results: $RUN_DIR"
     || fail "handoff failed $HANDOFF_FAILURES of $HANDOFF_CASES assertions"
 [ "$LARGE_FAILURES" -eq 0 ] \
     || fail "large-object failed $LARGE_FAILURES of $LARGE_CASES assertions"
+[ "$LM_FAILURES" -eq 0 ] \
+    || fail "last-modified failed $LM_FAILURES of $LM_CASES assertions"

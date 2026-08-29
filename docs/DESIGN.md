@@ -403,7 +403,11 @@ The first save also locks in a freshly generated `storeID` before any fragment c
 
 The gate authenticates, resolves the bucket, unwraps `aws-chunked` framing if the client used it, and takes the object size from `Content-Length` or `X-Amz-Decoded-Content-Length`. A request that declares no length is rejected with `MissingContentLength`: the splitter needs the size up front, and it is what placement records.
 
-Every PUT draws a **write epoch**: eight bytes from `crypto/rand`, compared only for equality, with zero reserved as invalid. It is stamped on every shard of the stripe and into the placement record, so the record names one generation and a shard either belongs to it or does not.
+Every PUT mints a **write epoch**: 44 bits of milliseconds since 1970, 10 bits of gate node id and a 10-bit per-millisecond sequence, with zero reserved as invalid. It is stamped on every shard of the stripe and into the placement record, so the record names one generation and a shard either belongs to it or does not.
+
+It is compared only for equality, so uniqueness is the one property the shard path needs — an epoch that repeated for a key would let a surviving shard of an older write be accepted as current. The node id is what makes that structural rather than probabilistic: two gates minting in the same millisecond cannot collide. The minter never returns a value at or below one it has already returned, so a clock that steps backwards costs sequence numbers rather than safety.
+
+The milliseconds are the object's `LastModified` on every surface that serves one, which is why the record spends its eight bytes here rather than on entropy plus a separate modification time. A version 1 record's epoch is random and carries no time; those objects report the zero date, and always will.
 
 The body is split into `K` data shard buffers in memory and each is streamed to its node in parallel. Parity is encoded into buffers of its own and written from those. It is deliberately not piped from a single encoder: one parity node refusing would close its pipe, fail the encode and take every other parity write down with it, losing all redundancy at once rather than one shard of it.
 
@@ -788,7 +792,7 @@ Things the design implies but the code does not do. Longer-horizon items live in
 
 **ETags are derived from the name, not the content.** `ObjectETag` is the first half of `sha256("bucket/key")`, hex encoded. It identifies the object but not its version, so a client cannot use it to detect that an object changed.
 
-**Listings are not paginated.** `ListObjects` scans and returns everything under the prefix, always reporting `IsTruncated: false` and a max-keys of 1000 it does not enforce. `LastModified` is not stored and is reported as the current time.
+**Listings are not paginated.** `ListObjects` scans and returns everything under the prefix, always reporting `IsTruncated: false` and a max-keys of 1000 it does not enforce.
 
 **No multi-object delete.** `POST /{bucket}?delete=` has no route and returns 405.
 
