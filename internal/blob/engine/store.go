@@ -262,6 +262,8 @@ func (store *Store) Lookup(key [32]byte, index uint32) (Reader, error) {
 
 	seg.addRef()
 
+	buf, held := takeFragWindow(ext.PSize / totalFragSize)
+
 	return &reader{
 		key:     key,
 		index:   index,
@@ -270,7 +272,8 @@ func (store *Store) Lookup(key [32]byte, index uint32) (Reader, error) {
 		aead:    store.aead,
 		seg:     seg,
 		ext:     ext,
-		buf:     make([]byte, min(int64(bufLen), ext.PSize/totalFragSize)*totalFragSize),
+		buf:     buf,
+		held:    held,
 	}, nil
 }
 
@@ -338,6 +341,8 @@ func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64)
 		return nil, fmt.Errorf("append idx: %w", err)
 	}
 
+	wbuf, wheld := takeFragWindow(int64(fragCount)) //nolint:gosec // G115: fragment count of a bounded extent.
+
 	w := &writer{
 		store:    store,
 		key:      key,
@@ -348,7 +353,8 @@ func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64)
 		ext:      ext,
 		valueNum: store.valueNum,
 		fragNum:  store.fragNum,
-		buf:      make([]byte, min(uint64(bufLen), fragCount)*totalFragSize),
+		buf:      wbuf,
+		held:     wheld,
 	}
 
 	store.valueNum += 1

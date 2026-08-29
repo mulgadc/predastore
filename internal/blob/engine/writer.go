@@ -28,6 +28,10 @@ type writer struct {
 	// issue one WriteAt for the whole thing.
 	buf []byte
 
+	// held is the pooled window behind buf, or nil when buf is this writer's
+	// own. Close gives it back.
+	held *[]byte
+
 	// Offsets into the value's extent: cursor is where the next byte goes,
 	// flushedTo is fixed to the last successful WriteAt, and their difference is
 	// the live buffer fill.
@@ -118,6 +122,7 @@ func (w *writer) Close() (err error) {
 
 	w.closed = true
 	defer w.seg.releaseRef()
+	defer func() { dropFragWindow(w.held); w.held, w.buf = nil, nil }()
 
 	if w.cursor > w.flushedTo {
 		if err = w.flush(true); err != nil {

@@ -23,6 +23,10 @@ type reader struct {
 
 	buf []byte
 
+	// held is the pooled window behind buf, or nil when buf is this reader's
+	// own. Close gives it back.
+	held *[]byte
+
 	// Sequential position for Read; ReadAt is stateless.
 	readPos int64
 
@@ -130,6 +134,8 @@ func (r *reader) Close() error {
 	}
 
 	r.closed = true
+	dropFragWindow(r.held)
+	r.held, r.buf = nil, nil
 	r.seg.releaseRef()
 	return nil
 }
