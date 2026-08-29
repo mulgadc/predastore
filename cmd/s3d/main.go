@@ -69,7 +69,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer prof.Stop()
+	defer func() { _ = prof.Stop() }()
+
+	// Profiling that stops being written ends the run. Carrying on would leave
+	// an incomplete profile set behind a zero exit, which reads as a profiled
+	// run and is not one.
+	ctx = prof.Watch(ctx)
 
 	// Telemetry is best-effort: a failed init never blocks the S3 server.
 	otelShutdown, err := otelsetup.Init(ctx, "predastore")
@@ -125,11 +130,19 @@ func run() error {
 		return fmt.Errorf("load master key: %w", err)
 	}
 
-	return predastore.Run(ctx, predastore.Options{
+	runErr := predastore.Run(ctx, predastore.Options{
 		Config:    cfg,
 		HostID:    host.ID,
 		MasterKey: key,
 	})
+
+	// Stop flushes the last window and the final snapshots, so a failure it
+	// reports is one the run has not seen yet.
+	if profErr := prof.Stop(); profErr != nil {
+		return errors.Join(runErr, profErr)
+	}
+
+	return runErr
 }
 
 // hostEntry is the [[host]] this process runs, addressable so the flags that

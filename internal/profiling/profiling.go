@@ -14,6 +14,7 @@
 package profiling
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -78,7 +79,8 @@ func FromEnv() (Config, error) {
 	// PPROF_ENABLED is what the pre-c932d4a builds took. It survives as an
 	// alias so an old runbook still profiles something rather than silently
 	// profiling nothing.
-	if spec == "" && os.Getenv("PPROF_ENABLED") == "1" {
+	legacy := spec == "" && os.Getenv("PPROF_ENABLED") == "1"
+	if legacy {
 		spec = string(KindCPU)
 	}
 	if spec == "" {
@@ -101,7 +103,13 @@ func FromEnv() (Config, error) {
 		return Config{}, errors.New("GO_PROF names no profiles")
 	}
 
+	var err error
 	cfg.Dir = strings.TrimSpace(os.Getenv("GO_PROF_DIR"))
+	if cfg.Dir == "" && legacy {
+		if cfg.Dir, err = legacyDir(); err != nil {
+			return Config{}, err
+		}
+	}
 	if cfg.Dir == "" {
 		return Config{}, errors.New("GO_PROF is set but GO_PROF_DIR is empty")
 	}
@@ -109,7 +117,6 @@ func FromEnv() (Config, error) {
 		return Config{}, fmt.Errorf("GO_PROF_DIR must be absolute, got %q", cfg.Dir)
 	}
 
-	var err error
 	if cfg.Interval, err = duration("GO_PROF_INTERVAL", defaultInterval); err != nil {
 		return Config{}, err
 	}
@@ -118,6 +125,26 @@ func FromEnv() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// legacyDir maps the old PPROF_OUTPUT to the new output directory: profiles
+// land in the directory that variable named, under the current per-host, per-pid
+// filenames.
+//
+// The basename is deliberately not honoured. It named one file, and four s3d on
+// one machine inherit one environment, so honouring it would have three of them
+// overwrite the fourth — which is the failure the new naming exists to prevent.
+func legacyDir() (string, error) {
+	out := strings.TrimSpace(os.Getenv("PPROF_OUTPUT"))
+	if out == "" {
+		return "", errors.New("PPROF_ENABLED is set but neither GO_PROF_DIR nor PPROF_OUTPUT is")
+	}
+	dir, err := filepath.Abs(filepath.Dir(out))
+	if err != nil {
+		return "", fmt.Errorf("PPROF_OUTPUT: %w", err)
+	}
+
+	return dir, nil
 }
 
 func duration(name string, fallback time.Duration) (time.Duration, error) {
@@ -144,13 +171,65 @@ type Profiler struct {
 	done    chan struct{}
 	stopped sync.Once
 
+	// failed closes on the first write, rotation or close failure, and failure
+	// holds what it was. Profiling is opt-in, so anything that stops it being
+	// written ends the run: the numbers produced up to that point look like a
+	// profiled run and are not one.
+	failed  chan struct{}
+	failing sync.Once
+
 	// prevMutexFraction is what the process had before this armed mutex
 	// sampling, so shutdown can put it back.
 	prevMutexFraction int
 
 	mu      sync.Mutex
+	failure error
 	cpuFile *os.File
+	cpuName string
 	seq     map[Kind]int
+}
+
+// fail records the first failure and wakes anything watching. Later ones are
+// logged and dropped: the first is the one that explains the run.
+func (p *Profiler) fail(err error) {
+	slog.Error("profiling failed", "error", err)
+	p.failing.Do(func() {
+		p.mu.Lock()
+		p.failure = err
+		p.mu.Unlock()
+		close(p.failed)
+	})
+}
+
+// Err reports the first failure, or nil. It is safe on a nil receiver.
+func (p *Profiler) Err() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return p.failure
+}
+
+// Watch returns a context cancelled when profiling fails, so a run that has
+// stopped producing the evidence it was started for ends rather than carries on
+// looking like a profiled one. It is safe on a nil receiver.
+func (p *Profiler) Watch(ctx context.Context) context.Context {
+	if p == nil {
+		return ctx
+	}
+	watched, cancel := context.WithCancel(ctx)
+	go func() {
+		defer cancel()
+		select {
+		case <-p.failed:
+		case <-p.done:
+		case <-ctx.Done():
+		}
+	}()
+
+	return watched
 }
 
 // Start begins profiling for this host, or returns a nil *Profiler when the
@@ -165,10 +244,11 @@ func Start(cfg Config, hostID int) (*Profiler, error) {
 	}
 
 	p := &Profiler{
-		cfg:  cfg,
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
-		seq:  make(map[Kind]int),
+		cfg:    cfg,
+		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
+		failed: make(chan struct{}),
+		seq:    make(map[Kind]int),
 		// Started once per process: a host that restarts mid-run gets a new
 		// prefix rather than overwriting the evidence from before the fault.
 		prefix: fmt.Sprintf("%s-host%d-pid%d", time.Now().UTC().Format("20060102T150405Z"), hostID, os.Getpid()),
@@ -203,19 +283,22 @@ func Start(cfg Config, hostID int) (*Profiler, error) {
 }
 
 // Stop flushes the open CPU window, takes one last snapshot of every other
-// requested profile and restores the sampling rates it changed.
+// requested profile and restores the sampling rates it changed. It returns the
+// first failure profiling met, so a caller can exit non-zero on it.
 //
 // The final snapshot is the point of taking them periodically as well: a host
 // this process cannot shut down gracefully — SIGKILLed, or wiped by a scenario
 // — still leaves the intervals it wrote before the fault.
-func (p *Profiler) Stop() {
+func (p *Profiler) Stop() error {
 	if p == nil {
-		return
+		return nil
 	}
 	p.stopped.Do(func() {
 		close(p.stop)
 		<-p.done
 	})
+
+	return p.Err()
 }
 
 func (p *Profiler) loop() {
@@ -244,7 +327,7 @@ func (p *Profiler) loop() {
 			return
 		case <-cpuRotate:
 			if err := p.rotateCPU(); err != nil {
-				slog.Error("profiling: CPU profile rotation failed", "error", err)
+				p.fail(err)
 			}
 		case <-snapshot:
 			p.writeSnapshots()
@@ -268,17 +351,19 @@ func (p *Profiler) wantsSnapshots() bool {
 func (p *Profiler) rotateCPU() error {
 	p.closeCPU()
 
-	f, err := p.create(KindCPU)
+	f, final, err := p.create(KindCPU)
 	if err != nil {
 		return err
 	}
 	if err := pprof.StartCPUProfile(f); err != nil {
 		f.Close()
+		os.Remove(f.Name())
+
 		return fmt.Errorf("profiling: start CPU profile: %w", err)
 	}
 
 	p.mu.Lock()
-	p.cpuFile = f
+	p.cpuFile, p.cpuName = f, final
 	p.mu.Unlock()
 
 	return nil
@@ -286,16 +371,16 @@ func (p *Profiler) rotateCPU() error {
 
 func (p *Profiler) closeCPU() {
 	p.mu.Lock()
-	f := p.cpuFile
-	p.cpuFile = nil
+	f, final := p.cpuFile, p.cpuName
+	p.cpuFile, p.cpuName = nil, ""
 	p.mu.Unlock()
 
 	if f == nil {
 		return
 	}
 	pprof.StopCPUProfile()
-	if err := f.Close(); err != nil {
-		slog.Error("profiling: closing CPU profile", "file", f.Name(), "error", err)
+	if err := commit(f, final); err != nil {
+		p.fail(err)
 	}
 }
 
@@ -305,7 +390,7 @@ func (p *Profiler) writeSnapshots() {
 			continue
 		}
 		if err := p.writeSnapshot(kind); err != nil {
-			slog.Error("profiling: snapshot failed", "profile", string(kind), "error", err)
+			p.fail(err)
 		}
 	}
 }
@@ -316,36 +401,57 @@ func (p *Profiler) writeSnapshot(kind Kind) error {
 		return fmt.Errorf("no runtime profile named %q", kind)
 	}
 
-	f, err := p.create(kind)
+	f, final, err := p.create(kind)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	// Debug 0 is the binary pprof format, which is what go tool pprof reads
 	// and what carries the sample values rather than a rendered listing.
 	if err := prof.WriteTo(f, 0); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+
 		return fmt.Errorf("write %s profile: %w", kind, err)
 	}
 
-	return nil
+	return commit(f, final)
 }
 
-// create opens the next file for a profile kind. The sequence number is what
-// orders a run's snapshots, so it is per kind and never reused.
-func (p *Profiler) create(kind Kind) (*os.File, error) {
+// create opens the next file for a profile kind under a temporary name. The
+// sequence number is what orders a run's snapshots, so it is per kind and never
+// reused.
+func (p *Profiler) create(kind Kind) (*os.File, string, error) {
 	p.mu.Lock()
 	seq := p.seq[kind]
 	p.seq[kind]++
 	p.mu.Unlock()
 
-	name := filepath.Join(p.cfg.Dir, fmt.Sprintf("%s-%s-%03d.pprof", p.prefix, kind, seq))
-	f, err := os.Create(name)
+	final := filepath.Join(p.cfg.Dir, fmt.Sprintf("%s-%s-%03d.pprof", p.prefix, kind, seq))
+	f, err := os.CreateTemp(p.cfg.Dir, filepath.Base(final)+".*.part")
 	if err != nil {
-		return nil, fmt.Errorf("profiling: %w", err)
+		return nil, "", fmt.Errorf("profiling: %w", err)
 	}
 
-	return f, nil
+	return f, final, nil
+}
+
+// commit gives a written profile its final name, so a file under that name is
+// always one that finished. A process killed mid-write leaves a .part, which
+// nothing reading the directory will mistake for a complete profile.
+func commit(f *os.File, final string) error {
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+
+		return fmt.Errorf("profiling: close %s: %w", final, err)
+	}
+	if err := os.Rename(f.Name(), final); err != nil {
+		os.Remove(f.Name())
+
+		return fmt.Errorf("profiling: %w", err)
+	}
+
+	return nil
 }
 
 // disarm puts back the sampling rates this profiler changed.

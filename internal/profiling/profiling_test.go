@@ -2,6 +2,7 @@ package profiling
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -67,7 +68,7 @@ func TestDisabledProfilingStartsNothing(t *testing.T) {
 
 	assert.LessOrEqual(t, runtime.NumGoroutine(), before,
 		"profiling is off, so it must not have started a goroutine")
-	p.Stop()
+	require.NoError(t, p.Stop())
 }
 
 // GO_PROF set and unusable is a failed run, not a quiet one: the alternative
@@ -142,7 +143,7 @@ func TestFilenamesSeparateHostsProcessesKindsAndWindows(t *testing.T) {
 	p, err := Start(cfg, 3)
 	require.NoError(t, err)
 	time.Sleep(80 * time.Millisecond)
-	p.Stop()
+	require.NoError(t, p.Stop())
 
 	names := files(t, dir)
 	require.NotEmpty(t, names)
@@ -179,7 +180,7 @@ func TestShutdownFlushesTheOpenCPUWindow(t *testing.T) {
 	p, err := Start(cfg, 1)
 	require.NoError(t, err)
 	burn(50 * time.Millisecond)
-	p.Stop()
+	require.NoError(t, p.Stop())
 
 	names := files(t, dir)
 	require.Len(t, names, 1, "one window was opened and none rotated")
@@ -201,7 +202,7 @@ func TestSnapshotsLandBeforeShutdown(t *testing.T) {
 
 	p, err := Start(cfg, 2)
 	require.NoError(t, err)
-	defer p.Stop()
+	defer func() { _ = p.Stop() }()
 
 	// Two of each, so the first of each is known to be finished rather than
 	// still being written as the test reads it.
@@ -249,7 +250,7 @@ func TestSamplingIsArmedOnlyWhenAskedForAndRestoredAfter(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, runtime.SetMutexProfileFraction(-1),
 		"mutex sampling was not requested, so it must not be on")
-	p.Stop()
+	require.NoError(t, p.Stop())
 
 	asked := Config{
 		Kinds: map[Kind]bool{KindMutex: true, KindBlock: true}, Dir: t.TempDir(),
@@ -260,14 +261,14 @@ func TestSamplingIsArmedOnlyWhenAskedForAndRestoredAfter(t *testing.T) {
 	assert.Equal(t, mutexProfileFraction, runtime.SetMutexProfileFraction(-1),
 		"mutex sampling was requested and must be on")
 
-	p.Stop()
+	require.NoError(t, p.Stop())
 	assert.Equal(t, 0, runtime.SetMutexProfileFraction(-1),
 		"shutdown must put the sampling rate back")
 }
 
 func TestStopIsIdempotentAndSafeOnANilProfiler(t *testing.T) {
 	var nilProf *Profiler
-	assert.NotPanics(t, nilProf.Stop)
+	assert.NotPanics(t, func() { assert.NoError(t, nilProf.Stop()) })
 
 	dir := t.TempDir()
 	p, err := Start(Config{
@@ -276,8 +277,9 @@ func TestStopIsIdempotentAndSafeOnANilProfiler(t *testing.T) {
 	}, 1)
 	require.NoError(t, err)
 
-	p.Stop()
-	assert.NotPanics(t, p.Stop, "a deferred Stop after an explicit one must not close a closed channel")
+	require.NoError(t, p.Stop())
+	assert.NotPanics(t, func() { assert.NoError(t, p.Stop()) },
+		"a deferred Stop after an explicit one must not close a closed channel")
 }
 
 // A directory that cannot be created is a failed run rather than a silent one.
@@ -315,4 +317,164 @@ func burn(d time.Duration) {
 		}
 	}
 	_ = x
+}
+
+// The old runbooks name a file, and the new controller names a directory with
+// one file per host, process, kind and window. The mapping takes the directory
+// and drops the basename, because four s3d on one machine inherit one
+// environment and honouring the basename would have three overwrite the fourth.
+func TestTheLegacyOutputVariableNamesTheDirectory(t *testing.T) {
+	t.Setenv("GO_PROF", "")
+	t.Setenv("GO_PROF_DIR", "")
+	t.Setenv("PPROF_ENABLED", "1")
+	t.Setenv("PPROF_OUTPUT", "/var/tmp/old-runbook/predastore-cpu.prof")
+
+	cfg, err := FromEnv()
+	require.NoError(t, err)
+	assert.Equal(t, "/var/tmp/old-runbook", cfg.Dir)
+	assert.Equal(t, map[Kind]bool{KindCPU: true}, cfg.Kinds)
+}
+
+// GO_PROF_DIR still wins, so a runbook part-way through the migration profiles
+// where the new variable says rather than in two places.
+func TestTheNewDirectoryWinsOverTheLegacyOutput(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GO_PROF", "")
+	t.Setenv("GO_PROF_DIR", dir)
+	t.Setenv("PPROF_ENABLED", "1")
+	t.Setenv("PPROF_OUTPUT", "/var/tmp/old-runbook/predastore-cpu.prof")
+
+	cfg, err := FromEnv()
+	require.NoError(t, err)
+	assert.Equal(t, dir, cfg.Dir)
+}
+
+// Neither variable is a request that cannot be served, and profiling that was
+// asked for and cannot run fails the process rather than running unprofiled.
+func TestTheLegacyAliasWithNoOutputAtAllIsRefused(t *testing.T) {
+	t.Setenv("GO_PROF", "")
+	t.Setenv("GO_PROF_DIR", "")
+	t.Setenv("PPROF_ENABLED", "1")
+	t.Setenv("PPROF_OUTPUT", "")
+
+	_, err := FromEnv()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "PPROF_OUTPUT")
+}
+
+// A snapshot that cannot be written is a failed run. Logging it and carrying on
+// produces an incomplete profile set behind a zero exit, which reads as a
+// profiled run and is not one.
+func TestASnapshotFailureEndsTheRun(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "profiles")
+	p, err := Start(Config{
+		Kinds: map[Kind]bool{KindHeap: true}, Dir: dir,
+		Interval: 10 * time.Millisecond, CPUWindow: time.Hour,
+	}, 1)
+	require.NoError(t, err)
+
+	watched := p.Watch(t.Context())
+	require.NoError(t, os.RemoveAll(dir))
+
+	select {
+	case <-watched.Done():
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "profiling stopped writing and the run carried on")
+	}
+
+	err = p.Stop()
+	require.Error(t, err, "Stop must report the failure so the process can exit non-zero")
+	assert.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// A profile only gets its final name once it has been written and closed, so a
+// process killed mid-write leaves nothing a report script can mistake for the
+// last complete snapshot.
+func TestAnUnfinishedProfileNeverTakesTheFinalName(t *testing.T) {
+	dir := t.TempDir()
+	p, err := Start(Config{
+		Kinds: map[Kind]bool{KindHeap: true}, Dir: dir,
+		Interval: time.Hour, CPUWindow: time.Hour,
+	}, 1)
+	require.NoError(t, err)
+	defer func() { _ = p.Stop() }()
+
+	f, final, err := p.create(KindHeap)
+	require.NoError(t, err)
+	_, err = f.WriteString("half a profile")
+	require.NoError(t, err)
+
+	assert.NotEqual(t, final, f.Name(), "a profile is written under a temporary name")
+	assert.FileExists(t, f.Name())
+	assert.NoFileExists(t, final)
+
+	// The extension is the whole mechanism: a report script globs .pprof, so a
+	// half-written file must not carry it.
+	assert.Equal(t, ".pprof", filepath.Ext(final))
+	assert.NotEqual(t, ".pprof", filepath.Ext(f.Name()))
+
+	require.NoError(t, commit(f, final))
+	assert.FileExists(t, final)
+	assert.NoFileExists(t, f.Name())
+}
+
+// The same property against a real SIGKILL: this test re-runs itself as a
+// child that snapshots continuously, kills it without warning, and requires
+// every file under a final name to parse.
+func TestAKilledProcessLeavesNoProfileThatLooksComplete(t *testing.T) {
+	if dir := os.Getenv("PROFILING_CHILD_DIR"); dir != "" {
+		snapshotUntilKilled(dir)
+
+		return
+	}
+
+	dir := t.TempDir()
+	child := exec.Command(os.Args[0], "-test.run", t.Name(), "-test.timeout=60s")
+	child.Env = append(os.Environ(), "PROFILING_CHILD_DIR="+dir)
+	require.NoError(t, child.Start())
+
+	// Killed once it is demonstrably in the middle of writing: several
+	// snapshots have landed, so the next one is in flight.
+	deadline := time.Now().Add(30 * time.Second)
+	for len(glob(t, dir, "*.pprof")) < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.NoError(t, child.Process.Kill())
+	_ = child.Wait()
+
+	complete := glob(t, dir, "*.pprof")
+	require.NotEmpty(t, complete, "the child wrote nothing, so this proves nothing")
+	for _, name := range complete {
+		parse(t, name)
+	}
+}
+
+// snapshotUntilKilled is the child half of the test above. The goroutines make
+// the profile large enough that writing it takes real time, so a kill at an
+// arbitrary moment is likely to land inside a write.
+func snapshotUntilKilled(dir string) {
+	park := make(chan struct{})
+	defer close(park)
+	for range 20000 {
+		go func() { <-park }()
+	}
+
+	p, err := Start(Config{
+		Kinds: map[Kind]bool{KindGoroutine: true}, Dir: dir,
+		Interval: time.Millisecond, CPUWindow: time.Hour,
+	}, 1)
+	if err != nil {
+		panic(err)
+	}
+	defer func() { _ = p.Stop() }()
+
+	time.Sleep(time.Minute)
+}
+
+func glob(t *testing.T, dir, pattern string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, pattern))
+	require.NoError(t, err)
+
+	return matches
 }
