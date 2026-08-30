@@ -1,0 +1,97 @@
+# Three-host bare-metal cluster, RS(2,1), one host per physical machine.
+#
+# The same node layout as 3host.toml, moved onto real hardware: bottlebrush,
+# ironbark and casuarina, addressed on their 25GbE br-lan. Colocated nodes
+# still talk over the in-process pipe and remote ones over QUIC, so the
+# transport split is identical and only the wire underneath it changes.
+#
+#     scripts/bench/hw/hwbench.sh deploy && scripts/bench/hw/hwbench.sh start
+#
+# RS(2,1) over three hosts places exactly one shard per host, so a GET reads
+# one shard locally and fetches exactly one from a peer. That is the cleanest
+# attribution of inter-node transport cost this topology can produce, and it
+# is why the comparison against the loopback profiles uses three hosts rather
+# than four.
+
+version = 1
+region = "ap-southeast-2"
+
+[rs]
+data = 2
+parity = 1
+
+# The S3 gate's HTTP surface. enable_http2 advertises h2 over ALPN and
+# defaults on. Only a client that offers h2 is given it, so this is a
+# fleet-wide backstop rather than the way to keep one client off h2: a client
+# multiplexing large bodies onto one connection should decline h2 itself.
+# [s3]
+# enable_http2 = true
+
+# data_dir, tls_cert, tls_key and encryption_key are deliberately absent:
+# they are host-local, and start.sh passes them as flags so this file stays
+# identical on every machine.
+[[host]]
+id = 1
+addr = "10.10.8.4"
+
+  [[host.node]]
+  id = 1
+  role = "gate"
+  port = 8443
+
+  [[host.node]]
+  id = 2
+  role = "meta"
+  port = 6660
+
+  [[host.node]]
+  id = 3
+  role = "blob"
+  port = 9991
+
+[[host]]
+id = 2
+addr = "10.10.8.5"
+
+  [[host.node]]
+  id = 4
+  role = "gate"
+  port = 8443
+
+  [[host.node]]
+  id = 5
+  role = "meta"
+  port = 6660
+
+  [[host.node]]
+  id = 6
+  role = "blob"
+  port = 9991
+
+[[host]]
+id = 3
+addr = "10.10.8.6"
+
+  [[host.node]]
+  id = 7
+  role = "gate"
+  port = 8443
+
+  [[host.node]]
+  id = 8
+  role = "meta"
+  port = 6660
+
+  [[host.node]]
+  id = 9
+  role = "blob"
+  port = 9991
+
+# A config-defined service account. These are trusted: the policy table is
+# only consulted for IAM accounts, so none is written here.
+[[auth]]
+access_key_id = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+account_id = "123456789012"
+
+# No buckets defined — tests and benchmarks create their own.
