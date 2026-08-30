@@ -131,8 +131,27 @@ export PREDA_CONFIG_DIR="$WORK_DIR/config"
 export TMPDIR="$WORK_DIR/tmp"
 mkdir -p "$PREDA_DIR" "$PREDA_CONFIG_DIR" "$TMPDIR"
 
+# pin_availability states the two [rs] availability settings a profile runs
+# under instead of inheriting them, so a scenario measures the behaviour it
+# names even when the build's defaults change underneath it.
+pin_availability() {
+    local file="$1" degraded="$2" handoff="$3"
+    awk -v d="$degraded" -v h="$handoff" \
+        '/^\[rs\]$/ { print; print "degraded_writes = " d; print "hinted_handoff = " h; next } { print }' \
+        "$file" > "$file.tmp"
+    mv "$file.tmp" "$file"
+}
+
+# pin_repair_off is the same for the sweep: a profile testing what a damaged
+# cluster does must not have the damage repaired underneath it.
+pin_repair_off() {
+    printf '\n[repair]\nenabled = false\n' >> "$1"
+}
+
 CONFIG_FILE="$PREDA_CONFIG_DIR/$CONFIG_NAME.toml"
 render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$CONFIG_FILE" "$PORT_OFFSET"
+pin_availability "$CONFIG_FILE" false false
+pin_repair_off "$CONFIG_FILE"
 cp "$CONFIG_FILE" "$RUN_DIR/$CONFIG_NAME.toml"
 
 CA_FILE="$PREDA_DIR/server.pem"
@@ -333,9 +352,7 @@ REPAIR_CASES=0
 # nothing here can collide with the cluster the rest of the run uses.
 render_repair_profile() {
     render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$REPAIR_CONFIG" "$(( PORT_OFFSET + 100 ))"
-    awk '/^\[rs\]$/ { print; print "degraded_writes = true"; next } { print }' \
-        "$REPAIR_CONFIG" > "$REPAIR_CONFIG.tmp"
-    mv "$REPAIR_CONFIG.tmp" "$REPAIR_CONFIG"
+    pin_availability "$REPAIR_CONFIG" true false
     cat >> "$REPAIR_CONFIG" <<EOF
 
 [repair]
@@ -568,15 +585,13 @@ HANDOFF_DEADLINE="${STRESS_HANDOFF_DEADLINE:-180}"
 HANDOFF_FAILURES=0
 HANDOFF_CASES=0
 
-# render_handoff_profile turns handoff on and leaves degraded writes alone, so
-# the write floor stays the full stripe. Repair is on so the shards can be
+# render_handoff_profile turns handoff on and degraded writes explicitly off,
+# so the write floor stays the full stripe. Repair is on so the shards can be
 # watched coming home, and the bucket is public so an unsigned GET can read the
 # header saying what a read cost.
 render_handoff_profile() {
     render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$HANDOFF_CONFIG" "$(( PORT_OFFSET + 200 ))"
-    awk '/^\[rs\]$/ { print; print "hinted_handoff = true"; next } { print }' \
-        "$HANDOFF_CONFIG" > "$HANDOFF_CONFIG.tmp"
-    mv "$HANDOFF_CONFIG.tmp" "$HANDOFF_CONFIG"
+    pin_availability "$HANDOFF_CONFIG" false true
     cat >> "$HANDOFF_CONFIG" <<EOF
 
 [repair]
@@ -592,7 +607,7 @@ account_id = "123456789012"
 EOF
     grep -q '^hinted_handoff = true$' "$HANDOFF_CONFIG" \
         || fail "handoff: hinted_handoff was not written into $HANDOFF_CONFIG"
-    if grep -q '^degraded_writes' "$HANDOFF_CONFIG"; then
+    if grep -q '^degraded_writes = true$' "$HANDOFF_CONFIG"; then
         fail "handoff: degraded writes are on, so an accepted write proves nothing about handoff"
     fi
     cp "$HANDOFF_CONFIG" "$RUN_DIR/$HANDOFF_CLUSTER.toml"
@@ -839,9 +854,7 @@ render_node_profile() {
     local target="$1" offset="$2" pin="$3"
 
     render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$target" "$offset"
-    awk '/^\[rs\]$/ { print; print "degraded_writes = true"; print "hinted_handoff = true"; next } { print }' \
-        "$target" > "$target.tmp"
-    mv "$target.tmp" "$target"
+    pin_availability "$target" true true
     cat >> "$target" <<EOF
 
 [repair]
@@ -1243,6 +1256,8 @@ peak_rss_mib() {
 
 render_large_profile() {
     render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$LARGE_CONFIG" "$(( PORT_OFFSET + 300 ))"
+    pin_availability "$LARGE_CONFIG" false false
+    pin_repair_off "$LARGE_CONFIG"
     cat >> "$LARGE_CONFIG" <<EOF
 
 [[bucket]]
@@ -1686,6 +1701,8 @@ lm_check() {
 
 render_lastmod_profile() {
     render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$LM_CONFIG" "$(( PORT_OFFSET + 700 ))"
+    pin_availability "$LM_CONFIG" false false
+    pin_repair_off "$LM_CONFIG"
     cat >> "$LM_CONFIG" <<EOF
 
 [[bucket]]
