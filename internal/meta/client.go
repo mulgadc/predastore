@@ -33,16 +33,29 @@ type Item struct {
 // belongs to the caller.
 //
 // Reads try the cached leader then every replica; writes follow not-leader
-// redirects and cache the leader they land on.
+// redirects and cache the leader they land on. A replica that fails an attempt
+// is ordered last until it answers again, so one unresponsive replica costs a
+// deadline once rather than once per operation.
 type Client struct {
 	rpc        *rpc.Client
 	replicas   []config.NodeID
 	timeout    time.Duration
 	maxRetries int
 
-	mu     sync.Mutex
-	leader config.NodeID // cached leader replica id; 0 means unknown
+	// now is the clock the cooldown is judged against. Production reads the
+	// wall clock; a test supplies its own so expiry does not take 30s.
+	now func() time.Time
+
+	mu           sync.Mutex
+	leader       config.NodeID // cached leader replica id; 0 means unknown
+	unresponsive map[config.NodeID]time.Time
 }
+
+// replicaCooldown is how long a replica that failed an attempt is ordered
+// last. It has to outlast the gap between two operations for the second to
+// benefit from what the first learned, and demotion only ever means tried after
+// the others, so erring long is cheap.
+const replicaCooldown = 30 * time.Second
 
 // ClientConfig configures a Client.
 type ClientConfig struct {
@@ -74,17 +87,25 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		cfg.MaxRetries = 3
 	}
 	return &Client{
-		rpc:        cfg.Client,
-		replicas:   cfg.Replicas,
-		timeout:    cfg.Timeout,
-		maxRetries: cfg.MaxRetries,
+		rpc:          cfg.Client,
+		replicas:     cfg.Replicas,
+		timeout:      cfg.Timeout,
+		maxRetries:   cfg.MaxRetries,
+		now:          time.Now,
+		unresponsive: make(map[config.NodeID]time.Time),
 	}, nil
 }
 
 // call performs one request round trip against a replica: header, optional
 // body, half-close, then the response envelope. The configured timeout bounds
 // the attempt only as a fallback; cancelling ctx aborts it sooner.
-func (c *Client) call(ctx context.Context, target config.NodeID, op rpc.Opcode, req *MetaRequest, body []byte) (*MetaResponse, error) {
+//
+// Whether the replica answered is recorded either way, which is what stops the
+// next operation leading with a replica this one has just waited out.
+func (c *Client) call(ctx context.Context, target config.NodeID, op rpc.Opcode, req *MetaRequest, body []byte) (resp *MetaResponse, err error) {
+	caller := ctx
+	defer func() { c.observeReplica(caller, target, err) }()
+
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
@@ -108,29 +129,67 @@ func (c *Client) call(ctx context.Context, target config.NodeID, op rpc.Opcode, 
 	stop := context.AfterFunc(ctx, func() { stream.CancelRead(0) })
 	defer stop()
 
-	var resp MetaResponse
-	if err := json.NewDecoder(stream).Decode(&resp); err != nil {
+	var decoded MetaResponse
+	if err := json.NewDecoder(stream).Decode(&decoded); err != nil {
 		stream.CancelRead(0)
 		return nil, fmt.Errorf("decode response from replica %d: %w", target, err)
 	}
-	return &resp, nil
+	return &decoded, nil
 }
 
-// readOrder returns replicas with the cached leader first.
+// observeReplica records whether a replica answered. A caller that has given up
+// is not evidence about any replica: its cancellation fails every attempt in
+// flight, and marking on it would demote the whole set for one abandoned
+// request.
+func (c *Client) observeReplica(caller context.Context, target config.NodeID, err error) {
+	if err != nil && caller.Err() != nil {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err == nil {
+		delete(c.unresponsive, target)
+
+		return
+	}
+	c.unresponsive[target] = c.now()
+}
+
+// readOrder returns the replicas that answered most recently first, cached
+// leader ahead of the rest, and any replica still inside its cooldown last.
+//
+// Last, never absent. Reads consult every replica before giving up and writes
+// rotate through all of them, so this changes how long an answer takes and not
+// which answers are reachable — which is what makes a stale mark harmless.
 func (c *Client) readOrder() []config.NodeID {
 	c.mu.Lock()
 	leader := c.leader
+	cooling := make(map[config.NodeID]bool, len(c.unresponsive))
+	for id, at := range c.unresponsive {
+		if c.now().Sub(at) < replicaCooldown {
+			cooling[id] = true
+		} else {
+			delete(c.unresponsive, id)
+		}
+	}
 	c.mu.Unlock()
 
 	order := make([]config.NodeID, 0, len(c.replicas))
-	if leader != 0 {
+	if leader != 0 && !cooling[leader] {
 		order = append(order, leader)
 	}
 	for _, id := range c.replicas {
-		if id != leader {
+		if id != leader && !cooling[id] {
 			order = append(order, id)
 		}
 	}
+	for _, id := range c.replicas {
+		if cooling[id] {
+			order = append(order, id)
+		}
+	}
+
 	return order
 }
 

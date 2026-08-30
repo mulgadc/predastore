@@ -242,6 +242,8 @@ Reads try the cached leader first, then every replica, and only report not-found
 
 Writes go through the leader. A replica that cannot commit answers `not-leader` with the leader's advertise address when it knows one, and the client goes straight there; otherwise it rotates to the next replica after a short pause while an election settles. Attempts are bounded at `MaxRetries × len(replicas)` (default 3 per replica). A 10s per-attempt timeout is layered on the caller's context as a fallback; the caller's own cancellation still wins.
 
+A replica that fails an attempt is ordered last for 30s, so one unresponsive replica costs a deadline once rather than once per operation. This orders replicas and never removes one: reads consult every replica before giving up and writes rotate through all of them, so a stale mark changes how long an answer takes and not which answers are reachable. A replica whose process is stopped but whose transport is still up is the case it exists for — the stream opens, nothing comes back, and only the deadline tells the two apart. The mark clears on the replica's next success, and a caller cancelling its own request marks nobody.
+
 ## Tuning
 
 Defaults applied in `meta.New`, over hashicorp/raft's own:
