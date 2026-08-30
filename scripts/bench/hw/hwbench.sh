@@ -50,7 +50,12 @@ TOOLS_HOST="${HW_TOOLS_HOST:-${HOSTS[-1]}}"
 log()  { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 fail() { printf '%s FAIL %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; exit 1; }
 
-on() { local h="$1"; shift; timeout 120 ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$h" "$@"; }
+# SSH_TIMEOUT bounds every remote command. The default suits the short control
+# commands; a benchmark pass raises it, because the compare preset runs three
+# workloads of two minutes each and being killed at 120s looks like empty output.
+SSH_TIMEOUT="${HW_SSH_TIMEOUT:-120}"
+
+on() { local h="$1"; shift; timeout "$SSH_TIMEOUT" ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$h" "$@"; }
 
 # each runs one command on every host, in parallel, and fails if any host does.
 each() {
@@ -177,8 +182,12 @@ cmd_start() {
     local inner
     for i in "${!HOSTS[@]}"; do
         h="${HOSTS[$i]}"; id=$((i + 1))
+        # GOMAXPROCS is passed through because these hosts present 256 threads
+        # to a process that does a couple of cores of work, and the runtime's
+        # own scheduling is measurable at that ratio. Empty means unset.
         inner="cd $HW_ROOT/$ref && \
             export SSL_CERT_FILE=$HW_ROOT/inputs/server.pem \
+                   GOMAXPROCS='${GOMAXPROCS:-}' \
                    GO_PROF='${GO_PROF:-}' GO_PROF_DIR='${GO_PROF_DIR:-}' \
                    GO_PROF_INTERVAL='${GO_PROF_INTERVAL:-}' \
                    GO_PROF_CPU_WINDOW='${GO_PROF_CPU_WINDOW:-}' && \
@@ -276,6 +285,7 @@ cmd_verify() {
 cmd_perf() {
     local ref="${1:?usage: perf <ref>}" tag="${2:-run1}"
     local hosts i sha
+    local SSH_TIMEOUT="${HW_PERF_TIMEOUT:-2400}"
     hosts=""
     for i in "${!ADDRS[@]}"; do hosts="${hosts:+$hosts,}${ADDRS[$i]}:$GATE_PORT"; done
     sha="$(cat "$WORK/build/s3d-$ref.sha" 2>/dev/null || echo unknown)"
@@ -285,6 +295,7 @@ cmd_perf() {
     scp -q "$REPO_DIR/scripts/bench/e2e-performance.sh" \
         "$TOOLS_HOST:$HW_ROOT/harness/scripts/bench/e2e-performance.sh"
 
+    local rc=0
     on "$TOOLS_HOST" "chmod +x $HW_ROOT/harness/scripts/bench/e2e-performance.sh && \
         PATH=$HW_ROOT/tools/aws-cli/v2/current/bin:\$PATH \
         WARP=$HW_ROOT/tools/warp \
@@ -294,7 +305,22 @@ cmd_perf() {
         PERF_EXTERNAL_SHA=$sha \
         PERF_EXTERNAL_GO='$(go version)' \
         PERF_RESULTS_ROOT=$HW_ROOT/results \
-        $HW_ROOT/harness/scripts/bench/e2e-performance.sh 2>&1 | tail -30"
+        $HW_ROOT/harness/scripts/bench/e2e-performance.sh 2>&1 | tail -30" || rc=$?
+    save_host_logs "$ref" "$tag"
+    return "$rc"
+}
+
+# save_host_logs keeps each run's server logs. cmd_start truncates them on every
+# launch and the external harness has no route to them, so without this the only
+# account of a failed run is the client's side of it.
+save_host_logs() {
+    local ref="$1" tag="$2" i h id dest
+    dest="$HW_ROOT/hostlogs/$ref-$tag-$(date -u +%Y%m%dT%H%M%SZ)"
+    for i in "${!HOSTS[@]}"; do
+        h="${HOSTS[$i]}"; id=$((i + 1))
+        on "$h" "mkdir -p $dest && cp $HW_ROOT/$ref/logs/host-$id.log $dest/" || true
+    done
+    log "host logs saved to $dest on each host"
 }
 
 awscli() {
