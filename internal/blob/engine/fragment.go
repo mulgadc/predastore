@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync/atomic"
 )
 
 // Fragment layout (8240 bytes):
@@ -50,6 +51,13 @@ const (
 // either the ciphertext, the on-disk header bytes that feed AAD reconstruction,
 // or the master key / storeID do not match what was bound at seal time.
 var ErrIntegrity = errors.New("fragment integrity check failed")
+
+// integrityFailures counts fragments that failed their tag since the process
+// started, reported through Snapshot. An atomic on the error branch rather than
+// an instrument call: open runs per fragment, which is far too hot to record on,
+// and a failure returns up through a caller that may swallow the distinction
+// between corruption and a missing key.
+var integrityFailures atomic.Uint64
 
 // fragment is a fixed-size view over the on-disk layout, instantiated by casting
 // a slice of a window buffer:
@@ -105,6 +113,7 @@ func (f *fragment) open(aead cipher.AEAD, key [32]byte, index, storeID uint32) (
 	nonce := makeNonce(f.fragNum(), storeID)
 	plaintext, err := aead.Open(f.ciphertext()[:0], nonce[:], f.ciphertext(), aad[:])
 	if err != nil {
+		integrityFailures.Add(1)
 		return nil, fmt.Errorf("%w: %w", ErrIntegrity, err)
 	}
 

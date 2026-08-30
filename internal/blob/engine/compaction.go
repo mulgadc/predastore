@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -134,7 +136,8 @@ func (store *Store) compactOnce() error {
 	}
 
 	var totalExtents int
-	var totalBytes int64
+	var totalBytes, totalReclaimed int64
+	var dropped int64
 	for _, num := range candidates {
 		segStart := time.Now()
 		stats, err := store.compactSegment(num)
@@ -145,8 +148,10 @@ func (store *Store) compactOnce() error {
 			failed++
 			continue
 		}
+		dropped++
 		totalExtents += stats.extents
 		totalBytes += stats.bytes
+		totalReclaimed += stats.reclaimed
 		slog.Info("compacted segment",
 			"segNum", num,
 			"extents", stats.extents,
@@ -154,12 +159,27 @@ func (store *Store) compactOnce() error {
 			"duration", time.Since(segStart))
 	}
 
+	elapsed := time.Since(start)
+
+	store.mutex.Lock()
+	store.stats.cycles++
+	if failed > 0 {
+		store.stats.cyclesFailed++
+	}
+	store.stats.segmentsScanned += int64(len(candidates))
+	store.stats.segmentsDropped += dropped
+	store.stats.bytesRelocated += totalBytes
+	store.stats.bytesReclaimed += totalReclaimed
+	store.stats.lastCycleSecs = elapsed.Seconds()
+	store.mutex.Unlock()
+
 	slog.Info("compaction finished",
 		"segments", len(candidates),
 		"extents", totalExtents,
 		"bytes", totalBytes,
+		"reclaimed", totalReclaimed,
 		"failed", failed,
-		"duration", time.Since(start))
+		"duration", elapsed)
 	return nil
 }
 
@@ -235,6 +255,8 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 		return nil, 0, fmt.Errorf("scan tombstones: %w", err)
 	}
 
+	store.recordOccupancy(dead)
+
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
@@ -272,10 +294,51 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 	return candidates, failed, nil
 }
 
-// segmentStats summarises the live data relocated out of one drained segment.
+// recordOccupancy measures how much of the store's on-disk bytes are dead, for
+// Snapshot to report. It runs once per compaction cycle, where a directory walk
+// is affordable, precisely so the reporting path never has to do one.
+//
+// dead carries every tombstone, including any left behind for a segment that
+// has already been dropped, so the live figure is clamped at zero rather than
+// trusted to be consistent with the files on disk.
+func (store *Store) recordOccupancy(dead map[uint64]int64) {
+	entries, err := os.ReadDir(store.dir)
+	if err != nil {
+		slog.Warn("occupancy measurement skipped", "dir", store.dir, "error", err)
+		return
+	}
+
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".seg" {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			slog.Warn("occupancy measurement skipped a segment", "name", e.Name(), "error", err)
+			continue
+		}
+		total += info.Size()
+	}
+
+	var deadBytes int64
+	for _, b := range dead {
+		deadBytes += b
+	}
+
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	store.stats.scanAt = time.Now()
+	store.stats.deadBytes = min(deadBytes, total)
+	store.stats.liveBytes = max(total-deadBytes, 0)
+}
+
+// segmentStats summarises the live data relocated out of one drained segment,
+// and the on-disk bytes its drop gave back.
 type segmentStats struct {
-	extents int
-	bytes   int64
+	extents   int
+	bytes     int64
+	reclaimed int64
 }
 
 // compactSegment relocates a segment's live extents into the active append
@@ -317,6 +380,14 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 	}
 
 	store.mutex.Lock()
+	// Measured before the unlink, since afterwards there is nothing to stat.
+	// A segment that cannot be measured is still dropped: the reclaim figure
+	// is reporting, and must not decide whether the drop happens.
+	if seg, segErr := store.getSegment(num, false); segErr == nil {
+		if info, statErr := seg.Stat(); statErr == nil {
+			stats.reclaimed = info.Size()
+		}
+	}
 	err = store.dropSegment(num)
 	store.mutex.Unlock()
 	if err != nil {

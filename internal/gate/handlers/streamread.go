@@ -264,7 +264,7 @@ func (r *stripeReader) open(ctx context.Context, index int, node config.NodeID, 
 	if err == nil {
 		return rc, nil
 	}
-	recordShardReadError(ctx, err)
+	recordShardReadError(ctx, node, err)
 	if r.handoff != 0 && r.handoff != node {
 		if held, hErr := dial(r.handoff); hErr == nil {
 			slog.InfoContext(ctx, "Shard served from its handoff holder",

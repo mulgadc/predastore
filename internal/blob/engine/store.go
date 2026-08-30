@@ -69,14 +69,47 @@ type Store struct {
 	fullFreeFrac     float64
 
 	// statfs cache backing freeSpaceFraction; see statfsThrottleInterval.
-	statfsAt time.Time
-	freeFrac float64
+	statfsAt   time.Time
+	freeFrac   float64
+	freeBytes  uint64
+	totalBytes uint64
 
 	// bytesSinceStatfs accumulates reserved extent bytes since the last
 	// statfs; see statfsBytesInterval.
 	bytesSinceStatfs uint64
 
+	// Reported through Snapshot. Maintained rather than derived on demand: a
+	// reporter must not scan the tombstone namespace or the segment directory
+	// to answer, since it runs on a collection interval and would then charge
+	// the store for being observed.
+	stats storeStats
+
 	closed bool
+}
+
+// storeStats is everything Snapshot reports that is not already a field on
+// Store. Guarded by store.mutex, like the counters beside it.
+type storeStats struct {
+	// segments currently on disk, seeded by a single directory count at Open
+	// and maintained by create and drop from then on.
+	liveSegments int64
+
+	// Occupancy as measured by the last compaction scan, which already sums
+	// dead bytes per segment and stats every candidate. Reporting its numbers
+	// costs nothing; recomputing them per collection would cost a full scan.
+	// Zero scanAt means no cycle has run yet and neither figure is reported.
+	scanAt    time.Time
+	liveBytes int64
+	deadBytes int64
+
+	// Compaction totals, monotonic for the life of the process.
+	cycles          int64
+	cyclesFailed    int64
+	segmentsScanned int64
+	segmentsDropped int64
+	bytesRelocated  int64
+	bytesReclaimed  int64
+	lastCycleSecs   float64
 }
 
 type Reader interface {
@@ -211,6 +244,13 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("open disk index: %w", err)
 	}
 
+	// Counted once here, then maintained by create and drop. Doing it at Open
+	// is what keeps the reporting path free of a directory read.
+	store.stats.liveSegments, err = countSegments(dir)
+	if err != nil {
+		return nil, fmt.Errorf("count segments: %w", err)
+	}
+
 	if _, err := store.nextAvailableSegment(); err != nil {
 		return nil, err
 	}
@@ -226,6 +266,100 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 	)
 
 	return store, nil
+}
+
+// Snapshot is the store's capacity, occupancy and compaction state at one
+// instant, for a caller that reports it. Every field is read from a maintained
+// counter, so taking one costs a mutex acquisition and no I/O.
+type Snapshot struct {
+	// Free space as of the last statfs, which the write path refreshes; see
+	// statfsThrottleInterval. Measured reports whether one has happened at all:
+	// an idle store that has never appended has nothing to report yet, and zero
+	// free bytes would read as a full disk.
+	Measured   bool
+	FreeFrac   float64
+	FreeBytes  uint64
+	TotalBytes uint64
+
+	// Pressure is the watermark band the free fraction falls in: "ok",
+	// "nearfull" or "full", by the same comparison Append gates on.
+	Pressure string
+
+	// Monotonic counters persisted across restarts, so write volume comes out
+	// of them without counting anything on the write path.
+	SegNum   uint64
+	ValueNum uint64
+	FragNum  uint64
+
+	LiveSegments int64
+
+	// Occupancy as of the last compaction scan. Scanned is false until one has
+	// run: a store with compaction disabled never reports occupancy at all,
+	// which is honest, where a zero would read as a store holding no dead data.
+	Scanned   bool
+	LiveBytes int64
+	DeadBytes int64
+
+	CompactionCycles       int64
+	CompactionCyclesFailed int64
+	SegmentsScanned        int64
+	SegmentsDropped        int64
+	BytesRelocated         int64
+	BytesReclaimed         int64
+	LastCycleSeconds       float64
+
+	// IntegrityFailures counts fragments that failed their GCM tag since the
+	// process started. Non-zero means bytes on disk no longer authenticate,
+	// which is corruption rather than a routine error.
+	IntegrityFailures uint64
+}
+
+// Pressure bands, matching the watermarks Append gates on.
+const (
+	PressureOK       = "ok"
+	PressureNearFull = "nearfull"
+	PressureFull     = "full"
+)
+
+// Snapshot reports the store's current capacity and compaction state. It takes
+// no statfs and scans nothing: an idle store answers from the last measurement
+// the write path took, and reports Measured false until there has been one.
+func (store *Store) Snapshot() Snapshot {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+
+	s := Snapshot{
+		Measured:               !store.statfsAt.IsZero(),
+		FreeFrac:               store.freeFrac,
+		FreeBytes:              store.freeBytes,
+		TotalBytes:             store.totalBytes,
+		SegNum:                 store.segNum,
+		ValueNum:               store.valueNum,
+		FragNum:                store.fragNum,
+		LiveSegments:           store.stats.liveSegments,
+		Scanned:                !store.stats.scanAt.IsZero(),
+		LiveBytes:              store.stats.liveBytes,
+		DeadBytes:              store.stats.deadBytes,
+		CompactionCycles:       store.stats.cycles,
+		CompactionCyclesFailed: store.stats.cyclesFailed,
+		SegmentsScanned:        store.stats.segmentsScanned,
+		SegmentsDropped:        store.stats.segmentsDropped,
+		BytesRelocated:         store.stats.bytesRelocated,
+		BytesReclaimed:         store.stats.bytesReclaimed,
+		LastCycleSeconds:       store.stats.lastCycleSecs,
+		IntegrityFailures:      integrityFailures.Load(),
+	}
+
+	s.Pressure = PressureOK
+	switch {
+	case !s.Measured:
+	case s.FreeFrac < store.fullFreeFrac:
+		s.Pressure = PressureFull
+	case s.FreeFrac < store.nearfullFreeFrac:
+		s.Pressure = PressureNearFull
+	}
+
+	return s
 }
 
 // Lookup returns a reader for the given key. The underlying segment is

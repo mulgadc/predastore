@@ -1,16 +1,19 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/gate/chunked"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 // PutObject serves PUT /{bucket}/{key}: the body is erasure coded across the
@@ -25,10 +28,12 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 		bucket, key := resource.Bucket.Name, resource.Key
 
+		phase := time.Now()
 		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
+		phase = recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseBucketCheck, phase)
 
 		objectHash := model.ObjectHash(bucket, key)
 
@@ -48,8 +53,10 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 
 		written, err := writeObject(ctx, bc, cfg, ring, body, size, objectHash, place)
+		recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseShardFanout, phase)
 		if err != nil {
 			slog.ErrorContext(ctx, "putObject: shard distribution failed", "error", err)
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, writeFailureReason(err))
 			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, mapPutErr(err))
 			return
@@ -73,19 +80,28 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// Object hash -> shard placement, for retrieval. This is the commit
 		// point: before it the write is invisible, after it the epoch it names
 		// is what every read will demand, and the shards already carry it.
+		phase = time.Now()
 		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), record); err != nil {
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
 			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
+		phase = recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseMetaPlacement, phase)
 
 		commitShards(ctx, bc, objectHash, place, written)
 
 		// Listing key -> object hash, for ListObjects.
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
+		recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseMetaListing, phase)
+
+		// Counted only once both keys have landed: until then the shards exist
+		// but nothing references them, which is not an object.
+		telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeSuccess, "")
 
 		// Nearfull writes still succeed; the header lets clients back off before
 		// hitting the hard 507 rejection.
@@ -104,6 +120,15 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		w.Header().Set("ETag", model.ObjectETag(bucket, key))
 		w.WriteHeader(http.StatusOK)
 	})
+}
+
+// recordPhase records the time since start as one phase of an object request
+// and returns the instant the next phase begins, so chained phases share a
+// single clock read at each boundary and cannot overlap each other.
+func recordPhase(ctx context.Context, op, phase string, start time.Time) time.Time {
+	now := time.Now()
+	telemetry.RecordObjectPhase(ctx, op, phase, now.Sub(start).Seconds())
+	return now
 }
 
 // finishPayload completes the SigV4 payload check on a body large enough that sigv4

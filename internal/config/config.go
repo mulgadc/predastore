@@ -82,6 +82,10 @@ type Host struct {
 	// TLSCert and TLSKey identify the host to its peers and to S3 clients.
 	TLSCert string `toml:"tls_cert"`
 	TLSKey  string `toml:"tls_key"`
+	// AdminPort serves /healthz and /readyz on BindAddr. It is a property of
+	// the process rather than a role, so it sits here rather than becoming a
+	// fourth node role. Zero runs no admin listener.
+	AdminPort int `toml:"admin_port"`
 	// Nodes are the roles this host runs, as written under [[host.node]].
 	Nodes []Node `toml:"node"`
 }
@@ -471,6 +475,17 @@ func (c *Config) validateTopology() error {
 				return fmt.Errorf("nodes %d and %d both use data dir %s on host %d", other, n.ID, dir, h.ID)
 			}
 			dirs[dir] = n.ID
+		}
+
+		// The admin listener shares the host's cluster plane with the nodes, so
+		// it is one more port on the same machine and collides the same way.
+		if h.AdminPort != 0 {
+			if h.AdminPort < 1 || h.AdminPort > 65535 {
+				return fmt.Errorf("host %d admin_port %d is not a port", h.ID, h.AdminPort)
+			}
+			if other, ok := ports[h.AdminPort]; ok {
+				return fmt.Errorf("host %d admin_port %d is already used by node %d", h.ID, h.AdminPort, other)
+			}
 		}
 	}
 

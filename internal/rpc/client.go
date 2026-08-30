@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	"github.com/mulgadc/predastore/internal/config"
+	"github.com/mulgadc/predastore/internal/telemetry"
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
@@ -68,7 +69,12 @@ func OpenStream[T Header](
 		return nil, fmt.Errorf("write metadata + header: %w", err)
 	}
 
-	return &healthStream{Stream: stream, pool: c.pool, conn: conn}, nil
+	return &healthStream{
+		Stream:  stream,
+		pool:    c.pool,
+		conn:    conn,
+		release: telemetry.EnterRPCStream(ctx, uint64(remote)),
+	}, nil
 }
 
 var _ transport.Stream = (*healthStream)(nil)
@@ -82,6 +88,35 @@ type healthStream struct {
 	pool     *ConnPool
 	conn     transport.Conn
 	reported atomic.Bool
+
+	// release drops this stream from the open-stream gauge, on the first of
+	// Close, CancelRead or CancelWrite. A stream that is abandoned without any
+	// of them keeps its count, which is the leak the gauge exists to show.
+	release  func()
+	released atomic.Bool
+}
+
+// done releases the stream from the gauge exactly once, whichever teardown
+// call gets there first.
+func (s *healthStream) done() {
+	if s.released.CompareAndSwap(false, true) {
+		s.release()
+	}
+}
+
+func (s *healthStream) Close() error {
+	s.done()
+	return s.Stream.Close()
+}
+
+func (s *healthStream) CancelRead(code transport.StreamErrorCode) {
+	s.done()
+	s.Stream.CancelRead(code)
+}
+
+func (s *healthStream) CancelWrite(code transport.StreamErrorCode) {
+	s.done()
+	s.Stream.CancelWrite(code)
 }
 
 func (s *healthStream) note(n int64, err error) {

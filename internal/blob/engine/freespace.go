@@ -27,20 +27,23 @@ const (
 	statfsBytesInterval = 64 << 20 // 64 MiB
 )
 
-// statfsFree reports the free-space fraction of the filesystem backing dir,
-// as Bavail/Blocks — space available to an unprivileged writer, excluding a
-// filesystem's own reserved-blocks headroom.
+// statfsFree reports the space available to an unprivileged writer on the
+// filesystem backing dir, and that filesystem's total size. Available excludes
+// the filesystem's own reserved-blocks headroom, so the pair yields Bavail/Blocks
+// as a fraction.
+//
+// Absolute bytes are reported alongside the fraction because a fraction alone
+// cannot say how long the remaining space lasts: 5% of 200 GB and 5% of 2 TB
+// are the same watermark and very different amounts of warning.
 //
 // A package-level var so tests can substitute a synthetic implementation.
-var statfsFree = func(dir string) (float64, error) {
+var statfsFree = func(dir string) (freeBytes, totalBytes uint64, err error) {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(dir, &stat); err != nil {
-		return 0, fmt.Errorf("statfs %s: %w", dir, err)
+		return 0, 0, fmt.Errorf("statfs %s: %w", dir, err)
 	}
-	if stat.Blocks == 0 {
-		return 1, nil
-	}
-	return float64(stat.Bavail) / float64(stat.Blocks), nil
+	bsize := uint64(stat.Bsize)
+	return stat.Bavail * bsize, stat.Blocks * bsize, nil
 }
 
 // freeSpaceFraction returns the store's cached free-space fraction, refreshing
@@ -55,12 +58,21 @@ func (store *Store) freeSpaceFraction() (float64, error) {
 		return store.freeFrac, nil
 	}
 
-	frac, err := statfsFree(store.dir)
+	freeBytes, totalBytes, err := statfsFree(store.dir)
 	if err != nil {
 		return 0, err
 	}
 
+	// A filesystem reporting no blocks at all is treated as empty rather than
+	// as a division by zero, which would read as a full store and reject writes.
+	frac := 1.0
+	if totalBytes > 0 {
+		frac = float64(freeBytes) / float64(totalBytes)
+	}
+
 	store.freeFrac = frac
+	store.freeBytes = freeBytes
+	store.totalBytes = totalBytes
 	store.statfsAt = now
 	store.bytesSinceStatfs = 0
 	return frac, nil

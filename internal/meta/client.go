@@ -10,6 +10,7 @@ import (
 
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/rpc"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 // ErrNotFound is returned by reads when no replica holds the key.
@@ -139,6 +140,25 @@ func (c *Client) cacheLeader(id config.NodeID) {
 	c.mu.Unlock()
 }
 
+// observeOp records one meta operation and how long it took, counting every
+// replica the attempt had to try. Deferred from the exported methods rather
+// than from call, so a read that tried three replicas is one operation.
+//
+// Not-found is its own outcome. It is the answer to a question, not a failure,
+// and counting it as one would make a HEAD of a missing object look like a
+// broken meta plane.
+func observeOp(ctx context.Context, op string, start time.Time, err *error) {
+	outcome := telemetry.OutcomeSuccess
+	switch {
+	case *err == nil:
+	case errors.Is(*err, ErrNotFound):
+		outcome = telemetry.MetaOutcomeNotFound
+	default:
+		outcome = telemetry.OutcomeError
+	}
+	telemetry.RecordMetaClientOp(ctx, op, outcome, time.Since(start).Seconds())
+}
+
 // request builds a wire header for a key. Callers hand keys over as strings;
 // the wire carries them as bytes so binary keys survive JSON.
 func request(key string, limit int) *MetaRequest {
@@ -147,7 +167,9 @@ func request(key string, limit int) *MetaRequest {
 
 // Get retrieves a value. A replica that has not applied the key yet answers
 // not-found, so every replica is consulted before giving up.
-func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
+func (c *Client) Get(ctx context.Context, key string) (value []byte, err error) {
+	defer observeOp(ctx, telemetry.MetaOpGet, time.Now(), &err)
+
 	var lastErr error
 	notFound := false
 	for _, id := range c.readOrder() {
@@ -202,7 +224,9 @@ func (c *Client) Scan(ctx context.Context, prefix string, limit int) ([]Item, er
 // so a key inserted behind the cursor is missed and one deleted ahead of it is
 // never seen. Every caller so far treats a pass as a sweep to be repeated
 // rather than an inventory, which is what makes that acceptable.
-func (c *Client) ScanFrom(ctx context.Context, prefix, after string, limit int) ([]Item, error) {
+func (c *Client) ScanFrom(ctx context.Context, prefix, after string, limit int) (items []Item, err error) {
+	defer observeOp(ctx, telemetry.MetaOpScan, time.Now(), &err)
+
 	var lastErr error
 	for _, id := range c.readOrder() {
 		req := request(prefix, limit)
@@ -242,7 +266,9 @@ func (c *Client) ListKeys(ctx context.Context, prefix string) ([]string, error) 
 // consults exactly the replica named: it never tries another replica and
 // never follows a not-leader redirect, because the caller is asking what
 // this specific process observes, not for a leader-consistent answer.
-func (c *Client) Status(ctx context.Context, target config.NodeID) (MetaStatus, error) {
+func (c *Client) Status(ctx context.Context, target config.NodeID) (status MetaStatus, err error) {
+	defer observeOp(ctx, telemetry.MetaOpStatus, time.Now(), &err)
+
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
@@ -259,7 +285,6 @@ func (c *Client) Status(ctx context.Context, target config.NodeID) (MetaStatus, 
 	stop := context.AfterFunc(ctx, func() { stream.CancelRead(0) })
 	defer stop()
 
-	var status MetaStatus
 	if err := json.NewDecoder(stream).Decode(&status); err != nil {
 		stream.CancelRead(0)
 		return MetaStatus{}, fmt.Errorf("decode status from replica %d: %w", target, err)
@@ -268,12 +293,14 @@ func (c *Client) Status(ctx context.Context, target config.NodeID) (MetaStatus, 
 }
 
 // Put stores a key-value pair through the leader.
-func (c *Client) Put(ctx context.Context, key string, value []byte) error {
+func (c *Client) Put(ctx context.Context, key string, value []byte) (err error) {
+	defer observeOp(ctx, telemetry.MetaOpPut, time.Now(), &err)
 	return c.write(ctx, OpMetaPut, request(key, 0), value)
 }
 
 // Delete removes a key through the leader.
-func (c *Client) Delete(ctx context.Context, key string) error {
+func (c *Client) Delete(ctx context.Context, key string) (err error) {
+	defer observeOp(ctx, telemetry.MetaOpDelete, time.Now(), &err)
 	return c.write(ctx, OpMetaDelete, request(key, 0), nil)
 }
 
@@ -298,9 +325,14 @@ func (c *Client) write(ctx context.Context, op rpc.Opcode, req *MetaRequest, bod
 			lastErr = ErrNotLeader
 			if id, perr := ParseRaftAddress(resp.Leader); perr == nil {
 				// The replica knows the leader: go straight there.
+				telemetry.RecordMetaRedirect(ctx, telemetry.RedirectNotLeader)
 				target = id
 				continue
 			}
+			// A replica that refuses and can name no leader means an election
+			// is still settling, which is a different fault from being sent
+			// somewhere else.
+			telemetry.RecordMetaRedirect(ctx, telemetry.RedirectNoLeader)
 		default:
 			lastErr = fmt.Errorf("replica %d: %s", target, resp.Err)
 		}
@@ -319,5 +351,6 @@ func (c *Client) write(ctx context.Context, op rpc.Opcode, req *MetaRequest, bod
 			}
 		}
 	}
+	telemetry.RecordMetaRedirect(ctx, telemetry.RedirectRetryExhausted)
 	return fmt.Errorf("write %q failed after %d attempts: %w", req.Key, attempts, lastErr)
 }

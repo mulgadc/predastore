@@ -15,6 +15,7 @@ import (
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 // GetObject serves GET /{bucket}/{key}, reconstructing the object from its
@@ -31,16 +32,19 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// -1 for both ends means "no Range header"; any value >= 0 is a range request.
 		rangeStart, rangeEnd := parseRangeHeader(r.Header.Get("Range"))
 
+		phase := time.Now()
 		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
+		phase = recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseBucketCheck, phase)
 
 		place, size, err := loadPlacement(ctx, mc, ring, cfg, bucket, key)
 		if err != nil {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
+		recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseMetaPlacement, phase)
 
 		handoff := handoffNode(ring, cfg, model.ObjectHash(bucket, key))
 		serveObject(ctx, w, r, bc, cfg, bucket, key, place, size, rangeStart, rangeEnd, handoff)
@@ -187,8 +191,15 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 	// An empty object has no shards to read: the write path stores none, since
 	// the blob protocol has no zero-length value to store.
 	if size == 0 {
+		telemetry.RecordObjectRead(ctx, telemetry.ReadPathDirect)
+
 		return nil, 0, nil
 	}
+
+	// Unlike the streaming path this helper holds the object whole, so the
+	// payload is resident for the length of the read and concurrency
+	// multiplies it.
+	defer telemetry.EnterGateInflight(ctx, telemetry.GateOpGet, size)()
 
 	start := time.Now()
 	reader, err := newStripeReader(ctx, bc, cfg, model.ObjectHash(bucket, key), place, handoff, opts...)
@@ -203,6 +214,11 @@ func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key stri
 			fmt.Sprintf("reconstruction failed: %v", err), 500)
 	}
 	reportDegradedRead(ctx, bucket, key, reader.failures, reader.reconstructed, time.Since(start))
+	if reader.reconstructed > 0 {
+		telemetry.RecordObjectRead(ctx, telemetry.ReadPathReconstructed)
+	} else {
+		telemetry.RecordObjectRead(ctx, telemetry.ReadPathDirect)
+	}
 
 	return out.Bytes(), reader.reconstructed, nil
 }
@@ -225,7 +241,7 @@ const handoffHeader = "X-Spx-Handoff"
 // readRangeFromSingleShard reads length bytes from one data shard starting at
 // at: the fast path when the whole range lands inside one block. The layout
 // has already resolved where that is, so there is no shard arithmetic here.
-func readRangeFromSingleShard(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, shardIdx int, at, length int64) ([]byte, error) {
+func readRangeFromSingleShard(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, shardIdx int, at, length int64) (data []byte, err error) {
 	if shardIdx >= len(place.DataShardNodes) {
 		return nil, fmt.Errorf("shard index %d out of range", shardIdx)
 	}
@@ -239,13 +255,16 @@ func readRangeFromSingleShard(ctx context.Context, bc BlobClient, objectHash [32
 		Epoch:      place.WriteEpoch,
 	}
 
+	start := time.Now()
+	defer func() { recordShardOutcome(ctx, telemetry.ShardOpRead, nodeNum, start, err) }()
+
 	reader, err := bc.Get(ctx, nodeNum, objectRequest)
 	if err != nil {
 		return nil, fmt.Errorf("get range from node %d: %w", nodeNum, err)
 	}
 	defer reader.Close() // CRITICAL: Close to release the stream back to the pool
 
-	data, err := io.ReadAll(reader)
+	data, err = io.ReadAll(reader)
 	if err != nil {
 		return nil, fmt.Errorf("read range data: %w", err)
 	}

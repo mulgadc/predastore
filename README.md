@@ -180,6 +180,7 @@ parity = 1    # parity shards; data + parity must not exceed the blob node count
 id   = 1
 addr = "10.11.12.1"        # what other hosts dial; no port — nodes carry those
 # bind_addr = "10.11.12.1" # where raft and blob listen; defaults to addr
+# admin_port = 9100        # /healthz and /readyz on bind_addr; absent runs neither
 # data_dir  = "/var/lib/predastore"   # absolute; -data-dir supplies it otherwise
 
   # A role this host runs. One of "gate", "blob" or "meta".
@@ -203,6 +204,10 @@ addr = "10.11.12.1"        # what other hosts dial; no port — nodes carry thos
 Node ids are unique across the whole file; ports are unique within a host. A blob or meta node without its own `data_dir` derives one from the host's root and its node id, so separate disks are a per-node setting rather than a deployment layout.
 
 S3 is a public service and replication is not, so the two bind separately on a multi-homed machine: the host's `bind_addr` is where raft and blob traffic listens, and the gate's own `bind_addr` is where S3 does. Set the first to a private address and the second to `0.0.0.0` and the S3 endpoint answers on every interface while nothing reaches consensus or shard traffic from outside. Neither is required — a host that names only `addr` binds that one address for both, which is what a single-homed machine wants.
+
+`admin_port` puts `/healthz` and `/readyz` on the host's `bind_addr`, alongside the cluster plane and never on the S3 port. `/healthz` answers 200 once the process is listening. `/readyz` answers 200 when this process can serve: a meta replica observes a leader, the meta plane answers a read, and at least `data` blob nodes answer one — whichever of those the roles on the host can be asked. It answers 503 otherwise, with a body naming which check failed and nothing else. A host that names no `admin_port` runs no admin listener.
+
+A background sampler runs those checks on a fixed interval and `/readyz` only ever serves its last result, so answering a request costs nothing beyond reading it — hammering the endpoint does not add load to the meta plane or the blob nodes. The answer can lag reality by up to one sampling interval, and a request arriving before the first cycle completes gets 503 rather than an unfounded 200.
 
 Write every node under one `[[host]]` and the cluster runs in one process over the in-process pipe. Spread them across hosts and each process is launched separately with its own `-host` id. Nothing else changes.
 

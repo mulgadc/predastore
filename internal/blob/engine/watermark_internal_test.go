@@ -70,9 +70,9 @@ func TestFreeSpaceFractionThrottled(t *testing.T) {
 
 	calls := 0
 	orig := statfsFree
-	statfsFree = func(string) (float64, error) {
+	statfsFree = func(string) (uint64, uint64, error) {
 		calls++
-		return 0.5, nil
+		return 512, 1024, nil
 	}
 	defer func() { statfsFree = orig }()
 
@@ -92,9 +92,9 @@ func TestFreeSpaceFractionRefreshesAfterInterval(t *testing.T) {
 
 	calls := 0
 	orig := statfsFree
-	statfsFree = func(string) (float64, error) {
+	statfsFree = func(string) (uint64, uint64, error) {
 		calls++
-		return 0.5, nil
+		return 512, 1024, nil
 	}
 	defer func() { statfsFree = orig }()
 
@@ -118,9 +118,9 @@ func TestFreeSpaceFractionRefreshesAfterByteThreshold(t *testing.T) {
 
 	calls := 0
 	orig := statfsFree
-	statfsFree = func(string) (float64, error) {
+	statfsFree = func(string) (uint64, uint64, error) {
 		calls++
-		return 0.5, nil
+		return 512, 1024, nil
 	}
 	defer func() { statfsFree = orig }()
 

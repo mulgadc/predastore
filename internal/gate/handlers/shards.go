@@ -116,6 +116,16 @@ func mapPutErr(err error) *model.S3Error {
 	return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 }
 
+// writeFailureReason classifies a failed object write into one of the bounded
+// reasons the counter carries, drawing the same line mapPutErr draws for the
+// client: capacity is its own outcome, everything else is one bucket.
+func writeFailureReason(err error) string {
+	if errors.Is(err, engine.ErrStoreFull) {
+		return telemetry.WriteReasonStoreFull
+	}
+	return telemetry.WriteReasonShardWrite
+}
+
 // placeShards resolves where an object's shards live, in the ring order
 // writeObject writes them in. Recording the placement is what makes the
 // object retrievable, so the two must derive from the same object hash.
@@ -157,6 +167,35 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// shardFailureReason classifies a shard failure into one of the bounded
+// reasons the counters carry. The error text names a node and a key, so only
+// the classification is recorded.
+func shardFailureReason(err error) string {
+	switch {
+	case errors.Is(err, blob.ErrNotFound):
+		return telemetry.ShardReasonNotFound
+	case errors.Is(err, engine.ErrStoreFull):
+		return telemetry.ShardReasonStoreFull
+	default:
+		return telemetry.ShardReasonTransport
+	}
+}
+
+// recordShardOutcome counts one shard operation against one node with its
+// duration, and adds an error under a bounded reason when it failed. Called
+// once per shard per object, which is why the attribute sets behind it are
+// cached rather than built per call.
+func recordShardOutcome(ctx context.Context, op string, node config.NodeID, start time.Time, err error) {
+	outcome := telemetry.OutcomeSuccess
+	if err != nil {
+		outcome = telemetry.OutcomeError
+	}
+	telemetry.RecordShardOp(ctx, op, outcome, uint64(node), time.Since(start).Seconds())
+	if err != nil {
+		telemetry.RecordShardError(ctx, op, shardFailureReason(err), uint64(node))
+	}
+}
+
 // writeSingleShard streams the body to one node without staging it. The blob
 // client reads at most size bytes, so an over-long body is truncated rather
 // than overrunning the shard; a short one is caught here, because placement
@@ -164,7 +203,10 @@ func (c *countingReader) Read(p []byte) (int, error) {
 func writeSingleShard(
 	ctx context.Context, bc BlobClient, node config.NodeID, body io.Reader, size int64,
 	objectHash [32]byte, epoch uint64,
-) (writeResult, error) {
+) (_ writeResult, err error) {
+	start := time.Now()
+	defer func() { recordShardOutcome(ctx, telemetry.ShardOpWrite, node, start, err) }()
+
 	counted := &countingReader{r: body}
 
 	resp, err := bc.Put(ctx, node, blob.PutRequest{Key: objectHash, Size: size, Index: 0, Epoch: epoch}, counted)
@@ -246,6 +288,10 @@ func streamShards(
 ) (writeResult, error) {
 	total := cfg.TotalShards()
 	shardSize, blockSize := lay.shardSize, lay.blockSize
+
+	// What a write costs in memory is the working set, not the object: the
+	// stripe loop holds TotalShards blocks and the body streams through it.
+	defer telemetry.EnterGateInflight(ctx, telemetry.GateOpPut, int64(total)*blockSize)()
 
 	enc, err := reedsolomon.New(cfg.DataShards, cfg.ParityShards)
 	if err != nil {
@@ -520,7 +566,7 @@ var errShardWriteFloor = errors.New("too few shards durable")
 // being read.
 func logShardWriteFailure(ctx context.Context, node config.NodeID, index int, err error) {
 	reason := shardErrorReason(err)
-	telemetry.RecordShardError(ctx, "write", reason)
+	telemetry.RecordShardError(ctx, "write", reason, uint64(node))
 	if !shardLogSampler.allow(node, reason) {
 		return
 	}
@@ -616,8 +662,8 @@ func loadPlacement(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg
 // recordShardReadError counts a failed shard read under a bounded reason. The
 // error text names a node and a key, so only the classification is recorded:
 // a node that answered without the shard, or anything else.
-func recordShardReadError(ctx context.Context, err error) {
-	telemetry.RecordShardError(ctx, "read", shardErrorReason(err))
+func recordShardReadError(ctx context.Context, node config.NodeID, err error) {
+	telemetry.RecordShardError(ctx, "read", shardErrorReason(err), uint64(node))
 }
 
 // shardErrorReason classifies a failed shard read into one of the bounded
@@ -767,7 +813,9 @@ func deleteObject(ctx context.Context, bc BlobClient, bucket, key string, object
 				Index: uint32(ns.shardIndex), //nolint:gosec // G115: shardIndex bounded by DataShards + ParityShards (small uint).
 			}
 
+			start := time.Now()
 			resp, err := bc.Delete(ctx, ns.node, delReq)
+			recordShardOutcome(ctx, telemetry.ShardOpDelete, ns.node, start, err)
 			if err != nil {
 				slog.Error("deleteObject: delete failed", "node", ns.node, "error", err)
 				errCh <- err
