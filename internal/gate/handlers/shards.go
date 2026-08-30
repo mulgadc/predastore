@@ -785,6 +785,16 @@ const shardOpenTimeout = 5 * time.Second
 // delivering at.
 const hedgeDelay = 250 * time.Millisecond
 
+// shardConvictionWindow is how long a shard may deliver nothing before it is
+// treated as gone rather than slow. Past it, replacing the shard may spend the
+// parity unit the hedge reserve holds back, which is the right call: the
+// reserve exists for a genuine failure and this has become one.
+//
+// The same 5s as shardOpenTimeout, for the same reason. Without it a stalled
+// shard falls to the blob client's 30s idle timeout, which is a correct read
+// and far too slow a one.
+const shardConvictionWindow = 5 * time.Second
+
 // deleteObject sends DELETE requests to all shard nodes.
 func deleteObject(ctx context.Context, bc BlobClient, bucket, key string, objectHash [32]byte, place ObjectToShardNodes) error {
 	// Build (node, shardIndex) pairs so each delete carries the correct shard index.

@@ -690,3 +690,37 @@ func TestHedgeNeverSpendsTheLastParityUnit(t *testing.T) {
 		assert.Equal(t, 0, r.hedgeBudget(), "the survivor is the reserve, not a hedge budget")
 	})
 }
+
+// A shard silent past the conviction window has stopped being slow and started
+// being gone, so it is replaced even where no hedge was affordable. RS(2,1) is
+// the case with no hedge budget at all, and it is the one that has to work:
+// without this the read waits on the blob client's 30s idle timeout instead.
+func TestASilentShardIsConvictedEvenWithNoHedgeBudget(t *testing.T) {
+	t.Parallel()
+
+	const size = 2 * streamBlockSize
+	f := newWriteFixture(2, 1)
+	want := randomBytes(t, size)
+
+	ctx := context.Background()
+	objectHash := model.ObjectHash("b", "k")
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), size)
+	require.NoError(t, err)
+
+	// Enough budget to carry the silent shard past the conviction window; a
+	// hedge would have fired far earlier and is deliberately not available.
+	pacer := newShardPacer()
+	silent := &pacingBlob{
+		fakeBlob: f.bc, pacer: pacer, slow: place.DataShardNodes[1],
+		after: 0, budget: shardConvictionWindow + 4*hedgeProbeInterval,
+	}
+
+	start := pacer.clk.Now()
+	got, degraded, err := readObject(ctx, silent, f.cfg, "b", "k", place, size, 0,
+		withClock(pacer.clk), pacer.bind())
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+	assert.Positive(t, degraded, "a shard silent past the conviction window should have been replaced")
+	assert.GreaterOrEqual(t, pacer.clk.Now().Sub(start), shardConvictionWindow,
+		"it was replaced before the conviction window, so the reserve was spent on a hedge")
+}

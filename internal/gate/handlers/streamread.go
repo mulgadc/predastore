@@ -395,18 +395,29 @@ func (r *stripeReader) next(ctx context.Context) ([][]byte, int64, error) {
 			// Closing the stream unblocks its read, so an abandoned shard arrives
 			// back through the error path and is replaced there like any other
 			// loss. Only as many as parity can still replace are given up on.
-			budget := r.hedgeBudget()
+			//
+			// Two budgets, because a hedge and a conviction are different
+			// claims: the hedge guesses a shard is slow and leaves the reserve
+			// alone, the conviction has waited long enough to say it is gone.
+			hedges, convictions := r.hedgeBudget(), r.spareParity()
 			for i := range k {
-				if !inflight[i] || budget <= 0 {
+				if !inflight[i] {
 					continue
 				}
 				reason, since := r.progress[i].verdict(at)
 				if reason == "" {
 					continue
 				}
-				telemetry.RecordShardHedge(ctx, reason)
+				switch {
+				case since >= shardConvictionWindow && convictions > 0:
+				case hedges > 0:
+					telemetry.RecordShardHedge(ctx, reason)
+				default:
+					continue
+				}
 				r.fail(ctx, i, nodes[i], hedgeCause(reason), since)
-				budget--
+				hedges--
+				convictions--
 			}
 		case <-ctx.Done():
 			return nil, 0, ctx.Err()
