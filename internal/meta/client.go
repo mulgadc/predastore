@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -147,13 +148,25 @@ func (c *Client) observeReplica(caller context.Context, target config.NodeID, er
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	_, wasCooling := c.unresponsive[target]
 	if err == nil {
 		delete(c.unresponsive, target)
-
-		return
+	} else {
+		c.unresponsive[target] = c.now()
 	}
-	c.unresponsive[target] = c.now()
+	leader := c.leader
+	c.mu.Unlock()
+
+	// Only the transitions, because the steady states are the common ones: a
+	// replica answering, or one that has already been demoted failing again.
+	switch {
+	case err != nil && !wasCooling:
+		slog.WarnContext(caller, "Meta replica did not answer; ordering it last",
+			"replica", target, "was_cached_leader", leader == target,
+			"cooldown_ms", replicaCooldown.Milliseconds(), "err", err)
+	case err == nil && wasCooling:
+		slog.InfoContext(caller, "Meta replica answered again", "replica", target)
+	}
 }
 
 // readOrder returns the replicas that answered most recently first, cached
