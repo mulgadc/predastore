@@ -231,6 +231,16 @@ func (r *stripeReader) spareParity() int {
 	return n
 }
 
+// hedgeBudget is how many shards may be abandoned for slowness right now. One
+// parity unit is always held back, because a hedge is a guess about latency
+// and a genuine failure is not: spending the last one leaves a read that has
+// lost nothing unable to survive losing anything.
+//
+// At RS(2,1) that unit is the only one, so no hedge is ever affordable there
+// and a stalled shard is left to the blob client's idle guard instead. That is
+// slower than a hedge and it is not a read that fails.
+func (r *stripeReader) hedgeBudget() int { return r.spareParity() - 1 }
+
 // open dials one shard from a byte offset. Only the open is bounded by a
 // deadline; the body that follows is bounded by progress in the blob client's
 // idle guard, because a total cap cannot tell a stalled node from a large
@@ -385,9 +395,9 @@ func (r *stripeReader) next(ctx context.Context) ([][]byte, int64, error) {
 			// Closing the stream unblocks its read, so an abandoned shard arrives
 			// back through the error path and is replaced there like any other
 			// loss. Only as many as parity can still replace are given up on.
-			budget := r.spareParity()
+			budget := r.hedgeBudget()
 			for i := range k {
-				if !inflight[i] || budget == 0 {
+				if !inflight[i] || budget <= 0 {
 					continue
 				}
 				reason, since := r.progress[i].verdict(at)

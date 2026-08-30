@@ -580,11 +580,14 @@ func TestASlowButProgressingShardIsNotHedged(t *testing.T) {
 
 // A stream that opened and then said nothing is not slow, it is not working.
 // Its peer has already answered, so there is something to judge it against.
+//
+// RS(3,2), because a hedge never spends the last parity unit and RS(2,1) has
+// only one — see TestTheLastParityUnitIsNotSpentOnAHedge.
 func TestAShardThatDeliversNothingIsHedged(t *testing.T) {
 	t.Parallel()
 
 	const size = 2 * streamBlockSize
-	f := newWriteFixture(2, 1)
+	f := newWriteFixture(3, 2)
 	want := randomBytes(t, size)
 
 	ctx := context.Background()
@@ -618,7 +621,7 @@ func TestAShardThatStopsMidBlockIsHedged(t *testing.T) {
 	t.Parallel()
 
 	const size = 2 * streamBlockSize
-	f := newWriteFixture(2, 1)
+	f := newWriteFixture(3, 2)
 	want := randomBytes(t, size)
 
 	ctx := context.Background()
@@ -639,4 +642,51 @@ func TestAShardThatStopsMidBlockIsHedged(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 	assert.Positive(t, degraded, "a shard that stopped delivering should have been replaced")
+}
+
+// TestHedgeNeverSpendsTheLastParityUnit pins the rule that decides whether a
+// slow read can become a failed one. A hedge is a guess about latency and a
+// genuine failure is not, so the last unit is never spent on the guess.
+//
+// RS(2,1) is the case that matters: its only parity unit is also its last, so
+// no hedge is affordable and a stalled shard falls to the blob client's idle
+// guard instead. Every shipped multi-host config but 5host is RS(2,1).
+func TestHedgeNeverSpendsTheLastParityUnit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		data, parity int
+		want         int
+	}{
+		{"RS(2,1) can afford none", 2, 1, 0},
+		{"RS(3,2) can afford one", 3, 2, 1},
+		{"RS(7,3) can afford two", 7, 3, 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			r := &stripeReader{
+				total: tt.data + tt.parity,
+				lay:   layout{dataShards: tt.data},
+				dead:  make([]bool, tt.data+tt.parity),
+				src:   make([]io.ReadCloser, tt.data+tt.parity),
+			}
+			assert.Equal(t, tt.parity, r.spareParity(), "every parity unit starts spare")
+			assert.Equal(t, tt.want, r.hedgeBudget())
+		})
+	}
+
+	// A parity unit already consumed by a real loss is not available to hedge
+	// with either, which is what keeps the reserve a reserve.
+	t.Run("a lost parity unit is not lent back to the hedge", func(t *testing.T) {
+		t.Parallel()
+		r := &stripeReader{
+			total: 5, lay: layout{dataShards: 3},
+			dead: make([]bool, 5), src: make([]io.ReadCloser, 5),
+		}
+		r.dead[4] = true
+		assert.Equal(t, 1, r.spareParity())
+		assert.Equal(t, 0, r.hedgeBudget(), "the survivor is the reserve, not a hedge budget")
+	})
 }
