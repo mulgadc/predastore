@@ -10,10 +10,12 @@ import (
 // twoHostCluster is two hosts, each running a gate and two blob nodes, which is
 // the shape that tells a per-host answer apart from a cluster-wide one.
 func twoHostCluster() *Config {
+	enabled := true
+
 	return &Config{
 		Region: "ap-southeast-2",
 		RS:     RS{Data: 2, Parity: 1},
-		Repair: Repair{Enabled: true, Workers: 3, PageSize: 64, IntervalSeconds: 90},
+		Repair: Repair{Enabled: &enabled, Workers: 3, PageSize: 64, IntervalSeconds: 90},
 		Hosts: []HostConfig{
 			{
 				ID: 1, Addr: "10.0.0.1", TLSCert: "cert", TLSKey: "key",
@@ -66,16 +68,22 @@ func TestRepairSettingsReachTheGate(t *testing.T) {
 	assert.Equal(t, 90*time.Second, got.Interval)
 }
 
-// TestRepairIsOffUntilItIsAskedFor keeps the default honest: a file that says
-// nothing about repair gets the behaviour it had before repair existed.
-func TestRepairIsOffUntilItIsAskedFor(t *testing.T) {
+// TestRepairRunsUnlessItIsRefused keeps the default honest: a file that says
+// nothing about repair sweeps anyway, because the redundancy window degraded
+// writes open is closed by nothing else.
+func TestRepairRunsUnlessItIsRefused(t *testing.T) {
 	t.Parallel()
 	c := twoHostCluster()
 	c.Repair = Repair{}
 
 	got := gateConfig(c, c.Hosts[0], c.Hosts[0].Nodes[0], nil, nil).Repair
-	assert.False(t, got.Enabled)
+	assert.True(t, got.Enabled)
 	assert.Zero(t, got.Interval, "an unset interval must fall through to the sweep's own default")
+
+	off := false
+	c.Repair = Repair{Enabled: &off}
+	assert.False(t, gateConfig(c, c.Hosts[0], c.Hosts[0].Nodes[0], nil, nil).Repair.Enabled,
+		"an operator who refuses the sweep is still obeyed")
 }
 
 // TestGateOnlyHostRepairsForNothing covers the deployment where the gate does

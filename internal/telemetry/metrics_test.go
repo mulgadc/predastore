@@ -1093,6 +1093,14 @@ func recordEveryInstrument(t *testing.T) map[string]metricdata.Aggregation {
 	}
 	t.Cleanup(func() { _ = unregisterPool() })
 
+	unregisterRepair, err := RegisterRepairGauges(func() RepairSnapshot {
+		return RepairSnapshot{Pending: 3, Repaired: 9, Failed: 1, Passes: 4}
+	})
+	if err != nil {
+		t.Fatalf("register repair: %v", err)
+	}
+	t.Cleanup(func() { _ = unregisterRepair() })
+
 	return collect(t, reader)
 }
 

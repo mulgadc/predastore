@@ -413,9 +413,13 @@ The body is split into `K` data shard buffers in memory and each is streamed to 
 
 **The write is two-phase.** Each shard put makes the bytes durable and invisible. The placement record landing in raft is the commit point — the moment the object's new generation exists — and the shards are published only afterwards. A reader that finds a prepared-but-unpublished shard at the record's epoch completes the commit itself, so an interrupted writer costs a round trip rather than the object.
 
-By default the write is acknowledged only at full width. With `rs.degraded_writes` on it is acknowledged once `K` shards are durable, so one node down does not refuse writes; the response then carries `X-Spx-Degraded-Write: <n>`. `K` is the floor and not `K+1`, because any `K` of the `K+M` reconstruct — at RS(2,1) one more buys no redundancy and would refuse three quarters of writes with a single node down. The gap it opens is closed by repair, below.
+The write is acknowledged once `K` shards are durable, so one node down does not refuse writes; the response then carries `X-Spx-Degraded-Write: <n>`. Setting `rs.degraded_writes = false` restores a full-width floor. `K` is the floor and not `K+1`, because any `K` of the `K+M` reconstruct — at RS(2,1) one more buys no redundancy and would refuse three quarters of writes with a single node down.
 
-**Hinted handoff narrows that gap to nothing.** With `rs.hinted_handoff` on, a shard its owner will not take is written to the node one step off the end of the stripe on the ring instead of being given up on, and the response carries `X-Spx-Handoff: <n>`. The stripe is then complete and the object is as redundant as a full-width write; what is outstanding is only that the shards are not all where the record says. A position is handed off or missing, never both, so `X-Spx-Degraded-Write` still counts exactly the shards that landed nowhere.
+The floor is a **failure threshold, not a target**: the write places every shard it can reach, and the floor only decides whether to fail. At RS(3,2) with one node down the write acks with four shards and one parity unit either way; a floor of `K` rather than `K+1` differs only at two nodes down, where it accepts with no parity instead of refusing.
+
+The gap it opens is closed by repair, below — but only when the missing node returns, because repair rebuilds a shard onto its owner. At RS(2,1) an object written while a node is down holds no parity for the duration of the outage. That is the accepted position: a lost node is repaired and returned to service, and refusing writes meanwhile is the worse failure.
+
+**Hinted handoff narrows that gap to nothing.** A shard its owner will not take is written to the node one step off the end of the stripe on the ring instead of being given up on, and the response carries `X-Spx-Handoff: <n>`. The stripe is then complete and the object is as redundant as a full-width write; what is outstanding is only that the shards are not all where the record says. A position is handed off or missing, never both, so `X-Spx-Degraded-Write` still counts exactly the shards that landed nowhere.
 
 The holder is **derived and never recorded**: it is `ring.Nodes(hash, K+M+1)[K+M]`, which the read path and repair both recompute, so there is no hint to store, replicate or lose. Handoff is skipped when the cluster has no node to spare — placing a second shard of one object on a node that already holds one of its shards is not redundancy. Commit and abort follow the shard to wherever it actually landed: committing at the owner would be told the shard was never prepared, and the holder's copy would stay durable, unreferenced and unreadable.
 
@@ -481,7 +485,9 @@ The gate records the resolved placement rather than relying on the ring alone at
 
 ## Repair
 
-`internal/gate/repair` restores shards a blob node owns but does not hold at the generation its object's record names. It is off unless `[repair] enabled` is set; it exists to close the redundancy window degraded writes open, and a cluster running neither is in the state it has always been in.
+`internal/gate/repair` restores shards a blob node owns but does not hold at the generation its object's record names. It runs on every host with a local blob node unless `[repair] enabled = false`; it is what closes the redundancy window degraded writes open, and a cluster running one without the other takes the cost without the repayment.
+
+Rebuild concurrency derives from the CPU count but is capped at 8. Half of a 256-thread host is 129 concurrent rebuilds, which is not a sweep contending with serving but one displacing it, and a rebuild is bounded by disk and peer bandwidth well before it is bounded by goroutines.
 
 **It carries no correctness weight.** A read compares each shard's epoch against the record it has already loaded and discards a stale one whether or not repair has ever run. What repair restores is redundancy — the number of further losses an object survives — and never the object.
 
@@ -575,12 +581,12 @@ region  = "ap-southeast-2"      # required; the credential scope requests are co
 [rs]
 data   = 2
 parity = 1
-# degraded_writes = false       # accept a write at K shards rather than K+M; see §8
-# hinted_handoff  = false       # place a refused shard on the next node along; see §8
+# degraded_writes = true        # on; false refuses a write short of K+M. See §8
+# hinted_handoff  = true        # on; false leaves the stripe short instead. See §8
 
 # [repair]                      # restore shards held at a stale generation; see §9
-# enabled          = false
-# workers          = 0          # concurrent rebuilds; zero derives one from the CPU count
+# enabled          = true       # on wherever the host runs a blob node
+# workers          = 0          # concurrent rebuilds; zero derives one from the CPU count, capped at 8
 # page_size        = 0          # placement records per scan request; zero defaults to 512
 # interval_seconds = 0          # gap between passes; zero defaults to 300
 

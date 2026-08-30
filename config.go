@@ -193,7 +193,7 @@ func gateConfig(
 		NodeID: n.ID,
 		RS: gate.RS{
 			Data: c.RS.Data, Parity: c.RS.Parity,
-			DegradedWrites: c.RS.DegradedWrites, HintedHandoff: c.RS.HintedHandoff,
+			DegradedWrites: c.RS.DegradedWritesEnabled(), HintedHandoff: c.RS.HintedHandoffEnabled(),
 		},
 		Buckets:     bucketConfigs(c),
 		Auth:        authEntries(c),
@@ -205,7 +205,7 @@ func gateConfig(
 		// swept by exactly one coordinator without anything having to elect one.
 		LocalBlobNodeIDs: nodeIDs(hostNodesByRole(host, RoleBlob)),
 		Repair: gate.RepairConfig{
-			Enabled:  c.Repair.Enabled,
+			Enabled:  c.Repair.IsEnabled(),
 			Workers:  c.Repair.Workers,
 			PageSize: c.Repair.PageSize,
 			Interval: time.Duration(c.Repair.IntervalSeconds) * time.Second,

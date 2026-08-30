@@ -163,13 +163,27 @@ page_size = 256
 interval_seconds = 120
 `))
 		require.NoError(t, err)
-		assert.Equal(t, Repair{Enabled: true, Workers: 4, PageSize: 256, IntervalSeconds: 120}, cfg.Repair)
+		assert.True(t, cfg.Repair.IsEnabled())
+		assert.Equal(t, 4, cfg.Repair.Workers)
+		assert.Equal(t, 256, cfg.Repair.PageSize)
+		assert.Equal(t, 120, cfg.Repair.IntervalSeconds)
 	})
 
-	t.Run("absent", func(t *testing.T) {
+	// Absent means on, while the tunables still fall back to the sweep's own
+	// defaults. The two are separate questions: whether to sweep, and how hard.
+	t.Run("absent runs the sweep", func(t *testing.T) {
 		cfg, err := Load(write(t, base))
 		require.NoError(t, err)
-		assert.Equal(t, Repair{}, cfg.Repair, "repair is opt-in")
+		assert.True(t, cfg.Repair.IsEnabled(), "repair runs unless it is turned off")
+		assert.Zero(t, cfg.Repair.Workers, "an absent tunable takes the sweep's default")
+	})
+
+	// Explicitly off is what a fault scenario needs to observe damage without
+	// the sweep repairing it underneath the observation.
+	t.Run("explicitly off", func(t *testing.T) {
+		cfg, err := Load(write(t, base+"\n[repair]\nenabled = false\n"))
+		require.NoError(t, err)
+		assert.False(t, cfg.Repair.IsEnabled())
 	})
 
 	// The retention boundary decides whether a returning node replays the log
@@ -192,16 +206,24 @@ trailing_logs = 8
 		assert.Equal(t, Meta{}, absent.Meta, "an absent [meta] leaves every knob at the replica's default")
 	})
 
+	// Absent, true and false are three distinct states here, which is why the
+	// fields are pointers: a cluster stays writable through a node loss unless
+	// the operator has decided it should not.
 	t.Run("rs availability settings", func(t *testing.T) {
-		cfg, err := Load(write(t, base+"degraded_writes = true\nhinted_handoff = true\n"))
+		on, err := Load(write(t, base+"degraded_writes = true\nhinted_handoff = true\n"))
 		require.NoError(t, err)
-		assert.True(t, cfg.RS.DegradedWrites)
-		assert.True(t, cfg.RS.HintedHandoff)
+		assert.True(t, on.RS.DegradedWritesEnabled())
+		assert.True(t, on.RS.HintedHandoffEnabled())
 
-		off, err := Load(write(t, base))
+		off, err := Load(write(t, base+"degraded_writes = false\nhinted_handoff = false\n"))
 		require.NoError(t, err)
-		assert.False(t, off.RS.DegradedWrites, "degraded writes are opt-in")
-		assert.False(t, off.RS.HintedHandoff, "handoff is opt-in")
+		assert.False(t, off.RS.DegradedWritesEnabled(), "an operator can still refuse the window")
+		assert.False(t, off.RS.HintedHandoffEnabled())
+
+		absent, err := Load(write(t, base))
+		require.NoError(t, err)
+		assert.True(t, absent.RS.DegradedWritesEnabled(), "absent means on")
+		assert.True(t, absent.RS.HintedHandoffEnabled(), "absent means on")
 	})
 }
 

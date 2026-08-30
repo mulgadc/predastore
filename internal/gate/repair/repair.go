@@ -89,11 +89,17 @@ type Config struct {
 // durability liability until it is repaired, so repair is allowed to contend
 // with serving for the duration; integer division floors, so a single-CPU box
 // gets 1 rather than 0.
-func DefaultWorkers() int { return runtime.NumCPU()/2 + 1 }
+//
+// The cap is what makes that safe to run unasked. Half of a 256-thread host is
+// 129 concurrent rebuilds, which is not a repair sweep contending with serving
+// but one displacing it, and rebuild is bounded by disk and peer bandwidth
+// well before it is bounded by goroutines.
+func DefaultWorkers() int { return min(runtime.NumCPU()/2+1, maxDefaultWorkers) }
 
 const (
-	defaultPageSize = 512
-	defaultInterval = 5 * time.Minute
+	maxDefaultWorkers = 8
+	defaultPageSize   = 512
+	defaultInterval   = 5 * time.Minute
 )
 
 // Stats is what a pass did. Scanned counts placement records read, owned the

@@ -94,6 +94,11 @@ const (
 	metricRPCConnections = "predastore.rpc.connections"
 	metricRPCEvictions   = "predastore.rpc.evictions"
 	metricRPCStreamsOpen = "predastore.rpc.streams.open"
+
+	metricRepairPending  = "predastore.repair.pending"
+	metricRepairRepaired = "predastore.repair.repaired"
+	metricRepairFailed   = "predastore.repair.failed"
+	metricRepairPasses   = "predastore.repair.passes"
 )
 
 // metricNames is every name this package registers. Only the tests read it:
@@ -118,6 +123,7 @@ var metricNames = []string{
 	metricMetaClientOps, metricMetaClientDuration, metricMetaClientRedirects,
 	metricMetaFSMLSMBytes, metricMetaFSMVLogBytes, metricMetaSnapshotIndex, metricMetaLogTrailing,
 	metricRPCConnections, metricRPCEvictions, metricRPCStreamsOpen,
+	metricRepairPending, metricRepairRepaired, metricRepairFailed, metricRepairPasses,
 }
 
 // secondsBuckets bounds the duration histograms. The SDK default boundaries
@@ -194,6 +200,11 @@ var (
 	rpcConnections metric.Int64ObservableGauge
 	rpcEvictions   metric.Int64Counter
 	rpcStreamsOpen metric.Int64UpDownCounter
+
+	repairPending  metric.Int64ObservableGauge
+	repairRepaired metric.Int64ObservableGauge
+	repairFailed   metric.Int64ObservableGauge
+	repairPasses   metric.Int64ObservableGauge
 )
 
 // instruments lazily creates the shared instruments. The global meter
@@ -317,6 +328,15 @@ func instruments() {
 			"Connections dropped from the pool, by peer and reason. A peer evicted repeatedly is the one at fault.", "{eviction}")
 		rpcStreamsOpen = int64UpDownCounter(metricRPCStreamsOpen,
 			"Streams this node has open to a peer. Bounded by the transport's per-connection cap, which is otherwise invisible.", "{stream}")
+
+		repairPending = int64Gauge(metricRepairPending,
+			"Shard positions the last completed sweep could not rebuild. Above zero means stripes are short a holder right now.", "{shard}")
+		repairRepaired = int64Gauge(metricRepairRepaired,
+			"Shards rebuilt since start. Flat while pending is high means the sweep cannot place them, not that there is nothing to do.", "{shard}")
+		repairFailed = int64Gauge(metricRepairFailed,
+			"Rebuild attempts that failed since start.", "{shard}")
+		repairPasses = int64Gauge(metricRepairPasses,
+			"Sweeps completed since start. Not climbing means the sweep is stalled or was never started.", "{pass}")
 	})
 }
 
@@ -1029,6 +1049,43 @@ func RegisterMetaGauges(snapshot func() MetaSnapshot) (func() error, error) {
 	if err != nil {
 		return nil, err
 	}
+	return reg.Unregister, nil
+}
+
+// RepairSnapshot is what a repair service reports about its sweeps. Pending is
+// the one to watch: it counts shard positions the last completed pass could
+// not rebuild, so a cluster sitting above zero is short redundancy now.
+type RepairSnapshot struct {
+	Pending  int64
+	Repaired int64
+	Failed   int64
+	Passes   int64
+}
+
+// RegisterRepairGauges observes the repair sweep. Repair runs unasked, so its
+// progress has to be visible without an operator having opted into anything.
+func RegisterRepairGauges(snapshot func() RepairSnapshot) (func() error, error) {
+	instruments()
+	if meter == nil {
+		return func() error { return nil }, nil
+	}
+
+	reg, err := meter.RegisterCallback(
+		func(_ context.Context, o metric.Observer) error {
+			s := snapshot()
+			o.ObserveInt64(repairPending, s.Pending)
+			o.ObserveInt64(repairRepaired, s.Repaired)
+			o.ObserveInt64(repairFailed, s.Failed)
+			o.ObserveInt64(repairPasses, s.Passes)
+
+			return nil
+		},
+		repairPending, repairRepaired, repairFailed, repairPasses,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return reg.Unregister, nil
 }
 

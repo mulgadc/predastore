@@ -19,6 +19,7 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 	"github.com/mulgadc/predastore/internal/gate/repair"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 const (
@@ -277,6 +278,19 @@ func (s *Server) Run(ctx context.Context) error {
 	// before the listener drains: a rebuild in flight holds streams to peers
 	// that the drain would otherwise wait behind.
 	if s.repairer != nil {
+		unregister, err := telemetry.RegisterRepairGauges(func() telemetry.RepairSnapshot {
+			st := s.repairer.Stats()
+
+			return telemetry.RepairSnapshot{
+				Pending: st.Pending, Repaired: st.Repaired,
+				Failed: st.Failed, Passes: st.Passes,
+			}
+		})
+		if err != nil {
+			return fmt.Errorf("failed to register the repair gauges: %w", err)
+		}
+		defer func() { _ = unregister() }()
+
 		repairCtx, stopRepair := context.WithCancel(ctx)
 		var repairDone sync.WaitGroup
 		repairDone.Go(func() {

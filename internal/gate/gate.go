@@ -54,9 +54,9 @@ type RS struct {
 	HintedHandoff bool
 }
 
-// RepairConfig tunes the background repair sweep. It is off by default: it
-// exists to close the redundancy window degraded writes open, and a cluster
-// running neither is in the state it has always been in.
+// RepairConfig tunes the background repair sweep. It is on by default: it is
+// what closes the redundancy window degraded writes open, and a cluster
+// running one without the other takes the cost without the repayment.
 type RepairConfig struct {
 	Enabled bool
 
