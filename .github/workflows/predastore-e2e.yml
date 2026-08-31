@@ -204,13 +204,12 @@ jobs:
     env:
       HW_HOSTS: ${{ vars.PREDASTORE_HW_HOSTS || 'tf-user@bottlebrush tf-user@ironbark tf-user@casuarina' }}
       HW_ADDRS: ${{ vars.PREDASTORE_HW_ADDRS || '10.10.8.4 10.10.8.5 10.10.8.6' }}
-      # A CI-only root, distinct from the default a human uses running
-      # hwbench.sh by hand on the same machines. clean removes this path on
-      # every host at the end of every run; it must never share a path with
-      # someone's manual deployment.
+      # Same disk hwbench.sh itself defaults to (disk1: disk2 and disk3 carry
+      # spinifex's own storage services and confound the numbers). Only the
+      # leaf directory differs, so clean's rm -rf never reaches a manual run.
       HW_ROOT: ${{ vars.PREDASTORE_HW_ROOT || '/mnt/disk1/tf-user/predastore-ci' }}
-      # Also CI-only, so a stale worktree here is never a human's.
-      HW_WORK: /tmp/hwbench-ci
+      # HW_WORK is resolved against RUNNER_TEMP in the "Resolve HW_WORK" step
+      # below, not set here — runner.temp isn't reachable from job-level env:.
       # One ref: the commit under test. hwbench.sh's own default is three
       # refs including two hardcoded shas, a comparison harness rather than
       # a CI run.
@@ -252,6 +251,13 @@ jobs:
       - name: Checkout Code
         if: steps.gate.outputs.paused != 'true'
         uses: actions/checkout@v7
+
+      # runner.temp isn't reachable from job-level env:, and whether the
+      # runner's /tmp is tmpfs is unconfirmed, so HW_WORK is resolved here
+      # against RUNNER_TEMP, which shares the checkout's own disk.
+      - name: Resolve HW_WORK
+        if: steps.gate.outputs.paused != 'true'
+        run: echo "HW_WORK=$RUNNER_TEMP/hwbench-ci" >> "$GITHUB_ENV"
 
       - name: Setup Go
         if: steps.gate.outputs.paused != 'true'
