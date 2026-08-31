@@ -2308,6 +2308,16 @@ run_concurrent_put() {
         log "concurrent-put: round $round wrote $keys_n keys with $writers simultaneous writers each"
     done
 
+    # What each writer was told, tallied. A key can read back correctly while
+    # most of its writers were refused, so the verdicts are a separate finding
+    # from the readback and are worth stating even on a pass.
+    local verdicts
+    verdicts="$(awk '/^writer=/ {
+        for (i = 1; i <= NF; i++) if ($i ~ /^status=/) { sub(/^status=/, "", $i); n[$i]++ }
+        if ($0 ~ /outcome=client_error/) n["client_error"]++
+    } END { for (s in n) printf "%s=%d ", s, n[s]; printf "\n" }' "$outdir"/*.race)"
+    log "concurrent-put: writer verdicts $verdicts"
+
     # Read back through a gate that wrote nothing in the last round, so a
     # cached anything on the writing gate cannot answer for the cluster.
     local read_gate="${gates[${#gates[@]} - 1]}"
@@ -2370,6 +2380,11 @@ run_concurrent_put() {
                 log "concurrent-put: read error $code x$n"
             done
     fi
+
+    # The work dir goes with the run, and these are the only record of what each
+    # writer was told, which is where a failing key's explanation lives.
+    mkdir -p "$RUN_DIR/concurrent-put"
+    cp "$outdir"/*.race "$outdir"/*errors.txt "$RUN_DIR/concurrent-put/" 2>/dev/null || true
 
     aws_s3 "$first_gate" s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true
 
