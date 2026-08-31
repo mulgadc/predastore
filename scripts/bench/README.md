@@ -13,6 +13,8 @@ A minimal, manually-invoked harness for tracking predastore performance over tim
   used by the `partial-put` scenario. No S3 client can express this: they all
   either finish the body or abort, and both already work. `-rate` paces the send
   so a caller can kill it mid-body.
+- `e2e-performance.sh` — correctness round trips followed by isolated Warp
+  workloads, one profile at a time. Chosen by `PERF_PRESET` (`smoke` or `compare`).
 
 ### `e2e-stress` scenarios
 
@@ -78,6 +80,33 @@ for the large and kill cases), `STRESS_PARTIAL_KILL_RATE` and
 The abandon bound must stay above the gate's 50s request deadline or it asserts
 nothing. Concurrency times the large declared size is roughly the peak memory the
 run needs, so raising either on a small machine is how it gets OOM-killed.
+
+### `e2e-performance` presets and disk budget
+
+`PERF_PRESET` selects `smoke` (30s per workload, default) or `compare` (2m).
+Each of the three Warp workloads (`put`, `multipart-put`, `get`) writes into
+its own bucket for the duration of the preset, and `e2e-performance.sh` drops
+a bucket as soon as its workload finishes — the next workload never has to
+coexist on disk with data already measured.
+
+Before starting each profile, the script checks free space on the filesystem
+holding `WORK_DIR` against a per-preset floor and refuses to start if it is
+short, naming the shortfall. This runs before the cluster starts, so a failed
+check leaves no cluster and no data directory behind.
+
+| Preset    | Measured peak (pre-cleanup, all three buckets) | Budget |
+|-----------|--------------------------------------------------|--------|
+| `smoke`   | ~40 GiB                                          | 56 GiB (`60129542144` bytes) |
+| `compare` | ~50 GB                                           | 70 GB (`70000000000` bytes) |
+
+The budget is a floor with headroom over the measured peak, not a computed
+prediction: `put` runs for a fixed **duration**, not a fixed object count, so
+a faster disk writes more in that time, not less, than what was measured.
+Each budget is `measured peak × 1.3` (30% headroom for hardware variance and
+erasure-coded bytes on disk exceeding the client-side throughput the
+measurement was taken from) `÷ 0.95`, so a run landing exactly on budget still
+leaves the blob engine's 5%-free watermark intact rather than finishing at 4%
+free. Override with `PERF_MIN_FREE_BYTES`.
 
 All benchmarks can be run via the top-level dispatcher:
 

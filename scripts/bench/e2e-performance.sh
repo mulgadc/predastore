@@ -23,7 +23,7 @@
 #                    which this machine did not produce and cannot read.
 #
 # Preset overrides: PERF_DURATION, PERF_CONCURRENT, PERF_PUT_SIZE,
-# PERF_PART_SIZE, PERF_PARTS, PERF_GET_SIZE.
+# PERF_PART_SIZE, PERF_PARTS, PERF_GET_SIZE, PERF_MIN_FREE_BYTES.
 #
 
 set -euo pipefail
@@ -52,6 +52,17 @@ case "$PERF_PRESET" in
         MULTIPART_SIZE="${PERF_PART_SIZE:-5MiB}"
         MULTIPART_PARTS="${PERF_PARTS:-2}"
         GET_SIZE="${PERF_GET_SIZE:-10MiB}"
+        # `put` runs for a fixed duration, not a fixed object count, so this
+        # is a floor with headroom over a measured peak, not a prediction: a
+        # faster disk writes more in 30s, not less, than what was measured.
+        # Measured peak (sum of the three workload buckets, before any
+        # cleanup) was ~40 GiB. +30% headroom covers hardware variance and
+        # erasure-coded bytes on disk exceeding the client-side throughput
+        # the measurement was taken from: 40 * 1.3 = 52 GiB. Dividing by
+        # 0.95 keeps the blob engine's 5%-free watermark intact even if a
+        # run lands exactly on budget, rather than finishing at 4% free:
+        # 52 / 0.95 = 54.74 GiB, rounded up to 56 GiB.
+        MIN_FREE_BYTES="${PERF_MIN_FREE_BYTES:-60129542144}" # 56 GiB
         ;;
     compare)
         DURATION="${PERF_DURATION:-2m}"
@@ -60,6 +71,9 @@ case "$PERF_PRESET" in
         MULTIPART_SIZE="${PERF_PART_SIZE:-8MiB}"
         MULTIPART_PARTS="${PERF_PARTS:-16}"
         GET_SIZE="${PERF_GET_SIZE:-128MiB}"
+        # Same reasoning as smoke, against a measured peak of ~50 GB:
+        # 50 * 1.3 = 65 GB, / 0.95 = 68.42 GB, rounded up to 70 GB.
+        MIN_FREE_BYTES="${PERF_MIN_FREE_BYTES:-70000000000}" # 70 GB
         ;;
     *)
         echo "unknown PERF_PRESET: $PERF_PRESET (want smoke or compare)" >&2
@@ -110,6 +124,32 @@ mkdir -p "$PREDA_CONFIG_DIR"
 # directory stops those competing with the cluster for a small /tmp tmpfs.
 export TMPDIR="$WORK_DIR/tmp"
 mkdir -p "$PREDA_DIR" "$TMPDIR"
+
+# work_fs_stat reads byte-denominated `df` fields for the filesystem holding
+# WORK_DIR. -PB1 gives a single POSIX-format line in 1-byte blocks, so this
+# avoids parsing df's human-readable (G/M-suffixed) output. WORK_DIR must
+# already exist (mktemp -d above), or df has nothing to report on.
+work_fs_stat() {
+    df -PB1 "$WORK_DIR" | awk -v f="$1" 'NR==2 {print $f}'
+}
+
+WORK_FS_TOTAL_BYTES="$(work_fs_stat 2)"
+
+# check_free_space refuses to start a config without headroom for its
+# workload, so a capacity failure is a preflight message before any cluster
+# or data directory exists, rather than a Warp error mid-workload.
+check_free_space() {
+    local avail requirement shortfall mount
+    avail="$(work_fs_stat 4)"
+    [ -n "$avail" ] || { echo "could not read free space on $WORK_DIR" >&2; exit 1; }
+    requirement="$MIN_FREE_BYTES"
+    if [ "$avail" -lt "$requirement" ]; then
+        shortfall=$((requirement - avail))
+        mount="$(df -P "$WORK_DIR" | awk 'NR==2 {print $NF}')"
+        echo "insufficient free space for preset '$PERF_PRESET' on $mount ($WORK_DIR): needs $requirement bytes, has $avail bytes, short by $shortfall bytes" >&2
+        exit 1
+    fi
+}
 
 CURRENT_CONFIG=""
 cleanup() {
@@ -201,6 +241,16 @@ run_correctness() {
     aws_s3 s3 rb "s3://$bucket" --force >/dev/null
 }
 
+# drop_bucket removes a bucket once its workload has been measured, so the
+# next workload's writes don't have to coexist with it on disk. The
+# measurement is already recorded by the time this runs, so a failure here
+# is logged and swallowed rather than failing the run.
+drop_bucket() {
+    local bucket="$1"
+    aws_s3 s3 rb "s3://$bucket" --force >/dev/null 2>&1 ||
+        echo "warning: failed to drop bucket $bucket; continuing" >&2
+}
+
 # run_warp measures each workload on its own. A mixed workload cannot say which
 # path regressed, which is the whole question a before/after run is asked.
 run_warp() {
@@ -223,20 +273,33 @@ run_warp() {
         --full
     )
 
+    local put_bucket="warp-${config_name}-put-${RUN_ID}"
+    local multipart_bucket="warp-${config_name}-multipart-put-${RUN_ID}"
+    local get_bucket="warp-${config_name}-get-${RUN_ID}"
+
     mkdir -p "$output_dir"
     run_warp_checked "$output_dir/put.log" "$WARP" put "${common[@]}" \
         --disable-multipart --obj.size="$PUT_SIZE" \
-        --bucket="warp-${config_name}-put-${RUN_ID}" --benchdata="$output_dir/put"
+        --bucket="$put_bucket" --benchdata="$output_dir/put"
+    # Each workload owns its bucket, so dropping it here cannot affect the
+    # multipart-put or get workloads that follow. This is what keeps the
+    # config's peak disk usage to the largest single workload rather than
+    # the sum of all three.
+    drop_bucket "$put_bucket"
+
     run_warp_checked "$output_dir/multipart-put.log" "$WARP" multipart-put "${common[@]}" \
         --part.size="$MULTIPART_SIZE" --parts="$MULTIPART_PARTS" \
-        --part.concurrent="$part_concurrent" --bucket="warp-${config_name}-multipart-put-${RUN_ID}" \
+        --part.concurrent="$part_concurrent" --bucket="$multipart_bucket" \
         --benchdata="$output_dir/multipart-put"
+    drop_bucket "$multipart_bucket"
+
     # The GET set is seeded by multipart upload and then read whole. Warp's
     # `multipart` command reads with GET ?partNumber=N, a separate S3 feature
     # predastore does not implement.
     run_warp_checked "$output_dir/get.log" "$WARP" get "${common[@]}" \
         --objects=16 --obj.size="$GET_SIZE" --part.size="$MULTIPART_SIZE" \
-        --bucket="warp-${config_name}-get-${RUN_ID}" --benchdata="$output_dir/get"
+        --bucket="$get_bucket" --benchdata="$output_dir/get"
+    drop_bucket "$get_bucket"
 
     write_warp_analysis "$output_dir"
 }
@@ -331,6 +394,13 @@ fi
     echo "logical_cpus=$(getconf _NPROCESSORS_ONLN)"
     echo "memory_bytes=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo unknown)"
     echo
+    echo "Work filesystem"
+    echo "---------------"
+    echo "work_dir=$WORK_DIR"
+    echo "work_fs_avail_bytes=$(work_fs_stat 4)"
+    echo "work_fs_total_bytes=$WORK_FS_TOTAL_BYTES"
+    echo "min_free_bytes_required=$MIN_FREE_BYTES"
+    echo
     echo "Workload controls"
     echo "-----------------"
     echo "preset=$PERF_PRESET"
@@ -372,6 +442,11 @@ for config_name in $PERF_CONFIGS; do
         HOST_LIST="$(gate_endpoints "$CONFIG_FILE" | paste -sd,)"
         [ -n "$HOST_LIST" ] || { echo "no host in $config_name runs a gate" >&2; exit 1; }
         ENDPOINT="https://$(gate_endpoints "$CONFIG_FILE" | head -1)"
+
+        # Only the cluster this script starts writes to this box's disk. A
+        # cluster named by PERF_EXTERNAL_HOSTS stores its data elsewhere, so
+        # the free space here says nothing about whether that run can proceed.
+        check_free_space
 
         CURRENT_CONFIG="$config_name"
         echo "Starting $config_name ($HOST_LIST)"
