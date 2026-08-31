@@ -28,6 +28,42 @@ certs:
 build:
 	$(MAKE) go_build
 
+# Container targets. The image is the compatibility loop: it starts in seconds
+# and the smoke suite drives real S3 clients at it, which is how three of the
+# open S3-compatibility defects were found in the first place.
+DOCKER_IMAGE   ?= predastore:dev
+COMPOSE_SINGLE := deploy/compose.single.yml
+COMPOSE_CLUSTER:= deploy/compose.cluster.yml
+COMPOSE_FILE   ?= $(COMPOSE_CLUSTER)
+SMOKE_BASELINE ?= scripts/smoke-baseline.txt
+
+docker-build:
+	@echo -e "\n....Building $(DOCKER_IMAGE)"
+	docker build -t $(DOCKER_IMAGE) .
+
+# The cluster profile needs one keypair shared by every host: peers verify
+# against the trust store, so hosts holding their own identities never elect a
+# leader. The single profile generates its own and needs nothing here.
+compose-up: docker-build
+	@if [ "$(COMPOSE_FILE)" = "$(COMPOSE_CLUSTER)" ]; then deploy/docker/gen-certs.sh; fi
+	PREDA_IMAGE=$(DOCKER_IMAGE) docker compose -f $(COMPOSE_FILE) up -d
+
+compose-down:
+	PREDA_IMAGE=$(DOCKER_IMAGE) docker compose -f $(COMPOSE_FILE) down -v
+
+# Fails only on a regression against the baseline, since predastore does not
+# pass every check today. SMOKE_SUITES narrows the run: `make docker-smoke
+# SMOKE_SUITES=aws`.
+SMOKE_SUITES ?=
+docker-smoke:
+	@PREDA_IMAGE=$(DOCKER_IMAGE) PREDA_BASELINE=$(SMOKE_BASELINE) \
+		./scripts/smoke.sh $(SMOKE_SUITES)
+
+# Re-record the baseline. Run it when a fix lands, in the same change.
+docker-smoke-baseline:
+	@PREDA_IMAGE=$(DOCKER_IMAGE) PREDA_WRITE_BASELINE=$(SMOKE_BASELINE) \
+		./scripts/smoke.sh $(SMOKE_SUITES)
+
 # GO commands
 go_build:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
@@ -147,4 +183,4 @@ nilaway:
 
 .PHONY: certs build go_build preflight test test-cover test-race test-integration diff-coverage \
 	clean lint fix govulncheck nilaway warp-install e2e-performance e2e-performance-compare \
-	e2e-stress
+	e2e-stress docker-build docker-smoke docker-smoke-baseline compose-up compose-down
