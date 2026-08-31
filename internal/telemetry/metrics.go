@@ -739,6 +739,14 @@ const (
 	// ShardReasonStaleEpoch is a node holding the shard under a different
 	// write epoch than the placement record names: up, answering, and wrong.
 	ShardReasonStaleEpoch = "stale_epoch"
+	// ShardReasonCommitUnknown is a node that took the whole body and did not
+	// report before the commit bound, so whether the shard prepared is unknown
+	// at the time the write is scored.
+	ShardReasonCommitUnknown = "commit_unknown"
+	// ShardReasonSlowCommit is a node whose put was abandoned and whose shard
+	// turned out to be prepared after all: the write was never lost, only
+	// late. A node accumulating these is stalling rather than failing.
+	ShardReasonSlowCommit = "slow_commit"
 )
 
 // Object read paths. A reconstructed read consumed parity to answer it, so the

@@ -107,6 +107,10 @@ type fakeBlob struct {
 	declaring    func(size int64) error
 	failPutOn    func(index uint32) bool
 	failCommitOn func(index uint32) bool
+
+	// abandonPutOn models a node on a stalling drive: it takes the whole body
+	// and prepares the shard, then fails to report before the commit bound.
+	abandonPutOn func(index uint32) bool
 }
 
 func newFakeBlob() *fakeBlob {
@@ -143,6 +147,12 @@ func (b *fakeBlob) Put(_ context.Context, _ config.NodeID, req blob.PutRequest, 
 	b.mu.Lock()
 	b.prepared[shardID{key: req.Key, index: req.Index}] = fakeShard{data: buf.Bytes(), epoch: req.Epoch}
 	b.mu.Unlock()
+
+	// The shard is prepared either way. What the caller is told is the whole
+	// difference between a slow node and a lost write.
+	if b.abandonPutOn != nil && b.abandonPutOn(req.Index) {
+		return nil, fmt.Errorf("put to node holding shard %d: %w", req.Index, blob.ErrCommitUnknown)
+	}
 
 	return &blob.PutResponse{Size: int64(buf.Len()), Epoch: req.Epoch}, nil
 }

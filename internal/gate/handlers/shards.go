@@ -75,6 +75,12 @@ type writeResult struct {
 	// other or neither, never both.
 	missing []config.NodeID
 	handoff []int
+
+	// ambiguous names the positions whose node took the whole body and then
+	// did not report. The shard may be prepared there or may not, so it counts
+	// toward neither the floor nor the degraded signal, and the commit that
+	// follows the record settles it either way.
+	ambiguous []int
 }
 
 func (r writeResult) landedCount() int {
@@ -539,9 +545,17 @@ func collectStreams(ctx context.Context, cfg Config, streams []*shardStream, res
 			if firstErr == nil {
 				firstErr = outcome.err
 			}
+			logShardWriteFailure(ctx, s.holder, i, outcome.err)
+			// The holder took the body and went quiet. Leave it named in the
+			// record so a read finds the shard if it is there, and let the
+			// commit phase decide; a refusal we never received is not one.
+			if errors.Is(outcome.err, blob.ErrCommitUnknown) {
+				result.ambiguous = append(result.ambiguous, i)
+
+				continue
+			}
 			result.holders[i] = s.owner
 			result.missing = append(result.missing, s.owner)
-			logShardWriteFailure(ctx, s.holder, i, outcome.err)
 
 			continue
 		}
@@ -620,6 +634,17 @@ func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place
 			Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
 			Epoch: place.WriteEpoch,
 		})
+		if slices.Contains(written.ambiguous, index) {
+			// This commit is the answer the put never gave. Say which way it
+			// went: a node whose writes all land but never report in time is
+			// invisible otherwise, and that is the whole defect.
+			logAmbiguousResolution(ctx, node, index, place.WriteEpoch, overtaken, err)
+			if overtaken {
+				lost.Add(1)
+			}
+
+			return
+		}
 		switch {
 		case err != nil:
 			slog.WarnContext(ctx, "Shard commit failed",
@@ -630,6 +655,32 @@ func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place
 		}
 	})
 	return int(lost.Load())
+}
+
+// logAmbiguousResolution reports what became of a shard whose put was
+// abandoned. Prepared means the node was only slow and the stripe is at full
+// width after all; not prepared means the shard really is absent and repair
+// owns it. Overtaken means it did land and a newer generation has since won
+// the position, which is last-write-wins and not this write's problem.
+func logAmbiguousResolution(
+	ctx context.Context, node config.NodeID, index int, epoch uint64, overtaken bool, err error,
+) {
+	switch {
+	case err != nil && errors.Is(err, blob.ErrNotPrepared):
+		slog.WarnContext(ctx, "Shard was not prepared; the put that was abandoned did not land",
+			"node", node, "index", index, "epoch", fmt.Sprintf("%016x", epoch))
+	case err != nil:
+		slog.WarnContext(ctx, "Shard commit failed after an abandoned put; a read will complete it",
+			"node", node, "index", index, "epoch", fmt.Sprintf("%016x", epoch), "err", err)
+	case overtaken:
+		telemetry.RecordShardError(ctx, telemetry.ShardOpWrite, telemetry.ShardReasonSlowCommit, uint64(node))
+		slog.InfoContext(ctx, "Shard was prepared after its put was abandoned, then overtaken",
+			"node", node, "index", index, "epoch", fmt.Sprintf("%016x", epoch))
+	default:
+		telemetry.RecordShardError(ctx, telemetry.ShardOpWrite, telemetry.ShardReasonSlowCommit, uint64(node))
+		slog.InfoContext(ctx, "Shard was prepared after its put was abandoned; committed at full width",
+			"node", node, "index", index, "epoch", fmt.Sprintf("%016x", epoch))
+	}
 }
 
 // abortShards discards shards prepared for a write that will not be published,
@@ -657,10 +708,13 @@ func abortShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place 
 // committing it would be told so and aborting it would ask a node to discard
 // whatever generation it does hold. A position that was handed off is prepared
 // on the holder and nowhere else, so both have to be addressed there.
+// An ambiguous position is visited alongside the landed ones: committing it
+// publishes a shard that did prepare, and answers ErrNotPrepared for one that
+// did not, which is how a put nobody reported on is settled at no cost.
 func forEachShard(written writeResult, fn func(index int, node config.NodeID)) {
 	var wg sync.WaitGroup
 	for i, node := range written.holders {
-		if i < len(written.landed) && !written.landed[i] {
+		if i < len(written.landed) && !written.landed[i] && !slices.Contains(written.ambiguous, i) {
 			continue
 		}
 		wg.Go(func() { fn(i, node) })
@@ -711,6 +765,8 @@ func shardErrorReason(err error) string {
 		return telemetry.ShardReasonStaleEpoch
 	case errors.Is(err, blob.ErrNotFound):
 		return telemetry.ShardReasonNotFound
+	case errors.Is(err, blob.ErrCommitUnknown):
+		return telemetry.ShardReasonCommitUnknown
 	default:
 		return telemetry.ShardReasonTransport
 	}
