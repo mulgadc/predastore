@@ -324,6 +324,60 @@ func TestCopyObjectProducesAByteIdenticalDestination(t *testing.T) {
 	assert.Equal(t, strconv.Itoa(len(body)), getRR.Header().Get("Content-Length"))
 }
 
+// A source larger than one stripe forces the write path around more than one
+// iteration of its offset loop, which is where a streaming copy could lose
+// or duplicate bytes that a single-stripe copy would never exercise.
+func TestCopyObjectAcrossMultipleStripesIsByteIdentical(t *testing.T) {
+	// RS(1,1): with one data shard, shardSize is the object size itself, so
+	// crossing a second stripe only needs a little over one streamBlockSize
+	// rather than one per data shard.
+	f := newHandlerFixtureRS(1, 1, "src-bucket", "dst-bucket")
+	body := randomBytes(t, streamBlockSize+4096)
+
+	putRR := f.put("src-bucket", "source-key", body)
+	require.Equal(t, http.StatusOK, putRR.Code, putRR.Body.String())
+
+	copyRR := f.copy("dst-bucket", "dest-key", "/src-bucket/source-key", nil)
+	require.Equal(t, http.StatusOK, copyRR.Code, copyRR.Body.String())
+
+	var result CopyObjectResult
+	require.NoError(t, xml.Unmarshal(copyRR.Body.Bytes(), &result))
+	sum := md5.Sum(body)
+	assert.Equal(t, quotedHex(sum[:]), result.ETag)
+
+	getRR := f.get("dst-bucket", "dest-key")
+	require.Equal(t, http.StatusOK, getRR.Code)
+	assert.Equal(t, len(body), getRR.Body.Len(), "destination length must match the source")
+	assert.True(t, bytes.Equal(body, getRR.Body.Bytes()), "destination must be byte-identical across multiple stripes")
+}
+
+// A source read that fails partway through must not leave a destination
+// object behind: the copy aborts the shards it had placed and never reaches
+// the commit that would make the destination visible to a later GET.
+func TestCopyObjectReadFailureLeavesNoCommittedDestination(t *testing.T) {
+	f := newHandlerFixture("src-bucket", "dst-bucket")
+	body := randomBytes(t, 1<<16)
+	require.Equal(t, http.StatusOK, f.put("src-bucket", "source-key", body).Code)
+
+	srcPlace, _, err := loadPlacement(context.Background(), f.mc, f.ring, f.cfg, "src-bucket", "source-key")
+	require.NoError(t, err)
+
+	// RS(2,1) tolerates one lost data shard; taking down both puts the
+	// source read past what the parity shard alone can rebuild.
+	broken := &downBlob{fakeBlob: f.bc, down: srcPlace.DataShardNodes[0]}
+	worse := &twoDownBlob{downBlob: broken, alsoDown: srcPlace.DataShardNodes[1]}
+
+	req := httptest.NewRequest(http.MethodPut, "/dst-bucket/dest-key", nil).
+		WithContext(objectCtx("dst-bucket", "dest-key"))
+	req.Header.Set("X-Amz-Copy-Source", "/src-bucket/source-key")
+	rr := httptest.NewRecorder()
+	CopyObject(f.mc, worse, f.ring, f.cache, f.cfg).ServeHTTP(rr, req)
+	require.NotEqual(t, http.StatusOK, rr.Code, "a read failure mid-copy must not answer 200")
+
+	getRR := f.get("dst-bucket", "dest-key")
+	assert.Equal(t, http.StatusNotFound, getRR.Code, "no destination object must be committed after a failed copy")
+}
+
 // CopyObject also has to work with the bucket/key form of x-amz-copy-source,
 // without the leading slash S3 also accepts.
 func TestCopyObjectAcceptsSourceWithoutLeadingSlash(t *testing.T) {

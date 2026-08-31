@@ -188,10 +188,9 @@ func parseRangeHeader(header string) (start, end int64) {
 	return start, end
 }
 
-// readObject assembles the complete object in memory. It is the streaming read
-// with a buffer on the end of it, kept for the callers that genuinely need the
-// bytes in hand -- a multipart part being written into a pipe -- so there is
-// one read path rather than two that can disagree about a layout.
+// readObject assembles the complete object in memory. It has no production
+// caller any more -- CopyObject streams instead -- and remains only because
+// the test suite uses it as a buffered read for assertions.
 func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64, handoff config.NodeID, opts ...stripeOption) ([]byte, int, error) {
 	// An empty object has no shards to read: the write path stores none, since
 	// the blob protocol has no zero-length value to store.

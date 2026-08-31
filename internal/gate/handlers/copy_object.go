@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"bytes"
 	"io"
 	"log/slog"
 	"net/http"
@@ -26,10 +25,9 @@ var copySourceConditionHeaders = []string{
 }
 
 // CopyObject serves PUT /{bucket}/{key} carrying x-amz-copy-source. The
-// source is read whole and written to the destination through the same
-// streaming write PutObject uses, so the destination gets its own placement
-// record, its own epoch and its own content digest rather than a copy of the
-// source's.
+// source is streamed stripe by stripe into the same streaming write
+// PutObject uses, so the destination gets its own placement record, its own
+// epoch and its own content digest rather than a copy of the source's.
 func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
@@ -93,11 +91,6 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		}
 
 		srcHandoff := handoffNode(ring, cfg, model.ObjectHash(srcBucket, srcKey))
-		data, _, err := readObject(ctx, bc, cfg, srcBucket, srcKey, srcPlace, srcSize, srcHandoff)
-		if err != nil {
-			HandleError(w, r, err)
-			return
-		}
 
 		destHash := model.ObjectHash(destBucket, destKey)
 		place, err := placeShards(ring, cfg, destHash, srcSize)
@@ -106,12 +99,34 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			return
 		}
 
-		// The ETag is MD5 over the body, teed off the read the write path
-		// performs, the same as PutObject: the destination's digest is
-		// computed fresh rather than copied from the source's record, since a
-		// multipart source's composite form does not describe this object.
+		// The source is read stripe by stripe into a pipe and teed into the
+		// digest, the same shape GetObject streams a response body: the
+		// copy's memory footprint is a stripe, not the source object, no
+		// matter how large that object is.
 		digest := model.NewPartETagHasher()
-		written, err := writeObject(ctx, bc, cfg, ring, io.TeeReader(bytes.NewReader(data), digest), srcSize, destHash, place)
+		var written writeResult
+		if srcSize == 0 {
+			// An empty object has no shards to read back, only a placement
+			// record, so there is nothing to stream and no stripe reader to open.
+			written, err = writeObject(ctx, bc, cfg, ring, io.TeeReader(http.NoBody, digest), 0, destHash, place)
+		} else {
+			srcReader, rErr := newStripeReader(ctx, bc, cfg, model.ObjectHash(srcBucket, srcKey), srcPlace, srcHandoff)
+			if rErr != nil {
+				HandleError(w, r, model.NewS3Error(model.ErrInternalError, rErr.Error(), 500))
+				return
+			}
+
+			pr, pw := io.Pipe()
+			go func() { pw.CloseWithError(pipeObject(ctx, srcReader, pw, srcSize)) }()
+
+			written, err = writeObject(ctx, bc, cfg, ring, io.TeeReader(pr, digest), srcSize, destHash, place)
+
+			// Closing the read end unblocks the goroutine above if writeObject
+			// stopped short on its own error, so it always exits rather than
+			// blocking forever on a write nothing will read.
+			_ = pr.Close()
+			srcReader.close(ctx)
+		}
 		if err != nil {
 			slog.ErrorContext(ctx, "copyObject: shard distribution failed", "error", err)
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, writeFailureReason(err))
