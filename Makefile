@@ -56,11 +56,13 @@ compose-down:
 # SMOKE_SUITES=aws`.
 SMOKE_SUITES ?=
 docker-smoke:
-	@PREDA_BASELINE=$(SMOKE_BASELINE) ./scripts/smoke.sh $(SMOKE_SUITES)
+	@PREDA_IMAGE=$(DOCKER_IMAGE) PREDA_BASELINE=$(SMOKE_BASELINE) \
+		./scripts/smoke.sh $(SMOKE_SUITES)
 
 # Re-record the baseline. Run it when a fix lands, in the same change.
 docker-smoke-baseline:
-	@PREDA_WRITE_BASELINE=$(SMOKE_BASELINE) ./scripts/smoke.sh $(SMOKE_SUITES)
+	@PREDA_IMAGE=$(DOCKER_IMAGE) PREDA_WRITE_BASELINE=$(SMOKE_BASELINE) \
+		./scripts/smoke.sh $(SMOKE_SUITES)
 
 # GO commands
 go_build:

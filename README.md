@@ -113,7 +113,7 @@ make compose-up COMPOSE_FILE=deploy/compose.single.yml
 make compose-down
 ```
 
-`make docker-smoke` then drives aws-cli, rclone, restic and a `registry:3` on top of the running cluster. It asserts response content rather than exit codes, and gates on `scripts/smoke-baseline.txt` so it fails on a regression rather than on the checks predastore does not pass yet. Re-record that file with `make docker-smoke-baseline` in the same change as the fix.
+`make docker-smoke` then checks the image itself — non-root, no private key in any layer — and drives aws-cli, rclone, restic and a `registry:3` on top of the running cluster. It asserts response content rather than exit codes, and gates on `scripts/smoke-baseline.txt` so it fails on a regression rather than on the checks predastore does not pass yet. Re-record that file with `make docker-smoke-baseline` in the same change as the fix.
 
 #### Environment
 

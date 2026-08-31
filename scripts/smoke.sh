@@ -15,10 +15,11 @@
 #   scripts/smoke.sh                 # everything
 #   scripts/smoke.sh aws rclone      # named suites only
 #
-# Suites: aws rclone restic registry
+# Suites: image aws rclone restic registry
 #
 # Environment:
 #   PREDA_ENDPOINT   S3 endpoint (default https://127.0.0.1:8443)
+#   PREDA_IMAGE      Image the `image` suite inspects (default predastore:dev)
 #   PREDA_CA         Trust anchor. Defaults to deploy/docker/certs/server.pem
 #                    if present, else it is taken from the endpoint itself.
 #   PREDA_BASELINE   Compare against this baseline and fail only on
@@ -39,6 +40,7 @@ RESTIC_IMAGE="${RESTIC_IMAGE:-restic/restic:0.19.0}"
 REGISTRY_IMAGE="${REGISTRY_IMAGE:-registry:3.0.0}"
 
 PREDA_ENDPOINT="${PREDA_ENDPOINT:-https://127.0.0.1:8443}"
+PREDA_IMAGE="${PREDA_IMAGE:-predastore:dev}"
 export AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-AKIAIOSFODNN7EXAMPLE}"
 export AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY}"
 export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-ap-southeast-2}"
@@ -139,6 +141,58 @@ run_suite() {
 }
 
 printf '%sPredastore smoke — %s%s\n' "$BOLD" "$PREDA_ENDPOINT" "$NC"
+
+# --- the image itself --------------------------------------------------------
+
+if run_suite image; then
+    section "image — what actually shipped"
+
+    # Reviewing a Dockerfile tells you what it says, not what the layers hold.
+    # Both of these were pre-ship blockers in the spike this image replaces.
+    runs_as_non_root() {
+        local uid
+        uid=$(docker run --rm --entrypoint id "$PREDA_IMAGE" -u 2>&1) || { echo "$uid"; return 1; }
+        if [ "$uid" = "0" ]; then
+            echo "image runs as root"
+            return 1
+        fi
+        return 0
+    }
+    check "runs as a non-root uid"  runs_as_non_root
+
+    # A key deleted in a later layer is still in the image, so every layer is
+    # unpacked rather than the merged filesystem being inspected. Deleting a
+    # file writes a .wh. marker into the newer layer and leaves the older one
+    # holding the bytes, so the key still lands in the tree below.
+    #
+    # Two details this check got wrong first time round and that are easy to
+    # repeat: `docker save` writes an OCI layout whose layer blobs are gzipped,
+    # so grepping the saved stream matches nothing at all; and openssl and any
+    # Go binary carry PEM header strings and self-test keys in their string
+    # tables, so the grep has to skip binaries or the clean image reports 38
+    # keys.
+    no_private_key_in_layers() {
+        local dir root blob found
+        dir="$WORK/image-save"
+        root="$WORK/image-root"
+        rm -rf "$dir" "$root" && mkdir -p "$dir" "$root" || return 1
+        docker save "$PREDA_IMAGE" | tar -x -C "$dir" || return 1
+        for blob in "$dir"/blobs/sha256/*; do
+            zcat -f "$blob" 2>/dev/null \
+                | tar -x -C "$root" --no-same-owner --no-same-permissions 2>/dev/null
+        done
+        found=$(grep -rIl -- '-----BEGIN [A-Z ]*PRIVATE KEY-----' "$root" 2>/dev/null \
+            | sed "s|^$root||")
+        rm -rf "$dir" "$root"
+        if [ -n "$found" ]; then
+            echo "private key material in the image:"
+            printf '%s\n' "$found"
+            return 1
+        fi
+        return 0
+    }
+    check "no private key in any layer" no_private_key_in_layers
+fi
 
 # --- AWS CLI: the baseline S3 surface ---------------------------------------
 
@@ -334,6 +388,9 @@ if [ -n "${PREDA_WRITE_BASELINE:-}" ]; then
         done
     } > "$PREDA_WRITE_BASELINE"
     printf '  wrote baseline to %s\n' "$PREDA_WRITE_BASELINE"
+    # Recording what predastore does today succeeded even though some of what
+    # it does today is fail, so this exits clean.
+    exit 0
 fi
 
 if [ -n "${PREDA_BASELINE:-}" ]; then
