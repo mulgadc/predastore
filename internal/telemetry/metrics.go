@@ -91,9 +91,10 @@ const (
 	metricMetaSnapshotIndex = "predastore.meta.snapshot.index"
 	metricMetaLogTrailing   = "predastore.meta.log.trailing"
 
-	metricRPCConnections = "predastore.rpc.connections"
-	metricRPCEvictions   = "predastore.rpc.evictions"
-	metricRPCStreamsOpen = "predastore.rpc.streams.open"
+	metricRPCConnections   = "predastore.rpc.connections"
+	metricRPCEvictions     = "predastore.rpc.evictions"
+	metricRPCStreamsOpen   = "predastore.rpc.streams.open"
+	metricRPCStreamOpenDur = "predastore.rpc.stream.open.duration"
 
 	metricRepairPending  = "predastore.repair.pending"
 	metricRepairRepaired = "predastore.repair.repaired"
@@ -122,7 +123,7 @@ var metricNames = []string{
 	metricObjectPhaseDuration,
 	metricMetaClientOps, metricMetaClientDuration, metricMetaClientRedirects,
 	metricMetaFSMLSMBytes, metricMetaFSMVLogBytes, metricMetaSnapshotIndex, metricMetaLogTrailing,
-	metricRPCConnections, metricRPCEvictions, metricRPCStreamsOpen,
+	metricRPCConnections, metricRPCEvictions, metricRPCStreamsOpen, metricRPCStreamOpenDur,
 	metricRepairPending, metricRepairRepaired, metricRepairFailed, metricRepairPasses,
 }
 
@@ -197,9 +198,10 @@ var (
 	metaSnapshotIndex metric.Int64ObservableGauge
 	metaLogTrailing   metric.Int64ObservableGauge
 
-	rpcConnections metric.Int64ObservableGauge
-	rpcEvictions   metric.Int64Counter
-	rpcStreamsOpen metric.Int64UpDownCounter
+	rpcConnections   metric.Int64ObservableGauge
+	rpcEvictions     metric.Int64Counter
+	rpcStreamsOpen   metric.Int64UpDownCounter
+	rpcStreamOpenDur metric.Float64Histogram
 
 	repairPending  metric.Int64ObservableGauge
 	repairRepaired metric.Int64ObservableGauge
@@ -328,6 +330,8 @@ func instruments() {
 			"Connections dropped from the pool, by peer and reason. A peer evicted repeatedly is the one at fault.", "{eviction}")
 		rpcStreamsOpen = int64UpDownCounter(metricRPCStreamsOpen,
 			"Streams this node has open to a peer. Bounded by the transport's per-connection cap, which is otherwise invisible.", "{stream}")
+		rpcStreamOpenDur = secondsHistogram(metricRPCStreamOpenDur,
+			"Time spent acquiring a stream to a peer, before a byte is written. QUIC blocks this wait when the peer's stream credit is spent, so it is the only thing that separates a slow peer from a connection that has run out of streams to talk over.")
 
 		repairPending = int64Gauge(metricRepairPending,
 			"Shard positions the last completed sweep could not rebuild. Above zero means stripes are short a holder right now.", "{shard}")
@@ -998,6 +1002,19 @@ func EnterRPCStream(ctx context.Context, node uint64) func() {
 	opts := nodeAttrs(node)
 	rpcStreamsOpen.Add(ctx, 1, opts.add...)
 	return func() { rpcStreamsOpen.Add(context.WithoutCancel(ctx), -1, opts.add...) }
+}
+
+// RecordRPCStreamOpen records how long acquiring a stream to a peer took.
+// Separate from the stream's own duration on purpose: this wait happens before
+// the request exists, so it is the peer's stream credit and never its service
+// time. The open-stream gauge cannot show it -- a caller blocked here has not
+// entered the gauge yet.
+func RecordRPCStreamOpen(ctx context.Context, node uint64, elapsed time.Duration) {
+	instruments()
+	if rpcStreamOpenDur == nil {
+		return
+	}
+	rpcStreamOpenDur.Record(ctx, elapsed.Seconds(), nodeAttrs(node).record...)
 }
 
 // MetaSnapshot is one meta replica's storage state at collection time,

@@ -757,6 +757,46 @@ func TestEnterRPCStreamTracksOpenStreams(t *testing.T) {
 	}
 }
 
+// The open wait is per peer and carries no other dimension: it is a property
+// of the connection to that node, and one peer running out of stream credit is
+// exactly what it has to be able to show on its own.
+func TestRecordRPCStreamOpenIsPerPeer(t *testing.T) {
+	reader := withManualReader(t)
+	ctx := context.Background()
+
+	RecordRPCStreamOpen(ctx, 1, 400*time.Millisecond)
+	RecordRPCStreamOpen(ctx, 1, 200*time.Millisecond)
+	RecordRPCStreamOpen(ctx, 2, time.Millisecond)
+
+	m := collect(t, reader)
+	hist, ok := m["predastore.rpc.stream.open.duration"].(metricdata.Histogram[float64])
+	if !ok {
+		t.Fatalf("aggregation is %T, want Histogram[float64]", m["predastore.rpc.stream.open.duration"])
+	}
+
+	seen := map[string]struct {
+		count uint64
+		sum   float64
+	}{}
+	for _, dp := range hist.DataPoints {
+		node, ok := dp.Attributes.Value(attribute.Key("node"))
+		if !ok {
+			t.Fatal("open-duration point carries no node attribute")
+		}
+		e := seen[node.AsString()]
+		e.count += dp.Count
+		e.sum += dp.Sum
+		seen[node.AsString()] = e
+	}
+
+	if got := seen["1"]; got.count != 2 || got.sum < 0.59 || got.sum > 0.61 {
+		t.Errorf("node 1 = %d opens totalling %vs, want 2 totalling ~0.6s", got.count, got.sum)
+	}
+	if got := seen["2"].count; got != 1 {
+		t.Errorf("node 2 = %d opens, want 1", got)
+	}
+}
+
 func TestRecordRPCEvictionSeparatesPeersAndReasons(t *testing.T) {
 	reader := withManualReader(t)
 	ctx := context.Background()
@@ -1058,6 +1098,7 @@ func recordEveryInstrument(t *testing.T) map[string]metricdata.Aggregation {
 	RecordMetaRedirect(ctx, RedirectNotLeader)
 	RecordRPCEviction(ctx, 1, EvictionStall)
 	EnterRPCStream(ctx, 1)()
+	RecordRPCStreamOpen(ctx, 1, time.Millisecond)
 
 	unregister, err := RegisterRaftGauges(func() RaftSnapshot {
 		return RaftSnapshot{NodeID: "1", State: "Leader", LeaderKnown: true, Term: "1", CommitIndex: "2", AppliedIndex: "1"}
