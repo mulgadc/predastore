@@ -7,13 +7,14 @@
 #
 #     scripts/bench/hw/hwbench.sh deploy && scripts/bench/hw/hwbench.sh start
 #
-# The gate is on 8333 and meta on 6550, rather than the usual 8443 and 6660,
-# because these machines also run a spinifex-managed predastore. That one binds
-# *:8443 for its gate and UDP <addr>:6660 for its meta node, so both defaults
-# are already taken on the addresses this profile uses. Blob keeps 9991.
+# Every port here is off predastore's default, because these machines also run
+# a spinifex-managed predastore: gate 8333 not 8443, meta 6550 not 6660, blob
+# 9881 not 9991. Two of those were live collisions — spx binds *:8443 and UDP
+# <addr>:6660 — and blob moves with them so a later spinifex change cannot
+# reintroduce the problem on the one port that happened to be free.
 #
-# Check both protocols when moving this to other hardware. Meta is QUIC, so it
-# is a UDP listener and an ss -lntp sweep does not see it.
+# Check both protocols when moving this to other hardware. Meta and blob are
+# QUIC, so they are UDP listeners and an ss -lntp sweep does not see them.
 #
 # RS(2,1) over three hosts places exactly one shard per host, so a GET reads
 # one shard locally and fetches exactly one from a peer. That is the cleanest
@@ -55,7 +56,7 @@ addr = "10.10.8.4"
   [[host.node]]
   id = 3
   role = "blob"
-  port = 9991
+  port = 9881
 
 [[host]]
 id = 2
@@ -74,7 +75,7 @@ addr = "10.10.8.5"
   [[host.node]]
   id = 6
   role = "blob"
-  port = 9991
+  port = 9881
 
 [[host]]
 id = 3
@@ -93,7 +94,7 @@ addr = "10.10.8.6"
   [[host.node]]
   id = 9
   role = "blob"
-  port = 9991
+  port = 9881
 
 # A config-defined service account. These are trusted: the policy table is
 # only consulted for IAM accounts, so none is written here.

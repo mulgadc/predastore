@@ -16,6 +16,7 @@
 #   hwbench.sh stop                 Stop every host and confirm no s3d survives
 #   hwbench.sh status               What is running where
 #   hwbench.sh perf    <ref> [tag]  Run e2e-performance.sh against the cluster
+#   hwbench.sh stress  [scenario]   Run the e2e-stress gate on the tools host
 #   hwbench.sh clean                Remove the deployment from every host
 #
 # Environment:
@@ -283,6 +284,45 @@ cmd_verify() {
     awscli "${ADDRS[0]}" s3 rb "s3://$bucket" --force >/dev/null 2>&1 || true
 }
 
+# --- stress --------------------------------------------------------------
+#
+# The stress gate owns its cluster: it starts and stops one per scenario, wipes
+# a node's disk, and freezes processes by pid. None of that survives being
+# pointed at a cluster it did not start, so this ships the repo to a host and
+# runs the harness there unmodified rather than reimplementing it.
+#
+# What that buys is the hardware — real NVMe, real CPU, real scheduling. Its
+# inter-node traffic is still loopback on the one machine, so this is not the
+# bare-metal network test perf is. Making the stress gate drive a cluster
+# across hosts is separate work.
+cmd_stress() {
+    local scenario="${1:-}"
+    local dest="$HW_ROOT/stress"
+    local SSH_TIMEOUT="${HW_STRESS_TIMEOUT:-5400}"
+
+    on "$TOOLS_HOST" "mkdir -p $dest" >/dev/null
+
+    # git archive rather than the working tree, so a run is attributable to a
+    # commit. HEAD must therefore be the thing under test.
+    log "shipping $(git -C "$REPO_DIR" describe --tags --always --dirty) to $TOOLS_HOST"
+    git -C "$REPO_DIR" archive --format=tar HEAD \
+        | timeout "$SSH_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=10 \
+            "$TOOLS_HOST" "tar -C $dest -xf -"
+
+    # STRESS_WORK_ROOT is the one that matters: the harness defaults it under
+    # $HOME, which is the slower root volume here, and the large-object
+    # scenario would both measure that drive and risk filling it.
+    local rc=0
+    on "$TOOLS_HOST" "cd $dest && \
+        PATH=/usr/local/go/bin:\$PATH \
+        STRESS_SCENARIO='$scenario' \
+        STRESS_WORK_ROOT=$HW_ROOT/stress-work \
+        make e2e-stress" || rc=$?
+
+    log "stress exited $rc; results under $dest/scripts/bench/results/e2e-stress on $TOOLS_HOST"
+    return "$rc"
+}
+
 # --- benchmark -----------------------------------------------------------
 #
 # The measurement is e2e-performance.sh in its external-hosts mode, not a
@@ -348,6 +388,7 @@ case "${1:-}" in
     start)  shift; cmd_start "$@" ;;
     verify) shift; cmd_verify "$@" ;;
     perf)   shift; cmd_perf "$@" ;;
+    stress) shift; cmd_stress "$@" ;;
     stop)   shift; cmd_stop "$@" ;;
     status) shift; cmd_status "$@" ;;
     clean)  shift; cmd_clean "$@" ;;
