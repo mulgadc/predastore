@@ -174,32 +174,11 @@ RUN="$CACHE/run.txt"
 MANIFEST="$CACHE/manifest.txt"
 rm -f "$RUN" "$MANIFEST"
 
-# A `::` line is a node id and becomes --deselect. A `marker:name` line joins
-# a `-m "not A and not B..."` expression instead: some unimplemented families
-# (object lock, POST uploads, ACLs, CORS, public access block) have no ceph
-# marker to catch them, so node ids are the only way to exclude them.
-DESELECT=()
-MARKERS=()
-if [ -f "$SKIPS" ]; then
-    while read -r line; do
-        line="${line%%#*}"
-        line="$(printf '%s' "$line" | tr -d '[:space:]')"
-        [ -z "$line" ] && continue
-        case "$line" in
-            marker:*) MARKERS+=("${line#marker:}") ;;
-            *)        DESELECT+=(--deselect "$line") ;;
-        esac
-    done < "$SKIPS"
-fi
-
-MARK_EXPR=()
-if [ ${#MARKERS[@]} -gt 0 ]; then
-    expr=""
-    for m in "${MARKERS[@]}"; do
-        expr="${expr:+$expr and }not $m"
-    done
-    MARK_EXPR=(-m "$expr")
-fi
+# predastore_cleanup.py reads SKIPS itself and does the deselecting, in
+# pytest_collection_modifyitems, so that it can drop any node id or marker
+# match the committed baseline records as PASS before it ever reaches
+# --deselect or -m. See the skip guard note at the top of that file.
+BASELINE_COMMITTED="$SCRIPT_DIR/s3-tests-baseline.txt"
 
 log "Running ceph/s3-tests at ${S3TESTS_REF:0:12} against https://$HOST:$PORT"
 
@@ -209,9 +188,10 @@ log "Running ceph/s3-tests at ${S3TESTS_REF:0:12} against https://$HOST:$PORT"
     PYTHONWARNINGS=ignore \
     S3TEST_CONF="$CONF" \
     PREDA_S3TESTS_MANIFEST="$RUN" \
+    PREDA_S3TESTS_SKIPS="$SKIPS" \
+    PREDA_S3TESTS_BASELINE_FILE="$BASELINE_COMMITTED" \
         "$VENV/bin/pytest" "${SUITES[@]}" \
-            -q --no-header -p no:cacheprovider -p predastore_cleanup \
-            "${DESELECT[@]}" "${MARK_EXPR[@]}" "$@"
+            -q --no-header -p no:cacheprovider -p predastore_cleanup "$@"
 )
 
 if [ ! -s "$RUN" ]; then

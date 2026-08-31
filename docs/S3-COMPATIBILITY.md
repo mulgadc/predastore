@@ -15,15 +15,17 @@ make s3-tests
 
 | | count |
 | --- | --- |
-| pass | 164 |
+| pass | 178 |
 | fail | 216 |
-| skip | 506 |
+| skip | 492 |
 | error | 0 |
 
 `skip` is two different things, and it matters which:
 
-- **The suite's own skips** (6 of the 506) — cases ceph/s3-tests excludes on any implementation, decided by the suite itself before predastore is ever reached.
-- **Predastore's deliberate skips** (500 of the 506, listed in `scripts/s3-tests-skips.txt`) — a feature predastore has decided not to offer for now: object lock, POST uploads, server-side encryption and encrypted copy, bucket logging, ACLs, bucket policy, lifecycle, versioning, cross-account bucket access, CORS and public access block. These are deselected before the run rather than executed and failed, which is the difference between this run taking six and a half minutes and thirteen. A case only earns a line there when nobody is actively fixing it — see the header of that file for the exact bar, and `pytest_deselected` in `scripts/s3tests/predastore_cleanup.py` for how a deselected case still lands in the manifest as SKIP instead of silently vanishing.
+- **The suite's own skips** (6 of the 492) — cases ceph/s3-tests excludes on any implementation, decided by the suite itself before predastore is ever reached.
+- **Predastore's deliberate skips** (486 of the 492, listed in `scripts/s3-tests-skips.txt`) — a feature predastore has decided not to offer for now: object lock, POST uploads, server-side encryption and encrypted copy, bucket logging, ACLs, bucket policy, lifecycle, versioning, cross-account bucket access, CORS and public access block. These are deselected before the run rather than executed and failed, which is the difference between this run taking about seven minutes and thirteen. A case only earns a line there when nobody is actively fixing it — see the header of that file for the exact bar, and `pytest_deselected` in `scripts/s3tests/predastore_cleanup.py` for how a deselected case still lands in the manifest as SKIP instead of silently vanishing.
+
+A passing case is never one of the 486, whatever family's marker or node id would otherwise catch it. `pytest_collection_modifyitems` in `predastore_cleanup.py` computes the skip set from the file, then removes anything the committed baseline records as PASS before it deselects the rest, and prints the exception to stderr. The skip list exists to stop re-running known gaps, not to stop measuring what works — a marker written for one family can catch a case that belongs to a different, working one, as `encryption` did here with plain TLS-transfer tests. Fourteen cases are held back by this guard right now: `test_encrypted_transfer_13b/1MB/1b/1kb` and seven `test_sse_kms_*` cases, caught by the `encryption`/`sse_s3` markers meant for actual server-side encryption, and `test_object_lock_changing_mode_from_governance_with_bypass`, `test_object_lock_get_legal_hold` and `test_object_lock_put_legal_hold`, listed by node id alongside object lock cases that do fail. All fourteen pass and stay measured.
 
 A skip is not a pass. It means the same thing it always did for the suite's own skips: predastore has not been measured against that case in this run, on purpose. `docs/development/bugs/` and `docs/development/improvements/` carry the beads for anything in progress; a deliberate skip here means no bead is open yet.
 
@@ -77,24 +79,24 @@ deliberately not implemented is not here; see the next table.
 
 ## Deliberate skips
 
-`scripts/s3-tests-skips.txt` excludes 500 distinct cases across the areas
-below, either by pytest marker or by node id where ceph/s3-tests has no
-marker for the feature. Each is a feature predastore has decided not to offer
-for now, not a case the suite itself would skip. The count is everything the
-marker or node id list catches, including a small number of currently-passing
-or already-suite-skipped cases swept in alongside the rest of the family. The
-areas are not disjoint — a bucket-policy case that also exercises SSE, or a
-lifecycle case that also exercises versioning's delete marker, is counted in
-both rows it belongs to — so the rows sum to 507 while the file skips 500
-distinct cases.
+`scripts/s3-tests-skips.txt` names cases across the areas below, either by
+pytest marker or by node id where ceph/s3-tests has no marker for the
+feature. Each is a feature predastore has decided not to offer for now, not a
+case the suite itself would skip. The counts below are after the PASS guard
+described above removes anything actually passing — Object lock and SSE are
+each three and eleven lower than what the file's markers and node ids alone
+would catch, for the fourteen cases named above. The areas are not disjoint
+either — a bucket-policy case that also exercises SSE, or a lifecycle case
+that also exercises versioning's delete marker, is counted in both rows it
+belongs to — so the rows sum to 493 while the file skips 486 distinct cases.
 
 | Area | Cases | Selector |
 | --- | --- | --- |
-| SSE (S3, KMS, C) and encrypted copy | 147 | `marker:encryption`, `marker:sse_s3`, `marker:bucket_encryption` |
+| SSE (S3, KMS, C) and encrypted copy | 136 | `marker:encryption`, `marker:sse_s3`, `marker:bucket_encryption` |
 | Bucket logging | 113 | `marker:bucket_logging` |
 | Bucket and object ACLs | 35 | node ids |
 | Bucket policy | 36 | `marker:bucket_policy` + 5 `GetBucketPolicyStatus` node ids |
-| Object lock | 37 | node ids |
+| Object lock | 34 | node ids |
 | Lifecycle | 48 | `marker:lifecycle` (a superset of `lifecycle_expiration`/`lifecycle_transition`) |
 | Versioning | 20 | node ids + `marker:delete_marker` |
 | POST object uploads | 36 | node ids |

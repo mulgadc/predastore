@@ -2,13 +2,21 @@
 #
 # Two kinds of line, both ending in `# reason`:
 #
-#   marker:name                 a pytest marker; feeds -m "not name and ..."
-#   suite/path.py::test_name    a single node id; feeds --deselect
+#   marker:name                 a pytest marker
+#   suite/path.py::test_name    a single node id
 #
-# Either way the case is recorded as SKIP in the manifest, never dropped --
-# pytest_deselected in predastore_cleanup.py catches everything -m and
-# --deselect filter out and writes it to the manifest itself, so a skip here
-# is still visible in the count and the line is never lost.
+# pytest_collection_modifyitems in predastore_cleanup.py reads this file and
+# does the deselecting itself, rather than scripts/s3-tests.sh building
+# --deselect/-m -- and before it deselects anything, it drops from the set
+# every node id the committed baseline records as PASS. A marker can mean
+# more than the family it was written for here (`encryption` also catches
+# plain TLS-transfer cases, which is not this file's decision to make), so a
+# passing case is never silenced no matter which line reaches for it. The
+# exception prints to stderr when a run hits one. Whatever survives that
+# guard is still recorded as SKIP in the manifest, never dropped --
+# pytest_deselected in the same file catches it and writes it to the
+# manifest itself, so a skip here is still visible in the count and the line
+# is never lost.
 #
 # The bar for a line here is high, and it is not "predastore fails this".
 # An operation that is unimplemented but wanted must stay a FAIL: that is

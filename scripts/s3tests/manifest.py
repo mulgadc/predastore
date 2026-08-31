@@ -1,7 +1,9 @@
 """Compare two ceph/s3-tests conformance manifests.
 
 A manifest is one line per test case, `STATUS|node id`, sorted. The recorder
-half lives in predastore_cleanup.py, which writes it from pytest's own report.
+half lives in predastore_cleanup.py, which writes it from pytest's own report;
+that same file also decides what gets deselected, and never deselects a case
+the committed baseline records as PASS.
 
 The interesting question a run answers is not the pass rate -- predastore fails
 a lot of s3-tests and will for a while -- but which lines moved.
@@ -33,13 +35,12 @@ def read(path):
 
 
 def read_skips(path):
-    """Deliberate non-support: `node id  # reason`, one per line.
+    """Node id lines from s3-tests-skips.txt: `node id  # reason`.
 
-    A `marker:name` line feeds a pytest `-m` deselect expression instead of a
-    node id -- scripts/s3-tests.sh builds that separately -- so there is no
-    single node id to force here. The deselected cases it covers still land in
-    the manifest, but through pytest_deselected in predastore_cleanup.py,
-    which runs against the actual collected items rather than a name pattern.
+    Marker lines are skipped here, and so is the actual deselecting: both now
+    happen in pytest_collection_modifyitems in predastore_cleanup.py, which
+    also drops any case the committed baseline records as PASS before it
+    reaches --deselect. This is left only for the stale-name check below.
     """
     skips = {}
     with open(path, encoding='utf-8') as handle:
@@ -55,11 +56,9 @@ def read_skips(path):
 
 
 def merge(run_path, skips_path, out_path):
-    """Fold the deliberate skips into a run, and write the manifest."""
+    """Write the manifest from a run, whose SKIP status is already final."""
     entries = read(run_path)
     skips = read_skips(skips_path)
-    for node in skips:
-        entries[node] = SKIP
 
     with open(out_path, 'w', encoding='utf-8') as out:
         out.write('# ceph/s3-tests conformance manifest for predastore.\n')
@@ -70,7 +69,7 @@ def merge(run_path, skips_path, out_path):
 
     # A skip that names a case the suite no longer has is a stale exclusion,
     # and it hides the fact that nothing is being excluded any more.
-    stale = sorted(n for n in skips if n not in read(run_path))
+    stale = sorted(n for n in skips if n not in entries)
     for node in stale:
         print('skip names a case this run did not collect: %s' % node, file=sys.stderr)
     return 0
