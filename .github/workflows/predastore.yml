@@ -11,6 +11,12 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/predastore.yml
+      - Dockerfile
+      - .dockerignore
+      - "deploy/**"
+      - "config/**"
+      - scripts/smoke.sh
+      - scripts/smoke-baseline.txt
   pull_request:
     branches:
       - main
@@ -90,3 +96,47 @@ jobs:
 
       - name: Govulncheck
         run: go tool govulncheck ./...
+
+  s3_compatibility:
+    name: S3 Compatibility
+    runs-on: ubuntu-26.04
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      # Builds the image the same way an operator would, which is also the
+      # only place the FIPS build guard runs: a binary built without GOFIPS140
+      # compiles cleanly and then panics in init().
+      - name: Build Image
+        run: make docker-build
+
+      - name: Start Cluster
+        run: make compose-up
+
+      # Every gate answers for the whole cluster, so waiting on one is enough
+      # to know the cluster elected a leader and opened its blob nodes.
+      - name: Wait for Readiness
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9099/readyz >/dev/null; then
+              curl -sS http://127.0.0.1:9099/readyz; echo; exit 0
+            fi
+            sleep 2
+          done
+          echo "cluster did not become ready" >&2
+          docker compose -f deploy/compose.cluster.yml logs --tail 50
+          exit 1
+
+      # Predastore fails several checks today, so this gates on regressions
+      # against scripts/smoke-baseline.txt rather than on a clean run.
+      - name: Smoke Suite
+        run: make docker-smoke
+
+      - name: Cluster Logs
+        if: failure()
+        run: docker compose -f deploy/compose.cluster.yml logs --tail 200
+
+      - name: Stop Cluster
+        if: always()
+        run: make compose-down
