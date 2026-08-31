@@ -116,6 +116,26 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # This job asks whether the change broke something, which a baseline can
+      # be made to answer wrongly: re-recording it turns a fresh regression into
+      # an expected failure and the gate goes quiet. Growing the expected-failure
+      # count is therefore its own failure, reviewable as a number.
+      - name: Guard the Baselines
+        if: github.event_name == 'pull_request'
+        run: |
+          status=0
+          for f in scripts/smoke-baseline.txt scripts/stress-baseline.txt; do
+            base=$(git show "origin/${{ github.base_ref }}:$f" 2>/dev/null | grep -c '^FAIL|' || true)
+            head=$(grep -c '^FAIL|' "$f" || true)
+            if [ "$head" -gt "$base" ]; then
+              echo "::error file=$f::$f gained $((head - base)) expected failure(s); a regression is fixed, not recorded"
+              status=1
+            fi
+          done
+          exit $status
 
       # Builds the image the same way an operator would, which is also the
       # only place the FIPS build guard runs: a binary built without GOFIPS140
