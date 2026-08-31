@@ -117,14 +117,19 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			}
 
 			pr, pw := io.Pipe()
-			go func() { pw.CloseWithError(pipeObject(ctx, srcReader, pw, srcSize)) }()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				pw.CloseWithError(pipeObject(ctx, srcReader, pw, srcSize))
+			}()
 
 			written, err = writeObject(ctx, bc, cfg, ring, io.TeeReader(pr, digest), srcSize, destHash, place)
 
-			// Closing the read end unblocks the goroutine above if writeObject
-			// stopped short on its own error, so it always exits rather than
-			// blocking forever on a write nothing will read.
+			// Closing the read end unblocks the goroutine if writeObject stopped
+			// short, and waiting for it means the stripe reader is closed by
+			// nobody else while it is still being read.
 			_ = pr.Close()
+			<-done
 			srcReader.close(ctx)
 		}
 		if err != nil {
