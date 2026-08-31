@@ -92,6 +92,59 @@ jobs:
         if: always()
         run: make compose-down
 
+  conformance:
+    name: S3 Conformance (ceph/s3-tests)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          cache-dependency-path: "go.sum"
+          go-version-file: "go.mod"
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build
+        run: make build
+
+      # No container here. The suite needs the three accounts and the us-east-1
+      # region that only config/s3tests.toml carries, and render-config.sh emits
+      # exactly one account, so the image cannot serve this run without being
+      # handed a mounted profile.
+      - name: Start Cluster
+        run: ./scripts/start.sh -w s3tests
+
+      # Comparison, never strict. Predastore fails a large part of s3-tests and
+      # will for a long while, so the question this job answers is whether the
+      # branch moved anything, not whether the suite is green.
+      - name: Conformance Suite
+        run: make s3-tests
+
+      - name: Upload Manifest
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: s3-tests-manifest
+          path: /tmp/predastore-s3-tests/manifest.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Cluster Logs
+        if: failure()
+        run: tail -n 200 /tmp/predastore/s3tests/logs/*.log
+
+      - name: Stop Cluster
+        if: always()
+        run: ./scripts/stop.sh s3tests
+
   stress:
     name: Stress (${{ matrix.scenario }})
     runs-on: ubuntu-26.04

@@ -1,0 +1,16 @@
+# Cases deliberately excluded from the ceph/s3-tests conformance run.
+#
+# One pytest node id per line, with the reason after a `#`. Excluded cases are
+# recorded as SKIP in the manifest, so they stay visible rather than vanishing
+# from the count.
+#
+# The bar for a line here is high, and it is not "predastore fails this". An
+# operation that is unimplemented but wanted must stay a FAIL: that is the gap
+# the manifest exists to show, and skipping it hides the thing being measured.
+# A line belongs here only when the case cannot report anything useful --
+# a feature predastore has decided not to offer, or a case that takes the run
+# down rather than failing.
+#
+# Whole test modules are excluded in scripts/s3-tests.sh instead, by not being
+# in SUITES: test_iam, test_sts, test_sns, test_s3select and test_s3control
+# cover RGW extensions and other AWS services, none of which predastore claims.

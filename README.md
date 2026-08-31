@@ -153,6 +153,8 @@ Two of these have constraints the container cannot paper over:
 
 Multi-object delete (`DeleteObjects`) is not implemented; delete objects one at a time.
 
+How far that support goes is measured rather than claimed. [docs/S3-COMPATIBILITY.md](docs/S3-COMPATIBILITY.md) holds the result of running `ceph/s3-tests` — the suite Ceph RGW, MinIO and Garage are all validated against — with the per-case manifest in `scripts/s3-tests-baseline.txt`. Read it before assuming an operation behaves the way S3 documents it.
+
 ### AWS CLI Examples
 
 Against the `1host` dev profile. Its certificate is self-signed, so either install it as a trust anchor or pass `--no-verify-ssl`:
@@ -303,6 +305,17 @@ make clean            # Clean build artifacts
 ```
 
 `make preflight` must pass before committing; `make fix` auto-fixes what the linter can.
+
+### Conformance
+
+```bash
+./scripts/start.sh -w s3tests   # the only profile with the accounts and region the suite needs
+make s3-tests                   # fails on a regression against scripts/s3-tests-baseline.txt
+make s3-tests-strict            # fails on any failing case; red by design
+make s3-tests-baseline          # re-record, in the same change as the fix
+```
+
+The suite is `ceph/s3-tests`, pinned to a commit and cloned on first run. It takes about fifteen minutes. See [docs/S3-COMPATIBILITY.md](docs/S3-COMPATIBILITY.md) for what the current numbers mean.
 
 ### Performance Tuning
 
