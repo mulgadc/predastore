@@ -2,17 +2,35 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/gob"
 	"log/slog"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
+	"github.com/mulgadc/predastore/internal/meta"
 )
 
-// defaultMaxKeys is the page size S3 reports when the client asks for none.
+// defaultMaxKeys is the page size S3 reports when the client asks for none, and
+// the ceiling it clamps a larger request down to.
 const defaultMaxKeys = 1000
+
+// listEntry is one row of a listing: an object, or a common prefix standing in
+// for every key collapsed beneath it. Paging works on entries rather than on
+// raw keys because a delimiter turns many keys into one row.
+type listEntry struct {
+	// sortKey orders the listing and is what a continuation token names. It is
+	// the object key, or the common prefix including its trailing delimiter.
+	sortKey string
+	dir     bool
+	// hash keys the shard placement holding the object's size. Empty for a
+	// common prefix.
+	hash []byte
+}
 
 // ListObjects serves GET /{bucket} (ListObjectsV2). Objects are listed by
 // scanning their ARN keys in global state.
@@ -54,6 +72,28 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 
 		prefix := query.Get("prefix")
 		delimiter := query.Get("delimiter")
+		startAfter := query.Get("start-after")
+		token := query.Get("continuation-token")
+
+		maxKeys, ok := parseMaxKeys(query.Get("max-keys"))
+		if !ok {
+			WriteS3Error(w, r, http.StatusBadRequest, string(model.ErrInvalidArgument),
+				"max-keys must be a non-negative integer")
+			return
+		}
+
+		// A continuation token supersedes start-after, and both resolve to the
+		// same thing: the last entry the client has already seen.
+		cursor := startAfter
+		if token != "" {
+			decoded, err := base64.StdEncoding.DecodeString(token)
+			if err != nil {
+				WriteS3Error(w, r, http.StatusBadRequest, string(model.ErrInvalidArgument),
+					"The continuation token provided is incorrect")
+				return
+			}
+			cursor = string(decoded)
+		}
 
 		items, err := metaScan(ctx, mc, model.TableObjects, objectARN(bucket, prefix), 0)
 		if err != nil {
@@ -61,45 +101,50 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
-		contents := make([]ListObjectsV2_Contents, 0, len(items))
+		entries := collapse(items, objectARN(bucket, ""), prefix, delimiter)
+
+		// The scan arrives in key order, but MetaClient promises nothing about
+		// ordering, and a cursor into an unordered listing drops and repeats
+		// keys without saying so.
+		sort.Slice(entries, func(i, j int) bool { return entries[i].sortKey < entries[j].sortKey })
+
+		if cursor != "" {
+			entries = entries[sort.Search(len(entries), func(i int) bool {
+				return entries[i].sortKey > cursor
+			}):]
+		}
+
+		// max-keys of zero is an empty listing, not a truncated one: there is no
+		// entry to name in a token, so a client told it was truncated would
+		// either stall or re-request the same empty page forever.
+		truncated := maxKeys > 0 && len(entries) > maxKeys
+		if len(entries) > maxKeys {
+			entries = entries[:maxKeys]
+		}
+
+		contents := make([]ListObjectsV2_Contents, 0, len(entries))
 		prefixes := make([]ListObjectsV2_Dir, 0)
-		seenPrefix := make(map[string]bool)
-
-		keyPrefix := objectARN(bucket, "")
-		for _, item := range items {
-			if !strings.HasPrefix(item.Key, keyPrefix) {
+		for _, entry := range entries {
+			if entry.dir {
+				prefixes = append(prefixes, ListObjectsV2_Dir{Prefix: entry.sortKey})
 				continue
-			}
-			objectKey := strings.TrimPrefix(item.Key, keyPrefix)
-
-			// A delimiter collapses everything below it into a common prefix, which
-			// is how S3 presents a flat keyspace as directories.
-			if delimiter != "" {
-				afterPrefix := strings.TrimPrefix(objectKey, prefix)
-				if idx := strings.Index(afterPrefix, delimiter); idx >= 0 {
-					dir := objectKey[:len(prefix)+idx+len(delimiter)]
-					if !seenPrefix[dir] {
-						seenPrefix[dir] = true
-						prefixes = append(prefixes, ListObjectsV2_Dir{Prefix: dir})
-					}
-					continue
-				}
 			}
 
 			// The listing row holds the object hash; the size lives with the shard
-			// placement it keys.
+			// placement it keys. Only the page is resolved, so the cost of a
+			// listing follows the page size rather than the bucket size.
 			var objectSize int64
-			if len(item.Value) == 32 {
-				if meta, err := metaGet(ctx, mc, model.TableObjects, string(item.Value)); err == nil && len(meta) > 0 {
+			if len(entry.hash) == 32 {
+				if row, err := metaGet(ctx, mc, model.TableObjects, string(entry.hash)); err == nil && len(row) > 0 {
 					var placement ObjectToShardNodes
-					if err := gob.NewDecoder(bytes.NewReader(meta)).Decode(&placement); err == nil {
+					if err := gob.NewDecoder(bytes.NewReader(row)).Decode(&placement); err == nil {
 						objectSize = placement.Size
 					}
 				}
 			}
 
 			contents = append(contents, ListObjectsV2_Contents{
-				Key:          objectKey,
+				Key:          entry.sortKey,
 				LastModified: time.Now(), // TODO: Store actual modification time
 				Size:         objectSize,
 				StorageClass: "STANDARD",
@@ -107,17 +152,69 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 		}
 
 		result := ListObjectsV2{
-			Name:           bucket,
-			Prefix:         prefix,
-			KeyCount:       len(contents),
-			MaxKeys:        defaultMaxKeys,
-			IsTruncated:    false, // TODO: Implement pagination
-			Contents:       &contents,
-			CommonPrefixes: &prefixes,
+			Name:              bucket,
+			Prefix:            prefix,
+			Delimiter:         delimiter,
+			KeyCount:          len(contents) + len(prefixes),
+			MaxKeys:           maxKeys,
+			IsTruncated:       truncated,
+			ContinuationToken: token,
+			StartAfter:        startAfter,
+			Contents:          &contents,
+			CommonPrefixes:    &prefixes,
+		}
+		if truncated {
+			last := entries[len(entries)-1].sortKey
+			result.NextContinuationToken = base64.StdEncoding.EncodeToString([]byte(last))
 		}
 
 		if err := writeXML(w, http.StatusOK, result); err != nil {
 			slog.DebugContext(ctx, "failed to write XML response", "error", err)
 		}
 	})
+}
+
+// collapse turns scanned rows into listing entries, folding everything below a
+// delimiter into a single common prefix the way S3 presents a flat keyspace as
+// directories.
+func collapse(items []meta.Item, keyPrefix, prefix, delimiter string) []listEntry {
+	entries := make([]listEntry, 0, len(items))
+	seenPrefix := make(map[string]bool)
+
+	for _, item := range items {
+		if !strings.HasPrefix(item.Key, keyPrefix) {
+			continue
+		}
+		objectKey := strings.TrimPrefix(item.Key, keyPrefix)
+
+		if delimiter != "" {
+			afterPrefix := strings.TrimPrefix(objectKey, prefix)
+			if idx := strings.Index(afterPrefix, delimiter); idx >= 0 {
+				dir := objectKey[:len(prefix)+idx+len(delimiter)]
+				if !seenPrefix[dir] {
+					seenPrefix[dir] = true
+					entries = append(entries, listEntry{sortKey: dir, dir: true})
+				}
+				continue
+			}
+		}
+
+		entries = append(entries, listEntry{sortKey: objectKey, hash: item.Value})
+	}
+	return entries
+}
+
+// parseMaxKeys reads the client's page size. S3 clamps a request above 1000
+// rather than rejecting it, but a negative or non-numeric value is an error:
+// treating it as unlimited is how an unpaginated listing gets served to a
+// client that asked for a page.
+func parseMaxKeys(raw string) (int, bool) {
+	if raw == "" {
+		return defaultMaxKeys, true
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return min(n, defaultMaxKeys), true
 }

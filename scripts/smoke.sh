@@ -253,6 +253,39 @@ if run_suite aws; then
     head -c 16777216 /dev/urandom > "$WORK/multi.bin"
     check "Multipart upload (16 MiB)" aws_cli s3 cp /work/multi.bin "s3://$B/multi.bin"
 
+    # Two assertions, because either one alone passes against a server with no
+    # pagination at all. A paginator sent the whole prefix on page one stops
+    # happy, and a single unfollowed page proves nothing about resuming.
+    paginator_walks_every_key() {
+        local want=7 count truncated keys total unique
+        for i in 1 2 3 4 5 6 7; do
+            aws_cli s3 cp /work/hello.txt "s3://$B/page/$i" >/dev/null || return 1
+        done
+
+        # One page, not followed: the server has to bound it and say so.
+        count=$(aws_cli s3api list-objects-v2 --bucket "$B" --prefix "page/" \
+            --max-keys 2 --no-paginate --query 'length(Contents)' --output text 2>/dev/null)
+        truncated=$(aws_cli s3api list-objects-v2 --bucket "$B" --prefix "page/" \
+            --max-keys 2 --no-paginate --query 'IsTruncated' --output text 2>/dev/null)
+        if [ "$count" != "2" ] || [ "$truncated" != "True" ]; then
+            echo "max-keys=2 returned $count keys with IsTruncated=$truncated, want 2 and True"
+            return 1
+        fi
+
+        # Then the whole walk, following NextContinuationToken to exhaustion.
+        keys=$(aws_cli s3api list-objects-v2 --bucket "$B" --prefix "page/" \
+            --page-size 2 --query 'Contents[].Key' --output text 2>/dev/null \
+            | tr '\t' '\n' | grep '^page/')
+        total=$(printf '%s\n' "$keys" | grep -c .)
+        unique=$(printf '%s\n' "$keys" | sort -u | grep -c .)
+        if [ "$total" != "$want" ] || [ "$unique" != "$want" ]; then
+            echo "paged listing returned $total keys ($unique unique), want $want"
+            return 1
+        fi
+        return 0
+    }
+    check "ListObjectsV2 pagination"  paginator_walks_every_key
+
     # Content assertions. Each of these currently fails, and each is asserted
     # on what came back rather than on a status code, because that is the
     # difference between naming the defect and recording a pass.
