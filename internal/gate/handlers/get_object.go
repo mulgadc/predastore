@@ -105,7 +105,7 @@ func serveObject(
 	lay := newLayout(cfg.DataShards, size, place.BlockSize)
 	if status == http.StatusPartialContent && lay.contiguous(start, end) {
 		shardIdx, at := lay.locate(start)
-		if data, rErr := readRangeFromSingleShard(ctx, bc, objectHash, place, shardIdx, at, end-start+1); rErr == nil {
+		if data, rErr := readRangeHedged(ctx, bc, cfg, objectHash, place, shardIdx, at, end-start+1); rErr == nil {
 			header(int64(len(data)), 0)
 			if _, wErr := w.Write(data); wErr != nil {
 				slog.DebugContext(ctx, "failed to write response body", "error", wErr)
@@ -256,7 +256,15 @@ func readRangeFromSingleShard(ctx context.Context, bc BlobClient, objectHash [32
 	}
 
 	start := time.Now()
-	defer func() { recordShardOutcome(ctx, telemetry.ShardOpRead, nodeNum, start, err) }()
+	defer func() {
+		recordShardOutcome(ctx, telemetry.ShardOpRead, nodeNum, start, err)
+		// Only successes shape the hedge delay. A read that failed reports how
+		// long the failure took, which is a timeout far above the mean and
+		// would push the delay towards never hedging.
+		if err == nil {
+			shardLatency.observe(nodeNum, time.Since(start))
+		}
+	}()
 
 	reader, err := bc.Get(ctx, nodeNum, objectRequest)
 	if err != nil {
