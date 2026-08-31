@@ -77,19 +77,26 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
-		// Object hash -> shard placement, for retrieval. This is the commit
-		// point: before it the write is invisible, after it the epoch it names
-		// is what every read will demand, and the shards already carry it.
+		// Publish shards before the placement record. A stale writer whose
+		// preparation was superseded must not publish a record that no shard
+		// can satisfy.
+		if commitShards(ctx, bc, objectHash, place, written) {
+			abortShards(ctx, bc, objectHash, place, written)
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "write epoch superseded", 409))
+			return
+		}
+
+		// Object hash -> shard placement is the visibility point. Raft applies
+		// this max-epoch update atomically, so a delayed older writer cannot move
+		// the record backwards.
 		phase = time.Now()
-		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), record); err != nil {
+		if err := metaPutMax(ctx, mc, model.TableObjects, string(objectHash[:]), record, place.WriteEpoch); err != nil {
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
 			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 		phase = recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseMetaPlacement, phase)
-
-		commitShards(ctx, bc, objectHash, place, written)
 
 		// Listing key -> object hash, for ListObjects.
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {

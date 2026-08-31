@@ -50,6 +50,10 @@ func (m *fakeMeta) Put(_ context.Context, key string, value []byte) error {
 	return nil
 }
 
+func (m *fakeMeta) PutMax(ctx context.Context, key string, value []byte, _ uint64) error {
+	return m.Put(ctx, key, value)
+}
+
 func (m *fakeMeta) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
@@ -574,15 +575,15 @@ func logShardWriteFailure(ctx context.Context, node config.NodeID, index int, er
 		"node", node, "index", index, "reason", reason, "err", err)
 }
 
-// commitShards publishes every prepared shard, after the placement record
-// naming the epoch has landed in global state.
+// commitShards publishes every prepared shard before the placement record
+// naming the epoch lands in global state. A superseded epoch is reported so
+// its writer cannot publish a record that no shard can satisfy.
 //
-// The record is the commit point, so a failure here is recoverable rather than
-// fatal: the shards are durable under exactly the epoch the record names, and
-// a reader asking for that epoch completes the commit itself. It is reported
-// because a node failing to commit is worth seeing, not because the object is
-// in doubt.
-func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written writeResult) {
+// Non-supersession failures remain recoverable by a reader or repair, but an
+// epoch mismatch means another write has won the shard and this writer must
+// not publish its placement.
+func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written writeResult) (superseded bool) {
+	var lost atomic.Bool
 	forEachShard(written, func(index int, node config.NodeID) {
 		err := bc.Commit(ctx, node, blob.CommitRequest{
 			Key:   objectHash,
@@ -590,11 +591,15 @@ func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place
 			Epoch: place.WriteEpoch,
 		})
 		if err != nil {
-			slog.WarnContext(ctx, "Shard commit failed; the record is published and a read will complete it",
+			if errors.Is(err, blob.ErrNotPrepared) {
+				lost.Store(true)
+			}
+			slog.WarnContext(ctx, "Shard commit failed",
 				"node", node, "index", index,
 				"epoch", fmt.Sprintf("%016x", place.WriteEpoch), "err", err)
 		}
 	})
+	return lost.Load()
 }
 
 // abortShards discards shards prepared for a write that will not be published,

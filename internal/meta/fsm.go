@@ -24,6 +24,7 @@ type CommandType uint8
 const (
 	CommandPut CommandType = iota
 	CommandDelete
+	CommandPutMax
 )
 
 // Command represents a database operation that goes through Raft.
@@ -31,6 +32,7 @@ type Command struct {
 	Type  CommandType `json:"type"`
 	Key   []byte      `json:"key"` // []byte for safe JSON base64 encoding of binary keys
 	Value []byte      `json:"value,omitempty"`
+	Epoch uint64      `json:"epoch,omitempty"`
 }
 
 // FSM implements raft.FSM interface backed by Badger.
@@ -110,9 +112,37 @@ func (f *FSM) Apply(log *raft.Log) any {
 		return f.applyPut(string(cmd.Key), cmd.Value)
 	case CommandDelete:
 		return f.applyDelete(string(cmd.Key))
+	case CommandPutMax:
+		return f.applyPutMax(string(cmd.Key), cmd.Value, cmd.Epoch)
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
+}
+
+// applyPutMax publishes a placement only when it is not older than the
+// placement currently stored. The comparison happens inside the Raft FSM, so
+// concurrent gate requests cannot race a read-then-write check.
+func (f *FSM) applyPutMax(key string, value []byte, epoch uint64) error {
+	return f.db.Update(func(txn *badger.Txn) error {
+		if item, err := txn.Get([]byte(key)); err == nil {
+			current, err := item.ValueCopy(nil)
+			if err != nil {
+				return err
+			}
+			// Placement records store the epoch at byte offset 11. Only this
+			// operation is used for placement keys, so malformed/legacy values
+			// are replaced normally.
+			if len(current) >= 19 && current[0] == 0 && current[1] == 2 {
+				currentEpoch := binary.BigEndian.Uint64(current[11:19])
+				if currentEpoch > epoch {
+					return nil
+				}
+			}
+		} else if !errors.Is(err, badger.ErrKeyNotFound) {
+			return err
+		}
+		return txn.Set([]byte(key), value)
+	})
 }
 
 // applyPut stores a key-value pair.

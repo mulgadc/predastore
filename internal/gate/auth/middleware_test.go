@@ -42,9 +42,10 @@ var errNoCluster = errors.New("no cluster")
 
 type noMeta struct{}
 
-func (noMeta) Get(context.Context, string) ([]byte, error) { return nil, errNoCluster }
-func (noMeta) Put(context.Context, string, []byte) error   { return errNoCluster }
-func (noMeta) Delete(context.Context, string) error        { return errNoCluster }
+func (noMeta) Get(context.Context, string) ([]byte, error)          { return nil, errNoCluster }
+func (noMeta) Put(context.Context, string, []byte) error            { return errNoCluster }
+func (noMeta) PutMax(context.Context, string, []byte, uint64) error { return errNoCluster }
+func (noMeta) Delete(context.Context, string) error                 { return errNoCluster }
 func (noMeta) ScanFrom(context.Context, string, string, int) ([]meta.Item, error) {
 	return nil, errNoCluster
 }
