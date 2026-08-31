@@ -43,13 +43,16 @@ make build
 ./scripts/start.sh -w 1host     # one process, S3 on https://127.0.0.1:8443
 ```
 
-Three profiles ship with the repo. They differ only in how many hosts the nodes are spread over, which is what decides the transport between them:
+Four profiles ship with the repo. They differ only in how many hosts the nodes are spread over, which is what decides the transport between them:
 
 | Profile | Hosts | RS | Inter-node transport | Needs `sudo` |
 |---------|-------|----|----------------------|--------------|
 | `1host` | 1 | (1, 0) | in-process pipe only | no |
 | `3host` | 3 on `10.11.12.{1,2,3}` | (2, 1) | QUIC between hosts, pipe within | yes |
+| `4host` | 4 on `10.11.12.{1..4}` | (2, 1) | QUIC between hosts, pipe within | yes |
 | `5host` | 5 on `10.11.12.{1..5}` | (3, 2) | QUIC between hosts, pipe within | yes |
+
+Every host in every profile sets `admin_port = 9099`, so `/healthz` and `/readyz` answer on the host's own address. That is plain HTTP with no authentication, which is safe on a loopback dev cluster and is why the flag default is `0` rather than a port.
 
 The multi-host profiles put every host on one machine behind loopback aliases, so they need `sudo` to add those aliases and to install the generated certificate as a trust anchor. Each host answers S3 on its own address.
 
@@ -93,6 +96,52 @@ A cluster whose `[[host.node]]` entries all sit under one `[[host]]` runs entire
 
 The encryption key file must be exactly 32 raw bytes (no base64, no header) with mode `0600`. Generate one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key must be supplied to every host in a cluster; rotating it is not currently supported (see Roadmap → envelope encryption).
 
+### Run in Docker
+
+The image needs no arguments and no configuration file. On first start it generates a TLS identity and an at-rest key into its volume and serves a single-host RS(1, 0) cluster:
+
+```bash
+make docker-build
+docker run -d -p 8443:8443 -p 9099:9099 -v preda-data:/var/lib/predastore predastore:dev
+```
+
+Two compose topologies ship under `deploy/`. The cluster profile is four hosts at RS(2, 1), each with a gate, a meta replica and a blob node; every gate answers for the whole cluster, so `8443`–`8446` are four ways into the same thing:
+
+```bash
+make compose-up                              # four hosts
+make compose-up COMPOSE_FILE=deploy/compose.single.yml
+make compose-down
+```
+
+`make docker-smoke` then checks the image itself — non-root, no private key in any layer — and drives aws-cli, rclone, restic and a `registry:3` on top of the running cluster. It asserts response content rather than exit codes, and gates on `scripts/smoke-baseline.txt` so it fails on a regression rather than on the checks predastore does not pass yet. Re-record that file with `make docker-smoke-baseline` in the same change as the fix.
+
+#### Environment
+
+`s3d` itself reads no environment variables, so the entrypoint renders a configuration file from these and passes it as `-config`. Every one is optional.
+
+| Variable | Default | Description |
+|---|---|---|
+| `PREDA_PEERS` | `127.0.0.1` | Comma-separated host addresses in host-id order. More than one entry makes it a cluster |
+| `PREDA_HOST_ID` | `1` | Which `[[host]]` this process runs |
+| `PREDA_HOST_ID_FROM_ORDINAL` | `0` | Set to `1` to derive the host id from a StatefulSet pod ordinal |
+| `PREDA_BIND_ADDR` | `0.0.0.0` | Cluster-plane listen address |
+| `PREDA_RS_DATA`, `PREDA_RS_PARITY` | `1`/`0` alone, `2`/`1` otherwise | Erasure-coding width |
+| `PREDA_BLOB_NODES` | `1` | Blob nodes per host |
+| `PREDA_REGION` | `ap-southeast-2` | Region |
+| `PREDA_S3_PORT`, `PREDA_META_PORT`, `PREDA_BLOB_PORT` | `8443`, `6660`, `9991` | Node ports |
+| `PREDA_ADMIN_PORT` | `9099` | `/healthz` and `/readyz`; `0` runs neither |
+| `PREDA_ACCESS_KEY_ID`, `PREDA_SECRET_ACCESS_KEY`, `PREDA_ACCOUNT_ID` | the AWS example pair | Config-defined service account |
+| `PREDA_DATA` | `/var/lib/predastore` | Data root |
+| `PREDA_TLS_CERT`, `PREDA_TLS_KEY` | under `$PREDA_DATA/tls/` | TLS identity, generated if absent |
+| `PREDA_KEY` | `$PREDA_DATA/master.key` | AES-256 key at rest, generated if absent |
+| `PREDA_CONFIG` | — | Use this profile verbatim and render nothing |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+
+Two of these have constraints the container cannot paper over:
+
+- A cluster is refused without explicit credentials. The AWS example pair is a single-host evaluation default, not something to run four hosts on.
+- A cluster needs **one TLS keypair shared by every host**, because peers verify each other against the system trust store. Hosts that each generated their own identity do not fail loudly, they simply never elect a leader, so the entrypoint refuses to generate one when `PREDA_PEERS` names more than one address. `deploy/docker/gen-certs.sh` mints a shared local-development keypair; `make compose-up` runs it for you.
+
 ## S3 API Support
 
 | Area | Operations |
@@ -103,6 +152,8 @@ The encryption key file must be exactly 32 raw bytes (no base64, no header) with
 | Authentication | AWS Signature Version 4, presigned URLs |
 
 Multi-object delete (`DeleteObjects`) is not implemented; delete objects one at a time.
+
+How far that support goes is measured rather than claimed. [docs/S3-COMPATIBILITY.md](docs/S3-COMPATIBILITY.md) holds the result of running `ceph/s3-tests` — the suite Ceph RGW, MinIO and Garage are all validated against — with the per-case manifest in `scripts/s3-tests-baseline.txt`. Read it before assuming an operation behaves the way S3 documents it.
 
 ### AWS CLI Examples
 
@@ -180,7 +231,7 @@ parity = 1    # parity shards; data + parity must not exceed the blob node count
 id   = 1
 addr = "10.11.12.1"        # what other hosts dial; no port — nodes carry those
 # bind_addr = "10.11.12.1" # where raft and blob listen; defaults to addr
-# admin_port = 9100        # /healthz and /readyz on bind_addr; absent runs neither
+# admin_port = 9099        # /healthz and /readyz on bind_addr; absent runs neither
 # data_dir  = "/var/lib/predastore"   # absolute; -data-dir supplies it otherwise
 
   # A role this host runs. One of "gate", "blob" or "meta".
@@ -262,6 +313,17 @@ make clean            # Clean build artifacts
 ```
 
 `make preflight` must pass before committing; `make fix` auto-fixes what the linter can.
+
+### Conformance
+
+```bash
+./scripts/start.sh -w s3tests   # the only profile with the accounts and region the suite needs
+make s3-tests                   # fails on a regression against scripts/s3-tests-baseline.txt
+make s3-tests-strict            # fails on any failing case; red by design
+make s3-tests-baseline          # re-record, in the same change as the fix
+```
+
+The suite is `ceph/s3-tests`, pinned to a commit and cloned on first run. It takes about fifteen minutes. See [docs/S3-COMPATIBILITY.md](docs/S3-COMPATIBILITY.md) for what the current numbers mean.
 
 ### Performance Tuning
 

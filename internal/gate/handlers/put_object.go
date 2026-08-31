@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mulgadc/bluebottle/pkg/sigv4"
@@ -38,7 +39,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		objectHash := model.ObjectHash(bucket, key)
 
-		body, size := decodeBody(r)
+		body, size, dec := decodeBody(r)
 		if size < 0 {
 			HandleError(w, r, model.ErrMissingContentLengthError)
 			return
@@ -65,7 +66,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		// Shards are prepared but invisible until the placement lands below, so a
 		// body that fails its payload check leaves the previous object intact.
-		if err := finishPayload(r); err != nil {
+		if err := finishPayload(r, dec); err != nil {
 			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, err)
 			return
@@ -144,38 +145,146 @@ func recordPhase(ctx context.Context, op, phase string, start time.Time) time.Ti
 // verifies it as it streams: the signed digest is only compared at EOF, and the write
 // path stops at the declared length. Draining the remainder forces the comparison, so a
 // rewritten body is caught before the write is committed to global state.
-func finishPayload(r *http.Request) error {
+// It also finishes a framed body, where the remainder is the terminating chunk
+// and the trailers: the write path stops at the decoded length, so without this
+// the chunk signature closing the chain and the trailing checksum are never
+// read. Draining has to go through the decoder for that reason — draining
+// r.Body would read those bytes around every check the decoder makes on them.
+func finishPayload(r *http.Request, dec *chunked.Decoder) error {
 	if r.Body == nil {
 		return nil
 	}
 
-	if _, err := io.Copy(io.Discard, r.Body); err != nil {
+	var rest io.Reader = r.Body
+	if dec != nil {
+		rest = dec
+	}
+
+	if _, err := io.Copy(io.Discard, rest); err != nil {
 		if errors.Is(err, sigv4.ErrContentSHA256Mismatch) {
 			return model.ErrContentSHA256MismatchError
 		}
 
-		return model.NewS3Error(model.ErrInternalError, "Failed to read the request body", 500)
+		return mapChunkedErr(err)
+	}
+
+	if dec == nil {
+		return nil
+	}
+
+	// Two independent promises: the sentinel the client signed, and X-Amz-Trailer
+	// on the request. The header binds an unauthenticated write, which signs no
+	// sentinel, so neither alone is enough to decide the trailer was optional.
+	_, _, sent := dec.ChecksumTrailer()
+	promised := dec.PromisesChecksum() || SignedPayloadFrom(r.Context()).PromisesTrailer()
+	if !sent && !promised {
+		return nil
+	}
+	if err := dec.VerifyTrailerChecksum(); err != nil {
+		return mapChecksumErr(err)
 	}
 
 	return nil
 }
 
+// mapChecksumErr separates a body that failed its checksum from one that never
+// supplied a usable one. The first is a mismatch; the second is a request whose
+// integrity promise cannot be honoured, which is malformed.
+func mapChecksumErr(err error) error {
+	switch {
+	case errors.Is(err, chunked.ErrChecksumMissing),
+		errors.Is(err, chunked.ErrChecksumUndeclared):
+		return model.ErrMalformedChunkedBodyError
+	default:
+		return model.ErrChecksumMismatchError
+	}
+}
+
+// mapChunkedErr turns a framing failure into the response S3 gives for it. A
+// broken signature chain is an authentication failure; anything else about the
+// framing is a malformed request. Neither is a 500: both are the client's.
+func mapChunkedErr(err error) error {
+	switch {
+	case errors.Is(err, chunked.ErrChunkSignature):
+		return model.ErrSignatureDoesNotMatchError
+	case errors.Is(err, chunked.ErrMalformedFraming):
+		return model.ErrMalformedChunkedBodyError
+	default:
+		return model.NewS3Error(model.ErrInternalError, "Failed to read the request body", 500)
+	}
+}
+
 // decodeBody unwraps aws-chunked framing when the client used it, so the rest
 // of the write path only ever sees object bytes, and reports how many of those
 // bytes to expect. The count is negative when the request declared no length.
-func decodeBody(r *http.Request) (io.Reader, int64) {
+// The decoder comes back with them so the caller can finish the body through
+// it, and is nil when the body carries no framing.
+func decodeBody(r *http.Request) (io.Reader, int64, *chunked.Decoder) {
 	if r.Body == nil {
-		return http.NoBody, 0
+		return http.NoBody, 0, nil
 	}
-	if r.Header.Get("Content-Encoding") != "aws-chunked" {
-		return r.Body, r.ContentLength
+	if !bodyIsFramed(r) {
+		return r.Body, r.ContentLength, nil
 	}
+
+	var opts []chunked.Option
+	if chain := SignedPayloadFrom(r.Context()).Chain; chain != nil {
+		opts = append(opts, chunked.WithChain(chain))
+	}
+	// X-Amz-Trailer names the trailers to come, and hashing has to start before
+	// the body is read, so the promise is what selects the algorithm.
+	if promised := r.Header.Values("X-Amz-Trailer"); len(promised) > 0 {
+		opts = append(opts, chunked.WithTrailerChecksums(splitHeaderList(promised)))
+	}
+
 	// Content-Length on a chunked request measures the framing, not the object,
 	// so the decoded length is the only size the splitter can use. An absent or
 	// unparseable header leaves the object size undeclared.
 	decodedLen, err := strconv.ParseInt(r.Header.Get("X-Amz-Decoded-Content-Length"), 10, 64)
 	if err != nil || decodedLen < 0 {
-		return chunked.NewDecoder(r.Body, 0), -1
+		dec := chunked.NewDecoder(r.Body, 0, opts...)
+		return dec, -1, dec
 	}
-	return chunked.NewDecoder(r.Body, decodedLen), decodedLen
+	// The write path stops at the declared length, so the decoder has to hold
+	// the body to it as well; otherwise a short declaration stores a truncated
+	// object whose checksum still verifies over everything that was sent.
+	opts = append(opts, chunked.WithDeclaredLength(decodedLen))
+	dec := chunked.NewDecoder(r.Body, decodedLen, opts...)
+	return dec, decodedLen, dec
+}
+
+// splitHeaderList flattens a header that may repeat and may also carry a
+// comma-separated list in one value.
+func splitHeaderList(values []string) []string {
+	var out []string
+	for _, v := range values {
+		for part := range strings.SplitSeq(v, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
+}
+
+// bodyIsFramed reports whether the body carries aws-chunked framing.
+//
+// The sentinel the client signed decides it, not Content-Encoding: AWS
+// documents that header as optional on a chunked upload and permits
+// "aws-chunked, gzip", and it is not a signed header, so anything on the path
+// can add or remove it. Getting this wrong stores the framing as object data
+// and answers 200.
+//
+// An unauthenticated request signs nothing, so there the header is all there is.
+func bodyIsFramed(r *http.Request) bool {
+	payload := SignedPayloadFrom(r.Context())
+	if payload.Signed {
+		return payload.Framed()
+	}
+	for enc := range strings.SplitSeq(r.Header.Get("Content-Encoding"), ",") {
+		if strings.EqualFold(strings.TrimSpace(enc), "aws-chunked") {
+			return true
+		}
+	}
+	return false
 }

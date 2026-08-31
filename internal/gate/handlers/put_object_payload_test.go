@@ -84,7 +84,7 @@ func TestFinishPayload(t *testing.T) {
 		_, err := io.CopyN(io.Discard, req.Body, int64(len(large)))
 		require.NoError(t, err)
 
-		require.NoError(t, finishPayload(req))
+		require.NoError(t, finishPayload(req, nil))
 	})
 
 	t.Run("rewritten body", func(t *testing.T) {
@@ -93,7 +93,7 @@ func TestFinishPayload(t *testing.T) {
 		_, err := io.CopyN(io.Discard, req.Body, int64(len(large)))
 		require.NoError(t, err)
 
-		require.ErrorIs(t, finishPayload(req), model.ErrContentSHA256MismatchError)
+		require.ErrorIs(t, finishPayload(req, nil), model.ErrContentSHA256MismatchError)
 	})
 
 	t.Run("body already at EOF", func(t *testing.T) {
@@ -102,6 +102,6 @@ func TestFinishPayload(t *testing.T) {
 		_, err := io.ReadAll(req.Body)
 		require.NoError(t, err)
 
-		require.NoError(t, finishPayload(req))
+		require.NoError(t, finishPayload(req, nil))
 	})
 }

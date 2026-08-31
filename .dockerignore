@@ -1,0 +1,34 @@
+# Everything the image build does not need. Keeping this tight matters more
+# than usual here: the builder stage does a bare COPY of the tree, so anything
+# left in is both a layer-cache invalidator and a candidate for ending up in
+# an image someone publishes.
+
+.git
+.github
+.golangci.yml
+
+# Build outputs and runtime state, none of which belongs in a build context.
+bin/
+tmp/
+pids/
+logs/
+certs/
+clusters/
+*.test
+*.out
+
+# Benchmarks and their results: large, and nothing in the image runs them.
+scripts/bench/
+docs/
+
+# Deployment artefacts are consumed by docker and helm, not by the compiler.
+# The entrypoint scripts are the exception: the runtime stage copies them.
+deploy/
+!deploy/docker/
+
+# Test fixtures.
+**/testdata/
+
+.DS_Store
+Thumbs.db
+.env

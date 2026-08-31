@@ -11,6 +11,12 @@ on:
       - go.sum
       - Makefile
       - .github/workflows/predastore.yml
+      - Dockerfile
+      - .dockerignore
+      - "deploy/**"
+      - "config/**"
+      - scripts/smoke.sh
+      - scripts/smoke-baseline.txt
   pull_request:
     branches:
       - main
@@ -90,3 +96,77 @@ jobs:
 
       - name: Govulncheck
         run: go tool govulncheck ./...
+
+  # The S3 protocol surface, on one node and the two fastest suites. The full
+  # five-suite run against a four-node cluster, the stress scenarios and the
+  # Warp suite live in predastore-e2e.yml, on push to dev and on dispatch.
+  #
+  # This stays on the pull-request path rather than moving with them: it is the
+  # only gate on the S3 surface before a merge, and an SDK-default upload
+  # storing its aws-chunked framing as object data and answering 200 is exactly
+  # the class of defect it catches.
+  s3_compatibility:
+    name: S3 Compatibility (single node)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    env:
+      COMPOSE_FILE: deploy/compose.single.yml
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # This job asks whether the change broke something, which a baseline can
+      # be made to answer wrongly: re-recording it turns a fresh regression into
+      # an expected failure and the gate goes quiet. Growing the expected-failure
+      # count is therefore its own failure, reviewable as a number.
+      - name: Guard the Baselines
+        if: github.event_name == 'pull_request'
+        run: |
+          status=0
+          for f in scripts/smoke-baseline.txt scripts/stress-baseline.txt; do
+            base=$(git show "origin/${{ github.base_ref }}:$f" 2>/dev/null | grep -c '^FAIL|' || true)
+            head=$(grep -c '^FAIL|' "$f" || true)
+            if [ "$head" -gt "$base" ]; then
+              echo "::error file=$f::$f gained $((head - base)) expected failure(s); a regression is fixed, not recorded"
+              status=1
+            fi
+          done
+          exit $status
+
+      # Builds the image the same way an operator would, which is also the
+      # only place the FIPS build guard runs: a binary built without GOFIPS140
+      # compiles cleanly and then panics in init().
+      - name: Build Image
+        run: make docker-build
+
+      - name: Start Node
+        run: make compose-up COMPOSE_FILE="$COMPOSE_FILE"
+
+      - name: Wait for Readiness
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9099/readyz >/dev/null; then
+              curl -sS http://127.0.0.1:9099/readyz; echo; exit 0
+            fi
+            sleep 2
+          done
+          echo "node did not become ready" >&2
+          docker compose -f "$COMPOSE_FILE" logs --tail 50
+          exit 1
+
+      # Predastore fails several checks today, so this gates on regressions
+      # against scripts/smoke-baseline.txt rather than on a clean run.
+      - name: Smoke Suite
+        run: make docker-smoke SMOKE_SUITES="image aws"
+
+      - name: Node Logs
+        if: failure()
+        run: docker compose -f "$COMPOSE_FILE" logs --tail 200
+
+      - name: Stop Node
+        if: always()
+        run: make compose-down COMPOSE_FILE="$COMPOSE_FILE"

@@ -28,6 +28,71 @@ certs:
 build:
 	$(MAKE) go_build
 
+# Container targets. The image is the compatibility loop: it starts in seconds
+# and the smoke suite drives real S3 clients at it, which is how three of the
+# open S3-compatibility defects were found in the first place.
+DOCKER_IMAGE   ?= predastore:dev
+COMPOSE_SINGLE := deploy/compose.single.yml
+COMPOSE_CLUSTER:= deploy/compose.cluster.yml
+COMPOSE_FILE   ?= $(COMPOSE_CLUSTER)
+SMOKE_BASELINE ?= scripts/smoke-baseline.txt
+
+docker-build:
+	@echo -e "\n....Building $(DOCKER_IMAGE)"
+	docker build -t $(DOCKER_IMAGE) .
+
+# The cluster profile needs one keypair shared by every host: peers verify
+# against the trust store, so hosts holding their own identities never elect a
+# leader. The single profile generates its own and needs nothing here.
+compose-up: docker-build
+	@if [ "$(COMPOSE_FILE)" = "$(COMPOSE_CLUSTER)" ]; then deploy/docker/gen-certs.sh; fi
+	PREDA_IMAGE=$(DOCKER_IMAGE) docker compose -f $(COMPOSE_FILE) up -d
+
+compose-down:
+	PREDA_IMAGE=$(DOCKER_IMAGE) docker compose -f $(COMPOSE_FILE) down -v
+
+# Fails only on a regression against the baseline, since predastore does not
+# pass every check today. SMOKE_SUITES narrows the run: `make docker-smoke
+# SMOKE_SUITES=aws`.
+SMOKE_SUITES ?=
+docker-smoke:
+	@PREDA_IMAGE=$(DOCKER_IMAGE) PREDA_BASELINE=$(SMOKE_BASELINE) \
+		./scripts/smoke.sh $(SMOKE_SUITES)
+
+# Fails on any failing check. This is the honest question — is predastore S3
+# compatible — and it is red until the remaining gaps are closed. The
+# regression form above is what a pull request runs, so a branch is not red
+# for defects it did not introduce.
+docker-smoke-strict:
+	@PREDA_IMAGE=$(DOCKER_IMAGE) PREDA_BASELINE=$(SMOKE_BASELINE) PREDA_STRICT=1 \
+		./scripts/smoke.sh $(SMOKE_SUITES)
+
+# Re-record the baseline. Run it when a fix lands, in the same change.
+docker-smoke-baseline:
+	@PREDA_IMAGE=$(DOCKER_IMAGE) PREDA_WRITE_BASELINE=$(SMOKE_BASELINE) \
+		./scripts/smoke.sh $(SMOKE_SUITES)
+
+# ceph/s3-tests conformance. The smoke suite asks whether real clients work;
+# this asks whether the operations match the specification. It needs a cluster
+# on the s3tests profile, the only one carrying the three accounts and the
+# us-east-1 region the suite requires:
+#
+#   ./scripts/start.sh -w s3tests
+#   make s3-tests
+S3TESTS_BASELINE ?= scripts/s3-tests-baseline.txt
+
+s3-tests:
+	@PREDA_BASELINE=$(S3TESTS_BASELINE) ./scripts/s3-tests.sh
+
+# Fails on any failing case. Predastore is a long way from passing s3-tests, so
+# this is red by design: it exists to be read, not to gate anything.
+s3-tests-strict:
+	@PREDA_BASELINE=$(S3TESTS_BASELINE) PREDA_STRICT=1 ./scripts/s3-tests.sh
+
+# Re-record the baseline. Run it when a fix lands, in the same change.
+s3-tests-baseline:
+	@PREDA_WRITE_BASELINE=$(S3TESTS_BASELINE) ./scripts/s3-tests.sh
+
 # GO commands
 go_build:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
@@ -140,6 +205,33 @@ e2e-stress: build certs warp-install
 		WARP="$(WARP)" \
 		./scripts/bench/e2e-stress.sh
 
+# Two scenarios fail today, so CI gates on a regression against
+# scripts/stress-baseline.txt rather than on a clean run. STRESS_SCENARIOS
+# narrows it: `make e2e-stress-gate STRESS_SCENARIOS=freeze`.
+STRESS_BASELINE  ?= scripts/stress-baseline.txt
+STRESS_SCENARIOS ?=
+e2e-stress-gate: build certs warp-install
+	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
+		STRESS_HOST="$(STRESS_HOST)" STRESS_BASELINE="$(STRESS_BASELINE)" \
+		WARP="$(WARP)" \
+		./scripts/bench/stress-gate.sh $(STRESS_SCENARIOS)
+
+# Fails on any failing scenario. Red until torn-overwrite is fixed, which is
+# the point: an overwrite that leaves an object part new and part old is data
+# loss on the ordinary write path.
+e2e-stress-strict: build certs warp-install
+	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
+		STRESS_HOST="$(STRESS_HOST)" STRESS_BASELINE="$(STRESS_BASELINE)" \
+		STRESS_STRICT=1 WARP="$(WARP)" \
+		./scripts/bench/stress-gate.sh $(STRESS_SCENARIOS)
+
+# Re-record the baseline. Run it when a fix lands, in the same change.
+e2e-stress-baseline: build certs warp-install
+	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
+		STRESS_HOST="$(STRESS_HOST)" STRESS_WRITE_BASELINE="$(STRESS_BASELINE)" \
+		WARP="$(WARP)" \
+		./scripts/bench/stress-gate.sh $(STRESS_SCENARIOS)
+
 # NilAway — advisory nil-panic analysis. Not in preflight: it has a known
 # false-positive rate, so findings are triaged by hand rather than gating commits.
 nilaway:
@@ -147,4 +239,7 @@ nilaway:
 
 .PHONY: certs build go_build preflight test test-cover test-race test-integration diff-coverage \
 	clean lint fix govulncheck nilaway warp-install e2e-performance e2e-performance-compare \
-	e2e-stress
+	e2e-stress e2e-stress-gate e2e-stress-strict e2e-stress-baseline \
+	docker-build docker-smoke docker-smoke-strict docker-smoke-baseline \
+	s3-tests s3-tests-strict s3-tests-baseline \
+	compose-up compose-down
