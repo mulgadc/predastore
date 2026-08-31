@@ -31,6 +31,8 @@ const (
 	ErrInsufficientStorage     S3ErrorCode = "InsufficientStorage"
 	ErrMissingContentLength    S3ErrorCode = "MissingContentLength"
 	ErrInvalidArgument         S3ErrorCode = "InvalidArgument"
+	ErrSignatureDoesNotMatch   S3ErrorCode = "SignatureDoesNotMatch"
+	ErrMalformedChunkedBody    S3ErrorCode = "InvalidRequest"
 )
 
 // S3Error represents a typed S3 error with code and message.
@@ -133,6 +135,32 @@ var (
 		Code:       ErrMissingContentLength,
 		Message:    "You must provide the Content-Length HTTP header",
 		StatusCode: http.StatusLengthRequired,
+	}
+
+	// ErrSignatureDoesNotMatchError is returned when a chunk of an aws-chunked
+	// body does not continue the signature chain seeded by the request
+	// signature, which means those bytes are not the bytes the client signed.
+	ErrSignatureDoesNotMatchError = &S3Error{
+		Code:       ErrSignatureDoesNotMatch,
+		Message:    "The request signature we calculated does not match the signature you provided",
+		StatusCode: http.StatusForbidden,
+	}
+
+	// ErrMalformedChunkedBodyError is returned when an aws-chunked body's
+	// framing does not parse. The alternative is storing the framing as object
+	// data, which is what a missed decode does.
+	ErrMalformedChunkedBodyError = &S3Error{
+		Code:       ErrMalformedChunkedBody,
+		Message:    "The chunked upload framing in the request body is malformed",
+		StatusCode: http.StatusBadRequest,
+	}
+
+	// ErrChecksumMismatchError is returned when a body's trailing checksum does
+	// not match the one computed as it streamed.
+	ErrChecksumMismatchError = &S3Error{
+		Code:       ErrChecksumMismatch,
+		Message:    "The checksum the client sent does not match what was computed",
+		StatusCode: http.StatusBadRequest,
 	}
 )
 
