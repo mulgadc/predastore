@@ -89,8 +89,8 @@ func main() {
 		return &http.Client{
 			Timeout: *timeout,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{ //nolint:gosec // G402: local harness against a development CA.
-					InsecureSkipVerify: true,
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true, //nolint:gosec // G402: local harness against a development CA.
 					NextProtos:         []string{"http/1.1"},
 				},
 			},
@@ -124,9 +124,7 @@ func main() {
 	var ready, done sync.WaitGroup
 	for i, w := range writers {
 		ready.Add(1)
-		done.Add(1)
-		go func() {
-			defer done.Done()
+		done.Go(func() {
 			client := newClient()
 			ready.Done()
 			<-release
@@ -142,7 +140,7 @@ func main() {
 			defer resp.Body.Close()
 			_, _ = io.Copy(io.Discard, resp.Body)
 			w.status = resp.StatusCode
-		}()
+		})
 	}
 	ready.Wait()
 	close(release)
