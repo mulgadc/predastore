@@ -7,10 +7,13 @@
 #
 #     scripts/bench/hw/hwbench.sh deploy && scripts/bench/hw/hwbench.sh start
 #
-# The gate is on 8333 rather than the usual 8443 because these machines also
-# run a spinifex-managed predastore, and that one binds *:8443 — a wildcard, so
-# it already owns this host's address on that port. Meta and blob keep their
-# defaults; nothing else on the box listens there.
+# The gate is on 8333 and meta on 6550, rather than the usual 8443 and 6660,
+# because these machines also run a spinifex-managed predastore. That one binds
+# *:8443 for its gate and UDP <addr>:6660 for its meta node, so both defaults
+# are already taken on the addresses this profile uses. Blob keeps 9991.
+#
+# Check both protocols when moving this to other hardware. Meta is QUIC, so it
+# is a UDP listener and an ss -lntp sweep does not see it.
 #
 # RS(2,1) over three hosts places exactly one shard per host, so a GET reads
 # one shard locally and fetches exactly one from a peer. That is the cleanest
@@ -47,7 +50,7 @@ addr = "10.10.8.4"
   [[host.node]]
   id = 2
   role = "meta"
-  port = 6660
+  port = 6550
 
   [[host.node]]
   id = 3
@@ -66,7 +69,7 @@ addr = "10.10.8.5"
   [[host.node]]
   id = 5
   role = "meta"
-  port = 6660
+  port = 6550
 
   [[host.node]]
   id = 6
@@ -85,7 +88,7 @@ addr = "10.10.8.6"
   [[host.node]]
   id = 8
   role = "meta"
-  port = 6660
+  port = 6550
 
   [[host.node]]
   id = 9

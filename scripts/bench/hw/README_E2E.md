@@ -31,18 +31,27 @@ system owns:
 | **Ports** | Gate on **8333**, not 8443 — see below |
 | **Process name** | `s3d`. The spinifex services are all `spx`, so they cannot be confused |
 
-### The gate is on 8333, and this is not optional
+### The gate is on 8333 and meta on 6550, and neither is optional
 
-`spinifex-predastore` binds `*:8443` — a wildcard, so it already owns every
-address on this machine at that port. A second bind fails with `EADDRINUSE` and
-the gate never comes up.
+`spinifex-predastore` takes both defaults on these machines:
 
-The profile therefore uses **8333**. Meta (6660) and blob (9991) keep their
-defaults; nothing else on these boxes listens there. If you move this to other
-hardware, check before assuming:
+| Role | Usual | Here | Why |
+|---|---|---|---|
+| gate | 8443 | **8333** | `spx` binds `*:8443`, a wildcard, so it owns every address on the box at that port |
+| meta | 6660 | **6550** | `spx` binds UDP `<addr>:6660` — the same addresses this profile uses |
+| blob | 9991 | 9991 | Free |
+
+A collision surfaces as `bind: address already in use` and the gate never comes
+up.
+
+**Check both protocols.** Meta and blob are QUIC, so they are UDP listeners and
+an `ss -lntp` sweep does not see them — which is exactly how the 6660 clash was
+missed on the first attempt:
 
 ```bash
-ssh tf-user@bottlebrush 'sudo ss -lntp | grep -E ":(8333|6660|9991)\b"'
+ssh tf-user@bottlebrush 'for p in 8333 6550 9991; do
+    sudo ss -lnup | grep -qE ":$p\b" || sudo ss -lntp | grep -qE ":$p\b" \
+        && echo "$p TAKEN" || echo "$p free"; done'
 ```
 
 ## Safety on these three machines

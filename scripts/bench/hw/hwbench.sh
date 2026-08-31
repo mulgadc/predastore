@@ -155,7 +155,11 @@ cmd_tools() {
 
     if ! on "$TOOLS_HOST" "test -x $HW_ROOT/tools/aws-cli/v2/current/bin/aws"; then
         log "shipping the AWS CLI to $TOOLS_HOST"
-        tar -C /usr/local -cf - aws-cli | on "$TOOLS_HOST" "tar -C $HW_ROOT/tools -xf -"
+        # Not on(): it passes -n, which points stdin at /dev/null and would
+        # hand tar an empty archive.
+        tar -C /usr/local -cf - aws-cli \
+            | timeout "$SSH_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=10 \
+                "$TOOLS_HOST" "tar -C $HW_ROOT/tools -xf -"
         # The installer's "current" symlink is absolute into /usr/local, which
         # does not exist on the host. Relink it beside the version it names.
         on "$TOOLS_HOST" "cd $HW_ROOT/tools/aws-cli/v2 && ln -sfn \"\$(ls -d [0-9]* | tail -1)\" current"
