@@ -281,3 +281,51 @@ func TestDecodeBodyDeclaredLength(t *testing.T) {
 		assert.ErrorIs(t, err, chunked.ErrMalformedFraming)
 	})
 }
+
+// TestUnauthenticatedTrailerPromise covers a public-bucket write, which signs
+// no sentinel. X-Amz-Trailer is then the only promise on the request, and it
+// binds exactly as the signed sentinel does.
+func TestUnauthenticatedTrailerPromise(t *testing.T) {
+	const payload = "hello world"
+
+	t.Run("promised checksum omitted is rejected", func(t *testing.T) {
+		framed := fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n", len(payload), payload)
+		req := chunkedPutBody(t, framed, payload, "aws-chunked", SignedPayload{})
+		req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32c")
+
+		body, _, dec := decodeBody(req)
+		require.NotNil(t, dec)
+		_, err := io.ReadAll(body)
+		require.NoError(t, err)
+
+		assert.ErrorIs(t, finishPayload(req, dec), model.ErrMalformedChunkedBodyError)
+	})
+
+	t.Run("promised checksum sent is verified", func(t *testing.T) {
+		sum := crc32.Checksum([]byte(payload), crc32.MakeTable(crc32.Castagnoli))
+		var raw [4]byte
+		binary.BigEndian.PutUint32(raw[:], sum)
+
+		framed := fmt.Sprintf("%x\r\n%s\r\n0\r\nx-amz-checksum-crc32c:%s\r\n\r\n",
+			len(payload), payload, base64.StdEncoding.EncodeToString(raw[:]))
+		req := chunkedPutBody(t, framed, payload, "aws-chunked", SignedPayload{})
+		req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc32c")
+
+		body, _, dec := decodeBody(req)
+		_, err := io.ReadAll(body)
+		require.NoError(t, err)
+
+		assert.NoError(t, finishPayload(req, dec))
+	})
+
+	t.Run("no promise at all stays optional", func(t *testing.T) {
+		framed := fmt.Sprintf("%x\r\n%s\r\n0\r\n\r\n", len(payload), payload)
+		req := chunkedPutBody(t, framed, payload, "aws-chunked", SignedPayload{})
+
+		body, _, dec := decodeBody(req)
+		_, err := io.ReadAll(body)
+		require.NoError(t, err)
+
+		assert.NoError(t, finishPayload(req, dec))
+	})
+}

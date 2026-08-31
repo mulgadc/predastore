@@ -15,6 +15,8 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -47,9 +49,11 @@ type Decoder struct {
 	decoded     int64
 
 	// sums holds a running hash per checksum trailer the client promised in
-	// X-Amz-Trailer. The promise arrives before the body and the value after
-	// it, so the hash has to be chosen up front.
-	sums map[string]hash.Hash
+	// X-Amz-Trailer, and promised is that declaration itself. The promise
+	// arrives before the body and the value after it, so the hash has to be
+	// chosen up front and the two sets reconciled at the end.
+	sums     map[string]hash.Hash
+	promised []string
 
 	// Chain verification. chain is nil unless the client signed its chunks. The
 	// signature arrives in the header that precedes the data, so a chunk can
@@ -81,14 +85,23 @@ func WithDeclaredLength(n int64) Option {
 // WithTrailerChecksums prepares to verify the checksum trailers the client
 // named in X-Amz-Trailer. An algorithm not named here cannot be checked when it
 // arrives, because hashing it had to start before the body was read.
+//
+// A name with no hash behind it is still recorded as promised, so an algorithm
+// predastore cannot compute is rejected rather than quietly forgotten.
 func WithTrailerChecksums(names []string) Option {
 	return func(d *Decoder) {
 		for _, name := range names {
 			name = strings.ToLower(strings.TrimSpace(name))
+			if !strings.HasPrefix(name, checksumPrefix) {
+				continue
+			}
+			d.promised = append(d.promised, name)
 			if newHash, ok := checksumAlgos[name]; ok {
 				d.sums[name] = newHash()
 			}
 		}
+		sort.Strings(d.promised)
+		d.promised = slices.Compact(d.promised)
 	}
 }
 
@@ -195,6 +208,11 @@ func (d *Decoder) CRC64() uint64 {
 	return d.digest.Sum64()
 }
 
+const (
+	checksumPrefix    = "x-amz-checksum-"
+	checksumCRC64NVME = "x-amz-checksum-crc64nvme"
+)
+
 // checksumAlgos are the x-amz-checksum-* trailers S3 defines, each keyed by the
 // trailer name a client sends and mapped to the hash that verifies it.
 var checksumAlgos = map[string]func() hash.Hash{
@@ -220,34 +238,81 @@ func (d *Decoder) TrailerChecksum() (string, bool) {
 	return "", false
 }
 
-// ChecksumTrailer returns the checksum trailer the body carried, if any.
-func (d *Decoder) ChecksumTrailer() (name, value string, ok bool) {
-	for k, v := range d.trailers {
-		if strings.HasPrefix(k, "x-amz-checksum-") {
-			return k, v, true
+// checksumTrailers returns every x-amz-checksum-* trailer the body carried, in
+// name order. Sorted because ranging a map is randomised, and a body carrying
+// two checksums must not verify whichever one the iteration happened to pick.
+func (d *Decoder) checksumTrailers() []string {
+	var names []string
+	for k := range d.trailers {
+		if strings.HasPrefix(k, checksumPrefix) {
+			names = append(names, k)
 		}
 	}
-	return "", "", false
+	sort.Strings(names)
+	return names
 }
 
-// VerifyTrailerChecksum checks the body against the checksum trailer it
-// carried. A trailer naming an algorithm the client did not declare cannot be
-// verified after the fact, so it is an error rather than a pass.
+// ChecksumTrailer reports whether the body carried any checksum trailer.
+func (d *Decoder) ChecksumTrailer() (name, value string, ok bool) {
+	names := d.checksumTrailers()
+	if len(names) == 0 {
+		return "", "", false
+	}
+	return names[0], d.trailers[names[0]], true
+}
+
+// PromisesChecksum reports whether X-Amz-Trailer named a checksum. The promise
+// is the client's, not the signature's, so it binds an unauthenticated write
+// exactly as it binds a signed one.
+func (d *Decoder) PromisesChecksum() bool {
+	return len(d.promised) > 0
+}
+
+// VerifyTrailerChecksum checks the body against every checksum trailer it
+// carried, and against what X-Amz-Trailer said those would be.
+//
+// The declared set is enforced in both directions. A trailer that was not
+// declared cannot be verified, because hashing had to start before the body was
+// read; a declared one that never arrives is a promise the client broke.
 func (d *Decoder) VerifyTrailerChecksum() error {
-	name, value, ok := d.ChecksumTrailer()
-	if !ok {
+	sent := d.checksumTrailers()
+	if len(sent) == 0 {
 		return fmt.Errorf("%w: body carries no checksum trailer", ErrChecksumMissing)
 	}
 
-	// crc64nvme is always running, so it verifies whether or not the client
-	// bothered to declare it in X-Amz-Trailer.
-	if name == "x-amz-checksum-crc64nvme" {
+	if len(d.promised) > 0 {
+		for _, name := range d.promised {
+			if _, ok := d.trailers[name]; !ok {
+				return fmt.Errorf("%w: %s was declared but not sent", ErrChecksumMissing, name)
+			}
+		}
+		for _, name := range sent {
+			if !slices.Contains(d.promised, name) {
+				return fmt.Errorf("%w: %s was sent but not declared in X-Amz-Trailer",
+					ErrChecksumUndeclared, name)
+			}
+		}
+	}
+
+	for _, name := range sent {
+		if err := d.verifyOneChecksum(name, d.trailers[name]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// verifyOneChecksum compares one trailer against the hash that was running for
+// it. crc64nvme is always running, so it is checked whether or not the client
+// declared it; anything else had to be declared to have been hashed at all.
+func (d *Decoder) verifyOneChecksum(name, value string) error {
+	if name == checksumCRC64NVME {
 		return VerifyCRC64NVME(value, d.CRC64())
 	}
 
 	h, ok := d.sums[name]
 	if !ok {
-		return fmt.Errorf("%w: %s was not declared in X-Amz-Trailer", ErrChecksumUndeclared, name)
+		return fmt.Errorf("%w: %s cannot be verified", ErrChecksumUndeclared, name)
 	}
 	want, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value))
 	if err != nil {
@@ -295,8 +360,11 @@ func (d *Decoder) readNextChunkHeader() error {
 	if idx := strings.IndexByte(line, ';'); idx >= 0 {
 		ext, line = line[idx+1:], line[:idx]
 	}
+	// Unsigned, so a leading '-' is rejected by the parse rather than becoming a
+	// negative length that later slices a buffer out of range. 63 bits keeps the
+	// result representable as the int64 the rest of the decoder counts in.
 	sizeStr := strings.TrimSpace(line)
-	size, err := strconv.ParseInt(sizeStr, 16, 64)
+	size, err := strconv.ParseUint(sizeStr, 16, 63)
 	if err != nil {
 		return fmt.Errorf("%w: invalid chunk size %q: %w", ErrMalformedFraming, sizeStr, err)
 	}
@@ -331,7 +399,7 @@ func (d *Decoder) readNextChunkHeader() error {
 		return io.EOF
 	}
 
-	d.curChunkRemaining = size
+	d.curChunkRemaining = int64(size)
 	return nil
 }
 

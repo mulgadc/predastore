@@ -3,12 +3,16 @@ package chunked
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"strings"
 	"testing"
 
+	"github.com/minio/crc64nvme"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -232,4 +236,119 @@ func flipHexDigit(b byte) byte {
 		return '1'
 	}
 	return '0'
+}
+
+// buildTrailerBody frames payload with an arbitrary set of trailers, so a test
+// can send a checksum the client never declared or two at once.
+func buildTrailerBody(payload string, trailers ...string) string {
+	var buf strings.Builder
+	fmt.Fprintf(&buf, "%x\r\n%s\r\n0\r\n", len(payload), payload)
+	for _, t := range trailers {
+		fmt.Fprintf(&buf, "%s\r\n", t)
+	}
+	buf.WriteString("\r\n")
+	return buf.String()
+}
+
+func crc64Trailer(payload string) string {
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], crc64nvme.Checksum([]byte(payload)))
+	return "x-amz-checksum-crc64nvme:" + base64.StdEncoding.EncodeToString(b[:])
+}
+
+func crc32cTrailer(payload string) string {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], crc32.Checksum([]byte(payload), crc32.MakeTable(crc32.Castagnoli)))
+	return "x-amz-checksum-crc32c:" + base64.StdEncoding.EncodeToString(b[:])
+}
+
+// TestChecksumDeclarationIsBinding covers X-Amz-Trailer as a promise in both
+// directions. A checksum that was not declared could not have been hashed, and
+// one that was declared and never arrives is a promise the client broke.
+func TestChecksumDeclarationIsBinding(t *testing.T) {
+	const payload = "hello world"
+
+	t.Run("sending a different algorithm than declared is rejected", func(t *testing.T) {
+		// The AWS SDK always emits matching declaration and trailer names, so a
+		// mismatch is either a broken client or a rewritten body.
+		body := buildTrailerBody(payload, crc64Trailer(payload))
+		dec := NewDecoder(strings.NewReader(body), int64(len(payload)),
+			WithTrailerChecksums([]string{"x-amz-checksum-crc32c"}))
+		_, err := io.ReadAll(dec)
+		require.NoError(t, err)
+
+		assert.ErrorIs(t, dec.VerifyTrailerChecksum(), ErrChecksumMissing)
+	})
+
+	t.Run("a declared algorithm that arrives is verified", func(t *testing.T) {
+		body := buildTrailerBody(payload, crc32cTrailer(payload))
+		dec := NewDecoder(strings.NewReader(body), int64(len(payload)),
+			WithTrailerChecksums([]string{"x-amz-checksum-crc32c"}))
+		_, err := io.ReadAll(dec)
+		require.NoError(t, err)
+
+		assert.NoError(t, dec.VerifyTrailerChecksum())
+	})
+
+	t.Run("an undeclared extra checksum is rejected", func(t *testing.T) {
+		body := buildTrailerBody(payload, crc32cTrailer(payload), crc64Trailer(payload))
+		dec := NewDecoder(strings.NewReader(body), int64(len(payload)),
+			WithTrailerChecksums([]string{"x-amz-checksum-crc32c"}))
+		_, err := io.ReadAll(dec)
+		require.NoError(t, err)
+
+		assert.ErrorIs(t, dec.VerifyTrailerChecksum(), ErrChecksumUndeclared)
+	})
+
+	t.Run("every checksum sent is verified, not whichever came first", func(t *testing.T) {
+		// Ranging a map is randomised, so a body carrying a good checksum and a
+		// bad one must fail every time rather than most of the time.
+		body := buildTrailerBody(payload, crc64Trailer(payload), "x-amz-checksum-crc32c:AAAAAA==")
+		for range 20 {
+			dec := NewDecoder(strings.NewReader(body), int64(len(payload)),
+				WithTrailerChecksums([]string{"x-amz-checksum-crc32c", "x-amz-checksum-crc64nvme"}))
+			_, err := io.ReadAll(dec)
+			require.NoError(t, err)
+			require.ErrorIs(t, dec.VerifyTrailerChecksum(), ErrChecksumMismatch)
+		}
+	})
+
+	t.Run("an algorithm predastore cannot compute is rejected", func(t *testing.T) {
+		body := buildTrailerBody(payload, "x-amz-checksum-md5:AAAAAA==")
+		dec := NewDecoder(strings.NewReader(body), int64(len(payload)),
+			WithTrailerChecksums([]string{"x-amz-checksum-md5"}))
+		_, err := io.ReadAll(dec)
+		require.NoError(t, err)
+
+		assert.ErrorIs(t, dec.VerifyTrailerChecksum(), ErrChecksumUndeclared)
+	})
+
+	t.Run("declared but never sent is rejected", func(t *testing.T) {
+		body := buildTrailerBody(payload)
+		dec := NewDecoder(strings.NewReader(body), int64(len(payload)),
+			WithTrailerChecksums([]string{"x-amz-checksum-crc32c"}))
+		_, err := io.ReadAll(dec)
+		require.NoError(t, err)
+
+		assert.True(t, dec.PromisesChecksum())
+		assert.ErrorIs(t, dec.VerifyTrailerChecksum(), ErrChecksumMissing)
+	})
+}
+
+// TestChunkSizeIsUnsigned covers a chunk header that would otherwise become a
+// negative length and slice a buffer out of range.
+func TestChunkSizeIsUnsigned(t *testing.T) {
+	for _, body := range []string{
+		"-1\r\nhello\r\n0\r\n\r\n",
+		"-ffff\r\nhello\r\n0\r\n\r\n",
+		"+5\r\nhello\r\n0\r\n\r\n",
+	} {
+		t.Run(body[:strings.IndexByte(body, '\r')], func(t *testing.T) {
+			dec := NewDecoder(strings.NewReader(body), 0)
+			require.NotPanics(t, func() {
+				_, err := io.ReadAll(dec)
+				assert.ErrorIs(t, err, ErrMalformedFraming)
+			})
+		})
+	}
 }

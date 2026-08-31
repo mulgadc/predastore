@@ -145,11 +145,12 @@ func finishPayload(r *http.Request, dec *chunked.Decoder) error {
 		return nil
 	}
 
-	// A trailer mode names a trailing checksum in the sentinel the client
-	// signed, so an absent one is malformed rather than a client declining to
-	// checksum. On an unsigned trailer mode it is the body's only check.
+	// Two independent promises: the sentinel the client signed, and X-Amz-Trailer
+	// on the request. The header binds an unauthenticated write, which signs no
+	// sentinel, so neither alone is enough to decide the trailer was optional.
 	_, _, sent := dec.ChecksumTrailer()
-	if !sent && !SignedPayloadFrom(r.Context()).PromisesTrailer() {
+	promised := dec.PromisesChecksum() || SignedPayloadFrom(r.Context()).PromisesTrailer()
+	if !sent && !promised {
 		return nil
 	}
 	if err := dec.VerifyTrailerChecksum(); err != nil {
