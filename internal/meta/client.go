@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"time"
@@ -134,6 +135,13 @@ func (c *Client) call(ctx context.Context, target config.NodeID, op rpc.Opcode, 
 	if err := json.NewDecoder(stream).Decode(&decoded); err != nil {
 		stream.CancelRead(0)
 		return nil, fmt.Errorf("decode response from replica %d: %w", target, err)
+	}
+
+	// Decode stops at the end of the JSON value, which leaves the FIN unread
+	// and the stream never completed. The guard above still bounds this, so a
+	// replica that answers and then goes quiet cannot hold the call open.
+	if _, err := io.Copy(io.Discard, stream); err != nil {
+		stream.CancelRead(0)
 	}
 	return &decoded, nil
 }

@@ -312,8 +312,26 @@ func (s *Server) acceptStreams(
 				stream.CancelWrite(0)
 			} else {
 				stream.Close()
+				finishRequest(stream)
 			}
 		})
+	}
+}
+
+// requestDrainTimeout bounds the wait for a request's FIN once the handler has
+// answered. Every client half-closes before reading its response, so only a
+// peer that does not gets this far.
+const requestDrainTimeout = 5 * time.Second
+
+// finishRequest completes the receive side of a served stream. QUIC returns a
+// stream's credit to the peer only once the FIN is read or the read cancelled,
+// so a handler that stops at the end of its header starves the peer's budget.
+func finishRequest(stream transport.Stream) {
+	timer := time.AfterFunc(requestDrainTimeout, func() { stream.CancelRead(0) })
+	defer timer.Stop()
+
+	if _, err := io.Copy(io.Discard, stream); err != nil {
+		stream.CancelRead(0)
 	}
 }
 
