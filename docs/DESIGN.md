@@ -809,7 +809,7 @@ Things the design implies but the code does not do. Longer-horizon items live in
 
 **Two Raft round-trips per PUT.** The placement and the listing key are written separately. A batched apply would halve the metadata cost of a write.
 
-**ETags are derived from the name, not the content.** `ObjectETag` is the first half of `sha256("bucket/key")`, hex encoded. It identifies the object but not its version, so a client cannot use it to detect that an object changed.
+**No ETag backfill for pre-v3 objects.** `PutObject` and `CompleteMultipartUpload` store the body's MD5 in placement record v3 — a plain hex digest for a single part, `"<md5>-<N>"` for a multipart object assembled from N parts — and `GetObject`, `HeadObject` and `ListObjectsV2` return it as the ETag. A record written under an older placement version has no digest, so these surfaces omit its ETag instead of serving a stale value, and nothing rewrites it to add one.
 
 **Listings are not paginated.** `ListObjects` scans and returns everything under the prefix, always reporting `IsTruncated: false` and a max-keys of 1000 it does not enforce.
 
