@@ -47,7 +47,11 @@ func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Con
 
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
-		w.Header().Set("ETag", model.ObjectETag(bucket, key))
+		// A record with no stored digest omits the ETag rather than serving the
+		// old name-derived value; see the same choice in GetObject.
+		if etag, ok := place.ETag(); ok {
+			w.Header().Set("ETag", etag)
+		}
 		w.Header().Set("Last-Modified", lastModified(place))
 		w.WriteHeader(http.StatusOK)
 	})

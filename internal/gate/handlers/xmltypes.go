@@ -17,9 +17,12 @@ type ListObjectsV2_Dir struct {
 type ListObjectsV2_Contents struct {
 	Key          string    `xml:"Key"`
 	LastModified time.Time `xml:"LastModified"`
-	ETag         string    `xml:"ETag"`
-	Size         int64     `xml:"Size"`
-	StorageClass string    `xml:"StorageClass"`
+	// ETag is empty, and omitted, for an object whose placement record carries
+	// no content digest -- the same objects GetObject and HeadObject omit the
+	// header for.
+	ETag         string `xml:"ETag,omitempty"`
+	Size         int64  `xml:"Size"`
+	StorageClass string `xml:"StorageClass"`
 }
 
 // ListObjectsV2 answers GET /{bucket}. The cursor fields are omitted when
@@ -146,6 +149,14 @@ type CompleteMultipartUploadResult struct {
 	// Both of these are optional
 	ChecksumCRC64NVME string `xml:"ChecksumCRC64NVME,omitempty"`
 	ChecksumType      string `xml:"ChecksumType,omitempty"`
+}
+
+// CopyObjectResult answers PUT /{bucket}/{key} carrying x-amz-copy-source:
+// the destination's own ETag and modification time, not the source's.
+type CopyObjectResult struct {
+	XMLName      xml.Name  `xml:"CopyObjectResult"`
+	ETag         string    `xml:"ETag"`
+	LastModified time.Time `xml:"LastModified"`
 }
 
 // S3Error is the error document every failed request returns.

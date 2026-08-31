@@ -54,7 +54,11 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
-		written, err := writeObject(ctx, bc, cfg, ring, body, size, objectHash, place)
+		// The ETag is MD5 over the body, teed off the read the write path
+		// already performs rather than a second pass over a buffered copy.
+		digest := model.NewPartETagHasher()
+
+		written, err := writeObject(ctx, bc, cfg, ring, io.TeeReader(body, digest), size, objectHash, place)
 		recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseShardFanout, phase)
 		if err != nil {
 			slog.ErrorContext(ctx, "putObject: shard distribution failed", "error", err)
@@ -71,6 +75,11 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			HandleError(w, r, err)
 			return
 		}
+
+		// The record must already carry the digest here: after the commit
+		// point below, it is what every read will demand.
+		place.Digest = digest.Sum(nil)
+		place.DigestPresent = true
 
 		record, err := EncodePlacement(place)
 		if err != nil {
@@ -127,7 +136,9 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		if len(written.handoff) > 0 {
 			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))
 		}
-		w.Header().Set("ETag", model.ObjectETag(bucket, key))
+		if etag, ok := place.ETag(); ok {
+			w.Header().Set("ETag", etag)
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 }

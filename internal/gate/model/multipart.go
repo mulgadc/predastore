@@ -185,9 +185,11 @@ func PartETagFrom(h hash.Hash) string {
 	return fmt.Sprintf("\"%x\"", h.Sum(nil))
 }
 
-// CalculateMultipartETag calculates the ETag for a completed multipart upload
-// Format: "md5(concat(md5(part1), md5(part2), ...))-partCount".
-func CalculateMultipartETag(partETags []string, numParts int) string {
+// CalculateMultipartDigest computes the raw composite digest
+// CalculateMultipartETag formats: md5(concat(md5(part1), md5(part2), ...)).
+// Split out so a caller storing the digest in a placement record does not
+// have to parse it back out of the "-N" string the ETag renders as.
+func CalculateMultipartDigest(partETags []string) [16]byte {
 	// Concatenate all part MD5s
 	concat := make([]byte, 0, len(partETags)*16)
 
@@ -203,7 +205,13 @@ func CalculateMultipartETag(partETags []string, numParts int) string {
 		concat = append(concat, md5Bytes...)
 	}
 
-	finalMD5 := md5.Sum(concat)
+	return md5.Sum(concat)
+}
+
+// CalculateMultipartETag calculates the ETag for a completed multipart upload
+// Format: "md5(concat(md5(part1), md5(part2), ...))-partCount".
+func CalculateMultipartETag(partETags []string, numParts int) string {
+	finalMD5 := CalculateMultipartDigest(partETags)
 	return fmt.Sprintf("\"%x-%d\"", finalMD5, numParts)
 }
 

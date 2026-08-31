@@ -35,6 +35,17 @@ type ObjectToShardNodes struct {
 	// will.
 	Timestamped bool
 
+	// Digest is the object's content MD5, and DigestPresent reports whether it
+	// is actually set — a record written before version 3 carries neither, the
+	// same way an untimestamped record carries no real epoch.
+	Digest        []byte
+	DigestPresent bool
+
+	// PartCount is how many multipart parts Digest was composed from. Zero
+	// means Digest is a plain content digest rather than a composite one; it
+	// is meaningless when DigestPresent is false.
+	PartCount int
+
 	DataShardNodes   []config.NodeID
 	ParityShardNodes []config.NodeID
 }

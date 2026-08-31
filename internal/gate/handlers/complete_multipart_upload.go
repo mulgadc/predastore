@@ -123,6 +123,14 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			return
 		}
 
+		// The assembled object's own record must carry the same digest the
+		// response reports below, so a later HEAD, GET or listing can return
+		// it without recomputing anything.
+		digest := model.CalculateMultipartDigest(partETags)
+		place.Digest = digest[:]
+		place.DigestPresent = true
+		place.PartCount = len(parts)
+
 		shardRecord, err := EncodePlacement(place)
 		if err != nil {
 			abortShards(ctx, bc, objectHash, place, written)

@@ -83,7 +83,12 @@ func serveObject(
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-		w.Header().Set("ETag", model.ObjectETag(bucket, key))
+		// A record with no stored digest omits the ETag rather than serving the
+		// old name-derived value: a client comparing that against the body it
+		// just fetched would never see a match, and would retry forever.
+		if etag, ok := place.ETag(); ok {
+			w.Header().Set("ETag", etag)
+		}
 		w.Header().Set("Last-Modified", lastModified(place))
 		if contentRange != "" {
 			w.Header().Set("Content-Range", contentRange)

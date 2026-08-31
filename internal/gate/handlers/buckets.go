@@ -93,6 +93,7 @@ func lookupBucket(ctx context.Context, mc MetaClient, cache *BucketCache, bucket
 	}
 
 	var metadata model.BucketMetadata
+	//nolint:gosec // G709: the input is state this gate wrote, not client data.
 	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&metadata); err != nil {
 		return nil, model.NewS3Error(model.ErrInternalError, "failed to decode bucket metadata: "+err.Error(), 500)
 	}
