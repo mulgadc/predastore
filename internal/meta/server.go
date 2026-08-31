@@ -142,6 +142,7 @@ func (s *Server) open() (*rpc.Server, error) {
 	rpc.RegisterHandler(mux, OpRaftDial, s.handleRaftDial)
 	rpc.RegisterHandler(mux, OpMetaGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpMetaPut, s.handlePut)
+	rpc.RegisterHandler(mux, OpMetaPutMax, s.handlePutMax)
 	rpc.RegisterHandler(mux, OpMetaDelete, s.handleDelete)
 	rpc.RegisterHandler(mux, OpMetaScan, s.handleScan)
 	rpc.RegisterHandler(mux, OpMetaStatus, s.handleStatus)
@@ -410,6 +411,10 @@ func (s *Server) shutdownRaft() error {
 // put stores a key-value pair through raft consensus.
 func (s *Server) put(key string, value []byte) error {
 	return s.apply(Command{Type: CommandPut, Key: []byte(key), Value: value})
+}
+
+func (s *Server) putMax(key string, value []byte, epoch uint64) error {
+	return s.apply(Command{Type: CommandPutMax, Key: []byte(key), Value: value, Epoch: epoch})
 }
 
 // delete removes a key through raft consensus.

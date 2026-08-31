@@ -561,7 +561,26 @@ func (store *Store) reserveExtent(fragCount uint64) (*segment, int64, error) {
 func (store *Store) prepareExtent(key [32]byte, index uint32, ext extent, epoch uint64) error {
 	value := encodePreparedValue(ext, epoch, time.Now().UnixNano())
 	if err := store.index.Update(func(txn *badger.Txn) error {
-		return txn.Set(preparedKey(MakeKey(key, index)), value)
+		idxKey := MakeKey(key, index)
+		if raw, err := readRaw(txn, preparedKey(idxKey)); err == nil {
+			_, preparedEpoch, decodeErr := decodeIndexValue(raw)
+			if decodeErr != nil {
+				return decodeErr
+			}
+			if preparedEpoch > epoch {
+				return ErrNotPrepared
+			}
+		} else if !errors.Is(err, badger.ErrKeyNotFound) {
+			return err
+		}
+		if _, liveEpoch, err := readIndexValue(txn, idxKey); err == nil {
+			if liveEpoch > epoch {
+				return ErrNotPrepared
+			}
+		} else if !errors.Is(err, badger.ErrKeyNotFound) {
+			return err
+		}
+		return txn.Set(preparedKey(idxKey), value)
 	}); err != nil {
 		return fmt.Errorf("prepare: %w", err)
 	}
@@ -573,9 +592,9 @@ func (store *Store) prepareExtent(key [32]byte, index uint32, ext extent, epoch 
 // already been published finds the live row already at epoch and reports
 // success rather than failing a write that did land.
 //
-// A prepared row under a different epoch is left alone. Two writers racing the
-// same key each prepare under their own epoch, and neither may commit the
-// other's bytes.
+// A lower epoch cannot replace a newer prepared or live generation. Two
+// writers racing the same key therefore converge on the numerically newer
+// epoch, and neither may commit the other's bytes.
 func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) error {
 	idxKey := MakeKey(key, index)
 	prepKey := preparedKey(idxKey)
@@ -604,6 +623,11 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) error {
 			}
 			if prepared != epoch {
 				return ErrNotPrepared
+			}
+			if _, liveEpoch, liveErr := readIndexValue(txn, idxKey); liveErr == nil && liveEpoch > epoch {
+				return ErrNotPrepared
+			} else if liveErr != nil && !errors.Is(liveErr, badger.ErrKeyNotFound) {
+				return liveErr
 			}
 
 			// The superseded extent dies at this commit and nowhere else, so its

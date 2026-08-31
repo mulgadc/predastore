@@ -370,6 +370,14 @@ func (c *Client) Put(ctx context.Context, key string, value []byte) (err error) 
 	return c.write(ctx, OpMetaPut, request(key, 0), value)
 }
 
+// PutMax publishes a placement unless a newer epoch is already present.
+func (c *Client) PutMax(ctx context.Context, key string, value []byte, epoch uint64) (err error) {
+	defer observeOp(ctx, telemetry.MetaOpPut, time.Now(), &err)
+	req := request(key, 0)
+	req.Epoch = epoch
+	return c.write(ctx, OpMetaPutMax, req, value)
+}
+
 // Delete removes a key through the leader.
 func (c *Client) Delete(ctx context.Context, key string) (err error) {
 	defer observeOp(ctx, telemetry.MetaOpDelete, time.Now(), &err)
