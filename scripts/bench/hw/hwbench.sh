@@ -17,6 +17,7 @@
 #   hwbench.sh status               What is running where
 #   hwbench.sh perf    <ref> [tag]  Run e2e-performance.sh against the cluster
 #   hwbench.sh stress  [scenario]   Run the e2e-stress gate on the tools host
+#   hwbench.sh reclaim              Free run data, keeping tools and binaries
 #   hwbench.sh clean                Remove the deployment from every host
 #
 # Environment:
@@ -248,6 +249,19 @@ cmd_status() {
     each 'echo "$(hostname): s3d=$(pgrep -cx s3d || echo 0) load=$(cut -d" " -f1 /proc/loadavg)"'
 }
 
+# cmd_reclaim frees the space a finished run leaves behind without undoing the
+# setup. A cluster's data dir is the bulk of it — 58 GB per host after a
+# compare-preset perf pass — and start wipes it on every launch anyway, so
+# keeping it between runs buys nothing but a full disk. tools, inputs and the
+# built binaries stay, because re-fetching a 245 MB AWS CLI to run one more
+# benchmark is the reason nobody reclaims anything.
+cmd_reclaim() {
+    each "rm -rf $HW_ROOT/*/data $HW_ROOT/stress-work" >/dev/null || true
+    on "$TOOLS_HOST" "rm -f $HW_ROOT/verify.bin $HW_ROOT/got.bin" || true
+    log "reclaimed run data; tools, inputs and binaries kept"
+    each "echo \"\$(hostname): \$(df -h $HW_ROOT | awk 'NR==2{print \$4\" free (\"\$5\" used)\"}')\""
+}
+
 cmd_clean() {
     cmd_stop || true
     each "rm -rf $HW_ROOT"
@@ -282,6 +296,7 @@ cmd_verify() {
         log "verify: gate $a round tripped 8 MiB byte for byte"
     done
     awscli "${ADDRS[0]}" s3 rb "s3://$bucket" --force >/dev/null 2>&1 || true
+    on "$TOOLS_HOST" "rm -f $HW_ROOT/verify.bin $HW_ROOT/got.bin"
 }
 
 # --- stress --------------------------------------------------------------
@@ -320,6 +335,9 @@ cmd_stress() {
     local sha_short sha_full rc=0
     sha_short="$(git -C "$REPO_DIR" rev-parse --short HEAD)"
     sha_full="$(git -C "$REPO_DIR" rev-parse HEAD)"
+    # GOPATH and GOCACHE are left at their defaults under $HOME. That is the
+    # root volume, but it is about a gigabyte against 800+ free, and a warm
+    # module cache is what keeps a re-run from re-fetching every dependency.
     on "$TOOLS_HOST" "cd $dest && \
         PATH=/usr/local/go/bin:\$PATH \
         STRESS_SCENARIO='$scenario' \
@@ -399,6 +417,7 @@ case "${1:-}" in
     stress) shift; cmd_stress "$@" ;;
     stop)   shift; cmd_stop "$@" ;;
     status) shift; cmd_status "$@" ;;
+    reclaim) shift; cmd_reclaim "$@" ;;
     clean)  shift; cmd_clean "$@" ;;
     *) sed -n '2,30p' "$0"; exit 2 ;;
 esac

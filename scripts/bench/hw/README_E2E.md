@@ -199,6 +199,38 @@ that a hardware run covers the scenarios that use the main cluster
 Do not solve this by copying `e2e-stress.sh` and editing it. Two stress harnesses
 that drift apart is a worse outcome than not having the hardware one.
 
+## Disk, and cleaning up after yourself
+
+A run leaves a lot behind, and only some of it clears itself.
+
+| Path | After a run | Cleared by |
+|---|---|---|
+| `$HW_ROOT/<ref>/data` | **~58 GB per host** after a compare-preset perf pass | `reclaim` or `clean` |
+| `$HW_ROOT/stress-work` | ~0 — the stress harness removes its own work dir on `EXIT INT TERM` | itself |
+| `$HW_ROOT/stress` | ~62 MB, and its results accumulate per run | `clean` |
+| `$HW_ROOT/tools` | 272 MB (AWS CLI + warp) | `clean` |
+| `$HW_ROOT/verify.bin`, `got.bin` | 16 MB | `verify` now removes them |
+| `~/go`, `~/.cache` on the tools host | ~1 GB, on the root volume | left deliberately — a warm module cache is what stops a re-run re-fetching everything |
+
+```bash
+scripts/bench/hw/hwbench.sh reclaim   # free run data, keep tools and binaries
+scripts/bench/hw/hwbench.sh clean     # remove $HW_ROOT entirely
+```
+
+**Use `reclaim` between runs and `clean` when you are done.** The data dir is
+the bulk of it and `start` wipes it on every launch anyway, so keeping it
+between runs buys nothing but a full disk. `clean` takes the 245 MB AWS CLI
+with it, which is why it is not the routine choice.
+
+**Pull results off the hosts before `clean`.** Nothing does this for you, and
+the teardown takes them:
+
+```bash
+DEST=~/predastore-hw-$(date +%Y%m%d); mkdir -p "$DEST"
+ssh tf-user@casuarina 'cd /mnt/disk1/tf-user/predastore && \
+    tar -cz results hostlogs stress/scripts/bench/results' > "$DEST/hw-results.tar.gz"
+```
+
 ## Gotchas
 
 - **`HW_WORK` defaults into `/tmp`**, which a reboot clears — along with the
