@@ -303,8 +303,12 @@ cmd_stress() {
     on "$TOOLS_HOST" "mkdir -p $dest" >/dev/null
 
     # git archive rather than the working tree, so a run is attributable to a
-    # commit. HEAD must therefore be the thing under test.
-    log "shipping $(git -C "$REPO_DIR" describe --tags --always --dirty) to $TOOLS_HOST"
+    # commit. HEAD must therefore be the thing under test — an uncommitted
+    # change is silently not in the run, which reads as the fix not working.
+    if [ -n "$(git -C "$REPO_DIR" status --porcelain)" ]; then
+        log "NOTE working tree is dirty; shipping HEAD, so uncommitted changes are NOT in this run"
+    fi
+    log "shipping $(git -C "$REPO_DIR" describe --tags --always) to $TOOLS_HOST"
     git -C "$REPO_DIR" archive --format=tar HEAD \
         | timeout "$SSH_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=10 \
             "$TOOLS_HOST" "tar -C $dest -xf -"
@@ -312,11 +316,15 @@ cmd_stress() {
     # STRESS_WORK_ROOT is the one that matters: the harness defaults it under
     # $HOME, which is the slower root volume here, and the large-object
     # scenario would both measure that drive and risk filling it.
-    local rc=0
+    # git archive carries no .git, so the harness cannot derive its own run id.
+    local sha_short sha_full rc=0
+    sha_short="$(git -C "$REPO_DIR" rev-parse --short HEAD)"
+    sha_full="$(git -C "$REPO_DIR" rev-parse HEAD)"
     on "$TOOLS_HOST" "cd $dest && \
         PATH=/usr/local/go/bin:\$PATH \
         STRESS_SCENARIO='$scenario' \
         STRESS_WORK_ROOT=$HW_ROOT/stress-work \
+        STRESS_SHA=$sha_short STRESS_SHA_FULL=$sha_full \
         make e2e-stress" || rc=$?
 
     log "stress exited $rc; results under $dest/scripts/bench/results/e2e-stress on $TOOLS_HOST"

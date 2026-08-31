@@ -108,7 +108,7 @@ ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
 SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 REGION="ap-southeast-2"
 
-for command in aws awk curl diff git go openssl; do
+for command in aws awk curl diff go openssl; do
     command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 1; }
 done
 [ -x "$WARP" ] || { echo "Warp not executable: $WARP (run make warp-install)" >&2; exit 1; }
@@ -117,7 +117,10 @@ done
 mkdir -p "$RESULTS_ROOT"
 STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
 RUN_ID="$(printf '%s' "$STAMP" | tr '[:upper:]' '[:lower:]')"
-SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD)"
+# STRESS_SHA lets a caller name the commit when the tree is not a git
+# checkout — a CI runner given an archive, or the bare-metal harness, which
+# ships the tree with git archive and so has no .git on the far side.
+SHA="${STRESS_SHA:-$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 RUN_DIR="$RESULTS_ROOT/${STAMP}-${SHA}"
 WORK_DIR="$(mktemp -d "$WORK_ROOT/predastore-e2e-stress.XXXXXX")"
 
@@ -3007,7 +3010,7 @@ log "Warp completed with no errors"
     echo "==============================="
     echo
     echo "date_utc=$STAMP"
-    echo "predastore_sha=$(git -C "$REPO_DIR" rev-parse HEAD)"
+    echo "predastore_sha=${STRESS_SHA_FULL:-$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo unknown)}"
     echo "go_version=$(go version)"
     echo "warp_version=$($WARP --version 2>&1 | head -n 1)"
     echo "host=$(hostname)"
