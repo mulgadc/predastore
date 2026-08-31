@@ -136,6 +136,14 @@ jobs:
     timeout-minutes: 45
     if: inputs.run_performance != false
 
+    # A fixed group with no ref in it, so every performance run across every
+    # branch queues behind the one in flight. Killing a benchmark part way
+    # through wastes the whole run and leaves a cluster and its data behind,
+    # which is why this waits rather than cancels.
+    concurrency:
+      group: predastore-performance
+      cancel-in-progress: false
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v7
