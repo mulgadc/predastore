@@ -50,6 +50,10 @@ func (m *fakeMeta) Put(_ context.Context, key string, value []byte) error {
 	return nil
 }
 
+func (m *fakeMeta) PutMax(ctx context.Context, key string, value []byte, _ uint64) error {
+	return m.Put(ctx, key, value)
+}
+
 func (m *fakeMeta) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -79,29 +83,54 @@ type shardID struct {
 	index uint32
 }
 
+// fakeShard is one stored shard: its bytes and the epoch it was written under.
+type fakeShard struct {
+	data  []byte
+	epoch uint64
+}
+
 // fakeBlob stands in for the blob nodes. It records the largest single Write it
 // was handed, which is how a streaming write is told from a staged one: a
 // staged write arrives as one buffer the size of the object.
+//
+// It models prepare/commit and the epoch gate the same way a node does, so a
+// handler test exercises the real two-phase write rather than a shortcut.
 type fakeBlob struct {
-	mu     sync.Mutex
-	shards map[shardID][]byte
+	mu       sync.Mutex
+	shards   map[shardID]fakeShard
+	prepared map[shardID]fakeShard
 
-	maxWrite  atomic.Int64
-	putCalls  atomic.Int64
-	declaring func(size int64) error
+	maxWrite     atomic.Int64
+	putCalls     atomic.Int64
+	commitCalls  atomic.Int64
+	abortCalls   atomic.Int64
+	declaring    func(size int64) error
+	failPutOn    func(index uint32) bool
+	failCommitOn func(index uint32) bool
 }
 
-func newFakeBlob() *fakeBlob { return &fakeBlob{shards: make(map[shardID][]byte)} }
+func newFakeBlob() *fakeBlob {
+	return &fakeBlob{
+		shards:   make(map[shardID]fakeShard),
+		prepared: make(map[shardID]fakeShard),
+	}
+}
 
 func (b *fakeBlob) Put(_ context.Context, _ config.NodeID, req blob.PutRequest, body io.Reader) (*blob.PutResponse, error) {
 	b.putCalls.Add(1)
 	if req.Size <= 0 {
 		return nil, errors.New("no size specified")
 	}
+	if req.Epoch == 0 {
+		return nil, errors.New("no write epoch specified")
+	}
 	if b.declaring != nil {
 		if err := b.declaring(req.Size); err != nil {
 			return nil, err
 		}
+	}
+	if b.failPutOn != nil && b.failPutOn(req.Index) {
+		return nil, fmt.Errorf("node holding shard %d is not answering", req.Index)
 	}
 
 	// Mirror the node: never read past the declared size, and observe the
@@ -112,19 +141,72 @@ func (b *fakeBlob) Put(_ context.Context, _ config.NodeID, req blob.PutRequest, 
 	}
 
 	b.mu.Lock()
-	b.shards[shardID{key: req.Key, index: req.Index}] = buf.Bytes()
+	b.prepared[shardID{key: req.Key, index: req.Index}] = fakeShard{data: buf.Bytes(), epoch: req.Epoch}
 	b.mu.Unlock()
 
-	return &blob.PutResponse{Size: int64(buf.Len())}, nil
+	return &blob.PutResponse{Size: int64(buf.Len()), Epoch: req.Epoch}, nil
+}
+
+func (b *fakeBlob) Commit(_ context.Context, _ config.NodeID, req blob.CommitRequest) (bool, error) {
+	b.commitCalls.Add(1)
+	if b.failCommitOn != nil && b.failCommitOn(req.Index) {
+		return false, errors.New("commit refused")
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return false, b.commitLocked(shardID{key: req.Key, index: req.Index}, req.Epoch)
+}
+
+// commitLocked publishes a prepared shard, idempotently against the epoch.
+func (b *fakeBlob) commitLocked(id shardID, epoch uint64) error {
+	if prepared, ok := b.prepared[id]; ok && prepared.epoch == epoch {
+		b.shards[id] = prepared
+		delete(b.prepared, id)
+
+		return nil
+	}
+	if live, ok := b.shards[id]; ok && live.epoch == epoch {
+		return nil
+	}
+
+	return blob.ErrNotPrepared
+}
+
+func (b *fakeBlob) Abort(_ context.Context, _ config.NodeID, req blob.CommitRequest) error {
+	b.abortCalls.Add(1)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	id := shardID{key: req.Key, index: req.Index}
+	if prepared, ok := b.prepared[id]; ok && prepared.epoch == req.Epoch {
+		delete(b.prepared, id)
+	}
+
+	return nil
 }
 
 func (b *fakeBlob) Get(_ context.Context, _ config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
 	b.mu.Lock()
-	data, ok := b.shards[shardID{key: req.Key, index: req.Index}]
-	b.mu.Unlock()
+	defer b.mu.Unlock()
+
+	id := shardID{key: req.Key, index: req.Index}
+	shard, ok := b.shards[id]
 	if !ok {
-		return nil, fmt.Errorf("shard %x/%d not found", req.Key[:4], req.Index)
+		return nil, fmt.Errorf("shard %x/%d: %w", req.Key[:4], req.Index, blob.ErrNotFound)
 	}
+	if req.Epoch != 0 && shard.epoch != req.Epoch {
+		// A prepared shard under the requested epoch means the writer published
+		// the record and died before committing, exactly as the node does.
+		if err := b.commitLocked(id, req.Epoch); err != nil {
+			return nil, fmt.Errorf("shard %x/%d: %w", req.Key[:4], req.Index, blob.ErrEpochMismatch)
+		}
+		shard = b.shards[id]
+	}
+
+	data := shard.data
 	if req.RangeStart >= 0 && req.RangeEnd >= 0 {
 		data = data[req.RangeStart : req.RangeEnd+1]
 	}
@@ -136,6 +218,7 @@ func (b *fakeBlob) Delete(_ context.Context, _ config.NodeID, req blob.DeleteReq
 	b.mu.Lock()
 	_, ok := b.shards[id]
 	delete(b.shards, id)
+	delete(b.prepared, id)
 	b.mu.Unlock()
 	return &blob.DeleteResponse{Deleted: ok}, nil
 }
@@ -160,6 +243,24 @@ func (o *observingReader) Read(p []byte) (int, error) {
 var _ MetaClient = (*fakeMeta)(nil)
 var _ BlobClient = (*fakeBlob)(nil)
 
+// write runs the fixture's write path the way a handler does: place the object,
+// mint its epoch, prepare every shard, then publish. The placement it returns
+// is the one the shards carry, so it is what a read has to name — deriving a
+// second one would mint a different epoch and match nothing.
+func (f writeFixture) write(ctx context.Context, objectHash [32]byte, body io.Reader, size int64) (ObjectToShardNodes, writeResult, error) {
+	place, err := placeShards(f.ring, f.cfg, objectHash, size)
+	if err != nil {
+		return place, writeResult{}, err
+	}
+	written, err := writeObject(ctx, f.bc, f.cfg, f.ring, body, size, objectHash, place)
+	if err != nil {
+		return place, written, err
+	}
+	commitShards(ctx, f.bc, objectHash, place, written)
+
+	return place, written, nil
+}
+
 // writeFixture is a gate write path at one erasure width.
 type writeFixture struct {
 	mc   *fakeMeta
@@ -177,7 +278,10 @@ func newWriteFixture(data, parity int) writeFixture {
 		mc:   newFakeMeta(),
 		bc:   newFakeBlob(),
 		ring: placement.NewRing(nodes),
-		cfg:  Config{Region: "ap-southeast-2", DataShards: data, ParityShards: parity},
+		cfg: Config{
+			Region: "ap-southeast-2", DataShards: data, ParityShards: parity,
+			Epochs: mustEpochs(1),
+		},
 	}
 }
 
@@ -188,13 +292,10 @@ func (f writeFixture) roundTrip(t *testing.T, bucket, key string, body []byte) [
 	ctx := context.Background()
 	objectHash := model.ObjectHash(bucket, key)
 
-	_, err := writeObject(ctx, f.bc, f.ring, f.cfg, bytes.NewReader(body), int64(len(body)), objectHash)
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(body), int64(len(body)))
 	require.NoError(t, err)
 
-	place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(body)))
-	require.NoError(t, err)
-
-	got, err := readObject(ctx, f.bc, f.cfg, bucket, key, place, place.Size)
+	got, _, err := readObject(ctx, f.bc, f.cfg, bucket, key, place, place.Size, 0)
 	require.NoError(t, err)
 	return got
 }
@@ -234,9 +335,9 @@ func TestWriteObjectSingleShardStoresTheObjectWhole(t *testing.T) {
 	f.bc.mu.Lock()
 	defer f.bc.mu.Unlock()
 	require.Len(t, f.bc.shards, 1, "RS(1,0) writes exactly one shard")
-	for id, data := range f.bc.shards {
+	for id, shard := range f.bc.shards {
 		assert.Zero(t, id.index)
-		assert.Equal(t, want, data, "the shard is the object")
+		assert.Equal(t, want, shard.data, "the shard is the object")
 	}
 }
 
@@ -292,7 +393,7 @@ func TestWriteObjectSingleShardRejectsAShortBody(t *testing.T) {
 	f := newWriteFixture(1, 0)
 	body := bytes.NewReader(randomBytes(t, 100))
 
-	_, err := writeObject(context.Background(), f.bc, f.ring, f.cfg, body, 200, model.ObjectHash("b", "k"))
+	_, _, err := f.write(context.Background(), model.ObjectHash("b", "k"), body, 200)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "declared 200")
@@ -307,18 +408,24 @@ func TestWriteObjectSingleShardReportsPoolPressure(t *testing.T) {
 	f.bc.declaring = func(int64) error { return nil }
 
 	nearFull := &nearFullBlob{fakeBlob: f.bc}
-	poolNearFull, err := writeObject(
-		context.Background(), nearFull, f.ring, f.cfg,
-		bytes.NewReader([]byte("payload")), 7, model.ObjectHash("b", "k"),
+	objectHash := model.ObjectHash("b", "k")
+	place, err := placeShards(f.ring, f.cfg, objectHash, 7)
+	require.NoError(t, err)
+
+	written, err := writeObject(
+		context.Background(), nearFull, f.cfg, f.ring,
+		bytes.NewReader([]byte("payload")), 7, objectHash, place,
 	)
 
 	require.NoError(t, err)
-	assert.True(t, poolNearFull)
+	assert.True(t, written.poolNearFull)
 }
 
-// A parity shard is streamed through an io.Pipe that enc.Encode writes into on
-// this goroutine. A Put that gives up without draining it used to leave the
-// write side blocked forever, and io.Pipe does not observe ctx.
+// A parity shard used to be streamed through an io.Pipe that enc.Encode wrote
+// into on this goroutine, so a Put that gave up without draining it left the
+// write side blocked forever and io.Pipe does not observe ctx. The parity is
+// buffered now and the deadlock cannot recur, but a node refusing its body must
+// still return rather than hang, which is what this holds.
 func TestWriteObjectReturnsWhenParityPutAbandonsItsBody(t *testing.T) {
 	t.Parallel()
 
@@ -326,20 +433,24 @@ func TestWriteObjectReturnsWhenParityPutAbandonsItsBody(t *testing.T) {
 	bc := &parityRejectingBlob{fakeBlob: f.bc, dataShards: f.cfg.DataShards}
 	body := randomBytes(t, 64*1024)
 
+	objectHash := model.ObjectHash("b", "k")
+	place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(body)))
+	require.NoError(t, err)
+
 	done := make(chan error, 1)
 	go func() {
 		_, err := writeObject(
-			context.Background(), bc, f.ring, f.cfg,
-			bytes.NewReader(body), int64(len(body)), model.ObjectHash("b", "k"),
+			context.Background(), bc, f.cfg, f.ring,
+			bytes.NewReader(body), int64(len(body)), objectHash, place,
 		)
 		done <- err
 	}()
 
 	select {
 	case err := <-done:
-		require.Error(t, err, "a rejected parity shard has to fail the write")
+		require.Error(t, err, "a rejected parity shard has to fail the write at full width")
 	case <-time.After(10 * time.Second):
-		t.Fatal("writeObject blocked: the parity pipe was left without a reader")
+		t.Fatal("writeObject blocked rather than reporting the refused shard")
 	}
 }
 

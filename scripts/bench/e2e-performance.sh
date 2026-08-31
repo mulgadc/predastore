@@ -16,6 +16,11 @@
 #   PERF_PORT_OFFSET Added to every node port, so a run does not collide with a
 #                    cluster already on the defaults (default: 10000)
 #   WARP             Path to the warp binary (default: bin/tools/warp)
+#   PERF_EXTERNAL_HOSTS Measure a cluster this script did not start, as a comma
+#                    separated gate list of host:port. Skips the profile, the
+#                    port offset and start/stop; the config name is a label.
+#   PERF_EXTERNAL_SHA, PERF_EXTERNAL_GO  Provenance for that cluster's build,
+#                    which this machine did not produce and cannot read.
 #
 # Preset overrides: PERF_DURATION, PERF_CONCURRENT, PERF_PUT_SIZE,
 # PERF_PART_SIZE, PERF_PARTS, PERF_GET_SIZE.
@@ -62,7 +67,17 @@ case "$PERF_PRESET" in
         ;;
 esac
 
-for command in aws diff git go openssl; do
+# PERF_EXTERNAL_HOSTS measures a cluster this script did not start: a comma
+# separated gate list, as host:port. The workloads, their sizing and the
+# analysis are then identical to a local run, which is the point — a bare-metal
+# number is only comparable with a loopback one if the same code produced both.
+EXTERNAL="${PERF_EXTERNAL_HOSTS:-}"
+
+# git and go describe the tree that built the binary. On an external cluster
+# this machine did not build it, so the provenance is supplied rather than read.
+REQUIRED="aws diff openssl"
+[ -n "$EXTERNAL" ] || REQUIRED="$REQUIRED git go"
+for command in $REQUIRED; do
     command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 1; }
 done
 [ -x "$WARP" ] || { echo "Warp not executable: $WARP (run make warp-install)" >&2; exit 1; }
@@ -70,7 +85,11 @@ done
 mkdir -p "$RESULTS_ROOT"
 STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
 RUN_ID="$(printf '%s' "$STAMP" | tr '[:upper:]' '[:lower:]')"
-SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD)"
+if [ -n "$EXTERNAL" ]; then
+    SHA="${PERF_EXTERNAL_SHA:-external}"
+else
+    SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD)"
+fi
 RUN_DIR="$RESULTS_ROOT/${STAMP}-${SHA}"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/predastore-e2e-performance.XXXXXX")"
 
@@ -246,6 +265,9 @@ rejected_completions() {
 run_warp_checked() {
     local log_file="$1"
     shift
+    # An external cluster's gate logs are on other machines, so the counts stay
+    # zero and the partless tolerance below cannot fire. That fails such a run
+    # rather than excusing it, which is the safe direction.
     local logs="$PREDA_DIR/$CURRENT_CONFIG/logs"
     local status errors partless refused unstored
 
@@ -281,7 +303,14 @@ run_warp_checked() {
 }
 
 DIRTY="false"
-[ -z "$(git -C "$REPO_DIR" status --porcelain --untracked-files=no)" ] || DIRTY="true"
+if [ -n "$EXTERNAL" ]; then
+    PREDASTORE_SHA="${PERF_EXTERNAL_SHA:-unknown}"
+    GO_VERSION="${PERF_EXTERNAL_GO:-unknown}"
+else
+    [ -z "$(git -C "$REPO_DIR" status --porcelain --untracked-files=no)" ] || DIRTY="true"
+    PREDASTORE_SHA="$(git -C "$REPO_DIR" rev-parse HEAD)"
+    GO_VERSION="$(go version)"
+fi
 {
     echo "Predastore end-to-end performance run"
     echo "===================================="
@@ -289,9 +318,10 @@ DIRTY="false"
     echo "Run identity"
     echo "------------"
     echo "date_utc=$STAMP"
-    echo "predastore_sha=$(git -C "$REPO_DIR" rev-parse HEAD)"
+    echo "predastore_sha=$PREDASTORE_SHA"
     echo "predastore_dirty=$DIRTY"
-    echo "go_version=$(go version)"
+    echo "go_version=$GO_VERSION"
+    [ -z "$EXTERNAL" ] || echo "external_hosts=$EXTERNAL"
     echo "warp_version=$($WARP --version 2>&1 | head -n 1)"
     echo "warp_module_version=${WARP_VERSION:-unknown}"
     echo "host=$(hostname)"
@@ -325,20 +355,29 @@ DIRTY="false"
 } > "$RUN_DIR/run-info.txt"
 
 for config_name in $PERF_CONFIGS; do
-    [ -f "$CONFIG_DIR/$config_name.toml" ] || { echo "missing config: $config_name" >&2; exit 1; }
-    CONFIG_FILE="$PREDA_CONFIG_DIR/$config_name.toml"
-    render_profile "$CONFIG_DIR/$config_name.toml" "$CONFIG_FILE" "$PERF_PORT_OFFSET"
+    if [ -n "$EXTERNAL" ]; then
+        # The cluster is already running somewhere else, so the profile, the
+        # port offset and the start/stop below have nothing to act on. The
+        # config name is only a label for the results directory here.
+        HOST_LIST="$EXTERNAL"
+        ENDPOINT="https://${EXTERNAL%%,*}"
+        echo "Measuring external $config_name ($HOST_LIST)"
+    else
+        [ -f "$CONFIG_DIR/$config_name.toml" ] || { echo "missing config: $config_name" >&2; exit 1; }
+        CONFIG_FILE="$PREDA_CONFIG_DIR/$config_name.toml"
+        render_profile "$CONFIG_DIR/$config_name.toml" "$CONFIG_FILE" "$PERF_PORT_OFFSET"
 
-    # The profile decides where S3 answers, so the endpoints are read from it
-    # rather than assumed to be one gate on the default port.
-    HOST_LIST="$(gate_endpoints "$CONFIG_FILE" | paste -sd,)"
-    [ -n "$HOST_LIST" ] || { echo "no host in $config_name runs a gate" >&2; exit 1; }
-    ENDPOINT="https://$(gate_endpoints "$CONFIG_FILE" | head -1)"
+        # The profile decides where S3 answers, so the endpoints are read from it
+        # rather than assumed to be one gate on the default port.
+        HOST_LIST="$(gate_endpoints "$CONFIG_FILE" | paste -sd,)"
+        [ -n "$HOST_LIST" ] || { echo "no host in $config_name runs a gate" >&2; exit 1; }
+        ENDPOINT="https://$(gate_endpoints "$CONFIG_FILE" | head -1)"
 
-    CURRENT_CONFIG="$config_name"
-    echo "Starting $config_name ($HOST_LIST)"
-    "$SCRIPTS_DIR/start.sh" -w "$config_name"
-    cp "$CONFIG_FILE" "$RUN_DIR/$config_name.toml"
+        CURRENT_CONFIG="$config_name"
+        echo "Starting $config_name ($HOST_LIST)"
+        "$SCRIPTS_DIR/start.sh" -w "$config_name"
+        cp "$CONFIG_FILE" "$RUN_DIR/$config_name.toml"
+    fi
 
     run_correctness "$config_name" "$RUN_DIR/correctness/$config_name"
     run_warp "$config_name" "$RUN_DIR/$config_name"
@@ -354,13 +393,15 @@ for config_name in $PERF_CONFIGS; do
         done
     } >> "$RUN_DIR/run-info.txt"
 
-    "$SCRIPTS_DIR/stop.sh"
-    if [ -d "$PREDA_DIR/$config_name/logs" ]; then
-        mkdir -p "$RUN_DIR/logs/$config_name"
-        cp -R "$PREDA_DIR/$config_name/logs/." "$RUN_DIR/logs/$config_name/"
+    if [ -z "$EXTERNAL" ]; then
+        "$SCRIPTS_DIR/stop.sh"
+        if [ -d "$PREDA_DIR/$config_name/logs" ]; then
+            mkdir -p "$RUN_DIR/logs/$config_name"
+            cp -R "$PREDA_DIR/$config_name/logs/." "$RUN_DIR/logs/$config_name/"
+        fi
+        rm -rf "${PREDA_DIR:?}/$config_name"
+        CURRENT_CONFIG=""
     fi
-    rm -rf "${PREDA_DIR:?}/$config_name"
-    CURRENT_CONFIG=""
 done
 
 echo "Performance results: $RUN_DIR"

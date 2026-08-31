@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -139,6 +140,90 @@ func TestValidate_NodeBindAddr(t *testing.T) {
 		c.Hosts[0].Nodes[0].BindAddr = "0.0.0.0"
 
 		require.NoError(t, c.Validate())
+	})
+}
+
+// TestLoad_RepairTable proves the sweep's settings survive the file, and that a
+// file saying nothing about repair leaves it off.
+func TestLoad_RepairTable(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "s3d.toml")
+		require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+		return path
+	}
+	const base = "version = 1\nregion = \"ap-southeast-2\"\n\n[rs]\ndata = 2\nparity = 1\n"
+
+	t.Run("set", func(t *testing.T) {
+		cfg, err := Load(write(t, base+`
+[repair]
+enabled = true
+workers = 4
+page_size = 256
+interval_seconds = 120
+`))
+		require.NoError(t, err)
+		assert.True(t, cfg.Repair.IsEnabled())
+		assert.Equal(t, 4, cfg.Repair.Workers)
+		assert.Equal(t, 256, cfg.Repair.PageSize)
+		assert.Equal(t, 120, cfg.Repair.IntervalSeconds)
+	})
+
+	// Absent means on, while the tunables still fall back to the sweep's own
+	// defaults. The two are separate questions: whether to sweep, and how hard.
+	t.Run("absent runs the sweep", func(t *testing.T) {
+		cfg, err := Load(write(t, base))
+		require.NoError(t, err)
+		assert.True(t, cfg.Repair.IsEnabled(), "repair runs unless it is turned off")
+		assert.Zero(t, cfg.Repair.Workers, "an absent tunable takes the sweep's default")
+	})
+
+	// Explicitly off is what a fault scenario needs to observe damage without
+	// the sweep repairing it underneath the observation.
+	t.Run("explicitly off", func(t *testing.T) {
+		cfg, err := Load(write(t, base+"\n[repair]\nenabled = false\n"))
+		require.NoError(t, err)
+		assert.False(t, cfg.Repair.IsEnabled())
+	})
+
+	// The retention boundary decides whether a returning node replays the log
+	// or takes a whole snapshot. A profile that says nothing has to keep taking
+	// the replica's defaults, or every existing cluster changes behaviour on
+	// upgrade; a profile that pins it small is how a test reaches the snapshot
+	// path in a dozen writes rather than five thousand.
+	t.Run("meta table", func(t *testing.T) {
+		cfg, err := Load(write(t, base+`
+[meta]
+snapshot_interval_seconds = 1
+snapshot_threshold = 4
+trailing_logs = 8
+`))
+		require.NoError(t, err)
+		assert.Equal(t, Meta{SnapshotIntervalSeconds: 1, SnapshotThreshold: 4, TrailingLogs: 8}, cfg.Meta)
+
+		absent, err := Load(write(t, base))
+		require.NoError(t, err)
+		assert.Equal(t, Meta{}, absent.Meta, "an absent [meta] leaves every knob at the replica's default")
+	})
+
+	// Absent, true and false are three distinct states here, which is why the
+	// fields are pointers: a cluster stays writable through a node loss unless
+	// the operator has decided it should not.
+	t.Run("rs availability settings", func(t *testing.T) {
+		on, err := Load(write(t, base+"degraded_writes = true\nhinted_handoff = true\n"))
+		require.NoError(t, err)
+		assert.True(t, on.RS.DegradedWritesEnabled())
+		assert.True(t, on.RS.HintedHandoffEnabled())
+
+		off, err := Load(write(t, base+"degraded_writes = false\nhinted_handoff = false\n"))
+		require.NoError(t, err)
+		assert.False(t, off.RS.DegradedWritesEnabled(), "an operator can still refuse the window")
+		assert.False(t, off.RS.HintedHandoffEnabled())
+
+		absent, err := Load(write(t, base))
+		require.NoError(t, err)
+		assert.True(t, absent.RS.DegradedWritesEnabled(), "absent means on")
+		assert.True(t, absent.RS.HintedHandoffEnabled(), "absent means on")
 	})
 }
 

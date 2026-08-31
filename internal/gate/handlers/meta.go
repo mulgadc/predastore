@@ -2,9 +2,11 @@ package handlers
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"strings"
 
+	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/meta"
 )
 
@@ -19,6 +21,7 @@ var errNoMetaClient = errors.New("gate has no meta client")
 type MetaClient interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 	Put(ctx context.Context, key string, value []byte) error
+	PutMax(ctx context.Context, key string, value []byte, epoch uint64) error
 	Delete(ctx context.Context, key string) error
 	Scan(ctx context.Context, prefix string, limit int) ([]meta.Item, error)
 }
@@ -31,6 +34,27 @@ const arnObjectPrefix = "arn:aws:s3:::"
 
 // objectARN composes the listing key for an object.
 func objectARN(bucket, key string) string { return arnObjectPrefix + bucket + "/" + key }
+
+// ObjectHashOfKey recovers the object hash from a stored objects-table key, and
+// reports false for every other row the table holds.
+//
+// The table mixes whole-object placement records, keyed by a raw 32-byte hash,
+// with textual rows: the ARN listing, delete tombstones and in-flight multipart
+// parts. One of those can be exactly 32 bytes long, so length alone is not a
+// discriminator and the reserved prefixes are checked as well.
+func ObjectHashOfKey(stored string) ([32]byte, bool) {
+	key, found := strings.CutPrefix(stored, tablePrefix(model.TableObjects))
+	if !found || len(key) != sha256.Size {
+		return [32]byte{}, false
+	}
+	for _, reserved := range []string{arnObjectPrefix, deletedObjectPrefix, partKeyPrefix} {
+		if strings.HasPrefix(key, reserved) {
+			return [32]byte{}, false
+		}
+	}
+
+	return [32]byte([]byte(key)), true
+}
 
 // tablePrefix is what a table contributes to the front of a stored key.
 func tablePrefix(table string) string { return table + "/" }
@@ -54,6 +78,13 @@ func metaPut(ctx context.Context, mc MetaClient, table, key string, value []byte
 		return errNoMetaClient
 	}
 	return mc.Put(ctx, TableKey(table, key), value)
+}
+
+func metaPutMax(ctx context.Context, mc MetaClient, table, key string, value []byte, epoch uint64) error {
+	if mc == nil {
+		return errNoMetaClient
+	}
+	return mc.PutMax(ctx, TableKey(table, key), value, epoch)
 }
 
 // metaDelete removes one row of a table.

@@ -103,6 +103,29 @@ func (store *Store) compactOnce() error {
 	start := time.Now()
 	slog.Info("compaction started", "interval", store.compactionInterval, "liveThreshold", compactionLiveThreshold)
 
+	// Before selecting candidates: a prepared row keeps its extent alive, so a
+	// caller that died between prepare and commit would otherwise pin the space
+	// forever and hide it from the live-fraction estimate below.
+	reaped, err := store.sweepPrepared(preparedMaxAge)
+	if err != nil {
+		return fmt.Errorf("sweep prepared extents: %w", err)
+	}
+	if reaped > 0 {
+		slog.Warn("reaped abandoned prepared extents",
+			"count", reaped, "older_than_ms", preparedMaxAge.Milliseconds())
+	}
+
+	// Likewise for superseded generations: a commit demotes rather than
+	// tombstones, so this is where that space comes back.
+	released, err := store.sweepRetained(retainedMaxAge, retainedGenerations)
+	if err != nil {
+		return fmt.Errorf("sweep retained generations: %w", err)
+	}
+	if released > 0 {
+		slog.Info("released superseded generations",
+			"count", released, "older_than_ms", retainedMaxAge.Milliseconds())
+	}
+
 	candidates, failed, err := store.candidateSegments()
 	if err != nil {
 		return fmt.Errorf("select candidates: %w", err)
@@ -169,6 +192,144 @@ func (store *Store) compactOnce() error {
 		"failed", failed,
 		"duration", elapsed)
 	return nil
+}
+
+// preparedMaxAge is how long a prepared extent may sit unpublished before it
+// is treated as abandoned. A commit follows its prepare by one round trip, so
+// this is orders of magnitude beyond any live write; it is sized for a caller
+// that died, not for a slow one.
+const preparedMaxAge = 30 * time.Minute
+
+// sweepPrepared drops prepared rows older than maxAge, tombstoning the space
+// they reserved. Ageing is the only available test: the store cannot ask
+// whether the caller that prepared a row still intends to commit it.
+func (store *Store) sweepPrepared(maxAge time.Duration) (int, error) {
+	cutoff := time.Now().Add(-maxAge).UnixNano()
+
+	var stale [][]byte
+	if err := store.indexScan([]byte{preparedPrefix}, func(k, v []byte) error {
+		// Keys carry no namespace prefix, so roughly one object hash in 256
+		// starts with preparedPrefix and lands in this scan. The namespaces are
+		// told apart by width, which is also what makes decodePreparedAt total
+		// here.
+		if len(v) != preparedValueSize {
+			return nil
+		}
+
+		// A row in the superseded single-slot layout was never acknowledged to
+		// anyone, so it is reclaimed on sight rather than aged.
+		if len(k) == legacyPreparedKeySize {
+			stale = append(stale, append([]byte(nil), k...))
+			return nil
+		}
+		if len(k) != preparedKeySize {
+			return nil
+		}
+
+		at, err := decodePreparedAt(v)
+		if err != nil {
+			return fmt.Errorf("decode prepared row: %w", err)
+		}
+		if at < cutoff {
+			stale = append(stale, append([]byte(nil), k...))
+		}
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("scan prepared: %w", err)
+	}
+
+	dropped := 0
+	for _, k := range stale {
+		// The row is re-read inside the drop's own transaction, so a commit
+		// that published it between the scan and here simply finds nothing
+		// left to drop rather than losing its extent underneath it.
+		if err := store.dropGeneration(k, func(uint64) bool { return true }); err != nil {
+			return dropped, err
+		}
+		dropped++
+	}
+	return dropped, nil
+}
+
+// retainedMaxAge is how long a superseded generation stays answerable. What it
+// has to outlast is the gap between a writer publishing its shards and its
+// placement record landing, which is one meta round trip — so this is four
+// orders of magnitude of slack, not a fine judgement.
+//
+// It is not sized to cover a writer that died in that gap forever. That leaves
+// a record naming a generation this will eventually release, and closing it
+// needs repair to reconcile a record against what the nodes actually hold,
+// which is not this change.
+const retainedMaxAge = 5 * time.Minute
+
+// retainedGenerations caps how many superseded generations one shard position
+// keeps, oldest dropped first. Age alone would let a hot key pin a generation
+// per overwrite for the whole window, which is unbounded space for a bounded
+// purpose: only a record still in flight can name one, and the number of those
+// is the number of writers racing the key.
+const retainedGenerations = 4
+
+// sweepRetained reclaims generations that a commit superseded and nothing has
+// asked for since. It is the only thing that decides a generation is dead —
+// commit demotes, and never destroys.
+//
+// It enforces both bounds, and the count bound is enforced here rather than
+// only at commit because commit cannot enforce it. Each writer's transaction
+// prunes against its own snapshot, so concurrent commits of one position each
+// see a different subset and can leave more than the cap between them. This
+// runs on the compactor, single file, against everything that is actually
+// there.
+func (store *Store) sweepRetained(maxAge time.Duration, keep int) (int, error) {
+	cutoff := time.Now().Add(-maxAge).UnixNano()
+
+	type row struct {
+		key []byte
+		at  int64
+	}
+
+	var stale [][]byte
+	var group []row
+
+	// Rows sort by position and then by big-endian epoch, so one position's
+	// generations arrive contiguously and oldest first.
+	flush := func() {
+		for i, r := range group {
+			if r.at < cutoff || i < len(group)-keep {
+				stale = append(stale, r.key)
+			}
+		}
+		group = nil
+	}
+
+	if err := store.indexScan([]byte{retainedPrefix}, func(k, v []byte) error {
+		// Same width discrimination as the prepared sweep: an object hash
+		// starting with retainedPrefix puts a 36-byte live row in this scan.
+		if len(k) != retainedKeySize || len(v) != preparedValueSize {
+			return nil
+		}
+		at, err := decodePreparedAt(v)
+		if err != nil {
+			return fmt.Errorf("decode retained row: %w", err)
+		}
+		key := append([]byte(nil), k...)
+		if len(group) > 0 && !bytes.Equal(group[0].key[:retainedKeySize-8], key[:retainedKeySize-8]) {
+			flush()
+		}
+		group = append(group, row{key: key, at: at})
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("scan retained: %w", err)
+	}
+	flush()
+
+	dropped := 0
+	for _, k := range stale {
+		if err := store.dropGeneration(k, func(uint64) bool { return true }); err != nil {
+			return dropped, err
+		}
+		dropped++
+	}
+	return dropped, nil
 }
 
 // candidateSegments scans the tombstone namespace, sums dead bytes per segment,
@@ -294,24 +455,16 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 	}
 
 	for _, e := range entries {
-		key := e.Key[:]
-		raw, err := store.indexGet(key)
-		if errors.Is(err, badger.ErrKeyNotFound) {
+		badgerKey, raw, cur, err := store.rowAt(e.Key, num, e.Off)
+		if err != nil {
+			return stats, err
+		}
+		// A .idx row is only live if some index key still points at this exact
+		// slot; anything deleted or superseded is already dead.
+		if badgerKey == nil {
 			continue
 		}
-		if err != nil {
-			return stats, fmt.Errorf("get extent: %w", err)
-		}
-		cur, err := decodeExtent(raw)
-		if err != nil {
-			return stats, fmt.Errorf("decode extent: %w", err)
-		}
-		// A .idx row is only live if the index still points at this exact slot;
-		// anything deleted or superseded is already dead.
-		if cur.SegNum != num || cur.Off != e.Off {
-			continue
-		}
-		if err := store.relocateExtent(key, cur); err != nil {
+		if err := store.relocateExtent(badgerKey, e.Key, raw, cur); err != nil {
 			return stats, fmt.Errorf("relocate extent: %w", err)
 		}
 		stats.extents++
@@ -347,10 +500,66 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 	return stats, store.deleteTombstones(num)
 }
 
+// rowAt finds the index key, if any, whose extent occupies segment num at off.
+// It checks the live row, then the prepared and retained generations: a
+// prepared extent is data a commit is about to publish and a retained one is
+// data a placement record may still name, so dropping either's segment would
+// lose a write that has already been acknowledged as durable.
+//
+// Prepared and retained rows are keyed by epoch, so there may be several of
+// each and none can be addressed directly — hence the scan.
+func (store *Store) rowAt(idxKey [36]byte, num uint64, off int64) (badgerKey, raw []byte, ext extent, err error) {
+	value, err := store.indexGet(idxKey[:])
+	switch {
+	case err == nil:
+		cur, _, decodeErr := decodeIndexValue(value)
+		if decodeErr != nil {
+			return nil, nil, extent{}, fmt.Errorf("decode extent: %w", decodeErr)
+		}
+		if cur.SegNum == num && cur.Off == off {
+			return idxKey[:], value, cur, nil
+		}
+	case !errors.Is(err, badger.ErrKeyNotFound):
+		return nil, nil, extent{}, fmt.Errorf("get extent: %w", err)
+	}
+
+	for _, prefix := range [][]byte{preparedScan(idxKey[:]), retainedScan(idxKey[:])} {
+		var (
+			found    []byte
+			foundRaw []byte
+			foundExt extent
+		)
+		scanErr := store.indexScan(prefix, func(k, v []byte) error {
+			if found != nil || len(k) != len(prefix)+8 {
+				return nil
+			}
+			cur, _, decodeErr := decodeIndexValue(v)
+			if decodeErr != nil {
+				return fmt.Errorf("decode extent: %w", decodeErr)
+			}
+			if cur.SegNum == num && cur.Off == off {
+				found = append([]byte(nil), k...)
+				foundRaw = append([]byte(nil), v...)
+				foundExt = cur
+			}
+			return nil
+		})
+		if scanErr != nil {
+			return nil, nil, extent{}, scanErr
+		}
+		if found != nil {
+			return found, foundRaw, foundExt, nil
+		}
+	}
+
+	return nil, nil, extent{}, nil
+}
+
 // relocateExtent moves an extent into the active append segment and repoints
 // the index at it, unless a concurrent overwrite or delete of the same key gets
-// there first.
-func (store *Store) relocateExtent(key []byte, old extent) error {
+// there first. badgerKey is the row being repointed, which is the live row or
+// the prepared one; idxKey is always the 36-byte form the sidecar records.
+func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []byte, old extent) error {
 	fragCount := uint64(old.PSize / totalFragSize) //nolint:gosec // PSize is a non-negative multiple of totalFragSize.
 
 	store.mutex.Lock()
@@ -375,7 +584,7 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 	// the destination the extent actually landed in is the one that must be
 	// recorded, not whatever store.segNum happens to be afterward.
 	newExt := extent{SegNum: dstSeg.num, Off: dstOff, PSize: old.PSize, LSize: old.LSize}
-	if err := dstSeg.appendIdx(idxEntry{Off: dstOff, Key: [36]byte(key), PSize: old.PSize}); err != nil {
+	if err := dstSeg.appendIdx(idxEntry{Off: dstOff, Key: idxKey, PSize: old.PSize}); err != nil {
 		srcSeg.releaseRef()
 		dstSeg.releaseRef()
 		store.mutex.Unlock()
@@ -404,7 +613,7 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 	for {
 		err := store.index.Update(func(txn *badger.Txn) error {
 			var stale bool
-			item, err := txn.Get(key)
+			item, err := txn.Get(badgerKey)
 			switch {
 			case errors.Is(err, badger.ErrKeyNotFound):
 				stale = true
@@ -415,7 +624,7 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 				if err != nil {
 					return err
 				}
-				stale = !bytes.Equal(cur, old.encode())
+				stale = !bytes.Equal(cur, oldRaw)
 			}
 
 			// Losing the race strands the copy for good — only this swap could have
@@ -424,7 +633,9 @@ func (store *Store) relocateExtent(key []byte, old extent) error {
 			if stale {
 				return txn.Set(tombstoneKey(newExt.SegNum, newExt.Off), tombstoneValue(newExt.PSize))
 			}
-			return txn.Set(key, newExt.encode())
+			// Rewrite the extent and keep the tail, so the epoch — and, on a
+			// prepared row, its stamp — survives the move untouched.
+			return txn.Set(badgerKey, repointValue(oldRaw, newExt))
 		})
 
 		// The read above puts this txn under badger's conflict detection, which a

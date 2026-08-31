@@ -95,6 +95,18 @@ func (fakeBlob) Delete(context.Context, config.NodeID, blob.DeleteRequest) (*blo
 	return nil, errors.New("no blob nodes")
 }
 
+func (fakeBlob) Stat(context.Context, config.NodeID, blob.StatRequest) (*blob.StatResponse, error) {
+	return nil, errors.New("no blob nodes")
+}
+
+func (fakeBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) (bool, error) {
+	return false, errors.New("no blob nodes")
+}
+
+func (fakeBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error {
+	return errors.New("no blob nodes")
+}
+
 // newTestGate builds a gate through the production constructor, filling in
 // what New requires and a test rarely cares about: a loadable TLS pair and the
 // two cluster clients. Whatever cfg already sets is left alone.
@@ -108,6 +120,10 @@ func newTestGate(t *testing.T, cfg Config) *Server {
 	}
 	if cfg.Blob == nil {
 		cfg.Blob = fakeBlob{}
+	}
+	// Every gate needs an id: it goes into the write epoch, and zero is not one.
+	if cfg.NodeID == 0 {
+		cfg.NodeID = 1
 	}
 	s, err := New(cfg)
 	require.NoError(t, err)

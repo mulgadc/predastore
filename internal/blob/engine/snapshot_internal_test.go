@@ -67,7 +67,7 @@ func TestSnapshotReportsPressureBand(t *testing.T) {
 			// measurement it took on the way to rejecting is what is under
 			// test. A writer that was handed out holds a segment reference, so
 			// it has to be closed or the store never finishes closing.
-			if w, err := st.Append([32]byte{0x42}, 0, 16); err == nil {
+			if w, err := st.Append([32]byte{0x42}, 0, 16, nextTestEpoch()); err == nil {
 				if err := w.Close(); err != nil {
 					t.Fatalf("close writer: %v", err)
 				}

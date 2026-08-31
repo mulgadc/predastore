@@ -3,6 +3,7 @@ package predastore
 import (
 	"cmp"
 	"slices"
+	"time"
 
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate"
@@ -47,6 +48,7 @@ type NodeConfig = config.Node
 // The remaining tables of the configuration file.
 type (
 	RS         = config.RS
+	Repair     = config.Repair
 	Compaction = config.Compaction
 	S3         = config.S3
 	Bucket     = config.Bucket
@@ -113,6 +115,18 @@ func hasRemoteNodes(c *Config, hostID HostID) bool {
 	})
 }
 
+// hostNodesByRole is every node with the role that runs on this host.
+func hostNodesByRole(h HostConfig, role Role) []NodeConfig {
+	var out []NodeConfig
+	for _, n := range h.Nodes {
+		if n.Role == role {
+			out = append(out, n)
+		}
+	}
+
+	return out
+}
+
 // nodeIDs names a set of nodes by id, which is how every client addresses one.
 func nodeIDs(nodes []NodeConfig) []NodeID {
 	ids := make([]NodeID, 0, len(nodes))
@@ -172,16 +186,30 @@ func iamConfig(c *Config) *auth.IAMConfig {
 // reads, plus the wiring its host supplies — where it listens, the TLS
 // identity it serves under, and the cluster clients it works through.
 func gateConfig(
-	c *Config, host HostConfig, n NodeConfig, mc handlers.MetaClient, bc handlers.BlobClient,
+	c *Config, host HostConfig, n NodeConfig, mc gate.MetaClient, bc gate.BlobClient,
 ) gate.Config {
 	return gate.Config{
-		Region:      c.Region,
-		RS:          gate.RS{Data: c.RS.Data, Parity: c.RS.Parity},
+		Region: c.Region,
+		NodeID: n.ID,
+		RS: gate.RS{
+			Data: c.RS.Data, Parity: c.RS.Parity,
+			DegradedWrites: c.RS.DegradedWritesEnabled(), HintedHandoff: c.RS.HintedHandoffEnabled(),
+		},
 		Buckets:     bucketConfigs(c),
 		Auth:        authEntries(c),
 		IAM:         iamConfig(c),
 		RateLimit:   c.RateLimit,
 		BlobNodeIDs: nodeIDs(nodesByRole(c, RoleBlob)),
+
+		// Repair is scoped to the blob nodes sharing this process, so each is
+		// swept by exactly one coordinator without anything having to elect one.
+		LocalBlobNodeIDs: nodeIDs(hostNodesByRole(host, RoleBlob)),
+		Repair: gate.RepairConfig{
+			Enabled:  c.Repair.IsEnabled(),
+			Workers:  c.Repair.Workers,
+			PageSize: c.Repair.PageSize,
+			Interval: time.Duration(c.Repair.IntervalSeconds) * time.Second,
+		},
 
 		Addr:        config.NodeBindAddr(host, n),
 		Port:        n.Port,

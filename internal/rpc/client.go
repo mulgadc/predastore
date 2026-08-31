@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sync/atomic"
+	"time"
 
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/telemetry"
@@ -54,7 +55,9 @@ func OpenStream[T Header](
 	// Open stream. A connection that cannot open one is reported to the pool:
 	// no response is ever read over it, so nothing else would ever record that
 	// it has stopped carrying traffic, and it would be handed out forever.
+	opened := time.Now()
 	stream, err := conn.OpenStream(ctx)
+	telemetry.RecordRPCStreamOpen(ctx, uint64(remote), time.Since(opened))
 	if err != nil {
 		c.pool.noteFailure(conn)
 		return nil, err

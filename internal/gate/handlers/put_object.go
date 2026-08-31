@@ -1,10 +1,9 @@
 package handlers
 
 import (
-	"bytes"
 	"context"
-	"encoding/gob"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -46,38 +45,57 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
-		poolNearFull, err := writeObject(ctx, bc, ring, cfg, body, size, objectHash)
-		recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseShardFanout, phase)
-		if err != nil {
-			slog.ErrorContext(ctx, "putObject: shard distribution failed", "error", err)
-			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, writeFailureReason(err))
-			HandleError(w, r, mapPutErr(err))
-			return
-		}
-
-		// Shards are written but nothing references them until the placement lands
-		// below, so a body that fails its payload check leaves no readable object.
-		if err := finishPayload(r, dec); err != nil {
-			HandleError(w, r, err)
-			return
-		}
-
+		// Placement, and the write epoch every shard is stamped with, are fixed
+		// before the first byte moves: the record the read path will dial has to
+		// be the same list the shards were written to.
 		place, err := placeShards(ring, cfg, objectHash, size)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 
-		var buf bytes.Buffer
-		if err := gob.NewEncoder(&buf).Encode(place); err != nil {
+		written, err := writeObject(ctx, bc, cfg, ring, body, size, objectHash, place)
+		recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseShardFanout, phase)
+		if err != nil {
+			slog.ErrorContext(ctx, "putObject: shard distribution failed", "error", err)
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, writeFailureReason(err))
+			abortShards(ctx, bc, objectHash, place, written)
+			HandleError(w, r, mapPutErr(err))
+			return
+		}
+
+		// Shards are prepared but invisible until the placement lands below, so a
+		// body that fails its payload check leaves the previous object intact.
+		if err := finishPayload(r, dec); err != nil {
+			abortShards(ctx, bc, objectHash, place, written)
+			HandleError(w, r, err)
+			return
+		}
+
+		record, err := EncodePlacement(place)
+		if err != nil {
+			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 
-		// Object hash -> shard placement, for retrieval.
+		// Publish shards before the placement record, so the record can never
+		// name a generation the shards have not reached. It may name one they
+		// have already passed, and the blob store retains superseded
+		// generations for exactly that reason.
+		if overtaken := commitShards(ctx, bc, objectHash, place, written); overtaken > 0 {
+			slog.InfoContext(ctx, "A newer write overtook this one",
+				"shards_superseded", overtaken,
+				"epoch", fmt.Sprintf("%016x", place.WriteEpoch))
+		}
+
+		// Object hash -> shard placement is the visibility point. Raft applies
+		// this max-epoch update atomically, so a delayed older writer cannot move
+		// the record backwards.
 		phase = time.Now()
-		if err := metaPut(ctx, mc, model.TableObjects, string(objectHash[:]), buf.Bytes()); err != nil {
+		if err := metaPutMax(ctx, mc, model.TableObjects, string(objectHash[:]), record, place.WriteEpoch); err != nil {
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
+			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
@@ -97,8 +115,17 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		// Nearfull writes still succeed; the header lets clients back off before
 		// hitting the hard 507 rejection.
-		if poolNearFull {
+		if written.poolNearFull {
 			w.Header().Set("X-Predastore-Pool-Pressure", "nearfull")
+		}
+		// The write is durable and correct; what it is short of is redundancy,
+		// until repair restores the shards that did not land. A caller writing
+		// something it cannot reproduce deserves to know that.
+		if written.degraded() {
+			w.Header().Set(degradedWriteHeader, strconv.Itoa(len(written.missing)))
+		}
+		if len(written.handoff) > 0 {
+			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))
 		}
 		w.Header().Set("ETag", model.ObjectETag(bucket, key))
 		w.WriteHeader(http.StatusOK)

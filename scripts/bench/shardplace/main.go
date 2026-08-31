@@ -9,6 +9,9 @@
 //
 //	shard=0 role=data node=2 host=1
 //
+// A cluster with a node to spare gets one more line, naming where a shard its
+// owner refuses would be handed off to. It holds nothing on a healthy write.
+//
 // The host is what a signal is delivered to: a host is one s3d process and its
 // blob node runs inside it, so freezing the host freezes that shard alone.
 package main
@@ -59,15 +62,18 @@ func blobRing(cfg *predastore.Config) ([]config.NodeID, map[config.NodeID]config
 }
 
 // resolveShards answers where bucket/key's shards live, in the order the gate
-// writes them: data shards first, then parity.
+// writes them: data shards first, then parity, then the handoff holder.
 func resolveShards(cfg *predastore.Config, bucket, key string) ([]shardPlacement, error) {
 	ids, hostOf := blobRing(cfg)
 	if len(ids) == 0 {
 		return nil, fmt.Errorf("config has no blob node")
 	}
 
+	// One past the stripe, so the handoff holder is named when the ring has a
+	// node to spare. Asking for more than the ring holds is not an error there,
+	// it simply returns what it has.
 	total := cfg.RS.Data + cfg.RS.Parity
-	nodes, err := placement.NewRing(ids).Nodes(model.ObjectHash(bucket, key), total)
+	nodes, err := placement.NewRing(ids).Nodes(model.ObjectHash(bucket, key), min(total+1, len(ids)))
 	if err != nil {
 		return nil, fmt.Errorf("place %s/%s: %w", bucket, key, err)
 	}
@@ -75,7 +81,10 @@ func resolveShards(cfg *predastore.Config, bucket, key string) ([]shardPlacement
 	out := make([]shardPlacement, 0, len(nodes))
 	for i, node := range nodes {
 		role := "data"
-		if i >= cfg.RS.Data {
+		switch {
+		case i >= total:
+			role = "handoff"
+		case i >= cfg.RS.Data:
 			role = "parity"
 		}
 		out = append(out, shardPlacement{Index: i, Role: role, Node: node, Host: hostOf[node]})

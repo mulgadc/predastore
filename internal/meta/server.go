@@ -75,13 +75,29 @@ func New(cfg Config) (*Server, error) {
 	cfg.HeartbeatTimeout = orDefault(cfg.HeartbeatTimeout, 1000*time.Millisecond)
 	cfg.ElectionTimeout = orDefault(cfg.ElectionTimeout, 1000*time.Millisecond)
 	cfg.CommitTimeout = orDefault(cfg.CommitTimeout, 50*time.Millisecond)
+	// raft's own defaults are 8192 and 10240, which covers about 5,100 object
+	// writes: any outage longer than that took a whole snapshot install.
+	// Retaining a million writes instead costs about 566 MB of bolt log, and
+	// bolt files never shrink, so this is a floor rather than a peak.
 	cfg.SnapshotInterval = orDefault(cfg.SnapshotInterval, 120*time.Second)
-	cfg.SnapshotThreshold = orDefault(cfg.SnapshotThreshold, uint64(8192))
-	cfg.TrailingLogs = orDefault(cfg.TrailingLogs, uint64(10240))
+	cfg.SnapshotThreshold = orDefault(cfg.SnapshotThreshold, snapshotThreshold)
+	cfg.TrailingLogs = orDefault(cfg.TrailingLogs, trailingLogs)
 	cfg.LeaderLeaseTimeout = orDefault(cfg.LeaderLeaseTimeout, 500*time.Millisecond)
 
 	return &Server{cfg: cfg}, nil
 }
+
+const (
+	// trailingLogs is how far back a replica can fall and still catch up by
+	// replaying the log instead of taking the whole keyspace.
+	trailingLogs = 2_000_000
+
+	// snapshotThreshold is set to the same figure on purpose. A snapshot
+	// writes the whole store, so taking one every T entries costs each write
+	// an amortised store/T on top of itself: a threshold well under the row
+	// count is write amplification. See the sizing rule in DESIGN.md.
+	snapshotThreshold = 2_000_000
+)
 
 // orDefault replaces an unset value with the default for its field.
 func orDefault[T comparable](v, def T) T {
@@ -126,6 +142,7 @@ func (s *Server) open() (*rpc.Server, error) {
 	rpc.RegisterHandler(mux, OpRaftDial, s.handleRaftDial)
 	rpc.RegisterHandler(mux, OpMetaGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpMetaPut, s.handlePut)
+	rpc.RegisterHandler(mux, OpMetaPutMax, s.handlePutMax)
 	rpc.RegisterHandler(mux, OpMetaDelete, s.handleDelete)
 	rpc.RegisterHandler(mux, OpMetaScan, s.handleScan)
 	rpc.RegisterHandler(mux, OpMetaStatus, s.handleStatus)
@@ -147,7 +164,11 @@ func (s *Server) open() (*rpc.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open badger: %w", err)
 	}
-	s.fsm = NewFSM(s.badgerDB)
+	opts := []FSMOption{WithNode(s.cfg.NodeID)}
+	if s.cfg.OnKeyChanged != nil {
+		opts = append(opts, OnKeyChanged(s.cfg.OnKeyChanged))
+	}
+	s.fsm = NewFSM(s.badgerDB, opts...)
 
 	s.bolt, err = raftboltdb.NewBoltStore(filepath.Join(s.cfg.DataDir, "raft.db"))
 	if err != nil {
@@ -165,6 +186,10 @@ func (s *Server) open() (*rpc.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create raft: %w", err)
 	}
+	// NewRaft replays any local snapshot before it returns, so every restore
+	// from here on is one a leader sent because this replica fell outside the
+	// log it retains. That is the difference the FSM cannot see for itself.
+	s.fsm.serving.Store(true)
 	// Consensus state is only observable once raft exists. A failure to
 	// register loses the gauges, not the replica, so it is logged and left.
 	unregister, err := telemetry.RegisterRaftGauges(s.raftSnapshot)
@@ -388,6 +413,10 @@ func (s *Server) put(key string, value []byte) error {
 	return s.apply(Command{Type: CommandPut, Key: []byte(key), Value: value})
 }
 
+func (s *Server) putMax(key string, value []byte, epoch uint64) error {
+	return s.apply(Command{Type: CommandPutMax, Key: []byte(key), Value: value, Epoch: epoch})
+}
+
 // delete removes a key through raft consensus.
 func (s *Server) delete(key string) error {
 	return s.apply(Command{Type: CommandDelete, Key: []byte(key)})
@@ -423,8 +452,8 @@ func (s *Server) get(key string) ([]byte, error) {
 }
 
 // scan iterates over every key with the given prefix.
-func (s *Server) scan(prefix string, fn func(key string, value []byte) error) error {
-	return s.fsm.Scan(prefix, fn)
+func (s *Server) scan(prefix, after string, fn func(key string, value []byte) error) error {
+	return s.fsm.ScanFrom(prefix, after, fn)
 }
 
 // leaderAddr returns the advertise address of the current leader, empty while

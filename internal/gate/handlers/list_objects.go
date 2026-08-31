@@ -1,9 +1,7 @@
 package handlers
 
 import (
-	"bytes"
 	"encoding/base64"
-	"encoding/gob"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -130,22 +128,23 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 				continue
 			}
 
-			// The listing row holds the object hash; the size lives with the shard
-			// placement it keys. Only the page is resolved, so the cost of a
-			// listing follows the page size rather than the bucket size.
+			// The listing row holds the object hash; the size and the write time
+			// live with the shard placement it keys. Only the page is resolved, so
+			// the cost of a listing follows the page size, not the bucket size.
 			var objectSize int64
+			var modified time.Time
 			if len(entry.hash) == 32 {
 				if row, err := metaGet(ctx, mc, model.TableObjects, string(entry.hash)); err == nil && len(row) > 0 {
-					var placement ObjectToShardNodes
-					if err := gob.NewDecoder(bytes.NewReader(row)).Decode(&placement); err == nil {
+					if placement, err := DecodePlacement(row); err == nil {
 						objectSize = placement.Size
+						modified, _ = placement.ModifiedAt()
 					}
 				}
 			}
 
 			contents = append(contents, ListObjectsV2_Contents{
 				Key:          entry.sortKey,
-				LastModified: time.Now(), // TODO: Store actual modification time
+				LastModified: modified,
 				Size:         objectSize,
 				StorageClass: "STANDARD",
 			})

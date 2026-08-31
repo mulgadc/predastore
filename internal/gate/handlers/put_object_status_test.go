@@ -82,7 +82,7 @@ func TestDecoderErrorReachesTheClient(t *testing.T) {
 	})
 
 	body, size, dec := decodeBody(req)
-	_, err := writeObject(t.Context(), f.bc, f.ring, f.cfg, body, size, model.ObjectHash("b", "k"))
+	_, _, err := f.write(t.Context(), model.ObjectHash("b", "k"), body, size)
 	if err == nil {
 		// The declared length was satisfied before the truncation showed, so the
 		// failure lands on the drain instead.

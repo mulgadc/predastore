@@ -118,6 +118,9 @@ type Reader interface {
 	io.WriterTo
 
 	Size() int64
+
+	// Epoch is the write epoch the value was stored under.
+	Epoch() uint64
 }
 
 type Writer interface {
@@ -133,6 +136,12 @@ var (
 	// ErrStoreFull is returned by Append when free space has dropped below
 	// the full watermark (see WithFreeSpaceWatermark).
 	ErrStoreFull = errors.New("store full")
+
+	// ErrNotPrepared is returned by Commit when the key holds no prepared
+	// extent under that epoch: the prepare never landed, it was aborted, or it
+	// was aged out. It is distinct from a store error because the caller's
+	// answer is to rewrite the shard, not to retry the commit.
+	ErrNotPrepared = errors.New("no prepared extent under that epoch")
 )
 
 // Option configures a Store at Open time. Options may fail (e.g. invalid key
@@ -356,6 +365,37 @@ func (store *Store) Snapshot() Snapshot {
 // Lookup returns a reader for the given key. The underlying segment is
 // reference-counted: the caller must call reader.Close() to release it.
 func (store *Store) Lookup(key [32]byte, index uint32) (Reader, error) {
+	return store.lookup(MakeKey(key, index), key, index)
+}
+
+// LookupAt returns a reader for one specific generation of a shard position:
+// the live row if it is that generation, otherwise the retained copy a later
+// commit demoted.
+//
+// This is what makes the placement record authoritative. A record naming an
+// epoch the shards have already moved past is not stale data to be refused —
+// it is the version the cluster agreed on, and it stays answerable until the
+// sweep reclaims it.
+func (store *Store) LookupAt(key [32]byte, index uint32, epoch uint64) (Reader, error) {
+	idxKey := MakeKey(key, index)
+
+	reader, err := store.lookup(idxKey, key, index)
+	if err == nil {
+		if reader.Epoch() == epoch {
+			return reader, nil
+		}
+		_ = reader.Close()
+	} else if !errors.Is(err, ErrKeyNotFound) {
+		return nil, err
+	}
+
+	return store.lookup(retainedKey(idxKey, epoch), key, index)
+}
+
+// lookup opens whichever index row it is pointed at. Retained rows carry the
+// wider prepared-shaped value so they can be aged out, and decodeIndexValue
+// takes both widths, so the same open serves either namespace.
+func (store *Store) lookup(rowKey []byte, key [32]byte, index uint32) (Reader, error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
@@ -363,8 +403,7 @@ func (store *Store) Lookup(key [32]byte, index uint32) (Reader, error) {
 		return nil, ErrClosedStore
 	}
 
-	idxKey := MakeKey(key, index)
-	data, err := store.indexGet(idxKey)
+	data, err := store.indexGet(rowKey)
 	if err != nil {
 		if errors.Is(err, badger.ErrKeyNotFound) {
 			return nil, ErrKeyNotFound
@@ -373,7 +412,7 @@ func (store *Store) Lookup(key [32]byte, index uint32) (Reader, error) {
 		return nil, fmt.Errorf("get extent: %w", err)
 	}
 
-	ext, err := decodeExtent(data)
+	ext, epoch, err := decodeIndexValue(data)
 	if err != nil {
 		return nil, fmt.Errorf("decode extent: %w", err)
 	}
@@ -387,21 +426,28 @@ func (store *Store) Lookup(key [32]byte, index uint32) (Reader, error) {
 
 	seg.addRef()
 
+	buf, held := takeFragWindow(ext.PSize / totalFragSize)
+
 	return &reader{
 		key:     key,
 		index:   index,
+		epoch:   epoch,
 		storeID: store.storeID,
 		aead:    store.aead,
 		seg:     seg,
 		ext:     ext,
-		buf:     make([]byte, min(int64(bufLen), ext.PSize/totalFragSize)*totalFragSize),
+		buf:     buf,
+		held:    held,
 	}, nil
 }
 
 // Append reserves space for a value of the given logical size and returns a
-// writer. The value reaches the index only when that writer is closed, so an
-// overwrite keeps serving its previous data until then.
-func (store *Store) Append(key [32]byte, index uint32, size int64) (Writer, error) {
+// writer. Closing that writer prepares the extent rather than publishing it,
+// so an overwrite keeps serving its previous data until Commit is called.
+//
+// epoch is opaque here: the engine stores it, returns it on Lookup and matches
+// it on Commit, and never orders or interprets it.
+func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64) (Writer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("negative size %d", size)
 	}
@@ -459,16 +505,20 @@ func (store *Store) Append(key [32]byte, index uint32, size int64) (Writer, erro
 		return nil, fmt.Errorf("append idx: %w", err)
 	}
 
+	wbuf, wheld := takeFragWindow(int64(fragCount)) //nolint:gosec // G115: fragment count of a bounded extent.
+
 	w := &writer{
 		store:    store,
 		key:      key,
 		index:    index,
+		epoch:    epoch,
 		storeID:  store.storeID,
 		seg:      seg,
 		ext:      ext,
 		valueNum: store.valueNum,
 		fragNum:  store.fragNum,
-		buf:      make([]byte, min(uint64(bufLen), fragCount)*totalFragSize),
+		buf:      wbuf,
+		held:     wheld,
 	}
 
 	store.valueNum += 1
@@ -530,58 +580,279 @@ func (store *Store) reserveExtent(fragCount uint64) (*segment, int64, error) {
 	return seg, off, nil
 }
 
-// commitExtent points a key at ext, tombstoning any extent it supersedes.
-// Called from writer.Close once the data is durable; takes no store.mutex.
-func (store *Store) commitExtent(key [32]byte, index uint32, ext extent) error {
+// prepareExtent records a durable extent that is not yet the value's data.
+// Called from writer.Close; takes no store.mutex.
+//
+// The row goes into badger rather than being left implicit, and that is the
+// whole point: compaction decides a .idx row is dead when no badger key points
+// at it, so an extent held only in memory between prepare and commit would be
+// dropped out from under the commit. A prepared row makes it live enough to be
+// relocated instead.
+func (store *Store) prepareExtent(key [32]byte, index uint32, ext extent, epoch uint64) error {
+	value := encodePreparedValue(ext, epoch, time.Now().UnixNano())
+	if err := store.index.Update(func(txn *badger.Txn) error {
+		return txn.Set(preparedKey(MakeKey(key, index), epoch), value)
+	}); err != nil {
+		return fmt.Errorf("prepare: %w", err)
+	}
+	return nil
+}
+
+// Commit publishes a prepared extent as the value's data. It is idempotent
+// against the epoch: a retry after the row has already been published finds the
+// live row already at epoch and reports success rather than failing a write
+// that did land.
+//
+// Publishing is forward-only, and losing that race is not an error. A commit
+// whose epoch does not beat the live row leaves the row alone and reports
+// published=false, so the caller learns it was superseded without being told
+// its write failed. Last write wins: every concurrent writer of one shard
+// position is acknowledged, and the highest epoch is the one that survives.
+//
+// The generation a commit supersedes is retained rather than tombstoned, so a
+// placement record still naming it can be served. Retained rows are reclaimed
+// by the sweep, which is the only thing that decides a generation is dead.
+func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published bool, err error) {
 	idxKey := MakeKey(key, index)
+	prepKey := preparedKey(idxKey, epoch)
 
 	for {
+		published = false
 		err := store.index.Update(func(txn *badger.Txn) error {
-			old, err := readExtent(txn, idxKey)
+			raw, err := readRaw(txn, prepKey)
 			switch {
-			// A first write supersedes nothing.
 			case errors.Is(err, badger.ErrKeyNotFound):
+				// Nothing prepared under this epoch. Either the row was already
+				// published, or a newer generation overtook it, or the prepare
+				// never happened — and only the last of those is a failure.
+				_, liveEpoch, liveErr := readIndexValue(txn, idxKey)
+				switch {
+				case liveErr == nil && liveEpoch == epoch:
+					published = true
+					return nil
+				case liveErr == nil && liveEpoch > epoch:
+					return nil
+				}
+				return ErrNotPrepared
 			case err != nil:
 				return err
-			default:
-				// The old extent dies at this commit and nowhere else, so its hint
-				// rides the same txn and can neither precede nor outlive it.
-				if err := txn.Set(tombstoneKey(old.SegNum, old.Off), tombstoneValue(old.PSize)); err != nil {
-					return fmt.Errorf("put tombstone: %w", err)
+			}
+
+			ext, prepared, err := decodeIndexValue(raw)
+			if err != nil {
+				return fmt.Errorf("decode prepared: %w", err)
+			}
+			if prepared != epoch {
+				return ErrNotPrepared
+			}
+
+			old, liveEpoch, liveErr := readIndexValue(txn, idxKey)
+			switch {
+			case liveErr != nil && !errors.Is(liveErr, badger.ErrKeyNotFound):
+				return liveErr
+
+			// Overtaken before it was ever live. It is still retained rather than
+			// discarded: this writer's commit runs before its placement record,
+			// so a record naming this generation can land after the newer one
+			// has already taken the position, and it has to resolve.
+			case liveErr == nil && liveEpoch > epoch:
+				if err := txn.Set(retainedKey(idxKey, epoch), encodePreparedValue(ext, epoch, time.Now().UnixNano())); err != nil {
+					return fmt.Errorf("retain superseded generation: %w", err)
+				}
+				if err := pruneRetained(txn, idxKey, retainedGenerations); err != nil {
+					return err
+				}
+				return txn.Delete(prepKey)
+
+			// Demoted, not destroyed: a record naming this generation is still
+			// answerable until the sweep decides otherwise. Riding the same txn
+			// is what stops the row existing in both places or in neither.
+			case liveErr == nil:
+				if err := txn.Set(retainedKey(idxKey, liveEpoch), encodePreparedValue(old, liveEpoch, time.Now().UnixNano())); err != nil {
+					return fmt.Errorf("retain superseded generation: %w", err)
+				}
+				if err := pruneRetained(txn, idxKey, retainedGenerations); err != nil {
+					return err
 				}
 			}
 
-			return txn.Set(idxKey, ext.encode())
+			if err := txn.Set(idxKey, encodeIndexValue(ext, epoch)); err != nil {
+				return err
+			}
+			published = true
+			return txn.Delete(prepKey)
 		})
 
-		// The read above puts this txn under badger's conflict detection, which a
+		// The reads above put this txn under badger's conflict detection, which a
 		// compactor relocating the same key trips.
 		if errors.Is(err, badger.ErrConflict) {
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("commit: %w", err)
+			if errors.Is(err, ErrNotPrepared) {
+				return false, err
+			}
+			return false, fmt.Errorf("commit: %w", err)
+		}
+		return published, nil
+	}
+}
+
+// Abort discards a prepared extent. The tombstone is what makes the dead space
+// advertise itself: candidateSegments ranks by summed tombstone bytes, so an
+// abort that wrote none would leave the space unreclaimed until something else
+// happened to die in the same segment.
+//
+// Aborting something never prepared is not an error: the caller is telling the
+// store to make sure nothing is pending, and it is not.
+func (store *Store) Abort(key [32]byte, index uint32, epoch uint64) error {
+	return store.dropGeneration(preparedKey(MakeKey(key, index), epoch), func(prepared uint64) bool {
+		return prepared == epoch
+	})
+}
+
+// dropGeneration removes a prepared or retained row when want accepts its
+// epoch, tombstoning the extent it held. Both namespaces carry the same value
+// encoding, and both are reclaimed the same way.
+func (store *Store) dropGeneration(rowKey []byte, want func(epoch uint64) bool) error {
+	for {
+		err := store.index.Update(func(txn *badger.Txn) error {
+			raw, err := readRaw(txn, rowKey)
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			ext, held, err := decodeIndexValue(raw)
+			if err != nil {
+				return fmt.Errorf("decode generation: %w", err)
+			}
+			if !want(held) {
+				return nil
+			}
+			if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
+				return fmt.Errorf("put tombstone: %w", err)
+			}
+			return txn.Delete(rowKey)
+		})
+		if errors.Is(err, badger.ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("drop generation: %w", err)
 		}
 		return nil
 	}
 }
 
-// readExtent decodes the extent a key currently points at, propagating
-// badger.ErrKeyNotFound unwrapped so callers can branch on a missing key.
-func readExtent(txn *badger.Txn, key []byte) (extent, error) {
+// readRaw returns a key's value bytes, propagating badger.ErrKeyNotFound
+// unwrapped so callers can branch on a missing key.
+func readRaw(txn *badger.Txn, key []byte) ([]byte, error) {
 	item, err := txn.Get(key)
 	if err != nil {
-		return extent{}, err
+		return nil, err
 	}
 	raw, err := item.ValueCopy(nil)
 	if err != nil {
-		return extent{}, fmt.Errorf("copy extent: %w", err)
+		return nil, fmt.Errorf("copy value: %w", err)
 	}
-	ext, err := decodeExtent(raw)
+	return raw, nil
+}
+
+// dropRowsUnder tombstones and removes every row under a prefix, inside the
+// caller's transaction. Used to clear a shard position's prepared and retained
+// generations, which are keyed by epoch and so cannot be addressed one by one.
+//
+// The prefix covers a whole shard position, and a live row for an object hash
+// that happens to start with the namespace byte would be a different width, so
+// the width check is what keeps the scan from deleting an unrelated object.
+func dropRowsUnder(txn *badger.Txn, prefix []byte) error {
+	opts := badger.DefaultIteratorOptions
+	opts.Prefix = prefix
+	it := txn.NewIterator(opts)
+	defer it.Close()
+
+	var keys [][]byte
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		item := it.Item()
+		if len(item.Key()) != len(prefix)+8 {
+			continue
+		}
+		raw, err := item.ValueCopy(nil)
+		if err != nil {
+			return fmt.Errorf("copy value: %w", err)
+		}
+		ext, _, err := decodeIndexValue(raw)
+		if err != nil {
+			return fmt.Errorf("decode row: %w", err)
+		}
+		if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
+			return fmt.Errorf("put tombstone: %w", err)
+		}
+		keys = append(keys, item.KeyCopy(nil))
+	}
+
+	// Deleting inside the iteration would invalidate it.
+	for _, k := range keys {
+		if err := txn.Delete(k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// pruneRetained drops the oldest retained generations of one shard position
+// until at most keep remain, tombstoning what it removes. Epochs sort
+// big-endian, so the iteration is already oldest-first and the tail to keep is
+// the last keep rows.
+func pruneRetained(txn *badger.Txn, idxKey []byte, keep int) error {
+	prefix := retainedScan(idxKey)
+
+	opts := badger.DefaultIteratorOptions
+	opts.Prefix = prefix
+	it := txn.NewIterator(opts)
+
+	var rows [][]byte
+	var exts []extent
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		item := it.Item()
+		if len(item.Key()) != retainedKeySize {
+			continue
+		}
+		raw, err := item.ValueCopy(nil)
+		if err != nil {
+			it.Close()
+			return fmt.Errorf("copy retained row: %w", err)
+		}
+		ext, _, err := decodeIndexValue(raw)
+		if err != nil {
+			it.Close()
+			return fmt.Errorf("decode retained row: %w", err)
+		}
+		rows = append(rows, item.KeyCopy(nil))
+		exts = append(exts, ext)
+	}
+	it.Close()
+
+	for i := 0; i < len(rows)-keep; i++ {
+		if err := txn.Set(tombstoneKey(exts[i].SegNum, exts[i].Off), tombstoneValue(exts[i].PSize)); err != nil {
+			return fmt.Errorf("tombstone pruned generation: %w", err)
+		}
+		if err := txn.Delete(rows[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readIndexValue decodes the extent and epoch a key currently points at.
+func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
+	raw, err := readRaw(txn, key)
 	if err != nil {
-		return extent{}, fmt.Errorf("decode extent: %w", err)
+		return extent{}, 0, err
 	}
-	return ext, nil
+	return decodeIndexValue(raw)
 }
 
 // Delete removes a key's index entry and tombstones its extent, in one
@@ -599,7 +870,16 @@ func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
 	idxKey := MakeKey(key, index)
 	deleted := false
 	err := store.index.Update(func(txn *badger.Txn) error {
-		ext, err := readExtent(txn, idxKey)
+		// Every generation goes, not just the live one: a prepared row would
+		// resurrect the value on a later commit, and a retained row would keep
+		// answering a record that names it.
+		for _, scan := range [][]byte{preparedScan(idxKey), retainedScan(idxKey)} {
+			if err := dropRowsUnder(txn, scan); err != nil {
+				return fmt.Errorf("delete: %w", err)
+			}
+		}
+
+		ext, _, err := readIndexValue(txn, idxKey)
 		if errors.Is(err, badger.ErrKeyNotFound) {
 			return nil
 		}
@@ -689,6 +969,65 @@ func tombstoneValue(psize int64) []byte {
 	v := make([]byte, 8)
 	binary.BigEndian.PutUint64(v, uint64(psize)) //nolint:gosec // PSize is a non-negative on-disk byte count.
 	return v
+}
+
+// Prepared extents live at p ‖ MakeKey(...) ‖ BE(epoch), 45 bytes against the
+// live row's 36 and the tombstone namespace's 17, so all are told apart by
+// width alone — the same discrimination the rest of the index already makes.
+//
+// The epoch is in the key, not just the value, and that is what makes two
+// writers of one shard position independent: each prepares into its own row
+// and neither can overwrite or destroy the other's in-flight extent.
+const preparedPrefix = 'p'
+
+const preparedKeySize = 45
+
+// legacyPreparedKeySize is the single-slot layout this replaced: p ‖ MakeKey.
+// Rows in it are uncommitted in-flight state that was never acknowledged, so
+// the sweep drops them on sight rather than migrating them.
+const legacyPreparedKeySize = 37
+
+func preparedKey(idxKey []byte, epoch uint64) []byte {
+	key := make([]byte, 0, preparedKeySize)
+	key = append(append(key, preparedPrefix), idxKey...)
+
+	return binary.BigEndian.AppendUint64(key, epoch)
+}
+
+// preparedScan is the prefix covering every prepared row for one shard
+// position, whatever epoch it was prepared under.
+func preparedScan(idxKey []byte) []byte {
+	key := make([]byte, 0, legacyPreparedKeySize)
+
+	return append(append(key, preparedPrefix), idxKey...)
+}
+
+// Retained extents live at r ‖ MakeKey(...) ‖ BE(epoch) and hold the generation
+// a commit superseded, rather than tombstoning it there and then.
+//
+// A write publishes its shards before its placement record, so the record can
+// name an epoch older than the one the shards have already moved to — either
+// briefly, while a newer writer's record is still in flight, or permanently, if
+// that writer died in between. Retaining the superseded generation is what lets
+// such a record still resolve, which is what makes the record the commit point
+// the design always claimed it was.
+const retainedPrefix = 'r'
+
+const retainedKeySize = 45
+
+func retainedKey(idxKey []byte, epoch uint64) []byte {
+	key := make([]byte, 0, retainedKeySize)
+	key = append(append(key, retainedPrefix), idxKey...)
+
+	return binary.BigEndian.AppendUint64(key, epoch)
+}
+
+// retainedScan is the prefix covering every retained generation of one shard
+// position.
+func retainedScan(idxKey []byte) []byte {
+	key := make([]byte, 0, retainedKeySize-8)
+
+	return append(append(key, retainedPrefix), idxKey...)
 }
 
 // MakeKey builds a 36-byte index key: the 32-byte key || 4-byte big-endian index.

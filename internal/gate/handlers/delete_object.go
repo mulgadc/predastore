@@ -48,8 +48,8 @@ func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handler
 			return
 		}
 
-		var place ObjectToShardNodes
-		if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&place); err != nil {
+		place, err := DecodePlacement(data)
+		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "corrupt metadata", 500))
 			return
 		}

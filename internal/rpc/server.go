@@ -295,6 +295,11 @@ func (s *Server) acceptStreams(
 	conn transport.Conn,
 	streams *sync.WaitGroup,
 ) error {
+	// Only quic meters streams. A pipe is in-process on both ends with nothing
+	// to reclaim, and io.Pipe is synchronous, so draining one can only disturb
+	// a response quic would have buffered.
+	drain := conn.LocalAddr().Network() == string(transport.NetworkQUIC)
+
 	for {
 		stream, err := conn.AcceptStream(acceptCtx)
 		if err != nil {
@@ -312,9 +317,30 @@ func (s *Server) acceptStreams(
 				stream.CancelWrite(0)
 			} else {
 				stream.Close()
+				if drain {
+					finishRequest(stream)
+				}
 			}
 		})
 	}
+}
+
+// requestDrainTimeout bounds the wait for a request's FIN once the handler has
+// answered. Every client half-closes before reading its response, so only a
+// peer that does not gets this far.
+const requestDrainTimeout = 5 * time.Second
+
+// finishRequest completes the receive side of a served stream. QUIC returns a
+// stream's credit to the peer only once the FIN is read or the read cancelled,
+// so a handler that stops at the end of its header starves the peer's budget.
+// It is best effort and never cancels on error: the response has already been
+// written, and a cancel is surfaced to the peer as a stream error that destroys
+// the answer it is still reading.
+func finishRequest(stream transport.Stream) {
+	timer := time.AfterFunc(requestDrainTimeout, func() { stream.CancelRead(0) })
+	defer timer.Stop()
+
+	_, _ = io.Copy(io.Discard, stream)
 }
 
 func (s *Server) handleStream(ctx context.Context, stream transport.Stream) error {

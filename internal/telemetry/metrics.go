@@ -15,6 +15,7 @@ import (
 	"context"
 	"strconv"
 	"sync"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -47,6 +48,12 @@ const (
 	metricShardErrors   = "predastore.shard.errors"
 	metricShardOps      = "predastore.shard.ops"
 	metricShardDuration = "predastore.shard.duration"
+	metricShardHedges   = "predastore.shard.hedges"
+	metricShardTTFB     = "predastore.shard.ttfb"
+	metricShardBytes    = "predastore.shard.read.bytes"
+	metricShardStalls   = "predastore.shard.stalls"
+	metricShardLongest  = "predastore.shard.stall.longest"
+	metricShardRate     = "predastore.shard.throughput"
 
 	metricObjectReads  = "predastore.object.reads"
 	metricObjectWrites = "predastore.object.writes"
@@ -84,9 +91,15 @@ const (
 	metricMetaSnapshotIndex = "predastore.meta.snapshot.index"
 	metricMetaLogTrailing   = "predastore.meta.log.trailing"
 
-	metricRPCConnections = "predastore.rpc.connections"
-	metricRPCEvictions   = "predastore.rpc.evictions"
-	metricRPCStreamsOpen = "predastore.rpc.streams.open"
+	metricRPCConnections   = "predastore.rpc.connections"
+	metricRPCEvictions     = "predastore.rpc.evictions"
+	metricRPCStreamsOpen   = "predastore.rpc.streams.open"
+	metricRPCStreamOpenDur = "predastore.rpc.stream.open.duration"
+
+	metricRepairPending  = "predastore.repair.pending"
+	metricRepairRepaired = "predastore.repair.repaired"
+	metricRepairFailed   = "predastore.repair.failed"
+	metricRepairPasses   = "predastore.repair.passes"
 )
 
 // metricNames is every name this package registers. Only the tests read it:
@@ -98,6 +111,8 @@ var metricNames = []string{
 	metricMultipartUploads, metricMultipartSessions, metricMultipartPartCount,
 	metricMultipartPartBytes, metricMultipartPartFetches,
 	metricShardErrors, metricShardOps, metricShardDuration,
+	metricShardHedges, metricShardTTFB, metricShardBytes,
+	metricShardStalls, metricShardLongest, metricShardRate,
 	metricObjectReads, metricObjectWrites,
 	metricGateInflightBytes, metricGateInflightRequests,
 	metricBlobFreeFrac, metricBlobFreeBytes, metricBlobTotalBytes, metricBlobPressure,
@@ -108,7 +123,8 @@ var metricNames = []string{
 	metricObjectPhaseDuration,
 	metricMetaClientOps, metricMetaClientDuration, metricMetaClientRedirects,
 	metricMetaFSMLSMBytes, metricMetaFSMVLogBytes, metricMetaSnapshotIndex, metricMetaLogTrailing,
-	metricRPCConnections, metricRPCEvictions, metricRPCStreamsOpen,
+	metricRPCConnections, metricRPCEvictions, metricRPCStreamsOpen, metricRPCStreamOpenDur,
+	metricRepairPending, metricRepairRepaired, metricRepairFailed, metricRepairPasses,
 }
 
 // secondsBuckets bounds the duration histograms. The SDK default boundaries
@@ -135,7 +151,14 @@ var (
 	multipartPartBytes   metric.Int64Counter
 	multipartPartFetches metric.Int64Counter
 
-	shardErrors   metric.Int64Counter
+	shardErrors  metric.Int64Counter
+	shardHedges  metric.Int64Counter
+	shardTTFB    metric.Int64Histogram
+	shardBytes   metric.Int64Counter
+	shardStalls  metric.Int64Counter
+	shardLongest metric.Int64Histogram
+	shardRate    metric.Int64Histogram
+
 	shardOps      metric.Int64Counter
 	shardDuration metric.Float64Histogram
 
@@ -175,9 +198,15 @@ var (
 	metaSnapshotIndex metric.Int64ObservableGauge
 	metaLogTrailing   metric.Int64ObservableGauge
 
-	rpcConnections metric.Int64ObservableGauge
-	rpcEvictions   metric.Int64Counter
-	rpcStreamsOpen metric.Int64UpDownCounter
+	rpcConnections   metric.Int64ObservableGauge
+	rpcEvictions     metric.Int64Counter
+	rpcStreamsOpen   metric.Int64UpDownCounter
+	rpcStreamOpenDur metric.Float64Histogram
+
+	repairPending  metric.Int64ObservableGauge
+	repairRepaired metric.Int64ObservableGauge
+	repairFailed   metric.Int64ObservableGauge
+	repairPasses   metric.Int64ObservableGauge
 )
 
 // instruments lazily creates the shared instruments. The global meter
@@ -217,6 +246,19 @@ func instruments() {
 			"Shard operations attempted, by op, node and outcome. The denominator the error counter is read against.", "{operation}")
 		shardDuration = secondsHistogram(metricShardDuration,
 			"Duration of one shard operation against one node. A per-node tail is what separates a single sick node from a slow cluster.")
+
+		shardHedges = int64Counter(metricShardHedges,
+			"Shard reads given up on in favour of parity, by reason. Without the reason there is no telling a cluster hedging usefully from one hedging on every request.", "{hedge}")
+		shardTTFB = int64Histogram(metricShardTTFB,
+			"Time from opening a shard stream to its first byte. A node that accepts a connection and then says nothing shows up here and nowhere else.", "ms")
+		shardBytes = int64Counter(metricShardBytes,
+			"Bytes delivered by shard reads, by node.", "By")
+		shardStalls = int64Counter(metricShardStalls,
+			"Gaps in a shard stream long enough to count as a stall. A shard that keeps delivering is never hedged, so this is what separates slow from stopped.", "{stall}")
+		shardLongest = int64Histogram(metricShardLongest,
+			"The longest gap in a single shard stream.", "ms")
+		shardRate = int64Histogram(metricShardRate,
+			"Delivered rate of a shard read over the time it spent reading. The floor a slow shard is judged against, in place of an absolute duration that is a throughput floor in disguise.", "KiBy/s")
 
 		objectReads = int64Counter(metricObjectReads,
 			"Object reads served, by path. A reconstructed read consumed parity to answer, and is the only in-band evidence that a blob node is losing data.", "{read}")
@@ -288,6 +330,17 @@ func instruments() {
 			"Connections dropped from the pool, by peer and reason. A peer evicted repeatedly is the one at fault.", "{eviction}")
 		rpcStreamsOpen = int64UpDownCounter(metricRPCStreamsOpen,
 			"Streams this node has open to a peer. Bounded by the transport's per-connection cap, which is otherwise invisible.", "{stream}")
+		rpcStreamOpenDur = secondsHistogram(metricRPCStreamOpenDur,
+			"Time spent acquiring a stream to a peer, before a byte is written. QUIC blocks this wait when the peer's stream credit is spent, so it is the only thing that separates a slow peer from a connection that has run out of streams to talk over.")
+
+		repairPending = int64Gauge(metricRepairPending,
+			"Shard positions the last completed sweep could not rebuild. Above zero means stripes are short a holder right now.", "{shard}")
+		repairRepaired = int64Gauge(metricRepairRepaired,
+			"Shards rebuilt since start. Flat while pending is high means the sweep cannot place them, not that there is nothing to do.", "{shard}")
+		repairFailed = int64Gauge(metricRepairFailed,
+			"Rebuild attempts that failed since start.", "{shard}")
+		repairPasses = int64Gauge(metricRepairPasses,
+			"Sweeps completed since start. Not climbing means the sweep is stalled or was never started.", "{pass}")
 	})
 }
 
@@ -328,6 +381,15 @@ func int64Counter(name, description, unit string) metric.Int64Counter {
 		otel.Handle(err)
 	}
 	return c
+}
+
+func int64Histogram(name, description, unit string) metric.Int64Histogram {
+	h, err := meter.Int64Histogram(name,
+		metric.WithDescription(description), metric.WithUnit(unit))
+	if err != nil {
+		otel.Handle(err)
+	}
+	return h
 }
 
 func int64UpDownCounter(name, description, unit string) metric.Int64UpDownCounter {
@@ -674,6 +736,9 @@ const (
 	ShardReasonStoreFull = "store_full"
 	// ShardReasonTransport is any other failure reaching or reading the node.
 	ShardReasonTransport = "transport"
+	// ShardReasonStaleEpoch is a node holding the shard under a different
+	// write epoch than the placement record names: up, answering, and wrong.
+	ShardReasonStaleEpoch = "stale_epoch"
 )
 
 // Object read paths. A reconstructed read consumed parity to answer it, so the
@@ -942,6 +1007,19 @@ func EnterRPCStream(ctx context.Context, node uint64) func() {
 	return func() { rpcStreamsOpen.Add(context.WithoutCancel(ctx), -1, opts.add...) }
 }
 
+// RecordRPCStreamOpen records how long acquiring a stream to a peer took.
+// Separate from the stream's own duration on purpose: this wait happens before
+// the request exists, so it is the peer's stream credit and never its service
+// time. The open-stream gauge cannot show it -- a caller blocked here has not
+// entered the gauge yet.
+func RecordRPCStreamOpen(ctx context.Context, node uint64, elapsed time.Duration) {
+	instruments()
+	if rpcStreamOpenDur == nil {
+		return
+	}
+	rpcStreamOpenDur.Record(ctx, elapsed.Seconds(), nodeAttrs(node).record...)
+}
+
 // MetaSnapshot is one meta replica's storage state at collection time,
 // alongside the consensus state RaftSnapshot carries. Every field comes from
 // figures raft and badger already hold, so a collection reads no files.
@@ -991,6 +1069,43 @@ func RegisterMetaGauges(snapshot func() MetaSnapshot) (func() error, error) {
 	if err != nil {
 		return nil, err
 	}
+	return reg.Unregister, nil
+}
+
+// RepairSnapshot is what a repair service reports about its sweeps. Pending is
+// the one to watch: it counts shard positions the last completed pass could
+// not rebuild, so a cluster sitting above zero is short redundancy now.
+type RepairSnapshot struct {
+	Pending  int64
+	Repaired int64
+	Failed   int64
+	Passes   int64
+}
+
+// RegisterRepairGauges observes the repair sweep. Repair runs unasked, so its
+// progress has to be visible without an operator having opted into anything.
+func RegisterRepairGauges(snapshot func() RepairSnapshot) (func() error, error) {
+	instruments()
+	if meter == nil {
+		return func() error { return nil }, nil
+	}
+
+	reg, err := meter.RegisterCallback(
+		func(_ context.Context, o metric.Observer) error {
+			s := snapshot()
+			o.ObserveInt64(repairPending, s.Pending)
+			o.ObserveInt64(repairRepaired, s.Repaired)
+			o.ObserveInt64(repairFailed, s.Failed)
+			o.ObserveInt64(repairPasses, s.Passes)
+
+			return nil
+		},
+		repairPending, repairRepaired, repairFailed, repairPasses,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return reg.Unregister, nil
 }
 
@@ -1102,5 +1217,62 @@ func EnterGateInflight(ctx context.Context, op string, size int64) func() {
 		if gateInflightRequests != nil {
 			gateInflightRequests.Add(ctx, -1, opts.add...)
 		}
+	}
+}
+
+// Hedge reasons, as a bounded label set. A shard that keeps delivering is
+// never hedged, so there is deliberately no reason for "slow".
+const (
+	// HedgeHardFail is a refused, closed, missing or wrong-epoch shard: it is
+	// not coming, so parity starts immediately rather than after a delay.
+	HedgeHardFail = "hard_fail"
+	// HedgeNoTTFB is a stream that opened and then sent nothing within the
+	// budget, while a peer had already delivered.
+	HedgeNoTTFB = "no_ttfb"
+	// HedgeStall is a stream that was delivering and then stopped.
+	HedgeStall = "stall"
+)
+
+// ShardRead is what one shard delivered over the course of one object read.
+type ShardRead struct {
+	Node string
+	// TTFB is zero when the shard never delivered a byte.
+	TTFB    time.Duration
+	Bytes   int64
+	Active  time.Duration
+	Stalls  int64
+	Longest time.Duration
+}
+
+// RecordShardHedge counts one shard given up on, by reason.
+func RecordShardHedge(ctx context.Context, reason string) {
+	instruments()
+	if shardHedges == nil {
+		return
+	}
+	shardHedges.Add(ctx, 1, metric.WithAttributeSet(attribute.NewSet(
+		attribute.String("reason", reason),
+	)))
+}
+
+// RecordShardRead records what one shard delivered. Rate is reported over the
+// time spent reading rather than wall time, so a shard waiting its turn behind
+// a stripe is not counted as slow.
+func RecordShardRead(ctx context.Context, r ShardRead) {
+	instruments()
+	if shardBytes == nil {
+		return
+	}
+	node := metric.WithAttributeSet(attribute.NewSet(attribute.String("node", r.Node)))
+	shardBytes.Add(ctx, r.Bytes, node)
+	if r.TTFB > 0 {
+		shardTTFB.Record(ctx, r.TTFB.Milliseconds(), node)
+	}
+	if r.Stalls > 0 {
+		shardStalls.Add(ctx, r.Stalls, node)
+		shardLongest.Record(ctx, r.Longest.Milliseconds(), node)
+	}
+	if r.Active > 0 && r.Bytes > 0 {
+		shardRate.Record(ctx, r.Bytes*int64(time.Second)/int64(r.Active)/1024, node)
 	}
 }

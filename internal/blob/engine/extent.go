@@ -16,7 +16,18 @@ type extent struct {
 	LSize  int64
 }
 
-const extentEncodedSize = 32
+// An index value is an extent followed by the write epoch that produced it. A
+// prepared value carries the time it was prepared as well, so a row abandoned
+// by a caller that died between prepare and commit can be aged out rather than
+// pinning its segment forever.
+//
+// The extent occupies the same leading bytes in both, which is what lets
+// compaction relocate either kind by rewriting the head and keeping the tail.
+const (
+	extentEncodedSize = 32
+	indexValueSize    = extentEncodedSize + 8
+	preparedValueSize = indexValueSize + 8
+)
 
 func (ext extent) encode() []byte {
 	buf := make([]byte, extentEncodedSize)
@@ -37,4 +48,53 @@ func decodeExtent(buf []byte) (ext extent, err error) {
 	ext.PSize = int64(binary.BigEndian.Uint64(buf[16:24])) //nolint:gosec // round-trips bit-for-bit from encode.
 	ext.LSize = int64(binary.BigEndian.Uint64(buf[24:32])) //nolint:gosec // round-trips bit-for-bit from encode.
 	return ext, nil
+}
+
+// encodeIndexValue renders the live row for a committed extent.
+func encodeIndexValue(ext extent, epoch uint64) []byte {
+	buf := make([]byte, indexValueSize)
+	copy(buf, ext.encode())
+	binary.BigEndian.PutUint64(buf[extentEncodedSize:], epoch)
+	return buf
+}
+
+// encodePreparedValue renders a prepared row. at is a wall-clock nanosecond
+// stamp used only to age the row out; nothing reads it for ordering.
+func encodePreparedValue(ext extent, epoch uint64, at int64) []byte {
+	buf := make([]byte, preparedValueSize)
+	copy(buf, encodeIndexValue(ext, epoch))
+	binary.BigEndian.PutUint64(buf[indexValueSize:], uint64(at)) //nolint:gosec // round-trips bit-for-bit via int64 cast on decode.
+	return buf
+}
+
+// decodeIndexValue parses a live or a prepared row. Both are accepted here
+// because compaction and the reaper walk rows without knowing which kind they
+// hold; a caller that cares checks the width itself.
+func decodeIndexValue(buf []byte) (ext extent, epoch uint64, err error) {
+	if len(buf) != indexValueSize && len(buf) != preparedValueSize {
+		return ext, 0, fmt.Errorf("invalid index value length %d, want %d or %d",
+			len(buf), indexValueSize, preparedValueSize)
+	}
+	ext, err = decodeExtent(buf[:extentEncodedSize])
+	if err != nil {
+		return ext, 0, err
+	}
+	return ext, binary.BigEndian.Uint64(buf[extentEncodedSize:indexValueSize]), nil
+}
+
+// decodePreparedAt reads the stamp from a prepared row.
+func decodePreparedAt(buf []byte) (int64, error) {
+	if len(buf) != preparedValueSize {
+		return 0, fmt.Errorf("invalid prepared value length %d, want %d", len(buf), preparedValueSize)
+	}
+	return int64(binary.BigEndian.Uint64(buf[indexValueSize:])), nil //nolint:gosec // round-trips bit-for-bit from encode.
+}
+
+// repointValue rewrites a row's extent while keeping everything after it, so a
+// relocation preserves the epoch and, on a prepared row, its stamp.
+func repointValue(old []byte, newExt extent) []byte {
+	out := make([]byte, len(old))
+	copy(out, newExt.encode())
+	copy(out[extentEncodedSize:], old[extentEncodedSize:])
+	return out
 }

@@ -14,6 +14,7 @@ var ErrClosedReader = errors.New("closed reader")
 type reader struct {
 	key     [32]byte
 	index   uint32
+	epoch   uint64
 	storeID uint32
 	aead    cipher.AEAD
 
@@ -21,6 +22,10 @@ type reader struct {
 	ext extent
 
 	buf []byte
+
+	// held is the pooled window behind buf, or nil when buf is this reader's
+	// own. Close gives it back.
+	held *[]byte
 
 	// Sequential position for Read; ReadAt is stateless.
 	readPos int64
@@ -112,6 +117,12 @@ func (r *reader) WriteTo(w io.Writer) (int64, error) {
 }
 
 // Size returns the logical (data-only) size of the value, excluding fragment headers.
+// Epoch reports the write epoch this value was stored under. The read path
+// compares it against the epoch the placement record names, so a shard left
+// behind by a node that missed an overwrite reads as absent rather than as
+// data.
+func (r *reader) Epoch() uint64 { return r.epoch }
+
 func (r *reader) Size() int64 {
 	return r.ext.LSize
 }
@@ -123,6 +134,8 @@ func (r *reader) Close() error {
 	}
 
 	r.closed = true
+	dropFragWindow(r.held)
+	r.held, r.buf = nil, nil
 	r.seg.releaseRef()
 	return nil
 }

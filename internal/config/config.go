@@ -137,13 +137,71 @@ func NodeBindAddr(h Host, n Node) string {
 type RS struct {
 	Data   int `toml:"data"`
 	Parity int `toml:"parity"`
+
+	// DegradedWrites acknowledges a write once Data shards are durable rather
+	// than requiring the full stripe, so one node down does not refuse writes.
+	// Absent means on; see DegradedWritesEnabled for what that costs.
+	DegradedWrites *bool `toml:"degraded_writes"`
+
+	// HintedHandoff sends a shard its owner will not take to the next node
+	// along the ring, so the stripe is complete when the write is acknowledged
+	// rather than only durable. Repair returns it to its owner afterwards.
+	HintedHandoff *bool `toml:"hinted_handoff"`
 }
+
+// DegradedWritesEnabled reports whether a write may be acknowledged short of
+// the full stripe. Absent means on: refusing writes while a node is down is a
+// worse failure than the redundancy window accepting them opens.
+//
+// That window is real. Repair rebuilds a shard onto its owner, so it cannot
+// close until the node returns, and at RS(2,1) an object written meanwhile
+// holds no parity at all. The position is that a lost node is repaired and
+// returned to service, and the sweep restores redundancy then.
+func (r RS) DegradedWritesEnabled() bool { return r.DegradedWrites == nil || *r.DegradedWrites }
+
+// HintedHandoffEnabled reports whether a shard its owner refuses may go to the
+// next node along the ring. Absent means on. It is inert on a cluster whose
+// stripe spans every node, which has no spare to hand off to.
+func (r RS) HintedHandoffEnabled() bool { return r.HintedHandoff == nil || *r.HintedHandoff }
+
+// Repair tunes the background sweep that restores shards a blob node owns but
+// does not hold at the generation its object's record names. It is on by
+// default: it is what closes the redundancy window degraded writes open, and
+// shipping one without the other takes the cost without the repayment.
+type Repair struct {
+	Enabled *bool `toml:"enabled"`
+
+	// Workers bounds concurrent shard rebuilds, PageSize how many placement
+	// records a scan asks for at a time, and IntervalSeconds the gap between
+	// passes. Zero takes the sweep's own default for each.
+	Workers         int `toml:"workers"`
+	PageSize        int `toml:"page_size"`
+	IntervalSeconds int `toml:"interval_seconds"`
+}
+
+// IsEnabled reports whether the sweep should run. Absent means on; a host with
+// no local blob node still runs none, because there is nothing for it to own.
+func (r Repair) IsEnabled() bool { return r.Enabled == nil || *r.Enabled }
 
 // Compaction tunes the shard store's background compactor. A zero interval
 // falls back to the store's default; compaction itself is never off, because
 // without it overwrite and delete churn never reclaims dead shards.
 type Compaction struct {
 	IntervalSeconds int `toml:"interval_seconds"`
+}
+
+// Meta tunes the metadata plane's raft log retention. Every zero takes the
+// replica's own default, so a profile that says nothing behaves as before.
+//
+// TrailingLogs is the one that decides how a returning node catches up: within
+// it the leader replays log entries, past it the node takes a whole snapshot.
+// It is configuration rather than a constant because a test needs to cross
+// that boundary in a dozen writes and production needs it not to be crossed at
+// all.
+type Meta struct {
+	SnapshotIntervalSeconds int    `toml:"snapshot_interval_seconds"`
+	SnapshotThreshold       uint64 `toml:"snapshot_threshold"`
+	TrailingLogs            uint64 `toml:"trailing_logs"`
 }
 
 // S3 tunes the gate's HTTP surface, as opposed to the S3 semantics above it.
@@ -213,7 +271,11 @@ type Config struct {
 	// from the host base and the node id.
 	Hosts []Host `toml:"host"`
 
+	Repair Repair `toml:"repair"`
+
 	Compaction Compaction `toml:"compaction"`
+
+	Meta Meta `toml:"meta"`
 
 	S3 S3 `toml:"s3"`
 

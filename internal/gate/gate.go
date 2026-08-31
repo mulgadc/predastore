@@ -5,16 +5,67 @@
 package gate
 
 import (
+	"context"
+	"time"
+
 	"github.com/mulgadc/bluebottle/pkg/ratelimit"
+	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
+	"github.com/mulgadc/predastore/internal/gate/repair"
+	"github.com/mulgadc/predastore/internal/meta"
+)
+
+// MetaClient is the metadata surface a gate needs: everything the request
+// handlers read and write, plus the cursor scan the repair sweep pages the
+// object table with, which no request path asks for.
+type MetaClient interface {
+	handlers.MetaClient
+	ScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error)
+}
+
+// BlobClient is the shard surface a gate needs: the request path's reads and
+// writes, plus the stat repair asks a node which generation it holds with.
+type BlobClient interface {
+	handlers.BlobClient
+	Stat(ctx context.Context, node config.NodeID, req blob.StatRequest) (*blob.StatResponse, error)
+}
+
+var (
+	_ MetaClient = (*meta.Client)(nil)
+	_ BlobClient = (*blob.Client)(nil)
+
+	_ repair.MetaClient = MetaClient(nil)
+	_ repair.BlobClient = BlobClient(nil)
 )
 
 // RS fixes the erasure code the gate places objects with.
 type RS struct {
 	Data   int
 	Parity int
+
+	// DegradedWrites acknowledges a write once Data shards are durable rather
+	// than requiring the full stripe.
+	DegradedWrites bool
+
+	// HintedHandoff places a shard its owner refuses on the next node along
+	// the ring instead of leaving the stripe short.
+	HintedHandoff bool
+}
+
+// RepairConfig tunes the background repair sweep. It is on by default: it is
+// what closes the redundancy window degraded writes open, and a cluster
+// running one without the other takes the cost without the repayment.
+type RepairConfig struct {
+	Enabled bool
+
+	// Workers bounds concurrent shard rebuilds, PageSize how many placement
+	// records a scan asks for at a time, and Interval the gap between passes.
+	// Zero takes the repair package's own default for each.
+	Workers  int
+	PageSize int
+	Interval time.Duration
 }
 
 // Config is everything one S3 gate runs on: its slice of the product
@@ -24,6 +75,10 @@ type RS struct {
 type Config struct {
 	Region string
 
+	// NodeID is this gate's own node id. It goes into every write epoch, which
+	// is what keeps two gates minting in the same millisecond apart.
+	NodeID config.NodeID
+
 	RS RS
 
 	// Buckets are the config-defined buckets.
@@ -32,6 +87,16 @@ type Config struct {
 	// BlobNodeIDs are the blob nodes the placement ring spreads
 	// objects across.
 	BlobNodeIDs []config.NodeID
+
+	// LocalBlobNodeIDs are the blob nodes running in this process. They are the
+	// ones this gate repairs for: every blob node is repaired by exactly one
+	// coordinator, the gate that shares its disk, which settles ownership
+	// without an election.
+	LocalBlobNodeIDs []config.NodeID
+
+	// Repair sweeps for shards a local blob node owns but does not hold at the
+	// generation its record names.
+	Repair RepairConfig
 
 	// TODO: Move to IAM
 	Auth []auth.Entry
@@ -64,8 +129,8 @@ type Config struct {
 	// and Blob the nodes holding shards. Both are required: the gate runs the
 	// S3 frontend only, and the process that runs the cluster nodes owns the
 	// transports underneath them.
-	Meta handlers.MetaClient
-	Blob handlers.BlobClient
+	Meta MetaClient
+	Blob BlobClient
 
 	// CredProv stands in for the credential chain New resolves from Auth and
 	// IAM. Test seam: production leaves it nil.
@@ -75,9 +140,11 @@ type Config struct {
 // handlerConfig is the slice of the config the handlers read.
 func (s3 *Config) handlerConfig() handlers.Config {
 	return handlers.Config{
-		Region:       s3.Region,
-		DataShards:   s3.RS.Data,
-		ParityShards: s3.RS.Parity,
-		Buckets:      s3.Buckets,
+		Region:         s3.Region,
+		DataShards:     s3.RS.Data,
+		ParityShards:   s3.RS.Parity,
+		DegradedWrites: s3.RS.DegradedWrites,
+		HintedHandoff:  s3.RS.HintedHandoff,
+		Buckets:        s3.Buckets,
 	}
 }

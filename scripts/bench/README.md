@@ -7,7 +7,8 @@ A minimal, manually-invoked harness for tracking predastore performance over tim
 - `bench-disk.sh` — raw-disk fio ceiling (run independently of predastore).
 - `bench-cluster.sh` — predastore cluster on loopback, driven by `warp mixed`.
 - `fio-jobs/` — four fio jobs covering predastore's predicted access patterns.
-- `e2e-stress.sh` — fault injection. Two scenarios, chosen by `STRESS_SCENARIO`.
+- `e2e-stress.sh` — fault injection and end-to-end correctness, one scenario per
+  `STRESS_SCENARIO`.
 - `partialput/` — a PUT client that declares a body length and then stops sending,
   used by the `partial-put` scenario. No S3 client can express this: they all
   either finish the body or abort, and both already work. `-rate` paces the send
@@ -51,6 +52,20 @@ not asserted: no ceiling has been agreed, and a threshold would only be a guess.
 
     make e2e-stress                                    # freeze
     make e2e-stress STRESS_SCENARIO=partial-put        # incomplete client
+    make e2e-stress STRESS_SCENARIO=last-modified      # object dates
+
+`last-modified` injects no fault. It asserts that HEAD, GET, ListObjectsV2 and
+ListParts all report when the object was written and all report the same thing,
+because they used to give three different answers: HEAD and GET dated everything
+`0001-01-01` and ListObjectsV2 answered the time of the listing, so a client that
+listed a bucket and then headed a key saw two dates decades apart and an
+incremental sync saw every object change on every pass.
+
+The date is the write epoch in the placement record, so it is asserted end to end
+rather than in a handler test: it has to survive being encoded into the record,
+committed through raft and decoded by a gate other than the one that wrote it,
+which is why every read in the scenario is taken from a second gate. Ten
+assertions, about 30 seconds, no fault injection and no tunables.
 
 Tunables: `STRESS_PARTIAL_HOLD` (how long the client stalls, default 180),
 `STRESS_PARTIAL_ABANDON` (the bound the gate must meet, default 90),

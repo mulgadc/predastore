@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -17,6 +18,8 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/gate/repair"
+	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
 const (
@@ -45,6 +48,10 @@ type Server struct {
 	// Handler dependencies, shared by the route table and the auth middleware.
 	handlerCfg handlers.Config
 	buckets    *handlers.BucketCache // config-defined buckets, plus those created since startup
+
+	// repairer is nil unless repair is enabled and this gate has local blob
+	// nodes to repair for.
+	repairer *repair.Service
 }
 
 var _ http.Handler = (*Server)(nil)
@@ -90,6 +97,15 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	handlerCfg := cfg.handlerConfig()
+
+	// One minter per gate process. Building it here rather than in
+	// handlerConfig matters: that method is also called to look a bucket up,
+	// and a second minter for the same node would reissue the same epochs.
+	minter, err := handlers.NewEpochMinter(cfg.NodeID)
+	if err != nil {
+		return nil, err
+	}
+	handlerCfg.Epochs = minter
 	s := &Server{
 		cfg:        cfg,
 		cert:       cert,
@@ -102,9 +118,41 @@ func New(cfg Config) (*Server, error) {
 		s.throttler = ratelimit.New(cfg.RateLimit)
 	}
 
+	ring := placement.NewRing(cfg.BlobNodeIDs)
+	if s.repairer, err = newRepairer(cfg, ring); err != nil {
+		return nil, err
+	}
+
 	s.setupMiddleware()
-	s.setupRoutes(placement.NewRing(cfg.BlobNodeIDs))
+	s.setupRoutes(ring)
 	return s, nil
+}
+
+// newRepairer builds the background sweep, or returns nil when there is nothing
+// for it to do. A gate with no colocated blob nodes is not a failure to
+// configure: it repairs for the nodes sharing its process, and a gate-only host
+// legitimately has none.
+func newRepairer(cfg Config, ring *placement.Ring) (*repair.Service, error) {
+	if !cfg.Repair.Enabled || len(cfg.LocalBlobNodeIDs) == 0 {
+		return nil, nil
+	}
+
+	svc, err := repair.New(repair.Config{
+		Nodes:        cfg.LocalBlobNodeIDs,
+		Ring:         ring,
+		Meta:         cfg.Meta,
+		Blob:         cfg.Blob,
+		DataShards:   cfg.RS.Data,
+		ParityShards: cfg.RS.Parity,
+		Workers:      cfg.Repair.Workers,
+		PageSize:     cfg.Repair.PageSize,
+		Interval:     cfg.Repair.Interval,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to build the repair sweep: %w", err)
+	}
+
+	return svc, nil
 }
 
 // ServeHTTP routes one S3 request through the middleware chain. Run serves
@@ -147,6 +195,29 @@ func alpnProtocols(enableHTTP2 bool) []string {
 // httpProtocols mirrors alpnProtocols for the server's own wiring. Both are
 // needed: Serve installs the h2 handler whenever TLSConfig mentions h2, so
 // leaving this unset would contradict the ALPN list above.
+// newHTTPServer builds the S3 listener's server.
+//
+// It sets no ReadTimeout or WriteTimeout deliberately. Both are whole-body
+// bounds by construction, so neither can express "the peer is still sending"
+// and either would cap an object at whatever transfers inside it — a 60s
+// WriteTimeout is a few gigabytes and no more. requestDeadlineMiddleware
+// applies the equivalent per request and releases it for object data, whose
+// bodies are bounded by progress instead.
+//
+// The bounds that remain are the ones on fixed-size work: the header
+// exchange, and an idle connection nobody is using.
+func newHTTPServer(addr string, handler http.Handler, tlsCfg *tls.Config, protocols *http.Protocols) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		TLSConfig:         tlsCfg,
+		Protocols:         protocols,
+		IdleTimeout:       120 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+}
+
 func httpProtocols(enableHTTP2 bool) *http.Protocols {
 	var p http.Protocols
 	p.SetHTTP1(true)
@@ -178,17 +249,7 @@ func (s *Server) Run(ctx context.Context) error {
 	protocols := httpProtocols(s.cfg.EnableHTTP2)
 
 	addr := net.JoinHostPort(s.cfg.Addr, strconv.Itoa(s.cfg.Port))
-	httpSrv := &http.Server{
-		Addr:              addr,
-		Handler:           s.router,
-		TLSConfig:         tlsCfg,
-		Protocols:         protocols,
-		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second,
-		MaxHeaderBytes:    1 << 20,
-	}
+	httpSrv := newHTTPServer(addr, s.router, tlsCfg, protocols)
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -212,6 +273,36 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		<-serveErr
 	}()
+
+	// The sweep is scoped to Run so no goroutine outlives it, and it is stopped
+	// before the listener drains: a rebuild in flight holds streams to peers
+	// that the drain would otherwise wait behind.
+	if s.repairer != nil {
+		unregister, err := telemetry.RegisterRepairGauges(func() telemetry.RepairSnapshot {
+			st := s.repairer.Stats()
+
+			return telemetry.RepairSnapshot{
+				Pending: st.Pending, Repaired: st.Repaired,
+				Failed: st.Failed, Passes: st.Passes,
+			}
+		})
+		if err != nil {
+			return fmt.Errorf("failed to register the repair gauges: %w", err)
+		}
+		defer func() { _ = unregister() }()
+
+		repairCtx, stopRepair := context.WithCancel(ctx)
+		var repairDone sync.WaitGroup
+		repairDone.Go(func() {
+			if err := s.repairer.Run(repairCtx); err != nil {
+				slog.Error("Repair sweep stopped", "error", err)
+			}
+		})
+		defer func() {
+			stopRepair()
+			repairDone.Wait()
+		}()
+	}
 
 	slog.Info("Starting S3 gate", "addr", addr, "http2", s.cfg.EnableHTTP2)
 

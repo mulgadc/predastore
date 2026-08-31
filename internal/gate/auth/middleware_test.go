@@ -42,9 +42,13 @@ var errNoCluster = errors.New("no cluster")
 
 type noMeta struct{}
 
-func (noMeta) Get(context.Context, string) ([]byte, error) { return nil, errNoCluster }
-func (noMeta) Put(context.Context, string, []byte) error   { return errNoCluster }
-func (noMeta) Delete(context.Context, string) error        { return errNoCluster }
+func (noMeta) Get(context.Context, string) ([]byte, error)          { return nil, errNoCluster }
+func (noMeta) Put(context.Context, string, []byte) error            { return errNoCluster }
+func (noMeta) PutMax(context.Context, string, []byte, uint64) error { return errNoCluster }
+func (noMeta) Delete(context.Context, string) error                 { return errNoCluster }
+func (noMeta) ScanFrom(context.Context, string, string, int) ([]meta.Item, error) {
+	return nil, errNoCluster
+}
 func (noMeta) Scan(context.Context, string, int) ([]meta.Item, error) {
 	return nil, errNoCluster
 }
@@ -63,6 +67,15 @@ func (noBlob) Delete(context.Context, config.NodeID, blob.DeleteRequest) (*blob.
 	return nil, errNoCluster
 }
 
+func (noBlob) Stat(context.Context, config.NodeID, blob.StatRequest) (*blob.StatResponse, error) {
+	return nil, errNoCluster
+}
+
+func (noBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) (bool, error) {
+	return false, errNoCluster
+}
+func (noBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error { return errNoCluster }
+
 // sessionGate builds a gate whose only bucket is config-defined and owned
 // by the session's account, so authorization is the only thing under test.
 func sessionGate(t *testing.T, p auth.CredentialProvider) http.Handler {
@@ -70,6 +83,7 @@ func sessionGate(t *testing.T, p auth.CredentialProvider) http.Handler {
 	cert, key, _ := testcerts.Generate(t)
 	s, err := gate.New(gate.Config{
 		Region: sessionRegion,
+		NodeID: 1,
 		Buckets: []handlers.BucketConfig{{
 			Name: "session-bucket", Region: sessionRegion,
 			Public: false, AccountID: auth.TestSessionAccount,

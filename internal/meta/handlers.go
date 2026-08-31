@@ -48,6 +48,14 @@ func (s *Server) handlePut(ctx context.Context, h MetaRequest, stream transport.
 	return respond(stream, s.writeResult(s.put(string(h.Key), value)))
 }
 
+func (s *Server) handlePutMax(ctx context.Context, h MetaRequest, stream transport.Stream) error {
+	value, err := io.ReadAll(stream)
+	if err != nil {
+		return fmt.Errorf("read put-max value: %w", err)
+	}
+	return respond(stream, s.writeResult(s.putMax(string(h.Key), value, h.Epoch)))
+}
+
 func (s *Server) handleDelete(ctx context.Context, h MetaRequest, stream transport.Stream) error {
 	return respond(stream, s.writeResult(s.delete(string(h.Key))))
 }
@@ -77,7 +85,7 @@ func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport
 	// surfacing an error to the client.
 	errScanLimit := errors.New("scan limit reached")
 	var items []ScanItem
-	err := s.scan(string(h.Key), func(key string, value []byte) error {
+	err := s.scan(string(h.Key), string(h.After), func(key string, value []byte) error {
 		if h.Limit > 0 && len(items) >= h.Limit {
 			return errScanLimit
 		}

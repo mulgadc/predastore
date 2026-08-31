@@ -1,14 +1,14 @@
 package handlers
 
 import (
-	"bytes"
 	"context"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
@@ -21,30 +21,91 @@ import (
 	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
-// ObjectToShardNodes maps an object to its shard locations.
+// ObjectToShardNodes maps an object to its shard locations. The node ids are
+// the record of where the shards physically went, not a cache of what the ring
+// would derive today: the read path dials these, so they are what survives a
+// ring whose tuning changed under them.
 type ObjectToShardNodes struct {
-	Object           [32]byte
-	Size             int64
+	Size       int64
+	WriteEpoch uint64
+	BlockSize  int64
+
+	// Timestamped reports whether WriteEpoch carries a time. Version 1 records
+	// hold a random epoch instead, so they have no modification time and never
+	// will.
+	Timestamped bool
+
 	DataShardNodes   []config.NodeID
 	ParityShardNodes []config.NodeID
+}
+
+// AllNodes returns the shard nodes in shard order: data first, then parity, so
+// index i in the result is the node holding shard i.
+func (p ObjectToShardNodes) AllNodes() []config.NodeID {
+	nodes := make([]config.NodeID, 0, len(p.DataShardNodes)+len(p.ParityShardNodes))
+	nodes = append(nodes, p.DataShardNodes...)
+
+	return append(nodes, p.ParityShardNodes...)
 }
 
 // shardWriteOutcome captures the result of writing a shard to a blob node.
 type shardWriteOutcome struct {
 	shardIndex   int
-	shardSize    int64
 	poolNearFull bool // mirrors PutResponse.PoolNearFull for this shard's node.
 	err          error
 }
 
-// bytesBufferWriter wraps a byte slice pointer for use as io.Writer.
-type bytesBufferWriter struct {
-	buf *[]byte
+// writeResult is what a write left on the cluster. It carries the landed set
+// rather than a count because commit, abort and the degraded signal each need
+// to know which positions, not how many: committing a shard that was never
+// prepared is noise, and aborting one is a request to discard something else's
+// work.
+type writeResult struct {
+	poolNearFull bool
+	landed       []bool
+
+	// holders is where shard i actually went — its placement node, or the
+	// handoff node when the owner would not take it. Commit and abort follow
+	// this rather than the record, because a shard handed off is not on the
+	// node the record names.
+	holders []config.NodeID
+
+	// missing names the owners whose shard landed nowhere at all, and handoff
+	// the positions that landed away from home. A position is in one or the
+	// other or neither, never both.
+	missing []config.NodeID
+	handoff []int
 }
 
-func (w *bytesBufferWriter) Write(p []byte) (n int, err error) {
-	*w.buf = append(*w.buf, p...)
-	return len(p), nil
+func (r writeResult) landedCount() int {
+	n := 0
+	for _, ok := range r.landed {
+		if ok {
+			n++
+		}
+	}
+
+	return n
+}
+
+// degraded reports whether the write went out at less than full width. The
+// object is durable either way; what is reduced is how many further losses it
+// survives until repair restores the missing shards.
+//
+// A shard that was handed off is not missing: the stripe is complete, just not
+// where the record says, and both the read path and repair look there.
+func (r writeResult) degraded() bool { return len(r.missing) > 0 }
+
+// fullWidth is the result of a write with no shards to place, which is an empty
+// object: nothing is missing because nothing was owed, and there is nothing on
+// any node to commit or abort.
+func fullWidth(total int) writeResult {
+	landed := make([]bool, total)
+	for i := range landed {
+		landed[i] = true
+	}
+
+	return writeResult{landed: landed}
 }
 
 // mapPutErr translates a shard-write error into the S3 error returned to the
@@ -91,15 +152,25 @@ func writeFailureReason(err error) string {
 // placeShards resolves where an object's shards live, in the ring order
 // writeObject writes them in. Recording the placement is what makes the
 // object retrievable, so the two must derive from the same object hash.
+// The epoch is minted here, once, before any shard is written, and the same
+// value goes to every shard and into the record. A retry mints a new one: two
+// attempts must never be mistaken for one complete write.
 func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int64) (ObjectToShardNodes, error) {
 	nodes, err := ring.Nodes(objectHash, cfg.TotalShards())
 	if err != nil {
 		return ObjectToShardNodes{}, err
 	}
 
+	epoch, err := cfg.Epochs.Next()
+	if err != nil {
+		return ObjectToShardNodes{}, err
+	}
+
 	return ObjectToShardNodes{
-		Object:           objectHash,
 		Size:             size,
+		WriteEpoch:       epoch,
+		Timestamped:      true,
+		BlockSize:        writeLayout(cfg.DataShards, size).blockSize,
 		DataShardNodes:   append([]config.NodeID(nil), nodes[:cfg.DataShards]...),
 		ParityShardNodes: append([]config.NodeID(nil), nodes[cfg.DataShards:]...),
 	}, nil
@@ -153,21 +224,25 @@ func recordShardOutcome(ctx context.Context, op string, node config.NodeID, star
 // than overrunning the shard; a short one is caught here, because placement
 // records size and a short value would read back as a corrupt object.
 func writeSingleShard(
-	ctx context.Context, bc BlobClient, node config.NodeID, body io.Reader, size int64, objectHash [32]byte,
-) (poolNearFull bool, err error) {
+	ctx context.Context, bc BlobClient, node config.NodeID, body io.Reader, size int64,
+	objectHash [32]byte, epoch uint64,
+) (_ writeResult, err error) {
 	start := time.Now()
 	defer func() { recordShardOutcome(ctx, telemetry.ShardOpWrite, node, start, err) }()
 
 	counted := &countingReader{r: body}
 
-	resp, err := bc.Put(ctx, node, blob.PutRequest{Key: objectHash, Size: size, Index: 0}, counted)
+	resp, err := bc.Put(ctx, node, blob.PutRequest{Key: objectHash, Size: size, Index: 0, Epoch: epoch}, counted)
 	if err != nil {
-		return false, err
+		return writeResult{landed: []bool{false}, missing: []config.NodeID{node}}, err
 	}
+	holders := []config.NodeID{node}
 	if counted.n != size {
-		return false, fmt.Errorf("body delivered %d bytes, declared %d", counted.n, size)
+		return writeResult{landed: []bool{true}, holders: holders},
+			fmt.Errorf("body delivered %d bytes, declared %d", counted.n, size)
 	}
-	return resp.PoolNearFull, nil
+
+	return writeResult{poolNearFull: resp.PoolNearFull, landed: []bool{true}, holders: holders}, nil
 }
 
 // writeObject splits body into RS shards and sends each to the appropriate
@@ -175,188 +250,422 @@ func writeSingleShard(
 // up front, and it is what placement records, so a body that does not deliver
 // exactly that many bytes is an error rather than a short object.
 // poolNearFull is set if any shard's target node reported pressure.
-//
-// The stream encoder is constructed per request; hoisting it into the gate
-// belongs with the streaming refactor, not here.
-func writeObject(ctx context.Context, bc BlobClient, ring *placement.Ring, cfg Config, body io.Reader, size int64, objectHash [32]byte) (poolNearFull bool, err error) {
+func writeObject(ctx context.Context, bc BlobClient, cfg Config, ring *placement.Ring, body io.Reader, size int64, objectHash [32]byte, place ObjectToShardNodes) (writeResult, error) {
 	// An empty object has no shard to write: the blob protocol rejects a
 	// zero-length value, and recorded placement is enough to serve the GET.
 	if size == 0 {
-		return false, nil
+		return fullWidth(cfg.TotalShards()), nil
 	}
 
-	// Use objectHash for hash ring placement for consistency with storage and retrieval
-	shardNodes, err := ring.Nodes(objectHash, cfg.TotalShards())
-	if err != nil {
-		return false, err
-	}
+	// The nodes come from the placement that will be published, not from a
+	// second ring lookup: the record is what the read path dials, so a write
+	// that derived its own list could put shards where nothing looks for them.
+	shardNodes := place.AllNodes()
+	epoch := place.WriteEpoch
 
 	// RS(1,0) is the whole object on one node: nothing to split and no parity
 	// to encode. Streaming it straight through is what keeps a single-node
 	// write off the heap, so it is its own path rather than a degenerate split.
 	if cfg.DataShards == 1 && cfg.ParityShards == 0 {
-		return writeSingleShard(ctx, bc, shardNodes[0], body, size, objectHash)
+		return writeSingleShard(ctx, bc, shardNodes[0], body, size, objectHash, epoch)
 	}
 
-	// Past the single-shard path every data shard is buffered whole before it
-	// is sent, so the payload is resident for the length of the write and
-	// concurrency multiplies it.
-	defer telemetry.EnterGateInflight(ctx, telemetry.GateOpPut, size)()
+	return streamShards(ctx, bc, cfg, objectHash, epoch, shardNodes, body,
+		newLayout(cfg.DataShards, size, place.BlockSize), size,
+		handoffNode(ring, cfg, objectHash))
+}
 
-	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
+// streamBlockSize is how much of each shard the gate holds at once. The whole
+// working set is TotalShards blocks of it, so it sets the memory a write costs
+// and nothing else does: the object itself is never resident.
+//
+// 4 MiB matches the encoder's own streaming block, which is where the
+// throughput of the underlying Encode was tuned.
+const streamBlockSize = 4 << 20
+
+// zeroPadding supplies the tail of the last stripe. Reed-Solomon needs every
+// shard the same length and an object rarely divides evenly into k of them, so
+// the shortfall is zeros the reader never asks for: placement records the real
+// size, and the read path stops there.
+type zeroPadding struct{}
+
+func (zeroPadding) Read(p []byte) (int, error) {
+	clear(p)
+
+	return len(p), nil
+}
+
+// streamShards encodes the body a stripe at a time and carries each shard to
+// its node as it is produced, so the gate holds TotalShards blocks rather than
+// the object.
+//
+// A shard whose node stops taking bytes does not fail the write. Its stream is
+// abandoned and the loop keeps going, which leaves that position undurable and
+// nothing else disturbed — the same missing shard degraded writes, handoff and
+// repair already deal with. Failing the encode instead is what the buffered
+// version had to avoid by holding every shard whole.
+func streamShards(
+	ctx context.Context, bc BlobClient, cfg Config,
+	objectHash [32]byte, epoch uint64, shardNodes []config.NodeID,
+	body io.Reader, lay layout, size int64, handoff config.NodeID,
+) (writeResult, error) {
+	total := cfg.TotalShards()
+	shardSize, blockSize := lay.shardSize, lay.blockSize
+
+	// What a write costs in memory is the working set, not the object: the
+	// stripe loop holds TotalShards blocks and the body streams through it.
+	defer telemetry.EnterGateInflight(ctx, telemetry.GateOpPut, int64(total)*blockSize)()
+
+	enc, err := reedsolomon.New(cfg.DataShards, cfg.ParityShards)
 	if err != nil {
-		return false, err
+		return writeResult{landed: make([]bool, total)}, err
 	}
 
-	// Calculate shard size
-	ds := int64(cfg.DataShards)
-	shardSize := int((size + ds - 1) / ds)
+	// Every shard is written, so the whole set is taken up front. The pipes the
+	// stripe is handed to are unbuffered, so a write returns only once its bytes
+	// have been read out of the block and the next stripe may overwrite it.
+	blocks := newBlockSet(total, blockSize)
+	defer blocks.release()
+	stripe := make([][]byte, total)
 
-	// Step 1: Split the body into data shard buffers (in memory)
-	// This allows us to both send to the blob nodes and use for parity encoding
-	dataShardBuffers := make([][]byte, cfg.DataShards)
-	dataWriters := make([]io.Writer, cfg.DataShards)
-	for i := 0; i < cfg.DataShards; i++ {
-		dataShardBuffers[i] = make([]byte, 0, shardSize)
-		dataWriters[i] = &bytesBufferWriter{buf: &dataShardBuffers[i]}
+	streams := make([]*shardStream, total)
+	for i := range total {
+		streams[i] = startShardStream(ctx, bc, objectHash, epoch, i, shardNodes[i], shardSize)
 	}
 
-	if splitErr := enc.Split(body, dataWriters, size); splitErr != nil {
-		return false, splitErr
-	}
+	// The body is padded so a short last stripe still encodes, and counted so a
+	// body that does not deliver what it declared is an error rather than an
+	// object with zeros on the end.
+	counted := &countingReader{r: body}
+	padded := io.MultiReader(counted, zeroPadding{})
 
-	// Step 2: Send data shards to their nodes
-	dataCh := make(chan shardWriteOutcome, cfg.DataShards)
-	var dataWG sync.WaitGroup
-
-	for i := 0; i < cfg.DataShards; i++ {
-		dataWG.Add(1)
-		go func(idx int, shardData []byte) {
-			defer dataWG.Done()
-
-			nodeNum := shardNodes[idx]
-
-			putReq := blob.PutRequest{
-				Key:   objectHash,
-				Size:  int64(len(shardData)),
-				Index: uint32(idx), //nolint:gosec // G115: idx bounded by DataShards (small uint).
+	result := writeResult{landed: make([]bool, total), holders: make([]config.NodeID, total)}
+	for offset := int64(0); offset < shardSize; offset += blockSize {
+		n := min(blockSize, shardSize-offset)
+		for i := range cfg.DataShards {
+			stripe[i] = blocks.at(i)[:n]
+			if _, readErr := io.ReadFull(padded, stripe[i]); readErr != nil {
+				closeStreams(streams)
+				return result, fmt.Errorf("read object body: %w", readErr)
 			}
+		}
+		for i := cfg.DataShards; i < total; i++ {
+			stripe[i] = blocks.at(i)[:n]
+		}
+		if encErr := enc.Encode(stripe); encErr != nil {
+			closeStreams(streams)
+			return result, fmt.Errorf("encode parity: %w", encErr)
+		}
 
-			start := time.Now()
-			resp, putErr := bc.Put(ctx, nodeNum, putReq, bytes.NewReader(shardData))
-			recordShardOutcome(ctx, telemetry.ShardOpWrite, nodeNum, start, putErr)
-			if putErr != nil {
-				slog.Error("writeObject: put failed", "node", nodeNum, "error", putErr)
-				dataCh <- shardWriteOutcome{shardIndex: idx, err: putErr}
-				return
-			}
+		refused := writeStripe(streams, stripe)
+		if offset == 0 {
+			handOff(ctx, bc, objectHash, epoch, streams, stripe, refused, handoff, shardSize)
+		}
+	}
 
-			dataCh <- shardWriteOutcome{shardIndex: idx, shardSize: resp.Size, poolNearFull: resp.PoolNearFull}
-		}(i, dataShardBuffers[i])
+	if counted.n != size {
+		closeStreams(streams)
+
+		return result, fmt.Errorf("body delivered %d bytes, declared %d", counted.n, size)
+	}
+
+	return collectStreams(ctx, cfg, streams, result)
+}
+
+// shardStream carries one shard to one node while the encoder is still
+// producing the rest of it. The pipe is unbuffered, so a write to it is a
+// write onto the wire, and the shards advance together rather than one
+// completing before the next begins.
+type shardStream struct {
+	index  int
+	owner  config.NodeID
+	holder config.NodeID
+	pw     *io.PipeWriter
+	done   chan shardWriteOutcome
+	failed bool
+}
+
+func startShardStream(
+	ctx context.Context, bc BlobClient, objectHash [32]byte, epoch uint64,
+	index int, node config.NodeID, shardSize int64,
+) *shardStream {
+	pr, pw := io.Pipe()
+	s := &shardStream{
+		index: index, owner: node, holder: node,
+		pw: pw, done: make(chan shardWriteOutcome, 1),
 	}
 
 	go func() {
-		dataWG.Wait()
-		close(dataCh)
+		resp, err := bc.Put(ctx, node, blob.PutRequest{
+			Key:   objectHash,
+			Size:  shardSize,
+			Index: uint32(index), //nolint:gosec // G115: index bounded by the shard count.
+			Epoch: epoch,
+		}, pr)
+		// Closing the read side is what releases a producer still writing into
+		// a stream whose node has gone: io.Pipe has no buffer and does not
+		// observe ctx, so without this the whole write hangs on one dead node.
+		_ = pr.CloseWithError(io.ErrClosedPipe)
+
+		if err != nil {
+			s.done <- shardWriteOutcome{shardIndex: index, err: err}
+
+			return
+		}
+		s.done <- shardWriteOutcome{shardIndex: index, poolNearFull: resp.PoolNearFull}
 	}()
+
+	return s
+}
+
+// write sends one block, reporting whether the stream is still alive. A stream
+// that has already failed is a no-op rather than an error: the position is
+// recorded once, and the encode carries on for the shards that remain.
+func (s *shardStream) write(p []byte) bool {
+	if s.failed {
+		return false
+	}
+	if _, err := s.pw.Write(p); err != nil {
+		s.failed = true
+		_ = s.pw.CloseWithError(err)
+
+		return false
+	}
+
+	return true
+}
+
+func (s *shardStream) abandon() {
+	if !s.failed {
+		s.failed = true
+		_ = s.pw.CloseWithError(io.ErrClosedPipe)
+	}
+}
+
+// writeStripe sends one block of every shard at once and names the positions
+// whose node would not take it. Concurrently, because each write blocks until
+// its node reads: in sequence, the slowest node would set the rate for all of
+// them and the shards would no longer advance together.
+func writeStripe(streams []*shardStream, stripe [][]byte) []int {
+	var (
+		mu      sync.Mutex
+		refused []int
+		wg      sync.WaitGroup
+	)
+	for i, s := range streams {
+		if s.failed {
+			continue
+		}
+		wg.Go(func() {
+			if s.write(stripe[i]) {
+				return
+			}
+			mu.Lock()
+			refused = append(refused, i)
+			mu.Unlock()
+		})
+	}
+	wg.Wait()
+
+	// Sorted so the handoff list and the log are in shard order rather than in
+	// whichever order the concurrent writes happened to fail.
+	slices.Sort(refused)
+
+	return refused
+}
+
+// handOff restarts the shards their owner refused against the one node off the
+// end of the stripe.
+//
+// It is only ever called for the first block, and that is the whole of what
+// makes it possible: nothing is buffered, so a shard can only be re-aimed
+// while none of it has been sent yet. A node that stops taking bytes part way
+// through leaves that position missing, for repair to restore — which is the
+// case handoff used to cover and now does not.
+func handOff(
+	ctx context.Context, bc BlobClient, objectHash [32]byte, epoch uint64,
+	streams []*shardStream, stripe [][]byte, refused []int,
+	handoff config.NodeID, shardSize int64,
+) {
+	if handoff == 0 {
+		return
+	}
+	for _, i := range refused {
+		if streams[i].owner == handoff {
+			continue
+		}
+		alt := startShardStream(ctx, bc, objectHash, epoch, i, handoff, shardSize)
+		alt.owner = streams[i].owner
+		if !alt.write(stripe[i]) {
+			<-alt.done
+			logShardWriteFailure(ctx, handoff, i, io.ErrClosedPipe)
+
+			continue
+		}
+
+		// The refused stream is already closed, so its outcome is waiting and
+		// has to be taken or the goroutine holding it never retires.
+		<-streams[i].done
+		streams[i] = alt
+		slog.InfoContext(ctx, "Shard handed off; its owner would not take it",
+			"owner", alt.owner, "holder", handoff, "index", i,
+			"epoch", fmt.Sprintf("%016x", epoch))
+	}
+}
+
+// closeStreams abandons every stream and waits for its put to retire, so a
+// write that gives up leaves no goroutine holding a pipe.
+func closeStreams(streams []*shardStream) {
+	for _, s := range streams {
+		s.abandon()
+		<-s.done
+	}
+}
+
+// collectStreams closes the live streams, waits for every put to report, and
+// assembles what the write left on the cluster.
+func collectStreams(ctx context.Context, cfg Config, streams []*shardStream, result writeResult) (writeResult, error) {
+	for _, s := range streams {
+		if !s.failed {
+			_ = s.pw.Close()
+		}
+	}
 
 	var firstErr error
-	for outcome := range dataCh {
-		if outcome.err != nil && firstErr == nil {
-			firstErr = outcome.err
+	for i, s := range streams {
+		result.holders[i] = s.holder
+		outcome := <-s.done
+		if outcome.err != nil {
+			if firstErr == nil {
+				firstErr = outcome.err
+			}
+			result.holders[i] = s.owner
+			result.missing = append(result.missing, s.owner)
+			logShardWriteFailure(ctx, s.holder, i, outcome.err)
+
+			continue
+		}
+		result.landed[i] = true
+		if s.holder != s.owner {
+			result.handoff = append(result.handoff, i)
 		}
 		if outcome.poolNearFull {
-			poolNearFull = true
-		}
-	}
-	if firstErr != nil {
-		return false, firstErr
-	}
-
-	// Step 3: Encode parity shards using the buffered data shards. Zero parity
-	// has nothing to encode, and the encoder would read every data shard back
-	// to produce nothing, so stop at the data shards.
-	if cfg.ParityShards == 0 {
-		return poolNearFull, nil
-	}
-
-	dataReaders := make([]io.Reader, cfg.DataShards)
-	for i := 0; i < cfg.DataShards; i++ {
-		dataReaders[i] = bytes.NewReader(dataShardBuffers[i])
-	}
-
-	parityWriters := make([]io.Writer, cfg.ParityShards)
-	parityPipeWriters := make([]*io.PipeWriter, cfg.ParityShards)
-	parityCh := make(chan shardWriteOutcome, cfg.ParityShards)
-	var parityWG sync.WaitGroup
-
-	for i := 0; i < cfg.ParityShards; i++ {
-		pr, pw := io.Pipe()
-		parityPipeWriters[i] = pw
-		parityWriters[i] = pw
-
-		parityIdx := cfg.DataShards + i
-		parityWG.Add(1)
-		go func(localParityIdx int, shardIdx int, r *io.PipeReader) {
-			defer parityWG.Done()
-			// enc.Encode runs on the caller's goroutine and writes into this
-			// pipe. Abandoning the read side on an early return would block it
-			// forever, and io.Pipe does not observe ctx.
-			defer func() { _ = r.Close() }()
-
-			nodeNum := shardNodes[shardIdx]
-
-			putReq := blob.PutRequest{
-				Key:   objectHash,
-				Size:  int64(shardSize),
-				Index: uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards + ParityShards (small uint).
-			}
-
-			start := time.Now()
-			resp, putErr := bc.Put(ctx, nodeNum, putReq, r)
-			recordShardOutcome(ctx, telemetry.ShardOpWrite, nodeNum, start, putErr)
-			if putErr != nil {
-				slog.Error("writeObject: put parity failed", "node", nodeNum, "error", putErr)
-				parityCh <- shardWriteOutcome{shardIndex: localParityIdx, err: putErr}
-				return
-			}
-
-			parityCh <- shardWriteOutcome{shardIndex: localParityIdx, shardSize: resp.Size, poolNearFull: resp.PoolNearFull}
-		}(i, parityIdx, pr)
-	}
-
-	encodeErr := enc.Encode(dataReaders, parityWriters)
-
-	for i := 0; i < cfg.ParityShards; i++ {
-		if encodeErr != nil {
-			_ = parityPipeWriters[i].CloseWithError(encodeErr)
-		} else {
-			_ = parityPipeWriters[i].Close()
+			result.poolNearFull = true
 		}
 	}
 
-	go func() {
-		parityWG.Wait()
-		close(parityCh)
-	}()
-
-	firstErr = nil
-	for outcome := range parityCh {
-		if outcome.err != nil && firstErr == nil {
-			firstErr = outcome.err
-		}
-		if outcome.poolNearFull {
-			poolNearFull = true
-		}
-	}
-	if encodeErr != nil && firstErr == nil {
-		firstErr = encodeErr
-	}
-	if firstErr != nil {
-		return false, firstErr
+	if landed := result.landedCount(); landed < cfg.MinShards() {
+		return result, fmt.Errorf("%w: %d of %d shards durable, nodes %v unreachable: %w",
+			errShardWriteFloor, landed, cfg.MinShards(), result.missing, firstErr)
 	}
 
-	return poolNearFull, nil
+	return result, nil
+}
+
+// handoffNode is the node one step off the end of the stripe on the ring: where
+// a shard goes when its owner will not take it. It is derived and never
+// recorded, which is what lets the read path and repair find it later without a
+// hint to store. Zero means there is none — handoff is off, or the cluster has
+// no node to spare.
+func handoffNode(ring *placement.Ring, cfg Config, objectHash [32]byte) config.NodeID {
+	if !cfg.HintedHandoff || ring == nil {
+		return 0
+	}
+	nodes, err := ring.Nodes(objectHash, cfg.TotalShards()+1)
+	if err != nil || len(nodes) <= cfg.TotalShards() {
+		return 0
+	}
+
+	return nodes[cfg.TotalShards()]
+}
+
+// errShardWriteFloor reports a write that could not place enough shards to be
+// acknowledged, as distinct from one that placed enough but not all.
+var errShardWriteFloor = errors.New("too few shards durable")
+
+// logShardWriteFailure reports one shard a write could not place, sampled per
+// node and reason for the same reason a read failure is: a node down makes
+// every write degraded, so an unsampled line floods exactly when the logs are
+// being read.
+func logShardWriteFailure(ctx context.Context, node config.NodeID, index int, err error) {
+	reason := shardErrorReason(err)
+	telemetry.RecordShardError(ctx, "write", reason, uint64(node))
+	if !shardLogSampler.allow(node, reason) {
+		return
+	}
+	slog.WarnContext(ctx, "Shard write failed; the stripe is short one holder",
+		"node", node, "index", index, "reason", reason, "err", err)
+}
+
+// commitShards publishes every prepared shard before the placement record
+// naming the epoch lands in global state. A superseded epoch is reported so
+// its writer cannot publish a record that no shard can satisfy.
+//
+// Non-supersession failures remain recoverable by a reader or repair, but an
+// epoch mismatch means another write has won the shard and this writer must
+// not publish its placement.
+// commitShards publishes every prepared shard and reports how many were
+// overtaken by a newer generation.
+//
+// Being overtaken is not a failure and does not fail the write. Concurrent
+// writers of one key have no defined winner, the epoch decides it, and the
+// loser is still owed an acknowledgement — the object it wrote existed and was
+// durable, and a newer one replaced it. That is last-write-wins, and the count
+// is returned so it can be logged rather than acted on.
+func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written writeResult) (superseded int) {
+	var lost atomic.Int64
+	forEachShard(written, func(index int, node config.NodeID) {
+		overtaken, err := bc.Commit(ctx, node, blob.CommitRequest{
+			Key:   objectHash,
+			Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
+			Epoch: place.WriteEpoch,
+		})
+		switch {
+		case err != nil:
+			slog.WarnContext(ctx, "Shard commit failed",
+				"node", node, "index", index,
+				"epoch", fmt.Sprintf("%016x", place.WriteEpoch), "err", err)
+		case overtaken:
+			lost.Add(1)
+		}
+	})
+	return int(lost.Load())
+}
+
+// abortShards discards shards prepared for a write that will not be published,
+// releasing their space now rather than leaving the nodes to age them out.
+// Nothing references them either way, so a failure is logged and not returned.
+func abortShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written writeResult) {
+	forEachShard(written, func(index int, node config.NodeID) {
+		err := bc.Abort(ctx, node, blob.CommitRequest{
+			Key:   objectHash,
+			Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
+			Epoch: place.WriteEpoch,
+		})
+		if err != nil {
+			slog.WarnContext(ctx, "Shard abort failed; the node will age the prepared extent out",
+				"node", node, "index", index,
+				"epoch", fmt.Sprintf("%016x", place.WriteEpoch), "err", err)
+		}
+	})
+}
+
+// forEachShard runs fn concurrently against every shard position that landed,
+// at the node it actually landed on, and waits.
+//
+// A position whose put never succeeded has nothing prepared anywhere, so
+// committing it would be told so and aborting it would ask a node to discard
+// whatever generation it does hold. A position that was handed off is prepared
+// on the holder and nowhere else, so both have to be addressed there.
+func forEachShard(written writeResult, fn func(index int, node config.NodeID)) {
+	var wg sync.WaitGroup
+	for i, node := range written.holders {
+		if i < len(written.landed) && !written.landed[i] {
+			continue
+		}
+		wg.Go(func() { fn(i, node) })
+	}
+	wg.Wait()
 }
 
 // loadPlacement retrieves shard location metadata for an object.
@@ -373,11 +682,8 @@ func loadPlacement(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg
 		return ObjectToShardNodes{}, 0, err
 	}
 
-	var objectToShardNodes ObjectToShardNodes
-	r := bytes.NewReader(data)
-	dec := gob.NewDecoder(r)
-
-	if err := dec.Decode(&objectToShardNodes); err != nil {
+	objectToShardNodes, err := DecodePlacement(data)
+	if err != nil {
 		return ObjectToShardNodes{}, 0, err
 	}
 
@@ -388,223 +694,141 @@ func loadPlacement(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg
 	return objectToShardNodes, objectToShardNodes.Size, nil
 }
 
-// readShard fetches one shard whole and buffers it. The data is read into
-// memory before the stream is closed, so the caller never reads from a closed
-// connection.
-func readShard(ctx context.Context, bc BlobClient, objectHash [32]byte, node config.NodeID, index int) (data []byte, err error) {
-	start := time.Now()
-	defer func() { recordShardOutcome(ctx, telemetry.ShardOpRead, node, start, err) }()
-
-	reader, err := bc.Get(ctx, node, blob.GetRequest{
-		Key:        objectHash,
-		RangeStart: -1, // -1 means full shard (no range)
-		RangeEnd:   -1,
-		Index:      uint32(index), //nolint:gosec // G115: index bounded by shard count (small uint).
-	})
-	if err != nil {
-		return nil, err
-	}
-	data, err = io.ReadAll(reader)
-	if closeErr := reader.Close(); closeErr != nil {
-		slog.DebugContext(ctx, "Failed to close shard stream reader", "node", node, "error", closeErr)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return data, nil
+// recordShardReadError counts a failed shard read under a bounded reason. The
+// error text names a node and a key, so only the classification is recorded:
+// a node that answered without the shard, or anything else.
+func recordShardReadError(ctx context.Context, node config.NodeID, err error) {
+	telemetry.RecordShardError(ctx, "read", shardErrorReason(err), uint64(node))
 }
 
-// shardBytes reads an object's shards, concurrently, tolerantly and hedged.
-//
-// Concurrently, because reading them one after another makes an object's read
-// latency the sum of its shards rather than the slowest of them, so one slow
-// node stalls every read that touches it.
-//
-// Tolerantly, because a shard that cannot be read is exactly what the parity
-// exists for. A failed shard leaves a nil entry for the caller to reconstruct
-// from; an error is returned only when too few shards survive for any
-// reconstruction to be possible.
-//
-// Hedged, because the read is complete once enough shards have arrived, and
-// waiting for the rest hands a stalled node the power to set every reader's
-// latency. The data shards go first, so a healthy read never fetches a parity
-// shard it does not need; the parity shards follow only if the data shards have
-// not all landed shortly after, or one of them has already failed.
-func shardBytes(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes) ([][]byte, error) {
-	need := len(place.DataShardNodes)
-	shards := make([][]byte, need+len(place.ParityShardNodes))
-	if need == 0 {
-		return shards, nil
+// shardErrorReason classifies a failed shard read into one of the bounded
+// metric reasons. stale_epoch is the one worth separating: absent and
+// transport say a node is down, which is visible everywhere else, while a
+// stale epoch is a node that is up, answering and wrong.
+func shardErrorReason(err error) string {
+	switch {
+	case errors.Is(err, blob.ErrEpochMismatch):
+		return telemetry.ShardReasonStaleEpoch
+	case errors.Is(err, blob.ErrNotFound):
+		return telemetry.ShardReasonNotFound
+	default:
+		return telemetry.ShardReasonTransport
 	}
-
-	// Cancelled on return, which abandons whatever is still outstanding: a
-	// shard that arrives after the object has been served is wasted work.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	var mu sync.Mutex
-	available := 0
-	enough := make(chan struct{})
-	dataFailed := make(chan struct{})
-	var enoughOnce, failedOnce sync.Once
-
-	read := func(index int, node config.NodeID) {
-		shardCtx, shardCancel := context.WithTimeout(ctx, shardReadTimeout)
-		defer shardCancel()
-
-		start := time.Now()
-		data, err := readShard(shardCtx, bc, objectHash, node, index)
-		if err != nil {
-			slog.WarnContext(ctx, "Shard read failed, falling back to parity",
-				"node", node, "index", index, "err", err,
-				"duration_ms", time.Since(start).Milliseconds())
-			if index < need {
-				failedOnce.Do(func() { close(dataFailed) })
-			}
-			return
-		}
-		if elapsed := time.Since(start); elapsed >= slowShardThreshold {
-			slog.WarnContext(ctx, "Shard read slow",
-				"node", node, "index", index, "duration_ms", elapsed.Milliseconds())
-		}
-
-		mu.Lock()
-		defer mu.Unlock()
-		// Indices are distinct, but the lock still guards the slice itself: the
-		// caller snapshots it once enough shards land, while slower reads are
-		// still outstanding and may yet write their own entry.
-		shards[index] = data
-		available++
-		if available >= need {
-			enoughOnce.Do(func() { close(enough) })
-		}
-	}
-
-	// Every goroutine is registered before anything waits on them, so the
-	// parity reads wait for their cue rather than being started later.
-	var wg sync.WaitGroup
-	for i, node := range place.DataShardNodes {
-		wg.Go(func() { read(i, node) })
-	}
-	for i, node := range place.ParityShardNodes {
-		wg.Go(func() {
-			hedge := time.NewTimer(hedgeDelay)
-			defer hedge.Stop()
-			select {
-			case <-enough:
-				return // the data shards were enough on their own
-			case <-ctx.Done():
-				return
-			case <-dataFailed:
-			case <-hedge.C:
-			}
-			select {
-			case <-enough:
-				return
-			default:
-			}
-			read(need+i, node)
-		})
-	}
-
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-enough:
-	case <-done:
-	}
-
-	// The hedge returns as soon as enough shards have landed, so the slower
-	// reads are still running. Hand back a snapshot: a straggler writing its
-	// entry must not mutate the slice the caller is reconstructing from.
-	mu.Lock()
-	defer mu.Unlock()
-	snapshot := make([][]byte, len(shards))
-	copy(snapshot, shards)
-	if available < need {
-		return snapshot, fmt.Errorf("%w: %d of %d shards available",
-			errInsufficientShards, available, need)
-	}
-	return snapshot, nil
 }
 
-// slowShardThreshold is the point past which a shard read is worth naming its
-// node for. A degrading node should be visible before it takes something down.
-const slowShardThreshold = 2 * time.Second
+// shardFailure records one shard the read could not use, and why. It is what
+// makes a degraded read say which node was at fault rather than only that one
+// was.
+type shardFailure struct {
+	index  int
+	node   config.NodeID
+	reason string
+}
 
-// shardReadTimeout caps a single shard read regardless of how much budget the
-// caller had. A node that accepts a stream and never answers otherwise spends
-// the whole request on itself, and a generous caller is punished hardest.
-const shardReadTimeout = 5 * time.Second
+// logShardFailure reports one unusable shard, sampled per node and reason. A
+// node stale for the whole keyspace makes every read degraded, so an unsampled
+// line is a flood at exactly the moment the logs are being read; the counter in
+// recordShardReadError is the unbounded-safe record of volume.
+func logShardFailure(ctx context.Context, node config.NodeID, index int, err error, took time.Duration) {
+	reason := shardErrorReason(err)
+	if !shardLogSampler.allow(node, reason) {
+		return
+	}
+	slog.InfoContext(ctx, "Shard unusable, falling back to parity",
+		"node", node, "index", index, "reason", reason, "err", err,
+		"duration_ms", took.Milliseconds())
+}
 
-// hedgeDelay is how long the data shards get before the parity shards are
-// fetched as well. Comfortably above a healthy shard read, and far below
-// anything a client would notice.
+// shardLogSampler admits one line per (node, reason) per second.
+var shardLogSampler = &sampler{interval: time.Second, last: map[string]time.Time{}}
+
+type sampler struct {
+	interval time.Duration
+	mu       sync.Mutex
+	last     map[string]time.Time
+}
+
+func (s *sampler) allow(node config.NodeID, reason string) bool {
+	key := fmt.Sprintf("%d/%s", node, reason)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	if at, ok := s.last[key]; ok && now.Sub(at) < s.interval {
+		return false
+	}
+	s.last[key] = now
+
+	return true
+}
+
+// reportDegradedRead records a read that had to be reconstructed. The read
+// itself succeeded and returned the correct bytes: a degraded stripe is ours to
+// fix and never a reason to fail a client's request.
+func reportDegradedRead(ctx context.Context, bucket, key string, failures []shardFailure, reconstructed int, took time.Duration) {
+	if len(failures) == 0 {
+		return
+	}
+
+	reasons := make([]string, 0, len(failures))
+	nodes := make([]config.NodeID, 0, len(failures))
+	for _, f := range failures {
+		if !slices.Contains(reasons, f.reason) {
+			reasons = append(reasons, f.reason)
+		}
+		if !slices.Contains(nodes, f.node) {
+			nodes = append(nodes, f.node)
+		}
+	}
+
+	slog.InfoContext(ctx, "Served degraded read",
+		"bucket", bucket, "key", key,
+		"reconstructed", reconstructed, "reasons", reasons, "nodes", nodes,
+		"read_ms", took.Milliseconds())
+}
+
+// slowShardFloor is the delivered rate below which a shard read is worth naming
+// its node for. A degrading node should be visible before it takes something
+// down, and a rate says that where an absolute duration cannot: two seconds is
+// healthy for a large block and hopeless for a small one.
+const slowShardFloor = 8 << 20 // bytes per second
+
+// hedgeProbeInterval is how often the stripe loop asks whether a shard is still
+// delivering. Fine enough that a stall is caught well inside the delay, coarse
+// enough to cost nothing on a healthy read.
+const hedgeProbeInterval = 25 * time.Millisecond
+
+// shardStallWindow is how long a shard that was delivering may deliver nothing
+// before parity replaces it. Well below the blob client's own idle timeout,
+// which aborts the transfer rather than routing around it.
+const shardStallWindow = time.Second
+
+// shardOpenTimeout caps the request and response envelope of a shard read.
+// Those are small and fixed, so a total bound is the right one for them: a
+// node that accepts a stream and never answers otherwise spends the whole
+// request on itself, and a generous caller is punished hardest.
+//
+// It deliberately does not cover the body. The shard that follows is bounded
+// by progress instead, which is the only bound that a 16 GiB shard and a
+// stalled node can both be measured against.
+const shardOpenTimeout = 5 * time.Second
+
+// hedgeDelay is how long a shard gets to produce its first byte, measured from
+// the moment a peer answered, before parity is fetched in its place. It bounds
+// only silence: a shard delivering steadily is never hedged, whatever it is
+// delivering at.
 const hedgeDelay = 250 * time.Millisecond
 
-// errInsufficientShards reports that too few shards survived to rebuild the
-// object, as distinct from some shards being missing but recoverable.
-var errInsufficientShards = errors.New("insufficient shards to reconstruct")
-
-// shardReadersOf turns shard bytes into readers, leaving a nil for every
-// shard that could not be read so the encoder knows to rebuild it.
-func shardReadersOf(shards [][]byte) []io.Reader {
-	readers := make([]io.Reader, len(shards))
-	for i, s := range shards {
-		if s != nil {
-			readers[i] = bytes.NewReader(s)
-		}
-	}
-	return readers
-}
-
-// missingShards counts the first n shards the read could not fill.
-func missingShards(shards [][]byte, n int) int {
-	missing := 0
-	for i := 0; i < n && i < len(shards); i++ {
-		if shards[i] == nil {
-			missing++
-		}
-	}
-	return missing
-}
-
-// reconstructObject rebuilds an object from its parity shards.
+// shardConvictionWindow is how long a shard may deliver nothing before it is
+// treated as gone rather than slow. Past it, replacing the shard may spend the
+// parity unit the hedge reserve holds back, which is the right call: the
+// reserve exists for a genuine failure and this has become one.
 //
-// Recovered shards are held in memory. They used to be written to temp files
-// named only for the object hash and shard index, so two concurrent reads of
-// one object wrote and deleted the same paths underneath each other. Keeping
-// them in memory also removes a second read of every shard, since the encoder
-// consumes the readers it is given.
-func reconstructObject(enc reedsolomon.StreamEncoder, shards [][]byte, size int64) (*bytes.Buffer, error) {
-	recovered := make([]*bytes.Buffer, len(shards))
-	writers := make([]io.Writer, len(shards))
-	for i := range shards {
-		if shards[i] == nil {
-			recovered[i] = &bytes.Buffer{}
-			writers[i] = recovered[i]
-		}
-	}
-
-	if err := enc.Reconstruct(shardReadersOf(shards), writers); err != nil {
-		return nil, fmt.Errorf("reconstruction failed: %w", err)
-	}
-	for i := range shards {
-		if shards[i] == nil && recovered[i] != nil {
-			shards[i] = recovered[i].Bytes()
-		}
-	}
-
-	var out bytes.Buffer
-	if err := enc.Join(&out, shardReadersOf(shards), size); err != nil {
-		return nil, fmt.Errorf("join after reconstruction failed: %w", err)
-	}
-	return &out, nil
-}
+// The same 5s as shardOpenTimeout, for the same reason. Without it a stalled
+// shard falls to the blob client's 30s idle timeout, which is a correct read
+// and far too slow a one.
+const shardConvictionWindow = 5 * time.Second
 
 // deleteObject sends DELETE requests to all shard nodes.
 func deleteObject(ctx context.Context, bc BlobClient, bucket, key string, objectHash [32]byte, place ObjectToShardNodes) error {

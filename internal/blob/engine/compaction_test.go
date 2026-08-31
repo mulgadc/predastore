@@ -37,7 +37,8 @@ func openStore(t *testing.T, opts ...engine.Option) (*engine.Store, string) {
 
 func write(t *testing.T, st *engine.Store, oh [32]byte, idx uint32, body []byte) {
 	t.Helper()
-	w, err := st.Append(oh, idx, int64(len(body)))
+	epoch := storetest.NextEpoch()
+	w, err := st.Append(oh, idx, int64(len(body)), epoch)
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -46,6 +47,9 @@ func write(t *testing.T, st *engine.Store, oh [32]byte, idx uint32, body []byte)
 	}
 	if err := w.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
+	}
+	if _, err := st.Commit(oh, idx, epoch); err != nil {
+		t.Fatalf("commit: %v", err)
 	}
 }
 

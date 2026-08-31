@@ -16,8 +16,20 @@ import (
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
-// ErrNotFound is returned by gets when the node does not hold the value.
-var ErrNotFound = errors.New("not found")
+var (
+	// ErrNotFound is returned by gets when the node does not hold the value.
+	ErrNotFound = errors.New("not found")
+
+	// ErrEpochMismatch is returned by gets when the node holds the shard under
+	// a different write epoch. It is deliberately not ErrNotFound: the node is
+	// up and answering, which is a different operational problem and the only
+	// one repair is responsible for clearing.
+	ErrEpochMismatch = errors.New("shard held under a different write epoch")
+
+	// ErrNotPrepared is returned by commits when the node has nothing prepared
+	// under that epoch. The answer is to rewrite the shard, not to retry.
+	ErrNotPrepared = errors.New("no prepared shard under that epoch")
+)
 
 // PutRequest identifies the value a put commits. The bytes travel separately,
 // as the body reader passed alongside it.
@@ -26,14 +38,19 @@ type PutRequest struct {
 	Index uint32
 	// Size is the number of body bytes to commit.
 	Size int64
+	// Epoch names the object generation this shard belongs to. Mandatory:
+	// zero is reserved as invalid and the node refuses it.
+	Epoch uint64
 }
 
-// PutResponse reports what a node committed.
+// PutResponse reports what a node prepared.
 type PutResponse struct {
 	Size int64
-	// PoolNearFull reports nearfull free-space pressure at commit time, so
+	// PoolNearFull reports nearfull free-space pressure at prepare time, so
 	// callers can back off before writes are rejected outright.
 	PoolNearFull bool
+	// Epoch echoes the generation the shard was prepared under.
+	Epoch uint64
 }
 
 // GetRequest identifies the value a get reads.
@@ -44,12 +61,35 @@ type GetRequest struct {
 	// reads the whole value.
 	RangeStart int64
 	RangeEnd   int64
+	// Epoch is the generation the caller will accept. Zero reads whatever the
+	// node holds, which only a caller with no placement record should do.
+	Epoch uint64
 }
 
 // DeleteRequest identifies the value a delete removes.
 type DeleteRequest struct {
 	Key   [32]byte
 	Index uint32
+}
+
+// CommitRequest publishes, or discards, a shard prepared by an earlier put.
+type CommitRequest struct {
+	Key   [32]byte
+	Index uint32
+	Epoch uint64
+}
+
+// StatRequest asks which generation of a shard a node holds. It names no epoch
+// because the answer is the epoch.
+type StatRequest struct {
+	Key   [32]byte
+	Index uint32
+}
+
+// StatResponse is what the node holds at that position.
+type StatResponse struct {
+	Epoch uint64
+	Size  int64
 }
 
 // DeleteResponse reports whether the node held the value.
@@ -185,6 +225,7 @@ func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, 
 		Key:        req.Key,
 		Index:      req.Index,
 		Size:       req.Size,
+		Epoch:      req.Epoch,
 		RangeStart: -1,
 		RangeEnd:   -1,
 	})
@@ -227,7 +268,7 @@ func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, 
 	default:
 		return nil, fmt.Errorf("put to node %d: %s", nodeID, resp.Err)
 	}
-	return &PutResponse{Size: resp.Size, PoolNearFull: resp.PoolNearFull}, nil
+	return &PutResponse{Size: resp.Size, PoolNearFull: resp.PoolNearFull, Epoch: resp.Epoch}, nil
 }
 
 // Delete marks a value deleted on the node.
@@ -256,6 +297,96 @@ func (c *Client) Delete(ctx context.Context, nodeID config.NodeID, req DeleteReq
 	return &DeleteResponse{Deleted: resp.Deleted}, nil
 }
 
+// Stat reports which generation of a shard the node holds, and how large it
+// is, without moving the body. Repair asks it of every position it owns, so a
+// get would move the whole store across the network to learn one number.
+//
+// ErrNotFound is an answer, not a failure: a node that holds nothing for a
+// position is exactly what repair is looking for.
+func (c *Client) Stat(ctx context.Context, nodeID config.NodeID, req StatRequest) (*StatResponse, error) {
+	stream, err := c.openBounded(ctx, nodeID, OpStat, &Request{
+		Key:        req.Key,
+		Index:      req.Index,
+		RangeStart: -1,
+		RangeEnd:   -1,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := stream.Close(); err != nil {
+		abortStream(stream)
+
+		return nil, fmt.Errorf("half-close stat stream: %w", err)
+	}
+	resp, err := c.awaitEnvelope(ctx, stream, bufio.NewReader(stream))
+	if err != nil {
+		stream.CancelRead(0)
+
+		return nil, fmt.Errorf("stat on node %d: %w", nodeID, err)
+	}
+	switch resp.Err {
+	case "":
+		return &StatResponse{Epoch: resp.Epoch, Size: resp.Size}, nil
+	case ErrCodeNotFound:
+		return nil, fmt.Errorf("stat on node %d: %w", nodeID, ErrNotFound)
+	default:
+		return nil, fmt.Errorf("stat on node %d: %s", nodeID, resp.Err)
+	}
+}
+
+// Commit publishes a shard the node prepared under the same epoch. It is
+// idempotent: a commit of a shard already published reports success, so the
+// caller may drive it again after a crash without distinguishing the cases.
+// Commit publishes a prepared shard. The bool reports that a newer generation
+// had already taken the position, so this commit published nothing — a lost
+// race, not a failure.
+func (c *Client) Commit(ctx context.Context, nodeID config.NodeID, req CommitRequest) (bool, error) {
+	resp, err := c.finish(ctx, nodeID, OpCommit, "commit", req)
+	if err != nil {
+		return false, err
+	}
+	return resp.Superseded, nil
+}
+
+// Abort discards a shard prepared under the same epoch, releasing its space
+// without waiting for the node to age it out. Aborting nothing is success.
+func (c *Client) Abort(ctx context.Context, nodeID config.NodeID, req CommitRequest) error {
+	_, err := c.finish(ctx, nodeID, OpAbort, "abort", req)
+	return err
+}
+
+// finish runs the bodyless second half of a write: open, half-close, read the
+// envelope. Commit and Abort differ only in the opcode they send.
+func (c *Client) finish(ctx context.Context, nodeID config.NodeID, op rpc.Opcode, name string, req CommitRequest) (*Response, error) {
+	stream, err := c.openBounded(ctx, nodeID, op, &Request{
+		Key:        req.Key,
+		Index:      req.Index,
+		Epoch:      req.Epoch,
+		RangeStart: -1,
+		RangeEnd:   -1,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := stream.Close(); err != nil {
+		abortStream(stream)
+		return nil, fmt.Errorf("half-close %s stream: %w", name, err)
+	}
+	resp, err := c.awaitEnvelope(ctx, stream, bufio.NewReader(stream))
+	if err != nil {
+		stream.CancelRead(0)
+		return nil, fmt.Errorf("%s on node %d: %w", name, nodeID, err)
+	}
+	switch resp.Err {
+	case "":
+		return resp, nil
+	case ErrCodeNotPrepared:
+		return nil, fmt.Errorf("%s on node %d: %w", name, nodeID, ErrNotPrepared)
+	default:
+		return nil, fmt.Errorf("%s on node %d: %s", name, nodeID, resp.Err)
+	}
+}
+
 // Get streams a value from the node: the whole of it, or the byte range the
 // request bounds. The caller must Close the returned reader to release the
 // stream.
@@ -263,6 +394,7 @@ func (c *Client) Get(ctx context.Context, nodeID config.NodeID, req GetRequest) 
 	stream, err := c.openBounded(ctx, nodeID, OpGet, &Request{
 		Key:        req.Key,
 		Index:      req.Index,
+		Epoch:      req.Epoch,
 		RangeStart: req.RangeStart,
 		RangeEnd:   req.RangeEnd,
 	})
@@ -286,6 +418,12 @@ func (c *Client) Get(ctx context.Context, nodeID config.NodeID, req GetRequest) 
 	case ErrCodeNotFound:
 		stream.CancelRead(0)
 		return nil, fmt.Errorf("get from node %d: %w", nodeID, ErrNotFound)
+	case ErrCodeEpochMismatch:
+		stream.CancelRead(0)
+		// Naming both epochs is what makes a stale node identifiable in a log
+		// rather than merely reported as wrong.
+		return nil, fmt.Errorf("get from node %d: want epoch %016x, node holds %016x: %w",
+			nodeID, req.Epoch, resp.Epoch, ErrEpochMismatch)
 	default:
 		stream.CancelRead(0)
 		return nil, fmt.Errorf("get from node %d: %s", nodeID, resp.Err)

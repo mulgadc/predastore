@@ -63,17 +63,14 @@ func TestReadObjectSurvivesOneNodeDown(t *testing.T) {
 
 			ctx := context.Background()
 			objectHash := model.ObjectHash("b", "k")
-			_, err := writeObject(ctx, f.bc, f.ring, f.cfg, bytes.NewReader(want), int64(len(want)), objectHash)
-			require.NoError(t, err)
-
-			place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(want)))
+			place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), int64(len(want)))
 			require.NoError(t, err)
 
 			// Take down whichever node holds the first data shard, so the
 			// loss is on the path a read uses rather than a spare.
 			broken := &downBlob{fakeBlob: f.bc, down: place.DataShardNodes[0]}
 
-			got, err := readObject(ctx, broken, f.cfg, "b", "k", place, place.Size)
+			got, _, err := readObject(ctx, broken, f.cfg, "b", "k", place, place.Size, 0)
 			require.NoError(t, err, "an object must still read with one node down")
 			assert.Equal(t, want, got, "the reconstructed object must be byte-identical")
 			assert.Positive(t, broken.touched.Load(), "the down node should have been tried")
@@ -91,17 +88,14 @@ func TestReadObjectFailsBeyondParity(t *testing.T) {
 
 	ctx := context.Background()
 	objectHash := model.ObjectHash("b", "k")
-	_, err := writeObject(ctx, f.bc, f.ring, f.cfg, bytes.NewReader(want), int64(len(want)), objectHash)
-	require.NoError(t, err)
-
-	place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(want)))
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), int64(len(want)))
 	require.NoError(t, err)
 
 	// RS(2,1) survives one loss; two is past what the parity covers.
 	broken := &downBlob{fakeBlob: f.bc, down: place.DataShardNodes[0]}
 	worse := &twoDownBlob{downBlob: broken, alsoDown: place.DataShardNodes[1]}
 
-	_, err = readObject(ctx, worse, f.cfg, "b", "k", place, place.Size)
+	_, _, err = readObject(ctx, worse, f.cfg, "b", "k", place, place.Size, 0)
 	require.Error(t, err, "losing more than the parity covers must fail loudly")
 }
 
@@ -125,46 +119,80 @@ var _ BlobClient = (*twoDownBlob)(nil)
 func TestReadObjectReadsShardsConcurrently(t *testing.T) {
 	t.Parallel()
 
-	const delay = 300 * time.Millisecond
 	f := newWriteFixture(3, 2)
 	want := randomBytes(t, 1<<16)
 
 	ctx := context.Background()
 	objectHash := model.ObjectHash("b", "k")
-	_, err := writeObject(ctx, f.bc, f.ring, f.cfg, bytes.NewReader(want), int64(len(want)), objectHash)
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), int64(len(want)))
 	require.NoError(t, err)
 
-	place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(want)))
-	require.NoError(t, err)
-
-	slow := &slowBlob{fakeBlob: f.bc, delay: delay}
-	start := time.Now()
-	got, err := readObject(ctx, slow, f.cfg, "b", "k", place, place.Size)
-	elapsed := time.Since(start)
+	// Held rather than delayed: no open returns until every one of them has
+	// arrived, so a sequential read cannot get past the first shard and the
+	// concurrency is proved rather than inferred from a stopwatch.
+	slow := newHeldBlob(f.bc, f.cfg.DataShards)
+	got, _, err := readObject(ctx, slow, f.cfg, "b", "k", place, place.Size, 0)
 
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
-	assert.Lessf(t, elapsed, time.Duration(f.cfg.DataShards)*delay,
-		"reading %d shards took %v, which is sequential", f.cfg.DataShards, elapsed)
+	assert.Truef(t, slow.met(), "only %d of %d shard opens were ever in flight at once",
+		slow.peak(), f.cfg.DataShards)
 }
 
-// slowBlob answers every read, but only after a delay.
-type slowBlob struct {
+// heldBlob holds every open until want of them are waiting together.
+type heldBlob struct {
 	*fakeBlob
 
-	delay time.Duration
+	want int
+
+	mu       sync.Mutex
+	arrived  int
+	released chan struct{}
 }
 
-func (b *slowBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
+func newHeldBlob(inner *fakeBlob, want int) *heldBlob {
+	return &heldBlob{fakeBlob: inner, want: want, released: make(chan struct{})}
+}
+
+func (b *heldBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
+	b.mu.Lock()
+	b.arrived++
+	last := b.arrived == b.want
+	b.mu.Unlock()
+	if last {
+		close(b.released)
+	}
 	select {
-	case <-time.After(b.delay):
+	case <-b.released:
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-time.After(heldBlobWait):
 	}
+
 	return b.fakeBlob.Get(ctx, node, req)
 }
 
-var _ BlobClient = (*slowBlob)(nil)
+// heldBlobWait releases a read that never gathered its shards, so the test
+// fails on what it is about rather than hanging until the suite times out.
+const heldBlobWait = 10 * time.Second
+
+func (b *heldBlob) met() bool {
+	select {
+	case <-b.released:
+		return true
+	default:
+		return false
+	}
+}
+
+func (b *heldBlob) peak() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.arrived
+}
+
+var _ BlobClient = (*heldBlob)(nil)
 
 // countingBlob records how many reads each node was asked for, so a test can
 // prove a shard was fetched once rather than once per pass.
@@ -207,16 +235,13 @@ func TestReadObjectDoesNotWaitOutAStalledNode(t *testing.T) {
 
 	ctx := context.Background()
 	objectHash := model.ObjectHash("b", "k")
-	_, err := writeObject(ctx, f.bc, f.ring, f.cfg, bytes.NewReader(want), int64(len(want)), objectHash)
-	require.NoError(t, err)
-
-	place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(want)))
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), int64(len(want)))
 	require.NoError(t, err)
 
 	stalled := &downBlob{fakeBlob: f.bc, down: place.DataShardNodes[0], delay: stall}
 
 	start := time.Now()
-	got, err := readObject(ctx, stalled, f.cfg, "b", "k", place, place.Size)
+	got, _, err := readObject(ctx, stalled, f.cfg, "b", "k", place, place.Size, 0)
 	elapsed := time.Since(start)
 
 	require.NoError(t, err, "the parity shard makes this object readable")
@@ -237,14 +262,11 @@ func TestReadObjectDoesNotFetchParityWhenTheDataShardsAnswer(t *testing.T) {
 
 	ctx := context.Background()
 	objectHash := model.ObjectHash("b", "k")
-	_, err := writeObject(ctx, f.bc, f.ring, f.cfg, bytes.NewReader(want), int64(len(want)), objectHash)
-	require.NoError(t, err)
-
-	place, err := placeShards(f.ring, f.cfg, objectHash, int64(len(want)))
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(want), int64(len(want)))
 	require.NoError(t, err)
 
 	counting := newCountingBlob(f.bc)
-	got, err := readObject(ctx, counting, f.cfg, "b", "k", place, place.Size)
+	got, _, err := readObject(ctx, counting, f.cfg, "b", "k", place, place.Size, 0)
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 

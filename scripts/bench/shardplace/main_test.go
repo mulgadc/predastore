@@ -64,16 +64,17 @@ func TestResolveShardsIgnoresHostDeclarationOrder(t *testing.T) {
 }
 
 // The property the scenario rests on: the nodes named here are the nodes the
-// gate would write to, in the order it writes them, split into data and parity
-// at the configured boundary.
+// gate would write to, in the order it writes them, split into data, parity and
+// the handoff holder at the configured boundaries.
 func TestResolveShardsMatchesTheGatesRing(t *testing.T) {
 	cfg := loadProfile(t)
 	ids, hostOf := blobRing(cfg)
+	total := cfg.RS.Data + cfg.RS.Parity
 
 	for _, key := range []string{"state.json", "victim.bin", "a", "deeply/nested/key"} {
 		t.Run(key, func(t *testing.T) {
 			nodes, err := placement.NewRing(ids).Nodes(
-				model.ObjectHash("bucket", key), cfg.RS.Data+cfg.RS.Parity)
+				model.ObjectHash("bucket", key), min(total+1, len(ids)))
 			require.NoError(t, err)
 
 			shards, err := resolveShards(cfg, "bucket", key)
@@ -84,13 +85,36 @@ func TestResolveShardsMatchesTheGatesRing(t *testing.T) {
 				assert.Equal(t, i, s.Index)
 				assert.Equal(t, nodes[i], s.Node)
 				assert.Equal(t, hostOf[nodes[i]], s.Host)
-				if i < cfg.RS.Data {
-					assert.Equal(t, "data", s.Role)
-				} else {
+				switch {
+				case i >= total:
+					assert.Equal(t, "handoff", s.Role)
+				case i >= cfg.RS.Data:
 					assert.Equal(t, "parity", s.Role)
+				default:
+					assert.Equal(t, "data", s.Role)
 				}
 			}
 		})
+	}
+}
+
+// The handoff holder is a node the stripe does not use, which is what makes it
+// somewhere to put a shard rather than a second copy on a node already holding
+// one of this object's.
+func TestHandoffHolderIsOutsideTheStripe(t *testing.T) {
+	cfg := loadProfile(t)
+	ids, _ := blobRing(cfg)
+	total := cfg.RS.Data + cfg.RS.Parity
+	require.Greater(t, len(ids), total, "this profile has no node to spare")
+
+	shards, err := resolveShards(cfg, "bucket", "state.json")
+	require.NoError(t, err)
+	require.Len(t, shards, total+1)
+
+	holder := shards[total]
+	assert.Equal(t, "handoff", holder.Role)
+	for _, s := range shards[:total] {
+		assert.NotEqual(t, holder.Node, s.Node, "the holder already carries shard %d", s.Index)
 	}
 }
 

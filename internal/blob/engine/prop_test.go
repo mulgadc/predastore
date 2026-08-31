@@ -120,8 +120,9 @@ func (sm *baseSM) Append(t *rapid.T) {
 	index := binary.BigEndian.Uint32(idxKey[32:])
 	body := sm.drawBody(t, "append")
 
-	refW, refErr := sm.Ref.Append(key, index, int64(len(body)))
-	realW, realErr := sm.Real.Append(key, index, int64(len(body)))
+	epoch := storetest.NextEpoch()
+	refW, refErr := sm.Ref.Append(key, index, int64(len(body)), epoch)
+	realW, realErr := sm.Real.Append(key, index, int64(len(body)), epoch)
 	defer func() {
 		if refW != nil {
 			refW.Close()
@@ -159,15 +160,30 @@ func (sm *baseSM) Append(t *rapid.T) {
 		}
 	}
 
-	// Lookup before commit: writer.Close hasn't run yet, so neither store
-	// should have committed the new extent.
-	sm.checkKey(t, "append/precommit", idxKey)
+	// Lookup before the writer closes: neither store may have published the
+	// new extent yet.
+	sm.checkKey(t, "append/prewrite", idxKey)
 
 	refErr = refW.Close()
 	realErr = realW.Close()
 	if sm.Strict() && !errors.Is(realErr, refErr) {
 		t.Fatalf("append writerclose: ref=%v real=%v", refErr, realErr)
 	}
+	if refErr != nil || realErr != nil {
+		return
+	}
+
+	// Closing only prepares. The value stays invisible until the commit below,
+	// which is the property the two-phase write exists for.
+	sm.checkKey(t, "append/prepared", idxKey)
+
+	refErr = sm.Ref.Commit(key, index, epoch)
+	_, realErr = sm.Real.Commit(key, index, epoch)
+	if sm.Strict() && !errors.Is(realErr, refErr) {
+		t.Fatalf("append commit: ref=%v real=%v", refErr, realErr)
+	}
+
+	sm.checkKey(t, "append/committed", idxKey)
 }
 
 func (sm *baseSM) Delete(t *rapid.T) {

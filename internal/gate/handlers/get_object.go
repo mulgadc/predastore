@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/internal/blob"
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 	"github.com/mulgadc/predastore/internal/telemetry"
@@ -46,35 +46,120 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 		recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseMetaPlacement, phase)
 
-		var body []byte
-		var contentRange string
-		status := http.StatusOK
+		handoff := handoffNode(ring, cfg, model.ObjectHash(bucket, key))
+		serveObject(ctx, w, r, bc, cfg, bucket, key, place, size, rangeStart, rangeEnd, handoff)
+	})
+}
 
-		if rangeStart >= 0 || rangeEnd >= 0 {
-			body, contentRange, err = readRange(ctx, bc, cfg, bucket, key, place, size, rangeStart, rangeEnd)
-			status = http.StatusPartialContent
-		} else {
-			body, err = readObject(ctx, bc, cfg, bucket, key, place, size)
-		}
-		if err != nil {
-			HandleError(w, r, err)
+// serveObject streams an object, or a range of one, to the client.
+//
+// The first stripe is read before any header is sent. That bounds nothing --
+// it is one stripe either way -- but it is what lets the response report the
+// reconstruction it cost: after WriteHeader nothing can be added, and an object
+// small enough to be a single stripe is fully known by then. On a longer object
+// a shard lost after the header has gone reaches the log and the metric but not
+// the header, which is why the count there is a floor rather than a total.
+func serveObject(
+	ctx context.Context, w http.ResponseWriter, r *http.Request,
+	bc BlobClient, cfg Config, bucket, key string,
+	place ObjectToShardNodes, size, rangeStart, rangeEnd int64, handoff config.NodeID,
+) {
+	status := http.StatusOK
+	start, end := int64(0), size-1
+	var contentRange string
+	if rangeStart >= 0 || rangeEnd >= 0 {
+		var ok bool
+		if start, end, ok = resolveRange(size, rangeStart, rangeEnd); !ok {
+			HandleError(w, r, model.ErrInvalidRangeError)
 			return
 		}
+		status = http.StatusPartialContent
+		contentRange = fmt.Sprintf("bytes %d-%d/%d", start, end, size)
+	}
 
+	header := func(length int64, degraded int) {
+		if degraded > 0 {
+			w.Header().Set(degradedHeader, strconv.Itoa(degraded))
+		}
 		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 		w.Header().Set("ETag", model.ObjectETag(bucket, key))
-		w.Header().Set("Last-Modified", time.Time{}.Format(httpTimeFormat))
-
-		if status == http.StatusPartialContent {
+		w.Header().Set("Last-Modified", lastModified(place))
+		if contentRange != "" {
 			w.Header().Set("Content-Range", contentRange)
 		}
 		w.WriteHeader(status)
+	}
 
-		if _, err := w.Write(body); err != nil {
-			slog.DebugContext(ctx, "failed to write response body", "error", err)
+	// An empty object has no shards: the write path stores none, because the
+	// blob protocol has no zero-length value to store.
+	if size == 0 {
+		header(0, 0)
+		return
+	}
+
+	objectHash := model.ObjectHash(bucket, key)
+
+	// A range inside one block is one ranged read of one shard, which is what
+	// makes a small read of a large object cost a small read.
+	lay := newLayout(cfg.DataShards, size, place.BlockSize)
+	if status == http.StatusPartialContent && lay.contiguous(start, end) {
+		shardIdx, at := lay.locate(start)
+		if data, rErr := readRangeHedged(ctx, bc, cfg, objectHash, place, shardIdx, at, end-start+1); rErr == nil {
+			header(int64(len(data)), 0)
+			if _, wErr := w.Write(data); wErr != nil {
+				slog.DebugContext(ctx, "failed to write response body", "error", wErr)
+			}
+			return
+		} else {
+			slog.WarnContext(ctx, "Single shard range read failed, falling back to reconstruction", "err", rErr)
 		}
-	})
+	}
+
+	began := time.Now()
+	reader, err := newStripeReader(ctx, bc, cfg, objectHash, place, handoff)
+	if err != nil {
+		HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+		return
+	}
+	defer reader.close(ctx)
+
+	first, n, err := reader.next(ctx)
+	if err != nil {
+		HandleError(w, r, model.NewS3Error(model.ErrInternalError,
+			fmt.Sprintf("reconstruction failed: %v", err), 500))
+		return
+	}
+
+	header(end-start+1, reader.reconstructed)
+
+	out := &windowWriter{dst: w, skip: start, limit: end - start + 1}
+	if err := drain(ctx, reader, out, first, n, size); err != nil {
+		// The header and part of the body have gone; the only honest signal
+		// left is to stop short of Content-Length, which every client treats
+		// as the failure it is.
+		slog.ErrorContext(ctx, "Object read failed after the response began",
+			"bucket", bucket, "key", key, "error", err)
+		return
+	}
+	reportDegradedRead(ctx, bucket, key, reader.failures, reader.reconstructed, time.Since(began))
+}
+
+// resolveRange clamps a requested range to the object, reporting whether what
+// is left is satisfiable.
+func resolveRange(size, reqStart, reqEnd int64) (start, end int64, ok bool) {
+	start, end = reqStart, reqEnd
+	if start < 0 {
+		start = 0
+	}
+	if end < 0 || end >= size {
+		end = size - 1
+	}
+	if start > end || start >= size {
+		return 0, 0, false
+	}
+
+	return start, end, true
 }
 
 // parseRangeHeader extracts a single byte range. An absent or unparseable
@@ -98,148 +183,88 @@ func parseRangeHeader(header string) (start, end int64) {
 	return start, end
 }
 
-// readObject reconstructs the complete object from its data shards, falling
-// back to parity reconstruction when the data shards alone will not join.
-func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64) ([]byte, error) {
+// readObject assembles the complete object in memory. It is the streaming read
+// with a buffer on the end of it, kept for the callers that genuinely need the
+// bytes in hand -- a multipart part being written into a pipe -- so there is
+// one read path rather than two that can disagree about a layout.
+func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64, handoff config.NodeID, opts ...stripeOption) ([]byte, int, error) {
 	// An empty object has no shards to read: the write path stores none, since
 	// the blob protocol has no zero-length value to store.
 	if size == 0 {
 		telemetry.RecordObjectRead(ctx, telemetry.ReadPathDirect)
-		return nil, nil
+
+		return nil, 0, nil
 	}
 
-	// The shards and the joined object are both held whole, so the payload is
-	// resident for the length of the read and concurrency multiplies it.
+	// Unlike the streaming path this helper holds the object whole, so the
+	// payload is resident for the length of the read and concurrency
+	// multiplies it.
 	defer telemetry.EnterGateInflight(ctx, telemetry.GateOpGet, size)()
 
-	// The stream encoder is constructed per request; hoisting it into the
-	// gate belongs with the streaming refactor, not here.
-	enc, err := reedsolomon.NewStream(cfg.DataShards, cfg.ParityShards)
+	start := time.Now()
+	reader, err := newStripeReader(ctx, bc, cfg, model.ObjectHash(bucket, key), place, handoff, opts...)
 	if err != nil {
-		return nil, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
+		return nil, 0, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
+	defer reader.close(ctx)
 
-	objectHash := model.ObjectHash(bucket, key)
-
-	// A failed shard read is what parity is for. Reconstruction is attempted
-	// whenever a data shard is missing, not only when the join fails, so that
-	// losing one node does not make every object on it unreadable.
-	phase := time.Now()
-	shards, readErr := shardBytes(ctx, bc, objectHash, place)
-	phase = recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseShardFanout, phase)
-	if readErr != nil {
-		return nil, model.NewS3Error(model.ErrInternalError,
-			fmt.Sprintf("reconstruction failed: %v", readErr), 500)
-	}
-	missing := missingShards(shards, len(place.DataShardNodes))
-
-	var out bytes.Buffer
-	if missing == 0 {
-		err := enc.Join(&out, shardReadersOf(shards), size)
-		if err == nil {
-			telemetry.RecordObjectRead(ctx, telemetry.ReadPathDirect)
-			return out.Bytes(), nil
-		}
-		slog.WarnContext(ctx, "Initial join failed, attempting reconstruction", "err", err)
-	} else {
-		slog.WarnContext(ctx, "Data shards incomplete, reconstructing from parity",
-			"missing", missing, "of", len(place.DataShardNodes))
-	}
-
-	// Reconstruction works from the shards already in hand. Re-reading them
-	// would pay a stalled node's latency a second time, which is what made one
-	// unresponsive node cost every reader twenty seconds rather than one
-	// reconstruction.
-	out.Reset()
-	reconstructed, err := reconstructObject(enc, shards, size)
-	recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseReconstruct, phase)
-	if err != nil {
-		return nil, model.NewS3Error(model.ErrInternalError,
+	out := bytes.NewBuffer(make([]byte, 0, size))
+	if err := pipeObject(ctx, reader, out, size); err != nil {
+		return nil, 0, model.NewS3Error(model.ErrInternalError,
 			fmt.Sprintf("reconstruction failed: %v", err), 500)
 	}
-	telemetry.RecordObjectRead(ctx, telemetry.ReadPathReconstructed)
-	return reconstructed.Bytes(), nil
+	reportDegradedRead(ctx, bucket, key, reader.failures, reader.reconstructed, time.Since(start))
+	if reader.reconstructed > 0 {
+		telemetry.RecordObjectRead(ctx, telemetry.ReadPathReconstructed)
+	} else {
+		telemetry.RecordObjectRead(ctx, telemetry.ReadPathDirect)
+	}
+
+	return out.Bytes(), reader.reconstructed, nil
 }
 
-// readRange serves a byte range. Reed-Solomon splits data sequentially across
-// the data shards, so a range inside one shard is a single ranged shard read;
-// anything wider falls back to reconstructing the object and slicing it.
-func readRange(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, totalSize, reqStart, reqEnd int64) (data []byte, contentRange string, err error) {
-	start, end := reqStart, reqEnd
-	if start < 0 {
-		start = 0
-	}
-	if end < 0 || end >= totalSize {
-		end = totalSize - 1
-	}
-	if start > end || start >= totalSize {
-		return nil, "", model.ErrInvalidRangeError
-	}
+// degradedHeader reports how many shards a GET had to reconstruct. It is not
+// an error signal: the response is a complete, correct object either way.
+const degradedHeader = "X-Spx-Degraded"
 
-	shardSize := (totalSize + int64(cfg.DataShards) - 1) / int64(cfg.DataShards)
-	startShardIdx := min(int(start/shardSize), cfg.DataShards-1)
-	endShardIdx := min(int(end/shardSize), cfg.DataShards-1)
+// degradedWriteHeader reports how many shards a PUT could not place. Also not
+// an error signal: the object is durable, but it survives fewer further losses
+// than a full-width write until repair restores the missing shards.
+const degradedWriteHeader = "X-Spx-Degraded-Write"
 
-	if startShardIdx == endShardIdx {
-		objectHash := model.ObjectHash(bucket, key)
-		data, err := readRangeFromSingleShard(ctx, bc, cfg, objectHash, place, startShardIdx, start, end, shardSize, totalSize)
-		if err == nil {
-			telemetry.RecordObjectRead(ctx, telemetry.ReadPathDirect)
-			return data, fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize), nil
-		}
-		slog.WarnContext(ctx, "Single shard range read failed, falling back to full reconstruction", "err", err)
-	}
+// handoffHeader reports how many shards a PUT placed away from their owner.
+// The stripe is complete and the object is as redundant as a full-width write;
+// what is outstanding is only that the shards are not yet where the record
+// says, which repair settles.
+const handoffHeader = "X-Spx-Handoff"
 
-	full, err := readObject(ctx, bc, cfg, bucket, key, place, totalSize)
-	if err != nil {
-		slog.ErrorContext(ctx, "Full object reconstruction failed", "err", err)
-		return nil, "", err
-	}
-
-	if end >= int64(len(full)) {
-		end = int64(len(full)) - 1
-	}
-	if start >= int64(len(full)) {
-		slog.ErrorContext(ctx, "Start position beyond data", "start", start, "dataLen", len(full))
-		return nil, "", model.ErrInvalidRangeError
-	}
-
-	return full[start : end+1], fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize), nil
-}
-
-// readRangeFromSingleShard reads a byte range from one data shard: the fast
-// path when the whole range lands inside it.
-func readRangeFromSingleShard(ctx context.Context, bc BlobClient, cfg Config, objectHash [32]byte, place ObjectToShardNodes, shardIdx int, globalStart, globalEnd, shardSize, totalSize int64) (data []byte, err error) {
+// readRangeFromSingleShard reads length bytes from one data shard starting at
+// at: the fast path when the whole range lands inside one block. The layout
+// has already resolved where that is, so there is no shard arithmetic here.
+func readRangeFromSingleShard(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, shardIdx int, at, length int64) (data []byte, err error) {
 	if shardIdx >= len(place.DataShardNodes) {
 		return nil, fmt.Errorf("shard index %d out of range", shardIdx)
-	}
-
-	shardStart := int64(shardIdx) * shardSize
-	offsetInShard := globalStart - shardStart
-	endInShard := globalEnd - shardStart
-
-	// The last shard is short whenever the object does not divide evenly.
-	actualShardSize := shardSize
-	if shardIdx == cfg.DataShards-1 {
-		actualShardSize = totalSize - shardStart
-		if actualShardSize <= 0 {
-			return nil, fmt.Errorf("invalid shard size calculation")
-		}
-	}
-	if endInShard >= actualShardSize {
-		endInShard = actualShardSize - 1
 	}
 
 	nodeNum := place.DataShardNodes[shardIdx]
 	objectRequest := blob.GetRequest{
 		Key:        objectHash,
 		Index:      uint32(shardIdx), //nolint:gosec // G115: shardIdx bounded by DataShards (small uint).
-		RangeStart: offsetInShard,
-		RangeEnd:   endInShard,
+		RangeStart: at,
+		RangeEnd:   at + length - 1,
+		Epoch:      place.WriteEpoch,
 	}
 
 	start := time.Now()
-	defer func() { recordShardOutcome(ctx, telemetry.ShardOpRead, nodeNum, start, err) }()
+	defer func() {
+		recordShardOutcome(ctx, telemetry.ShardOpRead, nodeNum, start, err)
+		// Only successes shape the hedge delay. A read that failed reports how
+		// long the failure took, which is a timeout far above the mean and
+		// would push the delay towards never hedging.
+		if err == nil {
+			shardLatency.observe(nodeNum, time.Since(start))
+		}
+	}()
 
 	reader, err := bc.Get(ctx, nodeNum, objectRequest)
 	if err != nil {

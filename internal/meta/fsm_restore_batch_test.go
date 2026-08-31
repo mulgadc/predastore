@@ -41,8 +41,7 @@ func TestFSM_Restore_ExceedsSingleTransaction(t *testing.T) {
 		data[fmt.Sprintf("objects/blob-%06d", i)] = v
 	}
 
-	sink := &mockSnapshotSink{}
-	require.NoError(t, (&FSMSnapshot{data: data}).Persist(sink))
+	stream := snapshotOf(t, data)
 
 	db := newTestDB(t)
 
@@ -59,7 +58,7 @@ func TestFSM_Restore_ExceedsSingleTransaction(t *testing.T) {
 	require.ErrorIs(t, err, badger.ErrTxnTooBig,
 		"premise broken: payload now fits one txn, so this test no longer exercises the bug")
 
-	require.NoError(t, NewFSM(db).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
+	require.NoError(t, NewFSM(db).Restore(io.NopCloser(bytes.NewReader(stream))))
 
 	for k, want := range data {
 		got, err := dbGet(db, []byte(k))
@@ -76,12 +75,9 @@ func TestFSM_Restore_ClearsPriorState(t *testing.T) {
 	db := newTestDB(t)
 	dbSet(t, db, []byte("stale/key"), []byte("must not survive"))
 
-	sink := &mockSnapshotSink{}
-	require.NoError(t, (&FSMSnapshot{data: map[string][]byte{
-		"fresh/key": []byte("from snapshot"),
-	}}).Persist(sink))
+	stream := snapshotOf(t, map[string][]byte{"fresh/key": []byte("from snapshot")})
 
-	require.NoError(t, NewFSM(db).Restore(io.NopCloser(bytes.NewReader(sink.buf))))
+	require.NoError(t, NewFSM(db).Restore(io.NopCloser(bytes.NewReader(stream))))
 
 	got, err := dbGet(db, []byte("fresh/key"))
 	require.NoError(t, err)
