@@ -81,4 +81,8 @@ type Response struct {
 	Epoch uint64 `json:"epoch,omitempty"`
 	// BodyLen is the number of body bytes following the envelope.
 	BodyLen int64 `json:"body_len,omitempty"`
+	// Superseded reports that a commit was overtaken by a newer generation and
+	// so published nothing. It is not an error — the caller raced another
+	// writer of the same shard and lost — but it is worth counting.
+	Superseded bool `json:"superseded,omitempty"`
 }

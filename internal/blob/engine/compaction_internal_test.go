@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 )
@@ -44,7 +45,7 @@ func openTestStore(t *testing.T, opts ...Option) (*Store, string) {
 func putValue(t *testing.T, st *Store, oh [32]byte, idx uint32, body []byte) {
 	t.Helper()
 	epoch := prepareValue(t, st, oh, idx, body)
-	if err := st.Commit(oh, idx, epoch); err != nil {
+	if _, err := st.Commit(oh, idx, epoch); err != nil {
 		t.Fatalf("commit (%x,%d): %v", oh[0], idx, err)
 	}
 }
@@ -273,10 +274,11 @@ type slot struct {
 
 func slotOf(ext extent) slot { return slot{segNum: ext.SegNum, off: ext.Off} }
 
-// An overwrite supersedes the key's previous extent, so those bytes are dead
-// the moment the new one commits and must carry a tombstone. The live slot
-// must not.
-func TestOverwriteTombstonesSupersededExtent(t *testing.T) {
+// An overwrite supersedes the key's previous extent. Those bytes are retained
+// rather than tombstoned, so a placement record still naming that generation
+// can be served, and they become dead when the sweep releases them. The live
+// slot must never be tombstoned at either point.
+func TestOverwriteRetainsThenReclaimsSupersededExtent(t *testing.T) {
 	st, _ := openTestStore(t, WithMaxSegSize(1*MiB))
 	oh := [32]byte{0x11}
 
@@ -290,9 +292,23 @@ func TestOverwriteTombstonesSupersededExtent(t *testing.T) {
 		t.Fatalf("overwrite reused slot %v; test cannot distinguish live from dead", slotOf(old))
 	}
 
+	// Still answerable, so not yet dead. Marking it dead here is what would
+	// let compaction reclaim bytes a record still points at.
+	if _, ok := tombstones(t, st)[slotOf(old)]; ok {
+		t.Fatalf("commit tombstoned superseded slot %v while it is still retained", slotOf(old))
+	}
+
+	released, err := st.sweepRetained(-time.Second, 0)
+	if err != nil {
+		t.Fatalf("sweep retained: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("sweep released %d retained generations, want 1", released)
+	}
+
 	found := tombstones(t, st)
 	if got, ok := found[slotOf(old)]; !ok {
-		t.Fatalf("superseded slot %v has no tombstone; it is invisible to compaction", slotOf(old))
+		t.Fatalf("released slot %v has no tombstone; it is invisible to compaction", slotOf(old))
 	} else if got != old.PSize {
 		t.Fatalf("tombstone for %v records %d bytes, want PSize %d", slotOf(old), got, old.PSize)
 	}
@@ -339,12 +355,19 @@ func TestTombstoneLandsAtCommitNotAppend(t *testing.T) {
 		t.Fatalf("prepared append changed the readable body")
 	}
 
-	// Committing is what supersedes the old extent.
-	if err := st.Commit(oh, 0, epoch); err != nil {
+	// Committing is what supersedes the old extent. It is retained, not dead,
+	// and the sweep is what makes it dead.
+	if _, err := st.Commit(oh, 0, epoch); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
+	if _, ok := tombstones(t, st)[slotOf(old)]; ok {
+		t.Fatalf("commit tombstoned superseded slot %v instead of retaining it", slotOf(old))
+	}
+	if _, err := st.sweepRetained(-time.Second, 0); err != nil {
+		t.Fatalf("sweep retained: %v", err)
+	}
 	if _, ok := tombstones(t, st)[slotOf(old)]; !ok {
-		t.Fatalf("commit did not tombstone superseded slot %v", slotOf(old))
+		t.Fatalf("the sweep did not tombstone released slot %v", slotOf(old))
 	}
 }
 
@@ -359,6 +382,13 @@ func TestOverwriteChurnDrainsSegment(t *testing.T) {
 	// segment 0 entirely dead.
 	putValue(t, st, oh, 0, body)
 	putValue(t, st, oh, 1, body)
+
+	// Overwriting retains the previous generation, so the space is not dead
+	// until it is released. Draining is a property of the reclaim path, not of
+	// how long the store holds a generation answerable.
+	if _, err := st.sweepRetained(-time.Second, 0); err != nil {
+		t.Fatalf("sweep retained: %v", err)
+	}
 
 	cands, failed, err := st.candidateSegments()
 	if err != nil {

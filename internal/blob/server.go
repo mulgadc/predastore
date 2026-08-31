@@ -27,7 +27,8 @@ import (
 type Store interface {
 	Append(key [32]byte, index uint32, size int64, epoch uint64) (engine.Writer, error)
 	Lookup(key [32]byte, index uint32) (engine.Reader, error)
-	Commit(key [32]byte, index uint32, epoch uint64) error
+	LookupAt(key [32]byte, index uint32, epoch uint64) (engine.Reader, error)
+	Commit(key [32]byte, index uint32, epoch uint64) (published bool, err error)
 	Abort(key [32]byte, index uint32, epoch uint64) error
 	Delete(key [32]byte, index uint32) (bool, error)
 	NearFull() bool
@@ -251,17 +252,23 @@ func drainBody(stream transport.Stream, size int64) error {
 // and is driven by whoever holds the published placement record, so a retry of
 // one already applied has to succeed rather than report a write that did land
 // as failed; the engine makes that idempotent against the epoch.
+//
+// Being overtaken by a newer generation is also success. The caller raced
+// another writer of the same shard and lost, which is a normal outcome and not
+// something to report as a failed write. Superseded says so, for the log and
+// the metric, and the response is still an acknowledgement.
 func (s *Server) handleCommit(ctx context.Context, h Request, stream transport.Stream) error {
 	if h.Epoch == 0 {
 		return respond(stream, &Response{Err: "no write epoch specified"})
 	}
-	if err := s.store.Commit(h.Key, h.Index, h.Epoch); err != nil {
+	published, err := s.store.Commit(h.Key, h.Index, h.Epoch)
+	if err != nil {
 		if errors.Is(err, engine.ErrNotPrepared) {
 			return respond(stream, &Response{Err: ErrCodeNotPrepared})
 		}
 		return respond(stream, &Response{Err: fmt.Sprintf("commit: %v", err)})
 	}
-	return respond(stream, &Response{Epoch: h.Epoch})
+	return respond(stream, &Response{Epoch: h.Epoch, Superseded: !published})
 }
 
 // handleAbort discards a prepared shard. Aborting something never prepared is
@@ -335,30 +342,45 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 	return nil
 }
 
-// resolveEpoch answers a get whose live shard is the wrong generation. A
-// prepared extent under the requested epoch means a writer published the
-// placement record and died before committing, so the record already names
-// this generation and completing the commit is the only outcome that can be
-// right. Anything else is a genuine mismatch and the caller reconstructs.
+// resolveEpoch answers a get whose live shard is the wrong generation. Two
+// cases reach here and both are ordinary:
 //
-// It takes ownership of the reader it is given: on either path that reader is
+// The record names a generation newer than the live row, which means a writer
+// published the record and died before committing. The prepared extent under
+// that epoch is still there — prepared rows are keyed by epoch, so no other
+// writer can have taken it — and completing the commit is the only right
+// outcome.
+//
+// Or the record names an older generation, because a newer writer published its
+// shards and its own record has not landed yet, or never will. That generation
+// was demoted rather than destroyed, so it is served from the retained
+// namespace. Refusing it would fail a read of the version the cluster agreed on.
+//
+// It takes ownership of the reader it is given: on every path that reader is
 // closed and the caller keeps only what comes back.
 func (s *Server) resolveEpoch(h Request, stale engine.Reader) (engine.Reader, error) {
+	held := stale.Epoch()
 	if err := stale.Close(); err != nil {
 		return nil, fmt.Errorf("close stale reader: %w", err)
 	}
-	if err := s.store.Commit(h.Key, h.Index, h.Epoch); err != nil {
+
+	if h.Epoch < held {
+		reader, err := s.store.LookupAt(h.Key, h.Index, h.Epoch)
+		if err != nil {
+			return nil, err
+		}
+		slog.Debug("served a generation a newer write superseded",
+			"node", s.cfg.NodeID, "index", h.Index,
+			"epoch", fmt.Sprintf("%016x", h.Epoch), "live", fmt.Sprintf("%016x", held))
+		return reader, nil
+	}
+
+	if _, err := s.store.Commit(h.Key, h.Index, h.Epoch); err != nil {
 		return nil, err
 	}
-	reader, err := s.store.Lookup(h.Key, h.Index)
+	reader, err := s.store.LookupAt(h.Key, h.Index, h.Epoch)
 	if err != nil {
 		return nil, err
-	}
-	// A concurrent overwrite could have moved it on again between the commit
-	// and this lookup, and serving the wrong generation is the one thing this
-	// path exists to prevent.
-	if reader.Epoch() != h.Epoch {
-		return nil, errors.Join(engine.ErrNotPrepared, reader.Close())
 	}
 	slog.Info("completed a shard commit abandoned by its writer",
 		"node", s.cfg.NodeID, "index", h.Index, "epoch", fmt.Sprintf("%016x", h.Epoch))

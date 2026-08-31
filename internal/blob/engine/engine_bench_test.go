@@ -55,7 +55,7 @@ func BenchmarkShardRoundTrip(b *testing.B) {
 				if wErr = w.Close(); wErr != nil {
 					b.Fatalf("close writer: %v", wErr)
 				}
-				if wErr = st.Commit(oh, idx, epoch); wErr != nil {
+				if _, wErr = st.Commit(oh, idx, epoch); wErr != nil {
 					b.Fatalf("commit: %v", wErr)
 				}
 

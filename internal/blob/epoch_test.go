@@ -114,9 +114,11 @@ func get(t *testing.T, c *blob.Client, epoch uint64) ([]byte, error) {
 func commit(t *testing.T, c *blob.Client, epoch uint64) error {
 	t.Helper()
 
-	return c.Commit(context.Background(), epochServerNode, blob.CommitRequest{
+	_, err := c.Commit(context.Background(), epochServerNode, blob.CommitRequest{
 		Key: epochKey(), Index: epochTestShardIndex, Epoch: epoch,
 	})
+
+	return err
 }
 
 // A shard is invisible between its put and its commit, so an overwrite serves
@@ -175,9 +177,17 @@ func TestBlobGetCompletesAnAbandonedCommit(t *testing.T) {
 	require.NoError(t, err, "a prepared shard under the requested epoch must be published and served")
 	assert.Equal(t, second, got)
 
-	// It is published, not merely served once: the old generation is gone.
-	_, err = get(t, c, 1)
-	require.ErrorIs(t, err, blob.ErrEpochMismatch)
+	// Published, not merely served once: an epoch-less get reads the live row,
+	// so this is the node's own answer to what it now holds.
+	got, err = get(t, c, 0)
+	require.NoError(t, err)
+	assert.Equal(t, second, got, "the completed commit did not become the live generation")
+
+	// The generation it superseded is retained, not destroyed: a record still
+	// naming it has to resolve.
+	got, err = get(t, c, 1)
+	require.NoError(t, err)
+	assert.Equal(t, first, got)
 }
 
 // A get with no epoch reads whatever the node holds. Only a caller with no

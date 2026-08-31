@@ -147,16 +147,16 @@ func (b *fakeBlob) Put(_ context.Context, _ config.NodeID, req blob.PutRequest, 
 	return &blob.PutResponse{Size: int64(buf.Len()), Epoch: req.Epoch}, nil
 }
 
-func (b *fakeBlob) Commit(_ context.Context, _ config.NodeID, req blob.CommitRequest) error {
+func (b *fakeBlob) Commit(_ context.Context, _ config.NodeID, req blob.CommitRequest) (bool, error) {
 	b.commitCalls.Add(1)
 	if b.failCommitOn != nil && b.failCommitOn(req.Index) {
-		return errors.New("commit refused")
+		return false, errors.New("commit refused")
 	}
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	return b.commitLocked(shardID{key: req.Key, index: req.Index}, req.Epoch)
+	return false, b.commitLocked(shardID{key: req.Key, index: req.Index}, req.Epoch)
 }
 
 // commitLocked publishes a prepared shard, idempotently against the epoch.

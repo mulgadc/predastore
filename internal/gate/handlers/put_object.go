@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -77,13 +78,14 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
-		// Publish shards before the placement record. A stale writer whose
-		// preparation was superseded must not publish a record that no shard
-		// can satisfy.
-		if commitShards(ctx, bc, objectHash, place, written) {
-			abortShards(ctx, bc, objectHash, place, written)
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "write epoch superseded", 409))
-			return
+		// Publish shards before the placement record, so the record can never
+		// name a generation the shards have not reached. It may name one they
+		// have already passed, and the blob store retains superseded
+		// generations for exactly that reason.
+		if overtaken := commitShards(ctx, bc, objectHash, place, written); overtaken > 0 {
+			slog.InfoContext(ctx, "A newer write overtook this one",
+				"shards_superseded", overtaken,
+				"epoch", fmt.Sprintf("%016x", place.WriteEpoch))
 		}
 
 		// Object hash -> shard placement is the visibility point. Raft applies

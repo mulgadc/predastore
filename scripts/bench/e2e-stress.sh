@@ -295,6 +295,9 @@ shard_host() {
 survivor_gate() {
     parse_hosts "$1" | awk -v h="$2" '$1 != h && $3 != "" { print "https://" $2 ":" $3; exit }'
 }
+gate_of() {
+    parse_hosts "$1" | awk -v h="$2" '$1 == h && $3 != "" { print "https://" $2 ":" $3; exit }'
+}
 
 # A host that was SIGSTOPped keeps the connections that died under it, and the
 # pool only evicts one after three stalls of five seconds each — long enough
@@ -2467,6 +2470,13 @@ run_torn_overwrite() {
     FIRST_GATE="https://$(gate_endpoints "$CONFIG_FILE" | head -1)"
     aws_s3 "$FIRST_GATE" s3 mb "s3://$BUCKET" >/dev/null
 
+    # No case overwrites this one, so a gate that cannot serve it is cold rather
+    # than holding a torn object. Warming against a key under test would confuse
+    # the two, which is the whole thing the assertions here distinguish.
+    TORN_SENTINEL="sentinel.json"
+    aws_s3 "$FIRST_GATE" s3api put-object \
+        --bucket "$BUCKET" --key "$TORN_SENTINEL" --body "$V1" >/dev/null
+
     TORN_FAILURES=0
     TORN_CASES=0
 
@@ -2509,9 +2519,18 @@ run_torn_overwrite() {
         fi
         TORN_CASES=$(( TORN_CASES + 1 ))
 
-        # Long enough for the thawed host to answer again, so the GET below is
-        # reading the cluster's settled state rather than racing the thaw.
-        sleep 10
+        # The thawed host's own gate is warmed, not merely waited on. It holds
+        # connections that died under the SIGSTOP, and the next case can pick it
+        # as the gate it writes through, where the eviction delay reads as a
+        # cluster fault rather than the recovery it is.
+        local thawed_gate
+        thawed_gate="$(gate_of "$CONFIG_FILE" "$host")"
+        if [ -n "$thawed_gate" ]; then
+            warm_gate "$thawed_gate" "$BUCKET" "$TORN_SENTINEL" "$name" \
+                || fail "$name: the thawed host's gate never served again"
+        else
+            sleep 10
+        fi
 
         local seen
         aws_s3 "$gate" s3 cp "s3://$BUCKET/$key" "$got" --only-show-errors 2>>"$EVENTS" || true
@@ -2574,7 +2593,16 @@ run_torn_overwrite() {
         fi
     fi
     TORN_CASES=$(( TORN_CASES + 1 ))
-    sleep 10
+
+    # Same reason as each case above: the freeze scenario runs next and may
+    # write through this host.
+    RECON_THAWED="$(gate_of "$CONFIG_FILE" "$RECON_HOST")"
+    if [ -n "$RECON_THAWED" ]; then
+        warm_gate "$RECON_THAWED" "$BUCKET" "$TORN_SENTINEL" reconstruction \
+            || fail "reconstruction: the thawed host's gate never served again"
+    else
+        sleep 10
+    fi
 
     log "raft state after the scenario"
     meta_status "${META_ALL[@]}" | tee -a "$EVENTS"
@@ -3026,6 +3054,13 @@ log "Warp completed with no errors"
         echo "torn_overwrite=pass"
     else
         echo "torn_overwrite=fail ($TORN_FAILURES of $TORN_CASES)"
+    fi
+    if [ "$CPUT_CASES" -eq 0 ]; then
+        echo "concurrent_put=skipped"
+    elif [ "$CPUT_FAILURES" -eq 0 ]; then
+        echo "concurrent_put=pass"
+    else
+        echo "concurrent_put=fail ($CPUT_FAILURES of $CPUT_CASES)"
     fi
     if [ "$STALE_CASES" -eq 0 ]; then
         echo "stale_shard=skipped"

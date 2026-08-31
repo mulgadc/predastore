@@ -178,7 +178,7 @@ func (sm *baseSM) Append(t *rapid.T) {
 	sm.checkKey(t, "append/prepared", idxKey)
 
 	refErr = sm.Ref.Commit(key, index, epoch)
-	realErr = sm.Real.Commit(key, index, epoch)
+	_, realErr = sm.Real.Commit(key, index, epoch)
 	if sm.Strict() && !errors.Is(realErr, refErr) {
 		t.Fatalf("append commit: ref=%v real=%v", refErr, realErr)
 	}

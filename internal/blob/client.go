@@ -337,19 +337,27 @@ func (c *Client) Stat(ctx context.Context, nodeID config.NodeID, req StatRequest
 // Commit publishes a shard the node prepared under the same epoch. It is
 // idempotent: a commit of a shard already published reports success, so the
 // caller may drive it again after a crash without distinguishing the cases.
-func (c *Client) Commit(ctx context.Context, nodeID config.NodeID, req CommitRequest) error {
-	return c.finish(ctx, nodeID, OpCommit, "commit", req)
+// Commit publishes a prepared shard. The bool reports that a newer generation
+// had already taken the position, so this commit published nothing — a lost
+// race, not a failure.
+func (c *Client) Commit(ctx context.Context, nodeID config.NodeID, req CommitRequest) (bool, error) {
+	resp, err := c.finish(ctx, nodeID, OpCommit, "commit", req)
+	if err != nil {
+		return false, err
+	}
+	return resp.Superseded, nil
 }
 
 // Abort discards a shard prepared under the same epoch, releasing its space
 // without waiting for the node to age it out. Aborting nothing is success.
 func (c *Client) Abort(ctx context.Context, nodeID config.NodeID, req CommitRequest) error {
-	return c.finish(ctx, nodeID, OpAbort, "abort", req)
+	_, err := c.finish(ctx, nodeID, OpAbort, "abort", req)
+	return err
 }
 
 // finish runs the bodyless second half of a write: open, half-close, read the
 // envelope. Commit and Abort differ only in the opcode they send.
-func (c *Client) finish(ctx context.Context, nodeID config.NodeID, op rpc.Opcode, name string, req CommitRequest) error {
+func (c *Client) finish(ctx context.Context, nodeID config.NodeID, op rpc.Opcode, name string, req CommitRequest) (*Response, error) {
 	stream, err := c.openBounded(ctx, nodeID, op, &Request{
 		Key:        req.Key,
 		Index:      req.Index,
@@ -358,24 +366,24 @@ func (c *Client) finish(ctx context.Context, nodeID config.NodeID, op rpc.Opcode
 		RangeEnd:   -1,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := stream.Close(); err != nil {
 		abortStream(stream)
-		return fmt.Errorf("half-close %s stream: %w", name, err)
+		return nil, fmt.Errorf("half-close %s stream: %w", name, err)
 	}
 	resp, err := c.awaitEnvelope(ctx, stream, bufio.NewReader(stream))
 	if err != nil {
 		stream.CancelRead(0)
-		return fmt.Errorf("%s on node %d: %w", name, nodeID, err)
+		return nil, fmt.Errorf("%s on node %d: %w", name, nodeID, err)
 	}
 	switch resp.Err {
 	case "":
-		return nil
+		return resp, nil
 	case ErrCodeNotPrepared:
-		return fmt.Errorf("%s on node %d: %w", name, nodeID, ErrNotPrepared)
+		return nil, fmt.Errorf("%s on node %d: %w", name, nodeID, ErrNotPrepared)
 	default:
-		return fmt.Errorf("%s on node %d: %s", name, nodeID, resp.Err)
+		return nil, fmt.Errorf("%s on node %d: %s", name, nodeID, resp.Err)
 	}
 }
 

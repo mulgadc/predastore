@@ -18,7 +18,7 @@ import (
 // and the commit that publishes it comes after the placement record lands.
 type BlobClient interface {
 	Put(ctx context.Context, nodeID config.NodeID, req blob.PutRequest, body io.Reader) (*blob.PutResponse, error)
-	Commit(ctx context.Context, nodeID config.NodeID, req blob.CommitRequest) error
+	Commit(ctx context.Context, nodeID config.NodeID, req blob.CommitRequest) (superseded bool, err error)
 	Abort(ctx context.Context, nodeID config.NodeID, req blob.CommitRequest) error
 	Get(ctx context.Context, nodeID config.NodeID, req blob.GetRequest) (io.ReadCloser, error)
 	Delete(ctx context.Context, nodeID config.NodeID, req blob.DeleteRequest) (*blob.DeleteResponse, error)

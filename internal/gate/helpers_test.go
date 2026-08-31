@@ -99,8 +99,8 @@ func (fakeBlob) Stat(context.Context, config.NodeID, blob.StatRequest) (*blob.St
 	return nil, errors.New("no blob nodes")
 }
 
-func (fakeBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) error {
-	return errors.New("no blob nodes")
+func (fakeBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) (bool, error) {
+	return false, errors.New("no blob nodes")
 }
 
 func (fakeBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error {

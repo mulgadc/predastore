@@ -71,8 +71,10 @@ func (noBlob) Stat(context.Context, config.NodeID, blob.StatRequest) (*blob.Stat
 	return nil, errNoCluster
 }
 
-func (noBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) error { return errNoCluster }
-func (noBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error  { return errNoCluster }
+func (noBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) (bool, error) {
+	return false, errNoCluster
+}
+func (noBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error { return errNoCluster }
 
 // sessionGate builds a gate whose only bucket is config-defined and owned
 // by the session's account, so authorization is the only thing under test.

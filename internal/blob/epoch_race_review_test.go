@@ -10,49 +10,64 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// This is a review-only regression reproducer for two PUTs of the same shard.
-// It models the legal ordering where the earlier PUT publishes metadata after
-// the later PUT has prepared and committed its epoch.
-func TestReviewConcurrentPutCanStrandPublishedEpoch(t *testing.T) {
+// Two writers of one shard position, the earlier one publishing its placement
+// record after the later one has already committed. This is the ordering that
+// used to strand an object: the record named a generation no node held, every
+// read failed on the epoch, and repair could not mend it because repair rebuilds
+// at the epoch the record names.
+//
+// Neither writer is failed and both generations are readable. Which one the
+// object ends up as is decided by the record, and the record only moves
+// forward, so the later writer wins — but the earlier writer was told its write
+// landed, and for as long as a record can still name it, it did.
+func TestAnEarlierWriterIsNotStrandedByALaterOne(t *testing.T) {
 	c := startBlobNode(t)
 	earlier := []byte("earlier PUT")
 	later := []byte("later PUT")
 
-	// Both writers complete their prepare phase. The second prepare replaces
-	// the node's only prepared pointer for this object and shard index.
+	// Prepared rows are keyed by epoch, so the second prepare takes nothing
+	// from the first: each writer owns its own in-flight extent.
 	put(t, c, 1, earlier)
 	put(t, c, 2, later)
 
-	// Writer 2 publishes epoch 2 and commits it. Writer 1 can then publish
-	// epoch 1 with the unconditional metadata Put, but can no longer commit it.
 	require.NoError(t, commit(t, c, 2))
-	err := commit(t, c, 1)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), blob.ErrNotPrepared.Error())
+
+	// Losing the race is not an error. The writer is told its write was
+	// superseded, not that it failed.
+	require.NoError(t, commit(t, c, 1))
 
 	got, err := get(t, c, 2)
 	require.NoError(t, err)
 	assert.Equal(t, later, got)
 
-	// A GET following the final epoch-1 placement record attempts the read-side
-	// commit, but epoch 1 is neither live nor prepared and remains unreadable.
-	_, err = get(t, c, 1)
-	require.ErrorIs(t, err, blob.ErrEpochMismatch)
-	t.Logf("stored epoch 2 remains readable as %q; published epoch 1: commit=%v, get=%v", got, blob.ErrNotPrepared, err)
+	// The generation a record may still name is served from the retained
+	// namespace rather than refused.
+	got, err = get(t, c, 1)
+	require.NoError(t, err, "a record naming the superseded generation must still resolve")
+	assert.Equal(t, earlier, got)
 }
 
-func TestReviewPrepareIsLastArrivalNotHighestEpoch(t *testing.T) {
+// A prepare arriving after a higher epoch has already committed is accepted:
+// it writes its own row and cannot displace anything. Refusing it here is what
+// made a lost race look like an unreachable node to the write path, which
+// failed the whole PUT with a 500 for what is an ordinary concurrent write.
+func TestALowerEpochPrepareIsAcceptedAndLosesAtCommit(t *testing.T) {
 	c := startBlobNode(t)
 
 	put(t, c, 2, []byte("higher timestamp"))
-	_, err := c.Put(context.Background(), epochServerNode, blob.PutRequest{
-		Key: epochKey(), Index: epochTestShardIndex, Size: int64(len("lower timestamp")), Epoch: 1,
-	}, strings.NewReader("lower timestamp"))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no prepared extent")
 	require.NoError(t, commit(t, c, 2))
+
+	lower := "lower timestamp"
+	_, err := c.Put(context.Background(), epochServerNode, blob.PutRequest{
+		Key: epochKey(), Index: epochTestShardIndex, Size: int64(len(lower)), Epoch: 1,
+	}, strings.NewReader(lower))
+	require.NoError(t, err, "a lower epoch prepares its own row and displaces nothing")
+
+	require.NoError(t, commit(t, c, 1))
+
+	// Forward-only: the commit published nothing and the live generation is
+	// still the higher epoch.
 	got, err := get(t, c, 2)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("higher timestamp"), got)
-	t.Logf("lower epoch arriving after higher epoch was rejected; stored value: %q", got)
 }

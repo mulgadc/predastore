@@ -52,7 +52,7 @@ type BlobClient interface {
 	Stat(ctx context.Context, node config.NodeID, req blob.StatRequest) (*blob.StatResponse, error)
 	Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error)
 	Put(ctx context.Context, node config.NodeID, req blob.PutRequest, body io.Reader) (*blob.PutResponse, error)
-	Commit(ctx context.Context, node config.NodeID, req blob.CommitRequest) error
+	Commit(ctx context.Context, node config.NodeID, req blob.CommitRequest) (superseded bool, err error)
 	Abort(ctx context.Context, node config.NodeID, req blob.CommitRequest) error
 	Delete(ctx context.Context, node config.NodeID, req blob.DeleteRequest) (*blob.DeleteResponse, error)
 }

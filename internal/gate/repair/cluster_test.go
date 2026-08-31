@@ -171,22 +171,22 @@ func (f *fakeBlob) Put(
 	return &blob.PutResponse{}, nil
 }
 
-func (f *fakeBlob) Commit(_ context.Context, node config.NodeID, req blob.CommitRequest) error {
+func (f *fakeBlob) Commit(_ context.Context, node config.NodeID, req blob.CommitRequest) (bool, error) {
 	f.commits.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.down[node] {
-		return errNodeDown
+		return false, errNodeDown
 	}
 	addr := shardAddr{node, req.Key, req.Index}
 	s, ok := f.prepared[addr]
 	if !ok || s.epoch != req.Epoch {
-		return blob.ErrNotPrepared
+		return false, blob.ErrNotPrepared
 	}
 	delete(f.prepared, addr)
 	f.committed[addr] = s
 
-	return nil
+	return false, nil
 }
 
 func (f *fakeBlob) Abort(_ context.Context, node config.NodeID, req blob.CommitRequest) error {

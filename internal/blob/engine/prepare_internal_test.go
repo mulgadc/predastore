@@ -24,7 +24,7 @@ func TestPreparedExtentIsNotVisibleUntilCommit(t *testing.T) {
 		t.Fatalf("a prepared overwrite was served before it was committed")
 	}
 
-	if err := st.Commit(oh, 0, epoch); err != nil {
+	if _, err := st.Commit(oh, 0, epoch); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 	if got := readValue(t, st, oh, 0); !bytes.Equal(got, second) {
@@ -39,7 +39,7 @@ func TestLookupReportsTheCommittedEpoch(t *testing.T) {
 	oh := [32]byte{0x12}
 
 	epoch := prepareValue(t, st, oh, 0, []byte("payload"))
-	if err := st.Commit(oh, 0, epoch); err != nil {
+	if _, err := st.Commit(oh, 0, epoch); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 
@@ -63,10 +63,10 @@ func TestCommitIsIdempotent(t *testing.T) {
 	body := []byte("payload")
 
 	epoch := prepareValue(t, st, oh, 0, body)
-	if err := st.Commit(oh, 0, epoch); err != nil {
+	if _, err := st.Commit(oh, 0, epoch); err != nil {
 		t.Fatalf("first commit: %v", err)
 	}
-	if err := st.Commit(oh, 0, epoch); err != nil {
+	if _, err := st.Commit(oh, 0, epoch); err != nil {
 		t.Fatalf("second commit: %v", err)
 	}
 	if got := readValue(t, st, oh, 0); !bytes.Equal(got, body) {
@@ -84,7 +84,7 @@ func TestCommitRefusesAnEpochItDidNotPrepare(t *testing.T) {
 	putValue(t, st, oh, 0, first)
 	prepared := prepareValue(t, st, oh, 0, bytes.Repeat([]byte{0xbb}, 2*KiB))
 
-	if err := st.Commit(oh, 0, prepared+1); !errors.Is(err, ErrNotPrepared) {
+	if _, err := st.Commit(oh, 0, prepared+1); !errors.Is(err, ErrNotPrepared) {
 		t.Fatalf("Commit(other epoch) = %v, want ErrNotPrepared", err)
 	}
 	if got := readValue(t, st, oh, 0); !bytes.Equal(got, first) {
@@ -92,7 +92,7 @@ func TestCommitRefusesAnEpochItDidNotPrepare(t *testing.T) {
 	}
 
 	// The prepared row is untouched, so its own writer can still publish it.
-	if err := st.Commit(oh, 0, prepared); err != nil {
+	if _, err := st.Commit(oh, 0, prepared); err != nil {
 		t.Fatalf("commit after a refused one: %v", err)
 	}
 }
@@ -103,7 +103,7 @@ func TestCommitRefusesAnEpochItDidNotPrepare(t *testing.T) {
 func TestCommitWithoutAPrepareFails(t *testing.T) {
 	st, _ := openTestStore(t)
 
-	if err := st.Commit([32]byte{0x15}, 0, 99); !errors.Is(err, ErrNotPrepared) {
+	if _, err := st.Commit([32]byte{0x15}, 0, 99); !errors.Is(err, ErrNotPrepared) {
 		t.Fatalf("Commit(nothing prepared) = %v, want ErrNotPrepared", err)
 	}
 }
@@ -128,7 +128,7 @@ func TestAbortDiscardsThePreparedExtentAndTombstonesIt(t *testing.T) {
 	if got := readValue(t, st, oh, 0); !bytes.Equal(got, first) {
 		t.Fatalf("abort changed the readable value")
 	}
-	if err := st.Commit(oh, 0, epoch); !errors.Is(err, ErrNotPrepared) {
+	if _, err := st.Commit(oh, 0, epoch); !errors.Is(err, ErrNotPrepared) {
 		t.Fatalf("Commit after abort = %v, want ErrNotPrepared", err)
 	}
 }
@@ -160,7 +160,7 @@ func TestDeleteClearsAPreparedExtent(t *testing.T) {
 		t.Fatal("delete reported no value where one was committed")
 	}
 
-	if err := st.Commit(oh, 0, epoch); !errors.Is(err, ErrNotPrepared) {
+	if _, err := st.Commit(oh, 0, epoch); !errors.Is(err, ErrNotPrepared) {
 		t.Fatalf("Commit after delete = %v, want ErrNotPrepared", err)
 	}
 	if _, err := st.Lookup(oh, 0); !errors.Is(err, ErrKeyNotFound) {
@@ -194,15 +194,15 @@ func TestCompactionRelocatesAPreparedExtent(t *testing.T) {
 	if _, err := st.rollSegment(); err != nil {
 		t.Fatalf("roll segment: %v", err)
 	}
-	before := preparedExtentOf(t, st, oh, 0)
+	before := preparedExtentOf(t, st, oh, 0, epoch)
 	if err := st.compactOnce(); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
-	if after := preparedExtentOf(t, st, oh, 0); slotOf(after) == slotOf(before) {
+	if after := preparedExtentOf(t, st, oh, 0, epoch); slotOf(after) == slotOf(before) {
 		t.Fatalf("compaction left the prepared extent at %v, so this proves nothing", slotOf(before))
 	}
 
-	if err := st.Commit(oh, 0, epoch); err != nil {
+	if _, err := st.Commit(oh, 0, epoch); err != nil {
 		t.Fatalf("commit after compaction: %v", err)
 	}
 	if got := readValue(t, st, oh, 0); !bytes.Equal(got, body) {
@@ -211,9 +211,9 @@ func TestCompactionRelocatesAPreparedExtent(t *testing.T) {
 }
 
 // preparedExtentOf reads the extent a prepared row points at.
-func preparedExtentOf(t *testing.T, st *Store, oh [32]byte, idx uint32) extent {
+func preparedExtentOf(t *testing.T, st *Store, oh [32]byte, idx uint32, epoch uint64) extent {
 	t.Helper()
-	raw, err := st.indexGet(preparedKey(MakeKey(oh, idx)))
+	raw, err := st.indexGet(preparedKey(MakeKey(oh, idx), epoch))
 	if err != nil {
 		t.Fatalf("get prepared row: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestSweepPreparedReapsAbandonedExtents(t *testing.T) {
 	if reaped != 1 {
 		t.Fatalf("sweep reaped %d abandoned prepared extents, want 1", reaped)
 	}
-	if err := st.Commit(oh, 0, epoch); !errors.Is(err, ErrNotPrepared) {
+	if _, err := st.Commit(oh, 0, epoch); !errors.Is(err, ErrNotPrepared) {
 		t.Fatalf("Commit after the reaper = %v, want ErrNotPrepared", err)
 	}
 	if got := len(tombstones(t, st)); got != 1 {

@@ -48,7 +48,7 @@ func write(t *testing.T, st *engine.Store, oh [32]byte, idx uint32, body []byte)
 	if err := w.Close(); err != nil {
 		t.Fatalf("close writer: %v", err)
 	}
-	if err := st.Commit(oh, idx, epoch); err != nil {
+	if _, err := st.Commit(oh, idx, epoch); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
 }

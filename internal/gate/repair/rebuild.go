@@ -22,14 +22,18 @@ import (
 // round trip and no reconstruction, and it is the same forward recovery a read
 // performs, so asking costs nothing when the answer is no.
 func (s *Service) repairShard(ctx context.Context, t task) error {
-	if err := s.cfg.Blob.Commit(ctx, t.node, blob.CommitRequest{
+	// Superseded means the node has moved past this generation and published
+	// nothing, so nothing was repaired and the other routes still have to run.
+	superseded, err := s.cfg.Blob.Commit(ctx, t.node, blob.CommitRequest{
 		Key: t.hash, Index: uint32(t.index), Epoch: t.place.WriteEpoch, //nolint:gosec // G115: bounded by the shard count.
-	}); err == nil {
+	})
+	switch {
+	case err == nil && !superseded:
 		slog.DebugContext(ctx, "Repaired a shard by publishing what its node had prepared",
 			"node", t.node, "index", t.index)
 
 		return nil
-	} else if !errors.Is(err, blob.ErrNotPrepared) {
+	case err != nil && !errors.Is(err, blob.ErrNotPrepared):
 		return fmt.Errorf("publish prepared shard: %w", err)
 	}
 
@@ -182,10 +186,17 @@ func (s *Service) publish(ctx context.Context, t task) error {
 		return s.discard(ctx, t)
 	}
 
-	if err := s.cfg.Blob.Commit(ctx, t.node, blob.CommitRequest{
+	// A rebuild overtaken by a live write is not a failure: the newer generation
+	// is the one the cluster wants, and it arrived without this sweep's help.
+	superseded, err := s.cfg.Blob.Commit(ctx, t.node, blob.CommitRequest{
 		Key: t.hash, Index: uint32(t.index), Epoch: t.place.WriteEpoch, //nolint:gosec // G115: bounded by the shard count.
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("commit rebuilt shard: %w", err)
+	}
+	if superseded {
+		slog.DebugContext(ctx, "A live write overtook a rebuilt shard",
+			"node", t.node, "index", t.index)
 	}
 
 	return nil

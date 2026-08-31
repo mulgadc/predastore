@@ -582,24 +582,32 @@ func logShardWriteFailure(ctx context.Context, node config.NodeID, index int, er
 // Non-supersession failures remain recoverable by a reader or repair, but an
 // epoch mismatch means another write has won the shard and this writer must
 // not publish its placement.
-func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written writeResult) (superseded bool) {
-	var lost atomic.Bool
+// commitShards publishes every prepared shard and reports how many were
+// overtaken by a newer generation.
+//
+// Being overtaken is not a failure and does not fail the write. Concurrent
+// writers of one key have no defined winner, the epoch decides it, and the
+// loser is still owed an acknowledgement — the object it wrote existed and was
+// durable, and a newer one replaced it. That is last-write-wins, and the count
+// is returned so it can be logged rather than acted on.
+func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written writeResult) (superseded int) {
+	var lost atomic.Int64
 	forEachShard(written, func(index int, node config.NodeID) {
-		err := bc.Commit(ctx, node, blob.CommitRequest{
+		overtaken, err := bc.Commit(ctx, node, blob.CommitRequest{
 			Key:   objectHash,
 			Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
 			Epoch: place.WriteEpoch,
 		})
-		if err != nil {
-			if errors.Is(err, blob.ErrNotPrepared) {
-				lost.Store(true)
-			}
+		switch {
+		case err != nil:
 			slog.WarnContext(ctx, "Shard commit failed",
 				"node", node, "index", index,
 				"epoch", fmt.Sprintf("%016x", place.WriteEpoch), "err", err)
+		case overtaken:
+			lost.Add(1)
 		}
 	})
-	return lost.Load()
+	return int(lost.Load())
 }
 
 // abortShards discards shards prepared for a write that will not be published,

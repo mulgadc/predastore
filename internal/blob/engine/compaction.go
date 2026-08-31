@@ -115,6 +115,17 @@ func (store *Store) compactOnce() error {
 			"count", reaped, "older_than_ms", preparedMaxAge.Milliseconds())
 	}
 
+	// Likewise for superseded generations: a commit demotes rather than
+	// tombstones, so this is where that space comes back.
+	released, err := store.sweepRetained(retainedMaxAge, retainedGenerations)
+	if err != nil {
+		return fmt.Errorf("sweep retained generations: %w", err)
+	}
+	if released > 0 {
+		slog.Info("released superseded generations",
+			"count", released, "older_than_ms", retainedMaxAge.Milliseconds())
+	}
+
 	candidates, failed, err := store.candidateSegments()
 	if err != nil {
 		return fmt.Errorf("select candidates: %w", err)
@@ -198,12 +209,23 @@ func (store *Store) sweepPrepared(maxAge time.Duration) (int, error) {
 	var stale [][]byte
 	if err := store.indexScan([]byte{preparedPrefix}, func(k, v []byte) error {
 		// Keys carry no namespace prefix, so roughly one object hash in 256
-		// starts with preparedPrefix and lands in this scan. The three
-		// namespaces are told apart by width, which is also what makes
-		// decodePreparedAt total here.
-		if len(k) != preparedKeySize || len(v) != preparedValueSize {
+		// starts with preparedPrefix and lands in this scan. The namespaces are
+		// told apart by width, which is also what makes decodePreparedAt total
+		// here.
+		if len(v) != preparedValueSize {
 			return nil
 		}
+
+		// A row in the superseded single-slot layout was never acknowledged to
+		// anyone, so it is reclaimed on sight rather than aged.
+		if len(k) == legacyPreparedKeySize {
+			stale = append(stale, append([]byte(nil), k...))
+			return nil
+		}
+		if len(k) != preparedKeySize {
+			return nil
+		}
+
 		at, err := decodePreparedAt(v)
 		if err != nil {
 			return fmt.Errorf("decode prepared row: %w", err)
@@ -221,7 +243,88 @@ func (store *Store) sweepPrepared(maxAge time.Duration) (int, error) {
 		// The row is re-read inside the drop's own transaction, so a commit
 		// that published it between the scan and here simply finds nothing
 		// left to drop rather than losing its extent underneath it.
-		if err := store.dropPrepared(k, func(uint64) bool { return true }); err != nil {
+		if err := store.dropGeneration(k, func(uint64) bool { return true }); err != nil {
+			return dropped, err
+		}
+		dropped++
+	}
+	return dropped, nil
+}
+
+// retainedMaxAge is how long a superseded generation stays answerable. What it
+// has to outlast is the gap between a writer publishing its shards and its
+// placement record landing, which is one meta round trip — so this is four
+// orders of magnitude of slack, not a fine judgement.
+//
+// It is not sized to cover a writer that died in that gap forever. That leaves
+// a record naming a generation this will eventually release, and closing it
+// needs repair to reconcile a record against what the nodes actually hold,
+// which is not this change.
+const retainedMaxAge = 5 * time.Minute
+
+// retainedGenerations caps how many superseded generations one shard position
+// keeps, oldest dropped first. Age alone would let a hot key pin a generation
+// per overwrite for the whole window, which is unbounded space for a bounded
+// purpose: only a record still in flight can name one, and the number of those
+// is the number of writers racing the key.
+const retainedGenerations = 4
+
+// sweepRetained reclaims generations that a commit superseded and nothing has
+// asked for since. It is the only thing that decides a generation is dead —
+// commit demotes, and never destroys.
+//
+// It enforces both bounds, and the count bound is enforced here rather than
+// only at commit because commit cannot enforce it. Each writer's transaction
+// prunes against its own snapshot, so concurrent commits of one position each
+// see a different subset and can leave more than the cap between them. This
+// runs on the compactor, single file, against everything that is actually
+// there.
+func (store *Store) sweepRetained(maxAge time.Duration, keep int) (int, error) {
+	cutoff := time.Now().Add(-maxAge).UnixNano()
+
+	type row struct {
+		key []byte
+		at  int64
+	}
+
+	var stale [][]byte
+	var group []row
+
+	// Rows sort by position and then by big-endian epoch, so one position's
+	// generations arrive contiguously and oldest first.
+	flush := func() {
+		for i, r := range group {
+			if r.at < cutoff || i < len(group)-keep {
+				stale = append(stale, r.key)
+			}
+		}
+		group = nil
+	}
+
+	if err := store.indexScan([]byte{retainedPrefix}, func(k, v []byte) error {
+		// Same width discrimination as the prepared sweep: an object hash
+		// starting with retainedPrefix puts a 36-byte live row in this scan.
+		if len(k) != retainedKeySize || len(v) != preparedValueSize {
+			return nil
+		}
+		at, err := decodePreparedAt(v)
+		if err != nil {
+			return fmt.Errorf("decode retained row: %w", err)
+		}
+		key := append([]byte(nil), k...)
+		if len(group) > 0 && !bytes.Equal(group[0].key[:retainedKeySize-8], key[:retainedKeySize-8]) {
+			flush()
+		}
+		group = append(group, row{key: key, at: at})
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("scan retained: %w", err)
+	}
+	flush()
+
+	dropped := 0
+	for _, k := range stale {
+		if err := store.dropGeneration(k, func(uint64) bool { return true }); err != nil {
 			return dropped, err
 		}
 		dropped++
@@ -398,26 +501,57 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 }
 
 // rowAt finds the index key, if any, whose extent occupies segment num at off.
-// It checks the live row and then the prepared one: a prepared extent is data
-// a commit is about to publish, so dropping its segment would lose a write
-// that has already been acknowledged as durable.
+// It checks the live row, then the prepared and retained generations: a
+// prepared extent is data a commit is about to publish and a retained one is
+// data a placement record may still name, so dropping either's segment would
+// lose a write that has already been acknowledged as durable.
+//
+// Prepared and retained rows are keyed by epoch, so there may be several of
+// each and none can be addressed directly — hence the scan.
 func (store *Store) rowAt(idxKey [36]byte, num uint64, off int64) (badgerKey, raw []byte, ext extent, err error) {
-	for _, candidate := range [][]byte{idxKey[:], preparedKey(idxKey[:])} {
-		value, err := store.indexGet(candidate)
-		if errors.Is(err, badger.ErrKeyNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, nil, extent{}, fmt.Errorf("get extent: %w", err)
-		}
-		cur, _, err := decodeIndexValue(value)
-		if err != nil {
-			return nil, nil, extent{}, fmt.Errorf("decode extent: %w", err)
+	value, err := store.indexGet(idxKey[:])
+	switch {
+	case err == nil:
+		cur, _, decodeErr := decodeIndexValue(value)
+		if decodeErr != nil {
+			return nil, nil, extent{}, fmt.Errorf("decode extent: %w", decodeErr)
 		}
 		if cur.SegNum == num && cur.Off == off {
-			return candidate, value, cur, nil
+			return idxKey[:], value, cur, nil
+		}
+	case !errors.Is(err, badger.ErrKeyNotFound):
+		return nil, nil, extent{}, fmt.Errorf("get extent: %w", err)
+	}
+
+	for _, prefix := range [][]byte{preparedScan(idxKey[:]), retainedScan(idxKey[:])} {
+		var (
+			found    []byte
+			foundRaw []byte
+			foundExt extent
+		)
+		scanErr := store.indexScan(prefix, func(k, v []byte) error {
+			if found != nil || len(k) != len(prefix)+8 {
+				return nil
+			}
+			cur, _, decodeErr := decodeIndexValue(v)
+			if decodeErr != nil {
+				return fmt.Errorf("decode extent: %w", decodeErr)
+			}
+			if cur.SegNum == num && cur.Off == off {
+				found = append([]byte(nil), k...)
+				foundRaw = append([]byte(nil), v...)
+				foundExt = cur
+			}
+			return nil
+		})
+		if scanErr != nil {
+			return nil, nil, extent{}, scanErr
+		}
+		if found != nil {
+			return found, foundRaw, foundExt, nil
 		}
 	}
+
 	return nil, nil, extent{}, nil
 }
 

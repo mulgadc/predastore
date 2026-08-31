@@ -96,8 +96,10 @@ func (d *discardBlob) Put(_ context.Context, node config.NodeID, req blob.PutReq
 	return &blob.PutResponse{Size: total, Epoch: req.Epoch}, nil
 }
 
-func (d *discardBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) error { return nil }
-func (d *discardBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error  { return nil }
+func (d *discardBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) (bool, error) {
+	return false, nil
+}
+func (d *discardBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error { return nil }
 
 func (d *discardBlob) Get(context.Context, config.NodeID, blob.GetRequest) (io.ReadCloser, error) {
 	return nil, blob.ErrNotFound

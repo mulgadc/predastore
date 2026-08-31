@@ -56,8 +56,8 @@ func (c *hedgeBlobClient) Get(ctx context.Context, node config.NodeID, req blob.
 func (c *hedgeBlobClient) Put(context.Context, config.NodeID, blob.PutRequest, io.Reader) (*blob.PutResponse, error) {
 	return nil, errors.New("not implemented")
 }
-func (c *hedgeBlobClient) Commit(context.Context, config.NodeID, blob.CommitRequest) error {
-	return errors.New("not implemented")
+func (c *hedgeBlobClient) Commit(context.Context, config.NodeID, blob.CommitRequest) (bool, error) {
+	return false, errors.New("not implemented")
 }
 func (c *hedgeBlobClient) Abort(context.Context, config.NodeID, blob.CommitRequest) error {
 	return errors.New("not implemented")

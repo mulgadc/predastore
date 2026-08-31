@@ -72,21 +72,21 @@ func (b *nodeBlob) Put(_ context.Context, node config.NodeID, req blob.PutReques
 	return &blob.PutResponse{Size: int64(len(buf)), Epoch: req.Epoch}, nil
 }
 
-func (b *nodeBlob) Commit(_ context.Context, node config.NodeID, req blob.CommitRequest) error {
+func (b *nodeBlob) Commit(_ context.Context, node config.NodeID, req blob.CommitRequest) (bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.down[node] {
-		return fmt.Errorf("node %d is not answering", node)
+		return false, fmt.Errorf("node %d is not answering", node)
 	}
 	addr := nodeAddr{node, req.Key, req.Index}
 	shard, ok := b.prepared[addr]
 	if !ok || shard.epoch != req.Epoch {
-		return blob.ErrNotPrepared
+		return false, blob.ErrNotPrepared
 	}
 	delete(b.prepared, addr)
 	b.committed[addr] = shard
 
-	return nil
+	return false, nil
 }
 
 func (b *nodeBlob) Abort(_ context.Context, node config.NodeID, req blob.CommitRequest) error {
