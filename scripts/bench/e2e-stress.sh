@@ -88,7 +88,7 @@ STALE_KEYS="${STRESS_STALE_KEYS:-12}"
 SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
     all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff|large-object|multipart-upload) ;;
-    last-modified) ;;
+    last-modified|concurrent-put) ;;
     node-rejoin|node-resync|node-rebuild) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
@@ -2185,6 +2185,216 @@ if [ "$SCENARIO" = partial-put ]; then
     exit 0
 fi
 
+# A state document rather than random bytes, because the objects this destroyed
+# in production were volume state: every record carries the generation that
+# wrote it, so a mixture is legible in the file itself rather than only as a
+# checksum that no longer matches. Both generations are byte-for-byte the same
+# length, which is what an in-place rewrite of a state document looks like and
+# what keeps the stored size honest.
+make_state() {
+    awk -v gen="$1" -v n="$3" 'BEGIN {
+        printf "{\n  \"v\": 1,\n  \"generation\": \"%s\",\n", gen
+        for (i = 1; i <= n; i++)
+            printf "  \"extent_%06d\": \"%s-%06d-0123456789abcdef0123456789abcdef\",\n", i, gen, i
+        printf "  \"trailer\": \"%s\"\n}\n", gen
+    }' > "$2"
+}
+
+
+# --- Scenario: concurrent-put ---
+#
+# Publishing an object is two independent writes, and nothing orders them
+# against a second writer of the same key. The placement record naming the
+# write epoch goes to the meta plane as a plain last-write-wins Put, and the
+# shards are published separately by commitShards. So whoever writes the record
+# last owns the record, whoever prepares last owns the shards, and those are
+# two different races.
+#
+# When they disagree the object is unreadable and stays that way. A shard node
+# keeps one prepared slot per position, so a second writer's prepare overwrites
+# the first's; the first writer's commit is then refused as not-prepared and
+# that refusal is logged and discarded. If that writer's record landed last,
+# the object's record names an epoch no shard holds and every read fails on the
+# epoch. Repair cannot mend it either, because repair rebuilds a shard at the
+# epoch the record names and no node has one.
+#
+# Both writers are told 200.
+#
+# Nothing here injects a fault. The cluster is whole, every node is healthy,
+# and the only ingredient is two clients writing the same key at the same time
+# — which is why it is asserted on the ordinary path rather than behind a
+# freeze. Writers are spread across all four gates, because two requests
+# arriving at one gate could serialise somewhere and prove less than they look
+# like proving.
+#
+# The assertion is deliberately weak about *which* value wins: concurrent
+# writers to one key have no defined winner and picking one would be inventing
+# a guarantee. It holds only that the object reads back, and reads back as
+# exactly one of the bodies whose PUT was acknowledged. A writer told its write
+# was superseded is not owed the object.
+CPUT_FAILURES=0
+CPUT_CASES=0
+
+# cput_generation_of names which body came back, or reports a mixture. Separate
+# from generation_of because that one is built for the two-generation torn
+# tests and this scenario has one body per writer.
+cput_generation_of() {
+    local got="$1" writers="$2" i
+    for i in $(seq 1 "$writers"); do
+        if cmp -s "$WORK_DIR/cput-bodies/g${i}.json" "$got"; then
+            echo "g${i}"
+            return
+        fi
+    done
+    echo "spliced($(grep -oE '"g[0-9]+-' "$got" | sort -u | tr -d '"-' | paste -sd,))"
+}
+
+run_concurrent_put() {
+    BUCKET="stress-cput-${RUN_ID}"
+    local writers="${STRESS_CPUT_WRITERS:-6}"
+    local keys_n="${STRESS_CPUT_KEYS:-8}"
+    local rounds="${STRESS_CPUT_ROUNDS:-3}"
+    local lines="${STRESS_CPUT_LINES:-2048}"
+
+    CPUT_FAILURES=0
+    CPUT_CASES=0
+
+    local first_gate gates=() endpoint_list
+    mapfile -t gates < <(gate_endpoints "$CONFIG_FILE" | sed 's#^#https://#')
+    [ "${#gates[@]}" -gt 0 ] || fail "concurrent-put: no gate in $CONFIG_NAME"
+    first_gate="${gates[0]}"
+    endpoint_list="$(printf '%s\n' "${gates[@]}" | paste -sd,)"
+
+    # The AWS CLI cannot race anything: each invocation spends the better part
+    # of a second starting Python, which staggers writers by far more than the
+    # window under test. racedput signs every request up front and releases them
+    # on a barrier, so they are inside the gate together.
+    local RACE_PROBE="$WORK_DIR/racedput"
+    go build -o "$RACE_PROBE" "$REPO_DIR/scripts/bench/racedput"
+
+    # Named for the writer, because racedput takes each writer's name from its
+    # body file and the readback matches what came back against that name.
+    mkdir -p "$WORK_DIR/cput-bodies"
+
+    local i body_list=()
+    for i in $(seq 1 "$writers"); do
+        make_state "g${i}" "$WORK_DIR/cput-bodies/g${i}.json" "$lines"
+        body_list+=("$WORK_DIR/cput-bodies/g${i}.json")
+    done
+    local bodies
+    bodies="$(printf '%s\n' "${body_list[@]}" | paste -sd,)"
+    log "concurrent-put: $writers bodies of $(wc -c < "$WORK_DIR/cput-bodies/g1.json") bytes, one per writer"
+
+    aws_s3 "$first_gate" s3 mb "s3://$BUCKET" >/dev/null
+
+    local outdir="$WORK_DIR/cput-out"
+    rm -rf "$outdir"
+    mkdir -p "$outdir"
+
+    local round key k pids=() p
+    for round in $(seq 1 "$rounds"); do
+        pids=()
+        for k in $(seq 1 "$keys_n"); do
+            key="$(printf 'cput-r%02d-k%02d.json' "$round" "$k")"
+            (
+                "$RACE_PROBE" -endpoints "$endpoint_list" -bucket "$BUCKET" -key "$key" \
+                    -bodies "$bodies" -region "$REGION" \
+                    -access-key "$ACCESS_KEY" -secret-key "$SECRET_KEY" \
+                    > "$outdir/${key}.race" 2>>"$outdir/put-errors.txt"
+            ) &
+            pids+=("$!")
+        done
+        for p in "${pids[@]}"; do wait "$p" || true; done
+        log "concurrent-put: round $round wrote $keys_n keys with $writers simultaneous writers each"
+    done
+
+    # Read back through a gate that wrote nothing in the last round, so a
+    # cached anything on the writing gate cannot answer for the cluster.
+    local read_gate="${gates[${#gates[@]} - 1]}"
+    local got="$WORK_DIR/cput-got.json" acked seen bad_keys=()
+    for round in $(seq 1 "$rounds"); do
+        for k in $(seq 1 "$keys_n"); do
+            key="$(printf 'cput-r%02d-k%02d.json' "$round" "$k")"
+            CPUT_CASES=$(( CPUT_CASES + 1 ))
+
+            # Only a 2xx is a promise. A writer told its epoch was superseded is
+            # not owed the object, so its body is not an acceptable answer.
+            acked=" $(awk '/^writer=/ && /status=2[0-9][0-9]/ {
+                sub(/^writer=/, "", $1); printf "%s ", $1 }' "$outdir/${key}.race")"
+            acked="${acked% }"
+            if [ -z "${acked// /}" ]; then
+                log "concurrent-put: FAIL $key had no acknowledged writer, so nothing published it"
+                CPUT_FAILURES=$(( CPUT_FAILURES + 1 ))
+                bad_keys+=("$key")
+                continue
+            fi
+
+            if ! aws_s3 "$read_gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+                s3api get-object --bucket "$BUCKET" --key "$key" "$got" \
+                >/dev/null 2>>"$outdir/get-errors.txt"; then
+                log "concurrent-put: FAIL $key is unreadable after$acked were acknowledged"
+                CPUT_FAILURES=$(( CPUT_FAILURES + 1 ))
+                bad_keys+=("$key")
+                continue
+            fi
+
+            seen="$(cput_generation_of "$got" "$writers")"
+            case " $acked " in
+                *" $seen "*) ;;
+                *)
+                    log "concurrent-put: FAIL $key reads as $seen, which no acknowledged writer sent ($acked)"
+                    cp "$got" "$RUN_DIR/concurrent-put-${key}"
+                    CPUT_FAILURES=$(( CPUT_FAILURES + 1 ))
+                    bad_keys+=("$key")
+                    ;;
+            esac
+        done
+    done
+
+    # Whether it is permanent is the difference between a defect and a delay,
+    # and repair runs by default, so a key still broken after a sweep interval
+    # is one nothing in the system will mend.
+    if [ "${#bad_keys[@]}" -gt 0 ]; then
+        log "concurrent-put: ${#bad_keys[@]} keys broken; waiting one repair interval to see whether anything mends them"
+        sleep "${STRESS_CPUT_RECHECK_S:-45}"
+        local recovered=0
+        for key in "${bad_keys[@]}"; do
+            if aws_s3 "$read_gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+                s3api get-object --bucket "$BUCKET" --key "$key" "$got" >/dev/null 2>&1; then
+                recovered=$(( recovered + 1 ))
+            fi
+        done
+        log "concurrent-put: $recovered of ${#bad_keys[@]} broken keys became readable again"
+        grep -oE 'An error occurred \([A-Za-z]+\)' "$outdir/get-errors.txt" 2>/dev/null \
+            | sort | uniq -c | while read -r n code; do
+                log "concurrent-put: read error $code x$n"
+            done
+    fi
+
+    aws_s3 "$first_gate" s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true
+
+    if [ "$CPUT_FAILURES" -eq 0 ]; then
+        log "concurrent-put: passed $CPUT_CASES assertions"
+    else
+        log "concurrent-put: FAILED $CPUT_FAILURES of $CPUT_CASES assertions"
+    fi
+}
+
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = concurrent-put ]; then
+    run_concurrent_put
+
+    if [ "$SCENARIO" = concurrent-put ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$CPUT_FAILURES" -eq 0 ] \
+            || fail "concurrent-put failed $CPUT_FAILURES of $CPUT_CASES assertions"
+        exit 0
+    fi
+
+    log "round trip after concurrent-put, before the torn-overwrite scenario"
+    round_trip "https://$(gate_endpoints "$CONFIG_FILE" | head -1)" post-cput \
+        || fail "the cluster did not take writes after the concurrent-put scenario"
+fi
+
 # --- Scenario: torn-overwrite ---
 #
 # An overwrite is not atomic across an object's shards. writeObject sends every
@@ -2212,21 +2422,6 @@ fi
 # fatal so the freeze test below still runs while this one is red.
 TORN_FAILURES=0
 TORN_CASES=0
-
-# A state document rather than random bytes, because the objects this destroyed
-# in production were volume state: every record carries the generation that
-# wrote it, so a mixture is legible in the file itself rather than only as a
-# checksum that no longer matches. Both generations are byte-for-byte the same
-# length, which is what an in-place rewrite of a state document looks like and
-# what keeps the stored size honest.
-make_state() {
-    awk -v gen="$1" -v n="$3" 'BEGIN {
-        printf "{\n  \"v\": 1,\n  \"generation\": \"%s\",\n", gen
-        for (i = 1; i <= n; i++)
-            printf "  \"extent_%06d\": \"%s-%06d-0123456789abcdef0123456789abcdef\",\n", i, gen, i
-        printf "  \"trailer\": \"%s\"\n}\n", gen
-    }' > "$2"
-}
 
 # generation_of classifies what came back against the $V1 and $V2 the calling
 # scenario built. Neither generation intact is the finding: a spliced object is
@@ -2862,3 +3057,5 @@ echo "Stress results: $RUN_DIR"
     || fail "large-object failed $LARGE_FAILURES of $LARGE_CASES assertions"
 [ "$LM_FAILURES" -eq 0 ] \
     || fail "last-modified failed $LM_FAILURES of $LM_CASES assertions"
+[ "$CPUT_FAILURES" -eq 0 ] \
+    || fail "concurrent-put failed $CPUT_FAILURES of $CPUT_CASES assertions"
