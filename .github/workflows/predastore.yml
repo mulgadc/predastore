@@ -97,9 +97,21 @@ jobs:
       - name: Govulncheck
         run: go tool govulncheck ./...
 
+  # The S3 protocol surface, on one node and the two fastest suites. The full
+  # five-suite run against a four-node cluster, the stress scenarios and the
+  # Warp suite live in predastore-e2e.yml, on push to dev and on dispatch.
+  #
+  # This stays on the pull-request path rather than moving with them: it is the
+  # only gate on the S3 surface before a merge, and an SDK-default upload
+  # storing its aws-chunked framing as object data and answering 200 is exactly
+  # the class of defect it catches.
   s3_compatibility:
-    name: S3 Compatibility
+    name: S3 Compatibility (single node)
     runs-on: ubuntu-26.04
+    timeout-minutes: 20
+
+    env:
+      COMPOSE_FILE: deploy/compose.single.yml
 
     steps:
       - name: Checkout Code
@@ -111,11 +123,9 @@ jobs:
       - name: Build Image
         run: make docker-build
 
-      - name: Start Cluster
-        run: make compose-up
+      - name: Start Node
+        run: make compose-up COMPOSE_FILE="$COMPOSE_FILE"
 
-      # Every gate answers for the whole cluster, so waiting on one is enough
-      # to know the cluster elected a leader and opened its blob nodes.
       - name: Wait for Readiness
         run: |
           for _ in $(seq 1 60); do
@@ -124,19 +134,19 @@ jobs:
             fi
             sleep 2
           done
-          echo "cluster did not become ready" >&2
-          docker compose -f deploy/compose.cluster.yml logs --tail 50
+          echo "node did not become ready" >&2
+          docker compose -f "$COMPOSE_FILE" logs --tail 50
           exit 1
 
       # Predastore fails several checks today, so this gates on regressions
       # against scripts/smoke-baseline.txt rather than on a clean run.
       - name: Smoke Suite
-        run: make docker-smoke
+        run: make docker-smoke SMOKE_SUITES="image aws"
 
-      - name: Cluster Logs
+      - name: Node Logs
         if: failure()
-        run: docker compose -f deploy/compose.cluster.yml logs --tail 200
+        run: docker compose -f "$COMPOSE_FILE" logs --tail 200
 
-      - name: Stop Cluster
+      - name: Stop Node
         if: always()
-        run: make compose-down
+        run: make compose-down COMPOSE_FILE="$COMPOSE_FILE"
