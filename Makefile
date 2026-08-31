@@ -176,6 +176,24 @@ e2e-stress: build certs warp-install
 		WARP="$(WARP)" \
 		./scripts/bench/e2e-stress.sh
 
+# Two scenarios fail today, so CI gates on a regression against
+# scripts/stress-baseline.txt rather than on a clean run. STRESS_SCENARIOS
+# narrows it: `make e2e-stress-gate STRESS_SCENARIOS=freeze`.
+STRESS_BASELINE  ?= scripts/stress-baseline.txt
+STRESS_SCENARIOS ?=
+e2e-stress-gate: build certs warp-install
+	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
+		STRESS_HOST="$(STRESS_HOST)" STRESS_BASELINE="$(STRESS_BASELINE)" \
+		WARP="$(WARP)" \
+		./scripts/bench/stress-gate.sh $(STRESS_SCENARIOS)
+
+# Re-record the baseline. Run it when a fix lands, in the same change.
+e2e-stress-baseline: build certs warp-install
+	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
+		STRESS_HOST="$(STRESS_HOST)" STRESS_WRITE_BASELINE="$(STRESS_BASELINE)" \
+		WARP="$(WARP)" \
+		./scripts/bench/stress-gate.sh $(STRESS_SCENARIOS)
+
 # NilAway — advisory nil-panic analysis. Not in preflight: it has a known
 # false-positive rate, so findings are triaged by hand rather than gating commits.
 nilaway:
@@ -183,4 +201,5 @@ nilaway:
 
 .PHONY: certs build go_build preflight test test-cover test-race test-integration diff-coverage \
 	clean lint fix govulncheck nilaway warp-install e2e-performance e2e-performance-compare \
-	e2e-stress docker-build docker-smoke docker-smoke-baseline compose-up compose-down
+	e2e-stress e2e-stress-gate e2e-stress-baseline \
+	docker-build docker-smoke docker-smoke-baseline compose-up compose-down
