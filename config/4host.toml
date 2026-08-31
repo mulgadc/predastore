@@ -37,9 +37,14 @@ parity = 1
 # data_dir, tls_cert, tls_key and encryption_key are deliberately absent:
 # they are host-local, and start.sh passes them as flags so this file stays
 # identical on every machine.
+#
+# admin_port serves /healthz and /readyz on the host's bind address, as plain
+# HTTP with no authentication. It is safe here because each host is a loopback
+# alias; on a public interface keep it on the private side or leave it out.
 [[host]]
 id = 1
 addr = "10.11.12.1"
+admin_port = 9099
 
   [[host.node]]
   id = 1
@@ -59,6 +64,7 @@ addr = "10.11.12.1"
 [[host]]
 id = 2
 addr = "10.11.12.2"
+admin_port = 9099
 
   [[host.node]]
   id = 4
@@ -78,6 +84,7 @@ addr = "10.11.12.2"
 [[host]]
 id = 3
 addr = "10.11.12.3"
+admin_port = 9099
 
   [[host.node]]
   id = 7
@@ -97,6 +104,7 @@ addr = "10.11.12.3"
 [[host]]
 id = 4
 addr = "10.11.12.4"
+admin_port = 9099
 
   [[host.node]]
   id = 10

@@ -1,0 +1,230 @@
+# Predastore end-to-end suites.
+#
+# Split out of Build and Test so a pull request is not gated on a four-node
+# cluster, and so the two suites that already existed but were invoked by no
+# workflow finally run somewhere.
+#
+# Build and Test keeps a trimmed compatibility job on the pull-request path.
+# The point of the split is to move the slow half, not to stop checking the S3
+# surface before a merge.
+name: E2E
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+      - Makefile
+      - Dockerfile
+      - .dockerignore
+      - "deploy/**"
+      - "config/**"
+      - "scripts/**"
+      - .github/workflows/predastore-e2e.yml
+  workflow_dispatch:
+    inputs:
+      smoke_suites:
+        description: "Smoke suites to run (empty = all: image aws rclone restic registry)"
+        required: false
+        default: ""
+      stress_scenarios:
+        description: "Stress scenarios to run (empty = all: partial-put torn-overwrite freeze)"
+        required: false
+        default: ""
+      run_performance:
+        description: "Also run the Warp performance suite"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    name: S3 Compatibility (cluster)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      # Builds the image the same way an operator would, which is also the
+      # only place the FIPS build guard runs: a binary built without GOFIPS140
+      # compiles cleanly and then panics in init().
+      - name: Build Image
+        run: make docker-build
+
+      - name: Start Cluster
+        run: make compose-up
+
+      # Every gate answers for the whole cluster, so waiting on one is enough
+      # to know the cluster elected a leader and opened its blob nodes.
+      - name: Wait for Readiness
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:9099/readyz >/dev/null; then
+              curl -sS http://127.0.0.1:9099/readyz; echo; exit 0
+            fi
+            sleep 2
+          done
+          echo "cluster did not become ready" >&2
+          docker compose -f deploy/compose.cluster.yml logs --tail 50
+          exit 1
+
+      # Every failing check fails this job. The suite exists to say whether
+      # predastore is S3 compatible, and it is not yet, so this stays red until
+      # the remaining gaps close. The baseline is still read, to mark each
+      # failure as a known gap or a new one in the job summary.
+      - name: Smoke Suite
+        run: make docker-smoke-strict SMOKE_SUITES="${{ inputs.smoke_suites }}"
+
+      - name: Cluster Logs
+        if: failure()
+        run: docker compose -f deploy/compose.cluster.yml logs --tail 200
+
+      - name: Stop Cluster
+        if: always()
+        run: make compose-down
+
+  conformance:
+    name: S3 Conformance (ceph/s3-tests)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          cache-dependency-path: "go.sum"
+          go-version-file: "go.mod"
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build
+        run: make build
+
+      # No container here. The suite needs the three accounts and the us-east-1
+      # region that only config/s3tests.toml carries, and render-config.sh emits
+      # exactly one account, so the image cannot serve this run without being
+      # handed a mounted profile.
+      - name: Start Cluster
+        run: ./scripts/start.sh -w s3tests
+
+      # Comparison, never strict. Predastore fails a large part of s3-tests and
+      # will for a long while, so the question this job answers is whether the
+      # branch moved anything, not whether the suite is green.
+      - name: Conformance Suite
+        run: make s3-tests
+
+      - name: Upload Manifest
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: s3-tests-manifest
+          path: /tmp/predastore-s3-tests/manifest.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Cluster Logs
+        if: failure()
+        run: tail -n 200 /tmp/predastore/s3tests/logs/*.log
+
+      - name: Stop Cluster
+        if: always()
+        run: ./scripts/stop.sh s3tests
+
+  stress:
+    name: Stress (${{ matrix.scenario }})
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    # One leg per scenario. e2e-stress.sh aborts on its first failed assertion,
+    # so chaining them means a known-red scenario hides every one after it.
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [partial-put, torn-overwrite, freeze]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          cache-dependency-path: "go.sum"
+          go-version-file: "go.mod"
+
+      # A failing scenario fails this job. torn-overwrite is red today and it
+      # should look red: an overwrite with no commit point across its shards
+      # leaves the object part new and part old, served as a 200 with the right
+      # length and ETag. The baseline marks it as known rather than excusing it.
+      - name: Run Scenario
+        if: inputs.stress_scenarios == '' || contains(inputs.stress_scenarios, matrix.scenario)
+        run: make e2e-stress-strict STRESS_SCENARIOS=${{ matrix.scenario }}
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: stress-${{ matrix.scenario }}
+          path: scripts/bench/results/e2e-stress/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  performance:
+    name: Performance (Warp)
+    # Pinned to the dedicated runner for two reasons: the compare preset writes
+    # tens of gigabytes, which no hosted runner has, and a throughput baseline
+    # compared across hosts reports a difference in machines as a regression.
+    runs-on: [self-hosted, ci-predastore]
+    timeout-minutes: 45
+    # inputs is null on a push, and GitHub coerces both sides of != to a number,
+    # so `inputs.run_performance != false` is `0 != 0` there and the job never
+    # runs. The event has to be checked first.
+    if: github.event_name != 'workflow_dispatch' || inputs.run_performance
+
+    # A fixed group with no ref in it, so every performance run across every
+    # branch queues behind the one in flight. Killing a benchmark part way
+    # through wastes the whole run and leaves a cluster and its data behind,
+    # which is why this waits rather than cancels.
+    concurrency:
+      group: predastore-performance
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          cache-dependency-path: "go.sum"
+          go-version-file: "go.mod"
+
+      # Artefacts only. Gating this on throughput is mulga-wpjsx, and it has to
+      # gate TTFB p99 rather than mean throughput: measured spread on this
+      # harness is 8.8-14.9% run to run, and back-to-back runs on one host show
+      # a systematic penalty to whichever runs second.
+      - name: Run Warp Suite
+        run: make e2e-performance
+
+      - name: Upload Results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: performance
+          path: scripts/bench/results/e2e-performance/
+          if-no-files-found: ignore
+          retention-days: 30

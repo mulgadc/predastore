@@ -38,9 +38,14 @@ parity = 1
 # data_dir, tls_cert, tls_key and encryption_key are deliberately absent:
 # they are host-local, and start.sh passes them as flags so this file stays
 # identical on every machine.
+#
+# admin_port serves /healthz and /readyz on the host's bind address, as plain
+# HTTP with no authentication. 9099 is clear of the 8660 the spinifex-managed
+# predastore on these machines uses, so both admin listeners can run at once.
 [[host]]
 id = 1
 addr = "10.10.8.4"
+admin_port = 9099
 
   [[host.node]]
   id = 1
@@ -60,6 +65,7 @@ addr = "10.10.8.4"
 [[host]]
 id = 2
 addr = "10.10.8.5"
+admin_port = 9099
 
   [[host.node]]
   id = 4
@@ -79,6 +85,7 @@ addr = "10.10.8.5"
 [[host]]
 id = 3
 addr = "10.10.8.6"
+admin_port = 9099
 
   [[host.node]]
   id = 7

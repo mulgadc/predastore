@@ -1,0 +1,28 @@
+# One predastore container: gate, meta and one blob node in a single process,
+# RS(1,0). Redundancy is whatever sits under the volume.
+#
+#   docker compose -f deploy/compose.single.yml up -d
+#   aws --endpoint-url https://127.0.0.1:8443 --no-verify-ssl s3 ls
+#
+# Nothing is generated ahead of time: the entrypoint mints a TLS identity and
+# an at-rest key into the volume on first start.
+
+name: predastore-single
+
+services:
+  predastore:
+    image: ${PREDA_IMAGE:-predastore:dev}
+    build:
+      context: ../
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${PREDA_S3_PUBLISH:-8443}:8443"
+      - "${PREDA_ADMIN_PUBLISH:-9099}:9099"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - preda-data:/var/lib/predastore
+
+volumes:
+  preda-data:

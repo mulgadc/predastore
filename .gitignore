@@ -36,3 +36,6 @@ scripts/bench/results
 
 # rapid property-test replay artifacts, written on failure
 **/testdata/rapid/
+
+# Bytecode from the conformance harness plugin.
+__pycache__/

@@ -65,11 +65,11 @@ func BenchmarkPutWritePath(b *testing.B) {
 
 					require.NoError(b, verifyPut(req))
 
-					decoded, size := decodeBody(req)
+					decoded, size, dec := decodeBody(req)
 					_, _, err := f.write(ctx, objectHash, decoded, size)
 					require.NoError(b, err)
 
-					require.NoError(b, finishPayload(req))
+					require.NoError(b, finishPayload(req, dec))
 				}
 			})
 		}

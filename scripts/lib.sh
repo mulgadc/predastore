@@ -62,18 +62,20 @@ meta_nodes() {
     ' "$1"
 }
 
-# render_profile copies the profile named by $1 to $2 with every node port
-# shifted by $3, so a harness can run beside a cluster already holding the
-# defaults. Ports appear only under [[host.node]], so a plain key match is
-# enough and stays readable.
+# render_profile copies the profile named by $1 to $2 with every node port and
+# the host admin_port shifted by $3, so a harness can run beside a cluster
+# already holding the defaults. A zero is left alone: on admin_port that is the
+# off switch, and shifting it would start a listener nobody asked for.
 render_profile() {
     awk -v offset="$3" '
-        /^[[:space:]]*port[[:space:]]*=/ {
-            match($0, /[0-9]+/)
-            printf "%s%d%s\n", substr($0, 1, RSTART - 1), \
-                substr($0, RSTART, RLENGTH) + offset, substr($0, RSTART + RLENGTH)
-            next
+        function shift(line,   val) {
+            match(line, /[0-9]+/)
+            val = substr(line, RSTART, RLENGTH) + 0
+            if (val == 0) return line
+            return sprintf("%s%d%s", substr(line, 1, RSTART - 1), \
+                val + offset, substr(line, RSTART + RLENGTH))
         }
+        /^[[:space:]]*(admin_)?port[[:space:]]*=/ { print shift($0); next }
         { print }
     ' "$1" > "$2"
 }

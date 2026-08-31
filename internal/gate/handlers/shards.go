@@ -15,6 +15,7 @@ import (
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/blob/engine"
 	"github.com/mulgadc/predastore/internal/config"
+	"github.com/mulgadc/predastore/internal/gate/chunked"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 	"github.com/mulgadc/predastore/internal/telemetry"
@@ -110,21 +111,42 @@ func fullWidth(total int) writeResult {
 // mapPutErr translates a shard-write error into the S3 error returned to the
 // client. A pool-full shard write must surface as 507, not the generic 500
 // other failures get.
+//
+// The body is read through the decoder as the shards are written, so a framing
+// or signature failure arrives here rather than at the end of the body. Those
+// are the client's fault and must not be reported as ours.
 func mapPutErr(err error) *model.S3Error {
 	if errors.Is(err, engine.ErrStoreFull) {
 		return model.ErrInsufficientStorageError
 	}
+	if s3err, ok := model.IsS3Error(mapChunkedErr(err)); ok && !isInternal(s3err) {
+		return s3err
+	}
 	return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
+}
+
+// isInternal reports whether an S3 error is the generic server fault, which is
+// mapChunkedErr's answer for anything it does not recognise.
+func isInternal(err *model.S3Error) bool {
+	return err.Code == model.ErrInternalError
 }
 
 // writeFailureReason classifies a failed object write into one of the bounded
 // reasons the counter carries, drawing the same line mapPutErr draws for the
 // client: capacity is its own outcome, everything else is one bucket.
+//
+// A body the client malformed is not a shard-write failure, and counting it as
+// one makes the storage-failure metric fire on client errors.
 func writeFailureReason(err error) string {
-	if errors.Is(err, engine.ErrStoreFull) {
+	switch {
+	case errors.Is(err, engine.ErrStoreFull):
 		return telemetry.WriteReasonStoreFull
+	case errors.Is(err, chunked.ErrChunkSignature),
+		errors.Is(err, chunked.ErrMalformedFraming):
+		return telemetry.WriteReasonBadRequest
+	default:
+		return telemetry.WriteReasonShardWrite
 	}
-	return telemetry.WriteReasonShardWrite
 }
 
 // placeShards resolves where an object's shards live, in the ring order

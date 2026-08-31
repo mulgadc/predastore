@@ -1,0 +1,105 @@
+# Four predastore hosts, RS(2,1), each with a gate, a meta replica and a blob
+# node. Colocated nodes talk over the in-process pipe; nodes on different hosts
+# talk over QUIC.
+#
+#   deploy/docker/gen-certs.sh
+#   docker compose -f deploy/compose.cluster.yml up -d
+#   aws --endpoint-url https://127.0.0.1:8443 --no-verify-ssl s3 ls
+#
+# Every gate answers for the whole cluster, so 8443-8446 are four ways into the
+# same thing. That is what makes the smoke suite able to write through one gate
+# and read through another.
+#
+# The addresses are static because peers dial `addr` from the rendered config
+# and a wildcard names nothing they can reach. The gateway is moved to .254:
+# Docker claims the first host address in a subnet for the bridge, which is
+# host 1 here.
+
+name: predastore-cluster
+
+x-preda: &preda
+  image: ${PREDA_IMAGE:-predastore:dev}
+  build:
+    context: ../
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  environment: &preda-env
+    PREDA_PEERS: ${PREDA_SUBNET:-10.11.12}.1,${PREDA_SUBNET:-10.11.12}.2,${PREDA_SUBNET:-10.11.12}.3,${PREDA_SUBNET:-10.11.12}.4
+    PREDA_ACCESS_KEY_ID: ${PREDA_ACCESS_KEY_ID:-AKIAIOSFODNN7EXAMPLE}
+    PREDA_SECRET_ACCESS_KEY: ${PREDA_SECRET_ACCESS_KEY:-wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY}
+    PREDA_TLS_CERT: /etc/predastore/tls/server.pem
+    PREDA_TLS_KEY: /etc/predastore/tls/server.key
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+  volumes:
+    - ./docker/certs:/etc/predastore/tls:ro
+
+services:
+  preda-1:
+    <<: *preda
+    environment:
+      <<: *preda-env
+      PREDA_HOST_ID: "1"
+    ports:
+      - "8443:8443"
+      - "9099:9099"
+    volumes:
+      - ./docker/certs:/etc/predastore/tls:ro
+      - preda-1-data:/var/lib/predastore
+    networks:
+      preda:
+        ipv4_address: ${PREDA_SUBNET:-10.11.12}.1
+
+  preda-2:
+    <<: *preda
+    environment:
+      <<: *preda-env
+      PREDA_HOST_ID: "2"
+    ports:
+      - "8444:8443"
+    volumes:
+      - ./docker/certs:/etc/predastore/tls:ro
+      - preda-2-data:/var/lib/predastore
+    networks:
+      preda:
+        ipv4_address: ${PREDA_SUBNET:-10.11.12}.2
+
+  preda-3:
+    <<: *preda
+    environment:
+      <<: *preda-env
+      PREDA_HOST_ID: "3"
+    ports:
+      - "8445:8443"
+    volumes:
+      - ./docker/certs:/etc/predastore/tls:ro
+      - preda-3-data:/var/lib/predastore
+    networks:
+      preda:
+        ipv4_address: ${PREDA_SUBNET:-10.11.12}.3
+
+  preda-4:
+    <<: *preda
+    environment:
+      <<: *preda-env
+      PREDA_HOST_ID: "4"
+    ports:
+      - "8446:8443"
+    volumes:
+      - ./docker/certs:/etc/predastore/tls:ro
+      - preda-4-data:/var/lib/predastore
+    networks:
+      preda:
+        ipv4_address: ${PREDA_SUBNET:-10.11.12}.4
+
+networks:
+  preda:
+    ipam:
+      config:
+        - subnet: ${PREDA_SUBNET:-10.11.12}.0/24
+          gateway: ${PREDA_SUBNET:-10.11.12}.254
+
+volumes:
+  preda-1-data:
+  preda-2-data:
+  preda-3-data:
+  preda-4-data:
