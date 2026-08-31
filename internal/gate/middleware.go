@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
@@ -14,6 +15,7 @@ import (
 	"github.com/mulgadc/bluebottle/pkg/ratelimit"
 	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/gate/auth"
+	"github.com/mulgadc/predastore/internal/gate/chunked"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 )
 
@@ -136,7 +138,8 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			expectedRegion = globalSigningRegion
 		}
 
-		if _, err := sig.Verify(credResult.SecretAccessKey, expectedRegion, "s3"); err != nil {
+		verified, err := sig.Verify(credResult.SecretAccessKey, expectedRegion, "s3")
+		if err != nil {
 			handlers.RespondSigV4Error(w, r, accessKey, err, nil)
 			return
 		}
@@ -200,6 +203,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), auth.ContextKeyAccessKeyID, accessKey)
 		ctx = context.WithValue(ctx, auth.ContextKeyAccountID, credResult.AccountID)
 		ctx = context.WithValue(ctx, auth.ContextKeyServiceAccount, credResult.SkipPolicyCheck)
+		ctx = handlers.WithSignedPayload(ctx, signedPayload(verified))
 		// The transaction span opens before authentication, so the account it
 		// resolved to can only be named here. One cluster serves many accounts
 		// and S3 is where a tenant's data lives, so an unattributed request is
@@ -207,4 +211,24 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		annotateSpanAccount(ctx, credResult.AccountID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// signedPayload is what the write path needs to decode and authenticate a body:
+// the sentinel the client signed, and for a signed streaming upload the seed of
+// its chunk signature chain.
+//
+// Only the chain's inputs are carried, never the verified request itself. The
+// write path continues one chain; it has no business re-signing anything.
+func signedPayload(v *sigv4.VerifiedRequest) handlers.SignedPayload {
+	p := handlers.SignedPayload{Signed: true, Mode: v.Canonical.PayloadMode}
+	if p.Mode != sigv4.StreamingSigned && p.Mode != sigv4.StreamingSignedTrailer {
+		return p
+	}
+	scope := strings.Join([]string{
+		v.Credential.Date, v.Credential.Region, v.Credential.Service, sigv4.AmzScopeTerminator,
+	}, "/")
+	p.Chain = chunked.NewChain(
+		v.SigningKey, v.Signature, scope, v.Timestamp.UTC().Format(sigv4.AmzTimeFormat),
+	)
+	return p
 }

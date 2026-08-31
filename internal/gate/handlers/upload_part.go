@@ -43,7 +43,7 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 
 		// The part is written as it arrives, so its length has to be known
 		// before the body is read rather than measured from what was buffered.
-		body, partSize := decodeBody(r)
+		body, partSize, dec := decodeBody(r)
 		if partSize < 0 {
 			HandleError(w, r, model.ErrMissingContentLengthError)
 			return
@@ -72,7 +72,7 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		}
 		// The part is only reachable once its metadata lands below, so a failed
 		// payload check here leaves nothing CompleteMultipartUpload can assemble.
-		if err := finishPayload(r); err != nil {
+		if err := finishPayload(r, dec); err != nil {
 			HandleError(w, r, err)
 			return
 		}
