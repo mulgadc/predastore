@@ -11,6 +11,7 @@ PASS|HeadObject
 PASS|GetObject
 PASS|GetObject (range)
 PASS|Multipart upload (16 MiB)
+PASS|ListObjectsV2 pagination
 FAIL|ETag is the body MD5
 FAIL|CopyObject (server-side)
 FAIL|DeleteObjects (bulk)

@@ -22,15 +22,22 @@ type ListObjectsV2_Contents struct {
 	StorageClass string    `xml:"StorageClass"`
 }
 
+// ListObjectsV2 answers GET /{bucket}. The cursor fields are omitted when
+// empty: a client that sees an empty NextContinuationToken on a truncated
+// listing has no way to tell it apart from one it can follow.
 type ListObjectsV2 struct {
-	XMLName        xml.Name                  `xml:"ListBucketResult"`
-	Name           string                    `xml:"Name"`
-	Prefix         string                    `xml:"Prefix"`
-	KeyCount       int                       `xml:"KeyCount"`
-	MaxKeys        int                       `xml:"MaxKeys"`
-	IsTruncated    bool                      `xml:"IsTruncated"`
-	Contents       *[]ListObjectsV2_Contents `xml:"Contents"`
-	CommonPrefixes *[]ListObjectsV2_Dir      `xml:"CommonPrefixes"`
+	XMLName               xml.Name                  `xml:"ListBucketResult"`
+	Name                  string                    `xml:"Name"`
+	Prefix                string                    `xml:"Prefix"`
+	Delimiter             string                    `xml:"Delimiter,omitempty"`
+	KeyCount              int                       `xml:"KeyCount"`
+	MaxKeys               int                       `xml:"MaxKeys"`
+	IsTruncated           bool                      `xml:"IsTruncated"`
+	ContinuationToken     string                    `xml:"ContinuationToken,omitempty"`
+	NextContinuationToken string                    `xml:"NextContinuationToken,omitempty"`
+	StartAfter            string                    `xml:"StartAfter,omitempty"`
+	Contents              *[]ListObjectsV2_Contents `xml:"Contents"`
+	CommonPrefixes        *[]ListObjectsV2_Dir      `xml:"CommonPrefixes"`
 }
 
 /*
