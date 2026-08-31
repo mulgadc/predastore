@@ -59,6 +59,14 @@ docker-smoke:
 	@PREDA_IMAGE=$(DOCKER_IMAGE) PREDA_BASELINE=$(SMOKE_BASELINE) \
 		./scripts/smoke.sh $(SMOKE_SUITES)
 
+# Fails on any failing check. This is the honest question — is predastore S3
+# compatible — and it is red until the remaining gaps are closed. The
+# regression form above is what a pull request runs, so a branch is not red
+# for defects it did not introduce.
+docker-smoke-strict:
+	@PREDA_IMAGE=$(DOCKER_IMAGE) PREDA_BASELINE=$(SMOKE_BASELINE) PREDA_STRICT=1 \
+		./scripts/smoke.sh $(SMOKE_SUITES)
+
 # Re-record the baseline. Run it when a fix lands, in the same change.
 docker-smoke-baseline:
 	@PREDA_IMAGE=$(DOCKER_IMAGE) PREDA_WRITE_BASELINE=$(SMOKE_BASELINE) \
@@ -187,6 +195,15 @@ e2e-stress-gate: build certs warp-install
 		WARP="$(WARP)" \
 		./scripts/bench/stress-gate.sh $(STRESS_SCENARIOS)
 
+# Fails on any failing scenario. Red until torn-overwrite is fixed, which is
+# the point: an overwrite that leaves an object part new and part old is data
+# loss on the ordinary write path.
+e2e-stress-strict: build certs warp-install
+	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
+		STRESS_HOST="$(STRESS_HOST)" STRESS_BASELINE="$(STRESS_BASELINE)" \
+		STRESS_STRICT=1 WARP="$(WARP)" \
+		./scripts/bench/stress-gate.sh $(STRESS_SCENARIOS)
+
 # Re-record the baseline. Run it when a fix lands, in the same change.
 e2e-stress-baseline: build certs warp-install
 	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
@@ -201,5 +218,6 @@ nilaway:
 
 .PHONY: certs build go_build preflight test test-cover test-race test-integration diff-coverage \
 	clean lint fix govulncheck nilaway warp-install e2e-performance e2e-performance-compare \
-	e2e-stress e2e-stress-gate e2e-stress-baseline \
-	docker-build docker-smoke docker-smoke-baseline compose-up compose-down
+	e2e-stress e2e-stress-gate e2e-stress-strict e2e-stress-baseline \
+	docker-build docker-smoke docker-smoke-strict docker-smoke-baseline \
+	compose-up compose-down

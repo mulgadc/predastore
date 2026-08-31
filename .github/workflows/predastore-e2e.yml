@@ -77,10 +77,12 @@ jobs:
           docker compose -f deploy/compose.cluster.yml logs --tail 50
           exit 1
 
-      # Predastore fails several checks today, so this gates on regressions
-      # against scripts/smoke-baseline.txt rather than on a clean run.
+      # Every failing check fails this job. The suite exists to say whether
+      # predastore is S3 compatible, and it is not yet, so this stays red until
+      # the remaining gaps close. The baseline is still read, to mark each
+      # failure as a known gap or a new one in the job summary.
       - name: Smoke Suite
-        run: make docker-smoke SMOKE_SUITES="${{ inputs.smoke_suites }}"
+        run: make docker-smoke-strict SMOKE_SUITES="${{ inputs.smoke_suites }}"
 
       - name: Cluster Logs
         if: failure()
@@ -111,12 +113,13 @@ jobs:
           cache-dependency-path: "go.sum"
           go-version-file: "go.mod"
 
-      # torn-overwrite and the leader freeze fail against predastore today, so
-      # this gates on a regression against scripts/stress-baseline.txt. A job
-      # that is red from its first run is a job nobody reads.
+      # A failing scenario fails this job. torn-overwrite is red today and it
+      # should look red: an overwrite with no commit point across its shards
+      # leaves the object part new and part old, served as a 200 with the right
+      # length and ETag. The baseline marks it as known rather than excusing it.
       - name: Run Scenario
         if: inputs.stress_scenarios == '' || contains(inputs.stress_scenarios, matrix.scenario)
-        run: make e2e-stress-gate STRESS_SCENARIOS=${{ matrix.scenario }}
+        run: make e2e-stress-strict STRESS_SCENARIOS=${{ matrix.scenario }}
 
       - name: Upload Results
         if: always()
@@ -134,7 +137,10 @@ jobs:
     # compared across hosts reports a difference in machines as a regression.
     runs-on: [self-hosted, ci-predastore]
     timeout-minutes: 45
-    if: inputs.run_performance != false
+    # inputs is null on a push, and GitHub coerces both sides of != to a number,
+    # so `inputs.run_performance != false` is `0 != 0` there and the job never
+    # runs. The event has to be checked first.
+    if: github.event_name != 'workflow_dispatch' || inputs.run_performance
 
     # A fixed group with no ref in it, so every performance run across every
     # branch queues behind the one in flight. Killing a benchmark part way

@@ -19,6 +19,9 @@
 # Environment:
 #   STRESS_BASELINE        Baseline file (default: scripts/stress-baseline.txt)
 #   STRESS_WRITE_BASELINE  Record outcomes here instead of gating
+#   STRESS_STRICT          1 to fail on any failing scenario, not just a
+#                          regression. The baseline is still read, to separate
+#                          a known gap from a new one in the report.
 #   Everything e2e-stress.sh reads is passed through untouched.
 #
 set -uo pipefail
@@ -81,21 +84,32 @@ if [ -n "$WRITE_BASELINE" ]; then
     exit 0
 fi
 
+note() {
+    [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+    printf '::%s::%s\n' "${2:-warning}" "$1"
+}
+
 regressions=0
 fixed=0
+failed=0
 printf '\n=== gate ===\n'
 for r in "${RESULTS[@]}"; do
     IFS='|' read -r status scenario <<< "$r"
+    [ "$status" = FAIL ] && failed=$((failed + 1))
     want=$(grep -F "|$scenario" "$BASELINE" | cut -d'|' -f1 | head -1)
     if [ -z "$want" ]; then
         printf '  ? %s is not in the baseline\n' "$scenario"
+        note "$scenario is not in the baseline"
         continue
     fi
     if [ "$want" = PASS ] && [ "$status" = FAIL ]; then
         printf '  REGRESSION %s survived in the baseline and fails now\n' "$scenario"
+        note "REGRESSION: $scenario survived in the baseline and fails now" error
         regressions=$((regressions + 1))
     elif [ "$want" = FAIL ] && [ "$status" = PASS ]; then
         fixed=$((fixed + 1))
+    elif [ "$status" = FAIL ]; then
+        note "known gap: $scenario"
     fi
 done
 
@@ -104,5 +118,26 @@ if [ "$fixed" -gt 0 ]; then
         "$fixed" "$BASELINE"
 fi
 
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    {
+        printf '## Stress\n\n| Scenario | Result | Baseline |\n|---|---|---|\n'
+        for r in "${RESULTS[@]}"; do
+            IFS='|' read -r status scenario <<< "$r"
+            want=$(grep -F "|$scenario" "$BASELINE" | cut -d'|' -f1 | head -1)
+            # Backticks are markdown for the summary, not a substitution.
+            # shellcheck disable=SC2016
+            printf '| `%s` | %s | %s |\n' "$scenario" "$status" "${want:-not baselined}"
+        done
+        printf '\n%d regression(s), %d newly passing.\n\n' "$regressions" "$fixed"
+    } >> "$GITHUB_STEP_SUMMARY"
+fi
+
 printf '\n'
+
+# Strict asks whether the cluster survives the fault; the default asks whether
+# this change made it survive less well than it used to.
+if [ "${STRESS_STRICT:-}" = 1 ]; then
+    [ "$failed" -eq 0 ]
+    exit $?
+fi
 [ "$regressions" -eq 0 ]

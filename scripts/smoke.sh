@@ -24,6 +24,9 @@
 #                    if present, else it is taken from the endpoint itself.
 #   PREDA_BASELINE   Compare against this baseline and fail only on
 #                    regressions. See scripts/smoke-baseline.txt.
+#   PREDA_STRICT     1 to fail on any failing check, not just a regression.
+#                    The baseline is still read, to separate a known gap from
+#                    a new one in the report.
 #   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION
 
 set -uo pipefail
@@ -98,6 +101,40 @@ check() {
 }
 
 section() { printf '\n%s%s%s\n' "$BOLD" "$1" "$NC"; }
+
+# note <message> [warning|error] — a GitHub annotation, so a run that is green
+# still lists what is broken instead of showing a bare tick. Silent off CI.
+note() {
+    [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+    printf '::%s::%s\n' "${2:-warning}" "$1"
+}
+
+# summary <regressions> <known> <fixed> — the run's job summary. A checks list
+# says only pass or fail, and "no regressions against seven known gaps" is not
+# something a tick can express.
+summary() {
+    [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+    {
+        printf '## S3 compatibility\n\n'
+        printf '%d of %d checks pass.\n\n' "$PASSED" "$((PASSED + FAILED))"
+        printf '| Result | Count |\n|---|---|\n'
+        printf '| Passing | %d |\n' "$PASSED"
+        printf '| Known gaps | %d |\n' "$2"
+        printf '| **Regressions** | **%d** |\n' "$1"
+        printf '| Newly passing | %d |\n\n' "$3"
+        if [ "$FAILED" -gt 0 ]; then
+            printf '### Failing\n\n'
+            for r in "${RESULTS[@]}"; do
+                IFS='|' read -r status label code <<< "$r"
+                [ "$status" = FAIL ] || continue
+                # Backticks are markdown for the summary, not a substitution.
+                # shellcheck disable=SC2016
+                printf -- '- `%s`%s\n' "$label" "${code:+ — $code}"
+            done
+            printf '\n'
+        fi
+    } >> "$GITHUB_STEP_SUMMARY"
+}
 
 # Clients run on the host network so they reach the published gate the same way
 # an operator would, rather than through a compose-internal address.
@@ -401,18 +438,24 @@ if [ -n "${PREDA_BASELINE:-}" ]; then
 
     regressions=0
     fixed=0
+    known=0
     for r in "${RESULTS[@]}"; do
         IFS='|' read -r status label _ <<< "$r"
         want=$(grep -F "|$label" "$PREDA_BASELINE" | cut -d'|' -f1 | head -1)
         if [ -z "$want" ]; then
             printf '  %s?%s %s is not in the baseline\n' "$YELLOW" "$NC" "$label"
+            note "$label is not in the baseline" warning
             continue
         fi
         if [ "$want" = "PASS" ] && [ "$status" = "FAIL" ]; then
             printf '  %sREGRESSION%s %s passed in the baseline and fails now\n' "$RED" "$NC" "$label"
+            note "REGRESSION: $label passed in the baseline and fails now" error
             regressions=$((regressions + 1))
         elif [ "$want" = "FAIL" ] && [ "$status" = "PASS" ]; then
             fixed=$((fixed + 1))
+        elif [ "$status" = "FAIL" ]; then
+            note "known gap: $label" warning
+            known=$((known + 1))
         fi
     done
 
@@ -420,7 +463,17 @@ if [ -n "${PREDA_BASELINE:-}" ]; then
         printf '\n  %s%d check(s) now pass that the baseline expects to fail.%s Update %s.\n' \
             "$GREEN" "$fixed" "$NC" "$PREDA_BASELINE"
     fi
+
+    summary "$regressions" "$known" "$fixed"
     printf '\n'
+
+    # Strict asks whether predastore is correct; the default asks whether this
+    # change broke something that worked. A pull request answers the second —
+    # the first would leave every branch red on defects it did not introduce.
+    if [ "${PREDA_STRICT:-}" = 1 ]; then
+        [ "$FAILED" -eq 0 ]
+        exit $?
+    fi
     [ "$regressions" -eq 0 ]
     exit $?
 fi
