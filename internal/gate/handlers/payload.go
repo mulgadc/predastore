@@ -36,6 +36,18 @@ func (p SignedPayload) Framed() bool {
 	}
 }
 
+// PromisesTrailer reports whether the sentinel the client signed names a
+// trailing checksum. Both trailer modes commit to sending one, so a body that
+// then omits it has not kept the promise its signature covers.
+func (p SignedPayload) PromisesTrailer() bool {
+	switch p.Mode {
+	case sigv4.StreamingSignedTrailer, sigv4.StreamingUnsignedTrailer:
+		return true
+	default:
+		return false
+	}
+}
+
 type payloadContextKey struct{}
 
 // WithSignedPayload attaches the payload classification to a request context.

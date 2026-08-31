@@ -698,6 +698,9 @@ const (
 	WriteReasonStoreFull = "store_full"
 	// WriteReasonShardWrite is any other failure placing a shard.
 	WriteReasonShardWrite = "shard_write"
+	// WriteReasonBadRequest is a body the client malformed. It fails while the
+	// shards are being written but is not a storage fault.
+	WriteReasonBadRequest = "bad_request"
 	// WriteReasonMeta is shards that landed but whose placement could not be
 	// committed. The bytes are on disk and nothing references them.
 	WriteReasonMeta = "meta"

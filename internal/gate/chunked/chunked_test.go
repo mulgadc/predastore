@@ -173,9 +173,7 @@ func TestDecoder_VerifyTrailerChecksum_Missing(t *testing.T) {
 	_, err := io.ReadAll(dec)
 	require.NoError(t, err)
 
-	err = dec.VerifyTrailerChecksum()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "missing x-amz-checksum-crc64nvme trailer")
+	assert.ErrorIs(t, dec.VerifyTrailerChecksum(), ErrChecksumMissing)
 }
 
 func TestDecoder_VerifyTrailerChecksum_Valid(t *testing.T) {

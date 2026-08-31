@@ -19,6 +19,20 @@ var ErrChunkSignature = errors.New("chunk signature does not match")
 // answers to the client: one is malformed, the other is unauthenticated.
 var ErrMalformedFraming = errors.New("malformed aws-chunked framing")
 
+// ErrChecksumMissing is returned when a body promised a trailing checksum and
+// did not send one. The mode names the trailer, so its absence is malformed
+// rather than a client declining to checksum.
+var ErrChecksumMissing = errors.New("promised checksum trailer is absent")
+
+// ErrChecksumUndeclared is returned for a checksum trailer the client never
+// named in X-Amz-Trailer. Hashing has to begin before the body is read, so
+// there is nothing to compare it against.
+var ErrChecksumUndeclared = errors.New("checksum trailer was not declared")
+
+// ErrChecksumMismatch is returned when a body does not match the checksum it
+// carried.
+var ErrChecksumMismatch = errors.New("checksum does not match")
+
 // The string-to-sign prefixes AWS defines for the two links in the chain: one
 // per data chunk, and one for the trailing header block.
 const (

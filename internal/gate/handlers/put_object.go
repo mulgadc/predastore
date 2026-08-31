@@ -141,18 +141,35 @@ func finishPayload(r *http.Request, dec *chunked.Decoder) error {
 		return mapChunkedErr(err)
 	}
 
-	// Only crc64nvme is understood, so a client checksumming with anything else
-	// is left to the chunk signatures and the transport. Verifying what we do
-	// understand still covers the aws-cli default path.
-	if dec != nil {
-		if _, ok := dec.TrailerChecksum(); ok {
-			if err := dec.VerifyTrailerChecksum(); err != nil {
-				return model.ErrChecksumMismatchError
-			}
-		}
+	if dec == nil {
+		return nil
+	}
+
+	// A trailer mode names a trailing checksum in the sentinel the client
+	// signed, so an absent one is malformed rather than a client declining to
+	// checksum. On an unsigned trailer mode it is the body's only check.
+	_, _, sent := dec.ChecksumTrailer()
+	if !sent && !SignedPayloadFrom(r.Context()).PromisesTrailer() {
+		return nil
+	}
+	if err := dec.VerifyTrailerChecksum(); err != nil {
+		return mapChecksumErr(err)
 	}
 
 	return nil
+}
+
+// mapChecksumErr separates a body that failed its checksum from one that never
+// supplied a usable one. The first is a mismatch; the second is a request whose
+// integrity promise cannot be honoured, which is malformed.
+func mapChecksumErr(err error) error {
+	switch {
+	case errors.Is(err, chunked.ErrChecksumMissing),
+		errors.Is(err, chunked.ErrChecksumUndeclared):
+		return model.ErrMalformedChunkedBodyError
+	default:
+		return model.ErrChecksumMismatchError
+	}
 }
 
 // mapChunkedErr turns a framing failure into the response S3 gives for it. A
@@ -186,6 +203,11 @@ func decodeBody(r *http.Request) (io.Reader, int64, *chunked.Decoder) {
 	if chain := SignedPayloadFrom(r.Context()).Chain; chain != nil {
 		opts = append(opts, chunked.WithChain(chain))
 	}
+	// X-Amz-Trailer names the trailers to come, and hashing has to start before
+	// the body is read, so the promise is what selects the algorithm.
+	if promised := r.Header.Values("X-Amz-Trailer"); len(promised) > 0 {
+		opts = append(opts, chunked.WithTrailerChecksums(splitHeaderList(promised)))
+	}
 
 	// Content-Length on a chunked request measures the framing, not the object,
 	// so the decoded length is the only size the splitter can use. An absent or
@@ -195,8 +217,26 @@ func decodeBody(r *http.Request) (io.Reader, int64, *chunked.Decoder) {
 		dec := chunked.NewDecoder(r.Body, 0, opts...)
 		return dec, -1, dec
 	}
+	// The write path stops at the declared length, so the decoder has to hold
+	// the body to it as well; otherwise a short declaration stores a truncated
+	// object whose checksum still verifies over everything that was sent.
+	opts = append(opts, chunked.WithDeclaredLength(decodedLen))
 	dec := chunked.NewDecoder(r.Body, decodedLen, opts...)
 	return dec, decodedLen, dec
+}
+
+// splitHeaderList flattens a header that may repeat and may also carry a
+// comma-separated list in one value.
+func splitHeaderList(values []string) []string {
+	var out []string
+	for _, v := range values {
+		for part := range strings.SplitSeq(v, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
 }
 
 // bodyIsFramed reports whether the body carries aws-chunked framing.
