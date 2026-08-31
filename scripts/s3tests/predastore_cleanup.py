@@ -69,6 +69,15 @@ class ManifestRecorder:
         if current is None or _RANK[status] > _RANK[current]:
             self.results[report.nodeid] = status
 
+    def pytest_deselected(self, items):
+        # A deselected case -- filtered by -m or --deselect, marker and node id
+        # id alike -- never runs, so logreport never fires for it. Record it as
+        # SKIP here or it silently drops out of the manifest instead.
+        for item in items:
+            current = self.results.get(item.nodeid)
+            if current is None or _RANK['SKIP'] > _RANK[current]:
+                self.results[item.nodeid] = 'SKIP'
+
     def pytest_sessionfinish(self, session):
         with open(self.path, 'w', encoding='utf-8') as handle:
             for node in sorted(self.results):

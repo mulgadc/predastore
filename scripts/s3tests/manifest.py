@@ -33,12 +33,19 @@ def read(path):
 
 
 def read_skips(path):
-    """Deliberate non-support: `node id  # reason`, one per line."""
+    """Deliberate non-support: `node id  # reason`, one per line.
+
+    A `marker:name` line feeds a pytest `-m` deselect expression instead of a
+    node id -- scripts/s3-tests.sh builds that separately -- so there is no
+    single node id to force here. The deselected cases it covers still land in
+    the manifest, but through pytest_deselected in predastore_cleanup.py,
+    which runs against the actual collected items rather than a name pattern.
+    """
     skips = {}
     with open(path, encoding='utf-8') as handle:
         for line in handle:
             line = line.strip()
-            if not line or line.startswith('#'):
+            if not line or line.startswith('#') or line.startswith('marker:'):
                 continue
             node, _, reason = line.partition('#')
             node = node.strip()

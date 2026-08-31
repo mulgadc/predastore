@@ -174,13 +174,31 @@ RUN="$CACHE/run.txt"
 MANIFEST="$CACHE/manifest.txt"
 rm -f "$RUN" "$MANIFEST"
 
+# A `::` line is a node id and becomes --deselect. A `marker:name` line joins
+# a `-m "not A and not B..."` expression instead: some unimplemented families
+# (object lock, POST uploads, ACLs, CORS, public access block) have no ceph
+# marker to catch them, so node ids are the only way to exclude them.
 DESELECT=()
+MARKERS=()
 if [ -f "$SKIPS" ]; then
     while read -r line; do
         line="${line%%#*}"
         line="$(printf '%s' "$line" | tr -d '[:space:]')"
-        [ -n "$line" ] && DESELECT+=(--deselect "$line")
+        [ -z "$line" ] && continue
+        case "$line" in
+            marker:*) MARKERS+=("${line#marker:}") ;;
+            *)        DESELECT+=(--deselect "$line") ;;
+        esac
     done < "$SKIPS"
+fi
+
+MARK_EXPR=()
+if [ ${#MARKERS[@]} -gt 0 ]; then
+    expr=""
+    for m in "${MARKERS[@]}"; do
+        expr="${expr:+$expr and }not $m"
+    done
+    MARK_EXPR=(-m "$expr")
 fi
 
 log "Running ceph/s3-tests at ${S3TESTS_REF:0:12} against https://$HOST:$PORT"
@@ -193,7 +211,7 @@ log "Running ceph/s3-tests at ${S3TESTS_REF:0:12} against https://$HOST:$PORT"
     PREDA_S3TESTS_MANIFEST="$RUN" \
         "$VENV/bin/pytest" "${SUITES[@]}" \
             -q --no-header -p no:cacheprovider -p predastore_cleanup \
-            "${DESELECT[@]}" "$@"
+            "${DESELECT[@]}" "${MARK_EXPR[@]}" "$@"
 )
 
 if [ ! -s "$RUN" ]; then
