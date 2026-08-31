@@ -33,7 +33,11 @@ REPO_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd -P)"
 
 HW_HOSTS="${HW_HOSTS:-tf-user@bottlebrush tf-user@ironbark tf-user@casuarina}"
 HW_ADDRS="${HW_ADDRS:-10.10.8.4 10.10.8.5 10.10.8.6}"
-HW_ROOT="${HW_ROOT:-/mnt/disk3/tf-user/predastore}"
+# disk1 rather than disk3, which carries the spinifex-managed predastore, or
+# disk2, which carries /var/lib/spinifex. Sharing a spindle with a storage
+# service confounds every number this harness produces. Root is a slower drive
+# and is never the answer.
+HW_ROOT="${HW_ROOT:-/mnt/disk1/tf-user/predastore}"
 HW_REFS="${HW_REFS:-dev:origin/dev base:f3a795d tip:80bda06}"
 WORK="${HW_WORK:-/tmp/hwbench}"
 CONFIG_NAME="3host-hw.toml"
@@ -44,7 +48,7 @@ read -ra ADDRS <<< "$HW_ADDRS"
 ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
 SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 REGION="ap-southeast-2"
-GATE_PORT=8443
+GATE_PORT=8333
 TOOLS_HOST="${HW_TOOLS_HOST:-${HOSTS[-1]}}"
 
 log()  { printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*"; }

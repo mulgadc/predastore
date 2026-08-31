@@ -7,6 +7,11 @@
 #
 #     scripts/bench/hw/hwbench.sh deploy && scripts/bench/hw/hwbench.sh start
 #
+# The gate is on 8333 rather than the usual 8443 because these machines also
+# run a spinifex-managed predastore, and that one binds *:8443 — a wildcard, so
+# it already owns this host's address on that port. Meta and blob keep their
+# defaults; nothing else on the box listens there.
+#
 # RS(2,1) over three hosts places exactly one shard per host, so a GET reads
 # one shard locally and fetches exactly one from a peer. That is the cleanest
 # attribution of inter-node transport cost this topology can produce, and it
@@ -37,7 +42,7 @@ addr = "10.10.8.4"
   [[host.node]]
   id = 1
   role = "gate"
-  port = 8443
+  port = 8333
 
   [[host.node]]
   id = 2
@@ -56,7 +61,7 @@ addr = "10.10.8.5"
   [[host.node]]
   id = 4
   role = "gate"
-  port = 8443
+  port = 8333
 
   [[host.node]]
   id = 5
@@ -75,7 +80,7 @@ addr = "10.10.8.6"
   [[host.node]]
   id = 7
   role = "gate"
-  port = 8443
+  port = 8333
 
   [[host.node]]
   id = 8
