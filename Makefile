@@ -72,6 +72,27 @@ docker-smoke-baseline:
 	@PREDA_IMAGE=$(DOCKER_IMAGE) PREDA_WRITE_BASELINE=$(SMOKE_BASELINE) \
 		./scripts/smoke.sh $(SMOKE_SUITES)
 
+# ceph/s3-tests conformance. The smoke suite asks whether real clients work;
+# this asks whether the operations match the specification. It needs a cluster
+# on the s3tests profile, the only one carrying the three accounts and the
+# us-east-1 region the suite requires:
+#
+#   ./scripts/start.sh -w s3tests
+#   make s3-tests
+S3TESTS_BASELINE ?= scripts/s3-tests-baseline.txt
+
+s3-tests:
+	@PREDA_BASELINE=$(S3TESTS_BASELINE) ./scripts/s3-tests.sh
+
+# Fails on any failing case. Predastore is a long way from passing s3-tests, so
+# this is red by design: it exists to be read, not to gate anything.
+s3-tests-strict:
+	@PREDA_BASELINE=$(S3TESTS_BASELINE) PREDA_STRICT=1 ./scripts/s3-tests.sh
+
+# Re-record the baseline. Run it when a fix lands, in the same change.
+s3-tests-baseline:
+	@PREDA_WRITE_BASELINE=$(S3TESTS_BASELINE) ./scripts/s3-tests.sh
+
 # GO commands
 go_build:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
@@ -220,4 +241,5 @@ nilaway:
 	clean lint fix govulncheck nilaway warp-install e2e-performance e2e-performance-compare \
 	e2e-stress e2e-stress-gate e2e-stress-strict e2e-stress-baseline \
 	docker-build docker-smoke docker-smoke-strict docker-smoke-baseline \
+	s3-tests s3-tests-strict s3-tests-baseline \
 	compose-up compose-down
