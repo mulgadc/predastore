@@ -32,7 +32,7 @@ on:
         required: false
         default: ""
       stress_scenarios:
-        description: "Stress scenarios to run (empty = all: partial-put torn-overwrite freeze)"
+        description: "Stress scenarios to run (empty = the eleven this job runs; name partial-put or multipart-upload to add them)"
         required: false
         default: ""
       run_performance:
@@ -151,46 +151,89 @@ jobs:
         run: ./scripts/stop.sh s3tests
 
   stress:
-    name: Stress (${{ matrix.scenario }})
-    runs-on: ubuntu-26.04
-    timeout-minutes: 30
-    # One leg per scenario. e2e-stress.sh aborts on its first failed assertion,
-    # so chaining them means a known-red scenario hides every one after it.
-    strategy:
-      fail-fast: false
-      matrix:
-        scenario: [partial-put, torn-overwrite, freeze]
+    name: Stress (fault injection)
+    # A hosted runner cannot host these. Eleven scenarios in sequence take
+    # about twenty minutes, and large-object writes 2 and 4 GiB objects that a
+    # hosted runner would skip for lack of disk.
+    runs-on: [self-hosted, ci-predastore]
+    # Twenty minutes measured on an eight-core VM, so this is room for a bad
+    # run rather than an estimate.
+    timeout-minutes: 45
+
+    # One runner serves this and the performance job. A benchmark measured
+    # while a stress run is SIGSTOPping hosts on the same box is not a
+    # measurement, so the two queue behind each other rather than overlap.
+    concurrency:
+      group: predastore-self-hosted
+      cancel-in-progress: false
 
     steps:
+      # Same pause as the performance job, and for the same reason: this box
+      # also carries dev clusters and workstation VMs.
+      - name: Manual-work / cluster-in-use mutex gate
+        id: gate
+        env:
+          REPO_VAR_PAUSED: ${{ vars.CI_PREDASTORE_HW_PAUSED }}
+        run: |
+          set -euo pipefail
+          PAUSED=false
+          if [ -f "$HOME/.ci-predastore-hw-paused" ]; then
+            PAUSED=true
+            echo "::warning::paused via the ~/.ci-predastore-hw-paused sentinel on the runner; manual work is in progress. Remove the file to resume CI."
+          fi
+          if [ "$(echo "${REPO_VAR_PAUSED:-}" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+            PAUSED=true
+            echo "::warning::paused via repository variable CI_PREDASTORE_HW_PAUSED=true."
+          fi
+          echo "paused=${PAUSED}" >> "$GITHUB_OUTPUT"
+
+      - name: Paused — nothing to do
+        if: steps.gate.outputs.paused == 'true'
+        run: echo "paused for manual work; exiting without starting a cluster."
+
       - name: Checkout Code
+        if: steps.gate.outputs.paused != 'true'
         uses: actions/checkout@v7
 
+      # Cached off, like the other self-hosted job. This runner keeps its
+      # module and build caches on local disk between runs, so the action
+      # would spend minutes fetching an archive of what is already here.
       - name: Setup Go
+        if: steps.gate.outputs.paused != 'true'
         uses: actions/setup-go@v7
         with:
-          cache-dependency-path: "go.sum"
+          cache: false
           go-version-file: "go.mod"
 
-      # A failing scenario fails this job. torn-overwrite is red today and it
-      # should look red: an overwrite with no commit point across its shards
-      # leaves the object part new and part old, served as a 200 with the right
-      # length and ETag. The baseline marks it as known rather than excusing it.
+      # One job for every scenario rather than one job each. stress-gate.sh
+      # invokes e2e-stress.sh once per scenario and records the outcome of
+      # each, so a red one no longer hides the ones behind it and the matrix
+      # that existed to prevent that has nothing left to do. On a single
+      # runner its legs would have run in sequence regardless.
       #
-      # partial-put holds four stalled uploads open for STRESS_PARTIAL_HOLD
-      # each, one after another, which is most of its runtime. 120s still
-      # clears the 90s abandon bound the scenario asserts against by the same
-      # margin the assertion needs, and saves four minutes of runner time.
-      - name: Run Scenario
-        if: inputs.stress_scenarios == '' || contains(inputs.stress_scenarios, matrix.scenario)
+      # A failing scenario fails the job. torn-overwrite is red today and it
+      # should look red: an overwrite with no commit point across its shards
+      # leaves the object part new and part old, served as a 200 with the
+      # right length and ETag. The baseline marks it known, not excused.
+      #
+      # Eleven of the thirteen. partial-put and multipart-upload are left out
+      # because they cost twenty of the forty minutes between them, and the
+      # spinifex nightly already runs the whole set. Naming either of them in
+      # the dispatch input still runs it.
+      - name: Run Scenarios
+        if: steps.gate.outputs.paused != 'true'
         env:
-          STRESS_PARTIAL_HOLD: 120
-        run: make e2e-stress-strict STRESS_SCENARIOS=${{ matrix.scenario }}
+          REQUESTED: ${{ inputs.stress_scenarios }}
+        run: |
+          set -euo pipefail
+          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put torn-overwrite stale-shard freeze"
+          make e2e-stress-strict STRESS_SCENARIOS="${REQUESTED:-$default}"
 
       - name: Upload Results
-        if: always()
+        if: always() && steps.gate.outputs.paused != 'true'
         uses: actions/upload-artifact@v5
         with:
-          name: stress-${{ matrix.scenario }}
+          name: stress
           path: scripts/bench/results/e2e-stress/
           if-no-files-found: ignore
           retention-days: 14
@@ -209,10 +252,11 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.run_performance
 
     # A fixed group with no ref in it, so runs across every branch queue behind
-    # each other. Killing a benchmark part way through leaves a cluster and its
-    # data behind on several machines, which is why this waits rather cancels.
+    # each other, and shared with the stress job because one runner serves
+    # both. Killing a benchmark part way through leaves a cluster and its data
+    # behind on several machines, which is why this waits rather than cancels.
     concurrency:
-      group: predastore-performance
+      group: predastore-self-hosted
       cancel-in-progress: false
 
     # The target hosts, their addresses and the directory the cluster is

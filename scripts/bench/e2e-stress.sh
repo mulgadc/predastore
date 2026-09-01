@@ -19,11 +19,13 @@
 #
 # Environment:
 #   STRESS_SCENARIO    Narrows the run to one test: "repair", "handoff",
-#                      "large-object", "last-modified", "torn-overwrite",
-#                      "stale-shard", "freeze", or "partial-put" — a client
-#                      that stops sending mid-body, which is not in a default
-#                      run. Unset runs repair, handoff, large-object,
-#                      last-modified, torn-overwrite, stale-shard and freeze.
+#                      "node-rejoin", "node-resync", "node-rebuild",
+#                      "multipart-upload", "last-modified", "large-object",
+#                      "concurrent-put", "torn-overwrite", "stale-shard",
+#                      "freeze", or "partial-put" — a client that stops sending
+#                      mid-body. Unset runs all of them except partial-put,
+#                      which holds stalled uploads open and is slow enough to
+#                      ask for by name.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -53,8 +55,8 @@
 #                      Seconds allowed for the sweep to bring the handed-off
 #                      shards home (default: 180)
 #   STRESS_LARGE_SIZES Object sizes the large-object scenario writes and reads
-#                      (default: "2GiB 4GiB 8GiB"). A size with no room on
-#                      disk is skipped loudly, never silently.
+#                      (default: "2GiB 4GiB"). A size with no room on disk is
+#                      skipped loudly, never silently.
 #   STRESS_WORK_ROOT   Where the cluster work directory is created. Defaults to
 #                      TMPDIR, except when large-object is in the run: TMPDIR is
 #                      often tmpfs, which is RAM-backed, so it would both cap
@@ -288,15 +290,19 @@ go build -o "$SHARD_PROBE" "$REPO_DIR/scripts/bench/shardplace"
 # Both take the profile as their first argument: the repair scenario below runs
 # its own cluster from its own file, and a helper that closed over the shared
 # one would silently answer for the wrong cluster.
+#
+# The awk programs flag the first match instead of exiting on it. Exiting closes
+# the pipe under a writer that has not finished, and pipefail then turns that
+# SIGPIPE into a silent 141 that set -e reads as a failed scenario.
 shard_host() {
     "$SHARD_PROBE" -config "$1" -bucket "$2" -key "$3" \
-        | awk -v r="role=$4" '$2 == r { sub(/^host=/, "", $4); print $4; exit }'
+        | awk -v r="role=$4" '!f && $2 == r { sub(/^host=/, "", $4); print $4; f = 1 }'
 }
 survivor_gate() {
-    parse_hosts "$1" | awk -v h="$2" '$1 != h && $3 != "" { print "https://" $2 ":" $3; exit }'
+    parse_hosts "$1" | awk -v h="$2" '!f && $1 != h && $3 != "" { print "https://" $2 ":" $3; f = 1 }'
 }
 gate_of() {
-    parse_hosts "$1" | awk -v h="$2" '$1 == h && $3 != "" { print "https://" $2 ":" $3; exit }'
+    parse_hosts "$1" | awk -v h="$2" '!f && $1 == h && $3 != "" { print "https://" $2 ":" $3; f = 1 }'
 }
 
 # A host that was SIGSTOPped keeps the connections that died under it, and the
@@ -421,7 +427,7 @@ run_repair() {
     gate="$(survivor_gate "$REPAIR_CONFIG" "$frozen")"
     [ -n "$gate" ] || fail "repair: no gate survives stopping host $frozen"
     frozen_gate="$(parse_hosts "$REPAIR_CONFIG" \
-        | awk -v h="$frozen" '$1 == h && $3 != "" { print "https://" $2 ":" $3; exit }')"
+        | awk -v h="$frozen" '!f && $1 == h && $3 != "" { print "https://" $2 ":" $3; f = 1 }')"
     [ -n "$frozen_gate" ] || fail "repair: host $frozen runs no gate, so nothing repairs its blob node"
 
     # Which role each key places on the host about to go down. Both are needed
@@ -430,7 +436,7 @@ run_repair() {
     # still pass.
     for key in "${keys[@]}"; do
         role="$("$SHARD_PROBE" -config "$REPAIR_CONFIG" -bucket "$REPAIR_BUCKET" -key "$key" \
-            | awk -v h="host=$frozen" '$4 == h { sub(/^role=/, "", $2); print $2; exit }')"
+            | awk -v h="host=$frozen" '!f && $4 == h { sub(/^role=/, "", $2); print $2; f = 1 }')"
         case "$role" in
             data) data_keys+=("$key") ;;
             parity) parity_keys+=("$key") ;;
@@ -645,7 +651,7 @@ run_handoff() {
     gate="$(survivor_gate "$HANDOFF_CONFIG" "$frozen")"
     [ -n "$gate" ] || fail "handoff: no gate survives stopping host $frozen"
     frozen_gate="$(parse_hosts "$HANDOFF_CONFIG" \
-        | awk -v h="$frozen" '$1 == h && $3 != "" { print "https://" $2 ":" $3; exit }')"
+        | awk -v h="$frozen" '!f && $1 == h && $3 != "" { print "https://" $2 ":" $3; f = 1 }')"
     [ -n "$frozen_gate" ] || fail "handoff: host $frozen runs no gate, so nothing repairs its blob node"
 
     # Only a key whose data shard sits on the stopped host can say anything
@@ -653,7 +659,7 @@ run_handoff() {
     # touches parity.
     for key in "${keys[@]}"; do
         role="$("$SHARD_PROBE" -config "$HANDOFF_CONFIG" -bucket "$HANDOFF_BUCKET" -key "$key" \
-            | awk -v h="host=$frozen" '$4 == h { sub(/^role=/, "", $2); print $2; exit }')"
+            | awk -v h="host=$frozen" '!f && $4 == h { sub(/^role=/, "", $2); print $2; f = 1 }')"
         if [ "$role" = data ]; then
             data_keys+=("$key")
         fi
@@ -915,7 +921,7 @@ rejoined() {
     deadline=$(( $(date +%s) + NODE_DEADLINE ))
     while [ "$(date +%s)" -lt "$deadline" ]; do
         leader="$(node_meta_status "${NODE_META_ALL[@]}" \
-            | awk '/is_leader=true/ { for (i = 1; i <= NF; i++) if ($i ~ /^applied=/) { sub(/^applied=/, "", $i); print $i; exit } }')"
+            | awk '!f && /is_leader=true/ { for (i = 1; i <= NF; i++) if ($i ~ /^applied=/) { sub(/^applied=/, "", $i); print $i; f = 1; break } }')"
         applied="$(node_meta_status "$victim_meta" \
             | awk -v n="$victim_meta" '$1 == "node=" n { for (i = 1; i <= NF; i++) if ($i ~ /^applied=/) { sub(/^applied=/, "", $i); print $i } }')"
         if [ -n "$leader" ] && [ -n "$applied" ] && [ "$applied" -ge "$leader" ]; then
@@ -951,7 +957,7 @@ run_node_recovery() {
     # lose: a majority of meta replicas must survive it, or what is measured is
     # loss of quorum rather than a replica catching up.
     victim="$(parse_hosts "$config" | awk 'END { print $1 }')"
-    victim_meta="$(meta_nodes "$config" | awk -v h="$victim" '$1 == h { print $2; exit }')"
+    victim_meta="$(meta_nodes "$config" | awk -v h="$victim" '!f && $1 == h { print $2; f = 1 }')"
     [ -n "$victim_meta" ] || fail "$NODE_MODE: host $victim runs no meta replica"
     [ "$(( ${#NODE_META_ALL[@]} - 1 ))" -gt $(( ${#NODE_META_ALL[@]} / 2 )) ] \
         || fail "$NODE_MODE: losing host $victim leaves no quorum"
@@ -959,7 +965,7 @@ run_node_recovery() {
     gate="$(survivor_gate "$config" "$victim")"
     [ -n "$gate" ] || fail "$NODE_MODE: no gate survives losing host $victim"
     victim_gate="$(parse_hosts "$config" \
-        | awk -v h="$victim" '$1 == h && $3 != "" { print "https://" $2 ":" $3; exit }')"
+        | awk -v h="$victim" '!f && $1 == h && $3 != "" { print "https://" $2 ":" $3; f = 1 }')"
     [ -n "$victim_gate" ] || fail "$NODE_MODE: host $victim runs no gate"
 
     openssl rand -out "$src" 1048576
@@ -972,7 +978,7 @@ run_node_recovery() {
     # touches parity, so a parity key reports nothing either way.
     for key in "${keys[@]}"; do
         if [ "$("$SHARD_PROBE" -config "$config" -bucket "$NODE_BUCKET" -key "$key" \
-            | awk -v h="host=$victim" '$4 == h { sub(/^role=/, "", $2); print $2; exit }')" = data ]; then
+            | awk -v h="host=$victim" '!f && $4 == h { sub(/^role=/, "", $2); print $2; f = 1 }')" = data ]; then
             data_keys+=("$key")
         fi
     done
@@ -1126,7 +1132,7 @@ run_node_recovery() {
             log "$NODE_MODE: $proof keeps its parity on host $victim, so the parity-down check is not available"
         else
             parity_gate="$(parse_hosts "$config" \
-                | awk -v a="$victim" -v b="$parity_host" '$1 != a && $1 != b && $3 != "" { print "https://" $2 ":" $3; exit }')"
+                | awk -v a="$victim" -v b="$parity_host" '!f && $1 != a && $1 != b && $3 != "" { print "https://" $2 ":" $3; f = 1 }')"
             stop_host "$cluster" "$parity_host"
             seen="$(degraded_read "$parity_gate" "$NODE_BUCKET" "$proof" "$got" 2>/dev/null || echo failed)"
             node_check "$([ "$seen" = 0 ] && diff -q "$src" "$got" >/dev/null 2>&1 && echo true || echo false)" \
@@ -1297,7 +1303,7 @@ run_large_object() {
 
     render_large_profile
 
-    gate="$(parse_hosts "$LARGE_CONFIG" | awk '$3 != "" { print "https://" $2 ":" $3; exit }')"
+    gate="$(parse_hosts "$LARGE_CONFIG" | awk '!f && $3 != "" { print "https://" $2 ":" $3; f = 1 }')"
     [ -n "$gate" ] || fail "large-object: no gate in $LARGE_CLUSTER"
 
     printf 'size\tbytes\tpath\tput_s\tput_MiBps\tget_s\tget_MiBps\tput_peak_MiB\tget_peak_MiB\treconstructed\tverdict\n' > "$results"
@@ -1528,7 +1534,7 @@ run_multipart_upload() {
         "$MP_BUCKET" "$REGION" >> "$LARGE_CONFIG"
     cp "$LARGE_CONFIG" "$RUN_DIR/$LARGE_CLUSTER.toml"
 
-    gate="$(parse_hosts "$LARGE_CONFIG" | awk '$3 != "" { print "https://" $2 ":" $3; exit }')"
+    gate="$(parse_hosts "$LARGE_CONFIG" | awk '!f && $3 != "" { print "https://" $2 ":" $3; f = 1 }')"
     [ -n "$gate" ] || fail "multipart-upload: no gate in $LARGE_CLUSTER"
 
     printf 'part\tparts\tbytes\tupload_s\tupload_MiBps\tcomplete_s\tget_s\tget_MiBps\tupload_peak_MiB\tcomplete_peak_MiB\tget_peak_MiB\treconstructed\tverdict\n' > "$results"
@@ -1735,7 +1741,7 @@ lm_header() {
         *) args+=(-o /dev/null -D -) ;;
     esac
     curl "${args[@]}" "$gate/$LM_BUCKET/$key" \
-        | awk 'tolower($1) == "last-modified:" { sub(/^[^:]*: */, ""); gsub(/\r/, ""); print; exit }'
+        | awk '!f && tolower($1) == "last-modified:" { sub(/^[^:]*: */, ""); gsub(/\r/, ""); print; f = 1 }'
 }
 
 # within reports whether an epoch falls in the window the write was issued in,
@@ -1756,7 +1762,7 @@ run_last_modified() {
     log "last-modified: starting $LM_CLUSTER"
     "$SCRIPTS_DIR/start.sh" -w "$LM_CLUSTER"
 
-    gate="$(parse_hosts "$LM_CONFIG" | awk '$3 != "" { print "https://" $2 ":" $3; exit }')"
+    gate="$(parse_hosts "$LM_CONFIG" | awk '!f && $3 != "" { print "https://" $2 ":" $3; f = 1 }')"
     [ -n "$gate" ] || fail "last-modified: no gate in $LM_CLUSTER"
     read_gate="$(survivor_gate "$LM_CONFIG" "$(parse_hosts "$LM_CONFIG" | awk 'NR == 1 { print $1 }')")"
     [ -n "$read_gate" ] || fail "last-modified: $LM_CLUSTER has only one gate, so a read cannot come from another"

@@ -2,7 +2,7 @@
 #
 # stress-gate.sh - Run e2e-stress scenarios and gate on a committed baseline.
 #
-# Two of the stress scenarios fail against predastore today, so a bare exit
+# Some of the stress scenarios fail against predastore today, so a bare exit
 # status makes the suite unusable as a gate: it would be red from its first run
 # and read by nobody. Against a baseline the question becomes the useful one —
 # did something that used to survive stop surviving.
@@ -33,9 +33,15 @@ BASELINE="${STRESS_BASELINE:-$REPO_DIR/scripts/stress-baseline.txt}"
 WRITE_BASELINE="${STRESS_WRITE_BASELINE:-}"
 
 # The scenarios e2e-stress.sh accepts for STRESS_SCENARIO. "all" is excluded on
-# purpose: it chains torn-overwrite into freeze and stops at the first failure,
-# so it cannot report the second when the first is one of the known-red ones.
-ALL_SCENARIOS=(partial-put torn-overwrite freeze)
+# purpose: it chains them and stops at the first failure, so it cannot report
+# the ones after a known-red one. Keep this in step with the case statement in
+# e2e-stress.sh — a scenario missing here is rejected rather than run.
+ALL_SCENARIOS=(
+    repair handoff
+    node-rejoin node-resync node-rebuild
+    multipart-upload last-modified large-object concurrent-put
+    partial-put torn-overwrite stale-shard freeze
+)
 
 if [ $# -gt 0 ]; then
     SCENARIOS=("$@")
@@ -59,7 +65,57 @@ if [ -z "$WRITE_BASELINE" ] && [ ! -f "$BASELINE" ]; then
     exit 2
 fi
 
+# The pattern matches only a cluster e2e-stress.sh started, because its work
+# directory is an mktemp under that name. A dev cluster, or the one an operator
+# runs from /tmp/predastore, does not match and is never signalled.
+STRAY_PATTERN='s3d -config [^ ]*predastore-e2e-stress\.'
+
+# pgrep -f matches on the whole command line, which any shell holding this
+# pattern in its own arguments satisfies. Every candidate is confirmed to be
+# an s3d before it is signalled, so the reaper cannot turn on its caller.
+stray_pids() {
+    local pid
+    for pid in $(pgrep -f "$STRAY_PATTERN" 2>/dev/null); do
+        [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = s3d ] && printf '%s\n' "$pid"
+    done
+}
+
+# A scenario that fails can exit with its cluster still running. The next one
+# then fails on the ports and loopback addresses it still holds, so one broken
+# scenario reads as several, and the freed-but-open data keeps its disk space
+# until the process dies. Reaping between scenarios keeps a result meaning what
+# it says.
+reap_strays() {
+    local after="$1" pid waited=0
+    [ -n "$(stray_pids)" ] || return 0
+
+    printf '  reaping the cluster left running after %s\n' "$after" >&2
+    [ -z "${GITHUB_ACTIONS:-}" ] \
+        || printf '::warning::%s left its cluster running; the harness reaped it, but any scenario after it may have failed on the ports it held\n' "$after"
+
+    for pid in $(stray_pids); do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    while [ "$waited" -lt 15 ] && [ -n "$(stray_pids)" ]; do
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+    for pid in $(stray_pids); do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
+
+    # Reported rather than removed: deleting an address needs root, and one
+    # left behind is a symptom worth seeing rather than a thing to paper over.
+    local aliases
+    aliases="$(ip -4 -o addr show lo 2>/dev/null | awk '$4 ~ /^10\./ { print $4 }' | paste -sd' ')"
+    [ -z "$aliases" ] || printf '  loopback aliases still assigned after %s: %s\n' "$after" "$aliases" >&2
+}
+
 RESULTS=()
+
+# The runner is persistent, so a job that was cancelled part way through can
+# leave a cluster behind for this one to trip over.
+reap_strays "an earlier run"
 
 for scenario in "${SCENARIOS[@]}"; do
     printf '\n=== scenario: %s ===\n' "$scenario"
@@ -70,6 +126,7 @@ for scenario in "${SCENARIOS[@]}"; do
         RESULTS+=("FAIL|$scenario")
         printf '  %s: FAIL\n' "$scenario"
     fi
+    reap_strays "$scenario"
 done
 
 if [ -n "$WRITE_BASELINE" ]; then
