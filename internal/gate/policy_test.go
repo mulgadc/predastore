@@ -16,26 +16,33 @@ import (
 func TestS3Action(t *testing.T) {
 	tests := []struct {
 		method string
+		target string
 		bucket string
 		key    string
 		want   string
 	}{
-		{"GET", "", "", "s3:ListAllMyBuckets"},
-		{"GET", "my-bucket", "", "s3:ListBucket"},
-		{"GET", "my-bucket", "key.txt", "s3:GetObject"},
-		{"HEAD", "my-bucket", "key.txt", "s3:GetObject"},
-		{"HEAD", "my-bucket", "", "s3:ListBucket"},
-		{"PUT", "my-bucket", "", "s3:CreateBucket"},
-		{"PUT", "my-bucket", "key.txt", "s3:PutObject"},
-		{"POST", "my-bucket", "key.txt", "s3:PutObject"},
-		{"DELETE", "my-bucket", "", "s3:DeleteBucket"},
-		{"DELETE", "my-bucket", "key.txt", "s3:DeleteObject"},
-		{"PATCH", "my-bucket", "key.txt", ""},
+		{"GET", "/", "", "", "s3:ListAllMyBuckets"},
+		{"GET", "/my-bucket", "my-bucket", "", "s3:ListBucket"},
+		{"GET", "/my-bucket/key.txt", "my-bucket", "key.txt", "s3:GetObject"},
+		{"HEAD", "/my-bucket/key.txt", "my-bucket", "key.txt", "s3:GetObject"},
+		{"HEAD", "/my-bucket", "my-bucket", "", "s3:ListBucket"},
+		{"PUT", "/my-bucket", "my-bucket", "", "s3:CreateBucket"},
+		{"PUT", "/my-bucket/key.txt", "my-bucket", "key.txt", "s3:PutObject"},
+		{"POST", "/my-bucket/key.txt?uploads", "my-bucket", "key.txt", "s3:PutObject"},
+		{"DELETE", "/my-bucket", "my-bucket", "", "s3:DeleteBucket"},
+		{"DELETE", "/my-bucket/key.txt", "my-bucket", "key.txt", "s3:DeleteObject"},
+		{"PATCH", "/my-bucket/key.txt", "my-bucket", "key.txt", ""},
+		// The batch delete is a POST that names no key. Mapping it to
+		// s3:PutObject with the other POSTs would let a principal holding only
+		// write access empty a bucket.
+		{"POST", "/my-bucket?delete", "my-bucket", "", "s3:DeleteObject"},
+		{"POST", "/my-bucket?delete=", "my-bucket", "", "s3:DeleteObject"},
 	}
 
 	for _, tt := range tests {
-		got := s3Action(tt.method, tt.bucket, tt.key)
-		assert.Equal(t, tt.want, got, "s3Action(%q, %q, %q)", tt.method, tt.bucket, tt.key)
+		r := httptest.NewRequest(tt.method, tt.target, nil)
+		got := s3Action(r, tt.bucket, tt.key)
+		assert.Equal(t, tt.want, got, "s3Action(%q %q, %q, %q)", tt.method, tt.target, tt.bucket, tt.key)
 	}
 }
 
@@ -76,6 +83,27 @@ func doc(effect, action, resource string) iampolicy.PolicyDocument {
 // allowed reports whether the S3 action on resource is permitted.
 func allowed(action, resource string, policies []iampolicy.PolicyDocument) bool {
 	return iampolicy.EvaluateWithKeys(action, resource, policies, nil) == iampolicy.Allow
+}
+
+// The batch delete is authorized as a delete of every key in the bucket. Write
+// access alone must not reach it, and delete access on one key must not carry
+// the whole batch.
+func TestEvaluateS3Access_BulkDelete(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/my-bucket?delete=", nil)
+	action := s3Action(r, "my-bucket", "")
+	resource := s3Resource("my-bucket", "*")
+
+	assert.Equal(t, "s3:DeleteObject", action)
+	assert.Equal(t, "arn:aws:s3:::my-bucket/*", resource)
+
+	writeOnly := []iampolicy.PolicyDocument{doc("Allow", "s3:PutObject", "arn:aws:s3:::my-bucket/*")}
+	assert.False(t, allowed(action, resource, writeOnly))
+
+	oneKey := []iampolicy.PolicyDocument{doc("Allow", "s3:DeleteObject", "arn:aws:s3:::my-bucket/one.txt")}
+	assert.False(t, allowed(action, resource, oneKey))
+
+	bucketWide := []iampolicy.PolicyDocument{doc("Allow", "s3:DeleteObject", "arn:aws:s3:::my-bucket/*")}
+	assert.True(t, allowed(action, resource, bucketWide))
 }
 
 func TestEvaluateS3Access_DefaultDeny(t *testing.T) {

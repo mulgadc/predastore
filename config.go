@@ -49,6 +49,7 @@ type NodeConfig = config.Node
 type (
 	RS         = config.RS
 	Repair     = config.Repair
+	Reaper     = config.Reaper
 	Compaction = config.Compaction
 	S3         = config.S3
 	Bucket     = config.Bucket
@@ -209,6 +210,16 @@ func gateConfig(
 			Workers:  c.Repair.Workers,
 			PageSize: c.Repair.PageSize,
 			Interval: time.Duration(c.Repair.IntervalSeconds) * time.Second,
+		},
+
+		// Reaper has no ownership scoping: every gate that runs repair also
+		// runs it, and a tombstone racing two gates costs redundant RPCs and
+		// nothing else.
+		Reaper: gate.ReaperConfig{
+			Enabled:  c.Reaper.IsEnabled(),
+			Workers:  c.Reaper.Workers,
+			PageSize: c.Reaper.PageSize,
+			Interval: time.Duration(c.Reaper.IntervalSeconds) * time.Second,
 		},
 
 		Addr:        config.NodeBindAddr(host, n),

@@ -100,6 +100,11 @@ const (
 	metricRepairRepaired = "predastore.repair.repaired"
 	metricRepairFailed   = "predastore.repair.failed"
 	metricRepairPasses   = "predastore.repair.passes"
+
+	metricReaperPending   = "predastore.reaper.pending"
+	metricReaperReclaimed = "predastore.reaper.reclaimed"
+	metricReaperFailed    = "predastore.reaper.failed"
+	metricReaperPasses    = "predastore.reaper.passes" //nolint:gosec // G101: metric name, not a credential value
 )
 
 // metricNames is every name this package registers. Only the tests read it:
@@ -125,6 +130,7 @@ var metricNames = []string{
 	metricMetaFSMLSMBytes, metricMetaFSMVLogBytes, metricMetaSnapshotIndex, metricMetaLogTrailing,
 	metricRPCConnections, metricRPCEvictions, metricRPCStreamsOpen, metricRPCStreamOpenDur,
 	metricRepairPending, metricRepairRepaired, metricRepairFailed, metricRepairPasses,
+	metricReaperPending, metricReaperReclaimed, metricReaperFailed, metricReaperPasses,
 }
 
 // secondsBuckets bounds the duration histograms. The SDK default boundaries
@@ -207,6 +213,11 @@ var (
 	repairRepaired metric.Int64ObservableGauge
 	repairFailed   metric.Int64ObservableGauge
 	repairPasses   metric.Int64ObservableGauge
+
+	reaperPending   metric.Int64ObservableGauge
+	reaperReclaimed metric.Int64ObservableGauge
+	reaperFailed    metric.Int64ObservableGauge
+	reaperPasses    metric.Int64ObservableGauge
 )
 
 // instruments lazily creates the shared instruments. The global meter
@@ -340,6 +351,15 @@ func instruments() {
 		repairFailed = int64Gauge(metricRepairFailed,
 			"Rebuild attempts that failed since start.", "{shard}")
 		repairPasses = int64Gauge(metricRepairPasses,
+			"Sweeps completed since start. Not climbing means the sweep is stalled or was never started.", "{pass}")
+
+		reaperPending = int64Gauge(metricReaperPending,
+			"Tombstones the last completed sweep could not reclaim. Above zero means shards a delete named are still waiting on a node that was unreachable.", "{tombstone}")
+		reaperReclaimed = int64Gauge(metricReaperReclaimed,
+			"Tombstones reclaimed since start, whether by deleting the shards they named or by dropping one superseded by a recreated key.", "{tombstone}")
+		reaperFailed = int64Gauge(metricReaperFailed,
+			"Reclaim attempts that failed since start.", "{tombstone}")
+		reaperPasses = int64Gauge(metricReaperPasses,
 			"Sweeps completed since start. Not climbing means the sweep is stalled or was never started.", "{pass}")
 	})
 }
@@ -1109,6 +1129,45 @@ func RegisterRepairGauges(snapshot func() RepairSnapshot) (func() error, error) 
 			return nil
 		},
 		repairPending, repairRepaired, repairFailed, repairPasses,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return reg.Unregister, nil
+}
+
+// ReaperSnapshot is what the reaper sweep reports about its passes. Pending is
+// the one to watch: it counts tombstones the last completed pass could not
+// reclaim, so a cluster sitting above zero has shards a delete named still
+// waiting on a node that was unreachable.
+type ReaperSnapshot struct {
+	Pending   int64
+	Reclaimed int64
+	Failed    int64
+	Passes    int64
+}
+
+// RegisterReaperGauges observes the reaper sweep. It runs unasked, the same as
+// repair, so its progress has to be visible without an operator having opted
+// into anything.
+func RegisterReaperGauges(snapshot func() ReaperSnapshot) (func() error, error) {
+	instruments()
+	if meter == nil {
+		return func() error { return nil }, nil
+	}
+
+	reg, err := meter.RegisterCallback(
+		func(_ context.Context, o metric.Observer) error {
+			s := snapshot()
+			o.ObserveInt64(reaperPending, s.Pending)
+			o.ObserveInt64(reaperReclaimed, s.Reclaimed)
+			o.ObserveInt64(reaperFailed, s.Failed)
+			o.ObserveInt64(reaperPasses, s.Passes)
+
+			return nil
+		},
+		reaperPending, reaperReclaimed, reaperFailed, reaperPasses,
 	)
 	if err != nil {
 		return nil, err

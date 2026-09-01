@@ -14,7 +14,7 @@ import (
 func s3SpanMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bucket, key := requestBucketKey(r.Context())
-		action := s3Action(r.Method, bucket, key)
+		action := s3Action(r, bucket, key)
 		if action != "" {
 			otelsetup.SetRequestAction(r.Context(), action)
 		}

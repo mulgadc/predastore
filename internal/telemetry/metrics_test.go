@@ -1142,6 +1142,14 @@ func recordEveryInstrument(t *testing.T) map[string]metricdata.Aggregation {
 	}
 	t.Cleanup(func() { _ = unregisterRepair() })
 
+	unregisterReaper, err := RegisterReaperGauges(func() ReaperSnapshot {
+		return ReaperSnapshot{Pending: 2, Reclaimed: 6, Failed: 1, Passes: 3}
+	})
+	if err != nil {
+		t.Fatalf("register reaper: %v", err)
+	}
+	t.Cleanup(func() { _ = unregisterReaper() })
+
 	return collect(t, reader)
 }
 

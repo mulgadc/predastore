@@ -183,6 +183,24 @@ type Repair struct {
 // no local blob node still runs none, because there is nothing for it to own.
 func (r Repair) IsEnabled() bool { return r.Enabled == nil || *r.Enabled }
 
+// Reaper tunes the background sweep that reclaims the shards a delete leaves
+// tombstoned. It is on by default: a delete no longer removes its shards
+// inline, so without this sweep running they are never reclaimed at all.
+type Reaper struct {
+	Enabled *bool `toml:"enabled"`
+
+	// Workers bounds concurrent tombstone reclaims, PageSize how many
+	// tombstone rows a scan asks for at a time, and IntervalSeconds the gap
+	// between passes. Zero takes the sweep's own default for each.
+	Workers         int `toml:"workers"`
+	PageSize        int `toml:"page_size"`
+	IntervalSeconds int `toml:"interval_seconds"`
+}
+
+// IsEnabled reports whether the sweep should run. Absent means on; a host with
+// no local blob node still runs none, because there is nothing for it to own.
+func (r Reaper) IsEnabled() bool { return r.Enabled == nil || *r.Enabled }
+
 // Compaction tunes the shard store's background compactor. A zero interval
 // falls back to the store's default; compaction itself is never off, because
 // without it overwrite and delete churn never reclaims dead shards.
@@ -272,6 +290,8 @@ type Config struct {
 	Hosts []Host `toml:"host"`
 
 	Repair Repair `toml:"repair"`
+
+	Reaper Reaper `toml:"reaper"`
 
 	Compaction Compaction `toml:"compaction"`
 
