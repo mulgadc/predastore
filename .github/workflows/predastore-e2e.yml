@@ -125,7 +125,12 @@ jobs:
       # Comparison, never strict. Predastore fails a large part of s3-tests and
       # will for a long while, so the question this job answers is whether the
       # branch moved anything, not whether the suite is green.
+      #
+      # Bounded below the job timeout on purpose: a job that hits its own
+      # timeout skips every later step, including the manifest upload, so the
+      # one artefact that would explain the failure is never produced.
       - name: Conformance Suite
+        timeout-minutes: 20
         run: make s3-tests
 
       - name: Upload Manifest
@@ -170,8 +175,15 @@ jobs:
       # should look red: an overwrite with no commit point across its shards
       # leaves the object part new and part old, served as a 200 with the right
       # length and ETag. The baseline marks it as known rather than excusing it.
+      #
+      # partial-put holds four stalled uploads open for STRESS_PARTIAL_HOLD
+      # each, one after another, which is most of its runtime. 120s still
+      # clears the 90s abandon bound the scenario asserts against by the same
+      # margin the assertion needs, and saves four minutes of runner time.
       - name: Run Scenario
         if: inputs.stress_scenarios == '' || contains(inputs.stress_scenarios, matrix.scenario)
+        env:
+          STRESS_PARTIAL_HOLD: 120
         run: make e2e-stress-strict STRESS_SCENARIOS=${{ matrix.scenario }}
 
       - name: Upload Results

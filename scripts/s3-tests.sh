@@ -182,16 +182,26 @@ BASELINE_COMMITTED="$SCRIPT_DIR/s3-tests-baseline.txt"
 
 log "Running ceph/s3-tests at ${S3TESTS_REF:0:12} against https://$HOST:$PORT"
 
+# CI is cleared deliberately. pytest disables its own assertion truncation when
+# it detects a CI environment, and this suite compares whole object bodies, so
+# one failed multi-megabyte comparison emits that body four times. The product
+# of this run is the manifest and the regression list, not the diffs.
+#
+# --tb=line for the same reason: several hundred known failures each rendering
+# a full traceback through botocore's internals says nothing the manifest does
+# not, and buries what does. -rf keeps the one-line failure roll-up.
 (
     cd "$CHECKOUT" || exit 2
     PYTHONPATH="$PLUGIN_DIR:$CHECKOUT" \
     PYTHONWARNINGS=ignore \
+    CI= \
     S3TEST_CONF="$CONF" \
     PREDA_S3TESTS_MANIFEST="$RUN" \
     PREDA_S3TESTS_SKIPS="$SKIPS" \
     PREDA_S3TESTS_BASELINE_FILE="$BASELINE_COMMITTED" \
         "$VENV/bin/pytest" "${SUITES[@]}" \
-            -q --no-header -p no:cacheprovider -p predastore_cleanup "$@"
+            -q --no-header --tb=line -rf \
+            -p no:cacheprovider -p predastore_cleanup "$@"
 )
 
 if [ ! -s "$RUN" ]; then
