@@ -129,14 +129,10 @@ func (f *FSM) applyPutMax(key string, value []byte, epoch uint64) error {
 			if err != nil {
 				return err
 			}
-			// Placement records store the epoch at byte offset 11. Only this
-			// operation is used for placement keys, so malformed/legacy values
-			// are replaced normally.
-			if len(current) >= 19 && current[0] == 0 && current[1] == 2 {
-				currentEpoch := binary.BigEndian.Uint64(current[11:19])
-				if currentEpoch > epoch {
-					return nil
-				}
+			// Only this operation is used for placement keys, so a value that
+			// is not a recognisable placement record is replaced normally.
+			if currentEpoch, ok := PlacementEpoch(current); ok && currentEpoch > epoch {
+				return nil
 			}
 		} else if !errors.Is(err, badger.ErrKeyNotFound) {
 			return err
