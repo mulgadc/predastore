@@ -151,7 +151,7 @@ Two of these have constraints the container cannot paper over:
 | Multipart | `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload` |
 | Authentication | AWS Signature Version 4, presigned URLs |
 
-Multi-object delete (`DeleteObjects`) is not implemented; delete objects one at a time.
+Multi-object delete (`DeleteObjects`) takes up to 1000 keys per request and reports the outcome of each one.
 
 How far that support goes is measured rather than claimed. [docs/S3-COMPATIBILITY.md](docs/S3-COMPATIBILITY.md) holds the result of running `ceph/s3-tests` — the suite Ceph RGW, MinIO and Garage are all validated against — with the per-case manifest in `scripts/s3-tests-baseline.txt`. Read it before assuming an operation behaves the way S3 documents it.
 
@@ -346,7 +346,6 @@ sudo sysctl -w net.core.wmem_max=7500000
 - [x] Background segment compaction
 - [ ] Envelope encryption (master key rotation, per-bucket / per-tenant keys)
 - [ ] Gossip-based node discovery
-- [ ] Multi-object delete (`DeleteObjects`)
 - [ ] Automatic shard rebalancing
 - [ ] Background read-repair
 - [ ] Bucket versioning

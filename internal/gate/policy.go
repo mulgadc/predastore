@@ -33,11 +33,20 @@ func bucketAccessAllowed(method, callerAccountID string, meta *model.BucketMetad
 	return false
 }
 
-// s3Action maps an HTTP method and the resolved bucket/key to the IAM S3 action.
-func s3Action(method, bucket, key string) string {
+// isBulkDelete reports whether a request is POST /{bucket}?delete, the batch
+// delete. It addresses no key, so without this it would take the multipart
+// mapping below and a principal holding only s3:PutObject could empty a bucket.
+func isBulkDelete(r *http.Request, key string) bool {
+	return r.Method == http.MethodPost && key == "" && r.URL.Query().Has("delete")
+}
+
+// s3Action maps a request and the resolved bucket/key to the IAM S3 action.
+// The request is read rather than the method alone because S3 distinguishes
+// some operations by sub-resource rather than by method.
+func s3Action(r *http.Request, bucket, key string) string {
 	hasKey := key != ""
 
-	switch method {
+	switch r.Method {
 	case http.MethodGet:
 		if bucket == "" {
 			return "s3:ListAllMyBuckets"
@@ -57,6 +66,9 @@ func s3Action(method, bucket, key string) string {
 		}
 		return "s3:CreateBucket"
 	case http.MethodPost:
+		if isBulkDelete(r, key) {
+			return "s3:DeleteObject"
+		}
 		return "s3:PutObject" // multipart uploads
 	case http.MethodDelete:
 		if hasKey {

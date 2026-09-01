@@ -22,6 +22,15 @@ func byQuery(param string, with, without http.Handler) http.Handler {
 	})
 }
 
+// methodNotAllowed answers the requests a route matches on method and pattern
+// but not on the sub-resource that selects the operation.
+func methodNotAllowed() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlers.WriteS3Error(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed",
+			"The specified method is not allowed against this resource")
+	})
+}
+
 // setupRoutes maps the S3 REST API onto the handlers, constructing each one
 // over the dependencies it needs. It runs after the middleware chain is
 // installed, since chi requires all middleware to be registered before the
@@ -53,6 +62,11 @@ func (s *Server) setupRoutes(ring *placement.Ring) {
 		r.Method(http.MethodGet, "/{bucket}", byQuery("uploads",
 			handlers.ListMultipartUploads(mc, cache),
 			handlers.ListObjects(mc, cache)))
+		// A POST at a bucket is the batch delete and nothing else, so without
+		// ?delete the route answers what an unmatched POST answered before it.
+		r.Method(http.MethodPost, "/{bucket}", byQuery("delete",
+			handlers.DeleteObjects(mc, bc, cache),
+			methodNotAllowed()))
 	})
 
 	// Object operations (with key).

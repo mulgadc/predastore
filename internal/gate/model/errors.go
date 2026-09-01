@@ -33,6 +33,7 @@ const (
 	ErrInvalidArgument         S3ErrorCode = "InvalidArgument"
 	ErrSignatureDoesNotMatch   S3ErrorCode = "SignatureDoesNotMatch"
 	ErrMalformedChunkedBody    S3ErrorCode = "InvalidRequest"
+	ErrMalformedXML            S3ErrorCode = "MalformedXML"
 )
 
 // S3Error represents a typed S3 error with code and message.

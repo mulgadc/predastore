@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
 	"log/slog"
 	"net/http"
@@ -40,48 +41,60 @@ func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handler
 			return
 		}
 
-		objectHash := model.ObjectHash(bucket, key)
-
-		data, err := metaGet(ctx, mc, model.TableObjects, string(objectHash[:]))
-		if err != nil {
-			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
+		if err := deleteStoredObject(ctx, mc, bc, bucket, key); err != nil {
+			HandleError(w, r, err)
 			return
 		}
-
-		place, err := DecodePlacement(data)
-		if err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "corrupt metadata", 500))
-			return
-		}
-
-		// A node that refuses its shard delete leaves garbage the compactor will
-		// reclaim; the object must still disappear from state.
-		if err := deleteObject(ctx, bc, bucket, key, objectHash, place); err != nil {
-			slog.ErrorContext(ctx, "deleteObject failed", "error", err)
-		}
-
-		// TODO: A future compaction coordinator can scan these entries to know which
-		// shard servers have deleted data that needs WAL compaction.
-		deletedInfo := DeletedObjectInfo{
-			Bucket:         bucket,
-			Key:            key,
-			ObjectHash:     objectHash,
-			DeletedAt:      time.Now().Unix(),
-			DataShardNodes: place.DataShardNodes,
-			ParityNodes:    place.ParityShardNodes,
-		}
-		var deletedBuf bytes.Buffer
-		if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err == nil {
-			_ = metaPut(ctx, mc, model.TableObjects, deletedObjectPrefix+bucket+"/"+key, deletedBuf.Bytes()) // Best effort
-		}
-
-		if err := metaDelete(ctx, mc, model.TableObjects, string(objectHash[:])); err != nil {
-			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
-			return
-		}
-
-		_ = metaDelete(ctx, mc, model.TableObjects, objectARN(bucket, key)) // Best effort
 
 		w.WriteHeader(http.StatusNoContent)
 	})
+}
+
+// deleteStoredObject removes one object: its shards, then the metadata that
+// names them. A key that is not there returns model.ErrNoSuchKeyError, which
+// the single-object route answers as 404 and the batch route reports as
+// deleted — S3's delete is idempotent only in the batch form.
+//
+// The caller has already established that the bucket exists.
+func deleteStoredObject(ctx context.Context, mc MetaClient, bc BlobClient, bucket, key string) error {
+	objectHash := model.ObjectHash(bucket, key)
+
+	data, err := metaGet(ctx, mc, model.TableObjects, string(objectHash[:]))
+	if err != nil {
+		return model.ErrNoSuchKeyError.WithResource(key)
+	}
+
+	place, err := DecodePlacement(data)
+	if err != nil {
+		return model.NewS3Error(model.ErrInternalError, "corrupt metadata", 500)
+	}
+
+	// A node that refuses its shard delete leaves garbage the compactor will
+	// reclaim; the object must still disappear from state.
+	if err := deleteObject(ctx, bc, bucket, key, objectHash, place); err != nil {
+		slog.ErrorContext(ctx, "deleteObject failed", "error", err)
+	}
+
+	// TODO: A future compaction coordinator can scan these entries to know which
+	// shard servers have deleted data that needs WAL compaction.
+	deletedInfo := DeletedObjectInfo{
+		Bucket:         bucket,
+		Key:            key,
+		ObjectHash:     objectHash,
+		DeletedAt:      time.Now().Unix(),
+		DataShardNodes: place.DataShardNodes,
+		ParityNodes:    place.ParityShardNodes,
+	}
+	var deletedBuf bytes.Buffer
+	if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err == nil {
+		_ = metaPut(ctx, mc, model.TableObjects, deletedObjectPrefix+bucket+"/"+key, deletedBuf.Bytes()) // Best effort
+	}
+
+	if err := metaDelete(ctx, mc, model.TableObjects, string(objectHash[:])); err != nil {
+		return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
+	}
+
+	_ = metaDelete(ctx, mc, model.TableObjects, objectARN(bucket, key)) // Best effort
+
+	return nil
 }

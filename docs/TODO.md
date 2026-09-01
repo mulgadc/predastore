@@ -111,7 +111,6 @@ One cluster-wide master key, no envelope layer. Rotating it would mean re-encryp
 
 ## S3 API
 
-- `POST /{bucket}?delete=` (batch DeleteObjects). Returns 405 because no route exists; warp's mixed-test cleanup hits it. Routing plus a fan-out over the existing single-object delete.
 - **Pagination for `ListObjects`.** The handler scans and returns everything under the prefix, hardcodes `IsTruncated: false`, and does not enforce `max-keys`. A large bucket returns an unbounded response.
 - **`LastModified` is not stored.** Listings report the current time for every object. Needs a timestamp in the placement record, or a parallel metadata key.
 - **Content-derived ETags.** `ObjectETag` is `hex(sha256("bucket/key")[:16])`, so it identifies the object but never changes when the object does, and clients cannot use it to detect a modification. Needs the hash computed over the body during the split.
