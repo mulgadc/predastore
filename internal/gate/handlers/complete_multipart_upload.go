@@ -95,10 +95,14 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 
 		// Validation has already established that every requested part exists,
 		// so the final size is known without assembling anything to measure.
-		partETags := make([]string, len(parts))
+		composite := model.NewMultipartETag(len(parts))
 		var finalSize int64
-		for i, part := range parts {
-			partETags[i] = model.NormalizeETag(storedMap[part.PartNumber].ETag)
+		for _, part := range parts {
+			if err := composite.AddPart(storedMap[part.PartNumber].ETag); err != nil {
+				telemetry.RecordMultipartUpload(ctx, telemetry.UploadRejected)
+				HandleError(w, r, err)
+				return
+			}
 			finalSize += storedMap[part.PartNumber].Size
 		}
 
@@ -122,6 +126,13 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			HandleError(w, r, mapPutErr(err))
 			return
 		}
+
+		// The assembled object's own record must carry the same digest the
+		// response reports below, so a later HEAD, GET or listing can return
+		// it without recomputing anything.
+		digest := composite.Digest()
+		place.Digest = digest[:]
+		place.PartCount = composite.PartCount()
 
 		shardRecord, err := EncodePlacement(place)
 		if err != nil {
@@ -167,7 +178,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			Location: fmt.Sprintf("https://%s/%s/%s", r.Host, bucket, key),
 			Bucket:   bucket,
 			Key:      key,
-			ETag:     model.CalculateMultipartETag(partETags, len(parts)),
+			ETag:     composite.String(),
 		}); err != nil {
 			slog.DebugContext(ctx, "failed to write XML response", "error", err)
 		}

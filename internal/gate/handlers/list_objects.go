@@ -128,16 +128,18 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 				continue
 			}
 
-			// The listing row holds the object hash; the size and the write time
-			// live with the shard placement it keys. Only the page is resolved, so
-			// the cost of a listing follows the page size, not the bucket size.
+			// The listing row holds the object hash; the size, the write time and
+			// the ETag live with the shard placement it keys. Only the page is
+			// resolved, so a listing costs the page size, not the bucket size.
 			var objectSize int64
 			var modified time.Time
+			var etag string
 			if len(entry.hash) == 32 {
 				if row, err := metaGet(ctx, mc, model.TableObjects, string(entry.hash)); err == nil && len(row) > 0 {
 					if placement, err := DecodePlacement(row); err == nil {
 						objectSize = placement.Size
 						modified, _ = placement.ModifiedAt()
+						etag, _ = placement.ETag()
 					}
 				}
 			}
@@ -145,6 +147,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			contents = append(contents, ListObjectsV2_Contents{
 				Key:          entry.sortKey,
 				LastModified: modified,
+				ETag:         etag,
 				Size:         objectSize,
 				StorageClass: "STANDARD",
 			})

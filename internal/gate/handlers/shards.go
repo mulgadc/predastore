@@ -35,6 +35,16 @@ type ObjectToShardNodes struct {
 	// will.
 	Timestamped bool
 
+	// Digest is the object's content MD5, or nil. A record written before
+	// version 3 carries none, and neither does a multipart part's: the part's
+	// ETag lives in the parts table instead.
+	Digest []byte
+
+	// PartCount is how many multipart parts Digest was composed from. Zero
+	// means Digest is a plain content digest rather than a composite one; it
+	// is meaningless when Digest is nil.
+	PartCount int
+
 	DataShardNodes   []config.NodeID
 	ParityShardNodes []config.NodeID
 }

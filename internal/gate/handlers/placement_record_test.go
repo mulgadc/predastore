@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -86,14 +87,14 @@ func TestPlacementRecordSize(t *testing.T) {
 	}{
 		{"RS(2,1)", ObjectToShardNodes{
 			DataShardNodes: []config.NodeID{6, 12}, ParityShardNodes: []config.NodeID{3},
-		}, 30},
+		}, 47},
 		{"RS(7,3)", ObjectToShardNodes{
 			DataShardNodes:   []config.NodeID{1, 2, 3, 4, 5, 6, 7},
 			ParityShardNodes: []config.NodeID{8, 9, 10},
-		}, 37},
+		}, 54},
 		{"RS(17,3)", ObjectToShardNodes{
 			DataShardNodes: make([]config.NodeID, 17), ParityShardNodes: make([]config.NodeID, 3),
-		}, 47},
+		}, 64},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -140,23 +141,30 @@ func TestPlacementRecordRejectsMalformedInput(t *testing.T) {
 		t.Fatalf("EncodePlacement() error = %v", err)
 	}
 
-	truncatedIDs := append([]byte(nil), good[:placementFixedSize+1]...)
+	// The digest marker is a single 0x00 byte here, since this record carries
+	// no digest, so the node ids start one byte past the fixed v3 header.
+	nodeIDStart := placementFixedSizeV3 + 1
+	truncatedIDs := append([]byte(nil), good[:nodeIDStart+1]...)
 
 	unknownVersion := append([]byte(nil), good...)
-	unknownVersion[1] = 0x03
+	unknownVersion[1] = 0x04
 
-	malformedUvarint := append([]byte(nil), good[:placementFixedSize]...)
+	malformedUvarint := append([]byte(nil), good[:nodeIDStart]...)
 	malformedUvarint = append(malformedUvarint, 0x80) // continuation bit with nothing after it
+
+	malformedMarker := append([]byte(nil), good[:placementFixedSizeV3]...)
+	malformedMarker = append(malformedMarker, 0x80) // continuation bit with nothing after it
 
 	tests := []struct {
 		name  string
 		input []byte
 	}{
 		{"empty", nil},
-		{"shorter than the header", good[:placementFixedSize-1]},
+		{"shorter than the header", good[:placementFixedSizeV3-1]},
 		{"unknown version", unknownVersion},
 		{"fewer node ids than k declares", truncatedIDs},
-		{"malformed uvarint", malformedUvarint},
+		{"malformed node id uvarint", malformedUvarint},
+		{"malformed digest marker uvarint", malformedMarker},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -201,9 +209,12 @@ func TestPlacementRecordRejectsUnencodableValues(t *testing.T) {
 // The header is a wire format: its field offsets are asserted directly so a
 // reordering that still round-trips through this package cannot pass silently.
 func TestPlacementRecordHeaderLayout(t *testing.T) {
+	digest := bytes.Repeat([]byte{0xab}, 16)
 	encoded, err := EncodePlacement(ObjectToShardNodes{
 		Size: 0x0102030405060708, WriteEpoch: 0x1112131415161718,
 		BlockSize:      0x2122232425262728,
+		Digest:         digest,
+		PartCount:      5,
 		DataShardNodes: []config.NodeID{6, 12}, ParityShardNodes: []config.NodeID{3},
 	})
 	if err != nil {
@@ -226,8 +237,123 @@ func TestPlacementRecordHeaderLayout(t *testing.T) {
 	if got := binary.BigEndian.Uint64(encoded[19:27]); got != 0x2122232425262728 {
 		t.Errorf("block size at offset 19 = %#x", got)
 	}
-	if want := []byte{6, 12, 3}; !bytes.Equal(encoded[27:], want) {
-		t.Errorf("node ids = %v, want %v", encoded[27:], want)
+	if !bytes.Equal(encoded[27:43], digest) {
+		t.Errorf("digest at offset 27 = %x, want %x", encoded[27:43], digest)
+	}
+	// The marker is 1 + PartCount, so a composite of 5 parts is 6, which fits
+	// in a single uvarint byte.
+	if encoded[43] != 6 {
+		t.Errorf("digest marker at offset 43 = %d, want 6", encoded[43])
+	}
+	if want := []byte{6, 12, 3}; !bytes.Equal(encoded[44:], want) {
+		t.Errorf("node ids = %v, want %v", encoded[44:], want)
+	}
+}
+
+// A record with no digest zero-fills the digest slot and marks it absent with
+// a single 0x00 byte, so decoding it back leaves Digest nil rather than
+// treating the zeros as a real MD5.
+func TestPlacementRecordWithNoDigestRoundTrips(t *testing.T) {
+	encoded, err := EncodePlacement(ObjectToShardNodes{
+		Size: 1, DataShardNodes: []config.NodeID{3, 6}, ParityShardNodes: []config.NodeID{9},
+	})
+	if err != nil {
+		t.Fatalf("EncodePlacement() error = %v", err)
+	}
+	if !bytes.Equal(encoded[27:43], make([]byte, 16)) {
+		t.Errorf("digest slot = %x, want all zero", encoded[27:43])
+	}
+	if encoded[43] != 0 {
+		t.Errorf("digest marker = %d, want 0", encoded[43])
+	}
+
+	decoded, err := DecodePlacement(encoded)
+	if err != nil {
+		t.Fatalf("DecodePlacement() error = %v", err)
+	}
+	if decoded.Digest != nil {
+		t.Errorf("Digest = %x, want nil", decoded.Digest)
+	}
+	if etag, ok := decoded.ETag(); ok {
+		t.Errorf("ETag() = %q, true, want ok = false", etag)
+	}
+}
+
+// A plain content digest and a composite multipart digest both round-trip,
+// and the marker tells them apart on the way back.
+func TestPlacementRecordDigestRoundTrips(t *testing.T) {
+	digest := bytes.Repeat([]byte{0x42}, 16)
+
+	t.Run("plain digest", func(t *testing.T) {
+		encoded, err := EncodePlacement(ObjectToShardNodes{
+			Size: 4, Digest: digest,
+			DataShardNodes: []config.NodeID{1}, ParityShardNodes: []config.NodeID{},
+		})
+		if err != nil {
+			t.Fatalf("EncodePlacement() error = %v", err)
+		}
+		decoded, err := DecodePlacement(encoded)
+		if err != nil {
+			t.Fatalf("DecodePlacement() error = %v", err)
+		}
+		if !bytes.Equal(decoded.Digest, digest) || decoded.PartCount != 0 {
+			t.Fatalf("decoded = digest=%x parts=%d, want digest=%x parts=0",
+				decoded.Digest, decoded.PartCount, digest)
+		}
+		if etag, ok := decoded.ETag(); !ok || etag != fmt.Sprintf("\"%x\"", digest) {
+			t.Errorf("ETag() = %q, %v, want %q, true", etag, ok, fmt.Sprintf("\"%x\"", digest))
+		}
+	})
+
+	t.Run("composite digest", func(t *testing.T) {
+		encoded, err := EncodePlacement(ObjectToShardNodes{
+			Size: 4, Digest: digest, PartCount: 3,
+			DataShardNodes: []config.NodeID{1}, ParityShardNodes: []config.NodeID{},
+		})
+		if err != nil {
+			t.Fatalf("EncodePlacement() error = %v", err)
+		}
+		decoded, err := DecodePlacement(encoded)
+		if err != nil {
+			t.Fatalf("DecodePlacement() error = %v", err)
+		}
+		if !bytes.Equal(decoded.Digest, digest) || decoded.PartCount != 3 {
+			t.Fatalf("decoded = digest=%x parts=%d, want digest=%x parts=3",
+				decoded.Digest, decoded.PartCount, digest)
+		}
+		if etag, ok := decoded.ETag(); !ok || etag != fmt.Sprintf("\"%x-3\"", digest) {
+			t.Errorf("ETag() = %q, %v, want %q, true", etag, ok, fmt.Sprintf("\"%x-3\"", digest))
+		}
+	})
+}
+
+// A version 1 or version 2 record predates the digest field entirely, so it
+// must decode as absent rather than erroring or reading garbage.
+func TestOlderRecordsHaveNoDigest(t *testing.T) {
+	v1 := []byte{placementMagic, 0x01, 1}
+	v1 = binary.BigEndian.AppendUint64(v1, 4096)
+	v1 = binary.BigEndian.AppendUint64(v1, 0x1112131415161718)
+	v1 = append(v1, 6)
+
+	v2 := []byte{placementMagic, 0x02, 1}
+	v2 = binary.BigEndian.AppendUint64(v2, 4096)
+	v2 = binary.BigEndian.AppendUint64(v2, 0x1112131415161718)
+	v2 = binary.BigEndian.AppendUint64(v2, 4096)
+	v2 = append(v2, 6)
+
+	for name, raw := range map[string][]byte{"version 1": v1, "version 2": v2} {
+		t.Run(name, func(t *testing.T) {
+			decoded, err := DecodePlacement(raw)
+			if err != nil {
+				t.Fatalf("DecodePlacement(%s) error = %v", name, err)
+			}
+			if decoded.Digest != nil {
+				t.Errorf("Digest = %x, want nil", decoded.Digest)
+			}
+			if _, ok := decoded.ETag(); ok {
+				t.Errorf("ETag() ok = true, want false")
+			}
+		})
 	}
 }
 

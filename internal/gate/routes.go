@@ -22,6 +22,20 @@ func byQuery(param string, with, without http.Handler) http.Handler {
 	})
 }
 
+// byHeader routes on the presence of a request header, the same way byQuery
+// routes on a query parameter: S3 overloads PUT /{bucket}/{key} across
+// PutObject and CopyObject and distinguishes them by x-amz-copy-source, which
+// chi cannot match on either.
+func byHeader(header string, with, without http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(header) != "" {
+			with.ServeHTTP(w, r)
+			return
+		}
+		without.ServeHTTP(w, r)
+	})
+}
+
 // setupRoutes maps the S3 REST API onto the handlers, constructing each one
 // over the dependencies it needs. It runs after the middleware chain is
 // installed, since chi requires all middleware to be registered before the
@@ -60,7 +74,7 @@ func (s *Server) setupRoutes(ring *placement.Ring) {
 		r.Use(resolveObject)
 		s.useRequestChain(r)
 
-		// bulkBody marks the four handlers that move object data. They share a
+		// bulkBody marks the five handlers that move object data. They share a
 		// method and pattern with cheap ones, so the choice is made here rather
 		// than by route: a request deadline that applies to a body caps the
 		// object at whatever fits in it.
@@ -70,7 +84,9 @@ func (s *Server) setupRoutes(ring *placement.Ring) {
 			bulkBody(handlers.GetObject(mc, bc, ring, cache, cfg))))
 		r.Method(http.MethodPut, "/{bucket}/*", byQuery("partNumber",
 			bulkBody(handlers.UploadPart(mc, bc, ring, cache, cfg)),
-			bulkBody(handlers.PutObject(mc, bc, ring, cache, cfg))))
+			byHeader("X-Amz-Copy-Source",
+				bulkBody(handlers.CopyObject(mc, bc, ring, cache, cfg)),
+				bulkBody(handlers.PutObject(mc, bc, ring, cache, cfg)))))
 		r.Method(http.MethodPost, "/{bucket}/*", byQuery("uploadId",
 			bulkBody(handlers.CompleteMultipartUpload(mc, bc, ring, cache, cfg)),
 			handlers.CreateMultipartUpload(mc, cache)))

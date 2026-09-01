@@ -27,6 +27,15 @@ func UploadPart(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		uploadID := r.URL.Query().Get("uploadId")
 		partNumber, _ := strconv.Atoi(r.URL.Query().Get("partNumber"))
 
+		// A part carrying x-amz-copy-source is UploadPartCopy, which this
+		// handler does not implement. Falling through would read the empty
+		// request body as the part's content, storing a silently wrong part
+		// rather than refusing the request.
+		if r.Header.Get("X-Amz-Copy-Source") != "" {
+			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "UploadPartCopy is not implemented")
+			return
+		}
+
 		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
