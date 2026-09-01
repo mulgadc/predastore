@@ -14,7 +14,7 @@ PASS|Multipart upload (16 MiB)
 PASS|ListObjectsV2 pagination
 PASS|ETag is the body MD5
 PASS|CopyObject (server-side)
-FAIL|DeleteObjects (bulk)
+PASS|DeleteObjects (bulk)
 PASS|DeleteObject (single)
 PASS|Presigned GET
 PASS|rclone mkdir
