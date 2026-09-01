@@ -112,10 +112,8 @@ func deleteBatch(
 	indices := make(chan int)
 
 	var wg sync.WaitGroup
-	wg.Add(workers)
 	for range workers {
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for i := range indices {
 				// A request that ran out of time reports the keys it never
 				// reached rather than claiming them deleted.
@@ -125,7 +123,7 @@ func deleteBatch(
 				}
 				outcomes[i] = deleteStoredObject(ctx, mc, bc, bucket, objects[i].Key)
 			}
-		}()
+		})
 	}
 
 	for i := range objects {

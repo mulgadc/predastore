@@ -385,25 +385,22 @@ func (s *Service) deleteShards(ctx context.Context, info handlers.DeletedObjectI
 	errCh := make(chan error, len(targets))
 
 	for _, target := range targets {
-		wg.Add(1)
-		go func(t shardTarget) {
-			defer wg.Done()
-
+		wg.Go(func() {
 			start := time.Now()
-			resp, err := s.cfg.Blob.Delete(ctx, t.node, blob.DeleteRequest{
+			resp, err := s.cfg.Blob.Delete(ctx, target.node, blob.DeleteRequest{
 				Key:   info.ObjectHash,
-				Index: uint32(t.index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
+				Index: uint32(target.index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
 			})
-			recordShardDelete(ctx, t.node, start, err)
+			recordShardDelete(ctx, target.node, start, err)
 			if err != nil {
-				errCh <- fmt.Errorf("node %d index %d: %w", t.node, t.index, err)
+				errCh <- fmt.Errorf("node %d index %d: %w", target.node, target.index, err)
 
 				return
 			}
 			if !resp.Deleted {
-				slog.DebugContext(ctx, "Reaper: shard already gone", "node", t.node, "index", t.index)
+				slog.DebugContext(ctx, "Reaper: shard already gone", "node", target.node, "index", target.index)
 			}
-		}(target)
+		})
 	}
 	wg.Wait()
 	close(errCh)
