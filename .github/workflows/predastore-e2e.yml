@@ -185,48 +185,38 @@ jobs:
 
   performance:
     name: Performance (Warp, bare metal)
-    # Pinned to the dedicated runner: it only executes ssh/scp against the
-    # three hardware hosts and holds no cluster data of its own.
+    # The runner only drives ssh/scp against the hardware hosts and holds no
+    # cluster data of its own.
     runs-on: [self-hosted, ci-predastore]
     timeout-minutes: 45
     # inputs is null on a push, and GitHub coerces both sides of != to a
     # number there, so the event has to be checked first.
     if: github.event_name != 'workflow_dispatch' || inputs.run_performance
 
-    # A fixed group with no ref in it, so every performance run across every
-    # branch queues behind the one in flight. Killing a benchmark part way
-    # through leaves a cluster and its data behind on three machines rather
-    # than one, which is why this waits rather than cancels.
+    # A fixed group with no ref in it, so runs across every branch queue behind
+    # each other. Killing a benchmark part way through leaves a cluster and its
+    # data behind on several machines, which is why this waits rather cancels.
     concurrency:
       group: predastore-performance
       cancel-in-progress: false
 
+    # The target hosts, their addresses and the directory the cluster is
+    # deployed to are deployment facts, not repository ones. They are supplied
+    # by repository variables and the job fails if any is unset.
     env:
-      HW_HOSTS: ${{ vars.PREDASTORE_HW_HOSTS || 'tf-user@bottlebrush tf-user@ironbark tf-user@casuarina' }}
-      HW_ADDRS: ${{ vars.PREDASTORE_HW_ADDRS || '10.10.8.4 10.10.8.5 10.10.8.6' }}
-      # Same disk hwbench.sh itself defaults to (disk1: disk2 and disk3 carry
-      # spinifex's own storage services and confound the numbers). Only the
-      # leaf directory differs, so clean's rm -rf never reaches a manual run.
-      HW_ROOT: ${{ vars.PREDASTORE_HW_ROOT || '/mnt/disk1/tf-user/predastore-ci' }}
-      # HW_WORK is resolved against RUNNER_TEMP in the "Resolve HW_WORK" step
-      # below, not set here — runner.temp isn't reachable from job-level env:.
-      # One ref: the commit under test. hwbench.sh's own default is three
-      # refs including two hardcoded shas, a comparison harness rather than
-      # a CI run.
+      HW_HOSTS: ${{ vars.PREDASTORE_HW_HOSTS }}
+      HW_ADDRS: ${{ vars.PREDASTORE_HW_ADDRS }}
+      HW_ROOT: ${{ vars.PREDASTORE_HW_ROOT }}
+      # One ref: the commit under test, rather than the script's own default of
+      # several refs for a before/after comparison.
       HW_REFS: ci:${{ github.sha }}
       PERF_TAG: ci-${{ github.run_id }}
-      # smoke matches what this job measured before this change (the
-      # Makefile's own default). Presets, durations, sizes and workloads are
-      # unchanged by this move to bare metal.
       PERF_PRESET: smoke
 
     steps:
-      # bottlebrush/ironbark/casuarina are the hypervisors for the env1-env21
-      # nested dev clusters and for engineers' own workstation VMs. Checked
-      # before any ssh to the hosts, mirroring the sentinel-file mutex
-      # spinifex's gpu-e2e.yml uses for wattle: a sentinel on the RUNNER (not
-      # the target hosts) or a repo/environment variable pauses this job
-      # cleanly instead of racing manual work on the cluster.
+      # The hardware hosts also carry the nested dev clusters and engineers'
+      # workstation VMs. A sentinel on the RUNNER or a repository variable
+      # pauses this job cleanly rather than racing manual work on them.
       - name: Manual-work / cluster-in-use mutex gate
         id: gate
         env:
@@ -236,25 +226,48 @@ jobs:
           PAUSED=false
           if [ -f "$HOME/.ci-predastore-hw-paused" ]; then
             PAUSED=true
-            echo "::warning::ci-predastore-hw paused via ~/.ci-predastore-hw-paused sentinel on the runner — skipping this run (manual work in progress on bottlebrush/ironbark/casuarina). Remove the file to resume CI."
+            echo "::warning::paused via the ~/.ci-predastore-hw-paused sentinel on the runner; manual work is in progress on the hardware hosts. Remove the file to resume CI."
           fi
           if [ "$(echo "${REPO_VAR_PAUSED:-}" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
             PAUSED=true
-            echo "::warning::ci-predastore-hw paused via repo/environment variable CI_PREDASTORE_HW_PAUSED=true — skipping this run."
+            echo "::warning::paused via repository variable CI_PREDASTORE_HW_PAUSED=true."
           fi
           echo "paused=${PAUSED}" >> "$GITHUB_OUTPUT"
 
       - name: Paused — nothing to do
         if: steps.gate.outputs.paused == 'true'
-        run: echo "cluster is paused for manual work; job exits cleanly without touching bottlebrush/ironbark/casuarina."
+        run: echo "paused for manual work; exiting without touching the hardware hosts."
+
+      # Checked before any ssh. HW_ROOT is deleted recursively on every host at
+      # the end of a run, so a shallow path here would be destructive: require
+      # an absolute path at least three components deep.
+      - name: Check required configuration
+        if: steps.gate.outputs.paused != 'true'
+        run: |
+          set -euo pipefail
+          fail=0
+          for name in HW_HOSTS HW_ADDRS HW_ROOT; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::repository variable PREDASTORE_${name} is not set"
+              fail=1
+            fi
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          if [ "$(wc -w <<< "$HW_HOSTS")" -ne "$(wc -w <<< "$HW_ADDRS")" ]; then
+            echo "::error::PREDASTORE_HW_HOSTS and PREDASTORE_HW_ADDRS name a different number of hosts"
+            exit 1
+          fi
+          case "$HW_ROOT" in
+            /*/*/*) ;;
+            *) echo "::error::PREDASTORE_HW_ROOT must be an absolute path at least three components deep; it is deleted recursively on every host"; exit 1 ;;
+          esac
 
       - name: Checkout Code
         if: steps.gate.outputs.paused != 'true'
         uses: actions/checkout@v7
 
-      # runner.temp isn't reachable from job-level env:, and whether the
-      # runner's /tmp is tmpfs is unconfirmed, so HW_WORK is resolved here
-      # against RUNNER_TEMP, which shares the checkout's own disk.
+      # runner.temp is not reachable from job-level env:, and the runner's /tmp
+      # may be tmpfs, so HW_WORK is resolved here against RUNNER_TEMP.
       - name: Resolve HW_WORK
         if: steps.gate.outputs.paused != 'true'
         run: echo "HW_WORK=$RUNNER_TEMP/hwbench-ci" >> "$GITHUB_ENV"
@@ -266,9 +279,9 @@ jobs:
           cache-dependency-path: "go.sum"
           go-version-file: "go.mod"
 
-      # hwbench.sh's on() shells out to plain `ssh $host ...` with no -i or
-      # -F, so the identity and known_hosts have to be the default ones for
-      # this runner user rather than passed on the command line.
+      # hwbench.sh's on() shells out to plain `ssh $host` with no -i or -F, so
+      # the identity has to be this runner user's default. The Host stanzas are
+      # derived from HW_HOSTS rather than named here.
       - name: Install SSH key for the hardware hosts
         if: steps.gate.outputs.paused != 'true'
         run: |
@@ -278,31 +291,31 @@ jobs:
           printf '%s\n' "${{ secrets.PREDASTORE_HW_SSH_KEY }}" > "$HOME/.ssh/predastore-hw-ci"
           printf '%s\n' "${{ secrets.PREDASTORE_HW_KNOWN_HOSTS }}" >> "$HOME/.ssh/known_hosts"
           chmod 600 "$HOME/.ssh/known_hosts"
-          {
-            echo "Host bottlebrush ironbark casuarina"
-            echo "  User tf-user"
-            echo "  IdentityFile $HOME/.ssh/predastore-hw-ci"
-            echo "  IdentitiesOnly yes"
-          } >> "$HOME/.ssh/config"
+          for target in $HW_HOSTS; do
+            {
+              echo "Host ${target#*@}"
+              echo "  User ${target%@*}"
+              echo "  IdentityFile $HOME/.ssh/predastore-hw-ci"
+              echo "  IdentitiesOnly yes"
+            } >> "$HOME/.ssh/config"
+          done
           chmod 600 "$HOME/.ssh/config"
 
       # cmd_tools ships the AWS CLI from this path on the RUNNER to the tools
-      # host — it does not install it. clean removes it from the tools host
-      # every run, so this has to be present on the runner every run too.
+      # host rather than installing it, and clean removes it from that host
+      # every run, so it has to be present here every run.
       - name: Check AWS CLI v2 is present on the runner
         if: steps.gate.outputs.paused != 'true'
         run: |
           set -euo pipefail
           if [ ! -d /usr/local/aws-cli ]; then
-            echo "::error::/usr/local/aws-cli is missing on this runner. hwbench.sh tools ships the AWS CLI from here to the tools host; install AWS CLI v2 to /usr/local/aws-cli once on this runner (see PR description) before this job can run." >&2
+            echo "::error::/usr/local/aws-cli is missing on this runner. Install AWS CLI v2 there once before this job can run." >&2
             exit 1
           fi
 
-      # cmd_build worktrees each ref under $HW_WORK and never removes it. A
-      # fresh sha every CI run would otherwise accumulate worktrees on the
-      # runner — the same disk problem this change exists to fix, moved one
-      # directory across. Pruning here, not in the script, keeps hwbench.sh's
-      # behavior unchanged for its normal (human, long-lived work dir) use.
+      # cmd_build worktrees each ref under $HW_WORK and never removes it, so a
+      # fresh sha every run would accumulate them. Pruning here rather than in
+      # the script leaves hwbench.sh's long-lived work dir behaviour alone.
       - name: Clean stale hwbench work dir
         if: steps.gate.outputs.paused != 'true'
         run: |
@@ -338,10 +351,9 @@ jobs:
         if: steps.gate.outputs.paused != 'true'
         run: scripts/bench/hw/hwbench.sh perf ci "$PERF_TAG"
 
-      # cmd_perf writes to $HW_ROOT/results on the tools host (the last host
-      # in HW_HOSTS) and save_host_logs writes per-host logs on every host.
-      # Nothing lands on the runner on its own, and clean below deletes the
-      # source, so this has to run first and has to run even on failure.
+      # Results are written on the tools host (the last in HW_HOSTS) and logs
+      # on every host, so nothing reaches the runner on its own. clean below
+      # deletes the source, so this runs first and runs even on failure.
       - name: Fetch results and host logs
         if: always() && steps.gate.outputs.paused != 'true'
         run: |
@@ -368,8 +380,8 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
-      # stop and clean run under always() so a cancelled run does not leave
-      # s3d processes and cluster data on three machines rather than one.
+      # Both run under always() so a cancelled run does not leave s3d
+      # processes and cluster data behind on the hardware hosts.
       - name: hwbench stop
         if: always() && steps.gate.outputs.paused != 'true'
         run: scripts/bench/hw/hwbench.sh stop || true
