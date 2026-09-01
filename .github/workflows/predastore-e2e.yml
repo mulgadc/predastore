@@ -499,6 +499,44 @@ jobs:
               "$h:$HW_ROOT/hostlogs/." "scripts/bench/hw/hostlogs/$hn/" || true
           done
 
+      # Free space where the cluster's data actually lands. Captured before
+      # clean, since clean is what frees it, and nothing else in the artefact
+      # can say whether a capacity failure was a capacity failure.
+      - name: Capture free space on the hardware hosts
+        if: always() && steps.gate.outputs.paused != 'true' && steps.config.outcome == 'success'
+        run: |
+          set -euo pipefail
+          for h in $HW_HOSTS; do
+            hn="${h#*@}"
+            mkdir -p "scripts/bench/hw/hostlogs/$hn"
+            ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$h" \
+              "df -PB1 '$HW_ROOT'" > "scripts/bench/hw/hostlogs/$hn/disk.txt" 2>/dev/null || true
+          done
+
+      # The job measures four times and the summary reports all four. The roots
+      # are listed in the order they ran rather than sorted together, so it
+      # reads loopback, loopback at 64 KiB, then the two passes on hardware.
+      - name: Write run summary
+        if: always() && steps.gate.outputs.paused != 'true' && steps.config.outcome == 'success'
+        run: |
+          set -euo pipefail
+          run_dirs=()
+          for root in scripts/bench/results/e2e-performance-loopback \
+                      scripts/bench/results/e2e-performance-loopback-small \
+                      scripts/bench/results/e2e-performance; do
+            [ -d "$root" ] || continue
+            while IFS= read -r d; do
+              [ -n "$d" ] && run_dirs+=("$d")
+            done < <(find "$root" -mindepth 1 -maxdepth 1 -type d | sort)
+          done
+          if [ "${#run_dirs[@]}" -gt 0 ]; then
+            scripts/bench/perf-summary.sh --hostlogs scripts/bench/hw/hostlogs \
+              "${run_dirs[@]}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No performance results were found for this run." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload Results
         if: always() && steps.gate.outputs.paused != 'true' && steps.config.outcome == 'success'
         uses: actions/upload-artifact@v5
