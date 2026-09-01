@@ -185,34 +185,46 @@ func PartETagFrom(h hash.Hash) string {
 	return fmt.Sprintf("\"%x\"", h.Sum(nil))
 }
 
-// CalculateMultipartDigest computes the raw composite digest
-// CalculateMultipartETag formats: md5(concat(md5(part1), md5(part2), ...)).
-// Split out so a caller storing the digest in a placement record does not
-// have to parse it back out of the "-N" string the ETag renders as.
-func CalculateMultipartDigest(partETags []string) [16]byte {
-	// Concatenate all part MD5s
-	concat := make([]byte, 0, len(partETags)*16)
-
-	for _, etag := range partETags {
-		// Remove quotes and any suffix (e.g., "-1" from nested multipart)
-		cleanETag := strings.Trim(etag, "\"")
-		cleanETag = strings.Split(cleanETag, "-")[0]
-		md5Bytes, err := hex.DecodeString(cleanETag)
-		if err != nil {
-			// If we can't decode, skip this part (shouldn't happen with valid ETags)
-			continue
-		}
-		concat = append(concat, md5Bytes...)
-	}
-
-	return md5.Sum(concat)
+// MultipartETag composes the entity tag of an object assembled from parts:
+// md5(concat(md5(part1), md5(part2), ...)) rendered with a "-N" suffix. Parts
+// are added in the order they make up the object.
+type MultipartETag struct {
+	digests []byte
+	parts   int
 }
 
-// CalculateMultipartETag calculates the ETag for a completed multipart upload
-// Format: "md5(concat(md5(part1), md5(part2), ...))-partCount".
-func CalculateMultipartETag(partETags []string, numParts int) string {
-	finalMD5 := CalculateMultipartDigest(partETags)
-	return fmt.Sprintf("\"%x-%d\"", finalMD5, numParts)
+// NewMultipartETag starts a composite over an expected part count, which only
+// sizes the buffer: AddPart accepts as many as it is given.
+func NewMultipartETag(parts int) *MultipartETag {
+	return &MultipartETag{digests: make([]byte, 0, parts*md5.Size)}
+}
+
+// AddPart accumulates one part's ETag, tolerating quotes and the "-N" suffix a
+// nested multipart part carries. An ETag it cannot read is an error rather
+// than a skip: skipping one composes a digest that is confidently wrong.
+func (m *MultipartETag) AddPart(etag string) error {
+	raw, _, _ := strings.Cut(NormalizeETag(etag), "-")
+	sum, err := hex.DecodeString(raw)
+	if err != nil || len(sum) != md5.Size {
+		return NewS3Error(ErrInvalidPart,
+			fmt.Sprintf("Part %d has an unusable ETag %q", m.parts+1, etag), 400)
+	}
+	m.digests = append(m.digests, sum...)
+	m.parts++
+
+	return nil
+}
+
+// Digest is the raw composite the placement record stores, so a later read can
+// render the ETag without parsing it back out of the "-N" string.
+func (m *MultipartETag) Digest() [md5.Size]byte { return md5.Sum(m.digests) }
+
+// PartCount is how many parts the composite was built from.
+func (m *MultipartETag) PartCount() int { return m.parts }
+
+// String renders the S3 entity tag, quoted.
+func (m *MultipartETag) String() string {
+	return fmt.Sprintf("\"%x-%d\"", m.Digest(), m.parts)
 }
 
 // NormalizeETag removes quotes and normalizes an ETag for comparison.

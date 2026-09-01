@@ -185,8 +185,10 @@ func TestMultipartUploadETagIsTheCompositeForm(t *testing.T) {
 	etag1 := uploadPart(1, part1)
 	etag2 := uploadPart(2, part2)
 
-	digest := model.CalculateMultipartDigest([]string{etag1, etag2})
-	wantETag := fmt.Sprintf("\"%x-2\"", digest)
+	composite := model.NewMultipartETag(2)
+	require.NoError(t, composite.AddPart(etag1))
+	require.NoError(t, composite.AddPart(etag2))
+	wantETag := composite.String()
 
 	completeBody, err := xml.Marshal(CompleteMultipartUploadRequest{Parts: []MultipartUploadPart{
 		{PartNumber: 1, ETag: etag1}, {PartNumber: 2, ETag: etag2},

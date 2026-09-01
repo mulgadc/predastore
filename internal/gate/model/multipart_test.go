@@ -229,43 +229,53 @@ func TestPartETagFromMatchesCalculatePartETag(t *testing.T) {
 	assert.Equal(t, CalculatePartETag(data), PartETagFrom(h))
 }
 
-func TestCalculateMultipartETag(t *testing.T) {
+func TestMultipartETag(t *testing.T) {
 	// Test with known part ETags
 	part1Data := []byte("part 1 data")
 	part2Data := []byte("part 2 data")
 	part1MD5 := md5.Sum(part1Data)
 	part2MD5 := md5.Sum(part2Data)
 
-	part1ETag := fmt.Sprintf("\"%x\"", part1MD5)
-	part2ETag := fmt.Sprintf("\"%x\"", part2MD5)
+	composite := NewMultipartETag(2)
+	require.NoError(t, composite.AddPart(fmt.Sprintf("\"%x\"", part1MD5)))
+	require.NoError(t, composite.AddPart(fmt.Sprintf("\"%x\"", part2MD5)))
 
-	partETags := []string{part1ETag, part2ETag}
-
-	result := CalculateMultipartETag(partETags, 2)
+	result := composite.String()
 
 	// Verify format: "md5-partcount"
 	assert.Contains(t, result, "-2\"")
-	assert.Greater(t, len(result), 35) // md5 hex (32) + quotes + dash + count
+	assert.Equal(t, 2, composite.PartCount())
 
 	// Calculate expected manually
 	concat := append(part1MD5[:], part2MD5[:]...)
 	expectedMD5 := md5.Sum(concat)
-	expectedETag := fmt.Sprintf("\"%x-%d\"", expectedMD5, 2)
-	assert.Equal(t, expectedETag, result)
+	assert.Equal(t, fmt.Sprintf("\"%x-%d\"", expectedMD5, 2), result)
+	assert.Equal(t, expectedMD5, composite.Digest())
 }
 
-func TestCalculateMultipartETag_WithQuotedETags(t *testing.T) {
-	// ETags might come with or without quotes
-	partETags := []string{
+func TestMultipartETagAcceptsEveryPartETagForm(t *testing.T) {
+	// ETags might come with or without quotes, and a nested multipart part
+	// carries its own "-N" suffix.
+	composite := NewMultipartETag(3)
+	for _, etag := range []string{
 		"\"d41d8cd98f00b204e9800998ecf8427e\"",
 		"d41d8cd98f00b204e9800998ecf8427e",
-		"\"d41d8cd98f00b204e9800998ecf8427e-1\"", // Already has part count suffix
+		"\"d41d8cd98f00b204e9800998ecf8427e-1\"",
+	} {
+		require.NoError(t, composite.AddPart(etag))
 	}
 
-	result := CalculateMultipartETag(partETags, 3)
+	assert.Contains(t, composite.String(), "-3\"")
+}
 
-	// Should handle all formats gracefully
-	assert.Contains(t, result, "-3\"")
+// A part ETag that is not a hex MD5 cannot contribute to the composite, and
+// skipping it would compose a digest that is wrong without saying so.
+func TestMultipartETagRejectsAnUnusablePartETag(t *testing.T) {
+	composite := NewMultipartETag(1)
+
+	assert.Error(t, composite.AddPart("not-an-etag"))
+	assert.Error(t, composite.AddPart("\"abc123\""))
+	assert.Equal(t, 0, composite.PartCount())
 }
 
 func TestNormalizeETag(t *testing.T) {
@@ -330,11 +340,10 @@ func TestMultipartETagFormat(t *testing.T) {
 		part2MD5[i] = byte(i + 16)
 	}
 
-	part1ETag := fmt.Sprintf("\"%s\"", hex.EncodeToString(part1MD5))
-	part2ETag := fmt.Sprintf("\"%s\"", hex.EncodeToString(part2MD5))
-
-	result := CalculateMultipartETag([]string{part1ETag, part2ETag}, 2)
+	composite := NewMultipartETag(2)
+	require.NoError(t, composite.AddPart(fmt.Sprintf("\"%s\"", hex.EncodeToString(part1MD5))))
+	require.NoError(t, composite.AddPart(fmt.Sprintf("\"%s\"", hex.EncodeToString(part2MD5))))
 
 	// Should match format: "hex-md5-of-concatenated-md5s-partcount"
-	assert.Regexp(t, `^"[a-f0-9]{32}-2"$`, result)
+	assert.Regexp(t, `^"[a-f0-9]{32}-2"$`, composite.String())
 }
