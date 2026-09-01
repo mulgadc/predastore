@@ -32,7 +32,7 @@ on:
         required: false
         default: ""
       stress_scenarios:
-        description: "Stress scenarios to run (empty = the eleven this job runs; name partial-put or multipart-upload to add them)"
+        description: "Stress scenarios to run (empty = the twelve this job runs; name partial-put to add it)"
         required: false
         default: ""
       run_performance:
@@ -150,90 +150,80 @@ jobs:
         if: always()
         run: ./scripts/stop.sh s3tests
 
-  stress:
-    name: Stress (fault injection)
-    # A hosted runner cannot host these. Eleven scenarios in sequence take
-    # about twenty minutes, and large-object writes 2 and 4 GiB objects that a
-    # hosted runner would skip for lack of disk.
-    runs-on: [self-hosted, ci-predastore]
-    # Twenty minutes measured on an eight-core VM, so this is room for a bad
-    # run rather than an estimate.
-    timeout-minutes: 45
-
-    # One runner serves this and the performance job. A benchmark measured
-    # while a stress run is SIGSTOPping hosts on the same box is not a
-    # measurement, so the two queue behind each other rather than overlap.
-    concurrency:
-      group: predastore-self-hosted
-      cancel-in-progress: false
-
+  # The scenario list is a job rather than a literal in the matrix so the
+  # dispatch input can still name partial-put, which the default set leaves
+  # out.
+  stress-plan:
+    name: Stress (plan)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      scenarios: ${{ steps.plan.outputs.scenarios }}
     steps:
-      # Same pause as the performance job, and for the same reason: this box
-      # also carries dev clusters and workstation VMs.
-      - name: Manual-work / cluster-in-use mutex gate
-        id: gate
-        env:
-          REPO_VAR_PAUSED: ${{ vars.CI_PREDASTORE_HW_PAUSED }}
-        run: |
-          set -euo pipefail
-          PAUSED=false
-          if [ -f "$HOME/.ci-predastore-hw-paused" ]; then
-            PAUSED=true
-            echo "::warning::paused via the ~/.ci-predastore-hw-paused sentinel on the runner; manual work is in progress. Remove the file to resume CI."
-          fi
-          if [ "$(echo "${REPO_VAR_PAUSED:-}" | tr '[:upper:]' '[:lower:]')" = "true" ]; then
-            PAUSED=true
-            echo "::warning::paused via repository variable CI_PREDASTORE_HW_PAUSED=true."
-          fi
-          echo "paused=${PAUSED}" >> "$GITHUB_OUTPUT"
-
-      - name: Paused — nothing to do
-        if: steps.gate.outputs.paused == 'true'
-        run: echo "paused for manual work; exiting without starting a cluster."
-
-      - name: Checkout Code
-        if: steps.gate.outputs.paused != 'true'
-        uses: actions/checkout@v7
-
-      # Cached off, like the other self-hosted job. This runner keeps its
-      # module and build caches on local disk between runs, so the action
-      # would spend minutes fetching an archive of what is already here.
-      - name: Setup Go
-        if: steps.gate.outputs.paused != 'true'
-        uses: actions/setup-go@v7
-        with:
-          cache: false
-          go-version-file: "go.mod"
-
-      # One job for every scenario rather than one job each. stress-gate.sh
-      # invokes e2e-stress.sh once per scenario and records the outcome of
-      # each, so a red one no longer hides the ones behind it and the matrix
-      # that existed to prevent that has nothing left to do. On a single
-      # runner its legs would have run in sequence regardless.
-      #
-      # A failing scenario fails the job. torn-overwrite is red today and it
-      # should look red: an overwrite with no commit point across its shards
-      # leaves the object part new and part old, served as a 200 with the
-      # right length and ETag. The baseline marks it known, not excused.
-      #
-      # Eleven of the thirteen. partial-put and multipart-upload are left out
-      # because they cost twenty of the forty minutes between them, and the
-      # spinifex nightly already runs the whole set. Naming either of them in
-      # the dispatch input still runs it.
-      - name: Run Scenarios
-        if: steps.gate.outputs.paused != 'true'
+      # Twelve of the thirteen. partial-put is left out because it fails today
+      # on an unbounded inbound body read, and a strict run that is red every
+      # time is a run nobody reads. The spinifex nightly covers it.
+      - name: Choose Scenarios
+        id: plan
         env:
           REQUESTED: ${{ inputs.stress_scenarios }}
         run: |
           set -euo pipefail
-          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put torn-overwrite stale-shard freeze"
-          make e2e-stress-strict STRESS_SCENARIOS="${REQUESTED:-$default}"
+          default="repair handoff node-rejoin node-resync node-rebuild multipart-upload last-modified large-object concurrent-put torn-overwrite stale-shard freeze"
+          # shellcheck disable=SC2086
+          printf '%s\n' ${REQUESTED:-$default} | jq -Rsc 'split("\n") | map(select(length > 0))' \
+            | sed 's/^/scenarios=/' >> "$GITHUB_OUTPUT"
+
+  stress:
+    name: Stress (${{ matrix.scenario }})
+    needs: stress-plan
+    # A hosted runner per scenario rather than all of them in sequence on one
+    # box. The scenarios are mostly deliberate waiting rather than compute, so
+    # in sequence they spend twenty minutes of wall clock doing about three
+    # minutes' worth of work each, and they queue behind the performance job
+    # for the one self-hosted runner while they do it.
+    runs-on: ubuntu-26.04
+    # No leg has taken over three minutes. This is room for a bad run.
+    timeout-minutes: 30
+
+    strategy:
+      # A red scenario must not cancel the others: the whole point of scenario
+      # granularity is that each one reports for itself.
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(needs.stress-plan.outputs.scenarios) }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          cache: true
+          go-version-file: "go.mod"
+
+      # large-object sizes itself to the disk it finds and says so when it
+      # skips. A hosted runner has offered 91GiB and four cores, which is
+      # enough for both its sizes, but that is a fact worth re-reading in the
+      # log rather than assuming.
+      - name: Runner Capacity
+        run: |
+          set -euo pipefail
+          printf 'cores: %s\n' "$(nproc)"
+          free -g
+          df -h "${TMPDIR:-/tmp}" /
+
+      # A failing scenario fails its own leg. stress-gate.sh still reads the
+      # baseline, so a known gap is reported as one rather than as a surprise.
+      - name: Run Scenario
+        run: make e2e-stress-strict STRESS_SCENARIOS="${{ matrix.scenario }}"
 
       - name: Upload Results
-        if: always() && steps.gate.outputs.paused != 'true'
+        if: always()
         uses: actions/upload-artifact@v5
         with:
-          name: stress
+          name: stress-${{ matrix.scenario }}
           path: scripts/bench/results/e2e-stress/
           if-no-files-found: ignore
           retention-days: 14
