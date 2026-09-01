@@ -198,9 +198,11 @@ jobs:
   performance:
     name: Performance (Warp, bare metal)
     # The runner only drives ssh/scp against the hardware hosts and holds no
-    # cluster data of its own.
+    # cluster data of its own, apart from the loopback run below.
     runs-on: [self-hosted, ci-predastore]
-    timeout-minutes: 45
+    # Room for the loopback run in front of the hardware one. Both presets are
+    # smoke, so the whole job has been landing inside 30.
+    timeout-minutes: 60
     # inputs is null on a push, and GitHub coerces both sides of != to a
     # number there, so the event has to be checked first.
     if: github.event_name != 'workflow_dispatch' || inputs.run_performance
@@ -340,6 +342,22 @@ jobs:
         if: steps.gate.outputs.paused != 'true'
         run: make warp-install
 
+      # The bare-metal numbers have no denominator without this. The same code
+      # and the same workloads with the network taken out is what says whether
+      # three hosts are worth having, and PERF_CONFIGS covers 1host and 3host.
+      #
+      # It runs before the hardware cluster starts rather than after it stops:
+      # if this runner is one of the hardware hosts, a loopback cluster beside
+      # a live one measures neither of them.
+      - name: Run Warp Suite (loopback)
+        if: steps.gate.outputs.paused != 'true'
+        env:
+          # /tmp here may be tmpfs and a 30s PUT workload stages gigabytes
+          # through it, so the script's work directory is steered off it.
+          TMPDIR: ${{ runner.temp }}
+          PERF_RESULTS_ROOT: scripts/bench/results/e2e-performance-loopback
+        run: make e2e-performance
+
       - name: hwbench build
         if: steps.gate.outputs.paused != 'true'
         run: scripts/bench/hw/hwbench.sh build
@@ -387,8 +405,12 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: performance
+          # Two roots, not one. A loopback figure and a bare-metal one are not
+          # comparable, and interleaving them under a single timestamped tree
+          # invites reading one as the other.
           path: |
             scripts/bench/results/e2e-performance/
+            scripts/bench/results/e2e-performance-loopback/
             scripts/bench/hw/hostlogs/
           if-no-files-found: ignore
           retention-days: 30
