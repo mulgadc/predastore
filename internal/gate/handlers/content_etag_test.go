@@ -218,36 +218,25 @@ func TestMultipartUploadETagIsTheCompositeForm(t *testing.T) {
 	assert.Equal(t, wantETag, (*listing.Contents)[0].ETag, "ListObjects must agree with CompleteMultipartUpload")
 }
 
-// rawPlacementV1 builds a version 1 placement record by hand, the format
-// this store wrote before it carried a block size or a content digest.
-func rawPlacementV1(size int64, epoch uint64, nodes []config.NodeID) []byte {
-	b := []byte{placementMagic, placementVersionV1, byte(len(nodes))}
+// rawLegacyPlacement builds a pre-digest placement record by hand. Version 1
+// carries neither a block size nor a digest; version 2 adds the block size.
+func rawLegacyPlacement(version byte, size int64, epoch uint64, blockSize int64, nodes []config.NodeID) []byte {
+	b := []byte{placementMagic, version, byte(len(nodes))}
 	b = binary.BigEndian.AppendUint64(b, uint64(size))
 	b = binary.BigEndian.AppendUint64(b, epoch)
+	if version >= 0x02 {
+		b = binary.BigEndian.AppendUint64(b, uint64(blockSize))
+	}
 	for _, id := range nodes {
 		b = binary.AppendUvarint(b, uint64(id))
 	}
 	return b
 }
 
-// rawPlacementV2 builds a version 2 placement record by hand: it carries a
-// real epoch and a block size, but predates the content digest v3 added.
-func rawPlacementV2(size int64, epoch uint64, blockSize int64, nodes []config.NodeID) []byte {
-	b := []byte{placementMagic, placementVersionV2, byte(len(nodes))}
-	b = binary.BigEndian.AppendUint64(b, uint64(size))
-	b = binary.BigEndian.AppendUint64(b, epoch)
-	b = binary.BigEndian.AppendUint64(b, uint64(blockSize))
-	for _, id := range nodes {
-		b = binary.AppendUvarint(b, uint64(id))
-	}
-	return b
-}
-
-// An object whose placement record predates version 3 has no stored digest
-// and cannot produce a correct ETag without re-reading its body. HEAD, GET
-// and the listing must all omit the header rather than serving the old
-// name-derived value, which is exactly the defect this fixes.
-func TestObjectWithNoStoredDigestOmitsETag(t *testing.T) {
+// A placement record written before content digests existed is not migrated:
+// it is refused, so a store holding one is rebuilt rather than quietly serving
+// objects whose ETag nothing can produce.
+func TestObjectWithLegacyPlacementRecordIsRefused(t *testing.T) {
 	// RS(1,0): a legacy record names exactly one node, so the ring width here
 	// must match rather than triggering the shard-count mismatch a real
 	// RS(2,1) placement would.
@@ -262,39 +251,33 @@ func TestObjectWithNoStoredDigestOmitsETag(t *testing.T) {
 	}
 
 	v1Body := []byte("a version one object")
-	seed("legacy-v1", rawPlacementV1(int64(len(v1Body)), 0xdeadbeefcafef00d, []config.NodeID{1}), v1Body, 0xdeadbeefcafef00d)
+	seed("legacy-v1", rawLegacyPlacement(0x01, int64(len(v1Body)), 0xdeadbeefcafef00d, 0, []config.NodeID{1}),
+		v1Body, 0xdeadbeefcafef00d)
 
 	v2Body := []byte("a version two object")
-	seed("legacy-v2", rawPlacementV2(int64(len(v2Body)), 12345, int64(len(v2Body)), []config.NodeID{1}), v2Body, 12345)
+	seed("legacy-v2", rawLegacyPlacement(0x02, int64(len(v2Body)), 12345, int64(len(v2Body)), []config.NodeID{1}),
+		v2Body, 12345)
 
 	for _, tt := range []struct {
 		name string
 		key  string
-		body []byte
 	}{
-		{"version 1", "legacy-v1", v1Body},
-		{"version 2", "legacy-v2", v2Body},
+		{"version 1", "legacy-v1"},
+		{"version 2", "legacy-v2"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			headRR := f.head(bucket, tt.key)
-			require.Equal(t, http.StatusOK, headRR.Code, headRR.Body.String())
-			assert.Empty(t, headRR.Header().Get("ETag"), "HEAD must omit the ETag for a record with no digest")
-			assert.Equal(t, strconv.Itoa(len(tt.body)), headRR.Header().Get("Content-Length"))
+			assert.NotEqual(t, http.StatusOK, headRR.Code, "HEAD must refuse a legacy record")
 
 			getRR := f.get(bucket, tt.key)
-			require.Equal(t, http.StatusOK, getRR.Code, getRR.Body.String())
-			assert.Empty(t, getRR.Header().Get("ETag"), "GET must omit the ETag for a record with no digest")
-			assert.Equal(t, tt.body, getRR.Body.Bytes())
+			assert.NotEqual(t, http.StatusOK, getRR.Code, "GET must refuse a legacy record")
 
 			listing := f.list(t, bucket)
-			var found bool
 			for _, c := range *listing.Contents {
 				if c.Key == tt.key {
-					found = true
-					assert.Empty(t, c.ETag, "the listing must omit the ETag for a record with no digest")
+					assert.Empty(t, c.ETag, "the listing must not invent an ETag for a legacy record")
 				}
 			}
-			assert.True(t, found, "expected %s in the listing", tt.key)
 		})
 	}
 }

@@ -128,7 +128,6 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		// it without recomputing anything.
 		digest := model.CalculateMultipartDigest(partETags)
 		place.Digest = digest[:]
-		place.DigestPresent = true
 		place.PartCount = len(parts)
 
 		shardRecord, err := EncodePlacement(place)

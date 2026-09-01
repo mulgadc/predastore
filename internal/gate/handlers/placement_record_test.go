@@ -6,7 +6,6 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	"slices"
 	"testing"
 	"time"
 
@@ -142,8 +141,8 @@ func TestPlacementRecordRejectsMalformedInput(t *testing.T) {
 	}
 
 	// The digest marker is a single 0x00 byte here, since this record carries
-	// no digest, so the node ids start one byte past the fixed v3 header.
-	nodeIDStart := placementFixedSizeV3 + 1
+	// no digest, so the node ids start one byte past the fixed header.
+	nodeIDStart := placementFixedSize + 1
 	truncatedIDs := append([]byte(nil), good[:nodeIDStart+1]...)
 
 	unknownVersion := append([]byte(nil), good...)
@@ -152,7 +151,7 @@ func TestPlacementRecordRejectsMalformedInput(t *testing.T) {
 	malformedUvarint := append([]byte(nil), good[:nodeIDStart]...)
 	malformedUvarint = append(malformedUvarint, 0x80) // continuation bit with nothing after it
 
-	malformedMarker := append([]byte(nil), good[:placementFixedSizeV3]...)
+	malformedMarker := append([]byte(nil), good[:placementFixedSize]...)
 	malformedMarker = append(malformedMarker, 0x80) // continuation bit with nothing after it
 
 	tests := []struct {
@@ -160,7 +159,7 @@ func TestPlacementRecordRejectsMalformedInput(t *testing.T) {
 		input []byte
 	}{
 		{"empty", nil},
-		{"shorter than the header", good[:placementFixedSizeV3-1]},
+		{"shorter than the header", good[:placementFixedSize-1]},
 		{"unknown version", unknownVersion},
 		{"fewer node ids than k declares", truncatedIDs},
 		{"malformed node id uvarint", malformedUvarint},
@@ -214,7 +213,6 @@ func TestPlacementRecordHeaderLayout(t *testing.T) {
 		Size: 0x0102030405060708, WriteEpoch: 0x1112131415161718,
 		BlockSize:      0x2122232425262728,
 		Digest:         digest,
-		DigestPresent:  true,
 		PartCount:      5,
 		DataShardNodes: []config.NodeID{6, 12}, ParityShardNodes: []config.NodeID{3},
 	})
@@ -252,8 +250,8 @@ func TestPlacementRecordHeaderLayout(t *testing.T) {
 }
 
 // A record with no digest zero-fills the digest slot and marks it absent with
-// a single 0x00 byte, so decoding it back reports DigestPresent false rather
-// than treating the zeros as a real MD5.
+// a single 0x00 byte, so decoding it back leaves Digest nil rather than
+// treating the zeros as a real MD5.
 func TestPlacementRecordWithNoDigestRoundTrips(t *testing.T) {
 	encoded, err := EncodePlacement(ObjectToShardNodes{
 		Size: 1, DataShardNodes: []config.NodeID{3, 6}, ParityShardNodes: []config.NodeID{9},
@@ -272,8 +270,8 @@ func TestPlacementRecordWithNoDigestRoundTrips(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodePlacement() error = %v", err)
 	}
-	if decoded.DigestPresent {
-		t.Errorf("DigestPresent = true, want false")
+	if decoded.Digest != nil {
+		t.Errorf("Digest = %x, want nil", decoded.Digest)
 	}
 	if etag, ok := decoded.ETag(); ok {
 		t.Errorf("ETag() = %q, true, want ok = false", etag)
@@ -287,7 +285,7 @@ func TestPlacementRecordDigestRoundTrips(t *testing.T) {
 
 	t.Run("plain digest", func(t *testing.T) {
 		encoded, err := EncodePlacement(ObjectToShardNodes{
-			Size: 4, Digest: digest, DigestPresent: true,
+			Size: 4, Digest: digest,
 			DataShardNodes: []config.NodeID{1}, ParityShardNodes: []config.NodeID{},
 		})
 		if err != nil {
@@ -297,9 +295,9 @@ func TestPlacementRecordDigestRoundTrips(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DecodePlacement() error = %v", err)
 		}
-		if !decoded.DigestPresent || !bytes.Equal(decoded.Digest, digest) || decoded.PartCount != 0 {
-			t.Fatalf("decoded = present=%v digest=%x parts=%d, want present digest=%x parts=0",
-				decoded.DigestPresent, decoded.Digest, decoded.PartCount, digest)
+		if !bytes.Equal(decoded.Digest, digest) || decoded.PartCount != 0 {
+			t.Fatalf("decoded = digest=%x parts=%d, want digest=%x parts=0",
+				decoded.Digest, decoded.PartCount, digest)
 		}
 		if etag, ok := decoded.ETag(); !ok || etag != fmt.Sprintf("\"%x\"", digest) {
 			t.Errorf("ETag() = %q, %v, want %q, true", etag, ok, fmt.Sprintf("\"%x\"", digest))
@@ -308,7 +306,7 @@ func TestPlacementRecordDigestRoundTrips(t *testing.T) {
 
 	t.Run("composite digest", func(t *testing.T) {
 		encoded, err := EncodePlacement(ObjectToShardNodes{
-			Size: 4, Digest: digest, DigestPresent: true, PartCount: 3,
+			Size: 4, Digest: digest, PartCount: 3,
 			DataShardNodes: []config.NodeID{1}, ParityShardNodes: []config.NodeID{},
 		})
 		if err != nil {
@@ -318,9 +316,9 @@ func TestPlacementRecordDigestRoundTrips(t *testing.T) {
 		if err != nil {
 			t.Fatalf("DecodePlacement() error = %v", err)
 		}
-		if !decoded.DigestPresent || !bytes.Equal(decoded.Digest, digest) || decoded.PartCount != 3 {
-			t.Fatalf("decoded = present=%v digest=%x parts=%d, want present digest=%x parts=3",
-				decoded.DigestPresent, decoded.Digest, decoded.PartCount, digest)
+		if !bytes.Equal(decoded.Digest, digest) || decoded.PartCount != 3 {
+			t.Fatalf("decoded = digest=%x parts=%d, want digest=%x parts=3",
+				decoded.Digest, decoded.PartCount, digest)
 		}
 		if etag, ok := decoded.ETag(); !ok || etag != fmt.Sprintf("\"%x-3\"", digest) {
 			t.Errorf("ETag() = %q, %v, want %q, true", etag, ok, fmt.Sprintf("\"%x-3\"", digest))
@@ -328,79 +326,35 @@ func TestPlacementRecordDigestRoundTrips(t *testing.T) {
 	})
 }
 
-// A version 1 or version 2 record predates the digest field entirely, so it
-// must decode as absent rather than erroring or reading garbage.
-func TestOlderRecordsHaveNoDigest(t *testing.T) {
+// Versions 1 and 2 were written to real stores and predate content digests.
+// They are refused by number rather than decoded, because an object whose ETag
+// cannot be produced is worse than one that is missing.
+func TestLegacyRecordVersionsAreRefused(t *testing.T) {
 	v1 := []byte{placementMagic, 0x01, 1}
 	v1 = binary.BigEndian.AppendUint64(v1, 4096)
 	v1 = binary.BigEndian.AppendUint64(v1, 0x1112131415161718)
 	v1 = append(v1, 6)
+	v1 = append(v1, make([]byte, placementFixedSize-len(v1))...)
 
 	v2 := []byte{placementMagic, 0x02, 1}
 	v2 = binary.BigEndian.AppendUint64(v2, 4096)
 	v2 = binary.BigEndian.AppendUint64(v2, 0x1112131415161718)
 	v2 = binary.BigEndian.AppendUint64(v2, 4096)
 	v2 = append(v2, 6)
+	v2 = append(v2, make([]byte, placementFixedSize-len(v2))...)
 
 	for name, raw := range map[string][]byte{"version 1": v1, "version 2": v2} {
 		t.Run(name, func(t *testing.T) {
-			decoded, err := DecodePlacement(raw)
-			if err != nil {
-				t.Fatalf("DecodePlacement(%s) error = %v", name, err)
-			}
-			if decoded.DigestPresent {
-				t.Errorf("DigestPresent = true, want false")
-			}
-			if _, ok := decoded.ETag(); ok {
-				t.Errorf("ETag() ok = true, want false")
+			if _, err := DecodePlacement(raw); !errors.Is(err, errPlacementLegacy) {
+				t.Errorf("DecodePlacement(%s) error = %v, want errPlacementLegacy", name, err)
 			}
 		})
 	}
 }
 
-// Objects written before the gate streamed have no block size in their record
-// and each of their shards is contiguous. Decoding must keep saying so, or
-// every one of them reads back as scrambled bytes.
-func TestAVersionOneRecordDecodesWithNoBlockSize(t *testing.T) {
-	v1 := []byte{placementMagic, 0x01, 2}
-	v1 = binary.BigEndian.AppendUint64(v1, 4096)
-	v1 = binary.BigEndian.AppendUint64(v1, 0x1112131415161718)
-	v1 = append(v1, 6, 12, 3)
-
-	decoded, err := DecodePlacement(v1)
-	if err != nil {
-		t.Fatalf("DecodePlacement(version 1) error = %v", err)
-	}
-	if decoded.BlockSize != 0 {
-		t.Errorf("block size = %d, want 0 so the layout reads as contiguous", decoded.BlockSize)
-	}
-	if decoded.Size != 4096 || decoded.WriteEpoch != 0x1112131415161718 {
-		t.Errorf("size = %d epoch = %#x", decoded.Size, decoded.WriteEpoch)
-	}
-	if want := []config.NodeID{6, 12}; !slices.Equal(decoded.DataShardNodes, want) {
-		t.Errorf("data shard nodes = %v, want %v", decoded.DataShardNodes, want)
-	}
-	if want := []config.NodeID{3}; !slices.Equal(decoded.ParityShardNodes, want) {
-		t.Errorf("parity shard nodes = %v, want %v", decoded.ParityShardNodes, want)
-	}
-}
-
-// A version 1 epoch is eight random bytes. Reading one as a time gives a date
-// hundreds of millions of years out, so the record has to say it cannot say.
-func TestOnlyAVersion2RecordReportsAModificationTime(t *testing.T) {
-	v1 := []byte{placementMagic, 0x01, 1}
-	v1 = binary.BigEndian.AppendUint64(v1, 4096)
-	v1 = binary.BigEndian.AppendUint64(v1, 0x1112131415161718)
-	v1 = append(v1, 6)
-
-	old, err := DecodePlacement(v1)
-	if err != nil {
-		t.Fatalf("DecodePlacement(version 1) error = %v", err)
-	}
-	if at, ok := old.ModifiedAt(); ok {
-		t.Errorf("version 1 record reported a modification time of %s", at)
-	}
-
+// The write epoch is a minted timestamp, and ModifiedAt is what every surface
+// serving a LastModified reads.
+func TestARecordReportsItsModificationTime(t *testing.T) {
 	minter := mustEpochs(3)
 	at := time.UnixMilli(1_800_000_000_123)
 	frozen(minter, at)
@@ -420,11 +374,7 @@ func TestOnlyAVersion2RecordReportsAModificationTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodePlacement() error = %v", err)
 	}
-	got, ok := fresh.ModifiedAt()
-	if !ok {
-		t.Fatal("version 2 record reported no modification time")
-	}
-	if !got.Equal(at) {
+	if got := fresh.ModifiedAt(); !got.Equal(at) {
 		t.Errorf("modification time = %s, want %s", got, at.UTC())
 	}
 }

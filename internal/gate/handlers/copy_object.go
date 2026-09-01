@@ -141,7 +141,6 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		}
 
 		place.Digest = digest.Sum(nil)
-		place.DigestPresent = true
 
 		record, err := EncodePlacement(place)
 		if err != nil {
@@ -174,9 +173,10 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))
 		}
 
+		// The digest was set above, so the record always has an ETag to give.
 		etag, _ := place.ETag()
-		modified, _ := place.ModifiedAt()
-		if err := writeXML(w, http.StatusOK, CopyObjectResult{ETag: etag, LastModified: modified}); err != nil {
+		if err := writeXML(w, http.StatusOK,
+			CopyObjectResult{ETag: etag, LastModified: place.ModifiedAt()}); err != nil {
 			slog.DebugContext(ctx, "failed to write XML response", "error", err)
 		}
 	})

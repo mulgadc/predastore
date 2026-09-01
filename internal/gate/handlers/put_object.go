@@ -79,7 +79,6 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// The record must already carry the digest here: after the commit
 		// point below, it is what every read will demand.
 		place.Digest = digest.Sum(nil)
-		place.DigestPresent = true
 
 		record, err := EncodePlacement(place)
 		if err != nil {
@@ -136,9 +135,9 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		if len(written.handoff) > 0 {
 			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))
 		}
-		if etag, ok := place.ETag(); ok {
-			w.Header().Set("ETag", etag)
-		}
+		// The digest was set above, so the record always has an ETag to give.
+		etag, _ := place.ETag()
+		w.Header().Set("ETag", etag)
 		w.WriteHeader(http.StatusOK)
 	})
 }

@@ -1,7 +1,6 @@
 package handlers
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -83,9 +82,8 @@ func serveObject(
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-		// A record with no stored digest omits the ETag rather than serving the
-		// old name-derived value: a client comparing that against the body it
-		// just fetched would never see a match, and would retry forever.
+		// A whole object's record always carries a digest; the guard covers the
+		// part records that share this type and do not.
 		if etag, ok := place.ETag(); ok {
 			w.Header().Set("ETag", etag)
 		}
@@ -186,45 +184,6 @@ func parseRangeHeader(header string) (start, end int64) {
 		end, _ = strconv.ParseInt(spec[idx+1:], 10, 64)
 	}
 	return start, end
-}
-
-// readObject assembles the complete object in memory. It has no production
-// caller any more -- CopyObject streams instead -- and remains only because
-// the test suite uses it as a buffered read for assertions.
-func readObject(ctx context.Context, bc BlobClient, cfg Config, bucket, key string, place ObjectToShardNodes, size int64, handoff config.NodeID, opts ...stripeOption) ([]byte, int, error) {
-	// An empty object has no shards to read: the write path stores none, since
-	// the blob protocol has no zero-length value to store.
-	if size == 0 {
-		telemetry.RecordObjectRead(ctx, telemetry.ReadPathDirect)
-
-		return nil, 0, nil
-	}
-
-	// Unlike the streaming path this helper holds the object whole, so the
-	// payload is resident for the length of the read and concurrency
-	// multiplies it.
-	defer telemetry.EnterGateInflight(ctx, telemetry.GateOpGet, size)()
-
-	start := time.Now()
-	reader, err := newStripeReader(ctx, bc, cfg, model.ObjectHash(bucket, key), place, handoff, opts...)
-	if err != nil {
-		return nil, 0, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
-	}
-	defer reader.close(ctx)
-
-	out := bytes.NewBuffer(make([]byte, 0, size))
-	if err := pipeObject(ctx, reader, out, size); err != nil {
-		return nil, 0, model.NewS3Error(model.ErrInternalError,
-			fmt.Sprintf("reconstruction failed: %v", err), 500)
-	}
-	reportDegradedRead(ctx, bucket, key, reader.failures, reader.reconstructed, time.Since(start))
-	if reader.reconstructed > 0 {
-		telemetry.RecordObjectRead(ctx, telemetry.ReadPathReconstructed)
-	} else {
-		telemetry.RecordObjectRead(ctx, telemetry.ReadPathDirect)
-	}
-
-	return out.Bytes(), reader.reconstructed, nil
 }
 
 // degradedHeader reports how many shards a GET had to reconstruct. It is not

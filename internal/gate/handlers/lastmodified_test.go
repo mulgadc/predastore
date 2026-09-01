@@ -3,7 +3,6 @@ package handlers
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/gob"
 	"encoding/xml"
 	"net/http"
@@ -89,29 +88,6 @@ func TestAnOverwriteAdvancesTheReportedTime(t *testing.T) {
 	head = httptest.NewRecorder()
 	HeadObject(f.mc, f.ring, testCache(), f.cfg).ServeHTTP(head, objectRequest(http.MethodHead, "k", ""))
 	assert.Equal(t, second.Format(httpTimeFormat), head.Header().Get("Last-Modified"))
-}
-
-// A version 1 record's epoch is random, so there is no time to report. The
-// header stays rather than disappearing: clients require one.
-func TestAnUndatedRecordStillCarriesTheHeader(t *testing.T) {
-	t.Parallel()
-
-	f := newWriteFixture(1, 0)
-	ctx := context.Background()
-	objectHash := model.ObjectHash(testBucket, "k")
-
-	v1 := []byte{placementMagic, 0x01, 1}
-	v1 = binary.BigEndian.AppendUint64(v1, 0)
-	v1 = binary.BigEndian.AppendUint64(v1, 0x1112131415161718)
-	v1 = append(v1, 1)
-	require.NoError(t, metaPut(ctx, f.mc, model.TableObjects, string(objectHash[:]), v1))
-
-	w := httptest.NewRecorder()
-	HeadObject(f.mc, f.ring, testCache(), f.cfg).ServeHTTP(w, objectRequest(http.MethodHead, "k", ""))
-
-	require.Equal(t, http.StatusOK, w.Code)
-	assert.Equal(t, time.Time{}.Format(httpTimeFormat), w.Header().Get("Last-Modified"),
-		"a random epoch must never be read as a date")
 }
 
 // ListParts serves what UploadPart stored, so a part now reports its own
