@@ -47,7 +47,7 @@ func ObjectHashOfKey(stored string) ([32]byte, bool) {
 	if !found || len(key) != sha256.Size {
 		return [32]byte{}, false
 	}
-	for _, reserved := range []string{arnObjectPrefix, deletedObjectPrefix, partKeyPrefix} {
+	for _, reserved := range []string{arnObjectPrefix, DeletedObjectPrefix, partKeyPrefix} {
 		if strings.HasPrefix(key, reserved) {
 			return [32]byte{}, false
 		}

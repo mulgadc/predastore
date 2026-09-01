@@ -13,6 +13,7 @@ import (
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
+	"github.com/mulgadc/predastore/internal/gate/reaper"
 	"github.com/mulgadc/predastore/internal/gate/repair"
 	"github.com/mulgadc/predastore/internal/meta"
 )
@@ -38,6 +39,9 @@ var (
 
 	_ repair.MetaClient = MetaClient(nil)
 	_ repair.BlobClient = BlobClient(nil)
+
+	_ reaper.MetaClient = MetaClient(nil)
+	_ reaper.BlobClient = BlobClient(nil)
 )
 
 // RS fixes the erasure code the gate places objects with.
@@ -63,6 +67,20 @@ type RepairConfig struct {
 	// Workers bounds concurrent shard rebuilds, PageSize how many placement
 	// records a scan asks for at a time, and Interval the gap between passes.
 	// Zero takes the repair package's own default for each.
+	Workers  int
+	PageSize int
+	Interval time.Duration
+}
+
+// ReaperConfig tunes the background sweep that reclaims the shards a delete
+// leaves tombstoned. It is on by default: a delete no longer removes its
+// shards inline, so without this sweep they are never reclaimed at all.
+type ReaperConfig struct {
+	Enabled bool
+
+	// Workers bounds concurrent tombstone reclaims, PageSize how many
+	// tombstone rows a scan asks for at a time, and Interval the gap between
+	// passes. Zero takes the reaper package's own default for each.
 	Workers  int
 	PageSize int
 	Interval time.Duration
@@ -97,6 +115,10 @@ type Config struct {
 	// Repair sweeps for shards a local blob node owns but does not hold at the
 	// generation its record names.
 	Repair RepairConfig
+
+	// Reaper sweeps for tombstones a delete left and reclaims the shards they
+	// name.
+	Reaper ReaperConfig
 
 	// TODO: Move to IAM
 	Auth []auth.Entry
