@@ -28,6 +28,13 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 		bucket, key := resource.Bucket.Name, resource.Key
 
+		// GET /{bucket}/{key}?acl — the object route resolves the key before any
+		// placement lookup runs, so answering here does not read the object.
+		if r.URL.Query().Has("acl") {
+			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "ACL is not implemented")
+			return
+		}
+
 		// -1 for both ends means "no Range header"; any value >= 0 is a range request.
 		rangeStart, rangeEnd := parseRangeHeader(r.Header.Get("Range"))
 
