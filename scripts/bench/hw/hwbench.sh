@@ -298,13 +298,17 @@ cmd_perf() {
     for i in "${!ADDRS[@]}"; do hosts="${hosts:+$hosts,}${ADDRS[$i]}:$GATE_PORT"; done
     sha="$(cat "$WORK/build/s3d-$ref.sha" 2>/dev/null || echo unknown)"
 
-    on "$TOOLS_HOST" "mkdir -p $HW_ROOT/harness/scripts/bench $HW_ROOT/results"
+    on "$TOOLS_HOST" "mkdir -p $HW_ROOT/harness/scripts/bench $HW_ROOT/results $HW_ROOT/tmp"
     scp -q "$REPO_DIR/scripts/lib.sh" "$TOOLS_HOST:$HW_ROOT/harness/scripts/lib.sh"
     scp -q "$REPO_DIR/scripts/bench/e2e-performance.sh" \
         "$TOOLS_HOST:$HW_ROOT/harness/scripts/bench/e2e-performance.sh"
 
     local rc=0
+    # e2e-performance.sh mktemp's its WORK_DIR under ${TMPDIR:-/tmp} before it
+    # repoints TMPDIR at a subdirectory of that same WORK_DIR, so warp's
+    # staged uploads never actually leave the ambient TMPDIR. Set it here first.
     on "$TOOLS_HOST" "chmod +x $HW_ROOT/harness/scripts/bench/e2e-performance.sh && \
+        TMPDIR=$HW_ROOT/tmp \
         PATH=$HW_ROOT/tools/aws-cli/v2/current/bin:\$PATH \
         WARP=$HW_ROOT/tools/warp \
         PERF_PRESET=${PERF_PRESET:-compare} \
