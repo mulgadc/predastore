@@ -123,6 +123,19 @@ func (s *Server) Run(ctx context.Context) error {
 		s.watchLeader(ctx)
 	}()
 
+	// The rpc drain waits on the raft dial handlers, and those are parked in
+	// Deliver until the layer closes. Closing it here rather than in shutdown
+	// is what lets the drain finish instead of waiting out the peer's deadline.
+	served := make(chan struct{})
+	defer close(served)
+	go func() {
+		select {
+		case <-ctx.Done():
+			s.layer.Close()
+		case <-served:
+		}
+	}()
+
 	serveErr := srv.Run(ctx)
 	<-watching
 	return errors.Join(serveErr, s.shutdown())
