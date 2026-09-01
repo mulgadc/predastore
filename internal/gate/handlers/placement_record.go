@@ -17,32 +17,39 @@ import (
 //	1    1     format version
 //	2    1     k, the data shard count; m is len(nodes) - k
 //	3    8     object size, uint64 big-endian
-//	11   8     write epoch, uint64 big-endian
-//	19   8     block size, uint64 big-endian
-//	27   16    content MD5, all zero when the record carries none
-//	43   var   digest marker, a uvarint: 0 means no digest, 1 means the 16
-//	           bytes above are a plain content digest, and N > 1 means they
-//	           are the composite of N-1 multipart parts
+//	11   8     write epoch, uint64 big-endian (version 2+ carries a timestamp)
+//	19   8     block size, uint64 big-endian (version 2+ only)
+//	27   16    content MD5 (version 3 only), all zero when the record carries none
+//	43   var   digest marker, a uvarint (version 3 only): 0 means no digest, 1
+//	           means the 16 bytes above are a plain content digest, and N > 1
+//	           means they are the composite of N-1 multipart parts
 //	var  var   k+m node ids as uvarints, data shards first then parity
 //
 // gob spent 217 bytes on a 66-byte payload because it emits a type descriptor
 // with every value. This spends 44 plus one byte per node id, in the common
 // case of a record carrying no digest.
 //
-// The marker is a uvarint rather than a fixed field because a multipart part
-// count runs to 10000 -- S3's own limit -- which does not fit one byte, and a
-// fixed two-byte field would spend a byte on every record carrying no
-// composite, which is nearly all of them.
+// Version 1 has no block size and its objects are laid out with each shard
+// contiguous, which is what the gate wrote before it could stream a write. Its
+// write epoch is random rather than a timestamp, so objects written under it
+// have no modification time to report.
 //
-// The version is 3 rather than 1 because versions 1 and 2 were written to real
-// stores. Reusing their numbers would let a record from one of them decode as
-// this format and read plausible nonsense; leaving the number alone makes it
-// fail loudly instead.
+// Version 3 adds the object's content MD5, so an ETag can be served without
+// re-reading the body. The marker is a uvarint rather than a fixed field
+// because a multipart part count runs to 10000 -- S3's own limit -- which does
+// not fit one byte, and a fixed two-byte field would spend a byte on every
+// object with no composite, which is nearly all of them, to cover a case only
+// multipart completion ever hits.
 const (
-	placementMagic     = 0x00
-	placementVersion   = 0x03
-	placementFixedSize = 43
-	maxDataShards      = 255
+	placementMagic       = 0x00
+	placementVersionV1   = 0x01
+	placementVersionV2   = 0x02
+	placementVersionV3   = 0x03
+	placementVersion     = placementVersionV3
+	placementFixedSizeV1 = 19
+	placementFixedSizeV2 = 27
+	placementFixedSizeV3 = 43
+	maxDataShards        = 255
 )
 
 // errPlacementFormat rejects a record written before the cutover. A gob stream
@@ -51,11 +58,6 @@ const (
 // of being handed to a decoder that would read plausible nonsense out of it.
 var errPlacementFormat = errors.New(
 	"placement record predates the fixed binary format; this store must be rebuilt")
-
-// errPlacementLegacy rejects the two record versions that predate content
-// ETags. They are not migrated: a store holding them is rebuilt, not upgraded.
-var errPlacementLegacy = errors.New(
-	"placement record predates content ETags; this store must be rebuilt")
 
 // EncodePlacement renders a placement record. The object hash is not stored:
 // the caller knows it — it is the key for whole objects, and derivable from
@@ -78,7 +80,7 @@ func EncodePlacement(p ObjectToShardNodes) ([]byte, error) {
 		return nil, fmt.Errorf("negative part count %d", p.PartCount)
 	}
 
-	buf := make([]byte, placementFixedSize, placementFixedSize+binary.MaxVarintLen64+k+len(p.ParityShardNodes))
+	buf := make([]byte, placementFixedSizeV3, placementFixedSizeV3+binary.MaxVarintLen64+k+len(p.ParityShardNodes))
 	buf[0] = placementMagic
 	buf[1] = placementVersion
 	buf[2] = byte(k)
@@ -86,9 +88,9 @@ func EncodePlacement(p ObjectToShardNodes) ([]byte, error) {
 	binary.BigEndian.PutUint64(buf[11:19], p.WriteEpoch)
 	binary.BigEndian.PutUint64(buf[19:27], uint64(p.BlockSize))
 
-	// The marker is 0 for "no digest", which is what a multipart part's record
-	// carries; 1 + PartCount otherwise, so 1 means a plain digest and anything
-	// higher names how many parts composed it.
+	// The marker is 0 for "no digest" so a v1/v2-style absent case round-trips
+	// as zero bytes; 1 + PartCount otherwise, so 1 means a plain digest and
+	// anything higher names how many parts composed it.
 	var marker uint64
 	if len(p.Digest) == md5.Size {
 		copy(buf[27:43], p.Digest)
@@ -108,17 +110,31 @@ func EncodePlacement(p ObjectToShardNodes) ([]byte, error) {
 // DecodePlacement parses a placement record, rejecting anything it cannot
 // account for byte by byte rather than returning a partially populated record.
 func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
-	if len(b) < placementFixedSize {
+	if len(b) < placementFixedSizeV1 {
 		return ObjectToShardNodes{}, fmt.Errorf("placement record is %d bytes, want at least %d",
-			len(b), placementFixedSize)
+			len(b), placementFixedSizeV1)
 	}
 	if b[0] != placementMagic {
 		return ObjectToShardNodes{}, errPlacementFormat
 	}
+
+	// A version 1 record carries no block size, and zero is what the read path
+	// reads as the contiguous layout those objects were written with.
+	fixed := placementFixedSizeV2
 	switch b[1] {
-	case placementVersion:
-	case 0x01, 0x02:
-		return ObjectToShardNodes{}, errPlacementLegacy
+	case placementVersionV1:
+		fixed = placementFixedSizeV1
+	case placementVersionV2:
+		if len(b) < placementFixedSizeV2 {
+			return ObjectToShardNodes{}, fmt.Errorf("placement record is %d bytes, want at least %d",
+				len(b), placementFixedSizeV2)
+		}
+	case placementVersionV3:
+		if len(b) < placementFixedSizeV3 {
+			return ObjectToShardNodes{}, fmt.Errorf("placement record is %d bytes, want at least %d",
+				len(b), placementFixedSizeV3)
+		}
+		fixed = placementFixedSizeV3
 	default:
 		return ObjectToShardNodes{}, fmt.Errorf("unknown placement record version %d", b[1])
 	}
@@ -127,19 +143,30 @@ func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
 	p := ObjectToShardNodes{
 		Size:       int64(binary.BigEndian.Uint64(b[3:11])), //nolint:gosec // round-trips bit-for-bit from encode.
 		WriteEpoch: binary.BigEndian.Uint64(b[11:19]),
-		BlockSize:  int64(binary.BigEndian.Uint64(b[19:27])), //nolint:gosec // round-trips bit-for-bit from encode.
+
+		// A version 1 epoch is eight random bytes, so reading it as a time
+		// gives a date hundreds of millions of years out. Version 2 and later
+		// carry a real one.
+		Timestamped: b[1] != placementVersionV1,
+	}
+	if fixed >= placementFixedSizeV2 {
+		p.BlockSize = int64(binary.BigEndian.Uint64(b[19:27])) //nolint:gosec // round-trips bit-for-bit from encode.
 	}
 
 	// The digest marker sits between the fixed header and the node ids, so the
-	// node ids start after it rather than at the end of the fixed header.
-	marker, n := binary.Uvarint(b[placementFixedSize:])
-	if n <= 0 {
-		return ObjectToShardNodes{}, errors.New("placement record has a malformed digest marker")
-	}
-	nodeIDStart := placementFixedSize + n
-	if marker > 0 {
-		p.Digest = append([]byte(nil), b[27:43]...)
-		p.PartCount = int(marker - 1) //nolint:gosec // marker is 1+PartCount, bounded by S3's own part limit.
+	// node ids start after it rather than at the end of the fixed header
+	// itself for a version 3 record.
+	nodeIDStart := fixed
+	if b[1] == placementVersionV3 {
+		marker, n := binary.Uvarint(b[placementFixedSizeV3:])
+		if n <= 0 {
+			return ObjectToShardNodes{}, errors.New("placement record has a malformed digest marker")
+		}
+		nodeIDStart = placementFixedSizeV3 + n
+		if marker > 0 {
+			p.Digest = append([]byte(nil), b[27:43]...)
+			p.PartCount = int(marker - 1) //nolint:gosec // marker is 1+PartCount, bounded by S3's own part limit.
+		}
 	}
 
 	ids := make([]config.NodeID, 0, k)
@@ -163,15 +190,20 @@ func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
 	return p, nil
 }
 
-// ModifiedAt reports when the object was written. This is the object's S3
-// LastModified on every surface that serves one.
-func (p ObjectToShardNodes) ModifiedAt() time.Time {
-	return EpochTime(p.WriteEpoch)
+// ModifiedAt reports when the object was written, and whether the record can
+// say. This is the object's S3 LastModified on every surface that serves one.
+func (p ObjectToShardNodes) ModifiedAt() (time.Time, bool) {
+	if !p.Timestamped {
+		return time.Time{}, false
+	}
+
+	return EpochTime(p.WriteEpoch), true
 }
 
 // ETag renders the S3 entity tag the record's content digest names, quoted,
-// and reports whether it can. A multipart part's own record carries no digest
-// -- the part's ETag lives in the parts table -- so it has none to give.
+// and reports whether it can. A record written before version 3 has no digest
+// to give, and neither does a multipart part's, the same way an untimestamped
+// record has no ModifiedAt.
 func (p ObjectToShardNodes) ETag() (string, bool) {
 	if len(p.Digest) != md5.Size {
 		return "", false

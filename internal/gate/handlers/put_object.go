@@ -135,9 +135,9 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		if len(written.handoff) > 0 {
 			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))
 		}
-		// The digest was set above, so the record always has an ETag to give.
-		etag, _ := place.ETag()
-		w.Header().Set("ETag", etag)
+		if etag, ok := place.ETag(); ok {
+			w.Header().Set("ETag", etag)
+		}
 		w.WriteHeader(http.StatusOK)
 	})
 }

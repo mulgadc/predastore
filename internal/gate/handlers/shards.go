@@ -30,8 +30,14 @@ type ObjectToShardNodes struct {
 	WriteEpoch uint64
 	BlockSize  int64
 
-	// Digest is the object's content MD5, or nil. A multipart part's record
-	// carries none: the part's ETag lives in the parts table instead.
+	// Timestamped reports whether WriteEpoch carries a time. Version 1 records
+	// hold a random epoch instead, so they have no modification time and never
+	// will.
+	Timestamped bool
+
+	// Digest is the object's content MD5, or nil. A record written before
+	// version 3 carries none, and neither does a multipart part's: the part's
+	// ETag lives in the parts table instead.
 	Digest []byte
 
 	// PartCount is how many multipart parts Digest was composed from. Zero
@@ -179,6 +185,7 @@ func placeShards(ring *placement.Ring, cfg Config, objectHash [32]byte, size int
 	return ObjectToShardNodes{
 		Size:             size,
 		WriteEpoch:       epoch,
+		Timestamped:      true,
 		BlockSize:        writeLayout(cfg.DataShards, size).blockSize,
 		DataShardNodes:   append([]config.NodeID(nil), nodes[:cfg.DataShards]...),
 		ParityShardNodes: append([]config.NodeID(nil), nodes[cfg.DataShards:]...),

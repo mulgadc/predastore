@@ -138,7 +138,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 				if row, err := metaGet(ctx, mc, model.TableObjects, string(entry.hash)); err == nil && len(row) > 0 {
 					if placement, err := DecodePlacement(row); err == nil {
 						objectSize = placement.Size
-						modified = placement.ModifiedAt()
+						modified, _ = placement.ModifiedAt()
 						etag, _ = placement.ETag()
 					}
 				}

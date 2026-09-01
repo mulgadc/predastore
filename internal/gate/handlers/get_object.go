@@ -82,8 +82,9 @@ func serveObject(
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-		// A whole object's record always carries a digest; the guard covers the
-		// part records that share this type and do not.
+		// A record with no stored digest omits the ETag rather than serving the
+		// old name-derived value: a client comparing that against the body it
+		// just fetched would never see a match, and would retry forever.
 		if etag, ok := place.ETag(); ok {
 			w.Header().Set("ETag", etag)
 		}
