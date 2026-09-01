@@ -242,6 +242,7 @@ jobs:
       # the end of a run, so a shallow path here would be destructive: require
       # an absolute path at least three components deep.
       - name: Check required configuration
+        id: config
         if: steps.gate.outputs.paused != 'true'
         run: |
           set -euo pipefail
@@ -355,7 +356,7 @@ jobs:
       # on every host, so nothing reaches the runner on its own. clean below
       # deletes the source, so this runs first and runs even on failure.
       - name: Fetch results and host logs
-        if: always() && steps.gate.outputs.paused != 'true'
+        if: always() && steps.gate.outputs.paused != 'true' && steps.config.outcome == 'success'
         run: |
           set -euo pipefail
           TOOLS_HOST="$(awk '{print $NF}' <<< "$HW_HOSTS")"
@@ -370,7 +371,7 @@ jobs:
           done
 
       - name: Upload Results
-        if: always() && steps.gate.outputs.paused != 'true'
+        if: always() && steps.gate.outputs.paused != 'true' && steps.config.outcome == 'success'
         uses: actions/upload-artifact@v5
         with:
           name: performance
@@ -381,17 +382,19 @@ jobs:
           retention-days: 30
 
       # Both run under always() so a cancelled run does not leave s3d
-      # processes and cluster data behind on the hardware hosts.
+      # processes and cluster data behind on the hardware hosts. hwbench.sh
+      # substitutes its own defaults for an empty HW_ROOT, so a run that never
+      # got past the configuration check must not reach clean.
       - name: hwbench stop
-        if: always() && steps.gate.outputs.paused != 'true'
+        if: always() && steps.gate.outputs.paused != 'true' && steps.config.outcome == 'success'
         run: scripts/bench/hw/hwbench.sh stop || true
 
       - name: hwbench clean
-        if: always() && steps.gate.outputs.paused != 'true'
+        if: always() && steps.gate.outputs.paused != 'true' && steps.config.outcome == 'success'
         run: scripts/bench/hw/hwbench.sh clean || true
 
       - name: Clean hwbench work dir
-        if: always() && steps.gate.outputs.paused != 'true'
+        if: always() && steps.gate.outputs.paused != 'true' && steps.config.outcome == 'success'
         run: |
           rm -rf "$HW_WORK"
           git worktree prune || true
