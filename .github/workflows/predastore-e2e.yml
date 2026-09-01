@@ -513,17 +513,27 @@ jobs:
               "df -PB1 '$HW_ROOT'" > "scripts/bench/hw/hostlogs/$hn/disk.txt" 2>/dev/null || true
           done
 
+      # The job measures four times and the summary reports all four. The roots
+      # are listed in the order they ran rather than sorted together, so it
+      # reads loopback, loopback at 64 KiB, then the two passes on hardware.
       - name: Write run summary
         if: always() && steps.gate.outputs.paused != 'true' && steps.config.outcome == 'success'
         run: |
           set -euo pipefail
-          run_dir="$(find scripts/bench/results/e2e-performance -mindepth 1 -maxdepth 1 -type d \
-            2>/dev/null | sort | tail -1)"
-          if [ -n "$run_dir" ]; then
-            scripts/bench/perf-summary.sh "$run_dir" scripts/bench/hw/hostlogs \
-              >> "$GITHUB_STEP_SUMMARY"
+          run_dirs=()
+          for root in scripts/bench/results/e2e-performance-loopback \
+                      scripts/bench/results/e2e-performance-loopback-small \
+                      scripts/bench/results/e2e-performance; do
+            [ -d "$root" ] || continue
+            while IFS= read -r d; do
+              [ -n "$d" ] && run_dirs+=("$d")
+            done < <(find "$root" -mindepth 1 -maxdepth 1 -type d | sort)
+          done
+          if [ "${#run_dirs[@]}" -gt 0 ]; then
+            scripts/bench/perf-summary.sh --hostlogs scripts/bench/hw/hostlogs \
+              "${run_dirs[@]}" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "No performance results were fetched from the hardware hosts." \
+            echo "No performance results were found for this run." \
               >> "$GITHUB_STEP_SUMMARY"
           fi
 

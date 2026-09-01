@@ -11,23 +11,36 @@
 # per-second throughput spread, standard deviations, and warp's own "too few
 # samples" notices -- are the ones that say whether the rest can be trusted.
 #
-# Usage:
-#   ./scripts/bench/perf-summary.sh <run-dir> [hostlogs-dir]
+# One CI run measures four times -- loopback at 1 MiB, loopback at 64 KiB, then
+# bare metal at both the smoke and compare presets -- so this takes every run
+# directory rather than one. Rendering the last of them was rendering a quarter
+# of what the job measured.
 #
-# <run-dir> holds run-info.txt and one directory per config, each holding
-# <workload>-latency.txt. [hostlogs-dir] is optional and holds <host>/disk.txt,
-# the `df -PB1` of the deployment root captured on each host.
+# Usage:
+#   ./scripts/bench/perf-summary.sh [--hostlogs <dir>] <run-dir>...
+#
+# Each <run-dir> holds run-info.txt and one directory per config, each holding
+# <workload>-latency.txt. --hostlogs is optional and names a directory of
+# <host>/disk.txt, the `df -PB1` of the deployment root captured on each host.
 #
 
 set -euo pipefail
 
-RUN_DIR="${1:-}"
-HOSTLOGS_DIR="${2:-}"
+HOSTLOGS_DIR=""
+RUN_DIRS=()
 
-[ -n "$RUN_DIR" ] || { echo "usage: $0 <run-dir> [hostlogs-dir]" >&2; exit 2; }
-[ -d "$RUN_DIR" ] || { echo "no such run directory: $RUN_DIR" >&2; exit 1; }
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --hostlogs) HOSTLOGS_DIR="${2:-}"; shift 2 ;;
+        -*) echo "unknown option: $1" >&2; exit 2 ;;
+        *) RUN_DIRS+=("$1"); shift ;;
+    esac
+done
 
-INFO="$RUN_DIR/run-info.txt"
+[ "${#RUN_DIRS[@]}" -gt 0 ] || { echo "usage: $0 [--hostlogs <dir>] <run-dir>..." >&2; exit 2; }
+
+RUN_DIR=""
+INFO=""
 
 # info_field reads a key=value line from run-info.txt. Absent is normal --
 # an external run cannot report the cluster's CPU, for one -- so a missing
@@ -69,6 +82,13 @@ human_bytes() {
         while (b >= 1024 && i < 5) { b /= 1024; i++ }
         printf (i == 1 ? "%d %s\n" : "%.1f %s\n"), b, u[i]
     }'
+}
+
+# seg_rate lifts the byte rate out of a segment line. Warp writes the rate and
+# the object rate on the same line and omits the former entirely at zero, so
+# matching the unit is the only way to tell an absent rate from a slow one.
+seg_rate() {
+    grep -o -m1 '[0-9.]\+ \?\([KMGT]iB\|B\)/s' <<< "${1:-}" || true
 }
 
 # to_mib turns a warp rate such as 761.0MiB/s or 1.2GiB/s into a bare number of
@@ -135,20 +155,27 @@ emit_latency_rows() {
 # describes a steady run or one that stalled and caught up, and it is the
 # figure a throughput gate has to be tolerant of.
 emit_segments() {
-    local config_dir="$1" f name split fast med slow spread printed=0
+    local config_dir="$1" f name split fast med slow spread printed=0 stalled=0
 
     for f in $(latency_files "$config_dir"); do
-        fast="$(report_field 's/^ \* Fastest: \([^,]*\),.*/\1/p' "$f")"
-        [ -n "$fast" ] || continue
+        grep -q '^ \* Fastest: ' "$f" || continue
         name="$(workload_name "$f")"
-        med="$(report_field 's/^ \* 50% Median: \([^,]*\),.*/\1/p' "$f")"
-        slow="$(report_field 's/^ \* Slowest: \([^,]*\),.*/\1/p' "$f")"
+        fast="$(seg_rate "$(grep -m1 '^ \* Fastest: ' "$f")")"
+        med="$(seg_rate "$(grep -m1 '^ \* 50% Median: ' "$f")")"
+        slow="$(seg_rate "$(grep -m1 '^ \* Slowest: ' "$f")")"
         split="$(report_field 's/^Throughput, split into \(.*\):/\1/p' "$f")"
+
+        # Warp prints no rate at all for a segment that moved no bytes, so an
+        # absent figure is a whole second in which the workload did nothing.
+        if [ -z "$slow" ]; then
+            slow='0 B/s'
+            stalled=1
+        fi
 
         spread="$(awk -v f="$(to_mib "$fast")" -v s="$(to_mib "$slow")" \
             -v m="$(to_mib "$med")" 'BEGIN {
-                if (m == "" || m + 0 == 0 || f == "" || s == "") { print "-"; exit }
-                printf "%.1f%%\n", (f - s) / m * 100
+                if (m == "" || m + 0 == 0 || f == "") { print "-"; exit }
+                printf "%.1f%%\n", (f - (s == "" ? 0 : s)) / m * 100
             }')"
 
         if [ "$printed" -eq 0 ]; then
@@ -159,8 +186,10 @@ emit_segments() {
             printed=1
         fi
         printf '| %s | %s | %s | %s | %s | %s |\n' \
-            "$name" "${split:--}" "${fast:--}" "${med:--}" "${slow:--}" "$spread"
+            "$name" "${split:--}" "${fast:--}" "${med:--}" "$slow" "$spread"
     done
+
+    [ "$stalled" -eq 0 ] || printf '\nA slowest segment of 0 B/s is a full second in which the workload completed nothing.\n'
 }
 
 # The TTFB line only appears on read workloads, and it is the number a
@@ -290,57 +319,88 @@ emit_disk() {
     done
 }
 
-printf '## Performance (Warp)\n\n'
+# The results root says where the pass ran and the preset says how hard it
+# pushed. Two passes share each, so the heading needs both to be unambiguous.
+pass_label() {
+    local place preset
+    case "$(basename "$(dirname "$RUN_DIR")")" in
+        *-loopback-small) place="loopback, small objects" ;;
+        *-loopback) place="loopback" ;;
+        *) place="$([ -n "$(info_field external_hosts)" ] && echo "bare metal" || echo "loopback")" ;;
+    esac
+    preset="$(info_field preset)"
+    printf '%s%s' "$place" "${preset:+ — $preset}"
+}
 
-sha="$(info_field predastore_sha)"
-dirty="$(info_field predastore_dirty)"
-external="$(info_field external_hosts)"
-mp_parts="$(info_field multipart_parts)"
-{
-    printf '| | |\n|---|---|\n'
-    if [ -n "$sha" ]; then
-        # Backticks are markdown for the summary, not a substitution.
-        # shellcheck disable=SC2016
-        printf '| Commit | `%s`%s |\n' "${sha:0:12}" \
-            "$([ "$dirty" = true ] && echo ' (working tree dirty)' || echo '')"
+render_run() {
+    RUN_DIR="${1%/}"
+    INFO="$RUN_DIR/run-info.txt"
+
+    local sha dirty external mp_parts config config_dir
+
+    printf '## Performance — %s\n\n' "$(pass_label)"
+
+    sha="$(info_field predastore_sha)"
+    dirty="$(info_field predastore_dirty)"
+    external="$(info_field external_hosts)"
+    mp_parts="$(info_field multipart_parts)"
+    {
+        printf '| | |\n|---|---|\n'
+        if [ -n "$sha" ]; then
+            # Backticks are markdown for the summary, not a substitution.
+            # shellcheck disable=SC2016
+            printf '| Commit | `%s`%s |\n' "${sha:0:12}" \
+                "$([ "$dirty" = true ] && echo ' (working tree dirty)' || echo '')"
+        fi
+        printf '| Preset | `%s`, %s per workload, %s concurrent |\n' \
+            "$(info_field preset)" "$(info_field duration)" "$(info_field concurrent)"
+        printf '| Object sizes | PUT %s, multipart %s x %s, GET %s |\n' \
+            "$(info_field put_size)" "$(info_field multipart_part_size)" \
+            "${mp_parts:--}" "$(info_field get_object_size)"
+        if [ -n "$external" ]; then
+            printf '| Cluster | bare metal, `%s` |\n' "$external"
+        else
+            printf '| Cluster | loopback profiles on one machine |\n'
+        fi
+        printf '| Measured from | %s, %s logical CPUs, %s RAM |\n' \
+            "$(info_field host)" "$(info_field logical_cpus)" \
+            "$(human_bytes "$(info_field memory_bytes)")"
+        printf '| Go | %s |\n' "$(info_field go_version)"
+        printf '| Warp | %s |\n' "$(info_field warp_version)"
+    } | sed 's/ | *|$/ | |/'
+
+    for config_dir in "$RUN_DIR"/*/; do
+        config="$(basename "$config_dir")"
+        case "$config" in logs|correctness) continue ;; esac
+        ls "$config_dir"/*-latency.txt >/dev/null 2>&1 || continue
+
+        printf '\n### Workloads — `%s`\n\n' "$config"
+        printf '| Workload | Reqs | Object | Concurrency | Hosts | Ran | Throughput | Objects/s |\n'
+        printf '|---|---:|---:|---:|---:|---:|---:|---:|\n'
+        emit_workload_rows "$config_dir"
+
+        printf '\n### Request latency\n\n'
+        printf '| Workload | Fastest | Avg | p50 | p90 | p99 | Slowest | StdDev |\n'
+        printf '|---|---:|---:|---:|---:|---:|---:|---:|\n'
+        emit_latency_rows "$config_dir"
+
+        emit_segments "$config_dir"
+        emit_ttfb "$config_dir"
+        emit_per_host "$config_dir"
+        emit_correctness "$config"
+        emit_notices "$config_dir"
+    done
+}
+
+for run in "${RUN_DIRS[@]}"; do
+    if [ ! -d "$run" ]; then
+        echo "no such run directory: $run" >&2
+        continue
     fi
-    printf '| Preset | `%s`, %s per workload, %s concurrent |\n' \
-        "$(info_field preset)" "$(info_field duration)" "$(info_field concurrent)"
-    printf '| Object sizes | PUT %s, multipart %s x %s, GET %s |\n' \
-        "$(info_field put_size)" "$(info_field multipart_part_size)" \
-        "${mp_parts:--}" "$(info_field get_object_size)"
-    if [ -n "$external" ]; then
-        printf '| Cluster | bare metal, `%s` |\n' "$external"
-    else
-        printf '| Cluster | loopback profiles on one machine |\n'
-    fi
-    printf '| Measured from | %s, %s logical CPUs, %s RAM |\n' \
-        "$(info_field host)" "$(info_field logical_cpus)" \
-        "$(human_bytes "$(info_field memory_bytes)")"
-    printf '| Go | %s |\n' "$(info_field go_version)"
-    printf '| Warp | %s |\n' "$(info_field warp_version)"
-} | sed 's/ | *|$/ | |/'
-
-for config_dir in "$RUN_DIR"/*/; do
-    config="$(basename "$config_dir")"
-    case "$config" in logs|correctness) continue ;; esac
-    ls "$config_dir"/*-latency.txt >/dev/null 2>&1 || continue
-
-    printf '\n### Workloads — `%s`\n\n' "$config"
-    printf '| Workload | Reqs | Object | Concurrency | Hosts | Ran | Throughput | Objects/s |\n'
-    printf '|---|---:|---:|---:|---:|---:|---:|---:|\n'
-    emit_workload_rows "$config_dir"
-
-    printf '\n### Request latency\n\n'
-    printf '| Workload | Fastest | Avg | p50 | p90 | p99 | Slowest | StdDev |\n'
-    printf '|---|---:|---:|---:|---:|---:|---:|---:|\n'
-    emit_latency_rows "$config_dir"
-
-    emit_segments "$config_dir"
-    emit_ttfb "$config_dir"
-    emit_per_host "$config_dir"
-    emit_correctness "$config"
-    emit_notices "$config_dir"
+    render_run "$run"
+    printf '\n'
 done
 
+# Once, at the end. The hosts are the same for every pass, and the figure is
+# what they had left when the run finished rather than per pass.
 emit_disk
