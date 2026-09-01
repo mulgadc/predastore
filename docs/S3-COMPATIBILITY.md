@@ -15,8 +15,8 @@ make s3-tests
 
 | | count |
 | --- | --- |
-| pass | 178 |
-| fail | 216 |
+| pass | 181 |
+| fail | 213 |
 | skip | 492 |
 | error | 0 |
 
@@ -29,13 +29,12 @@ A passing case is never one of the 486, whatever family's marker or node id woul
 
 A skip is not a pass. It means the same thing it always did for the suite's own skips: predastore has not been measured against that case in this run, on purpose. `docs/development/bugs/` and `docs/development/improvements/` carry the beads for anything in progress; a deliberate skip here means no bead is open yet.
 
-The 216 remaining fails are not features predastore has not started — those are now skipped — they are operations predastore attempts and gets wrong, or is actively being fixed: DeleteObjects, CopyObject and multipart copy, ETag, `ListObjects` v1 `Marker`, user metadata, sub-resource routing, and the request-validation cases in `test_headers.py`. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
+The 213 remaining fails are not features predastore has not started — those are now skipped — they are operations predastore attempts and gets wrong, or is actively being fixed: CopyObject and multipart copy, ETag, `ListObjects` v1 `Marker`, user metadata, sub-resource routing, and the request-validation cases in `test_headers.py`. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
 
 ## The gaps that break real clients
 
 | Operation | State | What happens |
 | --- | --- | --- |
-| `DeleteObjects` | **Missing** | 405 Method Not Allowed. Every client that empties a bucket in batches — the AWS CLI's `s3 rm --recursive`, rclone `purge`, the s3-tests teardown — falls back or fails. |
 | ETag | **Wrong value** | Not the body MD5. `PUT` of `hello` returns `678f45d4…`, not `5d41402a…`. It is also unquoted, where S3 quotes it, and `ListObjectsV2` returns it as the empty string while `HEAD` and `GET` return a value. rclone rejects every upload as corrupt on this. |
 | `ListObjects` (v1) | **Partial** | `Marker` is ignored. A v1 listing with `Marker=baz&MaxKeys=2` returns the first two keys again rather than the ones after `baz`, so a v1 client paging a prefix loops. v2's `continuation-token` and `start-after` do work. |
 | `ListObjectVersions` | **Answers the wrong document** | `GET /{bucket}?versions` is not routed, so it falls through and serves a plain `ListBucketResult`. boto3 parses that as zero versions and reports success. A client asking what versions exist is told "none". |
@@ -74,7 +73,7 @@ deliberately not implemented is not here; see the next table.
 | Object create / write | 11 | 25 | Metadata and conditional headers. |
 | Multipart upload | 6 | 6 | |
 | Ranged GET | 4 | 1 | |
-| DeleteObjects | 0 | 9 | 405. |
+| DeleteObjects | 3 | 6 | Implemented. What is left is versioned deletes, and the v1 key-limit case, which pages the bucket with `Marker`. |
 | CopyObject / copy part | 4 | 23 | Excludes encrypted copy, which is a deliberate skip below. |
 
 ## Deliberate skips
@@ -130,6 +129,6 @@ make s3-tests-baseline
 
 ## Caveat: the run needs a cleanup fallback
 
-s3-tests empties a bucket with `ListObjectVersions` and `DeleteObjects`. Predastore supports neither correctly, so nothing is deleted, every `DeleteBucket` answers `BucketNotEmpty`, and that failure lands in the *setup* of the next case. Unpatched, the run is 884 errors that say nothing about the 884 operations they were meant to measure.
+s3-tests empties a bucket with `ListObjectVersions` and `DeleteObjects`. `DeleteObjects` works now, but `ListObjectVersions` still answers the wrong document, so nothing is deleted, every `DeleteBucket` answers `BucketNotEmpty`, and that failure lands in the *setup* of the next case. Unpatched, the run is 884 errors that say nothing about the 884 operations they were meant to measure.
 
-`scripts/s3tests/predastore_cleanup.py` replaces the suite's teardown helper with per-key deletes. No test body, assertion or fixture value changes, and cleanup is not a measured behaviour. Delete that half of the plugin when `DeleteObjects` lands.
+`scripts/s3tests/predastore_cleanup.py` replaces the suite's teardown helper with per-key deletes. No test body, assertion or fixture value changes, and cleanup is not a measured behaviour. It stays until `ListObjectVersions` answers the right document, which is the half of the problem the batch delete did not fix.
