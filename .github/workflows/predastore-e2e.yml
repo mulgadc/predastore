@@ -286,11 +286,16 @@ jobs:
         if: steps.gate.outputs.paused != 'true'
         run: echo "HW_WORK=$RUNNER_TEMP/hwbench-ci" >> "$GITHUB_ENV"
 
+      # Cached off, unlike the hosted jobs. This runner keeps its module and
+      # build caches on local disk between runs, so the action was downloading
+      # a 3.4 GB archive of them from GitHub every time: 2m46s of a 6m job to
+      # fetch what was already sitting next to it, then 25s deciding whether
+      # to upload it back. The toolchain itself is found locally in 0.1s.
       - name: Setup Go
         if: steps.gate.outputs.paused != 'true'
         uses: actions/setup-go@v7
         with:
-          cache-dependency-path: "go.sum"
+          cache: false
           go-version-file: "go.mod"
 
       # hwbench.sh's on() shells out to plain `ssh $host` with no -i or -F, so
