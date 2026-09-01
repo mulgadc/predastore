@@ -96,8 +96,12 @@ func (s *Server) setupRoutes(ring *placement.Ring) {
 		r.Method(http.MethodGet, "/{bucket}/*", byQuery("uploadId",
 			handlers.ListParts(mc, cache),
 			bulkBody(handlers.GetObject(mc, bc, ring, cache, cfg))))
+		// x-amz-copy-source selects the server-side copy at both levels: with
+		// ?partNumber it is UploadPartCopy, without it CopyObject.
 		r.Method(http.MethodPut, "/{bucket}/*", byQuery("partNumber",
-			bulkBody(handlers.UploadPart(mc, bc, ring, cache, cfg)),
+			byHeader("X-Amz-Copy-Source",
+				bulkBody(handlers.UploadPartCopy(mc, bc, ring, cache, cfg)),
+				bulkBody(handlers.UploadPart(mc, bc, ring, cache, cfg))),
 			byHeader("X-Amz-Copy-Source",
 				bulkBody(handlers.CopyObject(mc, bc, ring, cache, cfg)),
 				bulkBody(handlers.PutObject(mc, bc, ring, cache, cfg)))))

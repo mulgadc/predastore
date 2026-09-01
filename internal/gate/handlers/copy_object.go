@@ -99,39 +99,19 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			return
 		}
 
-		// The source is read stripe by stripe into a pipe and teed into the
-		// digest, the same shape GetObject streams a response body: the
-		// copy's memory footprint is a stripe, not the source object, no
-		// matter how large that object is.
+		// The source is streamed and teed into the digest, so the destination
+		// gets its own content digest and the copy's memory footprint is a
+		// stripe rather than the source object.
 		digest := model.NewPartETagHasher()
-		var written writeResult
-		if srcSize == 0 {
-			// An empty object has no shards to read back, only a placement
-			// record, so there is nothing to stream and no stripe reader to open.
-			written, err = writeObject(ctx, bc, cfg, ring, io.TeeReader(http.NoBody, digest), 0, destHash, place)
-		} else {
-			srcReader, rErr := newStripeReader(ctx, bc, cfg, model.ObjectHash(srcBucket, srcKey), srcPlace, srcHandoff)
-			if rErr != nil {
-				HandleError(w, r, model.NewS3Error(model.ErrInternalError, rErr.Error(), 500))
-				return
-			}
-
-			pr, pw := io.Pipe()
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				pw.CloseWithError(pipeObject(ctx, srcReader, pw, srcSize))
-			}()
-
-			written, err = writeObject(ctx, bc, cfg, ring, io.TeeReader(pr, digest), srcSize, destHash, place)
-
-			// Closing the read end unblocks the goroutine if writeObject stopped
-			// short, and waiting for it means the stripe reader is closed by
-			// nobody else while it is still being read.
-			_ = pr.Close()
-			<-done
-			srcReader.close(ctx)
+		stream, err := openCopyStream(ctx, bc, cfg,
+			model.ObjectHash(srcBucket, srcKey), srcPlace, srcHandoff, srcSize, 0, srcSize)
+		if err != nil {
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+			return
 		}
+
+		written, err := writeObject(ctx, bc, cfg, ring, io.TeeReader(stream, digest), srcSize, destHash, place)
+		stream.close(ctx)
 		if err != nil {
 			slog.ErrorContext(ctx, "copyObject: shard distribution failed", "error", err)
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, writeFailureReason(err))
