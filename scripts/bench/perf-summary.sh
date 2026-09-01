@@ -319,17 +319,30 @@ emit_disk() {
     done
 }
 
-# The results root says where the pass ran and the preset says how hard it
-# pushed. Two passes share each, so the heading needs both to be unambiguous.
-pass_label() {
-    local place preset
-    case "$(basename "$(dirname "$RUN_DIR")")" in
-        *-loopback-small) place="loopback, small objects" ;;
-        *-loopback) place="loopback" ;;
-        *) place="$([ -n "$(info_field external_hosts)" ] && echo "bare metal" || echo "loopback")" ;;
-    esac
-    preset="$(info_field preset)"
-    printf '%s%s' "$place" "${preset:+ — $preset}"
+# where_label says the topology in the terms the profiles use. A hardware run
+# has no profile name worth printing -- hwbench names it after the ref and the
+# tag -- so it is described by how many gates answered instead.
+where_label() {
+    local external gates configs
+    external="$(info_field external_hosts)"
+    if [ -n "$external" ]; then
+        gates="$(awk -F, '{print NF}' <<< "$external")"
+        printf '%s hosts on hardware' "$gates"
+        return 0
+    fi
+    configs="$(info_field configs)"
+    printf '%s loopback' "${configs:-unknown}"
+}
+
+# sizing_label prints what the pass actually pushed rather than the preset name
+# that chose it. "smoke" and "compare" mean nothing to a reader; 1 MiB objects
+# against 64 MiB ones is the difference being drawn. Two passes share a
+# topology and two share a sizing, so a heading needs both to be unambiguous.
+sizing_label() {
+    local put get
+    put="$(info_field put_size)"
+    get="$(info_field get_object_size)"
+    printf '%s PUT / %s GET' "${put:-?}" "${get:-?}"
 }
 
 render_run() {
@@ -338,7 +351,7 @@ render_run() {
 
     local sha dirty external mp_parts config config_dir
 
-    printf '## Performance — %s\n\n' "$(pass_label)"
+    printf '## Performance — %s, %s\n\n' "$(where_label)" "$(sizing_label)"
 
     sha="$(info_field predastore_sha)"
     dirty="$(info_field predastore_dirty)"
@@ -352,16 +365,20 @@ render_run() {
             printf '| Commit | `%s`%s |\n' "${sha:0:12}" \
                 "$([ "$dirty" = true ] && echo ' (working tree dirty)' || echo '')"
         fi
-        printf '| Preset | `%s`, %s per workload, %s concurrent |\n' \
-            "$(info_field preset)" "$(info_field duration)" "$(info_field concurrent)"
         printf '| Object sizes | PUT %s, multipart %s x %s, GET %s |\n' \
             "$(info_field put_size)" "$(info_field multipart_part_size)" \
             "${mp_parts:--}" "$(info_field get_object_size)"
+        printf '| Load | %s per workload, %s concurrent |\n' \
+            "$(info_field duration)" "$(info_field concurrent)"
         if [ -n "$external" ]; then
-            printf '| Cluster | bare metal, `%s` |\n' "$external"
+            printf '| Cluster | separate hosts, gates at `%s` |\n' "$external"
         else
-            printf '| Cluster | loopback profiles on one machine |\n'
+            printf '| Cluster | `%s` profile, loopback on one machine |\n' \
+                "$(info_field configs)"
         fi
+        # The preset only chose the numbers above, so it is recorded for
+        # tracing a run back to its invocation rather than described.
+        printf '| Preset | `%s` |\n' "$(info_field preset)"
         printf '| Measured from | %s, %s logical CPUs, %s RAM |\n' \
             "$(info_field host)" "$(info_field logical_cpus)" \
             "$(human_bytes "$(info_field memory_bytes)")"
@@ -374,7 +391,14 @@ render_run() {
         case "$config" in logs|correctness) continue ;; esac
         ls "$config_dir"/*-latency.txt >/dev/null 2>&1 || continue
 
-        printf '\n### Workloads — `%s`\n\n' "$config"
+        # hwbench names a hardware config after the ref and the tag it was
+        # invoked with, which says nothing about the cluster, so the topology
+        # is used there instead of the directory name.
+        if [ -n "$external" ]; then
+            printf '\n### Workloads — %s\n\n' "$(where_label)"
+        else
+            printf '\n### Workloads — `%s`\n\n' "$config"
+        fi
         printf '| Workload | Reqs | Object | Concurrency | Hosts | Ran | Throughput | Objects/s |\n'
         printf '|---|---:|---:|---:|---:|---:|---:|---:|\n'
         emit_workload_rows "$config_dir"
