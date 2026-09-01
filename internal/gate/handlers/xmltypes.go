@@ -169,6 +169,37 @@ type S3Error struct {
 	HostId     string   `xml:"HostId"`
 }
 
+// DeleteRequest is the body of POST /{bucket}?delete. Quiet asks for the
+// deleted keys to be left out of the answer, leaving only the failures.
+type DeleteRequest struct {
+	XMLName xml.Name              `xml:"Delete"`
+	Quiet   bool                  `xml:"Quiet"`
+	Objects []DeleteRequestObject `xml:"Object"`
+}
+
+type DeleteRequestObject struct {
+	Key string `xml:"Key"`
+}
+
+// DeleteResult answers POST /{bucket}?delete. A key that could not be deleted
+// is reported beside the ones that were, so the outcome is per key and the
+// request itself still succeeds.
+type DeleteResult struct {
+	XMLName xml.Name        `xml:"DeleteResult"`
+	Deleted []DeletedObject `xml:"Deleted"`
+	Errors  []DeleteError   `xml:"Error"`
+}
+
+type DeletedObject struct {
+	Key string `xml:"Key"`
+}
+
+type DeleteError struct {
+	Key     string `xml:"Key"`
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
+}
+
 // CreateBucketConfiguration is the request body for CreateBucket.
 type CreateBucketConfiguration struct {
 	XMLName            xml.Name `xml:"CreateBucketConfiguration"`

@@ -138,7 +138,7 @@ func (s *Server) throttleMiddleware() func(http.Handler) http.Handler {
 			},
 			func(r *http.Request) (string, error) {
 				bucket, key := requestBucketKey(r.Context())
-				return s3Action(r.Method, bucket, key), nil
+				return s3Action(r, bucket, key), nil
 			},
 		},
 		func(w http.ResponseWriter, r *http.Request) {
@@ -201,8 +201,14 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		action := s3Action(method, bucket, key)
+		action := s3Action(r, bucket, key)
 		resource := s3Resource(bucket, key)
+		// The batch delete names its keys in the body, which is not read here.
+		// Authorizing it against every key in the bucket denies a caller who may
+		// delete only some of them, which is the safe direction to be wrong in.
+		if isBulkDelete(r, key) {
+			resource = s3Resource(bucket, "*")
+		}
 
 		// IAM policy evaluation (NATS-sourced credentials only).
 		if !credResult.SkipPolicyCheck {
