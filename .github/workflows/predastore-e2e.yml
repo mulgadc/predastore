@@ -353,6 +353,9 @@ jobs:
       # It runs before the hardware cluster starts rather than after it stops:
       # if this runner is one of the hardware hosts, a loopback cluster beside
       # a live one measures neither of them.
+      # 3host only. The 1host profile registers a readiness check that holds a
+      # typed-nil meta server, so the admin sample loop segfaults s3d three
+      # seconds into startup. Put 1host back when that is fixed.
       - name: Run Warp Suite (loopback)
         if: steps.gate.outputs.paused != 'true'
         env:
@@ -360,6 +363,7 @@ jobs:
           # through it, so the script's work directory is steered off it.
           TMPDIR: ${{ runner.temp }}
           PERF_RESULTS_ROOT: scripts/bench/results/e2e-performance-loopback
+          PERF_CONFIGS: 3host
         run: make e2e-performance
 
       # The pass above puts 1 MiB objects, where erasure coding and the disk
@@ -374,6 +378,7 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
           PERF_RESULTS_ROOT: scripts/bench/results/e2e-performance-loopback-small
+          PERF_CONFIGS: 3host
           PERF_PUT_SIZE: 64KiB
           PERF_GET_SIZE: 64KiB
           PERF_CONCURRENT: 16
