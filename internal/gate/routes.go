@@ -65,7 +65,7 @@ func (s *Server) setupRoutes(ring *placement.Ring) {
 		// A POST at a bucket is the batch delete and nothing else, so without
 		// ?delete the route answers what an unmatched POST answered before it.
 		r.Method(http.MethodPost, "/{bucket}", byQuery("delete",
-			handlers.DeleteObjects(mc, bc, cache),
+			handlers.DeleteObjects(mc, cache),
 			methodNotAllowed()))
 	})
 
@@ -90,7 +90,7 @@ func (s *Server) setupRoutes(ring *placement.Ring) {
 			handlers.CreateMultipartUpload(mc, cache)))
 		r.Method(http.MethodDelete, "/{bucket}/*", byQuery("uploadId",
 			handlers.AbortMultipartUpload(mc, bc, cache),
-			handlers.DeleteObject(mc, bc, cache)))
+			handlers.DeleteObject(mc, cache)))
 	})
 }
 

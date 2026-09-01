@@ -26,7 +26,7 @@ const (
 	deleteObjectsBodyLimit = 4 << 20
 
 	// deleteObjectsWorkers bounds how many keys are deleted at once. Each one
-	// is a metadata read, a shard fan-out and two metadata writes, and a batch
+	// is a metadata read and three metadata writes — no shard RPC — and a batch
 	// of a thousand run one at a time is the round-trip cost this operation
 	// exists to remove.
 	deleteObjectsWorkers = 8
@@ -37,7 +37,7 @@ const (
 // Every key is reported on independently. One that cannot be deleted produces
 // an Error entry beside the Deleted entries for the rest and never fails the
 // request, which is what lets a client emptying a bucket make progress.
-func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handler {
+func DeleteObjects(mc MetaClient, cache *BucketCache) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		resource, ok := routedBucket(w, r)
@@ -70,7 +70,7 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handle
 			return
 		}
 
-		outcomes := deleteBatch(ctx, mc, bc, bucket, request.Objects)
+		outcomes := deleteBatch(ctx, mc, bucket, request.Objects)
 
 		result := DeleteResult{}
 		for i, object := range request.Objects {
@@ -104,7 +104,7 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handle
 // results are written by index rather than collected, so the answer follows the
 // order the client asked in without a lock over it.
 func deleteBatch(
-	ctx context.Context, mc MetaClient, bc BlobClient, bucket string, objects []DeleteRequestObject,
+	ctx context.Context, mc MetaClient, bucket string, objects []DeleteRequestObject,
 ) []error {
 	outcomes := make([]error, len(objects))
 
@@ -123,7 +123,7 @@ func deleteBatch(
 					outcomes[i] = err
 					continue
 				}
-				outcomes[i] = deleteStoredObject(ctx, mc, bc, bucket, objects[i].Key)
+				outcomes[i] = deleteStoredObject(ctx, mc, bucket, objects[i].Key)
 			}
 		}()
 	}

@@ -30,7 +30,7 @@ func newDeleteFixture(t *testing.T, keys ...string) deleteFixture {
 	f := newWriteFixture(4, 2)
 	cache := NewBucketCache([]BucketConfig{{Name: deleteTestBucket, Region: "ap-southeast-2"}})
 
-	fixture := deleteFixture{write: f, handler: DeleteObjects(f.mc, f.bc, cache)}
+	fixture := deleteFixture{write: f, handler: DeleteObjects(f.mc, cache)}
 	for _, key := range keys {
 		fixture.seed(t, key, []byte("body of "+key))
 	}

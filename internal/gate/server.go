@@ -18,6 +18,7 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/gate/reaper"
 	"github.com/mulgadc/predastore/internal/gate/repair"
 	"github.com/mulgadc/predastore/internal/telemetry"
 )
@@ -52,6 +53,10 @@ type Server struct {
 	// repairer is nil unless repair is enabled and this gate has local blob
 	// nodes to repair for.
 	repairer *repair.Service
+
+	// reaper is nil unless the reaper sweep is enabled and this gate has local
+	// blob nodes to run it for.
+	reaper *reaper.Service
 }
 
 var _ http.Handler = (*Server)(nil)
@@ -122,6 +127,9 @@ func New(cfg Config) (*Server, error) {
 	if s.repairer, err = newRepairer(cfg, ring); err != nil {
 		return nil, err
 	}
+	if s.reaper, err = newReaper(cfg); err != nil {
+		return nil, err
+	}
 
 	s.setupMiddleware()
 	s.setupRoutes(ring)
@@ -150,6 +158,30 @@ func newRepairer(cfg Config, ring *placement.Ring) (*repair.Service, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to build the repair sweep: %w", err)
+	}
+
+	return svc, nil
+}
+
+// newReaper builds the background tombstone sweep, or returns nil when there
+// is nothing for it to do. Like repair, a gate with no colocated blob nodes is
+// not a failure to configure: there is no election, so every gate that could
+// run the sweep does, and a gate-only host legitimately has no shards to
+// reclaim from.
+func newReaper(cfg Config) (*reaper.Service, error) {
+	if !cfg.Reaper.Enabled || len(cfg.LocalBlobNodeIDs) == 0 {
+		return nil, nil
+	}
+
+	svc, err := reaper.New(reaper.Config{
+		Meta:     cfg.Meta,
+		Blob:     cfg.Blob,
+		Workers:  cfg.Reaper.Workers,
+		PageSize: cfg.Reaper.PageSize,
+		Interval: cfg.Reaper.Interval,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to build the reaper sweep: %w", err)
 	}
 
 	return svc, nil
@@ -301,6 +333,36 @@ func (s *Server) Run(ctx context.Context) error {
 		defer func() {
 			stopRepair()
 			repairDone.Wait()
+		}()
+	}
+
+	// Scoped and stopped the same way the repairer is: no goroutine outlives
+	// Run, and a reclaim in flight holds streams to peers the drain would
+	// otherwise wait behind.
+	if s.reaper != nil {
+		unregister, err := telemetry.RegisterReaperGauges(func() telemetry.ReaperSnapshot {
+			st := s.reaper.Stats()
+
+			return telemetry.ReaperSnapshot{
+				Pending: st.Pending, Reclaimed: st.Reclaimed,
+				Failed: st.Failed, Passes: st.Passes,
+			}
+		})
+		if err != nil {
+			return fmt.Errorf("failed to register the reaper gauges: %w", err)
+		}
+		defer func() { _ = unregister() }()
+
+		reaperCtx, stopReaper := context.WithCancel(ctx)
+		var reaperDone sync.WaitGroup
+		reaperDone.Go(func() {
+			if err := s.reaper.Run(reaperCtx); err != nil {
+				slog.Error("Reaper sweep stopped", "error", err)
+			}
+		})
+		defer func() {
+			stopReaper()
+			reaperDone.Wait()
 		}()
 	}
 
