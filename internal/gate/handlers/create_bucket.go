@@ -28,6 +28,12 @@ func CreateBucket(mc MetaClient, cache *BucketCache, cfg Config) http.Handler {
 			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "Bucket policy is not implemented")
 			return
 		}
+		// PUT /{bucket}?versioning — answering the create-bucket path here would
+		// report "already yours" rather than the truthful "not supported".
+		if r.URL.Query().Has("versioning") {
+			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "Versioning is not implemented")
+			return
+		}
 
 		ownerID := auth.AccessKeyID(ctx)
 		accountID := auth.AccountID(ctx)

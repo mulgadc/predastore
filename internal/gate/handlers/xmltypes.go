@@ -43,6 +43,23 @@ type ListObjectsV2 struct {
 	CommonPrefixes        *[]ListObjectsV2_Dir      `xml:"CommonPrefixes"`
 }
 
+// ListObjectsV1 answers GET /{bucket} when list-type is absent or not "2".
+// NextMarker is carried only when the listing is truncated and a delimiter is
+// in play, per the S3 spec: without a delimiter a client pages from the last
+// key in Contents instead, so there is nothing to name it with.
+type ListObjectsV1 struct {
+	XMLName        xml.Name                  `xml:"ListBucketResult"`
+	Name           string                    `xml:"Name"`
+	Prefix         string                    `xml:"Prefix"`
+	Marker         string                    `xml:"Marker"`
+	NextMarker     string                    `xml:"NextMarker,omitempty"`
+	Delimiter      string                    `xml:"Delimiter,omitempty"`
+	MaxKeys        int                       `xml:"MaxKeys"`
+	IsTruncated    bool                      `xml:"IsTruncated"`
+	Contents       *[]ListObjectsV2_Contents `xml:"Contents"`
+	CommonPrefixes *[]ListObjectsV2_Dir      `xml:"CommonPrefixes"`
+}
+
 /*
 <?xml version="1.0" encoding="UTF-8"?>
 <ListAllMyBucketsResult>

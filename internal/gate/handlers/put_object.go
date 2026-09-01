@@ -30,6 +30,13 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 		bucket, key := resource.Bucket.Name, resource.Key
 
+		// PUT /{bucket}/{key}?acl — answering 200 here would discard the ACL the
+		// caller sent rather than say object ACLs are not supported.
+		if r.URL.Query().Has("acl") {
+			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "ACL is not implemented")
+			return
+		}
+
 		phase := time.Now()
 		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
