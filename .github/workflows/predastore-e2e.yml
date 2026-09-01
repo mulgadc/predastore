@@ -216,8 +216,28 @@ jobs:
 
       # A failing scenario fails its own leg. stress-gate.sh still reads the
       # baseline, so a known gap is reported as one rather than as a surprise.
+      # The work directory holds the node logs, and the run deletes it on the
+      # way out. Keeping it costs nothing on a runner that is discarded whole.
       - name: Run Scenario
+        env:
+          STRESS_KEEP_WORK: "1"
         run: make e2e-stress-strict STRESS_SCENARIOS="${{ matrix.scenario }}"
+
+      # A scenario that dies while starting a cluster never reaches the point
+      # where it copies node logs into its results directory, so the artifact
+      # explains everything except the failures worth explaining.
+      - name: Node Logs
+        if: failure()
+        run: |
+          set -uo pipefail
+          for d in "$HOME"/.cache/predastore-e2e/predastore-e2e-stress.*/predastore/*/logs /tmp/predastore-e2e-stress.*/predastore/*/logs; do
+            [ -d "$d" ] || continue
+            for f in "$d"/*; do
+              [ -f "$f" ] || continue
+              printf '\n===== %s =====\n' "$f"
+              tail -50 "$f"
+            done
+          done
 
       - name: Upload Results
         if: always()
