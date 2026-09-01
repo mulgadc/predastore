@@ -12,15 +12,15 @@ PASS|GetObject
 PASS|GetObject (range)
 PASS|Multipart upload (16 MiB)
 PASS|ListObjectsV2 pagination
-FAIL|ETag is the body MD5
-FAIL|CopyObject (server-side)
+PASS|ETag is the body MD5
+PASS|CopyObject (server-side)
 FAIL|DeleteObjects (bulk)
 PASS|DeleteObject (single)
 PASS|Presigned GET
 PASS|rclone mkdir
-FAIL|rclone copy (up)
+PASS|rclone copy (up)
 PASS|rclone ls
-FAIL|rclone check
+PASS|rclone check
 PASS|rclone copy (down)
 PASS|rclone copyto (server-side)
 PASS|rclone purge (bulk delete)
