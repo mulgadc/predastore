@@ -26,6 +26,13 @@ var (
 	// one repair is responsible for clearing.
 	ErrEpochMismatch = errors.New("shard held under a different write epoch")
 
+	// ErrCommitUnknown is returned by puts whose body was delivered in full
+	// but whose result never came back within the commit bound. The shard may
+	// be prepared on the node or may not: we gave up, the node did not refuse.
+	// Treating it as a shard that never arrived is what makes a slow drive
+	// look like a lost write.
+	ErrCommitUnknown = errors.New("put outcome unknown: no result within the commit bound")
+
 	// ErrNotPrepared is returned by commits when the node has nothing prepared
 	// under that epoch. The answer is to rewrite the shard, not to retry.
 	ErrNotPrepared = errors.New("no prepared shard under that epoch")
@@ -101,6 +108,10 @@ type DeleteResponse struct {
 const (
 	DefaultEnvelopeTimeout = 10 * time.Second
 	DefaultIdleTimeout     = 30 * time.Second
+	// DefaultCommitTimeout sits above the kernel's 30s NVMe io_timeout so a
+	// device that stalls and then completes is waited out. Below it, a drive
+	// whose completion interrupts are late fails every write it does land.
+	DefaultCommitTimeout = 45 * time.Second
 )
 
 // Client performs value operations against blob nodes over rpc streams,
@@ -109,6 +120,7 @@ type Client struct {
 	rpc             *rpc.Client
 	envelopeTimeout time.Duration
 	idleTimeout     time.Duration
+	commitTimeout   time.Duration
 }
 
 type ClientConfig struct {
@@ -124,6 +136,11 @@ type ClientConfig struct {
 	// deliberately not a total duration: a large value transferring steadily
 	// must not be cut off, while one that stalls must not block forever.
 	IdleTimeout time.Duration
+	// CommitTimeout bounds the envelopes a node cannot send until it has
+	// fsynced: a put's response, and commit and abort. Their size is fixed
+	// but their timing is the disk's, so they do not belong under
+	// EnvelopeTimeout however small they are on the wire.
+	CommitTimeout time.Duration
 }
 
 func NewClient(cfg ClientConfig) (*Client, error) {
@@ -136,10 +153,14 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 	if cfg.IdleTimeout <= 0 {
 		cfg.IdleTimeout = DefaultIdleTimeout
 	}
+	if cfg.CommitTimeout <= 0 {
+		cfg.CommitTimeout = DefaultCommitTimeout
+	}
 	return &Client{
 		rpc:             cfg.Client,
 		envelopeTimeout: cfg.EnvelopeTimeout,
 		idleTimeout:     cfg.IdleTimeout,
+		commitTimeout:   cfg.CommitTimeout,
 	}, nil
 }
 
@@ -199,11 +220,23 @@ func (c *Client) openBounded(ctx context.Context, nodeID config.NodeID, op rpc.O
 	return c.open(openCtx, nodeID, op, h)
 }
 
-// awaitEnvelope reads the response envelope under a total cap, aborting the
-// read side if the peer goes quiet. This is where an unbounded client blocks
-// forever against a node that accepts a stream and never answers.
+// awaitEnvelope reads the response envelope under the envelope bound, for the
+// exchanges whose timing is the network's alone.
 func (c *Client) awaitEnvelope(ctx context.Context, stream transport.Stream, br *bufio.Reader) (*Response, error) {
-	respCtx, cancel := context.WithTimeout(ctx, c.envelopeTimeout)
+	return c.awaitEnvelopeWithin(ctx, stream, br, c.envelopeTimeout)
+}
+
+// awaitEnvelopeWithin reads the response envelope under a total cap, aborting
+// the read side if the peer goes quiet. This is where an unbounded client
+// blocks forever against a node that accepts a stream and never answers.
+//
+// The bound is the caller's because the same envelope means different things:
+// after a put it is not sent until the shard is fsynced, so capping it at a
+// round trip caps the disk.
+func (c *Client) awaitEnvelopeWithin(
+	ctx context.Context, stream transport.Stream, br *bufio.Reader, within time.Duration,
+) (*Response, error) {
+	respCtx, cancel := context.WithTimeout(ctx, within)
 	defer cancel()
 	stop := context.AfterFunc(respCtx, func() { stream.CancelRead(0) })
 	defer stop()
@@ -254,9 +287,17 @@ func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, 
 	}
 	stopCaller()
 
-	resp, err := c.awaitEnvelope(ctx, stream, bufio.NewReader(stream))
+	// The node does not answer until the shard is durable, so this waits on
+	// the disk and is bounded as such.
+	resp, err := c.awaitEnvelopeWithin(ctx, stream, bufio.NewReader(stream), c.commitTimeout)
 	if err != nil {
 		stream.CancelRead(0)
+		// The body is already delivered and half-closed, so a node that has
+		// not answered may still be committing. Say so, rather than reporting
+		// a refusal we never received.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("put to node %d: %w: %w", nodeID, ErrCommitUnknown, err)
+		}
 		return nil, fmt.Errorf("put to node %d: %w", nodeID, err)
 	}
 	switch resp.Err {
@@ -372,7 +413,9 @@ func (c *Client) finish(ctx context.Context, nodeID config.NodeID, op rpc.Opcode
 		abortStream(stream)
 		return nil, fmt.Errorf("half-close %s stream: %w", name, err)
 	}
-	resp, err := c.awaitEnvelope(ctx, stream, bufio.NewReader(stream))
+	// Publishing and discarding both reach the disk, so they are bounded by it
+	// rather than by the round trip that carries them.
+	resp, err := c.awaitEnvelopeWithin(ctx, stream, bufio.NewReader(stream), c.commitTimeout)
 	if err != nil {
 		stream.CancelRead(0)
 		return nil, fmt.Errorf("%s on node %d: %w", name, nodeID, err)
