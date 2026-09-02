@@ -176,6 +176,14 @@ type CopyObjectResult struct {
 	LastModified time.Time `xml:"LastModified"`
 }
 
+// CopyPartResult answers a part copy. The part's ETag arrives in the body
+// rather than the header UploadPart sets, and clients read it from there.
+type CopyPartResult struct {
+	XMLName      xml.Name  `xml:"CopyPartResult"`
+	ETag         string    `xml:"ETag"`
+	LastModified time.Time `xml:"LastModified"`
+}
+
 // S3Error is the error document every failed request returns.
 type S3Error struct {
 	XMLName    xml.Name `xml:"Error"`
