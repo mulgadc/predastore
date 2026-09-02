@@ -233,6 +233,14 @@ func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stre
 	}
 
 	if _, err := writer.ReadFrom(io.LimitReader(stream, h.Size)); err != nil {
+		// Close is what releases the segment reference Append took, so a failed
+		// body must still close or that reference is held for the life of the
+		// process. What it prepares is never published and is reaped in turn.
+		if closeErr := writer.Close(); closeErr != nil {
+			slog.Warn("close writer after failed body", "node", s.cfg.NodeID, "error", closeErr)
+		} else if abortErr := st.Abort(h.Key, h.Index, h.Epoch); abortErr != nil {
+			slog.Warn("abort partial write", "node", s.cfg.NodeID, "error", abortErr)
+		}
 		return respond(stream, &Response{Err: fmt.Sprintf("write: %v", err)})
 	}
 	// Closing prepares the extent rather than publishing it: the shard is
