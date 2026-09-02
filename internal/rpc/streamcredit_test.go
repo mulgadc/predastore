@@ -189,6 +189,13 @@ func TestLongLivedStreamIsNotTornDownByTheDrain(t *testing.T) {
 	const opHold Opcode = 0x7f03
 	served := make(chan transport.Stream, 1)
 
+	// The bound is what is under test, not its production length: a drain that
+	// cancels does so the moment it expires, so a short one exercises the same
+	// path.
+	restore := requestDrainTimeout
+	requestDrainTimeout = 250 * time.Millisecond
+	t.Cleanup(func() { requestDrainTimeout = restore })
+
 	mux := NewMux()
 	RegisterHandler(mux, opHold, func(_ context.Context, h pingHeader, stream transport.Stream) error {
 		// Answer, then hand the stream on and return, exactly as handleRaftDial
@@ -228,7 +235,7 @@ func TestLongLivedStreamIsNotTornDownByTheDrain(t *testing.T) {
 
 	// Well past requestDrainTimeout: neither end has half-closed, so a drain
 	// that cancels on expiry destroys this stream.
-	time.Sleep(requestDrainTimeout + 2*time.Second)
+	time.Sleep(requestDrainTimeout + 750*time.Millisecond)
 
 	// A pipe is synchronous and nothing is reading the held stream, so the write
 	// blocking is the healthy outcome. What must not happen is a stream error,
@@ -241,7 +248,7 @@ func TestLongLivedStreamIsNotTornDownByTheDrain(t *testing.T) {
 	select {
 	case err := <-wrote:
 		t.Fatalf("writing to a stream the handler still owns: %v", err)
-	case <-time.After(2 * time.Second):
+	case <-time.After(750 * time.Millisecond):
 	}
 }
 
