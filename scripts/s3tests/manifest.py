@@ -106,13 +106,18 @@ def compare(baseline_path, current_path, strict):
     show('REGRESSED -- these passed in the baseline', regressed)
     show('VANISHED -- in the baseline, not in this run', vanished)
     show('FIXED -- re-record the baseline in the same change', fixed)
+    if fixed:
+        print('\nRun `make s3-tests-baseline` to re-record it. CI uploads the '
+              'regenerated manifest as the s3-tests-manifest artifact, byte-'
+              'identical to the baseline, so an author who cannot run the '
+              'suite locally can download and commit it directly.')
     show('NEW -- not in the baseline', new)
 
-    # A regression and a vanished case are both failures of the comparison
-    # itself. Everything else is reported and does not fail the run, because a
-    # branch must not be red for gaps it did not introduce.
+    # Regressed, vanished, and fixed are all outcomes this branch caused, so
+    # each fails the comparison. NEW and strict-mode FAILING are not caused by
+    # this branch, so they are reported and left green.
     status = 0
-    if regressed or vanished:
+    if regressed or vanished or fixed:
         status = 1
     if strict and failing:
         show('FAILING -- strict mode fails on any of these', failing)
