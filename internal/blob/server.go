@@ -61,10 +61,19 @@ type Config struct {
 	// fills. Zero uses the engine's default interval.
 	Compaction time.Duration
 
+	// BodyIdleTimeout bounds a response body whose peer has stopped reading.
+	// Zero uses DefaultBodyIdleTimeout.
+	BodyIdleTimeout time.Duration
+
 	// Store stands in for the engine that would be opened at DataDir. Test
 	// seam: production leaves it nil.
 	Store Store
 }
+
+// DefaultBodyIdleTimeout bounds a get body that stops moving. It is deliberately
+// longer than the client's own idle timeout so a caller that gives up aborts its
+// own stream first; this is the backstop for one that vanishes without aborting.
+const DefaultBodyIdleTimeout = 60 * time.Second
 
 // Server serves rpc requests for one blob node. A process running several
 // nodes builds one Server per node, each with its own rpc server, so the
@@ -91,6 +100,9 @@ func New(cfg Config) (*Server, error) {
 	// than leaving a process holding an open store no peer can dial.
 	if len(cfg.Listeners) == 0 {
 		return nil, fmt.Errorf("node %d has no listeners", cfg.NodeID)
+	}
+	if cfg.BodyIdleTimeout <= 0 {
+		cfg.BodyIdleTimeout = DefaultBodyIdleTimeout
 	}
 	return &Server{cfg: cfg}, nil
 }
@@ -336,7 +348,18 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 	if err := respond(stream, &Response{BodyLen: responseSize}); err != nil {
 		return fmt.Errorf("write envelope: %w", err)
 	}
-	if _, err := stream.ReadFrom(io.NewSectionReader(reader, rangeStart, responseSize)); err != nil {
+	// Guarded because the reader holds a reference to its segment until it is
+	// closed. A peer that stops draining without aborting would otherwise pin
+	// that reference for as long as its connection survives, and compaction
+	// blocks on exactly those references.
+	guard := transport.NewWriteGuard(
+		io.NewSectionReader(reader, rangeStart, responseSize), stream, s.cfg.BodyIdleTimeout)
+	defer guard.Stop()
+
+	if _, err := stream.ReadFrom(guard); err != nil {
+		if guard.Expired() {
+			return fmt.Errorf("stream body: %w", transport.ErrIdleTimeout)
+		}
 		return fmt.Errorf("stream body: %w", err)
 	}
 	return nil
