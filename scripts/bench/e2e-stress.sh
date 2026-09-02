@@ -267,13 +267,33 @@ round_trip() {
     local endpoint="$1" label="$2"
     local bucket="stress-${label}-${RUN_ID}"
     local src="$WORK_DIR/$label.bin" dst="$WORK_DIR/$label.out"
+    local failed=""
 
-    openssl rand -out "$src" 1048576
-    aws_s3 "$endpoint" s3 mb "s3://$bucket" >/dev/null
-    aws_s3 "$endpoint" s3api put-object --bucket "$bucket" --key rt.bin --body "$src" >/dev/null
-    aws_s3 "$endpoint" s3 cp "s3://$bucket/rt.bin" "$dst" --only-show-errors
-    diff -q "$src" "$dst" >/dev/null
-    aws_s3 "$endpoint" s3 rb "s3://$bucket" --force >/dev/null
+    # set -e does not apply inside a function called on the left of ||, so
+    # every step is checked here and the first one to fail is what the trip
+    # reports.
+    if ! openssl rand -out "$src" 1048576; then
+        failed="source generation"
+    elif ! aws_s3 "$endpoint" s3 mb "s3://$bucket" >/dev/null; then
+        failed="bucket create"
+    elif ! aws_s3 "$endpoint" s3api put-object --bucket "$bucket" --key rt.bin --body "$src" >/dev/null; then
+        failed="PUT"
+    elif ! aws_s3 "$endpoint" s3 cp "s3://$bucket/rt.bin" "$dst" --only-show-errors; then
+        failed="GET"
+    elif ! diff -q "$src" "$dst" >/dev/null; then
+        failed="byte comparison"
+    fi
+
+    # Removal is best effort and never the result. It succeeds on the empty
+    # bucket a failed PUT leaves behind, which is what let a wholly failed
+    # trip report the removal's success as its own.
+    aws_s3 "$endpoint" s3 rb "s3://$bucket" --force >/dev/null || true
+
+    if [ -n "$failed" ]; then
+        log "round-trip $label: $failed failed"
+        return 1
+    fi
+    return 0
 }
 
 # Placement follows the object hash, which is derived from bucket and key
