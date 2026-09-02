@@ -930,7 +930,10 @@ func (store *Store) Close() error {
 	}
 
 	for num, seg := range store.segCache {
-		seg.waitForRefs()
+		if !seg.waitForRefs(closeRefDrainBudget) {
+			slog.Warn("closing segment with live references",
+				"segNum", num, "refs", seg.refs.Load())
+		}
 
 		if err := seg.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close segment %d: %w", num, err))

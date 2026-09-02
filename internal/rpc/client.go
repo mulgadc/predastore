@@ -97,6 +97,21 @@ type healthStream struct {
 	// of them keeps its count, which is the leak the gauge exists to show.
 	release  func()
 	released atomic.Bool
+
+	// abandoned records that this side ended the stream for its own reasons.
+	// The read that follows fails, but the failure is ours and says nothing
+	// about whether the peer is serving.
+	abandoned atomic.Bool
+}
+
+// abandon marks a teardown the caller asked for, so the failed read it causes
+// is not charged to the peer. Only that one code qualifies: an idle abort and
+// an expired envelope deadline are both the peer failing to answer, which is
+// exactly the stall the pool needs to hear about.
+func (s *healthStream) abandon(code transport.StreamErrorCode) {
+	if code == transport.StreamCodeCallerGone {
+		s.abandoned.Store(true)
+	}
 }
 
 // done releases the stream from the gauge exactly once, whichever teardown
@@ -107,17 +122,25 @@ func (s *healthStream) done() {
 	}
 }
 
+// Close half-closes the write side and leaves the response still to be read,
+// so it is not an abandonment and must not suppress anything.
 func (s *healthStream) Close() error {
 	s.done()
 	return s.Stream.Close()
 }
 
+// CancelRead and CancelWrite mark the stream before tearing it down, so a read
+// already blocked on it cannot unblock and report the resulting error before
+// the mark lands.
+
 func (s *healthStream) CancelRead(code transport.StreamErrorCode) {
+	s.abandon(code)
 	s.done()
 	s.Stream.CancelRead(code)
 }
 
 func (s *healthStream) CancelWrite(code transport.StreamErrorCode) {
+	s.abandon(code)
 	s.done()
 	s.Stream.CancelWrite(code)
 }
@@ -130,6 +153,11 @@ func (s *healthStream) note(n int64, err error) {
 		if s.reported.CompareAndSwap(false, true) {
 			s.pool.noteProgress(s.conn)
 		}
+	// A read the caller gave up on is not evidence about the peer. Charging it
+	// lets an expiring shard deadline or an abandoned hedge evict a healthy
+	// connection, and the colder replacement is then abandoned the same way.
+	case s.abandoned.Load():
+		return
 	case err != nil:
 		if s.reported.CompareAndSwap(false, true) {
 			s.pool.noteStall(s.conn)

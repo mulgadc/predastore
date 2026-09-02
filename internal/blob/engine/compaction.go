@@ -152,7 +152,14 @@ func (store *Store) compactOnce() error {
 	for _, num := range candidates {
 		segStart := time.Now()
 		stats, err := store.compactSegment(num)
-		if err != nil {
+		switch {
+		// A reader or writer still holds the segment. Its extents have already
+		// been relocated, so the next cycle finds nothing to move and only
+		// retries the drop.
+		case errors.Is(err, errSegmentBusy):
+			slog.Info("compaction deferred segment", "segNum", num)
+			continue
+		case err != nil:
 			// One bad segment must not strand the rest of the cycle: log it
 			// loudly and move on rather than aborting every other candidate.
 			slog.Error("compaction skipped segment", "segNum", num, "error", err)

@@ -8,13 +8,27 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
 	segFilename    = "%016d.seg"
 	idxSegFilename = "%016d.idx"
+)
+
+// errSegmentBusy reports a drop declined because the segment still has live
+// readers or writers. Not a failure: the caller retries on its next cycle.
+var errSegmentBusy = errors.New("segment still referenced")
+
+const (
+	// segRefPollInterval is how often the close path rechecks a segment's
+	// reference count.
+	segRefPollInterval = 20 * time.Millisecond
+
+	// closeRefDrainBudget bounds how long Close waits for one segment's readers
+	// and writers to finish before closing the fd out from under them.
+	closeRefDrainBudget = 10 * time.Second
 )
 
 // idxEntry is one row of a segment's append-only reverse sidecar (.idx), written
@@ -154,19 +168,34 @@ type segment struct {
 	idxSize int64  // .idx append cursor, guarded by store.mutex
 	num     uint64 // for unlink paths on drop
 
-	// Active readers and writers, drained before the fd closes. Safe as a
-	// WaitGroup because addRef only runs from Lookup/Append under store.mutex,
-	// and Close flips store.closed under that same mutex before waiting — so no
-	// addRef can race a Wait.
-	refs sync.WaitGroup
+	// Active readers and writers, drained before the fd closes. A counter
+	// rather than a WaitGroup so it can be tested without blocking: addRef only
+	// runs from Lookup/Append under store.mutex, so a zero read under that same
+	// lock is exact — no new reference can appear while it is held.
+	refs atomic.Int64
 
 	// Caches the on-disk full flag, sparing the hot Append path a ReadAt.
 	full atomic.Bool
 }
 
-func (seg *segment) addRef()      { seg.refs.Add(1) }
-func (seg *segment) releaseRef()  { seg.refs.Done() }
-func (seg *segment) waitForRefs() { seg.refs.Wait() }
+func (seg *segment) addRef()     { seg.refs.Add(1) }
+func (seg *segment) releaseRef() { seg.refs.Add(-1) }
+func (seg *segment) busy() bool  { return seg.refs.Load() > 0 }
+
+// waitForRefs drains active references, giving up after budget and reporting
+// whether it drained. Only the close path waits: a reader wedged against a peer
+// that stopped reading must not hold shutdown open indefinitely, and a segment
+// closed under one fails that read rather than stalling the process.
+func (seg *segment) waitForRefs(budget time.Duration) bool {
+	deadline := time.Now().Add(budget)
+	for seg.busy() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(segRefPollInterval)
+	}
+	return true
+}
 
 // appendIdx writes one row at the .idx append cursor and advances it. Caller
 // holds store.mutex.
@@ -183,14 +212,21 @@ func (seg *segment) syncIdx() error { return seg.idx.Sync() }
 // dropSegment unlinks a drained segment and its sidecar. Caller holds
 // store.mutex. Safe only once every live extent it held has been committed
 // elsewhere.
+//
+// A segment with live references is left in place and reported busy. Waiting
+// for them here would hold store.mutex across a wait no reader bounds, so a
+// single wedged reader would stall every other read and write on the node.
+// Deferring costs nothing but the dead space until the next cycle.
 func (store *Store) dropSegment(num uint64) error {
 	seg, ok := store.segCache[num]
 	if !ok {
 		return nil
 	}
+	if seg.busy() {
+		return fmt.Errorf("%w: segment %d", errSegmentBusy, num)
+	}
 	delete(store.segCache, num)
 	store.stats.liveSegments--
-	seg.waitForRefs()
 
 	var errs []error
 	if err := seg.Close(); err != nil {
