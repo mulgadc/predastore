@@ -1,0 +1,102 @@
+# S3 conformance (ceph/s3-tests) against predastore.
+#
+# Split out of predastore-e2e.yml so it also runs on a pull request: the
+# suite drives the gate over HTTP, so any code in the built binary can flip a
+# case -- routing, internal/meta and the blob engine have each done so -- which
+# is why the path filter below is any Go change rather than an enumerated "S3
+# surface" that would silently miss one. *_test.go is excluded because test
+# files do not change the shipped binary. deploy/** and Dockerfile are
+# deliberately absent: this job runs bare-process via ./scripts/start.sh -w
+# s3tests against config/s3tests.toml, not the container.
+name: Conformance
+
+on:
+  pull_request:
+    branches:
+      - main
+      - dev
+    paths:
+      - "**/*.go"
+      - "!**/*_test.go"
+      - go.mod
+      - go.sum
+      - Makefile
+      - "config/**"
+      - "scripts/**"
+      - .github/workflows/predastore-conformance.yml
+  push:
+    branches:
+      - main
+      - dev
+    paths:
+      - "**/*.go"
+      - "!**/*_test.go"
+      - go.mod
+      - go.sum
+      - Makefile
+      - "config/**"
+      - "scripts/**"
+      - .github/workflows/predastore-conformance.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: S3 Conformance (ceph/s3-tests)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          cache-dependency-path: "go.sum"
+          go-version-file: "go.mod"
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build
+        run: make build
+
+      # No container here. The suite needs the three accounts and the us-east-1
+      # region that only config/s3tests.toml carries, and render-config.sh emits
+      # exactly one account, so the image cannot serve this run without being
+      # handed a mounted profile.
+      - name: Start Cluster
+        run: ./scripts/start.sh -w s3tests
+
+      # Comparison, never strict. Predastore fails a large part of s3-tests and
+      # will for a long while, so the question this job answers is whether the
+      # branch moved anything, not whether the suite is green.
+      #
+      # Bounded below the job timeout on purpose: a job that hits its own
+      # timeout skips every later step, including the manifest upload, so the
+      # one artefact that would explain the failure is never produced.
+      - name: Conformance Suite
+        timeout-minutes: 20
+        run: make s3-tests
+
+      - name: Upload Manifest
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: s3-tests-manifest
+          path: /tmp/predastore-s3-tests/manifest.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Cluster Logs
+        if: failure()
+        run: tail -n 200 /tmp/predastore/s3tests/logs/*.log
+
+      - name: Stop Cluster
+        if: always()
+        run: ./scripts/stop.sh s3tests
