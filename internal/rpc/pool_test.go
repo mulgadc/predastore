@@ -366,9 +366,10 @@ func TestStalledStreamsEvictConnection(t *testing.T) {
 		if err != nil {
 			t.Fatalf("open stream: %v", err)
 		}
-		// Aborting the read is what a caller's expiring deadline does, so the
-		// stream ends without a byte of response.
-		stream.CancelRead(0)
+		// The idle guard aborting the read is what a peer that has stopped
+		// making progress looks like, so the stream ends without a byte of
+		// response and the connection is charged for it.
+		stream.CancelRead(transport.StreamCodeIdle)
 		if _, err := io.ReadAll(stream); err == nil {
 			t.Fatal("read from an aborted stream succeeded")
 		}
@@ -396,5 +397,50 @@ func TestStalledStreamsEvictConnection(t *testing.T) {
 	// The pool must be usable again: the next call dials a replacement.
 	if got, err := ping(ctx, caller, peer.id); err != nil || got != "pong:hello" {
 		t.Fatalf("ping after eviction returned %q, %v", got, err)
+	}
+}
+
+// TestAbandonedStreamsDoNotEvictConnection is the other half of the stall rule.
+// A caller abandons streams routinely — an open deadline expires, a hedged
+// shard is dropped once a faster copy lands — and each one ends in a failed
+// read. Charging those to the peer evicts connections that are serving
+// perfectly, and the colder replacement is abandoned the same way, so the
+// eviction repeats for as long as the caller keeps hedging.
+func TestAbandonedStreamsDoNotEvictConnection(t *testing.T) {
+	nodes := newTestCluster(t, 1, 2)
+	caller, peer := nodes[1], nodes[2]
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	conn, err := caller.pool.Dial(ctx, peer.id)
+	if err != nil {
+		t.Fatalf("dial node %d: %v", peer.id, err)
+	}
+
+	abandon := func() {
+		t.Helper()
+		stream, err := OpenStream(ctx, caller.client, peer.id, opPing, &pingHeader{Name: "hello"})
+		if err != nil {
+			t.Fatalf("open stream: %v", err)
+		}
+		stream.CancelRead(transport.StreamCodeCallerGone)
+		if _, err := io.ReadAll(stream); err == nil {
+			t.Fatal("read from an abandoned stream succeeded")
+		}
+	}
+
+	// Well past maxStreamStalls, so a connection charged for these would be
+	// long gone by the time the loop ends.
+	for range maxStreamStalls * 3 {
+		abandon()
+	}
+	if held, _ := caller.pool.held(peer.id); held != conn {
+		t.Fatalf("connection evicted after %d abandoned streams", maxStreamStalls*3)
+	}
+
+	// And the connection is still the one being used, not merely still listed.
+	if got, err := ping(ctx, caller, peer.id); err != nil || got != "pong:hello" {
+		t.Fatalf("ping over the retained connection returned %q, %v", got, err)
 	}
 }

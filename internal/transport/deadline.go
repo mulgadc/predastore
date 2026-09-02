@@ -15,6 +15,12 @@ var ErrIdleTimeout = errors.New("transfer stalled: idle timeout")
 // StreamCodeIdle is sent to the peer when an idle timeout aborts a stream.
 const StreamCodeIdle StreamErrorCode = 2
 
+// StreamCodeCallerGone aborts a stream the caller no longer wants: a deadline
+// it set itself, or a result it has already got elsewhere. It is distinct from
+// every other abort because it is the one that carries no verdict on the peer,
+// which is what stops a caller's own timeouts being read as peer failures.
+const StreamCodeCallerGone StreamErrorCode = 3
+
 // IdleGuard bounds a transfer by progress rather than by total duration. It
 // wraps the reader driving the transfer and aborts the stream when a single
 // read makes no progress within the idle timeout.

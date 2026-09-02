@@ -238,7 +238,16 @@ func (c *Client) awaitEnvelopeWithin(
 ) (*Response, error) {
 	respCtx, cancel := context.WithTimeout(ctx, within)
 	defer cancel()
-	stop := context.AfterFunc(respCtx, func() { stream.CancelRead(0) })
+	// Both our deadline and the caller's cancellation land here, and only here
+	// are both in scope to tell apart. Ours is the peer failing to answer; the
+	// caller's is no verdict on the peer at all.
+	stop := context.AfterFunc(respCtx, func() {
+		if ctx.Err() != nil {
+			stream.CancelRead(transport.StreamCodeCallerGone)
+			return
+		}
+		stream.CancelRead(0)
+	})
 	defer stop()
 
 	resp, err := readEnvelope(br)
@@ -487,7 +496,9 @@ func (c *Client) Get(ctx context.Context, nodeID config.NodeID, req GetRequest) 
 		stream:    stream,
 		remaining: resp.BodyLen,
 	}
-	body.stopCaller = context.AfterFunc(ctx, func() { stream.CancelRead(0) })
+	body.stopCaller = context.AfterFunc(ctx, func() {
+		stream.CancelRead(transport.StreamCodeCallerGone)
+	})
 	return body, nil
 }
 
@@ -521,8 +532,9 @@ func (s *bodyReadCloser) Close() error {
 	if s.stopCaller != nil {
 		s.stopCaller()
 	}
-	// Abort the read side in case the body was not fully drained; the
-	// write side is already closed.
-	s.stream.CancelRead(0)
+	// Abort the read side in case the body was not fully drained; the write
+	// side is already closed. A caller closing early is abandoning the shard,
+	// not reporting one, which is how a hedge stops evicting the loser.
+	s.stream.CancelRead(transport.StreamCodeCallerGone)
 	return nil
 }
