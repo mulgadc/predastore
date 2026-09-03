@@ -158,11 +158,7 @@ func recordPhase(ctx context.Context, op, phase string, start time.Time) time.Ti
 	return now
 }
 
-// finishPayload completes the SigV4 payload check on a body large enough that sigv4
-// verifies it as it streams: the signed digest is only compared at EOF, and the write
-// path stops at the declared length. Draining the remainder forces the comparison, so a
-// rewritten body is caught before the write is committed to global state.
-// It also finishes a framed body, where the remainder is the terminating chunk
+// finishPayload finishes a framed body, where the remainder is the terminating chunk
 // and the trailers: the write path stops at the decoded length, so without this
 // the chunk signature closing the chain and the trailing checksum are never
 // read. Draining has to go through the decoder for that reason — draining
@@ -178,10 +174,6 @@ func finishPayload(r *http.Request, dec *chunked.Decoder) error {
 	}
 
 	if _, err := io.Copy(io.Discard, rest); err != nil {
-		if errors.Is(err, sigv4.ErrContentSHA256Mismatch) {
-			return model.ErrContentSHA256MismatchError
-		}
-
 		return mapChunkedErr(err)
 	}
 
@@ -222,6 +214,8 @@ func mapChecksumErr(err error) error {
 // framing is a malformed request. Neither is a 500: both are the client's.
 func mapChunkedErr(err error) error {
 	switch {
+	case errors.Is(err, sigv4.ErrContentSHA256Mismatch):
+		return model.ErrContentSHA256MismatchError
 	case errors.Is(err, chunked.ErrChunkSignature):
 		return model.ErrSignatureDoesNotMatchError
 	case errors.Is(err, chunked.ErrMalformedFraming):
