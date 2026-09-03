@@ -206,9 +206,14 @@ func (p *ConnPool) Dialed() []transport.Conn {
 
 // insert offers a connection to a peer's slot and reports what the pool holds
 // afterwards, plus whether that is c. Each end keeps the connection the lower
-// node id dialed, which they compute alike, whether the slot already holds one
-// or not; anything else is last-write-wins. A displaced connection is closed, a
-// rejected one is left to its caller.
+// node id dialed, which they compute alike; anything else is last-write-wins. A
+// displaced connection is closed, a rejected one is left to its caller.
+//
+// An empty slot takes whatever arrived, including a connection the peer opened
+// that the tiebreak would otherwise hand back. Holding none is worse than
+// holding the wrong one: eviction empties the slot, and a node whose own dial
+// is failing would then refuse the working connection its peer was offering it
+// and have no way to send at all. Our dial displaces it when it lands.
 func (p *ConnPool) insert(remote config.NodeID, c transport.Conn, dialed bool) (transport.Conn, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -224,12 +229,6 @@ func (p *ConnPool) insert(remote config.NodeID, c transport.Conn, dialed bool) (
 			return e.conn, false
 		}
 		e.conn.Close()
-	case !ok && !dialed && preferred:
-		// An empty slot taking whatever arrived is how a node came to hold a
-		// connection the peer opened. Our own dial fills it instead; refusing
-		// our own would leave the other end of the tiebreak unable to open one
-		// at all.
-		return nil, false
 	}
 	p.conns[remote] = pooled{conn: c, dialed: dialed}
 	return c, true
