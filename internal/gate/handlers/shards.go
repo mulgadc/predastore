@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/klauspost/reedsolomon"
+	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/blob/engine"
 	"github.com/mulgadc/predastore/internal/config"
@@ -157,7 +158,8 @@ func writeFailureReason(err error) string {
 	switch {
 	case errors.Is(err, engine.ErrStoreFull):
 		return telemetry.WriteReasonStoreFull
-	case errors.Is(err, chunked.ErrChunkSignature),
+	case errors.Is(err, sigv4.ErrContentSHA256Mismatch),
+		errors.Is(err, chunked.ErrChunkSignature),
 		errors.Is(err, chunked.ErrMalformedFraming):
 		return telemetry.WriteReasonBadRequest
 	default:

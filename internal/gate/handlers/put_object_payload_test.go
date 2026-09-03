@@ -90,8 +90,11 @@ func TestFinishPayload(t *testing.T) {
 	t.Run("rewritten body", func(t *testing.T) {
 		req := verifiedPut(t, large, bytes.Repeat([]byte("b"), len(large)))
 
+		// The declared length ends the body, so the write path's own read fails on the
+		// last byte: the rewrite is caught before the drain rather than by it.
 		_, err := io.CopyN(io.Discard, req.Body, int64(len(large)))
-		require.NoError(t, err)
+		require.ErrorIs(t, err, sigv4.ErrContentSHA256Mismatch)
+		require.ErrorIs(t, mapPutErr(err), model.ErrContentSHA256MismatchError)
 
 		require.ErrorIs(t, finishPayload(req, nil), model.ErrContentSHA256MismatchError)
 	})

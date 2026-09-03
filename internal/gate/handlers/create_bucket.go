@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
@@ -41,7 +43,21 @@ func CreateBucket(mc MetaClient, cache *BucketCache, cfg Config) http.Handler {
 		region := cfg.Region
 		if r.ContentLength > 0 {
 			var config CreateBucketConfiguration
-			body, _ := io.ReadAll(r.Body)
+			// The read carries the SigV4 payload check on a streamed body, so discarding
+			// its error would apply a location the client never signed for.
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				// A rewritten body keeps its own error rather than being reported as a
+				// configuration the handler could not parse.
+				if errors.Is(err, sigv4.ErrContentSHA256Mismatch) {
+					HandleError(w, r, err)
+					return
+				}
+
+				HandleError(w, r, model.NewS3Error(model.ErrMalformedXML,
+					"The bucket configuration could not be read", http.StatusBadRequest))
+				return
+			}
 			if xml.Unmarshal(body, &config) == nil && config.LocationConstraint != "" {
 				region = config.LocationConstraint
 			}
