@@ -87,9 +87,9 @@ func TestMetaReachableAcceptsAKeyThatExists(t *testing.T) {
 	}
 }
 
-// The threshold is the data-shard count: below it a read cannot be
-// reconstructed at all, which is the point at which the gate stops serving.
-func TestBlobNodesReachableUsesTheDataShardThreshold(t *testing.T) {
+// The threshold is whatever the caller passes; writeShardFloor decides what
+// that is, and the cases below fix the arithmetic around it.
+func TestBlobNodesReachableUsesTheThresholdItIsGiven(t *testing.T) {
 	nodes := []NodeID{1, 2, 3, 4}
 
 	t.Run("ready at the threshold", func(t *testing.T) {
@@ -154,5 +154,44 @@ func TestBlobProbeClosesWhatItOpens(t *testing.T) {
 	}
 	if got := bc.closed.Load(); got != 2 {
 		t.Errorf("closed %d of 2 probe reads", got)
+	}
+}
+
+// TestWriteShardFloorFollowsDegradedWrites is the reason the gate could report
+// ready while accepting no writes at all. Readiness used the read floor, which
+// DataShards satisfies; with degraded writes off a write needs every shard, so
+// a node down ends writes while every read still reconstructs.
+func TestWriteShardFloorFollowsDegradedWrites(t *testing.T) {
+	off, on := false, true
+
+	if got := writeShardFloor(&Config{RS: RS{Data: 2, Parity: 1, DegradedWrites: &off}}); got != 3 {
+		t.Errorf("floor with degraded writes off = %d, want every shard (3)", got)
+	}
+	if got := writeShardFloor(&Config{RS: RS{Data: 2, Parity: 1, DegradedWrites: &on}}); got != 2 {
+		t.Errorf("floor with degraded writes on = %d, want the data shards (2)", got)
+	}
+	if got := writeShardFloor(&Config{RS: RS{Data: 2, Parity: 1}}); got != 2 {
+		t.Errorf("floor with degraded writes unset = %d, want the default-on value (2)", got)
+	}
+}
+
+// TestBlobNodeReachableNamesTheNodeAndDoesNotGateReadiness covers the other
+// half: which node is gone has to be answerable from the probe response, but
+// the cluster tolerates losing one, so saying so is not reporting unreadiness.
+func TestBlobNodeReachableNamesTheNodeAndDoesNotGateReadiness(t *testing.T) {
+	bc := &fakeShardProber{up: map[NodeID]bool{1: true}}
+
+	up := blobNodeReachable(bc, 1)
+	if up.Name != "blob_node_1" {
+		t.Errorf("check name = %q, want blob_node_1", up.Name)
+	}
+	if !up.Advisory {
+		t.Error("a single blob node being down must not make the gate unready")
+	}
+	if err := up.Probe(context.Background()); err != nil {
+		t.Errorf("probe of a node that answered returned %v, want nil", err)
+	}
+	if err := blobNodeReachable(bc, 2).Probe(context.Background()); err == nil {
+		t.Error("probe of a node that did not answer returned nil")
 	}
 }
