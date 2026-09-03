@@ -43,6 +43,11 @@ type CredentialResult struct {
 	// PrincipalType is "user" or "assumed-role", mirroring the session record.
 	// Empty for config-based credentials, which skip policy evaluation entirely.
 	PrincipalType string
+	// UserID is aws:userid: an IAM user's unique ID, or the role ID and session
+	// name STS minted for a role session. Unlike UserName it is never
+	// caller-chosen, so a policy may key on it for either principal type. Empty
+	// when the record predates the field, which omits the key.
+	UserID string
 }
 
 // IsIAMUser reports whether the credential resolves to a real IAM user rather
@@ -83,13 +88,18 @@ type sessionCredential struct {
 	// UnderlyingRoleARN identifies the assumed role for "assumed-role" sessions;
 	// SessionName carries the instance ID, not the role, so the role name is
 	// parsed from this ARN. Empty for "user" sessions.
-	UnderlyingRoleARN string    `json:"underlying_role_arn"`
-	ExpiresAt         time.Time `json:"expires_at"`
+	UnderlyingRoleARN string `json:"underlying_role_arn"`
+	// AssumedRoleID is the role ID and session name, as STS minted them. It is
+	// aws:userid for an assumed-role session. Empty for "user" sessions, which
+	// resolve their ID from the user record instead.
+	AssumedRoleID string    `json:"assumed_role_id"`
+	ExpiresAt     time.Time `json:"expires_at"`
 }
 
 // iamUser mirrors the spinifex IAM User stored in NATS KV.
 type iamUser struct {
 	UserName         string            `json:"user_name"`
+	UserID           string            `json:"user_id"` // unique ID (AIDA...), supplied as aws:userid
 	AccountID        string            `json:"account_id"`
 	AttachedPolicies []string          `json:"attached_policies"` // policy ARNs
 	Groups           []string          `json:"groups"`            // group NAMES the user belongs to (≤10)
@@ -484,12 +494,15 @@ func (p *NATSIAMProvider) lookupSessionCredentials(ctx context.Context, accessKe
 	// empty principal_type is treated as assumed-role for backward compat; any
 	// other value fails closed (no policies → implicit deny → 403 AccessDenied).
 	var policies []iampolicy.PolicyDocument
+	// A user session's aws:userid is the user's own ID; a role session carries
+	// the one STS minted. Both are read from the record, never from SessionName.
+	userID := cred.AssumedRoleID
 	switch cred.PrincipalType {
 	case principalTypeUser:
 		if err := p.ensureIAMBucketsForSession(ctx, accessKeyID); err != nil {
 			return nil, err
 		}
-		policies, err = p.resolveUserPolicies(ctx, cred.AccountID, cred.SessionName)
+		policies, userID, err = p.resolveUserPolicies(ctx, cred.AccountID, cred.SessionName)
 		if err != nil {
 			return nil, mapSessionPrincipalError(accessKeyID, err)
 		}
@@ -532,6 +545,7 @@ func (p *NATSIAMProvider) lookupSessionCredentials(ctx context.Context, accessKe
 		SkipPolicyCheck: false,
 		PolicyDocuments: policies,
 		PrincipalType:   cred.PrincipalType,
+		UserID:          userID,
 	}, nil
 }
 
@@ -640,7 +654,7 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 	}
 
 	// Resolve user policies
-	policies, err := p.resolveUserPolicies(ctx, ak.AccountID, ak.UserName)
+	policies, userID, err := p.resolveUserPolicies(ctx, ak.AccountID, ak.UserName)
 	if err != nil {
 		return nil, fmt.Errorf("resolve policies: %w", err)
 	}
@@ -652,6 +666,7 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 		SkipPolicyCheck: false,
 		PolicyDocuments: policies,
 		PrincipalType:   principalTypeUser,
+		UserID:          userID,
 	}
 
 	// Cache the result
@@ -694,21 +709,26 @@ func mapSessionPrincipalError(accessKeyID string, err error) error {
 	return fmt.Errorf("resolve session policies: %w", err)
 }
 
-func (p *NATSIAMProvider) resolveUserPolicies(ctx context.Context, accountID, userName string) ([]iampolicy.PolicyDocument, error) {
+// resolveUserPolicies returns the user's policy set and their unique ID, which
+// the door supplies as aws:userid. The ID comes back from here rather than from
+// a second lookup because the record it lives on is already read.
+func (p *NATSIAMProvider) resolveUserPolicies(
+	ctx context.Context, accountID, userName string,
+) ([]iampolicy.PolicyDocument, string, error) {
 	kvKey := accountID + "." + userName
 	entry, err := p.usersBucket.Get(ctx, kvKey)
 	if err != nil {
-		return nil, fmt.Errorf("lookup user %s: %w", kvKey, err)
+		return nil, "", fmt.Errorf("lookup user %s: %w", kvKey, err)
 	}
 
 	var user iamUser
 	if err := json.Unmarshal(entry.Value(), &user); err != nil {
-		return nil, fmt.Errorf("unmarshal user: %w", err)
+		return nil, "", fmt.Errorf("unmarshal user: %w", err)
 	}
 
 	docs, err := p.resolveManagedPolicies(ctx, accountID, "user "+userName, user.AttachedPolicies)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// User-own inline policies. Shares the group/role parse helper so a malformed
@@ -716,7 +736,7 @@ func (p *NATSIAMProvider) resolveUserPolicies(ctx context.Context, accountID, us
 	// spinifex's GetUserPolicies user-inline loop.
 	inline, err := resolveInlinePolicies(user.InlinePolicies, "user "+userName)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	docs = append(docs, inline...)
 
@@ -726,12 +746,12 @@ func (p *NATSIAMProvider) resolveUserPolicies(ctx context.Context, accountID, us
 	if len(user.Groups) > 0 {
 		groupDocs, err := p.resolveGroupPolicies(ctx, accountID, userName, user.Groups)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		docs = append(docs, groupDocs...)
 	}
 
-	return docs, nil
+	return docs, user.UserID, nil
 }
 
 // resolveGroupPolicies resolves the managed and inline policies inherited from a

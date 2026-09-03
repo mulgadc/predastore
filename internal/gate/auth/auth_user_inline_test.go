@@ -21,11 +21,37 @@ func TestResolveUserPolicies_UserInlineAllow(t *testing.T) {
 	}
 	p := newGroupProvider(users, map[string][]byte{}, nil)
 
-	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	docs, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 1, "user-inline Allow must resolve")
 	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs),
 		"user-inline Allow must be honoured")
+}
+
+// aws:userid comes back from the record the policies were resolved from, so the
+// door supplies it without a second lookup. A record predating the field yields
+// an empty ID, which omits the key rather than supplying one that matches
+// nothing.
+func TestResolveUserPolicies_ReturnsTheUserID(t *testing.T) {
+	withID := map[string][]byte{
+		inlineTestAccount + ".alice": mustMarshal(t, iamUser{
+			UserName: "alice", UserID: "AIDAALICE", AccountID: inlineTestAccount,
+		}),
+	}
+	_, userID, err := newGroupProvider(withID, map[string][]byte{}, nil).
+		resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	require.NoError(t, err)
+	assert.Equal(t, "AIDAALICE", userID)
+
+	legacy := map[string][]byte{
+		inlineTestAccount + ".alice": mustMarshal(t, iamUser{
+			UserName: "alice", AccountID: inlineTestAccount,
+		}),
+	}
+	_, userID, err = newGroupProvider(legacy, map[string][]byte{}, nil).
+		resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	require.NoError(t, err)
+	assert.Empty(t, userID)
 }
 
 // TestResolveUserPolicies_UserInlineDenyOverridesManagedAllow proves a user's
@@ -48,7 +74,7 @@ func TestResolveUserPolicies_UserInlineDenyOverridesManagedAllow(t *testing.T) {
 	}
 	p := newGroupProvider(users, policies, nil)
 
-	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	docs, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 2, "direct Allow and user-inline Deny must both resolve")
 	assert.False(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs),
@@ -68,6 +94,6 @@ func TestResolveUserPolicies_UserInlineMalformedFailsClosed(t *testing.T) {
 	}
 	p := newGroupProvider(users, map[string][]byte{}, nil)
 
-	_, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	_, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	assert.Error(t, err, "a malformed user inline document must fail closed")
 }

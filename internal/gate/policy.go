@@ -118,6 +118,11 @@ func conditionKeys(r *http.Request, action string, cred *auth.CredentialResult) 
 	if cred.IsIAMUser() && cred.UserName != "" {
 		keys[iampolicy.KeyUsername] = cred.UserName
 	}
+	// aws:userid is safe for both principal types: neither an IAM user's unique
+	// ID nor the role ID and session name STS minted is caller-chosen.
+	if cred.UserID != "" {
+		keys[iampolicy.KeyUserID] = cred.UserID
+	}
 	if cred.AccountID != "" {
 		keys[iampolicy.KeyPrincipalAccount] = cred.AccountID
 	}

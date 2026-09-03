@@ -21,6 +21,7 @@ import (
 var gatewayDoorKeys = []string{
 	iampolicy.KeySecureTransport,
 	iampolicy.KeyUsername,
+	iampolicy.KeyUserID,
 	iampolicy.KeyPrincipalAccount,
 	iampolicy.KeySourceIP,
 }
@@ -44,8 +45,14 @@ func emittedKeys(t *testing.T) map[string]string {
 	t.Helper()
 
 	creds := map[string]*auth.CredentialResult{
-		"user":         {AccountID: "000000000001", UserName: "alice", PrincipalType: "user"},
-		"assumed-role": {AccountID: "000000000001", UserName: "session", PrincipalType: "assumed-role"},
+		"user": {
+			AccountID: "000000000001", UserName: "alice",
+			UserID: "AIDAALICE", PrincipalType: "user",
+		},
+		"assumed-role": {
+			AccountID: "000000000001", UserName: "session",
+			UserID: "AROASHAREDOPS:session", PrincipalType: "assumed-role",
+		},
 	}
 
 	union := make(map[string]string)

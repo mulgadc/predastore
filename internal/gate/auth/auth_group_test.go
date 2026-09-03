@@ -75,7 +75,7 @@ func TestResolveUserPolicies_GroupManagedAllow(t *testing.T) {
 	}
 	p := newGroupProvider(users, policies, groups)
 
-	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	docs, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 1, "group-managed Allow must resolve")
 	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs),
@@ -99,7 +99,7 @@ func TestResolveUserPolicies_GroupInlineAllow(t *testing.T) {
 	}
 	p := newGroupProvider(users, map[string][]byte{}, groups)
 
-	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	docs, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 1, "group-inline Allow must resolve")
 	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs),
@@ -132,7 +132,7 @@ func TestResolveUserPolicies_GroupDenyOverridesDirectAllow(t *testing.T) {
 	}
 	p := newGroupProvider(users, policies, groups)
 
-	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	docs, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 2, "direct Allow and group Deny must both resolve")
 	assert.False(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs),
@@ -167,7 +167,7 @@ func TestResolveUserPolicies_CombineDirectAndGroup(t *testing.T) {
 	}
 	p := newGroupProvider(users, policies, groups)
 
-	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	docs, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err)
 	assert.Len(t, docs, 2, "direct and group managed policies must both resolve")
 }
@@ -190,7 +190,7 @@ func TestResolveUserPolicies_MissingGroupSkipped(t *testing.T) {
 	}
 	p := newGroupProvider(users, policies, map[string][]byte{})
 
-	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	docs, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err, "a missing group must be skipped, not fail")
 	require.Len(t, docs, 1, "the user's direct policy must still resolve")
 	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs))
@@ -213,7 +213,7 @@ func TestResolveUserPolicies_GroupInlineMalformedFailsClosed(t *testing.T) {
 	}
 	p := newGroupProvider(users, map[string][]byte{}, groups)
 
-	_, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	_, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	assert.Error(t, err, "a malformed group inline document must fail closed")
 }
 
@@ -234,7 +234,7 @@ func TestResolveUserPolicies_GroupManagedMissingFailsClosed(t *testing.T) {
 	}
 	p := newGroupProvider(users, map[string][]byte{}, groups)
 
-	_, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	_, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	assert.Error(t, err, "an unresolvable group managed policy must fail closed")
 }
 
@@ -259,7 +259,7 @@ func TestResolveUserPolicies_GroupsBucketAbsent(t *testing.T) {
 	p := newGroupProvider(users, policies, nil)
 	p.js = &fakeJS{kvErr: jetstream.ErrBucketNotFound}
 
-	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	docs, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err, "an absent groups bucket must skip group resolution, not fail")
 	require.Len(t, docs, 1, "the user's direct policy must still resolve")
 	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs))
@@ -277,7 +277,7 @@ func TestResolveUserPolicies_GroupsBucketInfraFault(t *testing.T) {
 	p := newGroupProvider(users, map[string][]byte{}, nil)
 	p.js = &fakeJS{kvErr: errors.New("nats: connection closed")}
 
-	_, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	_, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	assert.Error(t, err, "a groups-bucket infra fault must fail closed")
 }
 
@@ -299,7 +299,7 @@ func TestResolveUserPolicies_NoGroupsUnchanged(t *testing.T) {
 	}
 	p := newGroupProvider(users, policies, nil) // groupsBucket nil, groupsReady false, js nil
 
-	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	docs, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err)
 	require.Len(t, docs, 1, "a no-groups user resolves direct policies only")
 	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::any", docs))
@@ -337,7 +337,7 @@ func TestResolveUserPolicies_MultipleGroups(t *testing.T) {
 	}
 	p := newGroupProvider(users, policies, groups)
 
-	docs, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	docs, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err, "a missing group mid-list must be skipped, not abort resolution")
 	require.Len(t, docs, 2,
 		"the managed grant from Engineers and the inline grant from Auditors must both resolve past the skipped Ghost")
@@ -357,7 +357,7 @@ func TestResolveUserPolicies_GroupKVError(t *testing.T) {
 	p := newGroupProvider(users, map[string][]byte{}, map[string][]byte{})
 	p.groupsBucket = &fakeKV{getErr: errors.New("nats: connection closed")}
 
-	_, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+	_, _, err := p.resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.Error(t, err, "a per-group KV fault must fail closed, not be skipped")
 	assert.NotErrorIs(t, err, jetstream.ErrKeyNotFound,
 		"an infra fault must not be mistaken for a missing group")
