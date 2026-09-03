@@ -65,7 +65,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 
 		// Return proper errors for unsupported bucket sub-resource operations
 		// that Terraform and other tools may call.
-		slog.DebugContext(ctx, "listObjects called", "bucket", bucket, "query", r.URL.RawQuery)
+		slog.DebugContext(ctx, "listObjects called", "bucket", bucket)
 		if query.Has("policy") {
 			slog.DebugContext(ctx, "returning NoSuchBucketPolicy for ?policy request", "bucket", bucket)
 			WriteS3Error(w, r, http.StatusNotFound, "NoSuchBucketPolicy", "The bucket policy does not exist")
