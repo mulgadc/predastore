@@ -144,8 +144,8 @@ github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJ
 github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
 github.com/modern-go/reflect2 v0.0.0-20180701023420-4b7aa43c6742/go.mod h1:bx2lNnkwVCuqBIxFjflWJWanXIb3RllmbCylyMrvgv0=
 github.com/modern-go/reflect2 v1.0.1/go.mod h1:bx2lNnkwVCuqBIxFjflWJWanXIb3RllmbCylyMrvgv0=
-github.com/mulgadc/bluebottle v1.18.1-0.20260903003911-3d26c3a8def8 h1:eTOKjTcXmX6i9CSzrFhjtc/bpfy6bRizmIiPoVmVask=
-github.com/mulgadc/bluebottle v1.18.1-0.20260903003911-3d26c3a8def8/go.mod h1:XBIMI+G2s3wuJNiEdYtlGDvCacw82OXEw50RIQhowYg=
+github.com/mulgadc/bluebottle v1.18.1-0.20260903012122-3621f6fceeb1 h1:dqxj7umc858KKBq2CrXr/wrCzT1pcbj4sqGooV6qTWQ=
+github.com/mulgadc/bluebottle v1.18.1-0.20260903012122-3621f6fceeb1/go.mod h1:XBIMI+G2s3wuJNiEdYtlGDvCacw82OXEw50RIQhowYg=
 github.com/mwitkow/go-conntrack v0.0.0-20161129095857-cc309e4a2223/go.mod h1:qRWi+5nqEBWmkhHvq77mSJWrCKwh8bxhgT7d/eI7P4U=
 github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f/go.mod h1:qRWi+5nqEBWmkhHvq77mSJWrCKwh8bxhgT7d/eI7P4U=
 github.com/nats-io/nats.go v1.53.1 h1:Otsq3uLc/kLdjmkNHkXH0jBqwUquwdKFoe3fq6/3/Xo=
