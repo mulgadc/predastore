@@ -33,6 +33,6 @@ PASS|restic backup (2nd, dedup)
 PASS|restic forget --prune
 PASS|registry bucket
 PASS|registry starts on predastore
-FAIL|docker push
-FAIL|docker pull
+PASS|docker push
+PASS|docker pull
 PASS|registry catalog

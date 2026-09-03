@@ -566,6 +566,73 @@ func pipeObject(ctx context.Context, r *stripeReader, dst io.Writer, size int64)
 	return drain(ctx, r, dst, first, n, size)
 }
 
+// copyStream reads a byte range of a stored object as a stream. The object is
+// read stripe by stripe into a pipe, so a copy holds a stripe rather than the
+// object however large that object is.
+//
+// Both server-side copy paths use it, which is what keeps a whole-object copy
+// and a ranged part copy reading the source the same way.
+type copyStream struct {
+	pr   *io.PipeReader
+	src  *stripeReader
+	done chan struct{}
+}
+
+// openCopyStream starts streaming length bytes of an object from start. A
+// zero-length window needs no reader and yields EOF immediately, which is also
+// the empty-object case.
+func openCopyStream(
+	ctx context.Context, bc BlobClient, cfg Config,
+	objectHash [32]byte, place ObjectToShardNodes, handoff config.NodeID,
+	size, start, length int64,
+) (*copyStream, error) {
+	if size == 0 || length == 0 {
+		return &copyStream{pr: emptyPipe()}, nil
+	}
+
+	src, err := newStripeReader(ctx, bc, cfg, objectHash, place, handoff)
+	if err != nil {
+		return nil, err
+	}
+
+	pr, pw := io.Pipe()
+	var dst io.Writer = pw
+	if start > 0 || length < size {
+		dst = &windowWriter{dst: pw, skip: start, limit: length}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		pw.CloseWithError(pipeObject(ctx, src, dst, size))
+	}()
+
+	return &copyStream{pr: pr, src: src, done: done}, nil
+}
+
+func (c *copyStream) Read(p []byte) (int, error) { return c.pr.Read(p) }
+
+// close releases the pipe and waits for the pump. Closing the read end unblocks
+// a pump whose consumer stopped short, and waiting for it means nothing else
+// closes the stripe reader while it is still being read.
+func (c *copyStream) close(ctx context.Context) {
+	_ = c.pr.Close()
+	if c.done != nil {
+		<-c.done
+	}
+	if c.src != nil {
+		c.src.close(ctx)
+	}
+}
+
+// emptyPipe is a reader already at EOF, in the same pipe type the streaming
+// path returns so the caller has one shape to handle.
+func emptyPipe() *io.PipeReader {
+	pr, pw := io.Pipe()
+	_ = pw.Close()
+	return pr
+}
+
 // windowWriter serves a byte range out of a whole-object stream: it drops the
 // first skip bytes and stops after limit. A negative limit means no limit.
 //

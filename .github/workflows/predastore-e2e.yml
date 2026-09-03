@@ -2,7 +2,9 @@
 #
 # Split out of Build and Test so a pull request is not gated on a four-node
 # cluster, and so the two suites that already existed but were invoked by no
-# workflow finally run somewhere.
+# workflow finally run somewhere. Conformance split out again into
+# predastore-conformance.yml, so ceph/s3-tests also runs on a pull request
+# instead of only after merge.
 #
 # Build and Test keeps a trimmed compatibility job on the pull-request path.
 # The point of the split is to move the slow half, not to stop checking the S3
@@ -91,64 +93,6 @@ jobs:
       - name: Stop Cluster
         if: always()
         run: make compose-down
-
-  conformance:
-    name: S3 Conformance (ceph/s3-tests)
-    runs-on: ubuntu-26.04
-    timeout-minutes: 45
-
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v7
-
-      - name: Setup Go
-        uses: actions/setup-go@v7
-        with:
-          cache-dependency-path: "go.sum"
-          go-version-file: "go.mod"
-
-      - name: Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-
-      - name: Build
-        run: make build
-
-      # No container here. The suite needs the three accounts and the us-east-1
-      # region that only config/s3tests.toml carries, and render-config.sh emits
-      # exactly one account, so the image cannot serve this run without being
-      # handed a mounted profile.
-      - name: Start Cluster
-        run: ./scripts/start.sh -w s3tests
-
-      # Comparison, never strict. Predastore fails a large part of s3-tests and
-      # will for a long while, so the question this job answers is whether the
-      # branch moved anything, not whether the suite is green.
-      #
-      # Bounded below the job timeout on purpose: a job that hits its own
-      # timeout skips every later step, including the manifest upload, so the
-      # one artefact that would explain the failure is never produced.
-      - name: Conformance Suite
-        timeout-minutes: 20
-        run: make s3-tests
-
-      - name: Upload Manifest
-        if: always()
-        uses: actions/upload-artifact@v5
-        with:
-          name: s3-tests-manifest
-          path: /tmp/predastore-s3-tests/manifest.txt
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Cluster Logs
-        if: failure()
-        run: tail -n 200 /tmp/predastore/s3tests/logs/*.log
-
-      - name: Stop Cluster
-        if: always()
-        run: ./scripts/stop.sh s3tests
 
   # The scenario list is a job rather than a literal in the matrix so the
   # dispatch input can still name the two the default set leaves out.

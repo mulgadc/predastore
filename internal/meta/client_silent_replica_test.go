@@ -77,6 +77,12 @@ func startAnsweringReplica(t *testing.T, cfg *config.Config) {
 		Bootstrap: true,
 		Listeners: []transport.Listener{ln},
 		Resolver:  res,
+		// A single voter elects itself unopposed, so the production second is
+		// dead wait rather than contention this needs to exercise.
+		HeartbeatTimeout:   50 * time.Millisecond,
+		ElectionTimeout:    50 * time.Millisecond,
+		LeaderLeaseTimeout: 50 * time.Millisecond,
+		CommitTimeout:      5 * time.Millisecond,
 	})
 	require.NoError(t, err)
 

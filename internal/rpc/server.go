@@ -327,8 +327,9 @@ func (s *Server) acceptStreams(
 
 // requestDrainTimeout bounds the wait for a request's FIN once the handler has
 // answered. Every client half-closes before reading its response, so only a
-// peer that does not gets this far.
-const requestDrainTimeout = 5 * time.Second
+// peer that does not gets this far. Kept as a var so tests can lower it rather
+// than sleep out the production bound.
+var requestDrainTimeout = 5 * time.Second
 
 // finishRequest completes the receive side of a served stream. QUIC returns a
 // stream's credit to the peer only once the FIN is read or the read cancelled,

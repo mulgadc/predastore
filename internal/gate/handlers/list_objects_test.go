@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
@@ -39,15 +40,35 @@ func newListFixture(t *testing.T, keys ...string) listFixture {
 	return listFixture{mc: mc, handler: ListObjects(mc, cache)}
 }
 
-// list issues one ListObjectsV2 request and decodes the answer.
+// list issues one ListObjectsV2 request and decodes the answer. list-type=2 is
+// forced on: this helper's whole purpose is exercising the v2 shape, and every
+// existing caller predates the v1/v2 split, so leaving it implicit would silently
+// turn every one of them into a v1 request instead.
 func (f listFixture) list(t *testing.T, query url.Values) ListObjectsV2 {
 	t.Helper()
-	rr := f.do(t, query)
+	q := url.Values{}
+	maps.Copy(q, query)
+	q.Set("list-type", "2")
+	rr := f.do(t, q)
 	require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
 
 	var result ListObjectsV2
 	require.NoError(t, xml.NewDecoder(rr.Body).Decode(&result))
 	return result
+}
+
+// listV1 issues one v1 ListObjects request (no list-type, or any value other
+// than "2") and decodes the answer, returning the raw body alongside it so a
+// test can also check which fields the wire document does not carry.
+func (f listFixture) listV1(t *testing.T, query url.Values) (ListObjectsV1, string) {
+	t.Helper()
+	rr := f.do(t, query)
+	require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
+
+	body := rr.Body.String()
+	var result ListObjectsV1
+	require.NoError(t, xml.NewDecoder(strings.NewReader(body)).Decode(&result))
+	return result, body
 }
 
 func (f listFixture) do(t *testing.T, query url.Values) *httptest.ResponseRecorder {
@@ -108,6 +129,20 @@ func contentsOf(r ListObjectsV2) []ListObjectsV2_Contents {
 }
 
 func prefixesOf(r ListObjectsV2) []ListObjectsV2_Dir {
+	if r.CommonPrefixes == nil {
+		return nil
+	}
+	return *r.CommonPrefixes
+}
+
+func contentsOfV1(r ListObjectsV1) []ListObjectsV2_Contents {
+	if r.Contents == nil {
+		return nil
+	}
+	return *r.Contents
+}
+
+func prefixesOfV1(r ListObjectsV1) []ListObjectsV2_Dir {
 	if r.CommonPrefixes == nil {
 		return nil
 	}
@@ -231,7 +266,7 @@ func TestListObjectsRejectsUndecodableToken(t *testing.T) {
 	t.Parallel()
 
 	f := newListFixture(t, "a")
-	rr := f.do(t, url.Values{"continuation-token": {"not!base64"}})
+	rr := f.do(t, url.Values{"list-type": {"2"}, "continuation-token": {"not!base64"}})
 
 	assert.Equal(t, http.StatusBadRequest, rr.Code)
 }
@@ -286,6 +321,98 @@ func TestListObjectsPagingIsIndependentOfPageSize(t *testing.T) {
 		t.Run(strconv.Itoa(size), func(t *testing.T) {
 			t.Parallel()
 			assert.Equal(t, keys, f.walk(t, url.Values{}, size))
+		})
+	}
+}
+
+// A request with no list-type, the shape every v1 SDK sends, must position on
+// marker the same way start-after positions a v2 request: strictly after it.
+func TestListObjectsV1MarkerPositionsAfterKey(t *testing.T) {
+	t.Parallel()
+
+	f := newListFixture(t, "a", "b", "c", "d")
+	result, _ := f.listV1(t, url.Values{"marker": {"b"}})
+
+	require.Len(t, contentsOfV1(result), 2)
+	assert.Equal(t, "c", contentsOfV1(result)[0].Key)
+	assert.Equal(t, "d", contentsOfV1(result)[1].Key)
+	assert.Equal(t, "b", result.Marker, "S3 echoes the parameter back")
+}
+
+// NextMarker is only meaningful with a delimiter in play: without one the
+// client resumes from the last key in Contents, which is always present.
+func TestListObjectsV1TruncatedWithDelimiterCarriesNextMarker(t *testing.T) {
+	t.Parallel()
+
+	f := newListFixture(t, "a/1", "b/1", "c/1")
+	result, _ := f.listV1(t, url.Values{"delimiter": {"/"}, "max-keys": {"2"}})
+
+	require.Len(t, prefixesOfV1(result), 2)
+	assert.True(t, result.IsTruncated)
+	assert.Equal(t, "b/", result.NextMarker)
+}
+
+func TestListObjectsV1TruncatedWithoutDelimiterOmitsNextMarker(t *testing.T) {
+	t.Parallel()
+
+	f := newListFixture(t, listKeys(5)...)
+	result, _ := f.listV1(t, url.Values{"max-keys": {"2"}})
+
+	assert.True(t, result.IsTruncated)
+	assert.Empty(t, result.NextMarker)
+}
+
+// The two shapes must not bleed into each other: a v1 response carries no v2
+// cursor field, and asking for v2 explicitly must still produce one.
+func TestListObjectsV1OmitsV2FieldsAndV2IsUnchanged(t *testing.T) {
+	t.Parallel()
+
+	f := newListFixture(t, "a", "b")
+
+	_, v1Body := f.listV1(t, url.Values{})
+	for _, field := range []string{"<KeyCount>", "<ContinuationToken>", "<StartAfter>"} {
+		assert.NotContains(t, v1Body, field, "a v1 response must not carry v2-only fields")
+	}
+	assert.Contains(t, v1Body, "<Marker>")
+
+	rr := f.do(t, url.Values{"list-type": {"2"}})
+	require.Equal(t, http.StatusOK, rr.Code)
+	v2Body := rr.Body.String()
+	assert.Contains(t, v2Body, "<KeyCount>")
+	assert.NotContains(t, v2Body, "<Marker>")
+}
+
+// The tempting fix for the sub-resources below is a whitelist: reject any query
+// parameter the listing does not recognise. The AWS SDKs append x-id to an
+// ordinary listing, and this proves it still lists rather than answering 501.
+func TestListObjectsIgnoresUnknownQueryParameters(t *testing.T) {
+	t.Parallel()
+
+	f := newListFixture(t, "a", "b")
+	result := f.list(t, url.Values{"x-id": {"ListObjectsV2"}})
+
+	assert.Equal(t, 2, result.KeyCount)
+}
+
+// Each sub-resource predastore does not implement answers the code S3 uses for
+// it, matched by name rather than by excluding what the handler recognises.
+// The cases are the dispatch table itself, so this cannot drift from what the
+// handler actually matches on.
+func TestListObjectsSubResourceRejections(t *testing.T) {
+	t.Parallel()
+
+	f := newListFixture(t, "a")
+
+	for _, sr := range subResourceRejections {
+		t.Run(sr.param, func(t *testing.T) {
+			t.Parallel()
+			rr := f.do(t, url.Values{sr.param: {""}})
+
+			assert.Equal(t, sr.status, rr.Code, "body: %s", rr.Body.String())
+
+			var s3err S3Error
+			require.NoError(t, xml.NewDecoder(rr.Body).Decode(&s3err))
+			assert.Equal(t, sr.code, s3err.Code)
 		})
 	}
 }

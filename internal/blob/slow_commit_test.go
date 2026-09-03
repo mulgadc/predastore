@@ -312,7 +312,7 @@ func TestPutBodyStallTripsTheIdleGuard(t *testing.T) {
 		envelopeTimeout = 10 * time.Second
 		commitTimeout   = 45 * time.Second
 		idleTimeout     = 300 * time.Millisecond
-		readDelay       = 3 * time.Second
+		readDelay       = 1 * time.Second
 	)
 
 	client, _ := startSlowCommitNode(t, 0, readDelay, envelopeTimeout, commitTimeout, idleTimeout)
