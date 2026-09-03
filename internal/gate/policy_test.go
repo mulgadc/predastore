@@ -180,7 +180,10 @@ func TestConditionKeys_PopulatesEverySupportedKey(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/my-bucket?prefix=home/alice/", nil)
 	r.RemoteAddr = "10.4.1.9:52344"
 	r.TLS = &tls.ConnectionState{}
-	cred := &auth.CredentialResult{AccountID: "000000000001", UserName: "alice", PrincipalType: "user"}
+	cred := &auth.CredentialResult{
+		AccountID: "000000000001", UserName: "alice",
+		UserID: "AIDAALICE", PrincipalType: "user",
+	}
 
 	keys := conditionKeys(r, "s3:ListBucket", cred)
 
@@ -188,6 +191,7 @@ func TestConditionKeys_PopulatesEverySupportedKey(t *testing.T) {
 		iampolicy.KeySourceIP:         "10.4.1.9",
 		iampolicy.KeySecureTransport:  "true",
 		iampolicy.KeyUsername:         "alice",
+		iampolicy.KeyUserID:           "AIDAALICE",
 		iampolicy.KeyPrincipalAccount: "000000000001",
 		iampolicy.KeyS3Prefix:         "home/alice/",
 	}, keys)
@@ -202,6 +206,7 @@ func TestConditionKeys_OmitsUsernameForAssumedRole(t *testing.T) {
 	cred := &auth.CredentialResult{
 		AccountID:     "000000000001",
 		UserName:      "alice",
+		UserID:        "AROASHAREDOPS:alice",
 		PrincipalType: "assumed-role",
 	}
 
@@ -209,6 +214,10 @@ func TestConditionKeys_OmitsUsernameForAssumedRole(t *testing.T) {
 
 	assert.NotContains(t, keys, iampolicy.KeyUsername)
 	assert.Equal(t, "000000000001", keys[iampolicy.KeyPrincipalAccount])
+
+	// aws:userid is supplied for a session all the same: STS mints both halves
+	// of it from the resolved role, so it is not caller-chosen.
+	assert.Equal(t, "AROASHAREDOPS:alice", keys[iampolicy.KeyUserID])
 }
 
 // An empty value would compare as a real value that matches nothing, which on a
@@ -222,6 +231,7 @@ func TestConditionKeys_OmitsEmptyValues(t *testing.T) {
 	assert.NotContains(t, keys, iampolicy.KeySourceIP)
 	assert.NotContains(t, keys, iampolicy.KeyUsername)
 	assert.NotContains(t, keys, iampolicy.KeyPrincipalAccount)
+	assert.NotContains(t, keys, iampolicy.KeyUserID)
 }
 
 // s3:prefix exists only for a bucket listing; on any other action the key must

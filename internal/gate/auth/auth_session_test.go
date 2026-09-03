@@ -55,6 +55,8 @@ const (
 	testSessionRole       = "InstanceRole"
 	testSessionInstanceID = "i-0123456789abcdef0"
 	testSessionRoleARN    = "arn:aws:iam::" + testSessionAccount + ":role/" + testSessionRole
+	testSessionUserID     = "AIDAALICE"
+	testSessionRoleID     = "AROAINSTANCEROLE:" + testSessionInstanceID
 
 	allowAllS3Policy = `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}`
 	denyAllS3Policy  = `{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:*","Resource":"*"}]}`
@@ -129,6 +131,7 @@ func userSessionFixture(t *testing.T, k *masterkey.Key, secret string, expiresAt
 	users = map[string][]byte{
 		testSessionAccount + "." + testSessionUser: mustMarshal(t, iamUser{
 			UserName:         testSessionUser,
+			UserID:           testSessionUserID,
 			AccountID:        testSessionAccount,
 			AttachedPolicies: []string{"arn:aws:iam::" + testSessionAccount + ":policy/AdministratorAccess"},
 		}),
@@ -154,6 +157,7 @@ func assumedRoleSession(t *testing.T, k *masterkey.Key, secret, roleARN string, 
 		PrincipalType:     principalTypeAssumedRole,
 		SessionName:       testSessionInstanceID,
 		UnderlyingRoleARN: roleARN,
+		AssumedRoleID:     testSessionRoleID,
 		ExpiresAt:         expiresAt,
 	}
 	return map[string][]byte{testSessionAKID: mustMarshal(t, cred)}
@@ -194,6 +198,8 @@ func TestLookupSession_UserPrincipalResolves(t *testing.T) {
 	assert.Equal(t, testSessionUser, res.UserName)
 	assert.False(t, res.SkipPolicyCheck, "sessions never bypass policy/ownership checks")
 	assert.Len(t, res.PolicyDocuments, 1, "user-session policies must resolve via resolveUserPolicies")
+	assert.Equal(t, testSessionUserID, res.UserID,
+		"a user session's aws:userid is the user's own ID, read from the record the policies came from")
 }
 
 // TestLookupSession_AssumedRoleEmptyARN covers an assumed-role session whose
@@ -248,6 +254,8 @@ func TestLookupSession_AssumedRoleResolvesPolicies(t *testing.T) {
 	assert.True(t,
 		allowed("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments),
 		"the resolved role policy must authorize the allowed action")
+	assert.Equal(t, testSessionRoleID, res.UserID,
+		"a session's aws:userid is the ID STS minted, carried on the record rather than derived here")
 }
 
 // TestLookupSession_AssumedRoleNoAttachedPolicies: a role with zero attached
