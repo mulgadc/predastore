@@ -132,6 +132,19 @@ func HandleError(w http.ResponseWriter, r *http.Request, err error) {
 		s3error.Message = opErr.Message
 	} else {
 		switch {
+		// The SigV4 payload check rides on the read a handler makes of the request body, so
+		// this arrives here rather than from the middleware door. It is the client's error.
+		case errors.Is(err, sigv4.ErrContentSHA256Mismatch):
+			slog.WarnContext(r.Context(), "Request body does not match the signed payload hash",
+				"accessKeyID", auth.AccessKeyID(r.Context()),
+				"method", r.Method,
+				"path", r.URL.Path,
+				"payloadHashHeader", r.Header.Get("X-Amz-Content-Sha256"),
+				"remoteAddr", r.RemoteAddr,
+			)
+			statusCode = model.ErrContentSHA256MismatchError.StatusCode
+			s3error.Code = string(model.ErrContentSHA256MismatchError.Code)
+			s3error.Message = model.ErrContentSHA256MismatchError.Message
 		case strings.Contains(err.Error(), "NoSuchBucket") || strings.Contains(err.Error(), "Bucket not found"):
 			statusCode = http.StatusNotFound
 			s3error.Code = "NoSuchBucket"

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
@@ -53,6 +54,12 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handle
 
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, deleteObjectsBodyLimit))
 		if err != nil {
+			// A rewritten body keeps its own error rather than being reported as bad XML.
+			if errors.Is(err, sigv4.ErrContentSHA256Mismatch) {
+				HandleError(w, r, err)
+				return
+			}
+
 			HandleError(w, r, model.NewS3Error(model.ErrMalformedXML,
 				"The delete request could not be read", 400))
 			return
