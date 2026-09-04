@@ -659,9 +659,6 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 				if err := txn.Set(retainedKey(idxKey, epoch), encodePreparedValue(ext, epoch, time.Now().UnixNano())); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
 				}
-				if err := pruneRetained(txn, idxKey, retainedGenerations); err != nil {
-					return err
-				}
 				return txn.Delete(prepKey)
 
 			// Demoted, not destroyed: a record naming this generation is still
@@ -670,9 +667,6 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 			case liveErr == nil:
 				if err := txn.Set(retainedKey(idxKey, liveEpoch), encodePreparedValue(old, liveEpoch, time.Now().UnixNano())); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
-				}
-				if err := pruneRetained(txn, idxKey, retainedGenerations); err != nil {
-					return err
 				}
 			}
 
@@ -796,50 +790,6 @@ func dropRowsUnder(txn *badger.Txn, prefix []byte) error {
 	// Deleting inside the iteration would invalidate it.
 	for _, k := range keys {
 		if err := txn.Delete(k); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// pruneRetained drops the oldest retained generations of one shard position
-// until at most keep remain, tombstoning what it removes. Epochs sort
-// big-endian, so the iteration is already oldest-first and the tail to keep is
-// the last keep rows.
-func pruneRetained(txn *badger.Txn, idxKey []byte, keep int) error {
-	prefix := retainedScan(idxKey)
-
-	opts := badger.DefaultIteratorOptions
-	opts.Prefix = prefix
-	it := txn.NewIterator(opts)
-
-	var rows [][]byte
-	var exts []extent
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		item := it.Item()
-		if len(item.Key()) != retainedKeySize {
-			continue
-		}
-		raw, err := item.ValueCopy(nil)
-		if err != nil {
-			it.Close()
-			return fmt.Errorf("copy retained row: %w", err)
-		}
-		ext, _, err := decodeIndexValue(raw)
-		if err != nil {
-			it.Close()
-			return fmt.Errorf("decode retained row: %w", err)
-		}
-		rows = append(rows, item.KeyCopy(nil))
-		exts = append(exts, ext)
-	}
-	it.Close()
-
-	for i := 0; i < len(rows)-keep; i++ {
-		if err := txn.Set(tombstoneKey(exts[i].SegNum, exts[i].Off), tombstoneValue(exts[i].PSize)); err != nil {
-			return fmt.Errorf("tombstone pruned generation: %w", err)
-		}
-		if err := txn.Delete(rows[i]); err != nil {
 			return err
 		}
 	}

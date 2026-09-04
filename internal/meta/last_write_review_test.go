@@ -9,9 +9,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Review-only evidence that placement publication is an unconditional Put:
-// a delayed earlier writer can replace a newer epoch after it has committed.
-func TestReviewDelayedPlacementPutWins(t *testing.T) {
+// Placement publication is an unconditional Put, and a lower epoch arriving
+// second is meant to win. A PUT is not acknowledged until its record reaches
+// the log, so arrival order is acknowledgement order, and the write that
+// finished last is the one S3 hands the key to. Ordering by the epoch instead
+// picks whichever write *started* last, which is a different write whenever
+// two PUTs overlap.
+func TestPlacementPublicationIsLastWriteWins(t *testing.T) {
 	cli := startStatusReplica(t, true)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -25,8 +29,9 @@ func TestReviewDelayedPlacementPutWins(t *testing.T) {
 
 	got, err := cli.Get(ctx, "objects/same-object")
 	require.NoError(t, err)
-	assert.Equal(t, placementRecord(2), got)
-	t.Logf("final placement after epoch-2 then delayed epoch-1: %q", got)
+	assert.Equal(t, placementRecord(1), got,
+		"the record that arrived second must win: its writer is the one still "+
+			"waiting to be acknowledged, so it is the write that finished last")
 }
 
 func placementRecord(epoch byte) []byte {

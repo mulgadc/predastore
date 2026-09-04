@@ -126,23 +126,22 @@ func TestEveryCommittedGenerationStaysReadable(t *testing.T) {
 	}
 }
 
-// Retention is bounded by count as well as age, or a hot key would pin a
-// generation per overwrite for the whole window. The newest survive; the live
-// row is never a candidate.
+// No count bounds retention, however many writers race one position. This is
+// the regression guard for acknowledged objects going unreadable: the cap that
+// used to be here ranked generations by epoch, which is write *start* order,
+// while the record that survives is whichever write finished last. Any writer
+// the cap evicted could be the one the metadata went on to name.
 //
-// The cap is asserted after a sweep because the sweep is what enforces it.
-// Commit prunes too, but each writer's transaction sees its own snapshot, so
-// concurrent commits of one position can leave more than the cap between them.
-func TestRetentionKeepsOnlyTheNewestGenerations(t *testing.T) {
+// Every epoch here is fresh, so a generation missing after the sweep was
+// dropped by a count and by nothing else.
+func TestRetentionKeepsEveryFreshGeneration(t *testing.T) {
 	st, _ := openTestStore(t)
 	oh := [32]byte{0x43}
-	const writers = retainedGenerations + 3
+	const writers = 12
 
 	epochs, _, _ := raceWriters(t, st, oh, writers)
 
-	// Nothing is old enough to age out, so anything dropped here is dropped by
-	// the count bound alone.
-	if _, err := st.sweepRetained(retainedMaxAge, retainedGenerations); err != nil {
+	if _, err := st.sweepRetained(retainedMaxAge); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 
@@ -150,21 +149,20 @@ func TestRetentionKeepsOnlyTheNewestGenerations(t *testing.T) {
 	if err := countRetained(st, MakeKey(oh, 0), func() { kept++ }); err != nil {
 		t.Fatalf("scan retained: %v", err)
 	}
-	if kept != retainedGenerations {
-		t.Fatalf("retained %d generations, want the cap of %d", kept, retainedGenerations)
+	if kept != writers-1 {
+		t.Fatalf("retained %d generations of %d superseded, want all of them", kept, writers-1)
 	}
 
-	// The oldest is gone and the newest superseded one is not.
-	if r, err := st.LookupAt(oh, 0, epochs[0]); err == nil {
-		_ = r.Close()
-		t.Fatalf("the oldest generation outlived the cap")
-	}
-	r, err := st.LookupAt(oh, 0, epochs[writers-2])
-	if err != nil {
-		t.Fatalf("the newest superseded generation was pruned: %v", err)
-	}
-	if err := r.Close(); err != nil {
-		t.Fatalf("close: %v", err)
+	// Including the lowest epoch, which is the one a count bound drops first
+	// and is as likely as any other to be the generation the record names.
+	for i, epoch := range epochs[:writers-1] {
+		r, err := st.LookupAt(oh, 0, epoch)
+		if err != nil {
+			t.Fatalf("generation %d of %d was reclaimed while fresh: %v", i, writers, err)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
 	}
 }
 
@@ -177,7 +175,7 @@ func TestTheSweepReleasesRetainedGenerations(t *testing.T) {
 
 	epochs, _, _ := raceWriters(t, st, oh, writers)
 
-	released, err := st.sweepRetained(-1, retainedGenerations)
+	released, err := st.sweepRetained(-1)
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}

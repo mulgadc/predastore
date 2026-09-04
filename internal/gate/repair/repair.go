@@ -105,13 +105,20 @@ const (
 // Stats is what a pass did. Scanned counts placement records read, owned the
 // positions belonging to this service's nodes, and repaired those actually
 // rebuilt. Pending is what the last completed pass left owing.
+//
+// Superseded counts rebuilds the node refused to publish because it had moved
+// past the generation the record names. Those are separated from Repaired
+// because they are work that changed nothing: the next pass finds the same
+// mismatch and rebuilds it again, so counting them as repairs reports a sweep
+// as productive while it loops.
 type Stats struct {
-	Passes   int64
-	Scanned  int64
-	Owned    int64
-	Repaired int64
-	Failed   int64
-	Pending  int64
+	Passes     int64
+	Scanned    int64
+	Owned      int64
+	Repaired   int64
+	Superseded int64
+	Failed     int64
+	Pending    int64
 }
 
 // Service sweeps for shards its nodes owe and rebuilds them.
@@ -122,7 +129,7 @@ type Service struct {
 	pageSize int
 	interval time.Duration
 
-	passes, scanned, owned, repaired, failed, pending atomic.Int64
+	passes, scanned, owned, repaired, superseded, failed, pending atomic.Int64
 }
 
 // New validates cfg and applies its defaults. It starts nothing.
@@ -163,12 +170,13 @@ func cmpOr(v, fallback int) int {
 // Stats reports the running counters.
 func (s *Service) Stats() Stats {
 	return Stats{
-		Passes:   s.passes.Load(),
-		Scanned:  s.scanned.Load(),
-		Owned:    s.owned.Load(),
-		Repaired: s.repaired.Load(),
-		Failed:   s.failed.Load(),
-		Pending:  s.pending.Load(),
+		Passes:     s.passes.Load(),
+		Scanned:    s.scanned.Load(),
+		Owned:      s.owned.Load(),
+		Repaired:   s.repaired.Load(),
+		Superseded: s.superseded.Load(),
+		Failed:     s.failed.Load(),
+		Pending:    s.pending.Load(),
 	}
 }
 
@@ -208,16 +216,25 @@ func (s *Service) Pass(ctx context.Context) error {
 	for range s.workers {
 		wg.Go(func() {
 			for t := range work {
-				if err := s.repairShard(ctx, t); err != nil {
+				err := s.repairShard(ctx, t)
+				switch {
+				case errors.Is(err, errSuperseded):
+					// Not a failure and not a repair. The record and the node
+					// disagree about the current write, which rebuilding cannot
+					// settle, so this stays owed rather than reading as done.
+					s.superseded.Add(1)
+					slog.InfoContext(ctx, "Rebuilt shard refused: the node is past the record's generation",
+						"node", t.node, "index", t.index,
+						"epoch", fmt.Sprintf("%016x", t.place.WriteEpoch))
+				case err != nil:
 					s.failed.Add(1)
 					slog.WarnContext(ctx, "Shard repair failed",
 						"node", t.node, "index", t.index,
 						"epoch", fmt.Sprintf("%016x", t.place.WriteEpoch), "err", err)
-
-					continue
+				default:
+					owed.Add(-1)
+					s.repaired.Add(1)
 				}
-				owed.Add(-1)
-				s.repaired.Add(1)
 			}
 		})
 	}

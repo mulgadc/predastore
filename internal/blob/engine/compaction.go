@@ -117,7 +117,7 @@ func (store *Store) compactOnce() error {
 
 	// Likewise for superseded generations: a commit demotes rather than
 	// tombstones, so this is where that space comes back.
-	released, err := store.sweepRetained(retainedMaxAge, retainedGenerations)
+	released, err := store.sweepRetained(retainedMaxAge)
 	if err != nil {
 		return fmt.Errorf("sweep retained generations: %w", err)
 	}
@@ -269,24 +269,17 @@ func (store *Store) sweepPrepared(maxAge time.Duration) (int, error) {
 // which is not this change.
 const retainedMaxAge = 5 * time.Minute
 
-// retainedGenerations caps how many superseded generations one shard position
-// keeps, oldest dropped first. Age alone would let a hot key pin a generation
-// per overwrite for the whole window, which is unbounded space for a bounded
-// purpose: only a record still in flight can name one, and the number of those
-// is the number of writers racing the key.
-const retainedGenerations = 4
-
 // sweepRetained reclaims generations that a commit superseded and nothing has
 // asked for since. It is the only thing that decides a generation is dead —
 // commit demotes, and never destroys.
 //
-// It enforces both bounds, and the count bound is enforced here rather than
-// only at commit because commit cannot enforce it. Each writer's transaction
-// prunes against its own snapshot, so concurrent commits of one position each
-// see a different subset and can leave more than the cap between them. This
-// runs on the compactor, single file, against everything that is actually
-// there.
-func (store *Store) sweepRetained(maxAge time.Duration, keep int) (int, error) {
+// Age is the only bound, because age is the only thing that bounds who can
+// still name a generation. A count bound ranked them by epoch, which is write
+// *start* order, while the record that survives is the one whose write
+// finished last. Those are different writes whenever PUTs overlap, so the cap
+// evicted generations the metadata still pointed at, and the object read back
+// as a 500 having acknowledged every writer.
+func (store *Store) sweepRetained(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge).UnixNano()
 
 	type row struct {
@@ -300,8 +293,8 @@ func (store *Store) sweepRetained(maxAge time.Duration, keep int) (int, error) {
 	// Rows sort by position and then by big-endian epoch, so one position's
 	// generations arrive contiguously and oldest first.
 	flush := func() {
-		for i, r := range group {
-			if r.at < cutoff || i < len(group)-keep {
+		for _, r := range group {
+			if r.at < cutoff {
 				stale = append(stale, r.key)
 			}
 		}

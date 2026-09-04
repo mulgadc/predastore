@@ -298,7 +298,7 @@ func TestOverwriteRetainsThenReclaimsSupersededExtent(t *testing.T) {
 		t.Fatalf("commit tombstoned superseded slot %v while it is still retained", slotOf(old))
 	}
 
-	released, err := st.sweepRetained(-time.Second, 0)
+	released, err := st.sweepRetained(-time.Second)
 	if err != nil {
 		t.Fatalf("sweep retained: %v", err)
 	}
@@ -363,7 +363,7 @@ func TestTombstoneLandsAtCommitNotAppend(t *testing.T) {
 	if _, ok := tombstones(t, st)[slotOf(old)]; ok {
 		t.Fatalf("commit tombstoned superseded slot %v instead of retaining it", slotOf(old))
 	}
-	if _, err := st.sweepRetained(-time.Second, 0); err != nil {
+	if _, err := st.sweepRetained(-time.Second); err != nil {
 		t.Fatalf("sweep retained: %v", err)
 	}
 	if _, ok := tombstones(t, st)[slotOf(old)]; !ok {
@@ -386,7 +386,7 @@ func TestOverwriteChurnDrainsSegment(t *testing.T) {
 	// Overwriting retains the previous generation, so the space is not dead
 	// until it is released. Draining is a property of the reclaim path, not of
 	// how long the store holds a generation answerable.
-	if _, err := st.sweepRetained(-time.Second, 0); err != nil {
+	if _, err := st.sweepRetained(-time.Second); err != nil {
 		t.Fatalf("sweep retained: %v", err)
 	}
 

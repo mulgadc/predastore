@@ -119,30 +119,16 @@ func (f *FSM) Apply(log *raft.Log) any {
 	}
 }
 
-// applyPutMax publishes a placement only when it is not older than the
-// placement currently stored. The comparison happens inside the Raft FSM, so
-// concurrent gate requests cannot race a read-then-write check.
-func (f *FSM) applyPutMax(key string, value []byte, epoch uint64) error {
-	return f.db.Update(func(txn *badger.Txn) error {
-		if item, err := txn.Get([]byte(key)); err == nil {
-			current, err := item.ValueCopy(nil)
-			if err != nil {
-				return err
-			}
-			// Placement records store the epoch at byte offset 11. Only this
-			// operation is used for placement keys, so malformed/legacy values
-			// are replaced normally.
-			if len(current) >= 19 && current[0] == 0 && current[1] == 2 {
-				currentEpoch := binary.BigEndian.Uint64(current[11:19])
-				if currentEpoch > epoch {
-					return nil
-				}
-			}
-		} else if !errors.Is(err, badger.ErrKeyNotFound) {
-			return err
-		}
-		return txn.Set([]byte(key), value)
-	})
+// applyPutMax stores a placement record, and the epoch it carries orders
+// nothing. It exists so log entries written when this command did compare
+// epochs still replay, and new writers should use CommandPut.
+//
+// A client's PUT is not acknowledged until its record reaches the log, so
+// arrival order is acknowledgement order, and last-to-arrive is the write S3
+// calls the winner. Comparing epochs here picked the write that *started*
+// last instead, which is a different write whenever two PUTs overlap.
+func (f *FSM) applyPutMax(key string, value []byte, _ uint64) error {
+	return f.applyPut(key, value)
 }
 
 // applyPut stores a key-value pair.
