@@ -334,3 +334,44 @@ func TestSampleLoopStopsWithContext(t *testing.T) {
 		t.Fatal("sampleLoop did not stop after its context was cancelled")
 	}
 }
+
+// TestAdvisoryCheckIsReportedWithoutGatingReadiness is what advisory exists
+// for: a cluster tolerates losing one peer, so naming the peer that is gone
+// must not report the whole process unready and take it out of service.
+func TestAdvisoryCheckIsReportedWithoutGatingReadiness(t *testing.T) {
+	down := Check{
+		Name:     "blob_node_5",
+		Advisory: true,
+		Probe:    func(context.Context) error { return errors.New("did not answer") },
+	}
+	h := sampled([]Check{ok("meta_leader"), down}).Handler()
+
+	status, body := probe(t, h, "/readyz")
+
+	if status != http.StatusOK {
+		t.Errorf("readyz status = %d, want %d: an advisory failure is not unreadiness", status, http.StatusOK)
+	}
+	if body["status"] != "ready" {
+		t.Errorf("readyz status field = %v, want ready", body["status"])
+	}
+	checks, _ := body["checks"].(map[string]any)
+	if checks["blob_node_5"] != "failed" {
+		t.Errorf("checks[blob_node_5] = %v, want failed: the unreachable peer must be named", checks["blob_node_5"])
+	}
+}
+
+// A non-advisory failure alongside an advisory one still reports unready, so
+// advisory cannot be a way for a real failure to go unnoticed.
+func TestAdvisoryDoesNotMaskARealFailure(t *testing.T) {
+	advisory := Check{Name: "blob_node_5", Advisory: true, Probe: func(context.Context) error { return nil }}
+	h := sampled([]Check{advisory, failing("meta_leader", errors.New("no leader"))}).Handler()
+
+	status, body := probe(t, h, "/readyz")
+
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("readyz status = %d, want %d", status, http.StatusServiceUnavailable)
+	}
+	if body["status"] != "unready" {
+		t.Errorf("readyz status field = %v, want unready", body["status"])
+	}
+}

@@ -39,6 +39,10 @@ const shutdownGrace = 2 * time.Second
 type Check struct {
 	Name  string
 	Probe func(context.Context) error
+	// Advisory reports its result without gating readiness. It is for a
+	// condition an operator needs named -- which peer is unreachable -- on a
+	// process that is still able to serve without it.
+	Advisory bool
 }
 
 // probeSnapshot is the immutable outcome of one probe cycle: whether the
@@ -116,9 +120,11 @@ func (s *Server) runCycle(ctx context.Context) {
 		if err := check.Probe(ctx); err != nil {
 			// The reason stays in the log. A probe response is unauthenticated
 			// and an error carries addresses, keys and object names.
-			slog.WarnContext(ctx, "readiness check failed", "check", check.Name, "error", err)
+			slog.WarnContext(ctx, "readiness check failed", "check", check.Name, "advisory", check.Advisory, "error", err)
 			results[check.Name] = "failed"
-			ready = false
+			if !check.Advisory {
+				ready = false
+			}
 			continue
 		}
 		results[check.Name] = "ok"

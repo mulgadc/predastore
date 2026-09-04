@@ -237,9 +237,12 @@ func TestServerAdoptsConnectionsDialedBeforeStart(t *testing.T) {
 	}
 }
 
-// TestEmptySlotFollowsTiebreak covers the slot the tiebreak used to skip: an
-// empty one adopted whatever arrived, in either direction.
-func TestEmptySlotFollowsTiebreak(t *testing.T) {
+// TestEmptySlotTakesADonationAndOurDialDisplacesIt is the recovery hole the
+// tiebreak used to leave. An evicted slot is empty, and a node that refused the
+// peer's connection there had no way to send until its own dial worked -- which
+// is exactly the state it is in when it is evicting. Taking the donation and
+// letting our dial displace it converges on the same connection either way.
+func TestEmptySlotTakesADonationAndOurDialDisplacesIt(t *testing.T) {
 	const low, high = config.NodeID(1), config.NodeID(2)
 	trLow := transport.NewPipeTransport(t.Name(), int(low))
 	trHigh := transport.NewPipeTransport(t.Name(), int(high))
@@ -268,16 +271,28 @@ func TestEmptySlotFollowsTiebreak(t *testing.T) {
 	poolHigh := NewConnPool(high, testResolver(trHigh, map[config.NodeID]*transport.PipeTransport{low: trLow}))
 	t.Cleanup(func() { _ = poolLow.Close(); _ = poolHigh.Close() })
 
-	// The lower id prefers to dial, so it must not adopt what the higher id
-	// dialed even with nothing in the slot.
+	// The lower id prefers to dial, but an empty slot is worse than the wrong
+	// connection in it: it takes what the higher id opened rather than holding
+	// nothing.
 	if _, err := trHigh.Dial(ctx, trLow.Addr()); err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	if poolLow.Donate(<-accepted) {
-		t.Fatal("node 1 adopted a connection it prefers to dial itself")
+	donated := <-accepted
+	if !poolLow.Donate(donated) {
+		t.Fatal("node 1 refused a connection while holding none")
 	}
-	if c, _ := poolLow.held(high); c != nil {
-		t.Fatal("node 1 pooled a connection it prefers to dial itself")
+	if c, _ := poolLow.held(high); c != donated {
+		t.Fatal("node 1 did not pool the connection it accepted")
+	}
+
+	// Its own dial still wins the slot, so both ends converge on the same
+	// connection however the race ran.
+	own, err := poolLow.Dial(ctx, high)
+	if err != nil {
+		t.Fatalf("dial node %d: %v", high, err)
+	}
+	if c, _ := poolLow.held(high); c != own {
+		t.Fatal("node 1 kept the donated connection over the one it dialed")
 	}
 
 	// Its own dial is kept whichever way the tiebreak points: refusing that
@@ -442,5 +457,72 @@ func TestAbandonedStreamsDoNotEvictConnection(t *testing.T) {
 	// And the connection is still the one being used, not merely still listed.
 	if got, err := ping(ctx, caller, peer.id); err != nil || got != "pong:hello" {
 		t.Fatalf("ping over the retained connection returned %q, %v", got, err)
+	}
+}
+
+// TestEvictedSlotRecoversFromThePeersConnection is the wedge this exists for.
+// Eviction empties the slot, and the node doing the evicting is by definition
+// one whose own dials are not working. Refusing the peer's live connection
+// there left it with nothing to send over until its dial recovered, which is
+// how a gate went on evicting the same peer every thirty seconds indefinitely.
+func TestEvictedSlotRecoversFromThePeersConnection(t *testing.T) {
+	const low, high = config.NodeID(1), config.NodeID(2)
+	trLow := transport.NewPipeTransport(t.Name(), int(low))
+	trHigh := transport.NewPipeTransport(t.Name(), int(high))
+	t.Cleanup(func() { _ = trLow.Close(); _ = trHigh.Close() })
+
+	lnLow, err := trLow.Listen()
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	accepted := make(chan transport.Conn, 4)
+	go func() {
+		for {
+			c, aerr := lnLow.Accept(ctx)
+			if aerr != nil {
+				return
+			}
+			accepted <- c
+		}
+	}()
+
+	poolLow := NewConnPool(low, testResolver(trLow, map[config.NodeID]*transport.PipeTransport{high: trHigh}))
+	t.Cleanup(func() { _ = poolLow.Close() })
+
+	// Stall the connection out of the pool, exactly as an unresponsive peer
+	// does, leaving the slot empty.
+	if _, err := trHigh.Dial(ctx, trLow.Addr()); err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	first := <-accepted
+	if !poolLow.Donate(first) {
+		t.Fatalf("node %d refused the first connection", low)
+	}
+	for range maxStreamStalls {
+		poolLow.noteStall(first)
+	}
+	if c, _ := poolLow.held(high); c != nil {
+		t.Fatalf("node %d still holds a connection after %d stalls", low, maxStreamStalls)
+	}
+
+	// The peer reconnects. That connection has to be usable: the node whose
+	// slot just emptied is the one that cannot dial.
+	if _, err := trHigh.Dial(ctx, trLow.Addr()); err != nil {
+		t.Fatalf("re-dial: %v", err)
+	}
+	second := <-accepted
+	if !poolLow.Donate(second) {
+		t.Fatalf("node %d refused the peer's connection into the slot it had just evicted", low)
+	}
+	c, err := poolLow.Dial(ctx, high)
+	if err != nil {
+		t.Fatalf("Dial after recovery: %v", err)
+	}
+	if c != second {
+		t.Fatal("Dial did not return the connection the peer re-established")
 	}
 }

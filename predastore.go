@@ -138,6 +138,15 @@ const probeKey = "predastore/readyz-probe"
 
 var probeShardKey [32]byte
 
+// writeShardFloor is how many shards a write has to place before it is
+// acknowledged, which is every shard unless degraded writes are on.
+func writeShardFloor(cfg *Config) int {
+	if cfg.RS.DegradedWritesEnabled() {
+		return cfg.RS.Data
+	}
+	return cfg.RS.Data + cfg.RS.Parity
+}
+
 // probeReader is the meta read a readiness probe needs, and shardProber the
 // blob one. Both are narrowed to what the check calls so a probe can be tested
 // without a cluster behind it.
@@ -181,9 +190,14 @@ func metaReachable(mc probeReader) admin.Check {
 	}
 }
 
-// blobNodesReachable fails when fewer than the data-shard count answer. Losing
-// parity nodes degrades reads; losing more than parity ends them, so the
-// threshold is the number of shards a read cannot be reconstructed without.
+// blobNodesReachable fails when fewer blob nodes answer than a write needs
+// shards durable.
+//
+// The write floor, not the read one. Reads reconstruct from DataShards and so
+// survive losing parity, which is why a gate that cannot write at all still
+// answers every read it is asked for. Gating readiness on the read floor made
+// that gate report ready, and the only cluster-wide symptom of a store that
+// had stopped accepting writes was in its log.
 func blobNodesReachable(bc shardProber, nodes []NodeID, need int) admin.Check {
 	return admin.Check{
 		Name: "blob_nodes",
@@ -201,6 +215,22 @@ func blobNodesReachable(bc shardProber, nodes []NodeID, need int) admin.Check {
 
 			if got := int(reached.Load()); got < need {
 				return fmt.Errorf("%d of %d blob nodes answered, need %d", got, len(nodes), need)
+			}
+			return nil
+		},
+	}
+}
+
+// blobNodeReachable names one blob node in the probe response. Advisory: the
+// cluster tolerates losing a node, so one being gone is not unreadiness, but
+// which one it is has to be answerable without reading a gate's log.
+func blobNodeReachable(bc shardProber, id NodeID) admin.Check {
+	return admin.Check{
+		Name:     fmt.Sprintf("blob_node_%d", id),
+		Advisory: true,
+		Probe: func(ctx context.Context) error {
+			if !blobAnswers(ctx, bc, id) {
+				return fmt.Errorf("blob node %d did not answer", id)
 			}
 			return nil
 		},
@@ -326,9 +356,12 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		}
 		// The gate is the one role holding a client for each plane, so it is
 		// where reaching them can be asked about at all.
-		checks = append(checks,
-			metaReachable(metaClient),
-			blobNodesReachable(blobClient, nodeIDs(nodesByRole(cfg, RoleBlob)), cfg.RS.Data))
+		blobIDs := nodeIDs(nodesByRole(cfg, RoleBlob))
+		checks = append(checks, metaReachable(metaClient),
+			blobNodesReachable(blobClient, blobIDs, writeShardFloor(cfg)))
+		for _, id := range blobIDs {
+			checks = append(checks, blobNodeReachable(blobClient, id))
+		}
 
 	case RoleBlob:
 		// The node owns its store: it creates the directory, opens the engine
