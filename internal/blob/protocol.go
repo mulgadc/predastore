@@ -19,6 +19,11 @@ const (
 	// Repair asks this of every position it owns, so answering it with a get
 	// would move the whole store across the network to learn one number.
 	OpStat rpc.Opcode = 0x2006
+
+	// OpRelease drops one superseded generation of a shard. It names an epoch
+	// and only ever removes a retained row, so it cannot take the generation a
+	// node is currently serving.
+	OpRelease rpc.Opcode = 0x2007
 )
 
 // Response error codes with protocol meaning; anything else in Err is an

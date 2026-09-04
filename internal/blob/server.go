@@ -31,6 +31,7 @@ type Store interface {
 	Commit(key [32]byte, index uint32, epoch uint64) (published bool, err error)
 	Abort(key [32]byte, index uint32, epoch uint64) error
 	Delete(key [32]byte, index uint32) (bool, error)
+	ReleaseGeneration(key [32]byte, index uint32, epoch uint64) error
 	NearFull() bool
 	Close() error
 }
@@ -138,6 +139,7 @@ func (s *Server) Run(ctx context.Context) error {
 	rpc.RegisterHandler(mux, OpGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpPut, s.handlePut)
 	rpc.RegisterHandler(mux, OpDelete, s.handleDelete)
+	rpc.RegisterHandler(mux, OpRelease, s.handleRelease)
 	rpc.RegisterHandler(mux, OpCommit, s.handleCommit)
 	rpc.RegisterHandler(mux, OpAbort, s.handleAbort)
 	rpc.RegisterHandler(mux, OpStat, s.handleStat)
@@ -416,6 +418,17 @@ func (s *Server) resolveEpoch(h Request, stale engine.Reader) (engine.Reader, er
 	slog.Info("completed a shard commit abandoned by its writer",
 		"node", s.cfg.NodeID, "index", h.Index, "epoch", fmt.Sprintf("%016x", h.Epoch))
 	return reader, nil
+}
+
+// handleRelease drops a superseded generation a writer has finished with. It
+// is best-effort housekeeping, so a miss is success: the generation being gone
+// already is the outcome the caller wanted.
+func (s *Server) handleRelease(ctx context.Context, h Request, stream transport.Stream) error {
+	if err := s.store.ReleaseGeneration(h.Key, h.Index, h.Epoch); err != nil {
+		return respond(stream, &Response{Err: err.Error()})
+	}
+
+	return respond(stream, &Response{})
 }
 
 func (s *Server) handleDelete(ctx context.Context, h Request, stream transport.Stream) error {

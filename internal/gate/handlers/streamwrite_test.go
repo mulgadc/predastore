@@ -101,6 +101,8 @@ func (d *discardBlob) Commit(context.Context, config.NodeID, blob.CommitRequest)
 }
 func (d *discardBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error { return nil }
 
+func (d *discardBlob) Release(context.Context, config.NodeID, blob.ReleaseRequest) error { return nil }
+
 func (d *discardBlob) Get(context.Context, config.NodeID, blob.GetRequest) (io.ReadCloser, error) {
 	return nil, blob.ErrNotFound
 }

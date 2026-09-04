@@ -56,6 +56,20 @@ func (s *Server) handlePutMax(ctx context.Context, h MetaRequest, stream transpo
 	return respond(stream, s.writeResult(s.putMax(string(h.Key), value, h.Epoch)))
 }
 
+func (s *Server) handleSwap(ctx context.Context, h MetaRequest, stream transport.Stream) error {
+	value, err := io.ReadAll(stream)
+	if err != nil {
+		return fmt.Errorf("read swap value: %w", err)
+	}
+	previous, err := s.swap(string(h.Key), value)
+	resp := s.writeResult(err)
+	if err == nil {
+		resp.Value = previous
+	}
+
+	return respond(stream, resp)
+}
+
 func (s *Server) handleDelete(ctx context.Context, h MetaRequest, stream transport.Stream) error {
 	return respond(stream, s.writeResult(s.delete(string(h.Key))))
 }

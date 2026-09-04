@@ -109,9 +109,10 @@ func (s *slowCommitStore) Abort(_ [32]byte, index uint32, epoch uint64) error {
 	return nil
 }
 
-func (s *slowCommitStore) Delete(_ [32]byte, _ uint32) (bool, error) { return false, nil }
-func (s *slowCommitStore) NearFull() bool                            { return false }
-func (s *slowCommitStore) Close() error                              { return nil }
+func (s *slowCommitStore) ReleaseGeneration(_ [32]byte, _ uint32, _ uint64) error { return nil }
+func (s *slowCommitStore) Delete(_ [32]byte, _ uint32) (bool, error)              { return false, nil }
+func (s *slowCommitStore) NearFull() bool                                         { return false }
+func (s *slowCommitStore) Close() error                                           { return nil }
 
 // Prepared is what reached the platter, whatever the caller was told.
 func (s *slowCommitStore) Prepared(index uint32) (preparedValue, bool) {

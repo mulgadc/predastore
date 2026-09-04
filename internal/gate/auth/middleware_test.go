@@ -44,7 +44,7 @@ type noMeta struct{}
 
 func (noMeta) Get(context.Context, string) ([]byte, error)          { return nil, errNoCluster }
 func (noMeta) Put(context.Context, string, []byte) error            { return errNoCluster }
-func (noMeta) PutMax(context.Context, string, []byte, uint64) error { return errNoCluster }
+func (noMeta) Swap(context.Context, string, []byte) ([]byte, error) { return nil, errNoCluster }
 func (noMeta) Delete(context.Context, string) error                 { return errNoCluster }
 func (noMeta) ScanFrom(context.Context, string, string, int) ([]meta.Item, error) {
 	return nil, errNoCluster
@@ -75,6 +75,9 @@ func (noBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) (bool, 
 	return false, errNoCluster
 }
 func (noBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error { return errNoCluster }
+func (noBlob) Release(context.Context, config.NodeID, blob.ReleaseRequest) error {
+	return errNoCluster
+}
 
 // sessionGate builds a gate whose only bucket is config-defined and owned
 // by the session's account, so authorization is the only thing under test.

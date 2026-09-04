@@ -59,6 +59,10 @@ func (c *hedgeBlobClient) Put(context.Context, config.NodeID, blob.PutRequest, i
 func (c *hedgeBlobClient) Commit(context.Context, config.NodeID, blob.CommitRequest) (bool, error) {
 	return false, errors.New("not implemented")
 }
+func (c *hedgeBlobClient) Release(context.Context, config.NodeID, blob.ReleaseRequest) error {
+	return nil
+}
+
 func (c *hedgeBlobClient) Abort(context.Context, config.NodeID, blob.CommitRequest) error {
 	return errors.New("not implemented")
 }

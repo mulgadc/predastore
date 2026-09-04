@@ -195,12 +195,19 @@ func (s *Service) publish(ctx context.Context, t task) error {
 		return fmt.Errorf("commit rebuilt shard: %w", err)
 	}
 	if superseded {
-		slog.DebugContext(ctx, "A live write overtook a rebuilt shard",
-			"node", t.node, "index", t.index)
+		return fmt.Errorf("%w: node=%d index=%d built_for=%016x",
+			errSuperseded, t.node, t.index, t.place.WriteEpoch)
 	}
 
 	return nil
 }
+
+// errSuperseded reports that a rebuilt shard was refused because its node has
+// moved past the generation the record names. Nothing was repaired, and unlike
+// a transient failure the next pass will rebuild the same shard to the same
+// refusal: the node and the record disagree about which write is current, and
+// no amount of rebuilding settles that.
+var errSuperseded = errors.New("the node has moved past the generation the record names")
 
 // discard releases a rebuilt shard that must not be published.
 func (s *Service) discard(ctx context.Context, t task) error {

@@ -128,13 +128,15 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
-		if err := metaPut(ctx, mc, model.TableObjects, string(destHash[:]), record); err != nil {
+		previous, err := metaSwap(ctx, mc, model.TableObjects, string(destHash[:]), record)
+		if err != nil {
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
 			abortShards(ctx, bc, destHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 		commitShards(ctx, bc, destHash, place, written)
+		releaseSuperseded(ctx, bc, destHash, previous, place.WriteEpoch)
 
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(destBucket, destKey), destHash[:]); err != nil {
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)

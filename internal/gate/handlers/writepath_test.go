@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -50,8 +51,14 @@ func (m *fakeMeta) Put(_ context.Context, key string, value []byte) error {
 	return nil
 }
 
-func (m *fakeMeta) PutMax(ctx context.Context, key string, value []byte, _ uint64) error {
-	return m.Put(ctx, key, value)
+func (m *fakeMeta) Swap(ctx context.Context, key string, value []byte) ([]byte, error) {
+	m.mu.Lock()
+	previous := m.rows[key]
+	m.mu.Unlock()
+	if err := m.Put(ctx, key, value); err != nil {
+		return nil, err
+	}
+	return previous, nil
 }
 
 func (m *fakeMeta) Delete(_ context.Context, key string) error {
@@ -100,10 +107,16 @@ type fakeBlob struct {
 	shards   map[shardID]fakeShard
 	prepared map[shardID]fakeShard
 
-	maxWrite     atomic.Int64
-	putCalls     atomic.Int64
-	commitCalls  atomic.Int64
-	abortCalls   atomic.Int64
+	maxWrite    atomic.Int64
+	putCalls    atomic.Int64
+	commitCalls atomic.Int64
+	abortCalls  atomic.Int64
+
+	// released records every generation a writer said it had superseded, so a
+	// test can tell a bounded retention from one that only ages out.
+	released     []blob.ReleaseRequest
+	failReleases bool
+
 	declaring    func(size int64) error
 	failPutOn    func(index uint32) bool
 	failCommitOn func(index uint32) bool
@@ -182,6 +195,25 @@ func (b *fakeBlob) commitLocked(id shardID, epoch uint64) error {
 	}
 
 	return blob.ErrNotPrepared
+}
+
+func (b *fakeBlob) Release(_ context.Context, _ config.NodeID, req blob.ReleaseRequest) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.failReleases {
+		return errors.New("node is not answering")
+	}
+	b.released = append(b.released, req)
+
+	return nil
+}
+
+func (b *fakeBlob) releases() []blob.ReleaseRequest {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return slices.Clone(b.released)
 }
 
 func (b *fakeBlob) Abort(_ context.Context, _ config.NodeID, req blob.CommitRequest) error {

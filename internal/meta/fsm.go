@@ -25,6 +25,10 @@ const (
 	CommandPut CommandType = iota
 	CommandDelete
 	CommandPutMax
+	// CommandSwap stores a value and reports the one it replaced, so a writer
+	// learns what it superseded. Appended rather than inserted: these numbers
+	// are on disk in every existing log.
+	CommandSwap
 )
 
 // Command represents a database operation that goes through Raft.
@@ -114,35 +118,51 @@ func (f *FSM) Apply(log *raft.Log) any {
 		return f.applyDelete(string(cmd.Key))
 	case CommandPutMax:
 		return f.applyPutMax(string(cmd.Key), cmd.Value, cmd.Epoch)
+	case CommandSwap:
+		return f.applySwap(string(cmd.Key), cmd.Value)
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
 }
 
-// applyPutMax publishes a placement only when it is not older than the
-// placement currently stored. The comparison happens inside the Raft FSM, so
-// concurrent gate requests cannot race a read-then-write check.
-func (f *FSM) applyPutMax(key string, value []byte, epoch uint64) error {
-	return f.db.Update(func(txn *badger.Txn) error {
-		if item, err := txn.Get([]byte(key)); err == nil {
-			current, err := item.ValueCopy(nil)
-			if err != nil {
+// applyPutMax stores a placement record, and the epoch it carries orders
+// nothing. It exists so log entries written when this command did compare
+// epochs still replay, and new writers should use CommandPut.
+//
+// A client's PUT is not acknowledged until its record reaches the log, so
+// arrival order is acknowledgement order, and last-to-arrive is the write S3
+// calls the winner. Comparing epochs here picked the write that *started*
+// last instead, which is a different write whenever two PUTs overlap.
+func (f *FSM) applyPutMax(key string, value []byte, _ uint64) error {
+	return f.applyPut(key, value)
+}
+
+// applySwap stores a key-value pair and returns the value it replaced, or nil
+// if the key was absent. It reads before writing, so it is the more expensive
+// of the two and CommandPut stays the default.
+//
+// What the extra read buys is a writer knowing which generation it displaced.
+// Nothing else can tell it: the log settles who wins, and a caller that reads
+// the key itself beforehand races every other writer of that key.
+func (f *FSM) applySwap(key string, value []byte) any {
+	var previous []byte
+	err := f.db.Update(func(txn *badger.Txn) error {
+		switch item, err := txn.Get([]byte(key)); {
+		case err == nil:
+			if previous, err = item.ValueCopy(nil); err != nil {
 				return err
 			}
-			// Placement records store the epoch at byte offset 11. Only this
-			// operation is used for placement keys, so malformed/legacy values
-			// are replaced normally.
-			if len(current) >= 19 && current[0] == 0 && current[1] == 2 {
-				currentEpoch := binary.BigEndian.Uint64(current[11:19])
-				if currentEpoch > epoch {
-					return nil
-				}
-			}
-		} else if !errors.Is(err, badger.ErrKeyNotFound) {
+		case !errors.Is(err, badger.ErrKeyNotFound):
 			return err
 		}
+
 		return txn.Set([]byte(key), value)
 	})
+	if err != nil {
+		return err
+	}
+
+	return previous
 }
 
 // applyPut stores a key-value pair.

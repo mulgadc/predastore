@@ -659,9 +659,6 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 				if err := txn.Set(retainedKey(idxKey, epoch), encodePreparedValue(ext, epoch, time.Now().UnixNano())); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
 				}
-				if err := pruneRetained(txn, idxKey, retainedGenerations); err != nil {
-					return err
-				}
 				return txn.Delete(prepKey)
 
 			// Demoted, not destroyed: a record naming this generation is still
@@ -670,9 +667,6 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 			case liveErr == nil:
 				if err := txn.Set(retainedKey(idxKey, liveEpoch), encodePreparedValue(old, liveEpoch, time.Now().UnixNano())); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
-				}
-				if err := pruneRetained(txn, idxKey, retainedGenerations); err != nil {
-					return err
 				}
 			}
 
@@ -802,50 +796,6 @@ func dropRowsUnder(txn *badger.Txn, prefix []byte) error {
 	return nil
 }
 
-// pruneRetained drops the oldest retained generations of one shard position
-// until at most keep remain, tombstoning what it removes. Epochs sort
-// big-endian, so the iteration is already oldest-first and the tail to keep is
-// the last keep rows.
-func pruneRetained(txn *badger.Txn, idxKey []byte, keep int) error {
-	prefix := retainedScan(idxKey)
-
-	opts := badger.DefaultIteratorOptions
-	opts.Prefix = prefix
-	it := txn.NewIterator(opts)
-
-	var rows [][]byte
-	var exts []extent
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		item := it.Item()
-		if len(item.Key()) != retainedKeySize {
-			continue
-		}
-		raw, err := item.ValueCopy(nil)
-		if err != nil {
-			it.Close()
-			return fmt.Errorf("copy retained row: %w", err)
-		}
-		ext, _, err := decodeIndexValue(raw)
-		if err != nil {
-			it.Close()
-			return fmt.Errorf("decode retained row: %w", err)
-		}
-		rows = append(rows, item.KeyCopy(nil))
-		exts = append(exts, ext)
-	}
-	it.Close()
-
-	for i := 0; i < len(rows)-keep; i++ {
-		if err := txn.Set(tombstoneKey(exts[i].SegNum, exts[i].Off), tombstoneValue(exts[i].PSize)); err != nil {
-			return fmt.Errorf("tombstone pruned generation: %w", err)
-		}
-		if err := txn.Delete(rows[i]); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // readIndexValue decodes the extent and epoch a key currently points at.
 func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
 	raw, err := readRaw(txn, key)
@@ -853,6 +803,58 @@ func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
 		return extent{}, 0, err
 	}
 	return decodeIndexValue(raw)
+}
+
+// ReleaseGeneration marks one superseded generation of a shard position as
+// finished with, named by the epoch that wrote it. It reaches only the
+// retained namespace, so it cannot touch the generation the node is serving
+// however stale the caller's idea of that is.
+//
+// It backdates the row rather than dropping it, and the sweep reclaims it on
+// its next pass. A reader that resolved the old record a moment ago is still
+// streaming shards from that generation, and taking the bytes out from under
+// it would turn a rare lost write into a routine failed read. The delay is
+// what keeps that reader whole; the marking is what stops retention growing
+// with everything written inside the age window rather than with the writes
+// actually in flight.
+func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) error {
+	store.mutex.Lock()
+	closed := store.closed
+	store.mutex.Unlock()
+	if closed {
+		return ErrClosedStore
+	}
+
+	rowKey := retainedKey(MakeKey(key, index), epoch)
+	for {
+		err := store.index.Update(func(txn *badger.Txn) error {
+			raw, err := readRaw(txn, rowKey)
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				// Already reclaimed, which is the outcome the caller wanted.
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			ext, held, err := decodeIndexValue(raw)
+			if err != nil {
+				return fmt.Errorf("decode retained row: %w", err)
+			}
+			if held != epoch {
+				return nil
+			}
+
+			return txn.Set(rowKey, encodePreparedValue(ext, epoch, 0))
+		})
+		if errors.Is(err, badger.ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("release generation: %w", err)
+		}
+
+		return nil
+	}
 }
 
 // Delete removes a key's index entry and tombstones its extent, in one
