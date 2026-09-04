@@ -1614,10 +1614,13 @@ run_multipart_upload() {
         printf '{"Parts":[%s]}' "$(paste -sd, "$WORK_DIR/mp-parts-$spec.json.parts")" \
             > "$WORK_DIR/mp-parts-$spec.json"
 
-        # The window this scenario exists for.
+        # The window this scenario exists for. It needs an explicit read timeout:
+        # completing 1GiBx8 measures ~58s on a hosted runner, which straddles the
+        # CLI's 60s default and failed about two runs in three on that alone.
         start_rss_sampler "$WORK_DIR/mp-rss-complete-$spec.txt"
         done_start=$(date +%s)
-        aws_s3 "$gate" s3api complete-multipart-upload --bucket "$MP_BUCKET" --key "$key" \
+        aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 600 \
+            s3api complete-multipart-upload --bucket "$MP_BUCKET" --key "$key" \
             --upload-id "$upload_id" \
             --multipart-upload "file://$WORK_DIR/mp-parts-$spec.json" >/dev/null \
             || mp_check false "${spec}x${MP_PART_COUNT} complete-multipart-upload failed"
