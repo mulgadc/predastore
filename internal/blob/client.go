@@ -79,6 +79,13 @@ type DeleteRequest struct {
 	Index uint32
 }
 
+// ReleaseRequest drops one superseded generation of a shard.
+type ReleaseRequest struct {
+	Key   [32]byte
+	Index uint32
+	Epoch uint64
+}
+
 // CommitRequest publishes, or discards, a shard prepared by an earlier put.
 type CommitRequest struct {
 	Key   [32]byte
@@ -405,8 +412,16 @@ func (c *Client) Abort(ctx context.Context, nodeID config.NodeID, req CommitRequ
 	return err
 }
 
+// Release drops a superseded generation the caller has finished with, so the
+// space comes back now rather than when the retention window expires.
+func (c *Client) Release(ctx context.Context, nodeID config.NodeID, req ReleaseRequest) error {
+	_, err := c.finish(ctx, nodeID, OpRelease, "release", CommitRequest(req))
+
+	return err
+}
+
 // finish runs the bodyless second half of a write: open, half-close, read the
-// envelope. Commit and Abort differ only in the opcode they send.
+// envelope. Commit, Abort and Release differ only in the opcode they send.
 func (c *Client) finish(ctx context.Context, nodeID config.NodeID, op rpc.Opcode, name string, req CommitRequest) (*Response, error) {
 	stream, err := c.openBounded(ctx, nodeID, op, &Request{
 		Key:        req.Key,

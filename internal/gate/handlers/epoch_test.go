@@ -277,3 +277,61 @@ func (f writeFixture) publish(t *testing.T, objectHash [32]byte, place ObjectToS
 	require.NoError(t, err)
 	require.NoError(t, metaPut(context.Background(), f.mc, model.TableObjects, string(objectHash[:]), record))
 }
+
+// placement reads back the record a write published for one key.
+func (f writeFixture) placement(t *testing.T, key string) ObjectToShardNodes {
+	t.Helper()
+	objectHash := model.ObjectHash("b", key)
+	raw, err := metaGet(context.Background(), f.mc, model.TableObjects, string(objectHash[:]))
+	require.NoError(t, err)
+	place, err := DecodePlacement(raw)
+	require.NoError(t, err)
+
+	return place
+}
+
+// Retention is bounded by the writes still in flight, not by how many arrive in
+// a window: the writer that replaces a record tells the nodes the generation it
+// displaced is finished with. Without that the only bound is the sweep's age
+// cutoff, which a fast enough writer outruns.
+func TestOverwriteReleasesTheGenerationItSuperseded(t *testing.T) {
+	t.Parallel()
+
+	f := newWriteFixture(2, 1)
+	handler := PutObject(f.mc, f.bc, f.ring, testCache(), f.cfg)
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, objectPut("k", randomBytes(t, 100)))
+	require.Equal(t, http.StatusOK, w.Code)
+	require.Empty(t, f.bc.releases(), "the first write superseded nothing, so it must release nothing")
+
+	first := f.placement(t, "k")
+
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, objectPut("k", randomBytes(t, 100)))
+	require.Equal(t, http.StatusOK, w.Code)
+
+	released := f.bc.releases()
+	require.Len(t, released, 3, "every shard position of the superseded generation must be released")
+	for _, req := range released {
+		assert.Equal(t, first.WriteEpoch, req.Epoch,
+			"the release must name the generation that was replaced, not the one that replaced it")
+	}
+}
+
+// An overwrite that lands on an unreachable node must still succeed. The object
+// is durable and visible by then, and the sweep reclaims the same rows on age
+// alone, so refusing here would fail a write that has already happened.
+func TestOverwriteSucceedsWhenTheReleaseCannotBeDelivered(t *testing.T) {
+	t.Parallel()
+
+	f := newWriteFixture(2, 1)
+	f.bc.failReleases = true
+	handler := PutObject(f.mc, f.bc, f.ring, testCache(), f.cfg)
+
+	for range 2 {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, objectPut("k", randomBytes(t, 100)))
+		require.Equal(t, http.StatusOK, w.Code)
+	}
+}

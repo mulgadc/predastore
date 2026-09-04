@@ -54,10 +54,24 @@ func (c *compactor) loop() {
 	ticker := time.NewTicker(c.store.compactionInterval)
 	defer ticker.Stop()
 
+	// Retained generations are swept on their own, much faster cycle. A full
+	// cycle relocates extents and rewrites segments; this is one scan of the
+	// retained namespace, and it is what decides how long a writer's released
+	// generation keeps holding disk.
+	retained := time.NewTicker(retainedSweepInterval)
+	defer retained.Stop()
+
 	for {
 		select {
 		case <-c.done:
 			return
+		case <-retained.C:
+			released, err := c.store.sweepRetained(retainedMaxAge)
+			if err != nil {
+				slog.Error("retained sweep failed", "error", err)
+			} else if released > 0 {
+				slog.Debug("released superseded generations", "count", released)
+			}
 		case <-ticker.C:
 			if err := c.store.compactOnce(); err != nil {
 				slog.Error("compaction cycle failed", "error", err)
@@ -268,6 +282,12 @@ func (store *Store) sweepPrepared(maxAge time.Duration) (int, error) {
 // needs repair to reconcile a record against what the nodes actually hold,
 // which is not this change.
 const retainedMaxAge = 5 * time.Minute
+
+// retainedSweepInterval is how often superseded generations are reclaimed. It
+// is far shorter than the compaction cycle because it bounds the disk a
+// released generation holds after its writer has finished with it, and the
+// scan it runs is cheap next to a compaction pass.
+const retainedSweepInterval = 15 * time.Second
 
 // sweepRetained reclaims generations that a commit superseded and nothing has
 // asked for since. It is the only thing that decides a generation is dead —

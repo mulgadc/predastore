@@ -386,6 +386,16 @@ func (c *Client) PutMax(ctx context.Context, key string, value []byte, epoch uin
 	return c.write(ctx, OpMetaPutMax, req, value)
 }
 
+// Swap writes a value and returns the one it replaced, empty if the key was
+// absent. It is how a writer of a placement record learns which generation it
+// superseded, so the shards behind that generation can be released rather than
+// waiting out the retention window.
+func (c *Client) Swap(ctx context.Context, key string, value []byte) (previous []byte, err error) {
+	defer observeOp(ctx, telemetry.MetaOpPut, time.Now(), &err)
+
+	return c.writeValue(ctx, OpMetaSwap, request(key, 0), value)
+}
+
 // Delete removes a key through the leader.
 func (c *Client) Delete(ctx context.Context, key string) (err error) {
 	defer observeOp(ctx, telemetry.MetaOpDelete, time.Now(), &err)
@@ -395,6 +405,14 @@ func (c *Client) Delete(ctx context.Context, key string) (err error) {
 // write drives a consensus write to the leader, following not-leader
 // redirects and rotating through replicas while an election settles.
 func (c *Client) write(ctx context.Context, op rpc.Opcode, req *MetaRequest, body []byte) error {
+	_, err := c.writeValue(ctx, op, req, body)
+
+	return err
+}
+
+// writeValue is write, plus whatever the replica answered with. Only a swap
+// populates that; every other write leaves it nil.
+func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest, body []byte) ([]byte, error) {
 	candidates := c.readOrder()
 	next := 0
 	target := candidates[next]
@@ -408,7 +426,7 @@ func (c *Client) write(ctx context.Context, op rpc.Opcode, req *MetaRequest, bod
 			lastErr = err
 		case resp.Err == "":
 			c.cacheLeader(target)
-			return nil
+			return resp.Value, nil
 		case resp.Err == ErrCodeNotLeader:
 			lastErr = ErrNotLeader
 			if id, perr := ParseRaftAddress(resp.Leader); perr == nil {
@@ -434,11 +452,11 @@ func (c *Client) write(ctx context.Context, op rpc.Opcode, req *MetaRequest, bod
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return fmt.Errorf("write %q: %w", req.Key, ctx.Err())
+				return nil, fmt.Errorf("write %q: %w", req.Key, ctx.Err())
 			case <-timer.C:
 			}
 		}
 	}
 	telemetry.RecordMetaRedirect(ctx, telemetry.RedirectRetryExhausted)
-	return fmt.Errorf("write %q failed after %d attempts: %w", req.Key, attempts, lastErr)
+	return nil, fmt.Errorf("write %q failed after %d attempts: %w", req.Key, attempts, lastErr)
 }

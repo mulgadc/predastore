@@ -954,3 +954,36 @@ func deleteObject(ctx context.Context, bc BlobClient, bucket, key string, object
 
 	return nil
 }
+
+// releaseSuperseded tells the nodes behind a replaced placement record that its
+// generation is finished with, so the disk comes back on the next sweep rather
+// than at the end of the retention window.
+//
+// Best-effort by construction: the object is already durable and visible, the
+// sweep reclaims the same rows on age alone, and a node that cannot be reached
+// must not fail a write that has landed.
+func releaseSuperseded(ctx context.Context, bc BlobClient, objectHash [32]byte, previous []byte, mine uint64) {
+	if len(previous) == 0 {
+		return
+	}
+	prev, err := DecodePlacement(previous)
+	if err != nil || prev.WriteEpoch == mine || prev.Size == 0 {
+		return
+	}
+
+	var wg sync.WaitGroup
+	for index, node := range prev.AllNodes() {
+		wg.Go(func() {
+			if err := bc.Release(ctx, node, blob.ReleaseRequest{
+				Key:   objectHash,
+				Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
+				Epoch: prev.WriteEpoch,
+			}); err != nil {
+				slog.DebugContext(ctx, "Could not release a superseded generation; the sweep will age it out",
+					"node", node, "index", index,
+					"epoch", fmt.Sprintf("%016x", prev.WriteEpoch), "err", err)
+			}
+		})
+	}
+	wg.Wait()
+}

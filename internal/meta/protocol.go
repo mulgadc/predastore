@@ -24,6 +24,8 @@ const (
 	OpMetaDelete rpc.Opcode = 0x1003
 	OpMetaScan   rpc.Opcode = 0x1004
 	OpMetaPutMax rpc.Opcode = 0x1006
+	// OpMetaSwap writes a value and answers with the one it replaced.
+	OpMetaSwap rpc.Opcode = 0x1007
 
 	// OpMetaStatus asks a replica to report its own raft state, rather than
 	// any data it holds.

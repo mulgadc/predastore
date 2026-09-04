@@ -805,6 +805,58 @@ func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
 	return decodeIndexValue(raw)
 }
 
+// ReleaseGeneration marks one superseded generation of a shard position as
+// finished with, named by the epoch that wrote it. It reaches only the
+// retained namespace, so it cannot touch the generation the node is serving
+// however stale the caller's idea of that is.
+//
+// It backdates the row rather than dropping it, and the sweep reclaims it on
+// its next pass. A reader that resolved the old record a moment ago is still
+// streaming shards from that generation, and taking the bytes out from under
+// it would turn a rare lost write into a routine failed read. The delay is
+// what keeps that reader whole; the marking is what stops retention growing
+// with everything written inside the age window rather than with the writes
+// actually in flight.
+func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) error {
+	store.mutex.Lock()
+	closed := store.closed
+	store.mutex.Unlock()
+	if closed {
+		return ErrClosedStore
+	}
+
+	rowKey := retainedKey(MakeKey(key, index), epoch)
+	for {
+		err := store.index.Update(func(txn *badger.Txn) error {
+			raw, err := readRaw(txn, rowKey)
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				// Already reclaimed, which is the outcome the caller wanted.
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			ext, held, err := decodeIndexValue(raw)
+			if err != nil {
+				return fmt.Errorf("decode retained row: %w", err)
+			}
+			if held != epoch {
+				return nil
+			}
+
+			return txn.Set(rowKey, encodePreparedValue(ext, epoch, 0))
+		})
+		if errors.Is(err, badger.ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("release generation: %w", err)
+		}
+
+		return nil
+	}
+}
+
 // Delete removes a key's index entry and tombstones its extent, in one
 // transaction so the dead-space hint cannot outlive or precede the deletion.
 // Reports whether an extent existed; a missing key is not an error, which

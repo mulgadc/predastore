@@ -155,6 +155,7 @@ func (s *Server) open() (*rpc.Server, error) {
 	rpc.RegisterHandler(mux, OpRaftDial, s.handleRaftDial)
 	rpc.RegisterHandler(mux, OpMetaGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpMetaPut, s.handlePut)
+	rpc.RegisterHandler(mux, OpMetaSwap, s.handleSwap)
 	rpc.RegisterHandler(mux, OpMetaPutMax, s.handlePutMax)
 	rpc.RegisterHandler(mux, OpMetaDelete, s.handleDelete)
 	rpc.RegisterHandler(mux, OpMetaScan, s.handleScan)
@@ -430,6 +431,11 @@ func (s *Server) putMax(key string, value []byte, epoch uint64) error {
 	return s.apply(Command{Type: CommandPutMax, Key: []byte(key), Value: value, Epoch: epoch})
 }
 
+// swap stores a value and returns the one it replaced.
+func (s *Server) swap(key string, value []byte) ([]byte, error) {
+	return s.applyValue(Command{Type: CommandSwap, Key: []byte(key), Value: value})
+}
+
 // delete removes a key through raft consensus.
 func (s *Server) delete(key string) error {
 	return s.apply(Command{Type: CommandDelete, Key: []byte(key)})
@@ -437,25 +443,38 @@ func (s *Server) delete(key string) error {
 
 // apply commits one command, which only the leader may do.
 func (s *Server) apply(cmd Command) error {
+	_, err := s.applyValue(cmd)
+
+	return err
+}
+
+// applyValue commits one command and returns whatever its FSM handler reported,
+// which for CommandSwap is the value it replaced.
+func (s *Server) applyValue(cmd Command) ([]byte, error) {
 	if s.raft.State() != raft.Leader {
-		return ErrNotLeader
+		return nil, ErrNotLeader
 	}
 
 	data, err := json.Marshal(cmd)
 	if err != nil {
-		return fmt.Errorf("marshal command: %w", err)
+		return nil, fmt.Errorf("marshal command: %w", err)
 	}
 
 	future := s.raft.Apply(data, applyTimeout)
 	if err := future.Error(); err != nil {
-		return fmt.Errorf("raft apply failed: %w", err)
+		return nil, fmt.Errorf("raft apply failed: %w", err)
 	}
 
-	// The FSM reports a rejected command through the future's response.
-	if err, ok := future.Response().(error); ok {
-		return err
+	// The FSM reports a rejected command through the future's response, and a
+	// swap reports the value it replaced the same way.
+	switch response := future.Response().(type) {
+	case error:
+		return nil, response
+	case []byte:
+		return response, nil
+	default:
+		return nil, nil
 	}
-	return nil
 }
 
 // get reads a value from the local store. It may return stale data on a

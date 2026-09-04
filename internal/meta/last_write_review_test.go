@@ -41,3 +41,29 @@ func placementRecord(epoch byte) []byte {
 	b[18] = epoch
 	return b
 }
+
+// Swap is the same last-write-wins publication as Put, and additionally reports
+// the row it replaced. That report is what lets the writer release the storage
+// its predecessor was using, so retention is bounded by the writes in flight
+// rather than by the write rate over a window.
+func TestSwapReturnsTheRecordItReplaced(t *testing.T) {
+	cli := startStatusReplica(t, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.Eventually(t, func() bool {
+		status, err := cli.Status(ctx, 1)
+		return err == nil && status.IsLeader
+	}, 5*time.Second, 20*time.Millisecond)
+
+	previous, err := cli.Swap(ctx, "objects/swapped", placementRecord(2))
+	require.NoError(t, err)
+	assert.Empty(t, previous, "the first write replaced nothing")
+
+	previous, err = cli.Swap(ctx, "objects/swapped", placementRecord(3))
+	require.NoError(t, err)
+	assert.Equal(t, placementRecord(2), previous, "the second write must report what it displaced")
+
+	got, err := cli.Get(ctx, "objects/swapped")
+	require.NoError(t, err)
+	assert.Equal(t, placementRecord(3), got, "the record that arrived last must be the one stored")
+}

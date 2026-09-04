@@ -29,6 +29,13 @@ func (m *putFailingMeta) Put(ctx context.Context, key string, value []byte) erro
 	return m.fakeMeta.Put(ctx, key, value)
 }
 
+func (m *putFailingMeta) Swap(ctx context.Context, key string, value []byte) ([]byte, error) {
+	if m.failOn != nil && m.failOn(key) {
+		return nil, errors.New("simulated meta failure")
+	}
+	return m.fakeMeta.Swap(ctx, key, value)
+}
+
 var _ MetaClient = (*putFailingMeta)(nil)
 
 // failingBlob fails every shard Delete, standing in for a fan-out that could

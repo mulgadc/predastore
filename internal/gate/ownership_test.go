@@ -106,8 +106,12 @@ func (f *fakeMeta) Put(_ context.Context, key string, value []byte) error {
 	return nil
 }
 
-func (f *fakeMeta) PutMax(ctx context.Context, key string, value []byte, _ uint64) error {
-	return f.Put(ctx, key, value)
+func (f *fakeMeta) Swap(ctx context.Context, key string, value []byte) ([]byte, error) {
+	previous := f.rows[key]
+	if err := f.Put(ctx, key, value); err != nil {
+		return nil, err
+	}
+	return previous, nil
 }
 
 func (f *fakeMeta) Delete(_ context.Context, key string) error {

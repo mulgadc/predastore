@@ -97,6 +97,10 @@ func (b *nodeBlob) Abort(_ context.Context, node config.NodeID, req blob.CommitR
 	return nil
 }
 
+func (b *nodeBlob) Release(_ context.Context, _ config.NodeID, _ blob.ReleaseRequest) error {
+	return nil
+}
+
 func (b *nodeBlob) Get(_ context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

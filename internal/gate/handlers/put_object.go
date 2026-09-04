@@ -104,17 +104,20 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 				"epoch", fmt.Sprintf("%016x", place.WriteEpoch))
 		}
 
-		// Object hash -> shard placement is the visibility point. Raft applies
-		// this max-epoch update atomically, so a delayed older writer cannot move
-		// the record backwards.
+		// Object hash -> shard placement is the visibility point, and reaching
+		// the replicated log is what acknowledges this PUT, so the record that
+		// arrives last is the write S3 reports. Swapping rather than writing
+		// tells this writer which generation it displaced.
 		phase = time.Now()
-		if err := metaPutMax(ctx, mc, model.TableObjects, string(objectHash[:]), record, place.WriteEpoch); err != nil {
+		previous, err := metaSwap(ctx, mc, model.TableObjects, string(objectHash[:]), record)
+		if err != nil {
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
 			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
 		phase = recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseMetaPlacement, phase)
+		releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch)
 
 		// Listing key -> object hash, for ListObjects.
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {

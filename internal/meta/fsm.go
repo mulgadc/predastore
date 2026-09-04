@@ -25,6 +25,10 @@ const (
 	CommandPut CommandType = iota
 	CommandDelete
 	CommandPutMax
+	// CommandSwap stores a value and reports the one it replaced, so a writer
+	// learns what it superseded. Appended rather than inserted: these numbers
+	// are on disk in every existing log.
+	CommandSwap
 )
 
 // Command represents a database operation that goes through Raft.
@@ -114,6 +118,8 @@ func (f *FSM) Apply(log *raft.Log) any {
 		return f.applyDelete(string(cmd.Key))
 	case CommandPutMax:
 		return f.applyPutMax(string(cmd.Key), cmd.Value, cmd.Epoch)
+	case CommandSwap:
+		return f.applySwap(string(cmd.Key), cmd.Value)
 	default:
 		return fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
@@ -129,6 +135,34 @@ func (f *FSM) Apply(log *raft.Log) any {
 // last instead, which is a different write whenever two PUTs overlap.
 func (f *FSM) applyPutMax(key string, value []byte, _ uint64) error {
 	return f.applyPut(key, value)
+}
+
+// applySwap stores a key-value pair and returns the value it replaced, or nil
+// if the key was absent. It reads before writing, so it is the more expensive
+// of the two and CommandPut stays the default.
+//
+// What the extra read buys is a writer knowing which generation it displaced.
+// Nothing else can tell it: the log settles who wins, and a caller that reads
+// the key itself beforehand races every other writer of that key.
+func (f *FSM) applySwap(key string, value []byte) any {
+	var previous []byte
+	err := f.db.Update(func(txn *badger.Txn) error {
+		switch item, err := txn.Get([]byte(key)); {
+		case err == nil:
+			if previous, err = item.ValueCopy(nil); err != nil {
+				return err
+			}
+		case !errors.Is(err, badger.ErrKeyNotFound):
+			return err
+		}
+
+		return txn.Set([]byte(key), value)
+	})
+	if err != nil {
+		return err
+	}
+
+	return previous
 }
 
 // applyPut stores a key-value pair.

@@ -21,7 +21,7 @@ var errNoMetaClient = errors.New("gate has no meta client")
 type MetaClient interface {
 	Get(ctx context.Context, key string) ([]byte, error)
 	Put(ctx context.Context, key string, value []byte) error
-	PutMax(ctx context.Context, key string, value []byte, epoch uint64) error
+	Swap(ctx context.Context, key string, value []byte) ([]byte, error)
 	Delete(ctx context.Context, key string) error
 	Scan(ctx context.Context, prefix string, limit int) ([]meta.Item, error)
 }
@@ -80,11 +80,13 @@ func metaPut(ctx context.Context, mc MetaClient, table, key string, value []byte
 	return mc.Put(ctx, TableKey(table, key), value)
 }
 
-func metaPutMax(ctx context.Context, mc MetaClient, table, key string, value []byte, epoch uint64) error {
+// metaSwap writes one row and returns the row it replaced.
+func metaSwap(ctx context.Context, mc MetaClient, table, key string, value []byte) ([]byte, error) {
 	if mc == nil {
-		return errNoMetaClient
+		return nil, errNoMetaClient
 	}
-	return mc.PutMax(ctx, TableKey(table, key), value, epoch)
+
+	return mc.Swap(ctx, TableKey(table, key), value)
 }
 
 // metaDelete removes one row of a table.

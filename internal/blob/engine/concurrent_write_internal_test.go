@@ -196,6 +196,74 @@ func TestTheSweepReleasesRetainedGenerations(t *testing.T) {
 	}
 }
 
+// A generation whose record has been replaced is released by the writer that
+// replaced it, so retention is bounded by the writes in flight rather than by
+// the age cutoff. The row is backdated rather than dropped: a reader that
+// resolved the old record a moment ago is still streaming from it, and taking
+// the bytes now would turn a rare lost write into a routine failed read.
+func TestReleaseGenerationHandsBackASupersededGeneration(t *testing.T) {
+	st, _ := openTestStore(t)
+	oh := [32]byte{0x45}
+	const writers = 3
+
+	epochs, _, _ := raceWriters(t, st, oh, writers)
+
+	if err := st.ReleaseGeneration(oh, 0, epochs[0]); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	r, err := st.LookupAt(oh, 0, epochs[0])
+	if err != nil {
+		t.Fatalf("a released generation stopped answering before the sweep took it: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	released, err := st.sweepRetained(retainedMaxAge)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if released != 1 {
+		t.Fatalf("sweep released %d generations, want only the one handed back", released)
+	}
+	if r, err := st.LookupAt(oh, 0, epochs[0]); err == nil {
+		_ = r.Close()
+		t.Fatalf("the released generation survived the sweep")
+	}
+	// The other superseded generation was never released and is still fresh.
+	r, err = st.LookupAt(oh, 0, epochs[1])
+	if err != nil {
+		t.Fatalf("the sweep took a generation nobody released: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+// Releasing reaches only the retained namespace, so a caller working from a
+// stale placement record cannot ask a node to hand back the object it is
+// currently serving.
+func TestReleaseGenerationCannotTouchTheLiveGeneration(t *testing.T) {
+	st, _ := openTestStore(t)
+	oh := [32]byte{0x46}
+	const writers = 2
+
+	epochs, bodies, _ := raceWriters(t, st, oh, writers)
+	live := epochs[writers-1]
+
+	if err := st.ReleaseGeneration(oh, 0, live); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if _, err := st.sweepRetained(retainedMaxAge); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	if got := readValue(t, st, oh, 0); !bytes.Equal(got, bodies[writers-1]) {
+		t.Fatalf("releasing the live epoch changed what the position serves")
+	}
+}
+
 // countRetained calls seen once per retained row of one shard position.
 func countRetained(st *Store, idxKey []byte, seen func()) error {
 	prefix := retainedScan(idxKey)
