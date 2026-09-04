@@ -1,24 +1,38 @@
 #!/bin/bash
 #
-# stop.sh - Stop all running Predastore clusters
+# stop.sh - Stop running Predastore clusters
 #
-# Scans $PREDA_DIR/*/pids/ and stops any running processes, confirming each one
-# has actually exited before reporting success.
+# Reads $PREDA_DIR/<cluster>/pids/ and stops the processes it finds, confirming
+# each one has actually exited before reporting success. With no arguments every
+# cluster under $PREDA_DIR is stopped; naming clusters stops only those and
+# leaves the rest running.
 #
 # Usage:
-#   ./scripts/stop.sh
+#   ./scripts/stop.sh [-w] [clustername ...]
+#
+# Options:
+#   -w    Accepted for symmetry with start.sh and ignored. Stopping always waits
+#         for each process to exit, so there is no other mode to select.
 #
 # Environment:
-#   PREDA_DIR      cluster root to scan (default /tmp/predastore)
-#   STOP_TIMEOUT   seconds to wait after SIGTERM before SIGKILL (default 20)
-#   KILL_TIMEOUT   seconds to wait after SIGKILL before failing (default 5)
+#   PREDA_DIR          cluster root to scan (default /tmp/predastore)
+#   PREDA_CONFIG_DIR   where profiles are read from (default: repo config/)
+#   STOP_TIMEOUT       seconds to wait after SIGTERM before SIGKILL (default 20)
+#   KILL_TIMEOUT       seconds to wait after SIGKILL before failing (default 5)
+#
+# Examples:
+#   ./scripts/stop.sh              # every cluster under $PREDA_DIR
+#   ./scripts/stop.sh s3tests      # only that one
 #
 
 set -euo pipefail
 
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 REPO_DIR="$SCRIPT_DIR/.."
-CONFIG_DIR="$REPO_DIR/config"
+# Matches start.sh: a harness that generated its profiles elsewhere aliased the
+# loopback addresses in those, so reading the repo's copy here would tear down
+# addresses from a different profile of the same name.
+CONFIG_DIR="${PREDA_CONFIG_DIR:-$REPO_DIR/config}"
 
 # shellcheck source=scripts/lib.sh
 source "$SCRIPT_DIR/lib.sh"
@@ -34,6 +48,17 @@ NC='\033[0m'
 log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+
+# -w means "wait until ready" in start.sh. Here waiting for exit is what the
+# script does in every case, so the flag is taken and ignored rather than
+# rejected — callers pair the two scripts and pass it to both.
+while getopts "w" opt; do
+    case $opt in
+        w) ;;
+        *) log_error "Usage: $0 [-w] [clustername ...]"; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
 
 # A cluster launched against a different PREDA_DIR has no pidfile here, so it
 # survives this script silently and keeps holding its data directory. Report
@@ -51,6 +76,45 @@ report_stray() {
 
 if [ ! -d "$BASE_DIR" ]; then
     log_info "Nothing to stop — $BASE_DIR does not exist"
+    report_stray
+    exit 0
+fi
+
+# Naming clusters is what lets one run tear down its own without stopping a
+# cluster another run is still using. Naming none keeps the sweep, which is what
+# clean.sh and the benchmark harnesses call.
+clusters=()
+missing=()
+if [ $# -gt 0 ]; then
+    for name in "$@"; do
+        if [ -d "$BASE_DIR/$name" ]; then
+            clusters+=("$name")
+        else
+            missing+=("$name")
+        fi
+    done
+else
+    for dir in "$BASE_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        clusters+=("$(basename "$dir")")
+    done
+fi
+
+# Not being there is a legitimate answer to "stop this", and CI runs its
+# teardown step unconditionally, so a miss warns rather than failing. Listing
+# what is present is what keeps a typo from passing silently.
+if [ ${#missing[@]} -gt 0 ]; then
+    present=()
+    for dir in "$BASE_DIR"/*/; do
+        [ -d "$dir" ] || continue
+        present+=("$(basename "$dir")")
+    done
+    log_warn "No cluster directory under $BASE_DIR for: ${missing[*]}"
+    log_warn "Present: ${present[*]:-(none)}"
+fi
+
+if [ ${#clusters[@]} -eq 0 ]; then
+    log_info "No clusters to stop under $BASE_DIR"
     report_stray
     exit 0
 fi
@@ -95,9 +159,9 @@ stopped=0
 pids=()
 declare -A pid_label=() pid_file=()
 
-for pid_dir in "$BASE_DIR"/*/pids; do
+for cluster in "${clusters[@]}"; do
+    pid_dir="$BASE_DIR/$cluster/pids"
     [ -d "$pid_dir" ] || continue
-    cluster=$(basename "$(dirname "$pid_dir")")
 
     for pidfile in "$pid_dir"/*.pid; do
         [ -f "$pidfile" ] || continue
@@ -148,10 +212,10 @@ fi
 
 # Teardown loopback IPs for each cluster that has a matching config. Only
 # addresses start.sh could have aliased are removed: loopback is the machine's
-# own and a single-host profile never aliased anything.
-for cluster_dir in "$BASE_DIR"/*/; do
-    [ -d "$cluster_dir" ] || continue
-    cluster=$(basename "$cluster_dir")
+# own and a single-host profile never aliased anything. Scoped to the clusters
+# actually stopped, so naming one does not pull the addresses out from under
+# another that is still serving on them.
+for cluster in "${clusters[@]}"; do
     config="$CONFIG_DIR/${cluster}.toml"
     [ -f "$config" ] || continue
 

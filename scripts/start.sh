@@ -108,7 +108,7 @@ if [ -d "$PIDS" ]; then
         pid=$(cat "$pidfile")
         if kill -0 "$pid" 2>/dev/null; then
             log_error "Cluster '$CLUSTER_NAME' is already running (PID $pid from $(basename "$pidfile"))"
-            log_error "Run ./scripts/stop.sh first"
+            log_error "Run ./scripts/stop.sh $CLUSTER_NAME first"
             exit 1
         else
             # Stale PID file — clean it up
@@ -295,4 +295,4 @@ log_info "  Base:  $BASE"
 log_info "  Logs:  $LOGS/"
 log_info "  PIDs:  $PIDS/"
 log_info ""
-log_info "Stop with: ./scripts/stop.sh"
+log_info "Stop with: ./scripts/stop.sh $CLUSTER_NAME"

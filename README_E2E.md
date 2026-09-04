@@ -290,6 +290,13 @@ the new hash in the plan doc that changed it. Previous baselines:
   rather than once it has been signalled. Before this it deleted the pidfiles
   regardless, so an `s3d` that ignored the signal kept its ports and broke the
   next run looking like a fault in whatever was just built.
+- **`stop.sh` takes cluster names, and used to ignore them.** `stop.sh 3host`
+  now stops that cluster alone; with no names it sweeps every cluster under
+  `$PREDA_DIR`, which is what `clean.sh` and the benchmark harnesses rely on.
+  Naming a cluster that is not there warns and exits 0, because CI runs its
+  teardown step unconditionally and "already stopped" is a legitimate outcome.
+  `-w` is accepted and ignored for symmetry with `start.sh`. Before this the
+  arguments were silently discarded and every call stopped everything.
 - **A full disk breaks the linter with an unrelated message** —
   `no go files to analyze: running go mod tidy may solve the problem`. Check
   `df -h` first; `go clean -cache` reclaims several GB.
