@@ -205,7 +205,7 @@ e2e-stress: build certs warp-install
 		WARP="$(WARP)" \
 		./scripts/bench/e2e-stress.sh
 
-# Two scenarios fail today, so CI gates on a regression against
+# partial-put fails today, so CI gates on a regression against
 # scripts/stress-baseline.txt rather than on a clean run. STRESS_SCENARIOS
 # narrows it: `make e2e-stress-gate STRESS_SCENARIOS=freeze`.
 STRESS_BASELINE  ?= scripts/stress-baseline.txt
@@ -216,9 +216,9 @@ e2e-stress-gate: build certs warp-install
 		WARP="$(WARP)" \
 		./scripts/bench/stress-gate.sh $(STRESS_SCENARIOS)
 
-# Fails on any failing scenario. Red until torn-overwrite is fixed, which is
-# the point: an overwrite that leaves an object part new and part old is data
-# loss on the ordinary write path.
+# Fails on any failing scenario. Red until partial-put is fixed, which is the
+# point: a client that stops sending mid-body holds the gate until the harness
+# gives up, so one abandoned upload can occupy a handler indefinitely.
 e2e-stress-strict: build certs warp-install
 	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
 		STRESS_HOST="$(STRESS_HOST)" STRESS_BASELINE="$(STRESS_BASELINE)" \

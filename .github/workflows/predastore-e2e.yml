@@ -34,7 +34,7 @@ on:
         required: false
         default: ""
       stress_scenarios:
-        description: "Stress scenarios to run (empty = the eleven this job runs; name partial-put or multipart-upload to add them)"
+        description: "Stress scenarios to run (empty = the twelve this job runs; name partial-put to add it)"
         required: false
         default: ""
       run_performance:
@@ -103,17 +103,22 @@ jobs:
     outputs:
       scenarios: ${{ steps.plan.outputs.scenarios }}
     steps:
-      # Eleven of the thirteen. partial-put fails today on an unbounded inbound
-      # body read, and multipart-upload dies restarting its cluster between
-      # part sizes on about two hosted runs in three. Both are covered by the
-      # spinifex nightly, and either can be named in the dispatch input.
+      # Twelve of the thirteen. Only partial-put is out, and it is out because
+      # it fails: an unbounded inbound body read, mulga-8lxge. It is covered by
+      # the spinifex nightly and can be named in the dispatch input.
+      #
+      # multipart-upload was out too, recorded as dying restarting its cluster
+      # between part sizes. That was never the cause — completion took the CLI's
+      # 60s default while the work measures 63-68s, so it timed out on itself.
+      # With an explicit timeout it is 5 for 5, and it gates here rather than
+      # waiting for the nightly.
       - name: Choose Scenarios
         id: plan
         env:
           REQUESTED: ${{ inputs.stress_scenarios }}
         run: |
           set -euo pipefail
-          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put torn-overwrite stale-shard freeze"
+          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put torn-overwrite stale-shard freeze multipart-upload"
           # shellcheck disable=SC2086
           printf '%s\n' ${REQUESTED:-$default} | jq -Rsc 'split("\n") | map(select(length > 0))' \
             | sed 's/^/scenarios=/' >> "$GITHUB_OUTPUT"
