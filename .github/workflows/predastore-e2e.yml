@@ -34,7 +34,7 @@ on:
         required: false
         default: ""
       stress_scenarios:
-        description: "Stress scenarios to run (empty = the eleven this job runs; name partial-put or multipart-upload to add them)"
+        description: "Stress scenarios to run (empty = all thirteen)"
         required: false
         default: ""
       run_performance:
@@ -95,7 +95,7 @@ jobs:
         run: make compose-down
 
   # The scenario list is a job rather than a literal in the matrix so the
-  # dispatch input can still name the two the default set leaves out.
+  # dispatch input can narrow it to one scenario without editing the workflow.
   stress-plan:
     name: Stress (plan)
     runs-on: ubuntu-26.04
@@ -103,17 +103,21 @@ jobs:
     outputs:
       scenarios: ${{ steps.plan.outputs.scenarios }}
     steps:
-      # Eleven of the thirteen. partial-put fails today on an unbounded inbound
-      # body read, and multipart-upload dies restarting its cluster between
-      # part sizes on about two hosted runs in three. Both are covered by the
-      # spinifex nightly, and either can be named in the dispatch input.
+      # All thirteen. The two that were excluded both failed for reasons that
+      # had nothing to do with the scenarios: multipart-upload completion took
+      # the AWS CLI's 60s default while the work measures 63-68s, and
+      # partial-put had no bound on the inbound body read at all.
+      #
+      # Both were recorded as covered by the spinifex nightly. partial-put was
+      # not: it was the one scenario with no branch under SCENARIO=all, which is
+      # what the nightly runs, so it had no coverage anywhere.
       - name: Choose Scenarios
         id: plan
         env:
           REQUESTED: ${{ inputs.stress_scenarios }}
         run: |
           set -euo pipefail
-          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put torn-overwrite stale-shard freeze"
+          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put torn-overwrite stale-shard freeze multipart-upload partial-put"
           # shellcheck disable=SC2086
           printf '%s\n' ${REQUESTED:-$default} | jq -Rsc 'split("\n") | map(select(length > 0))' \
             | sed 's/^/scenarios=/' >> "$GITHUB_OUTPUT"

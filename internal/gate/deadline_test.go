@@ -7,6 +7,7 @@ package gate
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -123,4 +124,85 @@ func TestServerSetsNoWholeBodyTimeouts(t *testing.T) {
 	assert.NotZero(t, srv.ReadHeaderTimeout, "the header exchange is fixed-size and must stay bounded")
 	assert.NotZero(t, srv.IdleTimeout, "an idle connection must still be reclaimed")
 	assert.NotZero(t, srv.MaxHeaderBytes)
+}
+
+// The bound bulkBody's comment promises. Releasing the total deadline without
+// replacing it left a client that stops mid-body holding a handler until it
+// disconnected, which is a stall the blob client's guard cannot reach: that one
+// aborts a stream to a blob node, not a read on the client's own connection.
+func TestBulkBodyAbandonsABodyThatStopsArriving(t *testing.T) {
+	readErr := make(chan error, 1)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.Copy(io.Discard, r.Body)
+		readErr <- err
+	})
+
+	srv := httptest.NewServer(requestDeadlineMiddleware(bulkBodyWithin(100*time.Millisecond, inner)))
+	defer srv.Close()
+
+	// Declares more than it sends and then never sends the rest, so the read
+	// blocks on bytes that are still owed rather than on a closed connection.
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	go func() { _, _ = pw.Write([]byte("partial")) }()
+
+	req, err := http.NewRequest(http.MethodPut, srv.URL+"/b/k", pr)
+	require.NoError(t, err)
+	req.ContentLength = 4096
+	go func() {
+		resp, err := srv.Client().Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+
+	select {
+	case err := <-readErr:
+		require.Error(t, err, "a body that stopped arriving must not read as a complete one")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gate held a stalled body past its idle bound")
+	}
+}
+
+// The counter-property, and the reason the bound is on progress rather than on
+// total duration: a body that keeps arriving is never cut off, however long it
+// takes in total. Six sends at half the bound run to three times it.
+func TestBulkBodyDoesNotBoundABodyStillArriving(t *testing.T) {
+	const idle = 100 * time.Millisecond
+
+	done := make(chan error, 1)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.Copy(io.Discard, r.Body)
+		done <- err
+	})
+
+	srv := httptest.NewServer(requestDeadlineMiddleware(bulkBodyWithin(idle, inner)))
+	defer srv.Close()
+
+	pr, pw := io.Pipe()
+	go func() {
+		for range 6 {
+			time.Sleep(idle / 2)
+			if _, err := pw.Write([]byte("chunk")); err != nil {
+				break
+			}
+		}
+		_ = pw.Close()
+	}()
+
+	req, err := http.NewRequest(http.MethodPut, srv.URL+"/b/k", pr)
+	require.NoError(t, err)
+	go func() {
+		resp, err := srv.Client().Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err, "a body still making progress was cut off")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the body never finished")
+	}
 }

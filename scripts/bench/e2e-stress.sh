@@ -23,9 +23,7 @@
 #                      "multipart-upload", "last-modified", "large-object",
 #                      "concurrent-put", "torn-overwrite", "stale-shard",
 #                      "freeze", or "partial-put" — a client that stops sending
-#                      mid-body. Unset runs all of them except partial-put,
-#                      which holds stalled uploads open and is slow enough to
-#                      ask for by name.
+#                      mid-body. Unset runs all thirteen.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -1614,10 +1612,13 @@ run_multipart_upload() {
         printf '{"Parts":[%s]}' "$(paste -sd, "$WORK_DIR/mp-parts-$spec.json.parts")" \
             > "$WORK_DIR/mp-parts-$spec.json"
 
-        # The window this scenario exists for.
+        # The window this scenario exists for. It needs an explicit read timeout:
+        # completing 1GiBx8 measures ~58s on a hosted runner, which straddles the
+        # CLI's 60s default and failed about two runs in three on that alone.
         start_rss_sampler "$WORK_DIR/mp-rss-complete-$spec.txt"
         done_start=$(date +%s)
-        aws_s3 "$gate" s3api complete-multipart-upload --bucket "$MP_BUCKET" --key "$key" \
+        aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 600 \
+            s3api complete-multipart-upload --bucket "$MP_BUCKET" --key "$key" \
             --upload-id "$upload_id" \
             --multipart-upload "file://$WORK_DIR/mp-parts-$spec.json" >/dev/null \
             || mp_check false "${spec}x${MP_PART_COUNT} complete-multipart-upload failed"
@@ -1948,7 +1949,7 @@ meta_status "${META_ALL[@]}" | tee -a "$EVENTS"
 # it a data-loss bug rather than a leak is that the shards of the object being
 # overwritten have already been replaced with the truncated ones, while the
 # metadata record still describes the object that was there before.
-if [ "$SCENARIO" = partial-put ]; then
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = partial-put ]; then
     PARTIAL_PROBE="$WORK_DIR/partialput"
     go build -o "$PARTIAL_PROBE" "$REPO_DIR/scripts/bench/partialput"
 

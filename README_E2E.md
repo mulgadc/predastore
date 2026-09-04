@@ -22,8 +22,8 @@ unrelated, and passing this gate does not put anything on a server.
 
 ## What a default run does
 
-Eleven scenarios in order, then a Warp load test. A default run is about **25
-minutes** and asserts **156** things.
+Thirteen scenarios in order, then a Warp load test. A default run is about **35
+minutes** and asserts **180** things.
 
 | Scenario | Asserts | What it does |
 |---|---|---|
@@ -39,9 +39,7 @@ minutes** and asserts **156** things.
 | `torn-overwrite` | 5 | Overwrites with the host holding one named shard stopped; asserts the failed write left the object exactly as it was |
 | `stale-shard` | 48 | Overwrites with a host frozen, asserts no read ever splices generations |
 | `freeze` | 6 | Warp GET load while a host is SIGSTOPped; survivors keep serving, frozen host rejoins raft and takes writes |
-
-`partial-put` — a client that stops sending mid-body — exists but is **not** in a
-default run. Name it explicitly.
+| `partial-put` | 18 | A client that stops sending mid-body, over HTTP/1.1 and h2, killed and stalled; asserts the gate abandons it on its idle bound and the object it overwrites is untouched |
 
 **SIGSTOP is the fault worth injecting** because it is the one a healthy
 transport cannot distinguish from a slow peer: the process stays dialable and
