@@ -173,28 +173,19 @@ e2e-performance-compare: warp-install
 	@test -n "$(PERF_AFTER)" || { echo "PERF_AFTER is required" >&2; exit 2; }
 	@WARP="$(WARP)" ./scripts/bench/compare-performance.sh "$(PERF_BEFORE)" "$(PERF_AFTER)"
 
-# Fault injection on a four-host cluster. Two tests, both run by default, and
-# neither is a benchmark: together they take roughly seven minutes regardless
-# of how fast the machine is.
+# Fault injection on a four-host cluster. Thirteen scenarios, all run by
+# default, and none is a benchmark: the run is mostly deliberate waiting, so it
+# takes about the same wall clock regardless of how fast the machine is.
 #
-# torn-overwrite stops the one host holding a named shard and overwrites the
-# object while it is down. The write fails, as it must with a shard node
-# unreachable, and the run then asks what the object is afterwards. **It
-# currently fails**: an overwrite has no commit point across its shards, so a
-# failed one leaves the object part new and part old, served as a 200 with the
-# right length and ETag. That is silent data loss on the ordinary write path,
-# which is why it runs every time rather than on request.
+# They cover shard repair and handoff, the three node re-entry paths, object
+# size and timestamp semantics, concurrent and torn overwrites, stale shards, a
+# frozen host under load, multipart upload, and a client that stops sending
+# mid-body. STRESS_HOST=leader freezes whichever host raft elected instead,
+# which still fails: a gate keeps the frozen node first in its meta read order
+# and pays the full client timeout per key, so listing slows in proportion to
+# the number of objects.
 #
-# The freeze test then puts the cluster under load, freezes a follower with
-# SIGSTOP and asserts it keeps serving and rejoins. STRESS_HOST=leader freezes
-# whichever host raft elected instead, which also fails: a gate keeps the
-# frozen node first in its meta read order and pays the full client timeout per
-# key, so listing slows in proportion to the number of objects.
-#
-# STRESS_SCENARIO narrows a run to one test. STRESS_SCENARIO=partial-put is a
-# third fault, not in a default run: a client that stops sending mid-body,
-# which is about a stalled upload neither running forever nor damaging the
-# object it is overwriting.
+# STRESS_SCENARIO narrows a run to one of them.
 STRESS_CONFIG   ?= 4host
 STRESS_FREEZE   ?= 90
 STRESS_HOST     ?= follower
@@ -205,9 +196,9 @@ e2e-stress: build certs warp-install
 		WARP="$(WARP)" \
 		./scripts/bench/e2e-stress.sh
 
-# partial-put fails today, so CI gates on a regression against
-# scripts/stress-baseline.txt rather than on a clean run. STRESS_SCENARIOS
-# narrows it: `make e2e-stress-gate STRESS_SCENARIOS=freeze`.
+# CI gates on a regression against scripts/stress-baseline.txt rather than on a
+# clean run, so a branch is not red for a gap it did not introduce.
+# STRESS_SCENARIOS narrows it: `make e2e-stress-gate STRESS_SCENARIOS=freeze`.
 STRESS_BASELINE  ?= scripts/stress-baseline.txt
 STRESS_SCENARIOS ?=
 e2e-stress-gate: build certs warp-install
@@ -216,9 +207,8 @@ e2e-stress-gate: build certs warp-install
 		WARP="$(WARP)" \
 		./scripts/bench/stress-gate.sh $(STRESS_SCENARIOS)
 
-# Fails on any failing scenario. Red until partial-put is fixed, which is the
-# point: a client that stops sending mid-body holds the gate until the harness
-# gives up, so one abandoned upload can occupy a handler indefinitely.
+# Fails on any failing scenario, which is what CI runs. The baseline records
+# every scenario green, so this and the gate above currently agree.
 e2e-stress-strict: build certs warp-install
 	@STRESS_CONFIG="$(STRESS_CONFIG)" STRESS_FREEZE="$(STRESS_FREEZE)" \
 		STRESS_HOST="$(STRESS_HOST)" STRESS_BASELINE="$(STRESS_BASELINE)" \

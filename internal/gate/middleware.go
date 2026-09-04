@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -17,6 +18,7 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/chunked"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
+	"github.com/mulgadc/predastore/internal/transport"
 )
 
 // globalSigningRegion is the region clients sign S3's global operations against,
@@ -30,6 +32,11 @@ const globalSigningRegion = "us-east-1"
 // It is a bound on the fixed exchanges, not on object data. A body is bounded
 // by progress instead: see bulkBody.
 const requestDeadline = 50 * time.Second
+
+// bulkBodyIdle is how long an object body may make no progress before the gate
+// abandons it. It matches the blob client's idle timeout, so one stalled
+// transfer is bounded the same however far down the write path it stops.
+const bulkBodyIdle = 30 * time.Second
 
 type deadlineStopperKey struct{}
 
@@ -73,28 +80,59 @@ func deadlineMiddleware(within time.Duration, next http.Handler) http.Handler {
 // error: the context bound still applies, and h2 streams are already bounded
 // by the server's own limits.
 func setConnDeadlines(ctx context.Context, rc *http.ResponseController, t time.Time) {
-	if err := rc.SetReadDeadline(t); err != nil && !errors.Is(err, http.ErrNotSupported) {
-		slog.DebugContext(ctx, "set read deadline", "err", err)
-	}
+	setReadDeadline(ctx, rc, t)
 	if err := rc.SetWriteDeadline(t); err != nil && !errors.Is(err, http.ErrNotSupported) {
 		slog.DebugContext(ctx, "set write deadline", "err", err)
 	}
 }
 
-// bulkBody releases the request deadline for the handlers that move object
-// data. Those bodies are bounded by progress instead, by the blob client's
-// idle guard, because a total cap cannot express "still sending" and a
-// multi-gigabyte transfer is legitimately slow.
+// setReadDeadline moves only the read side, so a body that stops arriving can
+// be abandoned without disturbing the response the handler still has to write.
+func setReadDeadline(ctx context.Context, rc *http.ResponseController, t time.Time) {
+	if err := rc.SetReadDeadline(t); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		slog.DebugContext(ctx, "set read deadline", "err", err)
+	}
+}
+
+// bulkBody swaps the request deadline for a progress bound on the handlers
+// that move object data, because a total cap cannot express "still sending"
+// and a multi-gigabyte transfer is legitimately slow.
+//
+// The bound has to be here rather than on the blob client's guard: that one
+// aborts a stream to a blob node, which cannot interrupt a read blocked on the
+// client's own connection. Releasing the cap without replacing it leaves a
+// client that stops mid-body holding a goroutine until it disconnects.
 //
 // Cancellation survives, so a client that disconnects still stops the work,
 // and the deadline was in force for everything before the handler ran.
 func bulkBody(next http.Handler) http.Handler {
+	return bulkBodyWithin(bulkBodyIdle, next)
+}
+
+func bulkBodyWithin(idle time.Duration, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if stopper, ok := r.Context().Value(deadlineStopperKey{}).(*deadlineStopper); ok {
 			stopper.stop()
 		}
+
+		if r.Body != nil && r.Body != http.NoBody {
+			rc := http.NewResponseController(w)
+			guard := transport.NewAbortGuard(r.Body, func() {
+				setReadDeadline(r.Context(), rc, time.Now())
+			}, idle)
+			defer guard.Stop()
+			r.Body = guardedBody{Reader: guard, Closer: r.Body}
+		}
+
 		next.ServeHTTP(w, r)
 	})
+}
+
+// guardedBody carries the idle bound on reads and leaves Close to the original
+// body, so the server keeps owning the connection's lifecycle.
+type guardedBody struct {
+	io.Reader
+	io.Closer
 }
 
 // setupMiddleware installs the chain that runs before chi has matched a route,

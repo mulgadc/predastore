@@ -50,6 +50,13 @@ func NewReadGuard(r io.Reader, stream Stream, idle time.Duration) *IdleGuard {
 	return &IdleGuard{r: r, idle: idle, abort: func() { stream.CancelRead(StreamCodeIdle) }}
 }
 
+// NewAbortGuard guards a body whose stall is ended by something other than a
+// stream: abort must unblock a read already in flight, which for a net/http
+// request body means moving the connection's read deadline into the past.
+func NewAbortGuard(r io.Reader, abort func(), idle time.Duration) *IdleGuard {
+	return &IdleGuard{r: r, idle: idle, abort: abort}
+}
+
 // NewWriteGuard guards a body being written to stream. It wraps the source
 // the copy pulls from: a source read happens only once the previous write has
 // landed, so a write that blocks shows up as a read that never comes. The

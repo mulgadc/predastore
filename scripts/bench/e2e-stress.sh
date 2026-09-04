@@ -23,9 +23,7 @@
 #                      "multipart-upload", "last-modified", "large-object",
 #                      "concurrent-put", "torn-overwrite", "stale-shard",
 #                      "freeze", or "partial-put" — a client that stops sending
-#                      mid-body. Unset runs all of them except partial-put,
-#                      which holds stalled uploads open and is slow enough to
-#                      ask for by name.
+#                      mid-body. Unset runs all thirteen.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -1951,7 +1949,7 @@ meta_status "${META_ALL[@]}" | tee -a "$EVENTS"
 # it a data-loss bug rather than a leak is that the shards of the object being
 # overwritten have already been replaced with the truncated ones, while the
 # metadata record still describes the object that was there before.
-if [ "$SCENARIO" = partial-put ]; then
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = partial-put ]; then
     PARTIAL_PROBE="$WORK_DIR/partialput"
     go build -o "$PARTIAL_PROBE" "$REPO_DIR/scripts/bench/partialput"
 

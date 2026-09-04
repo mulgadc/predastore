@@ -34,7 +34,7 @@ on:
         required: false
         default: ""
       stress_scenarios:
-        description: "Stress scenarios to run (empty = the twelve this job runs; name partial-put to add it)"
+        description: "Stress scenarios to run (empty = all thirteen)"
         required: false
         default: ""
       run_performance:
@@ -95,7 +95,7 @@ jobs:
         run: make compose-down
 
   # The scenario list is a job rather than a literal in the matrix so the
-  # dispatch input can still name the two the default set leaves out.
+  # dispatch input can narrow it to one scenario without editing the workflow.
   stress-plan:
     name: Stress (plan)
     runs-on: ubuntu-26.04
@@ -103,22 +103,21 @@ jobs:
     outputs:
       scenarios: ${{ steps.plan.outputs.scenarios }}
     steps:
-      # Twelve of the thirteen. Only partial-put is out, and it is out because
-      # it fails: an unbounded inbound body read, mulga-8lxge. It is covered by
-      # the spinifex nightly and can be named in the dispatch input.
+      # All thirteen. The two that were excluded both failed for reasons that
+      # had nothing to do with the scenarios: multipart-upload completion took
+      # the AWS CLI's 60s default while the work measures 63-68s, and
+      # partial-put had no bound on the inbound body read at all.
       #
-      # multipart-upload was out too, recorded as dying restarting its cluster
-      # between part sizes. That was never the cause — completion took the CLI's
-      # 60s default while the work measures 63-68s, so it timed out on itself.
-      # With an explicit timeout it is 5 for 5, and it gates here rather than
-      # waiting for the nightly.
+      # Both were recorded as covered by the spinifex nightly. partial-put was
+      # not: it was the one scenario with no branch under SCENARIO=all, which is
+      # what the nightly runs, so it had no coverage anywhere.
       - name: Choose Scenarios
         id: plan
         env:
           REQUESTED: ${{ inputs.stress_scenarios }}
         run: |
           set -euo pipefail
-          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put torn-overwrite stale-shard freeze multipart-upload"
+          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put torn-overwrite stale-shard freeze multipart-upload partial-put"
           # shellcheck disable=SC2086
           printf '%s\n' ${REQUESTED:-$default} | jq -Rsc 'split("\n") | map(select(length > 0))' \
             | sed 's/^/scenarios=/' >> "$GITHUB_OUTPUT"
