@@ -59,7 +59,8 @@ The multi-host profiles put every host on one machine behind loopback aliases, s
 Stop, reset or benchmark the cluster with:
 
 ```bash
-./scripts/stop.sh
+./scripts/stop.sh              # every cluster under $PREDA_DIR
+./scripts/stop.sh 3host        # only that one, leaving any others running
 ./scripts/clean.sh
 ./scripts/bench.sh 3host
 ./scripts/bench.sh disk

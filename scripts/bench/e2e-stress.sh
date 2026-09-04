@@ -176,11 +176,10 @@ log() {
 
 fail() { log "FAIL: $*"; exit 1; }
 
-# stop_clusters takes down every cluster under PREDA_DIR and confirms each node
-# is gone rather than assuming the signal landed: one that outlives the run
-# holds its ports and fails the next one somewhere unrelated. stop.sh removes
-# each pidfile as it signals, so the handles are taken before it runs rather
-# than looked for afterwards.
+# stop_clusters takes down every cluster under PREDA_DIR, which is this run's own
+# private directory, so the unnamed sweep is already scoped to it. stop.sh now
+# confirms each node is gone and escalates on its own; the pids are still
+# collected first so a pidfile it could not attribute is still followed up here.
 stop_clusters() {
     local pidfile pid waited
     local pids=()
