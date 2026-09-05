@@ -1716,6 +1716,8 @@ LM_CONFIG="$PREDA_CONFIG_DIR/$LM_CLUSTER.toml"
 LM_BUCKET="stress-lastmod"
 LM_FAILURES=0
 LM_CASES=0
+PARTIAL_FAILURES=0
+PARTIAL_CASES=0
 
 lm_check() {
     local ok="$1" message="$2"
@@ -2007,8 +2009,6 @@ if [ "$SCENARIO" = all ] || [ "$SCENARIO" = partial-put ]; then
         echo "${found:-0}"
     }
 
-    FAILURES=0
-
     # run_case: <name> <http2> <declare> <send> <rate> <kill-after-seconds, 0 to stall>
     #
     # Each case stores a fresh object under its own key and then overwrites that
@@ -2082,12 +2082,10 @@ if [ "$SCENARIO" = all ] || [ "$SCENARIO" = partial-put ]; then
         log "$name: during=$during gate_max=${gate_ms}ms abandoned=$abandoned after=$after"
         local result
         for result in "$during" "$abandoned" "$after"; do
-            [ "$result" = pass ] || FAILURES=$(( FAILURES + 1 ))
+            [ "$result" = pass ] || PARTIAL_FAILURES=$(( PARTIAL_FAILURES + 1 ))
         done
-        CASES_RUN=$(( CASES_RUN + 3 ))
+        PARTIAL_CASES=$(( PARTIAL_CASES + 3 ))
     }
-
-    CASES_RUN=0
 
     # Both protocols, because they need not fail the same way: a stalled h2
     # stream is flow-control state on a shared connection, an HTTP/1.1 stall is
@@ -2202,16 +2200,24 @@ if [ "$SCENARIO" = all ] || [ "$SCENARIO" = partial-put ]; then
     log "concurrent: during=$CONC_DURING gate_max=${CONC_GATE_MS}ms abandoned=$CONC_ABANDONED after=$CONC_AFTER"
     log "concurrent: gate rss ${RSS_BEFORE}->${RSS_PEAK}MB, vsz ${VSZ_BEFORE}->${VSZ_PEAK}MB across $CONCURRENCY stalled uploads"
     for result in "$CONC_DURING" "$CONC_ABANDONED" "$CONC_AFTER"; do
-        [ "$result" = pass ] || FAILURES=$(( FAILURES + 1 ))
+        [ "$result" = pass ] || PARTIAL_FAILURES=$(( PARTIAL_FAILURES + 1 ))
     done
-    CASES_RUN=$(( CASES_RUN + 3 ))
+    PARTIAL_CASES=$(( PARTIAL_CASES + 3 ))
 
     aws_s3 "$ENDPOINT" s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true
 
-    echo "Stress results: $RUN_DIR"
-    [ "$FAILURES" -eq 0 ] || fail "partial-put scenario failed $FAILURES of $CASES_RUN assertions"
-    log "partial-put scenario passed"
-    exit 0
+    if [ "$PARTIAL_FAILURES" -eq 0 ]; then
+        log "partial-put: passed $PARTIAL_CASES assertions"
+    else
+        log "partial-put: FAILED $PARTIAL_FAILURES of $PARTIAL_CASES assertions"
+    fi
+
+    if [ "$SCENARIO" = partial-put ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$PARTIAL_FAILURES" -eq 0 ] \
+            || fail "partial-put failed $PARTIAL_FAILURES of $PARTIAL_CASES assertions"
+        exit 0
+    fi
 fi
 
 # A state document rather than random bytes, because the objects this destroyed
@@ -3102,10 +3108,39 @@ log "Warp completed with no errors"
     else
         echo "last_modified=fail ($LM_FAILURES of $LM_CASES)"
     fi
+    if [ "$NODE_CASES" -eq 0 ]; then
+        echo "node_recovery=skipped"
+    elif [ "$NODE_FAILURES" -eq 0 ]; then
+        echo "node_recovery=pass"
+    else
+        echo "node_recovery=fail ($NODE_FAILURES of $NODE_CASES)"
+    fi
+    if [ "$MP_CASES" -eq 0 ]; then
+        echo "multipart_upload=skipped"
+    elif [ "$MP_FAILURES" -eq 0 ]; then
+        if [ "$MP_SKIPPED" -gt 0 ]; then
+            echo "multipart_upload=pass ($MP_SKIPPED size(s) skipped for disk)"
+        else
+            echo "multipart_upload=pass"
+        fi
+    else
+        echo "multipart_upload=fail ($MP_FAILURES of $MP_CASES)"
+    fi
+    if [ "$PARTIAL_CASES" -eq 0 ]; then
+        echo "partial_put=skipped"
+    elif [ "$PARTIAL_FAILURES" -eq 0 ]; then
+        echo "partial_put=pass"
+    else
+        echo "partial_put=fail ($PARTIAL_FAILURES of $PARTIAL_CASES)"
+    fi
     if [ "$LARGE_CASES" -eq 0 ]; then
         echo "large_object=skipped"
     elif [ "$LARGE_FAILURES" -eq 0 ]; then
-        echo "large_object=pass${LARGE_SKIPPED:+ ($LARGE_SKIPPED size(s) skipped for disk)}"
+        if [ "$LARGE_SKIPPED" -gt 0 ]; then
+            echo "large_object=pass ($LARGE_SKIPPED size(s) skipped for disk)"
+        else
+            echo "large_object=pass"
+        fi
     else
         echo "large_object=fail ($LARGE_FAILURES of $LARGE_CASES)"
     fi
@@ -3135,3 +3170,9 @@ echo "Stress results: $RUN_DIR"
     || fail "last-modified failed $LM_FAILURES of $LM_CASES assertions"
 [ "$CPUT_FAILURES" -eq 0 ] \
     || fail "concurrent-put failed $CPUT_FAILURES of $CPUT_CASES assertions"
+[ "$NODE_FAILURES" -eq 0 ] \
+    || fail "node recovery failed $NODE_FAILURES of $NODE_CASES assertions"
+[ "$MP_FAILURES" -eq 0 ] \
+    || fail "multipart-upload failed $MP_FAILURES of $MP_CASES assertions"
+[ "$PARTIAL_FAILURES" -eq 0 ] \
+    || fail "partial-put failed $PARTIAL_FAILURES of $PARTIAL_CASES assertions"
