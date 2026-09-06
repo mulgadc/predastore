@@ -12,6 +12,11 @@
 #   PERF_PRESET      smoke (30s per workload, default) or compare (2m)
 #   PERF_CONFIGS     Profiles to run, space separated (default: "1host 3host")
 #   PERF_RESULTS_ROOT Where runs are written
+#   PERF_WORK_ROOT   Where the cluster work directory is created, and so which
+#                    disk the shards land on. Defaults to TMPDIR. Point it at
+#                    the fastest local filesystem: the PUT numbers cannot
+#                    exceed what this disk sustains under fsync, so a slow one
+#                    is measured instead of predastore.
 #   PERF_KEEP_WORK   1 to keep the cluster work directory after the run
 #   PERF_PORT_OFFSET Added to every node port, so a run does not collide with a
 #                    cluster already on the defaults (default: 10000)
@@ -91,10 +96,32 @@ else
     SHA="$(git -C "$REPO_DIR" rev-parse --short HEAD)"
 fi
 RUN_DIR="$RESULTS_ROOT/${STAMP}-${SHA}"
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/predastore-e2e-performance.XXXXXX")"
+
+# The shards land under the work directory, so whatever disk this resolves to is
+# the disk the PUT numbers measure. TMPDIR is the wrong thing to inherit for
+# that: it is chosen for scratch space, is often tmpfs, and on a CI runner is
+# wherever the runner was installed rather than wherever the fast disk is.
+#
+# PERF_WORK_ROOT names it directly. A run whose write path is bounded by the
+# host's slowest filesystem is measuring that filesystem, not predastore.
+# rotational_of reports what the kernel thinks the backing device is. It is
+# worth recording because it is the one property that separates the disks here
+# by name and not by speed: the boot volume is an M.2 RAID that reports 1.
+rotational_of() {
+    local src base
+    src="$(findmnt -no SOURCE --target "$1" 2>/dev/null)" || return 0
+    base="$(lsblk -no PKNAME "$src" 2>/dev/null | head -n 1)"
+    [ -n "$base" ] || base="$(basename "$src")"
+    cat "/sys/block/$base/queue/rotational" 2>/dev/null || echo unknown
+}
+
+WORK_ROOT="${PERF_WORK_ROOT:-${TMPDIR:-/tmp}}"
+[ -d "$WORK_ROOT" ] || { echo "PERF_WORK_ROOT does not exist: $WORK_ROOT" >&2; exit 1; }
+[ -w "$WORK_ROOT" ] || { echo "PERF_WORK_ROOT is not writable: $WORK_ROOT" >&2; exit 1; }
+WORK_DIR="$(mktemp -d "$WORK_ROOT/predastore-e2e-performance.XXXXXX")"
 
 case "$WORK_DIR" in
-    ""|/|"${TMPDIR:-/tmp}") echo "refusing unsafe work directory: $WORK_DIR" >&2; exit 1 ;;
+    ""|/|"$WORK_ROOT"|"${TMPDIR:-/tmp}") echo "refusing unsafe work directory: $WORK_DIR" >&2; exit 1 ;;
 esac
 
 mkdir -p "$RUN_DIR/logs" "$RUN_DIR/correctness"
@@ -330,6 +357,12 @@ fi
     echo "cpu=$(uname -p)"
     echo "logical_cpus=$(getconf _NPROCESSORS_ONLN)"
     echo "memory_bytes=$(awk '/MemTotal/ {print $2 * 1024}' /proc/meminfo 2>/dev/null || echo unknown)"
+    # The disk the shards land on bounds every PUT number below it, so which
+    # one it was belongs beside the numbers rather than in the job that set it.
+    echo "work_root=$WORK_ROOT"
+    echo "work_root_source=$(findmnt -no SOURCE --target "$WORK_ROOT" 2>/dev/null || echo unknown)"
+    echo "work_root_fstype=$(findmnt -no FSTYPE --target "$WORK_ROOT" 2>/dev/null || echo unknown)"
+    echo "work_root_rotational=$(rotational_of "$WORK_ROOT")"
     echo
     echo "Workload controls"
     echo "-----------------"
