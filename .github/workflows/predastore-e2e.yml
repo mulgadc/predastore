@@ -189,7 +189,7 @@ jobs:
 
       - name: Upload Results
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: stress-${{ matrix.scenario }}
           path: scripts/bench/results/e2e-stress/
@@ -502,7 +502,7 @@ jobs:
 
       - name: Upload Results
         if: always() && steps.gate.outputs.paused != 'true' && steps.config.outcome == 'success'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: performance
           # Two roots, not one. A loopback figure and a bare-metal one are not
