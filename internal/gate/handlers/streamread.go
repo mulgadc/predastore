@@ -540,13 +540,11 @@ func (r *stripeReader) reportShard(ctx context.Context, index int, node config.N
 		Longest: time.Duration(p.longest.Load()),
 	})
 
-	if active <= 0 {
-		return
-	}
-	if rate := bytes * int64(time.Second) / int64(active); rate < slowShardFloor {
+	if shardBelowFloor(bytes, active) {
 		slog.WarnContext(ctx, "Shard delivered below the throughput floor",
 			"node", node, "index", index, "bytes", bytes,
-			"rate_KiBps", rate/1024, "stalls", p.stalls.Load(),
+			"rate_KiBps", bytes*int64(time.Second)/int64(active)/1024,
+			"stalls", p.stalls.Load(),
 			"longest_stall_ms", time.Duration(p.longest.Load()).Milliseconds())
 	}
 }

@@ -40,7 +40,7 @@ ALL_SCENARIOS=(
     repair handoff
     node-rejoin node-resync node-rebuild
     multipart-upload last-modified large-object concurrent-put
-    partial-put torn-overwrite stale-shard freeze
+    partial-put torn-overwrite stale-shard object-sizes freeze
 )
 
 if [ $# -gt 0 ]; then

@@ -862,6 +862,25 @@ func reportDegradedRead(ctx context.Context, bucket, key string, failures []shar
 // healthy for a large block and hopeless for a small one.
 const slowShardFloor = 8 << 20 // bytes per second
 
+// slowShardMinBytes is the least a shard may deliver before its rate is worth
+// reading at all. A shard this size takes 32ms at the floor, well clear of the
+// round trip that would otherwise be the whole of the window it is timed over.
+const slowShardMinBytes = 256 << 10
+
+// shardBelowFloor reports whether a shard delivered slowly enough to name its
+// node for. A shard that arrived in one round trip is not judged: active is
+// then the latency, and bytes over a latency is not a throughput.
+//
+// Losing the small-object case costs no coverage. A degrading node shows up in
+// stalls, in the hedge and in connection eviction, none of which is a rate.
+func shardBelowFloor(bytes int64, active time.Duration) bool {
+	if bytes < slowShardMinBytes || active <= 0 {
+		return false
+	}
+
+	return bytes*int64(time.Second)/int64(active) < slowShardFloor
+}
+
 // hedgeProbeInterval is how often the stripe loop asks whether a shard is still
 // delivering. Fine enough that a stall is caught well inside the delay, coarse
 // enough to cost nothing on a healthy read.

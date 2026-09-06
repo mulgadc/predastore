@@ -1,8 +1,13 @@
 package handlers
 
 import (
+	"context"
+	"io"
 	"sync"
 	"time"
+
+	"github.com/mulgadc/predastore/internal/blob"
+	"github.com/mulgadc/predastore/internal/config"
 )
 
 // testClock is a clock that only moves when a test moves it. Time passing then
@@ -170,3 +175,50 @@ func (p *shardPacer) await(self int, ok func(*shardProgress) bool) {
 func frozenClock() stripeOption {
 	return withClock(newTestClock())
 }
+
+// latencyBlob charges a stated latency to every shard body it serves. A small
+// object arrives in one read, so its active window is whatever the machine took
+// to copy a few bytes between goroutines -- somewhere between zero and a
+// microsecond, and different on every run. Charging the latency explicitly makes
+// how fast a shard was delivered a property of the test rather than of the box.
+type latencyBlob struct {
+	*fakeBlob
+
+	clk     *testClock
+	latency time.Duration
+}
+
+func newLatencyBlob(bc *fakeBlob, latency time.Duration) *latencyBlob {
+	return &latencyBlob{fakeBlob: bc, clk: newTestClock(), latency: latency}
+}
+
+func (b *latencyBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
+	rc, err := b.fakeBlob.Get(ctx, node, req)
+	if err != nil {
+		return rc, err
+	}
+
+	return &latencyReader{ReadCloser: rc, blob: b}, nil
+}
+
+// latencyReader advances the clock once, on the read that delivers the first
+// bytes. That is the moment progress records as lastAt, so the shard's active
+// window becomes exactly the latency and nothing else.
+type latencyReader struct {
+	io.ReadCloser
+
+	blob    *latencyBlob
+	charged bool
+}
+
+func (r *latencyReader) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 && !r.charged {
+		r.charged = true
+		r.blob.clk.Advance(r.blob.latency)
+	}
+
+	return n, err
+}
+
+var _ BlobClient = (*latencyBlob)(nil)

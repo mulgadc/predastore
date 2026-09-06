@@ -12,4 +12,5 @@ PASS|concurrent-put
 PASS|partial-put
 PASS|torn-overwrite
 PASS|stale-shard
+PASS|object-sizes
 PASS|freeze
