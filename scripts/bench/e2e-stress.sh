@@ -22,8 +22,8 @@
 #                      "node-rejoin", "node-resync", "node-rebuild",
 #                      "multipart-upload", "last-modified", "large-object",
 #                      "concurrent-put", "torn-overwrite", "stale-shard",
-#                      "freeze", or "partial-put" — a client that stops sending
-#                      mid-body. Unset runs all thirteen.
+#                      "object-sizes", "freeze", or "partial-put" — a client
+#                      that stops sending mid-body. Unset runs all fourteen.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -55,6 +55,12 @@
 #   STRESS_LARGE_SIZES Object sizes the large-object scenario writes and reads
 #                      (default: "2GiB 4GiB"). A size with no room on disk is
 #                      skipped loudly, never silently.
+#   STRESS_SIZES       The object-sizes ladder, in bytes (default: 4 through
+#                      131072). Every size is below one stream block, so the
+#                      scenario is about small objects and stays that way.
+#   STRESS_SIZE_KEYS   Keys written per size (default: 16). Placement follows
+#                      the object hash, so this is how many placements each
+#                      size is exercised over rather than repetition.
 #   STRESS_WORK_ROOT   Where the cluster work directory is created. Defaults to
 #                      TMPDIR, except when large-object is in the run: TMPDIR is
 #                      often tmpfs, which is RAM-backed, so it would both cap
@@ -88,7 +94,7 @@ STALE_KEYS="${STRESS_STALE_KEYS:-12}"
 SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
     all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff|large-object|multipart-upload) ;;
-    last-modified|concurrent-put) ;;
+    last-modified|concurrent-put|object-sizes) ;;
     node-rejoin|node-resync|node-rebuild) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
@@ -1719,6 +1725,157 @@ LM_CASES=0
 PARTIAL_FAILURES=0
 PARTIAL_CASES=0
 
+# --- Scenario: object-sizes ---
+#
+# Every other scenario here writes megabytes. The sizes a control plane actually
+# stores are much smaller — a placement record, a volume state document, a piece
+# of user data — and nothing was reading one back across nodes.
+#
+# What that missed: the gate judged every shard read against an 8 MiB/s
+# throughput floor with no minimum size, and for an object that arrives in one
+# read the window it divides by is the round trip. 195 warnings across two e2e
+# cells were all on objects of 297-489 bytes, all naming one node, and were read
+# as a blob node degrading.
+#
+# So this is a ladder rather than a size: small enough to be latency-bound, wide
+# enough that a padding or rounding error at a shard boundary has somewhere to
+# show, and written under many keys because placement follows the object hash.
+# One key exercises one placement; sixteen exercise the ring.
+
+SIZES_CLUSTER="${CONFIG_NAME}-sizes"
+SIZES_CONFIG="$PREDA_CONFIG_DIR/$SIZES_CLUSTER.toml"
+SIZES_BUCKET="stress-sizes"
+SIZES_LADDER="${STRESS_SIZES:-4 8 96 297 489 512 1024 2048 4096 8192 16384 32768 65536 131072}"
+SIZES_KEYS="${STRESS_SIZE_KEYS:-16}"
+SIZES_FAILURES=0
+SIZES_CASES=0
+
+# The warning this scenario exists to keep out of the logs. Matched as a fixed
+# string against every node log, since a gate names its own node in the line.
+SIZES_FLOOR_WARNING="Shard delivered below the throughput floor"
+
+sizes_check() {
+    local ok="$1" message="$2"
+    SIZES_CASES=$(( SIZES_CASES + 1 ))
+    if [ "$ok" = true ]; then
+        log "object-sizes: pass, $message"
+    else
+        log "object-sizes: FAIL $message"
+        SIZES_FAILURES=$(( SIZES_FAILURES + 1 ))
+    fi
+}
+
+render_sizes_profile() {
+    render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$SIZES_CONFIG" "$(( PORT_OFFSET + 800 ))"
+    pin_availability "$SIZES_CONFIG" false false
+    pin_repair_off "$SIZES_CONFIG"
+    cat >> "$SIZES_CONFIG" <<EOF
+
+[[bucket]]
+name = "$SIZES_BUCKET"
+region = "$REGION"
+public = true
+account_id = "123456789012"
+EOF
+    cp "$SIZES_CONFIG" "$RUN_DIR/$SIZES_CLUSTER.toml"
+}
+
+run_object_sizes() {
+    local results="$RUN_DIR/object-sizes.tsv"
+    local gate read_gate size i key src dst bad short floor_lines log_file
+    local content_length
+
+    render_sizes_profile
+    log "object-sizes: starting $SIZES_CLUSTER"
+    "$SCRIPTS_DIR/start.sh" -w "$SIZES_CLUSTER"
+
+    gate="$(parse_hosts "$SIZES_CONFIG" | awk '!f && $3 != "" { print "https://" $2 ":" $3; f = 1 }')"
+    [ -n "$gate" ] || fail "object-sizes: no gate in $SIZES_CLUSTER"
+    read_gate="$(survivor_gate "$SIZES_CONFIG" "$(parse_hosts "$SIZES_CONFIG" | awk 'NR == 1 { print $1 }')")"
+    [ -n "$read_gate" ] \
+        || fail "object-sizes: $SIZES_CLUSTER has only one gate, so a read cannot come from another"
+    log "object-sizes: writing through $gate, reading back through $read_gate, $SIZES_KEYS keys per size"
+
+    printf 'size\tkeys\tmismatched\twrong_length\tverdict\n' > "$results"
+
+    src="$WORK_DIR/sizes-src.bin"
+    dst="$WORK_DIR/sizes-got.bin"
+
+    for size in $SIZES_LADDER; do
+        bad=0
+        short=0
+        for (( i = 0; i < SIZES_KEYS; i++ )); do
+            key="$(printf 'prefix-%02d/object-%d.bin' "$i" "$size")"
+            openssl rand -out "$src" "$size"
+
+            if ! aws_s3 "$gate" s3api put-object --bucket "$SIZES_BUCKET" --key "$key" \
+                --body "$src" >/dev/null 2>>"$RUN_DIR/object-sizes-errors.txt"; then
+                bad=$(( bad + 1 ))
+                continue
+            fi
+
+            # The read deliberately goes to a host that did not accept the
+            # write, so the shards cross the wire from nodes that have them
+            # only because the encode put them there.
+            #
+            # ContentLength comes off the GET rather than a third call: padding
+            # squares the last stripe, so an object that compares equal can
+            # still be served with the padded length, and this is the length
+            # the client was actually given.
+            content_length="$(aws_s3 "$read_gate" s3api get-object --bucket "$SIZES_BUCKET" \
+                --key "$key" --query ContentLength --output text \
+                "$dst" 2>>"$RUN_DIR/object-sizes-errors.txt")" || content_length=""
+            if [ -z "$content_length" ]; then
+                bad=$(( bad + 1 ))
+                continue
+            fi
+            cmp -s "$src" "$dst" || bad=$(( bad + 1 ))
+            [ "$content_length" = "$size" ] || short=$(( short + 1 ))
+        done
+
+        # HEAD is a different handler from GET and answers from the placement
+        # record rather than the stream, so one key per size is headed too.
+        key="$(printf 'prefix-00/object-%d.bin' "$size")"
+        content_length="$(aws_s3 "$read_gate" s3api head-object --bucket "$SIZES_BUCKET" \
+            --key "$key" --query ContentLength --output text 2>>"$RUN_DIR/object-sizes-errors.txt")"
+        sizes_check "$([ "$content_length" = "$size" ] && echo true || echo false)" \
+            "HEAD answers $size bytes for $key (got ${content_length:-nothing})"
+
+        if [ "$bad" -eq 0 ] && [ "$short" -eq 0 ]; then
+            printf '%s\t%s\t0\t0\tok\n' "$size" "$SIZES_KEYS" >> "$results"
+        else
+            printf '%s\t%s\t%s\t%s\tfailed\n' "$size" "$SIZES_KEYS" "$bad" "$short" >> "$results"
+        fi
+        sizes_check "$([ "$bad" -eq 0 ] && echo true || echo false)" \
+            "all $SIZES_KEYS keys at $size bytes round-tripped through a second gate ($bad mismatched)"
+        sizes_check "$([ "$short" -eq 0 ] && echo true || echo false)" \
+            "every GET at $size bytes was served that length ($short wrong)"
+    done
+    rm -f "$src" "$dst"
+
+    # The cluster is fresh and this scenario is its only workload, so any
+    # occurrence of the floor warning belongs to the ladder above — and every
+    # size in it is far too small for a throughput to have been measured.
+    floor_lines=0
+    for log_file in "$PREDA_DIR/$SIZES_CLUSTER/logs"/*; do
+        [ -f "$log_file" ] || continue
+        floor_lines=$(( floor_lines + $(grep -cF "$SIZES_FLOOR_WARNING" "$log_file" || true) ))
+    done
+    printf 'floor_warnings\t%s\n' "$floor_lines" >> "$results"
+    sizes_check "$([ "$floor_lines" -eq 0 ] && echo true || echo false)" \
+        "no node reported a shard below the throughput floor for a sub-128KiB object ($floor_lines lines)"
+
+    log "object-sizes: stopping $SIZES_CLUSTER"
+    "$SCRIPTS_DIR/stop.sh" -w "$SIZES_CLUSTER" >/dev/null 2>&1 || true
+    mkdir -p "$RUN_DIR/logs-sizes"
+    cp -R "$PREDA_DIR/$SIZES_CLUSTER/logs/." "$RUN_DIR/logs-sizes/" 2>/dev/null || true
+    if [ "$SIZES_FAILURES" -eq 0 ]; then
+        log "object-sizes: passed $SIZES_CASES assertions"
+    else
+        log "object-sizes: FAILED $SIZES_FAILURES of $SIZES_CASES assertions"
+    fi
+}
+
 lm_check() {
     local ok="$1" message="$2"
     LM_CASES=$(( LM_CASES + 1 ))
@@ -1925,6 +2082,17 @@ if [ "$SCENARIO" = all ] || [ "$SCENARIO" = large-object ]; then
         echo "Stress results: $RUN_DIR"
         [ "$LARGE_FAILURES" -eq 0 ] \
             || fail "large-object failed $LARGE_FAILURES of $LARGE_CASES assertions"
+        exit 0
+    fi
+fi
+
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = object-sizes ]; then
+    run_object_sizes
+
+    if [ "$SCENARIO" = object-sizes ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$SIZES_FAILURES" -eq 0 ] \
+            || fail "object-sizes failed $SIZES_FAILURES of $SIZES_CASES assertions"
         exit 0
     fi
 fi
