@@ -348,6 +348,14 @@ jobs:
         if: steps.gate.outputs.paused != 'true'
         run: make warp-install
 
+      # Not fatal: an unset variable falls back to TMPDIR, which is what this
+      # job did before. It is worth saying out loud though, because the fallback
+      # is the slow boot volume and the only other place that shows is the
+      # work_root line in run-info.txt.
+      - name: Warn if the loopback work root is unset
+        if: steps.gate.outputs.paused != 'true' && vars.PREDASTORE_PERF_WORK_ROOT == ''
+        run: echo "::warning::PREDASTORE_PERF_WORK_ROOT is unset, so the loopback shards land on the runner's boot volume and the PUT numbers measure that disk."
+
       # The bare-metal numbers have no denominator without this. The same code
       # and the same workloads with the network taken out is what says whether
       # three hosts are worth having, and PERF_CONFIGS covers 1host and 3host.
@@ -364,6 +372,12 @@ jobs:
           # /tmp here may be tmpfs and a 30s PUT workload stages gigabytes
           # through it, so the script's work directory is steered off it.
           TMPDIR: ${{ runner.temp }}
+          # runner.temp is on the boot volume, which is a Dell BOSS M.2 RAID
+          # the kernel reports as rotational: 88 MiB/s sequential and 8 MiB/s
+          # under fsync. Loopback PUT measured 6.62 MiB/s against it, which is
+          # that ceiling and not predastore's. The shards go on a SATA SSD
+          # instead, at 368 MiB/s sequential and 116 MiB/s under fsync.
+          PERF_WORK_ROOT: ${{ vars.PREDASTORE_PERF_WORK_ROOT }}
           PERF_RESULTS_ROOT: scripts/bench/results/e2e-performance-loopback
           PERF_CONFIGS: 3host
         run: make e2e-performance
@@ -379,6 +393,7 @@ jobs:
         if: steps.gate.outputs.paused != 'true'
         env:
           TMPDIR: ${{ runner.temp }}
+          PERF_WORK_ROOT: ${{ vars.PREDASTORE_PERF_WORK_ROOT }}
           PERF_RESULTS_ROOT: scripts/bench/results/e2e-performance-loopback-small
           PERF_CONFIGS: 3host
           PERF_PUT_SIZE: 64KiB
