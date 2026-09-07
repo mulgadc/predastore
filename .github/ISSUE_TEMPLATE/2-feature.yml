@@ -2,25 +2,6 @@ name: Feature request
 description: Suggest something new.
 labels: ["enhancement"]
 body:
-  - type: dropdown
-    id: component
-    attributes:
-      label: Component
-      options:
-        - S3 API
-        - Erasure coding
-        - Raft / metadata
-        - QUIC / transport
-        - Storage segments / durability
-        - Authentication / SigV4
-        - Encryption at rest
-        - Configuration / deployment
-        - Observability / telemetry
-        - Documentation
-        - Other / not sure
-    validations:
-      required: true
-
   - type: textarea
     id: proposal
     attributes:
