@@ -7,8 +7,6 @@ import (
 	"sync"
 )
 
-var ErrInvalidAddr = errors.New("invalid address")
-var ErrNoRegistry = errors.New("no registry")
 var ErrAddrInUse = errors.New("address already in use")
 var ErrConnRefused = errors.New("connection refused")
 
@@ -21,12 +19,15 @@ func NewPipeRegistry() *PipeRegistry {
 	return &PipeRegistry{trs: make(map[string]*PipeTransport)}
 }
 
+func (pr *PipeRegistry) key(addr net.Addr) string {
+	return addr.Network() + "|" + addr.String()
+}
+
 func (pr *PipeRegistry) put(new *PipeTransport) bool {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
 
-	key := new.addr.String()
-
+	key := pr.key(new.addr)
 	_, ok := pr.trs[key]
 	if ok {
 		return false
@@ -40,14 +41,14 @@ func (pr *PipeRegistry) get(addr net.Addr) (*PipeTransport, bool) {
 	pr.mu.RLock()
 	defer pr.mu.RUnlock()
 
-	pt, ok := pr.trs[addr.String()]
+	pt, ok := pr.trs[pr.key(addr)]
 	return pt, ok
 }
 
 func (pr *PipeRegistry) delete(addr net.Addr) {
 	pr.mu.Lock()
 	defer pr.mu.Unlock()
-	delete(pr.trs, addr.String())
+	delete(pr.trs, pr.key(addr))
 }
 
 type PipeTransport struct {
@@ -60,12 +61,8 @@ type PipeTransport struct {
 }
 
 func NewPipeTransport(addr net.Addr, reg *PipeRegistry) (*PipeTransport, error) {
-	if addr == nil {
-		return nil, ErrInvalidAddr
-	}
-
 	if reg == nil {
-		return nil, ErrNoRegistry
+		return nil, errors.New("nil registry")
 	}
 
 	pt := &PipeTransport{
@@ -85,6 +82,10 @@ func NewPipeTransport(addr net.Addr, reg *PipeRegistry) (*PipeTransport, error) 
 func (pt *PipeTransport) Accept() (net.Conn, error) {
 	select {
 	case conn := <-pt.accept:
+		if pt.isClosed() {
+			conn.Close()
+			return nil, &net.OpError{Op: "accept", Net: "pipe", Addr: pt.addr, Err: net.ErrClosed}
+		}
 		return conn, nil
 
 	case <-pt.done:
@@ -95,7 +96,7 @@ func (pt *PipeTransport) Accept() (net.Conn, error) {
 func (pt *PipeTransport) Addr() net.Addr { return pt.addr }
 
 func (pt *PipeTransport) Close() error {
-	err := net.ErrClosed
+	var err error = &net.OpError{Op: "close", Net: "pipe", Addr: pt.addr, Err: net.ErrClosed}
 
 	pt.once.Do(func() {
 		pt.registry.delete(pt.addr)
@@ -107,6 +108,10 @@ func (pt *PipeTransport) Close() error {
 }
 
 func (pt *PipeTransport) Dial(ctx context.Context, addr net.Addr) (net.Conn, error) {
+	if pt.isClosed() {
+		return nil, &net.OpError{Op: "dial", Net: "pipe", Addr: addr, Source: pt.addr, Err: net.ErrClosed}
+	}
+
 	listener, ok := pt.registry.get(addr)
 	if !ok {
 		return nil, &net.OpError{Op: "dial", Net: "pipe", Addr: addr, Source: pt.addr, Err: ErrConnRefused}
@@ -123,6 +128,16 @@ func (pt *PipeTransport) Dial(ctx context.Context, addr net.Addr) (net.Conn, err
 
 	case <-ctx.Done():
 		return nil, &net.OpError{Op: "dial", Net: "pipe", Addr: addr, Source: pt.addr, Err: ctx.Err()}
+	}
+}
+
+func (pt *PipeTransport) isClosed() bool {
+	select {
+	case <-pt.done:
+		return true
+
+	default:
+		return false
 	}
 }
 
