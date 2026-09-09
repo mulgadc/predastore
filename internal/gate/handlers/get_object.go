@@ -127,13 +127,20 @@ func serveObject(
 		}
 	}
 
+	// A range that crosses a block still reads whole stripes, because a stripe
+	// is what parity rebuilds, but only the ones it touches. The lead-in from
+	// the stripe boundary up to start is read and dropped.
 	began := time.Now()
-	reader, err := newStripeReader(ctx, bc, cfg, objectHash, place, handoff)
+	reader, err := newStripeReader(ctx, bc, cfg, objectHash, place, handoff, withStart(start))
 	if err != nil {
 		HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 		return
 	}
 	defer reader.close(ctx)
+
+	// Taken from the reader's own layout, so the offset it opened at and the
+	// lead-in dropped here cannot disagree.
+	stripeAt, _ := reader.lay.stripeStart(start)
 
 	first, n, err := reader.next(ctx)
 	if err != nil {
@@ -144,8 +151,8 @@ func serveObject(
 
 	header(end-start+1, reader.reconstructed)
 
-	out := &windowWriter{dst: w, skip: start, limit: end - start + 1}
-	if err := drain(ctx, reader, out, first, n, size); err != nil {
+	out := &windowWriter{dst: w, skip: start - stripeAt, limit: end - start + 1}
+	if err := drain(ctx, reader, out, first, n, stripeAt, end+1); err != nil {
 		// The header and part of the body have gone; the only honest signal
 		// left is to stop short of Content-Length, which every client treats
 		// as the failure it is.

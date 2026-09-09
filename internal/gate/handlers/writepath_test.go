@@ -112,6 +112,11 @@ type fakeBlob struct {
 	commitCalls atomic.Int64
 	abortCalls  atomic.Int64
 
+	// getBytes counts what the shard streams actually delivered, not what they
+	// were asked for: a read that opens a stream to the end of the shard and
+	// closes it early costs the node only the part it took.
+	getBytes atomic.Int64
+
 	// released records every generation a writer said it had superseded, so a
 	// test can tell a bounded retention from one that only ages out.
 	released     []blob.ReleaseRequest
@@ -252,7 +257,22 @@ func (b *fakeBlob) Get(_ context.Context, _ config.NodeID, req blob.GetRequest) 
 	if req.RangeStart >= 0 && req.RangeEnd >= 0 {
 		data = data[req.RangeStart : req.RangeEnd+1]
 	}
-	return io.NopCloser(bytes.NewReader(data)), nil
+	return io.NopCloser(&tallyingReader{r: bytes.NewReader(data), n: &b.getBytes}), nil
+}
+
+// tallyingReader adds what a shard stream hands over to a shared counter. The
+// production countingReader is per-stream and unsynchronised; shard reads run
+// concurrently against one tally.
+type tallyingReader struct {
+	r io.Reader
+	n *atomic.Int64
+}
+
+func (c *tallyingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n.Add(int64(n))
+
+	return n, err
 }
 
 func (b *fakeBlob) Delete(_ context.Context, _ config.NodeID, req blob.DeleteRequest) (*blob.DeleteResponse, error) {
