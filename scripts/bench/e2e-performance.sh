@@ -26,6 +26,9 @@
 #                    port offset and start/stop; the config name is a label.
 #   PERF_EXTERNAL_SHA, PERF_EXTERNAL_GO  Provenance for that cluster's build,
 #                    which this machine did not produce and cannot read.
+#   PERF_ACCESS_KEY, PERF_SECRET_KEY, PERF_REGION  The identity to measure as.
+#                    Defaults to the account the loopback configs trust, which
+#                    a cluster this script did not start will not have.
 #
 # Preset overrides: PERF_DURATION, PERF_CONCURRENT, PERF_PUT_SIZE,
 # PERF_PART_SIZE, PERF_PARTS, PERF_GET_SIZE.
@@ -45,9 +48,12 @@ WARP="${WARP:-$REPO_DIR/bin/tools/warp}"
 # shellcheck source=scripts/lib.sh
 source "$SCRIPTS_DIR/lib.sh"
 
-ACCESS_KEY="AKIAIOSFODNN7EXAMPLE"
-SECRET_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
-REGION="ap-southeast-2"
+# The defaults are the account the loopback configs trust. A provisioned
+# cluster mints its own pair at bootstrap instead, so an external run has to
+# be told which identity to use.
+ACCESS_KEY="${PERF_ACCESS_KEY:-AKIAIOSFODNN7EXAMPLE}"
+SECRET_KEY="${PERF_SECRET_KEY:-wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY}"
+REGION="${PERF_REGION:-ap-southeast-2}"
 
 case "$PERF_PRESET" in
     smoke)
