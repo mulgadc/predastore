@@ -203,3 +203,69 @@ func TestRangedReadsAgreeWithTheWholeObject(t *testing.T) {
 		})
 	}
 }
+
+// A range that crosses a block cannot be served off one shard, and the read
+// that replaces it used to start every shard at byte zero and run to the end of
+// the object. The bytes came back correct, so only a count of what the nodes
+// were made to deliver catches it: a two byte range cost a whole object of
+// shard reads, transfer and decryption.
+//
+// The bound is the stripes the range touches, because a stripe is the unit
+// parity rebuilds and so the smallest thing a degradable read can fetch.
+func TestARangedReadCostsOnlyTheStripesItTouches(t *testing.T) {
+	t.Parallel()
+
+	const size = 3*streamBlockSize + 7919
+	f := newWriteFixture(2, 1)
+	body := randomBytes(t, size)
+
+	ctx := context.Background()
+	objectHash := model.ObjectHash("b", "k")
+	place, _, err := f.write(ctx, objectHash, bytes.NewReader(body), size)
+	require.NoError(t, err)
+	f.publish(t, objectHash, place)
+
+	lay := newLayout(f.cfg.DataShards, size, place.BlockSize)
+
+	// touched is what the range ought to cost: every data shard, from the start
+	// of the stripe holding start to the end of the block holding end.
+	touched := func(start, end int64) int64 {
+		_, from := lay.stripeStart(start)
+		_, last := lay.stripeStart(end)
+		to := last + min(lay.blockSize, lay.shardSize-last)
+
+		return int64(lay.dataShards) * (to - from)
+	}
+
+	// The last stripe is short, so its offsets are spaced by the remainder
+	// rather than by the block. A range crossing inside it is what catches an
+	// alignment that rounded by the block size instead of asking the layout.
+	head := int64(lay.dataShards) * lay.blockSize * (lay.shardSize / lay.blockSize)
+	tailCross := head + lay.shardSize%lay.blockSize
+	require.Less(t, tailCross, int64(size), "fixture has no short last stripe to cross")
+
+	ranges := []struct{ start, end int64 }{
+		{streamBlockSize - 1, streamBlockSize},       // across the first boundary
+		{streamBlockSize - 1, 2 * streamBlockSize},   // across two
+		{2*streamBlockSize + 5, 3 * streamBlockSize}, // into the short last stripe
+		{tailCross - 1, tailCross},                   // across a boundary in the tail
+		{size - 2, size - 1},                         // one block: the fast path
+		{0, size - 1},                                // the whole object
+	}
+	// One tally over one object, so the ranges run in sequence rather than as
+	// parallel subtests: a shared counter cannot attribute concurrent reads.
+	for _, r := range ranges {
+		req := objectRequest(http.MethodGet, "k", "")
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", r.start, r.end))
+
+		f.bc.getBytes.Store(0)
+		w := httptest.NewRecorder()
+		GetObject(f.mc, f.bc, f.ring, testCache(), f.cfg).ServeHTTP(w, req)
+
+		require.Equal(t, http.StatusPartialContent, w.Code, "range %d-%d", r.start, r.end)
+		require.Equal(t, body[r.start:r.end+1], w.Body.Bytes(), "range %d-%d", r.start, r.end)
+		assert.LessOrEqualf(t, f.bc.getBytes.Load(), touched(r.start, r.end),
+			"range %d-%d of %d bytes read %d from the nodes, more than the %d its stripes hold",
+			r.start, r.end, r.end-r.start+1, f.bc.getBytes.Load(), touched(r.start, r.end))
+	}
+}

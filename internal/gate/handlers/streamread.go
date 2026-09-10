@@ -63,6 +63,17 @@ func withClock(c clock) stripeOption {
 	return func(r *stripeReader) { r.clk = c }
 }
 
+// withStart begins the read at the stripe holding an object offset rather than
+// at the start of the object, so a range costs the stripes it touches instead
+// of everything before it. The caller gets the bytes from that stripe boundary
+// on, and is the one that knows how many of them to drop.
+//
+// It aligns through the layout because the last stripe is short: rounding by
+// the block size would land in the wrong place there.
+func withStart(objectOffset int64) stripeOption {
+	return func(r *stripeReader) { _, r.offset = r.lay.stripeStart(objectOffset) }
+}
+
 func newStripeReader(
 	ctx context.Context, bc BlobClient, cfg Config,
 	objectHash [32]byte, place ObjectToShardNodes, handoff config.NodeID,
@@ -105,11 +116,16 @@ func newStripeReader(
 	// a connection and then says nothing costs shardOpenTimeout, and paying five
 	// seconds of that on every GET is exactly the availability loss parity is
 	// there to prevent.
+	//
+	// The start offset is read once here rather than inside the goroutines: an
+	// open the constructor gave up on outlives it, and the stripes that follow
+	// advance the same field.
 	nodes := place.AllNodes()
+	from := r.offset
 	opens := make(chan openResult, cfg.DataShards)
 	for i := range cfg.DataShards {
 		go func() {
-			rc, openErr := r.open(ctx, i, nodes[i], 0)
+			rc, openErr := r.open(ctx, i, nodes[i], from)
 			opens <- openResult{index: i, rc: rc, err: openErr}
 		}()
 	}
@@ -553,7 +569,15 @@ func (r *stripeReader) reportShard(ctx context.Context, index int, node config.N
 // shape both whole-object callers share: read the first stripe, then drain the
 // rest behind it.
 func pipeObject(ctx context.Context, r *stripeReader, dst io.Writer, size int64) error {
-	if size == 0 {
+	return pipeRange(ctx, r, dst, 0, size)
+}
+
+// pipeRange streams the object bytes in [from, to) from a reader already
+// positioned at the stripe that from begins. It emits from the stripe
+// boundary, so a caller wanting a range that starts inside one drops the
+// lead-in itself.
+func pipeRange(ctx context.Context, r *stripeReader, dst io.Writer, from, to int64) error {
+	if to <= from {
 		return nil
 	}
 	first, n, err := r.next(ctx)
@@ -561,7 +585,7 @@ func pipeObject(ctx context.Context, r *stripeReader, dst io.Writer, size int64)
 		return err
 	}
 
-	return drain(ctx, r, dst, first, n, size)
+	return drain(ctx, r, dst, first, n, from, to)
 }
 
 // copyStream reads a byte range of a stored object as a stream. The object is
@@ -588,21 +612,25 @@ func openCopyStream(
 		return &copyStream{pr: emptyPipe()}, nil
 	}
 
-	src, err := newStripeReader(ctx, bc, cfg, objectHash, place, handoff)
+	src, err := newStripeReader(ctx, bc, cfg, objectHash, place, handoff, withStart(start))
 	if err != nil {
 		return nil, err
 	}
 
+	// The reader begins at the stripe holding start, so the window drops what
+	// precedes start within that stripe rather than everything before it. The
+	// bound comes from the reader's own layout to keep the two in step.
+	stripeAt, _ := src.lay.stripeStart(start)
 	pr, pw := io.Pipe()
 	var dst io.Writer = pw
-	if start > 0 || length < size {
-		dst = &windowWriter{dst: pw, skip: start, limit: length}
+	if start > stripeAt || length < size {
+		dst = &windowWriter{dst: pw, skip: start - stripeAt, limit: length}
 	}
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		pw.CloseWithError(pipeObject(ctx, src, dst, size))
+		pw.CloseWithError(pipeRange(ctx, src, dst, stripeAt, start+length))
 	}()
 
 	return &copyStream{pr: pr, src: src, done: done}, nil
@@ -665,33 +693,37 @@ func (w *windowWriter) Write(p []byte) (int, error) {
 	return full, nil
 }
 
-// drain emits the object from the stripe already in hand and then the rest,
-// stopping at the object size so the padding that squares the last stripe is
-// never served. The first stripe is passed in because the caller has to read it
-// before it can send a header it cannot take back.
-func drain(ctx context.Context, r *stripeReader, dst io.Writer, first [][]byte, n int64, size int64) error {
-	var pos int64
+// drain emits object bytes [from, to) from the stripe already in hand and then
+// the rest, where from is the object offset that stripe begins at. Stopping at
+// to rather than at the object size is what keeps a range from reading the
+// whole object, and at to == size it is also what keeps the padding that
+// squares the last stripe from being served.
+//
+// The first stripe is passed in because the caller has to read it before it can
+// send a header it cannot take back.
+func drain(ctx context.Context, r *stripeReader, dst io.Writer, first [][]byte, n, from, to int64) error {
+	pos := from
 	blocks, count := first, n
 	for {
 		for i := range blocks {
-			if pos >= size {
+			if pos >= to {
 				break
 			}
 			chunk := blocks[i][:count]
-			if pos+int64(len(chunk)) > size {
-				chunk = chunk[:size-pos]
+			if pos+int64(len(chunk)) > to {
+				chunk = chunk[:to-pos]
 			}
 			if _, wErr := dst.Write(chunk); wErr != nil {
 				return wErr
 			}
 			pos += int64(len(chunk))
 		}
-		if pos >= size {
+		if pos >= to {
 			return nil
 		}
 		next, n, err := r.next(ctx)
 		if errors.Is(err, io.EOF) {
-			return fmt.Errorf("object ended after %d of %d bytes", pos, size)
+			return fmt.Errorf("object ended after %d of %d bytes", pos, to)
 		}
 		if err != nil {
 			return err

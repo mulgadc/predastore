@@ -147,6 +147,47 @@ func TestUploadPartCopyHonoursTheSourceRange(t *testing.T) {
 	assert.Equal(t, partETag(t, want), got.ETag)
 }
 
+// A copy range that crosses a block cannot be served off one shard, so it goes
+// through the same stripe reader a ranged GET does and carried the same read
+// amplification. The source is big enough for the range to start beyond the
+// first stripe, which is what the alignment has to get right.
+func TestUploadPartCopyOfARangeCrossingABlockCostsOnlyItsStripes(t *testing.T) {
+	t.Parallel()
+
+	f := newWriteFixture(2, 1)
+	const size = 3*streamBlockSize + 7919
+	source := randomBytes(t, size)
+	f.seedObject(t, "src", source)
+	f.seedEmptyUpload(t, "dst", "u1")
+
+	// The range straddles a block boundary inside the short last stripe, where
+	// offsets are spaced by the remainder rather than by the block. That is the
+	// case an alignment computed by dividing would put in the wrong place.
+	lay := writeLayout(f.cfg.DataShards, size)
+	tail := lay.shardSize % lay.blockSize
+	head := lay.shardSize / lay.blockSize * int64(lay.dataShards) * lay.blockSize
+	start := head + tail - 1
+	end := start + 4096
+	require.Less(t, end, int64(size), "range must stay inside the source")
+
+	f.bc.getBytes.Store(0)
+	w := httptest.NewRecorder()
+	UploadPartCopy(f.mc, f.bc, f.ring, copyTestCache(), f.cfg).ServeHTTP(w,
+		copyPartRequest("dst", "u1", 3, "/"+copyTestBucket+"/src", fmt.Sprintf("bytes=%d-%d", start, end)))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	// Read before the part is fetched back, or that read joins the tally.
+	read := f.bc.getBytes.Load()
+
+	want := source[start : end+1]
+	assert.Equal(t, want, f.readStoredPart(t, "dst", "u1", 3))
+
+	stripe := int64(lay.dataShards) * tail
+	assert.LessOrEqual(t, read, stripe,
+		"a %d byte copy range read %d from the nodes, more than the %d stripe holding it",
+		end-start+1, read, stripe)
+}
+
 // An upload assembled entirely from copied parts has to read back byte for
 // byte, which is the property the registry's blob digest check depends on.
 func TestCompletedUploadOfCopiedPartsReadsBack(t *testing.T) {

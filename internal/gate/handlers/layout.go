@@ -56,6 +56,25 @@ func (l layout) locate(offset int64) (shard int, at int64) {
 	return int(rel / tail), full*l.blockSize + rel%tail
 }
 
+// stripeStart reports where the stripe holding an object offset begins: its
+// first object offset, and the offset the data shards must be opened at to
+// read it. A stripe is the smallest unit parity can rebuild, so a read that
+// starts part way through an object still starts on one of these.
+//
+// It splits the object exactly as locate does, because a start that disagreed
+// with locate would serve the wrong bytes rather than fail.
+func (l layout) stripeStart(offset int64) (objectAt, shardAt int64) {
+	full := l.shardSize / l.blockSize
+	head := full * int64(l.dataShards) * l.blockSize
+	if offset < head {
+		stripe := offset / (int64(l.dataShards) * l.blockSize)
+
+		return stripe * int64(l.dataShards) * l.blockSize, stripe * l.blockSize
+	}
+
+	return head, full * l.blockSize
+}
+
 // contiguous reports whether an object range is one unbroken run inside a
 // single shard, which is the only case a single ranged shard read can serve.
 func (l layout) contiguous(start, end int64) bool {
