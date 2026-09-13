@@ -98,6 +98,52 @@ go_build:
 	@echo -e "\n....Building $(GO_PROJECT_NAME)"
 	go build -ldflags "-s -w" -o ./bin/s3d ./cmd/s3d
 
+# Standalone install, for a host running predastore as a systemd service rather
+# than under Spinifex or in a container. DESTDIR and PREFIX are honoured so a
+# package build can stage into a buildroot.
+#
+# It installs files and nothing else. daemon-reload, systemd-sysusers,
+# systemd-tmpfiles, `sysctl --system` and `systemctl enable` are activation, and
+# a target that performed them could not be used by a package build.
+PREFIX      ?= /usr/local
+DESTDIR     ?=
+SYSCONFDIR  ?= /etc
+# The vendor directory, not /etc/systemd/system: that one is the operator's, and
+# writing there would collide with a local override and survive uninstall.
+UNITDIR     ?= /usr/lib/systemd/system
+SYSUSERSDIR ?= /usr/lib/sysusers.d
+TMPFILESDIR ?= /usr/lib/tmpfiles.d
+# /etc/sysctl.d rather than /usr/lib/sysctl.d, because the value is a property
+# of the machine's NICs and workload and operators do edit it.
+SYSCTLDIR   ?= $(SYSCONFDIR)/sysctl.d
+
+SYSTEMD_SRC := deploy/systemd
+
+install: build
+	@echo -e "\n....Installing $(GO_PROJECT_NAME) to $(DESTDIR)$(PREFIX)"
+	install -D -m 0755 ./bin/s3d '$(DESTDIR)$(PREFIX)/bin/s3d'
+	install -D -m 0755 scripts/predastore-keygen.sh '$(DESTDIR)$(PREFIX)/bin/predastore-keygen'
+	install -D -m 0644 $(SYSTEMD_SRC)/predastore.service '$(DESTDIR)$(UNITDIR)/predastore.service'
+	install -D -m 0644 $(SYSTEMD_SRC)/predastore.sysusers.conf '$(DESTDIR)$(SYSUSERSDIR)/predastore.conf'
+	install -D -m 0644 $(SYSTEMD_SRC)/predastore.tmpfiles.conf '$(DESTDIR)$(TMPFILESDIR)/predastore.conf'
+	install -D -m 0644 $(SYSTEMD_SRC)/99-predastore-net.conf '$(DESTDIR)$(SYSCTLDIR)/99-predastore-net.conf'
+# Both land as examples. Installing them as the live config would clobber an
+# operator's credentials and topology on every upgrade, and the unit carries
+# in-unit defaults so a host with neither file still starts.
+	install -D -m 0644 $(SYSTEMD_SRC)/predastore.toml.example '$(DESTDIR)$(SYSCONFDIR)/predastore/predastore.toml.example'
+	install -D -m 0644 $(SYSTEMD_SRC)/predastore.env '$(DESTDIR)$(SYSCONFDIR)/predastore/predastore.env.example'
+# Modes only, no owner: the predastore account does not exist during a package
+# build. systemd-sysusers creates it and systemd-tmpfiles takes the ownership.
+	install -d -m 0750 '$(DESTDIR)$(SYSCONFDIR)/predastore'
+	install -d -m 0700 '$(DESTDIR)/var/lib/predastore'
+	@echo -e "\n ✅ Installed. To activate:"
+	@echo "      systemd-sysusers && systemd-tmpfiles --create"
+	@echo "      sysctl --system                                 # required for multi-host"
+	@echo "      cp $(SYSCONFDIR)/predastore/predastore.toml.example $(SYSCONFDIR)/predastore/predastore.toml"
+	@echo "      \$$EDITOR $(SYSCONFDIR)/predastore/predastore.toml   # replace every CHANGEME"
+	@echo "      $(PREFIX)/bin/predastore-keygen $(SYSCONFDIR)/predastore"
+	@echo "      systemctl daemon-reload && systemctl enable --now predastore"
+
 # Preflight — runs the same checks as GitHub Actions (lint + security + tests).
 # Use this before committing to catch CI failures locally.
 preflight:
@@ -227,7 +273,7 @@ e2e-stress-baseline: build certs warp-install
 nilaway:
 	go tool nilaway -include-pkgs=github.com/mulgadc/predastore -exclude-test-files ./...
 
-.PHONY: certs build go_build preflight test test-cover test-race test-integration diff-coverage \
+.PHONY: certs build go_build install preflight test test-cover test-race test-integration diff-coverage \
 	clean lint fix govulncheck nilaway warp-install e2e-performance e2e-performance-compare \
 	e2e-stress e2e-stress-gate e2e-stress-strict e2e-stress-baseline \
 	docker-build docker-smoke docker-smoke-strict docker-smoke-baseline \
