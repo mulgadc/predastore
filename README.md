@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="#standalone-or-spinifex">Standalone or Spinifex</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#s3-api-support">S3 API support</a> ·
   <a href="#architecture">Architecture</a> ·
@@ -27,6 +28,27 @@ Predastore is a distributed object-storage system implementing commonly used Ama
 
 Predastore can run independently and provides the default object-storage backend for Spinifex.
 
+## Standalone or Spinifex?
+
+Predastore runs on its own or as the object store of a [Spinifex](https://github.com/mulgadc/spinifex) cluster, and one thing decides which: whether the config carries an `[iam]` table. Without it the gate resolves every access key from the `[[auth]]` entries in its own TOML, dials nothing, and depends on no other service. With it the gate also reads users, groups, roles, policies and session credentials out of Spinifex's NATS JetStream KV buckets, with the config-defined accounts still matched first.
+
+Standalone is enough when a fixed set of service accounts and buckets, written into the config and distributed with it, is the whole access model. Reach for Spinifex when credentials have to change without a restart, or when more than one tenant shares the cluster.
+
+| | Standalone | Under Spinifex |
+|---|---|---|
+| Credentials | `[[auth]]` entries in the TOML | IAM access keys in NATS KV, plus the config accounts |
+| Authorisation | none — every config account is fully trusted | IAM policies, evaluated per request |
+| Buckets | `[[bucket]]` entries, plus whatever clients create | created through the API, owned per account |
+| Multiple tenants | no — every key reaches every bucket | yes, enforced by account ownership |
+| Users, groups, roles | no | IAM users, groups and roles |
+| Temporary credentials | no | STS assumed-role sessions |
+| Rotating a key | edit the TOML, restart the host | `CreateAccessKey`, no restart |
+| Keys and certificates | `predastore-keygen`, distributed by you | issued on `spx admin init`, distributed on join |
+| Cluster topology | you write the TOML | generated from the joined node set |
+| External dependencies | none | NATS, and the Spinifex daemon that populates it |
+
+The second row is the one that decides most deployments. A config-defined account in `[[auth]]` bypasses both policy evaluation and the bucket-ownership check, so every key in the file reaches every bucket in the cluster no matter which account owns it. Standalone predastore cannot hand out a credential that is less than total, and that — rather than any missing S3 operation — is what a multi-tenant deployment needs Spinifex for.
+
 ## Quick Start
 
 ### Build
@@ -34,6 +56,8 @@ Predastore can run independently and provides the default object-storage backend
 ```bash
 make build
 ```
+
+Build through the Makefile rather than calling `go build ./cmd/s3d` yourself. The binary links a FIPS boot check that panics on startup unless it was compiled with `GOFIPS140=v1.0.0`, which the Makefile exports and a bare `go build` does not.
 
 ### Run a Development Cluster
 
@@ -96,6 +120,29 @@ Each of these host-local settings may come from either the file or a flag, so th
 A cluster whose `[[host.node]]` entries all sit under one `[[host]]` runs entirely in one process over the in-process pipe, with no inter-node socket and no certificate beyond the one the gate serves. That is a property of the config, not a launch mode.
 
 The encryption key file must be exactly 32 raw bytes (no base64, no header) with mode `0600`. Generate one with `( umask 0177 && openssl rand -out master.key 32 )`. The same key must be supplied to every host in a cluster; rotating it is not currently supported (see Roadmap → envelope encryption).
+
+### Run as a systemd Service
+
+`make install` lays down the binary, a unit, and the drop-ins that create the service's user and its directories. It installs files and performs nothing else, so it is usable from a package build and leaves the sequencing to you:
+
+```bash
+make build
+sudo make install                                   # binary, unit, sysusers, tmpfiles, sysctl
+sudo systemd-sysusers && sudo systemd-tmpfiles --create
+sudo sysctl --system                                # required for multi-host
+
+sudo cp /etc/predastore/predastore.toml.example /etc/predastore/predastore.toml
+sudo $EDITOR /etc/predastore/predastore.toml        # replace every CHANGEME
+sudo predastore-keygen /etc/predastore              # the at-rest key and a TLS identity
+
+sudo systemctl daemon-reload && sudo systemctl enable --now predastore
+```
+
+`DESTDIR` and `PREFIX` are honoured, so a package build can stage the same target into a buildroot. The target compiles nothing and expects `./bin/s3d` to exist already, which is why `make build` comes first.
+
+The service runs as an unprivileged `predastore` user under a strict sandbox: `/etc` read-only, `/var/lib/predastore` the only writable path, no capabilities at all, and a syscall filter. Its host-local settings — which `[[host]]` it runs, where its data and keys live — come from `/etc/predastore/predastore.env`, which installs as `predastore.env.example` so an upgrade cannot overwrite an edited one. The shipped example config names those paths itself, which is what a single machine wants; a fleet distributing one identical TOML overrides them per host in the env file instead.
+
+`predastore-keygen` is idempotent, and it refuses to mint a TLS identity for a config naming more than one host. Peers verify each other against the system trust store, so hosts that each generated their own keypair never elect a leader rather than failing outright. Generate one keypair, distribute it to every host, and install its CA — see [Standalone TLS Trust](#standalone-tls-trust).
 
 ### Run in Docker
 
@@ -251,6 +298,20 @@ addr = "10.11.12.1"        # what other hosts dial; no port — nodes carry thos
   id   = 3
   role = "blob"
   port = 9991
+
+# A config-defined service account. Every request one signs is authorised, on
+# every bucket, so treat an entry here as a root credential.
+[[auth]]
+access_key_id     = "AKIAIOSFODNN7EXAMPLE"
+secret_access_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+account_id        = "123456789012"   # required; stamped as owner on buckets this key creates
+
+# A bucket that exists from startup rather than being created through the API.
+[[bucket]]
+name       = "artifacts"
+region     = "ap-southeast-2"
+account_id = "123456789012"          # required
+# public   = true                    # serve GET and HEAD without a signature
 ```
 
 Node ids are unique across the whole file; ports are unique within a host. A blob or meta node without its own `data_dir` derives one from the host's root and its node id, so separate disks are a per-node setting rather than a deployment layout.
@@ -263,7 +324,15 @@ A background sampler runs those checks on a fixed interval and `/readyz` only ev
 
 Write every node under one `[[host]]` and the cluster runs in one process over the in-process pipe. Spread them across hosts and each process is launched separately with its own `-host` id. Nothing else changes.
 
-`config/` holds three ready-made profiles — see [Run a Development Cluster](#run-a-development-cluster).
+`config/` holds the ready-made profiles — see [Run a Development Cluster](#run-a-development-cluster).
+
+### Accounts and Buckets
+
+`[[auth]]` is the whole of standalone access control. An entry's `account_id` is mandatory and becomes the owner of any bucket that key creates, but it does not confine the key: a config-defined account skips both policy evaluation and the bucket-ownership check, so it reads and writes every bucket in the cluster whoever owns it. Declare as few as the deployment needs, and use Spinifex if credentials have to be scoped — see [Standalone or Spinifex?](#standalone-or-spinifex).
+
+`[[bucket]]` declares a bucket that exists from startup without a `CreateBucket` call, which is what a deployment with a fixed set of them wants. `account_id` is required and an entry missing it refuses the whole config, while an entry with an invalid name is dropped with a warning rather than being fatal. `public = true` serves GET and HEAD without a signature, and is worth setting only on a bucket genuinely meant to be world-readable.
+
+`ListBuckets` answers from the metadata plane alone, so a bucket declared in the config does not appear in `aws s3 ls` until something creates it through the API. `HeadBucket`, GET and PUT all work against it in the meantime.
 
 ### Standalone TLS Trust
 
@@ -278,6 +347,25 @@ sudo update-ca-certificates
 sudo cp cluster-ca.pem /etc/pki/ca-trust/source/anchors/predastore-cluster-ca.pem
 sudo update-ca-trust
 ```
+
+### Socket Buffers for QUIC
+
+A multi-host cluster needs the kernel's socket buffer limit raised, and this is a correctness requirement rather than tuning. Blob, meta and raft traffic all ride QUIC, quic-go asks the kernel for a 7 MiB receive buffer, and at the default of 208 KiB that request is silently clamped and the socket drops datagrams under load. The symptom is failed shard writes, with nothing anywhere reporting a misconfigured limit.
+
+`make install` ships the setting as a drop-in, so a systemd deployment only has to apply it:
+
+```bash
+sudo sysctl --system        # applies deploy/systemd/99-predastore-net.conf
+```
+
+Set it directly otherwise, and persist it under `/etc/sysctl.d` so it survives a reboot:
+
+```bash
+sudo sysctl -w net.core.rmem_max=16777216
+sudo sysctl -w net.core.wmem_max=16777216
+```
+
+A single-host cluster runs every node over the in-process pipe and opens no QUIC socket at all, so none of this applies to it.
 
 ## Storage Backend
 
@@ -294,13 +382,25 @@ See [DESIGN.md](docs/DESIGN.md) §6 for the on-disk format: the segment layout, 
 
 ## Spinifex Integration
 
-Predastore is the default S3 storage provider for [Spinifex](https://github.com/mulgadc/spinifex). It can store user-created S3 objects, EC2 machine images, EBS snapshot data written through Viperblock, and service artefacts.
+Predastore is the default S3 storage provider for [Spinifex](https://github.com/mulgadc/spinifex), which turns the integration on by rendering one table into predastore's config:
+
+```toml
+[iam]
+nats_url           = "nats://127.0.0.1:4222"
+nats_token         = "..."
+master_key_path    = "/etc/spinifex/master.key"    # absolute; decrypts the stored secrets
+access_keys_bucket = "spinifex-iam-access-keys"
+```
+
+That table is the whole of it. With it present the gate opens Spinifex's JetStream KV buckets directly — there is no RPC and no callback into the control plane — and resolves an access key to the user, groups, roles and policies attached to it, decrypting each stored secret with the shared master key. A key prefixed `ASIA` is resolved as an STS session instead. Config-defined `[[auth]]` accounts are still matched first, so the service credentials in the file keep working whatever IAM holds.
+
+The connection retries indefinitely and the KV buckets are opened lazily, so predastore starts cleanly before the Spinifex daemon has created them and recovers on its own when NATS restarts. What the table buys is per-request authorisation: IAM users and roles, policy evaluation, temporary session credentials, and account ownership that genuinely separates tenants. Without it every credential is a root credential — see [Standalone or Spinifex?](#standalone-or-spinifex).
+
+Spinifex also leans on predastore as the store behind several of its own services, all of it ordinary S3 traffic through the same gate:
 
 - **EC2 AMI images** — machine images for VM launches
 - **EBS volume snapshots** — via [Viperblock](https://github.com/mulgadc/viperblock), which uses Predastore as its S3-compatible backend
 - **User data** — cloud-init configurations and system artifacts
-
-Predastore serves these over the S3 API like any other client traffic. It uses NATS for one thing only: when an `[iam]` table is configured, access keys, users, roles and policies are read from JetStream KV buckets, layered over the config-defined service accounts.
 
 ## Development
 
@@ -325,15 +425,6 @@ make s3-tests-baseline          # re-record, in the same change as the fix
 ```
 
 The suite is `ceph/s3-tests`, pinned to a commit and cloned on first run. It takes about fifteen minutes. See [docs/S3-COMPATIBILITY.md](docs/S3-COMPATIBILITY.md) for what the current numbers mean.
-
-### Performance Tuning
-
-For multi-host clusters, increase system socket buffers for QUIC:
-
-```bash
-sudo sysctl -w net.core.rmem_max=7500000
-sudo sysctl -w net.core.wmem_max=7500000
-```
 
 ## Roadmap
 
