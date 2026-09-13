@@ -119,7 +119,10 @@ SYSCTLDIR   ?= $(SYSCONFDIR)/sysctl.d
 
 SYSTEMD_SRC := deploy/systemd
 
-install: build
+# No build prerequisite: installing to a system path wants root, root usually
+# has no `go`, and a package build compiles and stages as separate steps anyway.
+install:
+	@test -x ./bin/s3d || { echo "./bin/s3d is missing — run 'make build' first" >&2; exit 1; }
 	@echo -e "\n....Installing $(GO_PROJECT_NAME) to $(DESTDIR)$(PREFIX)"
 	install -D -m 0755 ./bin/s3d '$(DESTDIR)$(PREFIX)/bin/s3d'
 	install -D -m 0755 scripts/predastore-keygen.sh '$(DESTDIR)$(PREFIX)/bin/predastore-keygen'
