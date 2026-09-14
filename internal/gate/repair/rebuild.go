@@ -254,6 +254,7 @@ func (s *Service) fetchPeers(
 	}
 
 	have := 0
+	var short peerShortfall
 	for index, node := range t.place.AllNodes() {
 		if index == t.index || have >= s.cfg.DataShards {
 			continue
@@ -266,6 +267,7 @@ func (s *Service) fetchPeers(
 			Epoch:      t.place.WriteEpoch,
 		})
 		if err != nil {
+			short.count(err)
 			slog.DebugContext(ctx, "Peer shard unusable for a repair",
 				"node", node, "index", index, "err", err)
 
@@ -278,9 +280,9 @@ func (s *Service) fetchPeers(
 
 	if have < s.cfg.DataShards {
 		closeAll()
+		short.have, short.need, short.epoch = have, s.cfg.DataShards, t.place.WriteEpoch
 
-		return nil, nil, fmt.Errorf("%w: %d of %d peers hold epoch %016x",
-			errTooFewPeers, have, s.cfg.DataShards, t.place.WriteEpoch)
+		return nil, nil, &short
 	}
 
 	return readers, closeAll, nil

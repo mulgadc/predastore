@@ -132,8 +132,8 @@ func (f *fakeBlob) Get(
 		return nil, blob.ErrNotFound
 	}
 	if req.Epoch != 0 && req.Epoch != s.epoch {
-		return nil, fmt.Errorf("epoch-mismatch: node holds %016x, caller asked for %016x",
-			s.epoch, req.Epoch)
+		return nil, fmt.Errorf("epoch-mismatch: node holds %016x, caller asked for %016x: %w",
+			s.epoch, req.Epoch, blob.ErrEpochMismatch)
 	}
 
 	return io.NopCloser(bytes.NewReader(s.body)), nil

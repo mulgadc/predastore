@@ -133,8 +133,16 @@ type Stats struct {
 	Superseded int64
 	Failed     int64
 	Pending    int64
-	// Deferred counts passes not run because the cluster never became ready.
+	// Deferred counts passes held back: the cluster never became ready, or no
+	// peer of an owed shard answered.
 	Deferred int64
+
+	// Failed split by cause. Unreachable is transient; a peer at another epoch
+	// or missing the shard means it cannot be rebuilt from what is there.
+	FailedPeerUnreachable int64
+	FailedPeerOtherEpoch  int64
+	FailedPeerMissing     int64
+	FailedOther           int64
 }
 
 // Service sweeps for shards its nodes owe and rebuilds them.
@@ -149,6 +157,8 @@ type Service struct {
 
 	passes, scanned, owned, repaired, superseded, failed, pending atomic.Int64
 	deferred                                                      atomic.Int64
+
+	failedPeerUnreachable, failedPeerOtherEpoch, failedPeerMissing, failedOther atomic.Int64
 }
 
 // New validates cfg and applies its defaults. It starts nothing.
@@ -199,6 +209,11 @@ func (s *Service) Stats() Stats {
 		Failed:     s.failed.Load(),
 		Pending:    s.pending.Load(),
 		Deferred:   s.deferred.Load(),
+
+		FailedPeerUnreachable: s.failedPeerUnreachable.Load(),
+		FailedPeerOtherEpoch:  s.failedPeerOtherEpoch.Load(),
+		FailedPeerMissing:     s.failedPeerMissing.Load(),
+		FailedOther:           s.failedOther.Load(),
 	}
 }
 
@@ -211,7 +226,8 @@ func (s *Service) Run(ctx context.Context) error {
 
 	for {
 		if s.awaitReady(ctx) {
-			if err := s.Pass(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			err := s.Pass(ctx)
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrPassDeferred) {
 				slog.ErrorContext(ctx, "Repair pass failed", "err", err)
 			}
 		}
@@ -280,15 +296,26 @@ func (s *Service) awaitReady(ctx context.Context) bool {
 // rule against a table being written underneath it, which is a second
 // correctness argument in a component that does not need one to be correct.
 func (s *Service) Pass(ctx context.Context) error {
+	// A pass that finds no peer reachable stops early, and the work queued
+	// behind it is abandoned rather than failed.
+	passCtx, stopPass := context.WithCancel(ctx)
+	defer stopPass()
+
 	work := make(chan task)
 	var wg sync.WaitGroup
 	var owed atomic.Int64
+	var deferred atomic.Bool
 
 	for range s.workers {
 		wg.Go(func() {
 			for t := range work {
-				err := s.repairShard(ctx, t)
+				err := s.repairShard(passCtx, t)
 				switch {
+				case err == nil:
+					owed.Add(-1)
+					s.repaired.Add(1)
+				case deferred.Load():
+					// Cut short by the deferral, which says nothing about this shard.
 				case errors.Is(err, errSuperseded):
 					// Not a failure and not a repair. The record and the node
 					// disagree about the current write, which rebuilding cannot
@@ -297,27 +324,30 @@ func (s *Service) Pass(ctx context.Context) error {
 					slog.InfoContext(ctx, "Rebuilt shard refused: the node is past the record's generation",
 						"node", t.node, "index", t.index,
 						"epoch", fmt.Sprintf("%016x", t.place.WriteEpoch))
-				case err != nil:
-					s.failed.Add(1)
-					slog.WarnContext(ctx, "Shard repair failed",
-						"node", t.node, "index", t.index,
-						"epoch", fmt.Sprintf("%016x", t.place.WriteEpoch), "err", err)
+				case noPeerReachable(err):
+					if deferred.CompareAndSwap(false, true) {
+						slog.InfoContext(ctx, "Repair pass deferred: no peer of an owed shard answered",
+							"node", t.node, "index", t.index, "err", err)
+						stopPass()
+					}
 				default:
-					owed.Add(-1)
-					s.repaired.Add(1)
+					reason := s.countFailure(err)
+					slog.WarnContext(ctx, "Shard repair failed",
+						"node", t.node, "index", t.index, "reason", string(reason),
+						"epoch", fmt.Sprintf("%016x", t.place.WriteEpoch), "err", err)
 				}
 			}
 		})
 	}
 
-	err := s.scan(ctx, func(t task) error {
+	err := s.scan(passCtx, func(t task) error {
 		owed.Add(1)
 		s.pending.Add(1)
 		select {
 		case work <- t:
 			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-passCtx.Done():
+			return passCtx.Err()
 		}
 	})
 
@@ -329,11 +359,13 @@ func (s *Service) Pass(ctx context.Context) error {
 	// keeps it from drifting when a pass is cut short.
 	s.pending.Store(max(owed.Load(), 0))
 	s.passes.Add(1)
-	if err != nil {
-		return err
+	if deferred.Load() {
+		s.deferred.Add(1)
+
+		return ErrPassDeferred
 	}
 
-	return nil
+	return err
 }
 
 // task is one shard one of this service's nodes owes.
