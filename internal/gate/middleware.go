@@ -252,7 +252,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		if !credResult.SkipPolicyCheck {
 			if action == "" {
 				slog.WarnContext(r.Context(), "Unsupported HTTP method for S3 action mapping",
-					"method", method, "path", r.URL.Path, "remoteAddr", r.RemoteAddr)
+					"method", method, "path", r.URL.Path, "remoteAddr", handlers.ClientAddr(r))
 				handlers.WriteS3Error(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed", "The specified method is not allowed")
 				return
 			}

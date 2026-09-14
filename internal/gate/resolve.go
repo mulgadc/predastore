@@ -61,6 +61,6 @@ func requestBucketKey(ctx context.Context) (bucket, key string) {
 // what is a bad request.
 func rejectResource(w http.ResponseWriter, r *http.Request, err error) {
 	slog.WarnContext(r.Context(), "Rejected malformed S3 request path",
-		"path", r.URL.Path, "rawPath", r.URL.RawPath, "error", err, "remoteAddr", r.RemoteAddr)
+		"path", r.URL.Path, "rawPath", r.URL.RawPath, "error", err, "remoteAddr", handlers.ClientAddr(r))
 	handlers.HandleError(w, r, err)
 }
