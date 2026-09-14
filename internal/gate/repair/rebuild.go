@@ -254,7 +254,7 @@ func (s *Service) fetchPeers(
 	}
 
 	have := 0
-	var short peerShortfall
+	var short peerShortfallError
 	for index, node := range t.place.AllNodes() {
 		if index == t.index || have >= s.cfg.DataShards {
 			continue

@@ -21,9 +21,9 @@ const (
 	reasonOther           failReason = "other"
 )
 
-// peerShortfall is a rebuild that found too few peers at the record's epoch,
+// peerShortfallError is a rebuild that found too few peers at the record's epoch,
 // with the reason each of the others could not contribute.
-type peerShortfall struct {
+type peerShortfallError struct {
 	have, need int
 	epoch      uint64
 
@@ -32,7 +32,7 @@ type peerShortfall struct {
 
 // count files one peer's refusal under its cause. Anything that is not an
 // answer about the shard is treated as not having reached the peer.
-func (p *peerShortfall) count(err error) {
+func (p *peerShortfallError) count(err error) {
 	switch {
 	case errors.Is(err, blob.ErrEpochMismatch):
 		p.otherEpoch++
@@ -43,16 +43,16 @@ func (p *peerShortfall) count(err error) {
 	}
 }
 
-func (p *peerShortfall) Error() string {
+func (p *peerShortfallError) Error() string {
 	return fmt.Sprintf("%s: %d of %d peers hold epoch %016x (%d unreachable, %d at another epoch, %d missing the shard)",
 		p.reason(), p.have, p.need, p.epoch, p.unreachable, p.otherEpoch, p.missing)
 }
 
-func (p *peerShortfall) Unwrap() error { return errTooFewPeers }
+func (p *peerShortfallError) Unwrap() error { return errTooFewPeers }
 
 // reason names the shortfall by its most transient cause: a shard with a peer
 // that did not answer has not been shown to be unrebuildable.
-func (p *peerShortfall) reason() failReason {
+func (p *peerShortfallError) reason() failReason {
 	switch {
 	case p.unreachable > 0:
 		return reasonPeerUnreachable
@@ -65,8 +65,7 @@ func (p *peerShortfall) reason() failReason {
 
 // classify names the cause of a failed repair.
 func classify(err error) failReason {
-	var short *peerShortfall
-	if errors.As(err, &short) {
+	if short, ok := errors.AsType[*peerShortfallError](err); ok {
 		return short.reason()
 	}
 
@@ -76,9 +75,9 @@ func classify(err error) failReason {
 // noPeerReachable reports a rebuild where no peer answered at all. That is a
 // fact about this node's view of the cluster, not about the shard.
 func noPeerReachable(err error) bool {
-	var short *peerShortfall
+	short, ok := errors.AsType[*peerShortfallError](err)
 
-	return errors.As(err, &short) &&
+	return ok &&
 		short.have == 0 && short.otherEpoch == 0 && short.missing == 0 && short.unreachable > 0
 }
 

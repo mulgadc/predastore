@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
@@ -27,7 +28,7 @@ func TestClientAddrTrustsXRealIPOnlyFromLoopback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			r := httptest.NewRequest("GET", "/bucket/key", nil)
+			r := httptest.NewRequest(http.MethodGet, "/bucket/key", nil)
 			r.RemoteAddr = tc.remote
 			if tc.header != "" {
 				r.Header.Set("X-Real-IP", tc.header)
