@@ -155,6 +155,13 @@ func newRepairer(cfg Config, ring *placement.Ring) (*repair.Service, error) {
 		Workers:      cfg.Repair.Workers,
 		PageSize:     cfg.Repair.PageSize,
 		Interval:     cfg.Repair.Interval,
+		Ready: &repair.ClusterReadiness{
+			Meta:         cfg.Meta,
+			MetaReplicas: cfg.MetaNodeIDs,
+			LocalMeta:    cfg.LocalMetaNodeIDs,
+			Blob:         cfg.Blob,
+			BlobNodes:    cfg.BlobNodeIDs,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to build the repair sweep: %w", err)

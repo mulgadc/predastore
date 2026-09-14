@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/model"
@@ -148,6 +149,10 @@ func (f *fakeMeta) ScanFrom(_ context.Context, prefix, after string, limit int) 
 		}
 	}
 	return items, nil
+}
+
+func (f *fakeMeta) Status(context.Context, config.NodeID) (meta.MetaStatus, error) {
+	return meta.MetaStatus{State: "Leader", IsLeader: true}, nil
 }
 
 // newFakeMeta seeds the bucket table the way CreateBucket would.

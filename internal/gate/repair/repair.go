@@ -16,6 +16,7 @@
 package repair
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -83,6 +84,13 @@ type Config struct {
 	// Interval is the gap between the end of one pass and the start of the
 	// next. Zero defaults.
 	Interval time.Duration
+
+	// Ready holds each pass until the cluster is settled. Nil runs every pass
+	// immediately. ReadyTimeout bounds one wait, after which the pass is
+	// deferred to the next interval; ReadyPoll is the gap between checks.
+	Ready        Readiness
+	ReadyTimeout time.Duration
+	ReadyPoll    time.Duration
 }
 
 // DefaultWorkers is the rebuild concurrency. A node holding stale shards is a
@@ -97,9 +105,15 @@ type Config struct {
 func DefaultWorkers() int { return min(runtime.NumCPU()/2+1, maxDefaultWorkers) }
 
 const (
-	maxDefaultWorkers = 8
-	defaultPageSize   = 512
-	defaultInterval   = 5 * time.Minute
+	maxDefaultWorkers   = 8
+	defaultPageSize     = 512
+	defaultInterval     = 5 * time.Minute
+	defaultReadyTimeout = 2 * time.Minute
+	defaultReadyPoll    = 2 * time.Second
+
+	// readyCheckTimeout bounds one readiness check, so an unanswering replica
+	// costs one poll rather than the whole wait.
+	readyCheckTimeout = 10 * time.Second
 )
 
 // Stats is what a pass did. Scanned counts placement records read, owned the
@@ -119,17 +133,22 @@ type Stats struct {
 	Superseded int64
 	Failed     int64
 	Pending    int64
+	// Deferred counts passes not run because the cluster never became ready.
+	Deferred int64
 }
 
 // Service sweeps for shards its nodes owe and rebuilds them.
 type Service struct {
-	cfg      Config
-	nodes    []config.NodeID
-	workers  int
-	pageSize int
-	interval time.Duration
+	cfg          Config
+	nodes        []config.NodeID
+	workers      int
+	pageSize     int
+	interval     time.Duration
+	readyTimeout time.Duration
+	readyPoll    time.Duration
 
 	passes, scanned, owned, repaired, superseded, failed, pending atomic.Int64
+	deferred                                                      atomic.Int64
 }
 
 // New validates cfg and applies its defaults. It starts nothing.
@@ -155,6 +174,8 @@ func New(cfg Config) (*Service, error) {
 	if s.interval <= 0 {
 		s.interval = defaultInterval
 	}
+	s.readyTimeout = cmp.Or(cfg.ReadyTimeout, defaultReadyTimeout)
+	s.readyPoll = cmp.Or(cfg.ReadyPoll, defaultReadyPoll)
 
 	return s, nil
 }
@@ -177,6 +198,7 @@ func (s *Service) Stats() Stats {
 		Superseded: s.superseded.Load(),
 		Failed:     s.failed.Load(),
 		Pending:    s.pending.Load(),
+		Deferred:   s.deferred.Load(),
 	}
 }
 
@@ -188,14 +210,63 @@ func (s *Service) Run(ctx context.Context) error {
 		"nodes", s.nodes, "workers", s.workers, "interval_ms", s.interval.Milliseconds())
 
 	for {
-		if err := s.Pass(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			slog.ErrorContext(ctx, "Repair pass failed", "err", err)
+		if s.awaitReady(ctx) {
+			if err := s.Pass(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				slog.ErrorContext(ctx, "Repair pass failed", "err", err)
+			}
 		}
 
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(s.interval):
+		}
+	}
+}
+
+// awaitReady holds a pass until the cluster is settled, and reports whether it
+// may run. A pass that is never ready is deferred, not failed: nothing it would
+// have read could be trusted, so it has learned nothing about any shard.
+func (s *Service) awaitReady(ctx context.Context) bool {
+	if s.cfg.Ready == nil {
+		return true
+	}
+
+	start := time.Now()
+	logged := false
+	for {
+		checkCtx, cancel := context.WithTimeout(ctx, readyCheckTimeout)
+		err := s.cfg.Ready.Ready(checkCtx)
+		cancel()
+		if ctx.Err() != nil {
+			return false
+		}
+		if err == nil {
+			if logged {
+				slog.InfoContext(ctx, "Repair pass released: cluster ready",
+					"waited_ms", time.Since(start).Milliseconds())
+			}
+
+			return true
+		}
+		if !logged {
+			slog.InfoContext(ctx, "Repair pass waiting for cluster readiness",
+				"reason", err.Error(), "timeout_ms", s.readyTimeout.Milliseconds())
+			logged = true
+		}
+		if time.Since(start) >= s.readyTimeout {
+			s.deferred.Add(1)
+			slog.InfoContext(ctx, "Repair pass deferred: cluster not ready",
+				"reason", err.Error(), "waited_ms", time.Since(start).Milliseconds(),
+				"next_in_ms", s.interval.Milliseconds())
+
+			return false
+		}
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(s.readyPoll):
 		}
 	}
 }

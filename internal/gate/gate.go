@@ -19,11 +19,12 @@ import (
 )
 
 // MetaClient is the metadata surface a gate needs: everything the request
-// handlers read and write, plus the cursor scan the repair sweep pages the
-// object table with, which no request path asks for.
+// handlers read and write, plus the cursor scan and replica status the repair
+// sweep uses, which no request path asks for.
 type MetaClient interface {
 	handlers.MetaClient
 	ScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error)
+	Status(ctx context.Context, target config.NodeID) (meta.MetaStatus, error)
 }
 
 // BlobClient is the shard surface a gate needs: the request path's reads and
@@ -111,6 +112,11 @@ type Config struct {
 	// coordinator, the gate that shares its disk, which settles ownership
 	// without an election.
 	LocalBlobNodeIDs []config.NodeID
+
+	// MetaNodeIDs are every meta replica, and LocalMetaNodeIDs those in this
+	// process. Repair waits for a leader and for the local ones to catch up.
+	MetaNodeIDs      []config.NodeID
+	LocalMetaNodeIDs []config.NodeID
 
 	// Repair sweeps for shards a local blob node owns but does not hold at the
 	// generation its record names.
