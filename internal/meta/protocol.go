@@ -37,6 +37,8 @@ const (
 const (
 	ErrCodeNotFound  = "not-found"
 	ErrCodeNotLeader = "not-leader"
+	// ErrCodeBehind answers a leader read the leader could not confirm in time.
+	ErrCodeBehind = "behind"
 )
 
 // raftAddrPrefix builds the node-identifying raft advertise address space
@@ -91,6 +93,9 @@ type MetaRequest struct {
 	// Epoch is used by OpMetaPutMax to reject a placement older than the one
 	// already published for the object.
 	Epoch uint64 `json:"epoch,omitempty"`
+	// Leader asks for a read only the leader may answer, and only once it has
+	// applied everything committed. A follower refuses with not-leader.
+	Leader bool `json:"leader,omitempty"`
 }
 
 func (h *MetaRequest) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }

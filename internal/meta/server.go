@@ -495,6 +495,24 @@ func (s *Server) leaderAddr() string {
 	return string(addr)
 }
 
+// leaderReadWait bounds how long a leader read waits to start its barrier.
+const leaderReadWait = 5 * time.Second
+
+// leaderRead reports whether this replica may serve a leader read, as a protocol
+// code, empty meaning yes. The barrier commits through a quorum and applies every
+// earlier entry first, which also covers a new leader's unapplied prior term.
+func (s *Server) leaderRead() string {
+	err := s.raft.Barrier(leaderReadWait).Error()
+	switch {
+	case err == nil:
+		return ""
+	case errors.Is(err, raft.ErrNotLeader), errors.Is(err, raft.ErrLeadershipLost):
+		return ErrCodeNotLeader
+	default:
+		return ErrCodeBehind
+	}
+}
+
 // LeaderKnown reports whether this replica currently observes a leader. It
 // reads local raft state only, so a replica partitioned from the cluster
 // answers false rather than blocking on a peer it cannot reach.

@@ -222,7 +222,7 @@ func (s *Service) discard(ctx context.Context, t task) error {
 
 // currentEpoch reads the epoch the object's record names right now.
 func (s *Service) currentEpoch(ctx context.Context, hash [32]byte) (uint64, error) {
-	raw, err := s.cfg.Meta.Get(ctx, handlers.TableKey(model.TableObjects, string(hash[:])))
+	raw, err := s.cfg.Meta.LeaderGet(ctx, handlers.TableKey(model.TableObjects, string(hash[:])))
 	if err != nil {
 		return 0, err
 	}

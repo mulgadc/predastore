@@ -37,12 +37,12 @@ import (
 	"github.com/mulgadc/predastore/internal/meta"
 )
 
-// MetaClient is the slice of the meta client a sweep reads. ScanFrom is the
-// one that matters: the object table does not fit in a single response on any
-// cluster worth repairing.
+// MetaClient is the slice of the meta client a sweep reads. Both reads go to
+// the leader: a replica still replaying its log serves records that make shards
+// look owed, and a rebuilt shard must not be committed on a stale epoch check.
 type MetaClient interface {
-	Get(ctx context.Context, key string) ([]byte, error)
-	ScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error)
+	LeaderGet(ctx context.Context, key string) ([]byte, error)
+	LeaderScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error)
 }
 
 var _ MetaClient = (*meta.Client)(nil)
@@ -350,7 +350,7 @@ func (s *Service) scan(ctx context.Context, emit func(task) error) error {
 	prefix := handlers.TableKey(model.TableObjects, "")
 	cursor := ""
 	for {
-		items, err := s.cfg.Meta.ScanFrom(ctx, prefix, cursor, s.pageSize)
+		items, err := s.cfg.Meta.LeaderScanFrom(ctx, prefix, cursor, s.pageSize)
 		if err != nil {
 			return fmt.Errorf("scan placement records: %w", err)
 		}

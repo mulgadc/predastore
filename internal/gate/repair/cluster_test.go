@@ -267,6 +267,15 @@ func (m *fakeMeta) ScanFrom(_ context.Context, prefix, after string, limit int) 
 	return items, nil
 }
 
+// The fake has one replica, so a leader read is the ordinary read.
+func (m *fakeMeta) LeaderGet(ctx context.Context, key string) ([]byte, error) {
+	return m.Get(ctx, key)
+}
+
+func (m *fakeMeta) LeaderScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error) {
+	return m.ScanFrom(ctx, prefix, after, limit)
+}
+
 // object is one stored object and everything a test needs to assert about it.
 type object struct {
 	hash   [32]byte

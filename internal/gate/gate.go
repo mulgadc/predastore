@@ -24,6 +24,8 @@ import (
 type MetaClient interface {
 	handlers.MetaClient
 	ScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error)
+	LeaderGet(ctx context.Context, key string) ([]byte, error)
+	LeaderScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error)
 	Status(ctx context.Context, target config.NodeID) (meta.MetaStatus, error)
 }
 
