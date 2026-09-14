@@ -126,23 +126,34 @@ const (
 // mismatch and rebuilds it again, so counting them as repairs reports a sweep
 // as productive while it loops.
 type Stats struct {
-	Passes     int64
-	Scanned    int64
-	Owned      int64
-	Repaired   int64
-	Superseded int64
-	Failed     int64
-	Pending    int64
+	Passes     int64 `json:"passes"`
+	Scanned    int64 `json:"scanned"`
+	Owned      int64 `json:"owned"`
+	Owed       int64 `json:"owed"`
+	Repaired   int64 `json:"repaired"`
+	Superseded int64 `json:"superseded"`
+	Failed     int64 `json:"failed"`
+	Pending    int64 `json:"pending"`
 	// Deferred counts passes held back: the cluster never became ready, or no
 	// peer of an owed shard answered.
-	Deferred int64
+	Deferred int64 `json:"deferred"`
+
+	// Repaired split by route: publishing a prepared shard, copying it back
+	// from the handoff standby, or rebuilding it from peers.
+	RepairedCommit  int64 `json:"repaired_commit"`
+	RepairedStandby int64 `json:"repaired_standby"`
+	RepairedRebuild int64 `json:"repaired_rebuild"`
 
 	// Failed split by cause. Unreachable is transient; a peer at another epoch
 	// or missing the shard means it cannot be rebuilt from what is there.
-	FailedPeerUnreachable int64
-	FailedPeerOtherEpoch  int64
-	FailedPeerMissing     int64
-	FailedOther           int64
+	FailedPeerUnreachable int64 `json:"failed_peer_unreachable"`
+	FailedPeerOtherEpoch  int64 `json:"failed_peer_other_epoch"`
+	FailedPeerMissing     int64 `json:"failed_peer_missing"`
+	FailedOther           int64 `json:"failed_other"`
+
+	// LastPass is the most recent pass, or the most recent deferral; nil
+	// until the first has ended.
+	LastPass *PassSummary `json:"last_pass,omitempty"`
 }
 
 // Service sweeps for shards its nodes owe and rebuilds them.
@@ -156,9 +167,17 @@ type Service struct {
 	readyPoll    time.Duration
 
 	passes, scanned, owned, repaired, superseded, failed, pending atomic.Int64
-	deferred                                                      atomic.Int64
+
+	deferred, owed atomic.Int64
+
+	repairedCommit, repairedStandby, repairedRebuild atomic.Int64
 
 	failedPeerUnreachable, failedPeerOtherEpoch, failedPeerMissing, failedOther atomic.Int64
+
+	// owedStreak counts consecutive passes that found shards owed, and lastPass
+	// holds the most recent summary.
+	owedStreak atomic.Int64
+	lastPass   atomic.Pointer[PassSummary]
 }
 
 // New validates cfg and applies its defaults. It starts nothing.
@@ -204,16 +223,23 @@ func (s *Service) Stats() Stats {
 		Passes:     s.passes.Load(),
 		Scanned:    s.scanned.Load(),
 		Owned:      s.owned.Load(),
+		Owed:       s.owed.Load(),
 		Repaired:   s.repaired.Load(),
 		Superseded: s.superseded.Load(),
 		Failed:     s.failed.Load(),
 		Pending:    s.pending.Load(),
 		Deferred:   s.deferred.Load(),
 
+		RepairedCommit:  s.repairedCommit.Load(),
+		RepairedStandby: s.repairedStandby.Load(),
+		RepairedRebuild: s.repairedRebuild.Load(),
+
 		FailedPeerUnreachable: s.failedPeerUnreachable.Load(),
 		FailedPeerOtherEpoch:  s.failedPeerOtherEpoch.Load(),
 		FailedPeerMissing:     s.failedPeerMissing.Load(),
 		FailedOther:           s.failedOther.Load(),
+
+		LastPass: s.lastPass.Load(),
 	}
 }
 
@@ -272,6 +298,10 @@ func (s *Service) awaitReady(ctx context.Context) bool {
 		}
 		if time.Since(start) >= s.readyTimeout {
 			s.deferred.Add(1)
+			s.lastPass.Store(&PassSummary{
+				Outcome: OutcomeNotReady, Reason: err.Error(),
+				Finished: time.Now(), DurationMs: time.Since(start).Milliseconds(),
+			})
 			slog.InfoContext(ctx, "Repair pass deferred: cluster not ready",
 				"reason", err.Error(), "waited_ms", time.Since(start).Milliseconds(),
 				"next_in_ms", s.interval.Milliseconds())
@@ -300,6 +330,7 @@ func (s *Service) Pass(ctx context.Context) error {
 	// behind it is abandoned rather than failed.
 	passCtx, stopPass := context.WithCancel(ctx)
 	defer stopPass()
+	start, before := time.Now(), s.Stats()
 
 	work := make(chan task)
 	var wg sync.WaitGroup
@@ -309,11 +340,12 @@ func (s *Service) Pass(ctx context.Context) error {
 	for range s.workers {
 		wg.Go(func() {
 			for t := range work {
-				err := s.repairShard(passCtx, t)
+				route, err := s.repairShard(passCtx, t)
 				switch {
 				case err == nil:
 					owed.Add(-1)
 					s.repaired.Add(1)
+					s.countRoute(route)
 				case deferred.Load():
 					// Cut short by the deferral, which says nothing about this shard.
 				case errors.Is(err, errSuperseded):
@@ -342,6 +374,7 @@ func (s *Service) Pass(ctx context.Context) error {
 
 	err := s.scan(passCtx, func(t task) error {
 		owed.Add(1)
+		s.owed.Add(1)
 		s.pending.Add(1)
 		select {
 		case work <- t:
@@ -361,9 +394,9 @@ func (s *Service) Pass(ctx context.Context) error {
 	s.passes.Add(1)
 	if deferred.Load() {
 		s.deferred.Add(1)
-
-		return ErrPassDeferred
+		err = ErrPassDeferred
 	}
+	s.summarise(ctx, before, start, err)
 
 	return err
 }

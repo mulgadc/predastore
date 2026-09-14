@@ -21,7 +21,7 @@ import (
 // driven home holds the right bytes already, invisible. Publishing them is one
 // round trip and no reconstruction, and it is the same forward recovery a read
 // performs, so asking costs nothing when the answer is no.
-func (s *Service) repairShard(ctx context.Context, t task) error {
+func (s *Service) repairShard(ctx context.Context, t task) (repairRoute, error) {
 	// Superseded means the node has moved past this generation and published
 	// nothing, so nothing was repaired and the other routes still have to run.
 	superseded, err := s.cfg.Blob.Commit(ctx, t.node, blob.CommitRequest{
@@ -32,18 +32,18 @@ func (s *Service) repairShard(ctx context.Context, t task) error {
 		slog.DebugContext(ctx, "Repaired a shard by publishing what its node had prepared",
 			"node", t.node, "index", t.index)
 
-		return nil
+		return routeCommit, nil
 	case err != nil && !errors.Is(err, blob.ErrNotPrepared):
-		return fmt.Errorf("publish prepared shard: %w", err)
+		return 0, fmt.Errorf("publish prepared shard: %w", err)
 	}
 
 	if err := s.pullFromHandoff(ctx, t); err == nil {
-		return nil
+		return routeStandby, nil
 	} else if !errors.Is(err, errNoHandoff) {
-		return err
+		return 0, err
 	}
 
-	return s.rebuildShard(ctx, t)
+	return routeRebuild, s.rebuildShard(ctx, t)
 }
 
 // errNoHandoff reports that the handoff holder has nothing for this position,
