@@ -53,22 +53,40 @@ type probeSnapshot struct {
 	checks map[string]string
 }
 
-// Server answers /healthz and /readyz.
+// Server answers /healthz, /readyz and any extra endpoints it was given.
 type Server struct {
-	addr   string
-	checks []Check
-	sample atomic.Pointer[probeSnapshot]
+	addr      string
+	checks    []Check
+	endpoints []Endpoint
+	sample    atomic.Pointer[probeSnapshot]
 }
 
-func New(addr string, checks []Check) *Server {
-	return &Server{addr: addr, checks: checks}
+// Endpoint is an extra read-only route served beside the probes. It is as
+// unauthenticated as they are, so it carries counters, never addresses or keys.
+type Endpoint struct {
+	Pattern string
+	Handler http.Handler
+}
+
+func New(addr string, checks []Check, endpoints ...Endpoint) *Server {
+	return &Server{addr: addr, checks: checks, endpoints: endpoints}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
+	for _, e := range s.endpoints {
+		mux.Handle(e.Pattern, e.Handler)
+	}
 	return mux
+}
+
+// JSONHandler serves whatever body returns, as uncached JSON.
+func JSONHandler(body func() any) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, body())
+	})
 }
 
 // healthz answers for the process itself. Reaching this handler is the whole

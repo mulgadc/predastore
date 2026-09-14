@@ -28,6 +28,7 @@ import (
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate"
+	"github.com/mulgadc/predastore/internal/gate/repair"
 	"github.com/mulgadc/predastore/internal/meta"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/transport"
@@ -103,6 +104,7 @@ func Run(ctx context.Context, opts Options) error {
 	runs := make([]func(context.Context) error, 0, len(host.Nodes)+1)
 	cleanups := make([]func(), 0, len(host.Nodes))
 	var checks []admin.Check
+	var endpoints []admin.Endpoint
 	defer func() {
 		for _, cleanup := range cleanups {
 			cleanup()
@@ -116,13 +118,14 @@ func Run(ctx context.Context, opts Options) error {
 		runs = append(runs, built.run)
 		cleanups = append(cleanups, built.cleanup)
 		checks = append(checks, built.checks...)
+		endpoints = append(endpoints, built.endpoints...)
 	}
 
 	// The admin listener binds the cluster plane, never the gate's S3 address:
 	// health is operator traffic and that address is public by design.
 	if host.AdminPort != 0 {
 		addr := net.JoinHostPort(config.HostBindAddr(host), strconv.Itoa(host.AdminPort))
-		runs = append(runs, admin.New(addr, checks).Run)
+		runs = append(runs, admin.New(addr, checks, endpoints...).Run)
 	}
 
 	g, gctx := errgroup.WithContext(ctx)
@@ -249,13 +252,35 @@ func blobAnswers(ctx context.Context, bc shardProber, id NodeID) bool {
 	return errors.Is(err, blob.ErrNotFound)
 }
 
+type repairReporter interface {
+	RepairStats() (repair.Stats, bool)
+}
+
+var _ repairReporter = (*gate.Server)(nil)
+
+// repairEndpoint serves the repair sweep's counters on the admin port, so what
+// repair has done can be read on the node and not only in the telemetry sink.
+func repairEndpoint(gw repairReporter) admin.Endpoint {
+	return admin.Endpoint{
+		Pattern: "GET /repair",
+		Handler: admin.JSONHandler(func() any {
+			stats, ok := gw.RepairStats()
+			if !ok {
+				return map[string]any{"enabled": false}
+			}
+			return map[string]any{"enabled": true, "stats": stats}
+		}),
+	}
+}
+
 // builtNode is one node's lifecycle and the readiness questions it can answer.
 // A node contributes only what it holds a client or a replica for, so a probe
 // describes the process it reached rather than the cluster as a whole.
 type builtNode struct {
-	run     func(context.Context) error
-	cleanup func()
-	checks  []admin.Check
+	run       func(context.Context) error
+	cleanup   func()
+	checks    []admin.Check
+	endpoints []admin.Endpoint
 }
 
 // buildNode builds one node of this host: the transports it is reached over,
@@ -322,6 +347,7 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 	dir := config.NodeDataDir(host, n)
 	var serve func(context.Context) error
 	var checks []admin.Check
+	var endpoints []admin.Endpoint
 
 	switch n.Role {
 	case RoleGate:
@@ -362,6 +388,7 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		for _, id := range blobIDs {
 			checks = append(checks, blobNodeReachable(blobClient, id))
 		}
+		endpoints = append(endpoints, repairEndpoint(gw))
 
 	case RoleBlob:
 		// The node owns its store: it creates the directory, opens the engine
@@ -415,5 +442,5 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		}
 		return nil
 	}
-	return builtNode{run: run, cleanup: cleanup, checks: checks}, nil
+	return builtNode{run: run, cleanup: cleanup, checks: checks, endpoints: endpoints}, nil
 }
