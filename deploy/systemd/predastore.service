@@ -1,9 +1,6 @@
 [Unit]
 Description=Predastore (S3-compatible object storage)
 Documentation=https://github.com/mulgadc/predastore
-# A [[host]] binds the address its config names, and binding an address the
-# kernel does not have yet fails outright. Multi-host deployments name a real
-# interface address, so the network has to be up before s3d starts.
 After=network-online.target
 Wants=network-online.target
 
@@ -12,18 +9,16 @@ Type=simple
 User=predastore
 Group=predastore
 
-# Defaults first, then the operator's file overrides them. Later settings win,
-# so the unit runs unattended if the file is absent, and the parse-sensitive
-# values below always have something valid in them.
+# Defaults first, overridden by the operator's file. The parse-sensitive values
+# always hold something valid, so the service starts without the file.
 Environment=PREDA_CONFIG=/etc/predastore/predastore.toml
 Environment=PREDA_HOST_ID=1
 Environment=PREDA_ADMIN_PORT=0
-Environment=PREDA_LOG_LEVEL=info
+Environment=PREDA_LOG_LEVEL=warn
 EnvironmentFile=-/etc/predastore/predastore.env
 
-# s3d resolves each host-local setting flag, then config, then default, so an
-# empty ${VAR} expands to one empty argument that falls through to the TOML.
-# That is what lets one ExecStart serve every deployment.
+# s3d resolves each setting flag, then config, then default, so an empty ${VAR}
+# falls through to the TOML and one ExecStart serves every deployment.
 ExecStart=/usr/local/bin/s3d \
     -config ${PREDA_CONFIG} \
     -host ${PREDA_HOST_ID} \
@@ -39,26 +34,18 @@ ExecStart=/usr/local/bin/s3d \
 Restart=on-failure
 RestartSec=5
 
-# Closing a blob node flushes its badger value log and a meta replica writes a
-# final raft snapshot. A SIGKILL through either turns the next start into a
-# recovery, so the stop budget is generous rather than tight.
+# A blob node flushes its badger value log on close and a meta replica writes a
+# final raft snapshot. SIGKILL through either turns the next start into a recovery.
 TimeoutStopSec=60
-
-# Predastore is the workload on a storage node, so losing it to a process that
-# merely allocated faster is never the outcome wanted.
 OOMScoreAdjust=-500
 
-# No MemoryHigh or MemoryMax: on a dedicated node a cap only leaves RAM the
-# page cache and the shard buffers could have used. Set them per deployment if
-# predastore shares the machine with something that must not be starved.
+# No MemoryHigh or MemoryMax: on a dedicated node a cap only takes RAM from the
+# page cache. Set them if predastore shares the machine.
 
-# Everything the service writes stays private to it, which the at-rest key
-# loader requires: it is fail-closed on a group- or other-readable mode.
+# The at-rest key loader is fail-closed on a group- or other-readable mode.
 UMask=0077
 
-# Filesystem access. ProtectSystem=strict already makes /etc read-only, so the
-# allowlist below is about stating what this service touches, and about failing
-# closed on a data directory nobody remembered to add.
+# Filesystem access
 NoNewPrivileges=yes
 ProtectSystem=strict
 PrivateDevices=yes
@@ -79,23 +66,18 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectProc=invisible
 SystemCallArchitectures=native
-# The gate is the one port a standalone deployment exposes publicly, so it is
-# worth filtering syscalls rather than only architectures. EPERM rather than
-# SIGSYS so a denial surfaces as a failed call instead of a killed process.
+# EPERM rather than SIGSYS, so a denial is a failed call not a killed process.
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 MemoryDenyWriteExecute=yes
-# TCP for the S3 gate, UDP for the QUIC cluster plane, AF_UNIX for the
-# resolver. Nothing here enumerates interfaces or routes, so no AF_NETLINK.
+# No AF_NETLINK: nothing here enumerates interfaces or routes.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# Every listening port is above 1024, so the service needs no capability at
-# all, not even CAP_NET_BIND_SERVICE.
+# Every listening port is above 1024, so not even CAP_NET_BIND_SERVICE.
 CapabilityBoundingSet=
 ProtectHostname=yes
 KeyringMode=private
 RemoveIPC=yes
-# No core dumps: a core would contain the at-rest key and plaintext object
-# data, written somewhere with none of the protections above.
+# A core would hold the at-rest key and plaintext object data.
 LimitCORE=0
 LimitNOFILE=65536
 LimitNPROC=4096
