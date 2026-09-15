@@ -132,7 +132,9 @@ func New(cfg Config) (*Server, error) {
 	}
 
 	s.setupMiddleware()
-	s.setupRoutes(ring)
+	if err := s.setupRoutes(ring); err != nil {
+		return nil, err
+	}
 	return s, nil
 }
 

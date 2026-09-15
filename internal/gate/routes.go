@@ -1,38 +1,27 @@
 package gate
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/s3api"
 )
 
-// byQuery routes on the presence of a query parameter. S3 overloads one method
-// and path across several operations and distinguishes them by query string,
-// which chi cannot match on, so the split is made explicit here rather than
-// buried in the handler it dispatches to.
-func byQuery(param string, with, without http.Handler) http.Handler {
+// selectRoute answers a method and pattern that several operations share. S3
+// distinguishes them by query parameter or header, which chi cannot match on,
+// so the first route the request selects wins and the table's order decides.
+func selectRoute(routes []s3api.Route, handlers map[string]http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Has(param) {
-			with.ServeHTTP(w, r)
-			return
+		for _, route := range routes {
+			if route.Selects(r) {
+				handlers[route.ID].ServeHTTP(w, r)
+				return
+			}
 		}
-		without.ServeHTTP(w, r)
-	})
-}
-
-// byHeader routes on the presence of a request header, the same way byQuery
-// routes on a query parameter: S3 overloads PUT /{bucket}/{key} across
-// PutObject and CopyObject and distinguishes them by x-amz-copy-source, which
-// chi cannot match on either.
-func byHeader(header string, with, without http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get(header) != "" {
-			with.ServeHTTP(w, r)
-			return
-		}
-		without.ServeHTTP(w, r)
+		methodNotAllowed().ServeHTTP(w, r)
 	})
 }
 
@@ -45,73 +34,107 @@ func methodNotAllowed() http.Handler {
 	})
 }
 
-// setupRoutes maps the S3 REST API onto the handlers, constructing each one
-// over the dependencies it needs. It runs after the middleware chain is
-// installed, since chi requires all middleware to be registered before the
-// first route.
+// setupRoutes builds the router from the declared S3 route table, so a route
+// exists only where s3api names the operation it answers. It runs after the
+// middleware chain is installed, since chi requires all middleware to be
+// registered before the first route.
 //
 // The three route groups are the three shapes an S3 request addresses: no
 // resource, a bucket, or an object. Middleware registered inside a group is
 // inline, so it runs after chi has matched and can resolve the resource from
 // the same URL parameters the handler reads.
-func (s *Server) setupRoutes(ring *placement.Ring) {
-	r := s.router
+func (s *Server) setupRoutes(ring *placement.Ring) error {
+	built := s.s3Handlers(ring)
+	if err := checkHandlers(built); err != nil {
+		return err
+	}
+
+	s.mountScope(s3api.ScopeService, nil, built)
+	s.mountScope(s3api.ScopeBucket, resolveBucket, built)
+	s.mountScope(s3api.ScopeObject, resolveObject, built)
+	return nil
+}
+
+// s3Handlers constructs each handler over the dependencies it needs, keyed by
+// the route ID that binds it. bulkBody marks the five that move object data: a
+// request deadline that applies to a body caps the object at whatever fits.
+func (s *Server) s3Handlers(ring *placement.Ring) map[string]http.Handler {
 	mc, bc := s.cfg.Meta, s.cfg.Blob
 	cache, cfg := s.buckets, s.handlerCfg
 
-	// Service operations address no resource.
-	r.Group(func(r chi.Router) {
+	return map[string]http.Handler{
+		"ListBuckets":             handlers.ListBuckets(mc),
+		"CreateBucket":            handlers.CreateBucket(mc, cache, cfg),
+		"HeadBucket":              handlers.HeadBucket(mc, cache),
+		"DeleteBucket":            handlers.DeleteBucket(mc, cache),
+		"ListMultipartUploads":    handlers.ListMultipartUploads(mc, cache),
+		"ListObjects":             handlers.ListObjects(mc, cache),
+		"DeleteObjects":           handlers.DeleteObjects(mc, bc, cache),
+		"HeadObject":              handlers.HeadObject(mc, ring, cache, cfg),
+		"ListParts":               handlers.ListParts(mc, cache),
+		"GetObject":               bulkBody(handlers.GetObject(mc, bc, ring, cache, cfg)),
+		"UploadPartCopy":          bulkBody(handlers.UploadPartCopy(mc, bc, ring, cache, cfg)),
+		"UploadPart":              bulkBody(handlers.UploadPart(mc, bc, ring, cache, cfg)),
+		"CopyObject":              bulkBody(handlers.CopyObject(mc, bc, ring, cache, cfg)),
+		"PutObject":               bulkBody(handlers.PutObject(mc, bc, ring, cache, cfg)),
+		"CompleteMultipartUpload": bulkBody(handlers.CompleteMultipartUpload(mc, bc, ring, cache, cfg)),
+		"CreateMultipartUpload":   handlers.CreateMultipartUpload(mc, cache),
+		"AbortMultipartUpload":    handlers.AbortMultipartUpload(mc, bc, cache),
+		"DeleteObject":            handlers.DeleteObject(mc, bc, cache),
+	}
+}
+
+// checkHandlers refuses a table and a handler set that have drifted apart, so a
+// declared operation cannot be unserved and a handler cannot be unreachable.
+func checkHandlers(built map[string]http.Handler) error {
+	declared := map[string]bool{}
+	for _, route := range s3api.Routes() {
+		declared[route.ID] = true
+		if built[route.ID] == nil {
+			return fmt.Errorf("s3 route %q has no handler", route.ID)
+		}
+	}
+	for id := range built {
+		if !declared[id] {
+			return fmt.Errorf("s3 handler %q answers no declared route", id)
+		}
+	}
+	return nil
+}
+
+// mountScope registers one route group: the declared routes that address this
+// kind of resource, behind the middleware that resolves it.
+func (s *Server) mountScope(scope s3api.Scope, resolve func(http.Handler) http.Handler, built map[string]http.Handler) {
+	s.router.Group(func(r chi.Router) {
+		if resolve != nil {
+			r.Use(resolve)
+		}
 		s.useRequestChain(r)
-		r.Method(http.MethodGet, "/", handlers.ListBuckets(mc))
+
+		for _, group := range groupRoutes(scope) {
+			r.Method(group[0].Method, group[0].Pattern, selectRoute(group, built))
+		}
 	})
+}
 
-	// Bucket operations (no key).
-	r.Group(func(r chi.Router) {
-		r.Use(resolveBucket)
-		s.useRequestChain(r)
-
-		r.Method(http.MethodPut, "/{bucket}", handlers.CreateBucket(mc, cache, cfg))
-		r.Method(http.MethodHead, "/{bucket}", handlers.HeadBucket(mc, cache))
-		r.Method(http.MethodDelete, "/{bucket}", handlers.DeleteBucket(mc, cache))
-		r.Method(http.MethodGet, "/{bucket}", byQuery("uploads",
-			handlers.ListMultipartUploads(mc, cache),
-			handlers.ListObjects(mc, cache)))
-		// A POST at a bucket is the batch delete and nothing else, so without
-		// ?delete the route answers what an unmatched POST answered before it.
-		r.Method(http.MethodPost, "/{bucket}", byQuery("delete",
-			handlers.DeleteObjects(mc, bc, cache),
-			methodNotAllowed()))
-	})
-
-	// Object operations (with key).
-	r.Group(func(r chi.Router) {
-		r.Use(resolveObject)
-		s.useRequestChain(r)
-
-		// bulkBody marks the five handlers that move object data. They share a
-		// method and pattern with cheap ones, so the choice is made here rather
-		// than by route: a request deadline that applies to a body caps the
-		// object at whatever fits in it.
-		r.Method(http.MethodHead, "/{bucket}/*", handlers.HeadObject(mc, ring, cache, cfg))
-		r.Method(http.MethodGet, "/{bucket}/*", byQuery("uploadId",
-			handlers.ListParts(mc, cache),
-			bulkBody(handlers.GetObject(mc, bc, ring, cache, cfg))))
-		// x-amz-copy-source selects the server-side copy at both levels: with
-		// ?partNumber it is UploadPartCopy, without it CopyObject.
-		r.Method(http.MethodPut, "/{bucket}/*", byQuery("partNumber",
-			byHeader("X-Amz-Copy-Source",
-				bulkBody(handlers.UploadPartCopy(mc, bc, ring, cache, cfg)),
-				bulkBody(handlers.UploadPart(mc, bc, ring, cache, cfg))),
-			byHeader("X-Amz-Copy-Source",
-				bulkBody(handlers.CopyObject(mc, bc, ring, cache, cfg)),
-				bulkBody(handlers.PutObject(mc, bc, ring, cache, cfg)))))
-		r.Method(http.MethodPost, "/{bucket}/*", byQuery("uploadId",
-			bulkBody(handlers.CompleteMultipartUpload(mc, bc, ring, cache, cfg)),
-			handlers.CreateMultipartUpload(mc, cache)))
-		r.Method(http.MethodDelete, "/{bucket}/*", byQuery("uploadId",
-			handlers.AbortMultipartUpload(mc, bc, cache),
-			handlers.DeleteObject(mc, bc, cache)))
-	})
+// groupRoutes returns the scope's routes grouped by method and pattern, in
+// declaration order: chi matches those, and the group decides between them.
+func groupRoutes(scope s3api.Scope) [][]s3api.Route {
+	var groups [][]s3api.Route
+	index := map[string]int{}
+	for _, route := range s3api.Routes() {
+		if route.Scope != scope {
+			continue
+		}
+		key := route.Method + " " + route.Pattern
+		if at, ok := index[key]; ok {
+			groups[at] = append(groups[at], route)
+			continue
+		}
+		index[key] = len(groups)
+		groups = append(groups, []s3api.Route{route})
+	}
+	return groups
 }
 
 // useRequestChain installs the middleware every route shares once its resource
