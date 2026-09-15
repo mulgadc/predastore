@@ -10,27 +10,28 @@ import (
 
 const DefaultReadOpcodeTimeout = 2 * time.Second
 
-type Transport interface {
-	net.Listener
-	Dial(ctx context.Context, addr net.Addr) (net.Conn, error)
+type NodeID string
+
+type Node interface {
+	ID() NodeID
+	Addrs() []net.Addr
 }
 
-type Opcode uint16
+type Resolver interface {
+	Lookup(id NodeID) (Node, bool)
+}
 
-func readOpcode(conn net.Conn) (Opcode, error) {
-	buf := make([]byte, 2)
+type Dialer interface {
+	Dial(ctx context.Context, peer NodeID) (net.Conn, error)
+}
 
-	if err := conn.SetReadDeadline(time.Now().Add(DefaultReadOpcodeTimeout)); err != nil {
-		return Opcode(0), err
-	}
+type Listener interface {
+	Accept() (net.Conn, error)
+	Close() error
+}
 
-	if _, err := io.ReadFull(conn, buf); err != nil {
-		return Opcode(0), err
-	}
-
-	if err := conn.SetReadDeadline(time.Time{}); err != nil {
-		return Opcode(0), err
-	}
-
-	return Opcode(binary.BigEndian.Uint16(buf)), nil
+type Server interface {
+	Serve(l Listener)
+	Shutdown(ctx context.Context) error
+	Close() error
 }

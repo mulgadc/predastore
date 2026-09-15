@@ -11,37 +11,49 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-const (
-	handshakeIdleTimeout time.Duration = 5 * time.Second
-	keepAlivePeriod      time.Duration = 15 * time.Second
-	maxIdleTimeout       time.Duration = 60 * time.Second
-
-	maxIncomingStreams int64 = 1000
-
-	initialStreamReceiveWindow uint64 = 2 * 1024 * 1024
-	maxStreamReceiveWindow     uint64 = 8 * 1024 * 1024
-
-	initialConnectionReceiveWindow uint64 = 16 * 1024 * 1024
-	maxConnectionReceiveWindow     uint64 = 128 * 1024 * 1024
-)
-
 type QUICTransport struct {
-	raw *quic.Transport
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	sf singleflight.Group
+	tlsConf  *tls.Config
+	quicConf *quic.Config
+	raw      *quic.Transport
 
 	mu    sync.RWMutex
+	sf    singleflight.Group
 	conns map[string]*quic.Conn
 }
 
-func NewQUICTransport(addr *net.UDPAddr) (*QUICTransport, error) {
+func NewQUICTransport(addr *net.UDPAddr, tlsConf *tls.Config) (*QUICTransport, error) {
 	conn, err := net.ListenUDP(addr.Network(), addr)
 	if err != nil {
 		return nil, err
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
+	quicConf := &quic.Config{
+		HandshakeIdleTimeout: 5 * time.Second,
+		KeepAlivePeriod:      15 * time.Second,
+		MaxIdleTimeout:       60 * time.Second,
+
+		MaxIncomingStreams:    1000,
+		MaxIncomingUniStreams: 1000,
+
+		InitialStreamReceiveWindow:     2 * 1024 * 1024,   // 2MB
+		MaxStreamReceiveWindow:         8 * 1024 * 1024,   // 8MB
+		InitialConnectionReceiveWindow: 16 * 1024 * 1024,  // 16MB
+		MaxConnectionReceiveWindow:     128 * 1024 * 1024, // 128MB
+	}
+
 	return &QUICTransport{
-		raw:   &quic.Transport{Conn: conn},
+		ctx:    ctx,
+		cancel: cancel,
+
+		tlsConf:  tlsConf,
+		quicConf: quicConf,
+		raw:      &quic.Transport{Conn: conn},
+
 		conns: make(map[string]*quic.Conn),
 	}, nil
 }
@@ -56,7 +68,7 @@ func (qt *QUICTransport) Dial(ctx context.Context, addr net.Addr) (net.Conn, err
 	if ok {
 		stream, err := conn.OpenStream()
 		if err != nil {
-			// TODO: Evict peer from pool here.
+			// TODO: Evict conn from pool here.
 			return nil, err
 		}
 
@@ -66,27 +78,36 @@ func (qt *QUICTransport) Dial(ctx context.Context, addr net.Addr) (net.Conn, err
 	done := qt.sf.DoChan(key, func() (any, error) {
 		qt.mu.RLock()
 		conn, ok := qt.conns[key]
+		qt.mu.RUnlock()
 		if ok {
-			stream, err := conn.OpenStream()
-			if err != nil {
-				// TODO: Evict conn from pool here.
-				return nil, err
-			}
-
-			return stream, nil
+			return conn, nil
 		}
 
-		// TODO: Fill out TLS config.
-		conn, err := qt.raw.Dial(context.TODO(), addr, &tls.Config{}, &quic.Config{})
+		// This Dial is bounded by the handshake timeout in qt.quicConf. No context
+		// deadline is required.
+		conn, err := qt.raw.Dial(qt.ctx, addr, qt.tlsConf, qt.quicConf)
+		if err != nil {
+			return nil, err
+		}
 
-		return nil, nil
+		qt.mu.Lock()
+		qt.conns[key] = conn
+		qt.mu.Unlock()
+
+		return conn, nil
 	})
 
 	select {
 	case result := <-done:
-		stream, ok := result.Val.(*quic.Stream)
+		conn, ok := result.Val.(*quic.Conn)
 		if !ok {
 			return nil, &net.OpError{Op: "dial", Net: "quic", Addr: addr, Source: qt.raw.Conn.LocalAddr(), Err: result.Err}
+		}
+
+		stream, err := conn.OpenStream()
+		if err != nil {
+			// TODO: Evict conn from pool here.
+			return nil, err
 		}
 
 		return quicConn{Stream: stream, lAddr: qt.raw.Conn.LocalAddr(), rAddr: addr}, nil
@@ -94,18 +115,6 @@ func (qt *QUICTransport) Dial(ctx context.Context, addr net.Addr) (net.Conn, err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-}
-
-func (qt *QUICTransport) getConn(key string) (*quic.Conn, bool) {
-	qt.mu.RLock()
-	defer qt.mu.RUnlock()
-
-	conn, ok := qt.conns[key]
-	if ok {
-		return
-	}
-
-	return nil, true
 }
 
 // TODO: Make quicConn properly satisfy the net.Conn contract.
