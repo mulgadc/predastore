@@ -21,7 +21,7 @@ import (
 // driven home holds the right bytes already, invisible. Publishing them is one
 // round trip and no reconstruction, and it is the same forward recovery a read
 // performs, so asking costs nothing when the answer is no.
-func (s *Service) repairShard(ctx context.Context, t task) error {
+func (s *Service) repairShard(ctx context.Context, t task) (repairRoute, error) {
 	// Superseded means the node has moved past this generation and published
 	// nothing, so nothing was repaired and the other routes still have to run.
 	superseded, err := s.cfg.Blob.Commit(ctx, t.node, blob.CommitRequest{
@@ -32,18 +32,18 @@ func (s *Service) repairShard(ctx context.Context, t task) error {
 		slog.DebugContext(ctx, "Repaired a shard by publishing what its node had prepared",
 			"node", t.node, "index", t.index)
 
-		return nil
+		return routeCommit, nil
 	case err != nil && !errors.Is(err, blob.ErrNotPrepared):
-		return fmt.Errorf("publish prepared shard: %w", err)
+		return 0, fmt.Errorf("publish prepared shard: %w", err)
 	}
 
 	if err := s.pullFromHandoff(ctx, t); err == nil {
-		return nil
+		return routeStandby, nil
 	} else if !errors.Is(err, errNoHandoff) {
-		return err
+		return 0, err
 	}
 
-	return s.rebuildShard(ctx, t)
+	return routeRebuild, s.rebuildShard(ctx, t)
 }
 
 // errNoHandoff reports that the handoff holder has nothing for this position,
@@ -222,7 +222,7 @@ func (s *Service) discard(ctx context.Context, t task) error {
 
 // currentEpoch reads the epoch the object's record names right now.
 func (s *Service) currentEpoch(ctx context.Context, hash [32]byte) (uint64, error) {
-	raw, err := s.cfg.Meta.Get(ctx, handlers.TableKey(model.TableObjects, string(hash[:])))
+	raw, err := s.cfg.Meta.LeaderGet(ctx, handlers.TableKey(model.TableObjects, string(hash[:])))
 	if err != nil {
 		return 0, err
 	}
@@ -254,6 +254,7 @@ func (s *Service) fetchPeers(
 	}
 
 	have := 0
+	var short peerShortfallError
 	for index, node := range t.place.AllNodes() {
 		if index == t.index || have >= s.cfg.DataShards {
 			continue
@@ -266,6 +267,7 @@ func (s *Service) fetchPeers(
 			Epoch:      t.place.WriteEpoch,
 		})
 		if err != nil {
+			short.count(err)
 			slog.DebugContext(ctx, "Peer shard unusable for a repair",
 				"node", node, "index", index, "err", err)
 
@@ -278,9 +280,9 @@ func (s *Service) fetchPeers(
 
 	if have < s.cfg.DataShards {
 		closeAll()
+		short.have, short.need, short.epoch = have, s.cfg.DataShards, t.place.WriteEpoch
 
-		return nil, nil, fmt.Errorf("%w: %d of %d peers hold epoch %016x",
-			errTooFewPeers, have, s.cfg.DataShards, t.place.WriteEpoch)
+		return nil, nil, &short
 	}
 
 	return readers, closeAll, nil

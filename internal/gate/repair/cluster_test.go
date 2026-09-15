@@ -132,8 +132,8 @@ func (f *fakeBlob) Get(
 		return nil, blob.ErrNotFound
 	}
 	if req.Epoch != 0 && req.Epoch != s.epoch {
-		return nil, fmt.Errorf("epoch-mismatch: node holds %016x, caller asked for %016x",
-			s.epoch, req.Epoch)
+		return nil, fmt.Errorf("epoch-mismatch: node holds %016x, caller asked for %016x: %w",
+			s.epoch, req.Epoch, blob.ErrEpochMismatch)
 	}
 
 	return io.NopCloser(bytes.NewReader(s.body)), nil
@@ -265,6 +265,15 @@ func (m *fakeMeta) ScanFrom(_ context.Context, prefix, after string, limit int) 
 	}
 
 	return items, nil
+}
+
+// The fake has one replica, so a leader read is the ordinary read.
+func (m *fakeMeta) LeaderGet(ctx context.Context, key string) ([]byte, error) {
+	return m.Get(ctx, key)
+}
+
+func (m *fakeMeta) LeaderScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error) {
+	return m.ScanFrom(ctx, prefix, after, limit)
 }
 
 // object is one stored object and everything a test needs to assert about it.

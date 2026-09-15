@@ -61,6 +61,16 @@ type Server struct {
 
 var _ http.Handler = (*Server)(nil)
 
+// RepairStats reports the repair sweep's counters, and false when this gate
+// runs no sweep.
+func (s *Server) RepairStats() (repair.Stats, bool) {
+	if s.repairer == nil {
+		return repair.Stats{}, false
+	}
+
+	return s.repairer.Stats(), true
+}
+
 // New validates cfg, applies its defaults, resolves the credential chain and
 // assembles the route table. It binds nothing and starts no goroutine: the
 // listener is Run's, and nothing on the server is set after this returns.
@@ -157,6 +167,13 @@ func newRepairer(cfg Config, ring *placement.Ring) (*repair.Service, error) {
 		Workers:      cfg.Repair.Workers,
 		PageSize:     cfg.Repair.PageSize,
 		Interval:     cfg.Repair.Interval,
+		Ready: &repair.ClusterReadiness{
+			Meta:         cfg.Meta,
+			MetaReplicas: cfg.MetaNodeIDs,
+			LocalMeta:    cfg.LocalMetaNodeIDs,
+			Blob:         cfg.Blob,
+			BlobNodes:    cfg.BlobNodeIDs,
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to build the repair sweep: %w", err)

@@ -52,6 +52,13 @@ func (noMeta) ScanFrom(context.Context, string, string, int) ([]meta.Item, error
 func (noMeta) Scan(context.Context, string, int) ([]meta.Item, error) {
 	return nil, errNoCluster
 }
+func (noMeta) LeaderGet(context.Context, string) ([]byte, error) { return nil, errNoCluster }
+func (noMeta) LeaderScanFrom(context.Context, string, string, int) ([]meta.Item, error) {
+	return nil, errNoCluster
+}
+func (noMeta) Status(context.Context, config.NodeID) (meta.MetaStatus, error) {
+	return meta.MetaStatus{}, errNoCluster
+}
 
 type noBlob struct{}
 

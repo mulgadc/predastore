@@ -329,6 +329,77 @@ func (c *Client) ScanFrom(ctx context.Context, prefix, after string, limit int) 
 	return nil, lastErr
 }
 
+// ErrNoLeaderRead reports that no replica would serve a leader read, which
+// means there is no leader or it could not confirm itself in time.
+var ErrNoLeaderRead = errors.New("no meta replica would serve a leader read")
+
+// LeaderGet is Get answered only by a leader that has applied everything
+// committed. A follower's not-found is not trusted, so neither is its value.
+func (c *Client) LeaderGet(ctx context.Context, key string) (value []byte, err error) {
+	defer observeOp(ctx, telemetry.MetaOpGet, time.Now(), &err)
+
+	resp, err := c.leaderRead(ctx, OpMetaGet, request(key, 0))
+	if err != nil {
+		return nil, err
+	}
+	switch resp.Err {
+	case "":
+		return resp.Value, nil
+	case ErrCodeNotFound:
+		return nil, fmt.Errorf("get %q: %w", key, ErrNotFound)
+	default:
+		return nil, errors.New(resp.Err)
+	}
+}
+
+// LeaderScanFrom is ScanFrom answered only by a leader that has applied
+// everything committed. Each page is fresh; the pages are still not a snapshot.
+func (c *Client) LeaderScanFrom(ctx context.Context, prefix, after string, limit int) (items []Item, err error) {
+	defer observeOp(ctx, telemetry.MetaOpScan, time.Now(), &err)
+
+	req := request(prefix, limit)
+	req.After = []byte(after)
+	resp, err := c.leaderRead(ctx, OpMetaScan, req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Err != "" {
+		return nil, errors.New(resp.Err)
+	}
+	items = make([]Item, len(resp.Items))
+	for i, it := range resp.Items {
+		items[i] = Item{Key: string(it.Key), Value: it.Value}
+	}
+
+	return items, nil
+}
+
+// leaderRead sends a leader read to each replica in turn until one serves it.
+// Any answer other than a refusal came from the leader, so it is cached.
+func (c *Client) leaderRead(ctx context.Context, op rpc.Opcode, req *MetaRequest) (*MetaResponse, error) {
+	req.Leader = true
+	var lastErr error
+	for _, id := range c.readOrder() {
+		resp, err := c.call(ctx, id, op, req, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.Err == ErrCodeNotLeader || resp.Err == ErrCodeBehind {
+			lastErr = fmt.Errorf("replica %d: %s", id, resp.Err)
+			continue
+		}
+		c.cacheLeader(id)
+
+		return resp, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no replica answered")
+	}
+
+	return nil, fmt.Errorf("%w: %w", ErrNoLeaderRead, lastErr)
+}
+
 // ListKeys returns every key with the prefix.
 func (c *Client) ListKeys(ctx context.Context, prefix string) ([]string, error) {
 	items, err := c.Scan(ctx, prefix, 0)

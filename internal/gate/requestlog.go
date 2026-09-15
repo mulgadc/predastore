@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/mulgadc/predastore/internal/gate/handlers"
 )
 
 // slowRequestThreshold is the point past which a request is worth reporting
@@ -53,6 +54,7 @@ func requestLog(next http.Handler) http.Handler {
 			"status", ww.Status(),
 			"bytes", ww.BytesWritten(),
 			"duration_ms", elapsed.Milliseconds(),
+			"remoteAddr", handlers.ClientAddr(r),
 		}
 
 		switch {

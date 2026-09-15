@@ -16,6 +16,7 @@
 package repair
 
 import (
+	"cmp"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -36,12 +37,12 @@ import (
 	"github.com/mulgadc/predastore/internal/meta"
 )
 
-// MetaClient is the slice of the meta client a sweep reads. ScanFrom is the
-// one that matters: the object table does not fit in a single response on any
-// cluster worth repairing.
+// MetaClient is the slice of the meta client a sweep reads. Both reads go to
+// the leader: a replica still replaying its log serves records that make shards
+// look owed, and a rebuilt shard must not be committed on a stale epoch check.
 type MetaClient interface {
-	Get(ctx context.Context, key string) ([]byte, error)
-	ScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error)
+	LeaderGet(ctx context.Context, key string) ([]byte, error)
+	LeaderScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error)
 }
 
 var _ MetaClient = (*meta.Client)(nil)
@@ -83,6 +84,13 @@ type Config struct {
 	// Interval is the gap between the end of one pass and the start of the
 	// next. Zero defaults.
 	Interval time.Duration
+
+	// Ready holds each pass until the cluster is settled. Nil runs every pass
+	// immediately. ReadyTimeout bounds one wait, after which the pass is
+	// deferred to the next interval; ReadyPoll is the gap between checks.
+	Ready        Readiness
+	ReadyTimeout time.Duration
+	ReadyPoll    time.Duration
 }
 
 // DefaultWorkers is the rebuild concurrency. A node holding stale shards is a
@@ -97,9 +105,15 @@ type Config struct {
 func DefaultWorkers() int { return min(runtime.NumCPU()/2+1, maxDefaultWorkers) }
 
 const (
-	maxDefaultWorkers = 8
-	defaultPageSize   = 512
-	defaultInterval   = 5 * time.Minute
+	maxDefaultWorkers   = 8
+	defaultPageSize     = 512
+	defaultInterval     = 5 * time.Minute
+	defaultReadyTimeout = 2 * time.Minute
+	defaultReadyPoll    = 2 * time.Second
+
+	// readyCheckTimeout bounds one readiness check, so an unanswering replica
+	// costs one poll rather than the whole wait.
+	readyCheckTimeout = 10 * time.Second
 )
 
 // Stats is what a pass did. Scanned counts placement records read, owned the
@@ -112,24 +126,58 @@ const (
 // mismatch and rebuilds it again, so counting them as repairs reports a sweep
 // as productive while it loops.
 type Stats struct {
-	Passes     int64
-	Scanned    int64
-	Owned      int64
-	Repaired   int64
-	Superseded int64
-	Failed     int64
-	Pending    int64
+	Passes     int64 `json:"passes"`
+	Scanned    int64 `json:"scanned"`
+	Owned      int64 `json:"owned"`
+	Owed       int64 `json:"owed"`
+	Repaired   int64 `json:"repaired"`
+	Superseded int64 `json:"superseded"`
+	Failed     int64 `json:"failed"`
+	Pending    int64 `json:"pending"`
+	// Deferred counts passes held back: the cluster never became ready, or no
+	// peer of an owed shard answered.
+	Deferred int64 `json:"deferred"`
+
+	// Repaired split by route: publishing a prepared shard, copying it back
+	// from the handoff standby, or rebuilding it from peers.
+	RepairedCommit  int64 `json:"repaired_commit"`
+	RepairedStandby int64 `json:"repaired_standby"`
+	RepairedRebuild int64 `json:"repaired_rebuild"`
+
+	// Failed split by cause. Unreachable is transient; a peer at another epoch
+	// or missing the shard means it cannot be rebuilt from what is there.
+	FailedPeerUnreachable int64 `json:"failed_peer_unreachable"`
+	FailedPeerOtherEpoch  int64 `json:"failed_peer_other_epoch"`
+	FailedPeerMissing     int64 `json:"failed_peer_missing"`
+	FailedOther           int64 `json:"failed_other"`
+
+	// LastPass is the most recent pass, or the most recent deferral; nil
+	// until the first has ended.
+	LastPass *PassSummary `json:"last_pass,omitempty"`
 }
 
 // Service sweeps for shards its nodes owe and rebuilds them.
 type Service struct {
-	cfg      Config
-	nodes    []config.NodeID
-	workers  int
-	pageSize int
-	interval time.Duration
+	cfg          Config
+	nodes        []config.NodeID
+	workers      int
+	pageSize     int
+	interval     time.Duration
+	readyTimeout time.Duration
+	readyPoll    time.Duration
 
 	passes, scanned, owned, repaired, superseded, failed, pending atomic.Int64
+
+	deferred, owed atomic.Int64
+
+	repairedCommit, repairedStandby, repairedRebuild atomic.Int64
+
+	failedPeerUnreachable, failedPeerOtherEpoch, failedPeerMissing, failedOther atomic.Int64
+
+	// owedStreak counts consecutive passes that found shards owed, and lastPass
+	// holds the most recent summary.
+	owedStreak atomic.Int64
+	lastPass   atomic.Pointer[PassSummary]
 }
 
 // New validates cfg and applies its defaults. It starts nothing.
@@ -155,6 +203,8 @@ func New(cfg Config) (*Service, error) {
 	if s.interval <= 0 {
 		s.interval = defaultInterval
 	}
+	s.readyTimeout = cmp.Or(cfg.ReadyTimeout, defaultReadyTimeout)
+	s.readyPoll = cmp.Or(cfg.ReadyPoll, defaultReadyPoll)
 
 	return s, nil
 }
@@ -173,10 +223,23 @@ func (s *Service) Stats() Stats {
 		Passes:     s.passes.Load(),
 		Scanned:    s.scanned.Load(),
 		Owned:      s.owned.Load(),
+		Owed:       s.owed.Load(),
 		Repaired:   s.repaired.Load(),
 		Superseded: s.superseded.Load(),
 		Failed:     s.failed.Load(),
 		Pending:    s.pending.Load(),
+		Deferred:   s.deferred.Load(),
+
+		RepairedCommit:  s.repairedCommit.Load(),
+		RepairedStandby: s.repairedStandby.Load(),
+		RepairedRebuild: s.repairedRebuild.Load(),
+
+		FailedPeerUnreachable: s.failedPeerUnreachable.Load(),
+		FailedPeerOtherEpoch:  s.failedPeerOtherEpoch.Load(),
+		FailedPeerMissing:     s.failedPeerMissing.Load(),
+		FailedOther:           s.failedOther.Load(),
+
+		LastPass: s.lastPass.Load(),
 	}
 }
 
@@ -188,14 +251,68 @@ func (s *Service) Run(ctx context.Context) error {
 		"nodes", s.nodes, "workers", s.workers, "interval_ms", s.interval.Milliseconds())
 
 	for {
-		if err := s.Pass(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			slog.ErrorContext(ctx, "Repair pass failed", "err", err)
+		if s.awaitReady(ctx) {
+			err := s.Pass(ctx)
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, ErrPassDeferred) {
+				slog.ErrorContext(ctx, "Repair pass failed", "err", err)
+			}
 		}
 
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-time.After(s.interval):
+		}
+	}
+}
+
+// awaitReady holds a pass until the cluster is settled, and reports whether it
+// may run. A pass that is never ready is deferred, not failed: nothing it would
+// have read could be trusted, so it has learned nothing about any shard.
+func (s *Service) awaitReady(ctx context.Context) bool {
+	if s.cfg.Ready == nil {
+		return true
+	}
+
+	start := time.Now()
+	logged := false
+	for {
+		checkCtx, cancel := context.WithTimeout(ctx, readyCheckTimeout)
+		err := s.cfg.Ready.Ready(checkCtx)
+		cancel()
+		if ctx.Err() != nil {
+			return false
+		}
+		if err == nil {
+			if logged {
+				slog.InfoContext(ctx, "Repair pass released: cluster ready",
+					"waited_ms", time.Since(start).Milliseconds())
+			}
+
+			return true
+		}
+		if !logged {
+			slog.InfoContext(ctx, "Repair pass waiting for cluster readiness",
+				"reason", err.Error(), "timeout_ms", s.readyTimeout.Milliseconds())
+			logged = true
+		}
+		if time.Since(start) >= s.readyTimeout {
+			s.deferred.Add(1)
+			s.lastPass.Store(&PassSummary{
+				Outcome: OutcomeNotReady, Reason: err.Error(),
+				Finished: time.Now(), DurationMs: time.Since(start).Milliseconds(),
+			})
+			slog.InfoContext(ctx, "Repair pass deferred: cluster not ready",
+				"reason", err.Error(), "waited_ms", time.Since(start).Milliseconds(),
+				"next_in_ms", s.interval.Milliseconds())
+
+			return false
+		}
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(s.readyPoll):
 		}
 	}
 }
@@ -209,15 +326,28 @@ func (s *Service) Run(ctx context.Context) error {
 // rule against a table being written underneath it, which is a second
 // correctness argument in a component that does not need one to be correct.
 func (s *Service) Pass(ctx context.Context) error {
+	// A pass that finds no peer reachable stops early, and the work queued
+	// behind it is abandoned rather than failed.
+	passCtx, stopPass := context.WithCancel(ctx)
+	defer stopPass()
+	start, before := time.Now(), s.Stats()
+
 	work := make(chan task)
 	var wg sync.WaitGroup
 	var owed atomic.Int64
+	var deferred atomic.Bool
 
 	for range s.workers {
 		wg.Go(func() {
 			for t := range work {
-				err := s.repairShard(ctx, t)
+				route, err := s.repairShard(passCtx, t)
 				switch {
+				case err == nil:
+					owed.Add(-1)
+					s.repaired.Add(1)
+					s.countRoute(route)
+				case deferred.Load():
+					// Cut short by the deferral, which says nothing about this shard.
 				case errors.Is(err, errSuperseded):
 					// Not a failure and not a repair. The record and the node
 					// disagree about the current write, which rebuilding cannot
@@ -226,27 +356,31 @@ func (s *Service) Pass(ctx context.Context) error {
 					slog.InfoContext(ctx, "Rebuilt shard refused: the node is past the record's generation",
 						"node", t.node, "index", t.index,
 						"epoch", fmt.Sprintf("%016x", t.place.WriteEpoch))
-				case err != nil:
-					s.failed.Add(1)
-					slog.WarnContext(ctx, "Shard repair failed",
-						"node", t.node, "index", t.index,
-						"epoch", fmt.Sprintf("%016x", t.place.WriteEpoch), "err", err)
+				case noPeerReachable(err):
+					if deferred.CompareAndSwap(false, true) {
+						slog.InfoContext(ctx, "Repair pass deferred: no peer of an owed shard answered",
+							"node", t.node, "index", t.index, "err", err)
+						stopPass()
+					}
 				default:
-					owed.Add(-1)
-					s.repaired.Add(1)
+					reason := s.countFailure(err)
+					slog.WarnContext(ctx, "Shard repair failed",
+						"node", t.node, "index", t.index, "reason", string(reason),
+						"epoch", fmt.Sprintf("%016x", t.place.WriteEpoch), "err", err)
 				}
 			}
 		})
 	}
 
-	err := s.scan(ctx, func(t task) error {
+	err := s.scan(passCtx, func(t task) error {
 		owed.Add(1)
+		s.owed.Add(1)
 		s.pending.Add(1)
 		select {
 		case work <- t:
 			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-passCtx.Done():
+			return passCtx.Err()
 		}
 	})
 
@@ -258,11 +392,13 @@ func (s *Service) Pass(ctx context.Context) error {
 	// keeps it from drifting when a pass is cut short.
 	s.pending.Store(max(owed.Load(), 0))
 	s.passes.Add(1)
-	if err != nil {
-		return err
+	if deferred.Load() {
+		s.deferred.Add(1)
+		err = ErrPassDeferred
 	}
+	s.summarise(ctx, before, start, err)
 
-	return nil
+	return err
 }
 
 // task is one shard one of this service's nodes owes.
@@ -279,7 +415,7 @@ func (s *Service) scan(ctx context.Context, emit func(task) error) error {
 	prefix := handlers.TableKey(model.TableObjects, "")
 	cursor := ""
 	for {
-		items, err := s.cfg.Meta.ScanFrom(ctx, prefix, cursor, s.pageSize)
+		items, err := s.cfg.Meta.LeaderScanFrom(ctx, prefix, cursor, s.pageSize)
 		if err != nil {
 			return fmt.Errorf("scan placement records: %w", err)
 		}

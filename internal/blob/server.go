@@ -311,8 +311,13 @@ func (s *Server) handleAbort(ctx context.Context, h Request, stream transport.St
 // of being asked would make the answer a thing the question caused.
 func (s *Server) handleStat(ctx context.Context, h Request, stream transport.Stream) error {
 	reader, err := s.store.Lookup(h.Key, h.Index)
-	if err != nil {
+	switch {
+	case errors.Is(err, engine.ErrKeyNotFound):
 		return respond(stream, &Response{Err: ErrCodeNotFound})
+	case err != nil:
+		// A store that could not answer has not shown the shard missing, and
+		// reporting it as missing would send repair to rebuild over it.
+		return respond(stream, &Response{Err: fmt.Sprintf("stat: %v", err)})
 	}
 	resp := Response{Epoch: reader.Epoch(), Size: reader.Size()}
 	if closeErr := reader.Close(); closeErr != nil {

@@ -26,7 +26,24 @@ func respond(stream transport.Stream, resp *MetaResponse) error {
 	return json.NewEncoder(stream).Encode(resp)
 }
 
+// refuseLeaderRead answers a leader read this replica cannot serve, and reports
+// whether it did. A plain read is served from the local FSM as before.
+func (s *Server) refuseLeaderRead(h MetaRequest, stream transport.Stream) (bool, error) {
+	if !h.Leader {
+		return false, nil
+	}
+	code := s.leaderRead()
+	if code == "" {
+		return false, nil
+	}
+
+	return true, respond(stream, &MetaResponse{Err: code, Leader: s.leaderAddr()})
+}
+
 func (s *Server) handleGet(ctx context.Context, h MetaRequest, stream transport.Stream) error {
+	if refused, err := s.refuseLeaderRead(h, stream); refused {
+		return err
+	}
 	// The raft node keys by Go string; the bytes survive the conversion, so
 	// the key badger stores is the one the client sent.
 	value, err := s.get(string(h.Key))
@@ -95,6 +112,9 @@ func (s *Server) handleStatus(ctx context.Context, h MetaStatusRequest, stream t
 }
 
 func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport.Stream) error {
+	if refused, err := s.refuseLeaderRead(h, stream); refused {
+		return err
+	}
 	// errScanLimit stops iteration once the limit is reached without
 	// surfacing an error to the client.
 	errScanLimit := errors.New("scan limit reached")

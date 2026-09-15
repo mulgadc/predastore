@@ -205,6 +205,8 @@ func gateConfig(
 		// Repair is scoped to the blob nodes sharing this process, so each is
 		// swept by exactly one coordinator without anything having to elect one.
 		LocalBlobNodeIDs: nodeIDs(hostNodesByRole(host, RoleBlob)),
+		MetaNodeIDs:      nodeIDs(nodesByRole(c, RoleMeta)),
+		LocalMetaNodeIDs: nodeIDs(hostNodesByRole(host, RoleMeta)),
 		Repair: gate.RepairConfig{
 			Enabled:  c.Repair.IsEnabled(),
 			Workers:  c.Repair.Workers,

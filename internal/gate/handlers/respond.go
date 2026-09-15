@@ -20,7 +20,7 @@ import (
 func RespondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string, err, lookupErr error) {
 	if lookupErr != nil {
 		if errors.Is(lookupErr, auth.ErrKeyNotFound) {
-			slog.WarnContext(r.Context(), "Unknown access key", "accessKeyID", claimedKey, "remoteAddr", r.RemoteAddr)
+			slog.WarnContext(r.Context(), "Unknown access key", "accessKeyID", claimedKey, "remoteAddr", ClientAddr(r))
 			WriteS3Error(w, r, http.StatusForbidden, "InvalidAccessKeyId",
 				"The AWS Access Key Id you provided does not exist in our records")
 			return
@@ -30,12 +30,12 @@ func RespondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string
 		// can fix. The offending ARN is logged, never returned to the client.
 		if errors.Is(lookupErr, auth.ErrPrincipalConfig) {
 			slog.ErrorContext(r.Context(), "Principal IAM configuration is invalid — denying",
-				"accessKeyID", claimedKey, "error", lookupErr, "remoteAddr", r.RemoteAddr)
+				"accessKeyID", claimedKey, "error", lookupErr, "remoteAddr", ClientAddr(r))
 			WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 			return
 		}
 		slog.ErrorContext(r.Context(), "Credential lookup infrastructure error",
-			"accessKeyID", claimedKey, "error", lookupErr, "remoteAddr", r.RemoteAddr)
+			"accessKeyID", claimedKey, "error", lookupErr, "remoteAddr", ClientAddr(r))
 		WriteS3Error(w, r, http.StatusInternalServerError, "InternalError",
 			"An internal error occurred while validating credentials")
 		return
@@ -65,7 +65,7 @@ func RespondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string
 			"path", r.URL.Path,
 			"payloadHashHeader", r.Header.Get("X-Amz-Content-Sha256"),
 			"contentLength", r.Header.Get("Content-Length"),
-			"remoteAddr", r.RemoteAddr,
+			"remoteAddr", ClientAddr(r),
 		)
 		WriteS3Error(w, r, http.StatusBadRequest, string(model.ErrContentSHA256Mismatch),
 			"The provided 'x-amz-content-sha256' header does not match what was computed")
@@ -87,7 +87,7 @@ func RespondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string
 			"contentLength", r.Header.Get("Content-Length"),
 			"userAgent", r.Header.Get("User-Agent"),
 			"proto", r.Proto,
-			"remoteAddr", r.RemoteAddr,
+			"remoteAddr", ClientAddr(r),
 		)
 		WriteS3Error(w, r, http.StatusForbidden, "SignatureDoesNotMatch",
 			"The request signature we calculated does not match the signature you provided. Check your key and signing method.")
@@ -140,7 +140,7 @@ func HandleError(w http.ResponseWriter, r *http.Request, err error) {
 				"method", r.Method,
 				"path", r.URL.Path,
 				"payloadHashHeader", r.Header.Get("X-Amz-Content-Sha256"),
-				"remoteAddr", r.RemoteAddr,
+				"remoteAddr", ClientAddr(r),
 			)
 			statusCode = model.ErrContentSHA256MismatchError.StatusCode
 			s3error.Code = string(model.ErrContentSHA256MismatchError.Code)
