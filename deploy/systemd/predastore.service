@@ -1,0 +1,86 @@
+[Unit]
+Description=Predastore (S3-compatible object storage)
+Documentation=https://github.com/mulgadc/predastore
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=predastore
+Group=predastore
+
+# Defaults first, overridden by the operator's file. The parse-sensitive values
+# always hold something valid, so the service starts without the file.
+Environment=PREDA_CONFIG=/etc/predastore/predastore.toml
+Environment=PREDA_HOST_ID=1
+Environment=PREDA_ADMIN_PORT=0
+Environment=PREDA_LOG_LEVEL=warn
+EnvironmentFile=-/etc/predastore/predastore.env
+
+# s3d resolves each setting flag, then config, then default, so an empty ${VAR}
+# falls through to the TOML and one ExecStart serves every deployment.
+ExecStart=/usr/local/bin/s3d \
+    -config ${PREDA_CONFIG} \
+    -host ${PREDA_HOST_ID} \
+    -data-dir ${PREDA_DATA_DIR} \
+    -encryption-key ${PREDA_ENCRYPTION_KEY} \
+    -tls-cert ${PREDA_TLS_CERT} \
+    -tls-key ${PREDA_TLS_KEY} \
+    -bind-addr ${PREDA_BIND_ADDR} \
+    -gate-bind-addr ${PREDA_GATE_BIND_ADDR} \
+    -admin-port ${PREDA_ADMIN_PORT} \
+    -log-level ${PREDA_LOG_LEVEL}
+
+Restart=on-failure
+RestartSec=5
+
+# A blob node flushes its badger value log on close and a meta replica writes a
+# final raft snapshot. SIGKILL through either turns the next start into a recovery.
+TimeoutStopSec=60
+OOMScoreAdjust=-500
+
+# No MemoryHigh or MemoryMax: on a dedicated node a cap only takes RAM from the
+# page cache. Set them if predastore shares the machine.
+
+# The at-rest key loader is fail-closed on a group- or other-readable mode.
+UMask=0077
+
+# Filesystem access
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateDevices=yes
+ReadOnlyPaths=/etc/predastore
+ReadWritePaths=/var/lib/predastore
+
+# Hardening
+ProtectHome=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+SystemCallArchitectures=native
+# EPERM rather than SIGSYS, so a denial is a failed call not a killed process.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+MemoryDenyWriteExecute=yes
+# No AF_NETLINK: nothing here enumerates interfaces or routes.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Every listening port is above 1024, so not even CAP_NET_BIND_SERVICE.
+CapabilityBoundingSet=
+ProtectHostname=yes
+KeyringMode=private
+RemoveIPC=yes
+# A core would hold the at-rest key and plaintext object data.
+LimitCORE=0
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

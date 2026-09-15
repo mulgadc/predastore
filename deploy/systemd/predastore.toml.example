@@ -1,0 +1,74 @@
+# Standalone predastore, installed to /etc/predastore/predastore.toml.
+# Replace every CHANGEME and run predastore-keygen before the first start.
+#
+# No [iam] table is the whole difference from a Spinifex deployment: the gate
+# resolves access keys from [[auth]] below and contacts nothing.
+
+version = 1
+region = "ap-southeast-2"
+
+# RS(1,0) is one shard with no parity, so redundancy is whatever sits under the
+# blob node: this wants RAID or ZFS beneath it. Growing past one machine means
+# more blob nodes, a real code such as RS(2,1), and one keypair shared by all.
+[rs]
+data = 1
+parity = 0
+
+# Omit interval_seconds for the default of 300s; compaction is never off.
+# [compaction]
+# interval_seconds = 300
+
+[[host]]
+id = 1
+
+# The cluster plane, and what other hosts dial. Loopback suits a single host
+# and keeps the admin listener off the public interface.
+addr = "127.0.0.1"
+
+# /healthz and /readyz on addr above, never on the S3 port. Plain HTTP with no
+# authentication, so it belongs on the private side.
+admin_port = 9099
+
+# Host-local paths. predastore.env overrides them per host when one TOML is
+# distributed across a fleet.
+data_dir = "/var/lib/predastore"
+tls_cert = "/etc/predastore/server.pem"
+tls_key = "/etc/predastore/server.key"
+encryption_key = "/etc/predastore/master.key"
+
+  # The S3 endpoint. Its own bind_addr exposes S3 while the cluster plane
+  # above stays on loopback.
+  [[host.node]]
+  id = 1
+  role = "gate"
+  port = 8443
+  bind_addr = "0.0.0.0"
+
+  [[host.node]]
+  id = 2
+  role = "meta"
+  port = 6660
+
+  [[host.node]]
+  id = 3
+  role = "blob"
+  port = 9991
+
+# A config-defined service account, fully trusted: every request one signs is
+# authorised on any bucket, regardless of account_id. Treat it as a root
+# credential. account_id is mandatory and owns the buckets this key creates.
+[[auth]]
+access_key_id = "CHANGEME"
+secret_access_key = "CHANGEME"
+account_id = "100000000001"
+
+# A bucket that exists at start rather than being created through the API.
+# account_id is required; an invalid name is dropped with a warning.
+#
+# ListBuckets does not report an entry declared here, so `aws s3 ls` comes back
+# empty while head-bucket, GET and PUT all work against it.
+[[bucket]]
+name = "example-bucket"
+region = "ap-southeast-2"
+account_id = "100000000001"
+public = false
