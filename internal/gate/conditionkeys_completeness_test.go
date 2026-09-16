@@ -24,6 +24,7 @@ var gatewayDoorKeys = []string{
 	iampolicy.KeyUserID,
 	iampolicy.KeyPrincipalAccount,
 	iampolicy.KeySourceIP,
+	iampolicy.KeyPrincipalType,
 }
 
 // s3:prefix is the only key this door adds over the gateway's set: it is the one

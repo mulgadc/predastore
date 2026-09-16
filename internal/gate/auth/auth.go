@@ -57,6 +57,21 @@ func (c *CredentialResult) IsIAMUser() bool {
 	return c.PrincipalType == principalTypeUser
 }
 
+// PrincipalTypeCondition maps PrincipalType to the canonical aws:PrincipalType
+// value AWS documents, so a policy sees the same spelling here as at the AWS
+// gateway. A config-based credential's empty PrincipalType reports false, so
+// the door omits the key rather than supplying an empty string.
+func (c *CredentialResult) PrincipalTypeCondition() (string, bool) {
+	switch c.PrincipalType {
+	case principalTypeUser:
+		return iampolicy.PrincipalTypeUser, true
+	case principalTypeAssumedRole:
+		return iampolicy.PrincipalTypeAssumedRole, true
+	default:
+		return "", false
+	}
+}
+
 // CredentialProvider looks up credentials by access key ID.
 type CredentialProvider interface {
 	LookupCredentials(accessKeyID string) (*CredentialResult, error)

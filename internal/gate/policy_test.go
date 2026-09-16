@@ -194,7 +194,35 @@ func TestConditionKeys_PopulatesEverySupportedKey(t *testing.T) {
 		iampolicy.KeyUserID:           "AIDAALICE",
 		iampolicy.KeyPrincipalAccount: "000000000001",
 		iampolicy.KeyS3Prefix:         "home/alice/",
+		iampolicy.KeyPrincipalType:    iampolicy.PrincipalTypeUser,
 	}, keys)
+}
+
+// Every principal type this door recognizes maps to the canonical AWS spelling,
+// and an unrecognized one — a config-based credential with no PrincipalType —
+// omits the key rather than supplying an empty string.
+func TestConditionKeys_PrincipalType(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/my-bucket/obj", nil)
+	r.RemoteAddr = "10.4.1.9:52344"
+
+	tests := []struct {
+		principalType string
+		want          string
+		omitted       bool
+	}{
+		{principalType: "user", want: iampolicy.PrincipalTypeUser},
+		{principalType: "assumed-role", want: iampolicy.PrincipalTypeAssumedRole},
+		{principalType: "", omitted: true},
+	}
+	for _, tt := range tests {
+		cred := &auth.CredentialResult{AccountID: "000000000001", PrincipalType: tt.principalType}
+		keys := conditionKeys(r, "s3:GetObject", cred)
+		if tt.omitted {
+			assert.NotContains(t, keys, iampolicy.KeyPrincipalType, "principalType %q", tt.principalType)
+			continue
+		}
+		assert.Equal(t, tt.want, keys[iampolicy.KeyPrincipalType], "principalType %q", tt.principalType)
+	}
 }
 
 // RoleSessionName is chosen by the caller of AssumeRole and lands in UserName
