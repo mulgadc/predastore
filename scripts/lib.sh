@@ -62,6 +62,57 @@ meta_nodes() {
     ' "$1"
 }
 
+# take_host_lock blocks until this shell owns the host-wide benchmark lock,
+# waiting at most $1 seconds, and reports the path it took in HOST_LOCK_PATH.
+# The benchmark harnesses contend for things that are properties of the machine
+# rather than of a run — the loopback aliases and the shifted port range — and
+# the GitHub concurrency groups that serialise CI are scoped to one repository
+# each, so they cannot see a run started by another repository or by hand.
+#
+# flock rather than a sentinel file: the kernel releases the lock when the
+# holding descriptor closes, which covers a clean exit, a crash, a SIGKILL and a
+# runner reset alike. There is no stale lock to expire, so the only timeout is
+# on acquiring it.
+#
+# The path comes back in a variable because the lock lives on fd 9 of whichever
+# shell opened it. Called as `$(take_host_lock)` the function would run in a
+# subshell that exits immediately, dropping the lock before the caller has done
+# anything with it.
+#
+# fd 9 is reserved for this across the dev scripts. Children inherit it, so
+# anything launched to outlive the harness — s3d, above all — must close it with
+# `9>&-`. An orphan holding the lock open is the one way this can wedge, since
+# there would then be no process left that releasing it is waiting on.
+HOST_LOCK_PATH=""
+take_host_lock() {
+    local timeout="${1:-3600}"
+    HOST_LOCK_PATH="${PREDA_BENCH_LOCK:-/var/lock/predastore-bench.lock}"
+
+    if ! command -v flock >/dev/null 2>&1; then
+        echo "flock is required to serialise benchmark runs on this host" >&2
+        return 1
+    fi
+
+    # /run/lock is world-writable and sticky, so the usual case is a lock file
+    # this user already owns. A file left by another user is the exception worth
+    # handling: fall back rather than fail, since an unlocked run is worse than a
+    # lock in a second place, and every caller resolves the fallback identically.
+    if [ -e "$HOST_LOCK_PATH" ]; then
+        [ -w "$HOST_LOCK_PATH" ] || HOST_LOCK_PATH="${TMPDIR:-/tmp}/predastore-bench.lock"
+    else
+        [ -w "$(dirname "$HOST_LOCK_PATH")" ] || HOST_LOCK_PATH="${TMPDIR:-/tmp}/predastore-bench.lock"
+    fi
+
+    # Append rather than truncate: the file is a lock and never has contents,
+    # and truncation is the one open mode that can fail on a file we may share.
+    exec 9>>"$HOST_LOCK_PATH"
+
+    if ! flock -w "$timeout" 9; then
+        echo "another predastore benchmark has held $HOST_LOCK_PATH for ${timeout}s" >&2
+        return 1
+    fi
+}
+
 # render_profile copies the profile named by $1 to $2 with every node port and
 # the host admin_port shifted by $3, so a harness can run beside a cluster
 # already holding the defaults. A zero is left alone: on admin_port that is the

@@ -20,6 +20,8 @@
 #   PERF_KEEP_WORK   1 to keep the cluster work directory after the run
 #   PERF_PORT_OFFSET Added to every node port, so a run does not collide with a
 #                    cluster already on the defaults (default: 10000)
+#   PERF_LOCK_WAIT   Seconds to wait for the host benchmark lock (default: 3600)
+#   PREDA_BENCH_LOCK Path of that lock (default: /var/lock/predastore-bench.lock)
 #   WARP             Path to the warp binary (default: bin/tools/warp)
 #   PERF_EXTERNAL_HOSTS Measure a cluster this script did not start, as a comma
 #                    separated gate list of host:port. Skips the profile, the
@@ -92,6 +94,14 @@ for command in $REQUIRED; do
     command -v "$command" >/dev/null || { echo "$command is required" >&2; exit 1; }
 done
 [ -x "$WARP" ] || { echo "Warp not executable: $WARP (run make warp-install)" >&2; exit 1; }
+
+# Taken before anything is created, and held for the whole run. A second
+# benchmark on this host would share the loopback aliases and the shifted port
+# range, and an external run would share the cluster it measures; in both cases
+# the two runs measure each other. Waiting is the right answer rather than
+# failing, since the caller wants the numbers either way.
+take_host_lock "${PERF_LOCK_WAIT:-3600}"
+echo "Holding host benchmark lock: $HOST_LOCK_PATH"
 
 mkdir -p "$RESULTS_ROOT"
 STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"

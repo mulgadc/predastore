@@ -232,19 +232,38 @@ wait_ready() {
     fail "gates did not come up within 90s"
 }
 
-# cmd_stop confirms no s3d survives rather than trusting the signal. A stop
-# that returns while a process still holds the ports serves the next ref's
+# These are shared machines, so an s3d is identified by the data root on its
+# command line and never by its name. Matching the name would stop every s3d on
+# three hosts that other people also use. The leading bracket keeps the pattern
+# from matching the shell that carries it in its own argv.
+OURS="[s]3d -config $HW_ROOT/"
+ANY_S3D="[s]3d -config"
+
+# cmd_stop confirms no s3d of ours survives rather than trusting the signal. A
+# stop that returns while a process still holds the ports serves the next ref's
 # measurement from the previous ref's binary.
 cmd_stop() {
     # shellcheck disable=SC2016  # expands on the remote host, not here
-    each 'pkill -x s3d 2>/dev/null; for i in $(seq 1 45); do pgrep -x s3d >/dev/null || break; sleep 1; done; \
-          if pgrep -x s3d >/dev/null; then pkill -9 -x s3d; sleep 2; fi; \
-          echo "$(hostname) s3d remaining: $(pgrep -cx s3d || true)"'
+    each "ours='$OURS'; any='$ANY_S3D'; root='$HW_ROOT'; "'
+          pkill -f "$ours" 2>/dev/null
+          for i in $(seq 1 45); do pgrep -f "$ours" >/dev/null || break; sleep 1; done
+          if pgrep -f "$ours" >/dev/null; then pkill -9 -f "$ours"; sleep 2; fi
+          echo "$(hostname) s3d remaining: $(pgrep -cf "$ours" || true)"
+          stray=$(pgrep -af "$any" | grep -Fv "$root/" || true)
+          if [ -n "$stray" ]; then
+              echo "$(hostname) s3d outside $root, left running:"
+              echo "$stray"
+          fi
+          exit 0'
 }
 
 cmd_status() {
     # shellcheck disable=SC2016  # expands on the remote host, not here
-    each 'echo "$(hostname): s3d=$(pgrep -cx s3d || echo 0) load=$(cut -d" " -f1 /proc/loadavg)"'
+    each "ours='$OURS'; any='$ANY_S3D'; "'
+          mine=$(pgrep -cf "$ours" || echo 0)
+          all=$(pgrep -cf "$any" || echo 0)
+          echo "$(hostname): ours=$mine all=$all load=$(cut -d" " -f1 /proc/loadavg)"
+          exit 0'
 }
 
 cmd_clean() {

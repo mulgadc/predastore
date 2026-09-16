@@ -201,11 +201,22 @@ fi
 
 # --- Loopback aliases ---
 
+# An alias on lo is the machine's, not this cluster's, and nothing reference
+# counts it. Recording the ones this run actually added is what lets stop.sh
+# leave alone an address that was already there when it started — otherwise the
+# first cluster to stop takes the addresses out from under every other one still
+# serving on them.
+ALIASES="$BASE/aliases"
+rm -f "$ALIASES"
+
 if [ "$HOST_COUNT" -gt 1 ]; then
     log_info "Setting up loopback IP aliases..."
     for ip in $(routable_addrs "$CONFIG_FILE"); do
-        if ! ip addr show lo | grep -qw "$ip"; then
+        if ip addr show lo | grep -qw "$ip"; then
+            log_info "  $ip is already on lo, leaving it for its owner to remove"
+        else
             sudo ip addr add "${ip}/24" dev lo
+            echo "$ip" >> "$ALIASES"
             log_info "  Added $ip to lo"
         fi
     done
@@ -234,7 +245,10 @@ launch() {
     [ -n "${LOG_LEVEL:-}" ] && args+=(-log-level "$LOG_LEVEL")
 
     mkdir -p "$data_dir"
-    nohup "$S3D_BINARY" "${args[@]}" > "$LOGS/${label}.log" 2>&1 &
+    # 9>&- because a benchmark harness holds its host lock open on fd 9, and an
+    # s3d that outlives the harness would otherwise keep that lock held with
+    # nothing left to release it.
+    nohup "$S3D_BINARY" "${args[@]}" > "$LOGS/${label}.log" 2>&1 9>&- &
     local pid=$!
     echo "$pid" > "$PIDS/${label}.pid"
     LAUNCHED_PIDS+=("$pid")
