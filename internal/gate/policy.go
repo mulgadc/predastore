@@ -129,5 +129,10 @@ func conditionKeys(r *http.Request, action string, cred *auth.CredentialResult) 
 	if action == "s3:ListBucket" {
 		keys[iampolicy.KeyS3Prefix] = r.URL.Query().Get("prefix")
 	}
+	// Resolved from the credential record, never from anything the caller
+	// supplies, so unlike aws:username it is safe for a role session too.
+	if v, ok := cred.PrincipalTypeCondition(); ok {
+		keys[iampolicy.KeyPrincipalType] = v
+	}
 	return keys
 }
