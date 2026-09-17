@@ -1327,19 +1327,29 @@ func RecordShardHedge(ctx context.Context, reason string) {
 // a stripe is not counted as slow.
 func RecordShardRead(ctx context.Context, r ShardRead) {
 	instruments()
-	if shardBytes == nil {
+	// Guarded per instrument: a construction failure is reported and the
+	// instrument left nil, so the counter being built says nothing about
+	// whether the histograms were. The early-out spares the attribute set.
+	if shardBytes == nil && shardTTFB == nil && shardStalls == nil &&
+		shardLongest == nil && shardRate == nil {
 		return
 	}
 	node := metric.WithAttributeSet(attribute.NewSet(attribute.String("node", r.Node)))
-	shardBytes.Add(ctx, r.Bytes, node)
-	if r.TTFB > 0 {
+	if shardBytes != nil {
+		shardBytes.Add(ctx, r.Bytes, node)
+	}
+	if shardTTFB != nil && r.TTFB > 0 {
 		shardTTFB.Record(ctx, r.TTFB.Milliseconds(), node)
 	}
 	if r.Stalls > 0 {
-		shardStalls.Add(ctx, r.Stalls, node)
-		shardLongest.Record(ctx, r.Longest.Milliseconds(), node)
+		if shardStalls != nil {
+			shardStalls.Add(ctx, r.Stalls, node)
+		}
+		if shardLongest != nil {
+			shardLongest.Record(ctx, r.Longest.Milliseconds(), node)
+		}
 	}
-	if r.Active > 0 && r.Bytes > 0 {
+	if shardRate != nil && r.Active > 0 && r.Bytes > 0 {
 		shardRate.Record(ctx, r.Bytes*int64(time.Second)/int64(r.Active)/1024, node)
 	}
 }
