@@ -47,14 +47,6 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			return
 		}
 
-		// Versioning is not implemented anywhere in this store, so a request
-		// naming a specific source version cannot be honoured: copying the
-		// current version instead would silently ignore what was asked for.
-		if versionID != "" && versionID != "null" {
-			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
-				"Copying a specific object version is not implemented")
-			return
-		}
 		for _, h := range copySourceConditionHeaders {
 			if r.Header.Get(h) != "" {
 				WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
@@ -84,15 +76,29 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			return
 		}
 
-		srcPlace, srcSize, err := loadPlacement(ctx, mc, ring, cfg, srcBucket, srcKey)
+		// x-amz-copy-source carries its own versionId, so a copy can name a
+		// version of the source rather than only its current one.
+		srcTarget, err := resolveReadTarget(ctx, mc, cache, srcBucket, srcKey, versionID)
+		if err != nil {
+			handleVersionedReadErr(w, r, srcKey, srcTarget, err)
+			return
+		}
+
+		srcPlace, srcSize, err := loadPlacementByHash(ctx, mc, ring, cfg, srcTarget.hash)
 		if err != nil {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(srcKey))
 			return
 		}
 
-		srcHandoff := handoffNode(ring, cfg, model.ObjectHash(srcBucket, srcKey))
+		srcHandoff := handoffNode(ring, cfg, srcTarget.hash)
 
-		destHash := model.ObjectHash(destBucket, destKey)
+		destTarget, err := resolveWriteTarget(ctx, mc, cache, destBucket, destKey)
+		if err != nil {
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+			return
+		}
+		destHash := destTarget.hash
+
 		place, err := placeShards(ring, cfg, destHash, srcSize)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
@@ -104,7 +110,7 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		// stripe rather than the source object.
 		digest := model.NewPartETagHasher()
 		stream, err := openCopyStream(ctx, bc, cfg,
-			model.ObjectHash(srcBucket, srcKey), srcPlace, srcHandoff, srcSize, 0, srcSize)
+			srcTarget.hash, srcPlace, srcHandoff, srcSize, 0, srcSize)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
@@ -136,7 +142,15 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			return
 		}
 		commitShards(ctx, bc, destHash, place, written)
-		releaseSuperseded(ctx, bc, destHash, previous, place.WriteEpoch)
+		if !destTarget.versioned {
+			releaseSuperseded(ctx, bc, destHash, previous, place.WriteEpoch)
+		}
+
+		if err := indexWrite(ctx, mc, destBucket, destKey, destTarget, place); err != nil {
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+			return
+		}
 
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(destBucket, destKey), destHash[:]); err != nil {
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
@@ -154,6 +168,7 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		if len(written.handoff) > 0 {
 			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))
 		}
+		setVersionIDHeader(w.Header(), destTarget.versionID)
 
 		etag, _ := place.ETag()
 		modified, _ := place.ModifiedAt()

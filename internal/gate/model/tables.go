@@ -10,6 +10,14 @@ const (
 	// so a config-declared bucket — which has no record — can still be tagged
 	// without being given one, and an owner with it.
 	TableBucketTags = "buckettags" // Bucket tags (bucket -> tag set)
-	TableMultipart  = "multipart"  // Multipart upload metadata (uploadID -> metadata)
-	TableParts      = "parts"      // Part metadata (uploadID:partNumber -> part info)
+	// TableBucketVersioning holds each bucket's versioning state, separately
+	// from the bucket record for the same reason the tags are: a config-declared
+	// bucket has no record to put it in.
+	TableBucketVersioning = "bucketversioning" // Bucket versioning state (bucket -> Enabled|Suspended)
+	// TableObjectVersions indexes the versions of every key. Its rows sort
+	// newest-first within a key, so one prefix scan answers both "what is the
+	// current version of this key" and ListObjectVersions over a whole bucket.
+	TableObjectVersions = "objectversions" // Object versions (bucket/key -> version records)
+	TableMultipart      = "multipart"      // Multipart upload metadata (uploadID -> metadata)
+	TableParts          = "parts"          // Part metadata (uploadID:partNumber -> part info)
 )

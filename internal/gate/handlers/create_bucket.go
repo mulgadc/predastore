@@ -29,7 +29,6 @@ var unsupportedBucketWrites = []struct {
 }{
 	{"policy", "Bucket policy is not implemented"},
 	{"acl", "Bucket ACLs are not implemented"},
-	{"versioning", "Versioning is not implemented"},
 	{"encryption", "Bucket encryption configuration is not implemented"},
 	{"lifecycle", "Lifecycle configuration is not implemented"},
 	{"publicAccessBlock", "Public access block configuration is not implemented"},

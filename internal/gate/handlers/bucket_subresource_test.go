@@ -189,7 +189,7 @@ func TestGetBucketLocationIsEmptyForUsEast1(t *testing.T) {
 // list, so dropping an entry from that list fails here instead of quietly
 // removing its case and leaving the sub-resource answering as CreateBucket.
 var refusedBucketWrites = []string{
-	"policy", "acl", "versioning", "encryption", "lifecycle", "publicAccessBlock",
+	"policy", "acl", "encryption", "lifecycle", "publicAccessBlock",
 	"ownershipControls", "cors", "object-lock", "notification", "logging",
 	"replication", "website", "accelerate", "requestPayment", "analytics",
 	"intelligent-tiering", "inventory", "metrics",

@@ -57,6 +57,19 @@ func DeleteBucket(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
+		// A versioned bucket whose every key is hidden behind a delete marker has
+		// no listing keys at all, so the scan above reports it empty while it
+		// still holds every byte ever written to it.
+		versions, err := metaScan(ctx, mc, model.TableObjectVersions, versionBucketPrefix(bucket), 1)
+		if err != nil {
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+			return
+		}
+		if len(versions) > 0 {
+			HandleError(w, r, model.ErrBucketNotEmptyError.WithResource(bucket))
+			return
+		}
+
 		if err := metaDelete(ctx, mc, model.TableBuckets, bucket); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "failed to delete bucket: "+err.Error(), 500))
 			return
@@ -67,6 +80,12 @@ func DeleteBucket(mc MetaClient, cache *BucketCache) http.Handler {
 		// them. A recycled name would otherwise inherit the old set.
 		if err := deleteBucketTags(ctx, mc, bucket); err != nil {
 			slog.ErrorContext(ctx, "failed to delete bucket tags", "bucket", bucket, "error", err)
+		}
+
+		// Same ordering, same reason: a recycled name must not inherit the
+		// versioning state of the bucket that held it before.
+		if err := metaDelete(ctx, mc, model.TableBucketVersioning, bucket); err != nil {
+			slog.ErrorContext(ctx, "failed to delete bucket versioning state", "bucket", bucket, "error", err)
 		}
 
 		cache.remove(bucket)

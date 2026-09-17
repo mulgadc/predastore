@@ -28,6 +28,37 @@ import (
 type fakeMeta struct {
 	mu   sync.Mutex
 	rows map[string][]byte
+
+	// ops counts state round trips by kind. Every one of these is a network
+	// call to a replica in production, not a local map read, so a handler that
+	// grows one is a latency regression on every request that takes that path.
+	ops map[string]int
+}
+
+// count records one state round trip. Callers hold the lock.
+func (m *fakeMeta) count(op string) {
+	if m.ops == nil {
+		m.ops = map[string]int{}
+	}
+	m.ops[op]++
+}
+
+// roundTrips is the total number of state calls made so far.
+func (m *fakeMeta) roundTrips() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	total := 0
+	for _, n := range m.ops {
+		total += n
+	}
+	return total
+}
+
+// resetOps starts a fresh measurement.
+func (m *fakeMeta) resetOps() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ops = map[string]int{}
 }
 
 func newFakeMeta() *fakeMeta { return &fakeMeta{rows: make(map[string][]byte)} }
@@ -35,6 +66,7 @@ func newFakeMeta() *fakeMeta { return &fakeMeta{rows: make(map[string][]byte)} }
 func (m *fakeMeta) Get(_ context.Context, key string) ([]byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.count("get")
 	v, ok := m.rows[key]
 	if !ok {
 		// The real client's sentinel: callers branch on it to tell a missing
@@ -47,6 +79,7 @@ func (m *fakeMeta) Get(_ context.Context, key string) ([]byte, error) {
 func (m *fakeMeta) Put(_ context.Context, key string, value []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.count("put")
 	m.rows[key] = append([]byte(nil), value...)
 	return nil
 }
@@ -54,6 +87,10 @@ func (m *fakeMeta) Put(_ context.Context, key string, value []byte) error {
 func (m *fakeMeta) Swap(ctx context.Context, key string, value []byte) ([]byte, error) {
 	m.mu.Lock()
 	previous := m.rows[key]
+	// Swap is one call in production even though this fake reads then writes,
+	// so the Put below is discounted rather than counted twice.
+	m.count("swap")
+	m.ops["put"]--
 	m.mu.Unlock()
 	if err := m.Put(ctx, key, value); err != nil {
 		return nil, err
@@ -64,6 +101,7 @@ func (m *fakeMeta) Swap(ctx context.Context, key string, value []byte) ([]byte, 
 func (m *fakeMeta) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.count("delete")
 	delete(m.rows, key)
 	return nil
 }
@@ -71,6 +109,7 @@ func (m *fakeMeta) Delete(_ context.Context, key string) error {
 func (m *fakeMeta) Scan(_ context.Context, prefix string, limit int) ([]meta.Item, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.count("scan")
 	var items []meta.Item
 	for k, v := range m.rows {
 		if strings.HasPrefix(k, prefix) {

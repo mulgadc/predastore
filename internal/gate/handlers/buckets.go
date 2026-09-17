@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
+	"sync"
+	"time"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/meta"
@@ -15,11 +17,18 @@ import (
 // The handlers and the auth middleware share one instance, so a bucket created
 // by a request is visible to the next request's ownership check.
 type BucketCache struct {
+	// mu guards entries and versioning. Both are written by a request handler
+	// -- CreateBucket, DeleteBucket, an object write -- while other requests
+	// read them concurrently.
+	mu      sync.RWMutex
 	entries []BucketConfig
 	// declared names the buckets that came from config rather than from a
 	// CreateBucket. It is written once and never added to, so it stays the
-	// answer to "is this part of the deployment" as entries grows.
+	// answer to "is this part of the deployment" as entries grows, and needs
+	// no lock.
 	declared map[string]bool
+
+	versioning map[string]versioningEntry
 }
 
 // NewBucketCache seeds the cache from the config-defined buckets.
@@ -29,8 +38,9 @@ func NewBucketCache(configured []BucketConfig) *BucketCache {
 		declared[b.Name] = true
 	}
 	return &BucketCache{
-		entries:  append([]BucketConfig(nil), configured...),
-		declared: declared,
+		entries:    append([]BucketConfig(nil), configured...),
+		declared:   declared,
+		versioning: map[string]versioningEntry{},
 	}
 }
 
@@ -44,6 +54,8 @@ func (c *BucketCache) isDeclared(bucket string) bool {
 
 // find returns the cached entry for a bucket.
 func (c *BucketCache) find(bucket string) (BucketConfig, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	for _, b := range c.entries {
 		if b.Name == bucket {
 			return b, true
@@ -54,6 +66,8 @@ func (c *BucketCache) find(bucket string) (BucketConfig, bool) {
 
 // add makes a freshly created bucket available without waiting for a state read.
 func (c *BucketCache) add(name, region, accountID string, public bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.entries = append(c.entries, BucketConfig{
 		Name:      name,
 		Region:    region,
@@ -64,6 +78,8 @@ func (c *BucketCache) add(name, region, accountID string, public bool) {
 
 // remove drops a deleted bucket from the cache.
 func (c *BucketCache) remove(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	kept := make([]BucketConfig, 0, len(c.entries))
 	for _, b := range c.entries {
 		if b.Name != name {
@@ -71,6 +87,45 @@ func (c *BucketCache) remove(name string) {
 		}
 	}
 	c.entries = kept
+	delete(c.versioning, name)
+}
+
+// versioningTTL bounds how long a gate may act on a versioning status another
+// gate could have changed since.
+//
+// Some bound is needed because the status is read on every object request and
+// the read is a synchronous state round-trip -- the same cost this cache exists
+// to keep off the request path for bucket existence. The bound is short because
+// the stale answer that matters is "never versioned": a gate holding it writes
+// through the unversioned path and releases the generation it replaced, so the
+// previous copy is gone. S3 documents its own propagation delay here and asks
+// for fifteen minutes after enabling versioning before writing; five seconds is
+// the same hazard, two orders of magnitude smaller.
+const versioningTTL = 5 * time.Second
+
+// versioningEntry is one cached status and the instant it stops being usable.
+type versioningEntry struct {
+	status string
+	expiry time.Time
+}
+
+// cachedVersioning returns a bucket's versioning status if it was read recently
+// enough to still be acted on.
+func (c *BucketCache) cachedVersioning(bucket string) (string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, ok := c.versioning[bucket]
+	if !ok || time.Now().After(entry.expiry) {
+		return "", false
+	}
+	return entry.status, true
+}
+
+// rememberVersioning records a status just read from, or just written to, state.
+func (c *BucketCache) rememberVersioning(bucket, status string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.versioning[bucket] = versioningEntry{status: status, expiry: time.Now().Add(versioningTTL)}
 }
 
 // lookupBucket resolves a bucket the way HeadBucket does: the cache first

@@ -204,6 +204,9 @@ type DeleteRequest struct {
 
 type DeleteRequestObject struct {
 	Key string `xml:"Key"`
+	// VersionId names one version to destroy. Without it a delete on a versioned
+	// bucket appends a delete marker instead, exactly as the single-key route does.
+	VersionId string `xml:"VersionId"`
 }
 
 // DeleteResult answers POST /{bucket}?delete. A key that could not be deleted
@@ -216,7 +219,10 @@ type DeleteResult struct {
 }
 
 type DeletedObject struct {
-	Key string `xml:"Key"`
+	Key                   string `xml:"Key"`
+	VersionId             string `xml:"VersionId,omitempty"`
+	DeleteMarker          bool   `xml:"DeleteMarker,omitempty"`
+	DeleteMarkerVersionId string `xml:"DeleteMarkerVersionId,omitempty"`
 }
 
 type DeleteError struct {
@@ -256,4 +262,53 @@ type Tag struct {
 type Tagging struct {
 	XMLName xml.Name `xml:"Tagging"`
 	TagSet  []Tag    `xml:"TagSet>Tag"`
+}
+
+// VersioningConfiguration is the request body for PutBucketVersioning and the
+// response for GetBucketVersioning. Status is omitted when empty: a bucket that
+// has never been versioned reports no status, which S3 distinguishes from
+// Suspended.
+type VersioningConfiguration struct {
+	XMLName   xml.Name `xml:"VersioningConfiguration"`
+	Status    string   `xml:"Status,omitempty"`
+	MFADelete string   `xml:"MfaDelete,omitempty"`
+}
+
+// ObjectVersionEntry is one version in a ListObjectVersions listing.
+type ObjectVersionEntry struct {
+	Key          string    `xml:"Key"`
+	VersionId    string    `xml:"VersionId"`
+	IsLatest     bool      `xml:"IsLatest"`
+	LastModified time.Time `xml:"LastModified"`
+	ETag         string    `xml:"ETag,omitempty"`
+	Size         int64     `xml:"Size"`
+	StorageClass string    `xml:"StorageClass"`
+}
+
+// DeleteMarkerEntry is one delete marker in a ListObjectVersions listing. It
+// carries no size and no etag because a delete marker has neither.
+type DeleteMarkerEntry struct {
+	Key          string    `xml:"Key"`
+	VersionId    string    `xml:"VersionId"`
+	IsLatest     bool      `xml:"IsLatest"`
+	LastModified time.Time `xml:"LastModified"`
+}
+
+// ListVersionsResult answers GET /{bucket}?versions. Versions and delete
+// markers are separate elements in the document even though they interleave in
+// key order, which is how S3 reports them.
+type ListVersionsResult struct {
+	XMLName             xml.Name             `xml:"ListVersionsResult"`
+	Name                string               `xml:"Name"`
+	Prefix              string               `xml:"Prefix"`
+	KeyMarker           string               `xml:"KeyMarker"`
+	VersionIdMarker     string               `xml:"VersionIdMarker"`
+	NextKeyMarker       string               `xml:"NextKeyMarker,omitempty"`
+	NextVersionIdMarker string               `xml:"NextVersionIdMarker,omitempty"`
+	Delimiter           string               `xml:"Delimiter,omitempty"`
+	MaxKeys             int                  `xml:"MaxKeys"`
+	IsTruncated         bool                 `xml:"IsTruncated"`
+	Versions            []ObjectVersionEntry `xml:"Version"`
+	DeleteMarkers       []DeleteMarkerEntry  `xml:"DeleteMarker"`
+	CommonPrefixes      *[]ListObjectsV2_Dir `xml:"CommonPrefixes"`
 }

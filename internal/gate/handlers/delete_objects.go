@@ -38,7 +38,7 @@ const (
 // Every key is reported on independently. One that cannot be deleted produces
 // an Error entry beside the Deleted entries for the rest and never fails the
 // request, which is what lets a client emptying a bucket make progress.
-func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handler {
+func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		resource, ok := routedBucket(w, r)
@@ -77,7 +77,7 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handle
 			return
 		}
 
-		outcomes := deleteBatch(ctx, mc, bc, bucket, request.Objects)
+		outcomes := deleteBatch(ctx, mc, bc, cache, cfg, bucket, request.Objects)
 
 		result := DeleteResult{}
 		for i, object := range request.Objects {
@@ -85,15 +85,25 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handle
 			// A key that was never there is reported as deleted: a client
 			// emptying a bucket races its own listing, and failing it for a key
 			// that is already gone gives it nothing to do about the answer.
-			if outcomes[i] != nil && !errors.Is(outcomes[i], model.ErrNoSuchKeyError) {
-				code, message := deleteFailure(outcomes[i])
+			if outcomes[i].err != nil && !errors.Is(outcomes[i].err, model.ErrNoSuchKeyError) {
+				code, message := deleteFailure(outcomes[i].err)
 				result.Errors = append(result.Errors, DeleteError{Key: key, Code: code, Message: message})
 				continue
 			}
 			if request.Quiet {
 				continue
 			}
-			result.Deleted = append(result.Deleted, DeletedObject{Key: key})
+			deleted := DeletedObject{Key: key}
+			// A delete that appended a marker names the marker; one that
+			// destroyed a version names the version. They are different answers
+			// and a client emptying a versioned bucket has to tell them apart.
+			if outcomes[i].deleteMarker {
+				deleted.DeleteMarker = true
+				deleted.DeleteMarkerVersionId = outcomes[i].versionID
+			} else {
+				deleted.VersionId = outcomes[i].versionID
+			}
+			result.Deleted = append(result.Deleted, deleted)
 		}
 
 		if len(result.Errors) > 0 {
@@ -110,36 +120,62 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handle
 // deleteBatch deletes each key and returns the outcomes in request order. The
 // results are written by index rather than collected, so the answer follows the
 // order the client asked in without a lock over it.
+//
+// Entries are dealt out by key, not one at a time. Deleting a version reconciles
+// which version of that key is current, and two of those running concurrently
+// each decide it from a view taken before the other's delete landed -- which is
+// exactly the shape a client emptying a versioned bucket sends, every version of
+// every key in one request. Keys still run in parallel with each other.
 func deleteBatch(
-	ctx context.Context, mc MetaClient, bc BlobClient, bucket string, objects []DeleteRequestObject,
-) []error {
-	outcomes := make([]error, len(objects))
+	ctx context.Context, mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config,
+	bucket string, objects []DeleteRequestObject,
+) []batchOutcome {
+	outcomes := make([]batchOutcome, len(objects))
 
-	workers := min(deleteObjectsWorkers, len(objects))
-	indices := make(chan int)
+	byKey := map[string][]int{}
+	order := make([]string, 0, len(objects))
+	for i, object := range objects {
+		if _, seen := byKey[object.Key]; !seen {
+			order = append(order, object.Key)
+		}
+		byKey[object.Key] = append(byKey[object.Key], i)
+	}
+
+	workers := min(deleteObjectsWorkers, len(order))
+	keys := make(chan string)
 
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Go(func() {
-			for i := range indices {
-				// A request that ran out of time reports the keys it never
-				// reached rather than claiming them deleted.
-				if err := ctx.Err(); err != nil {
-					outcomes[i] = err
-					continue
+			for key := range keys {
+				for _, i := range byKey[key] {
+					// A request that ran out of time reports the keys it never
+					// reached rather than claiming them deleted.
+					if err := ctx.Err(); err != nil {
+						outcomes[i] = batchOutcome{err: err}
+						continue
+					}
+					outcome, err := deleteObjectVersion(ctx, mc, bc, cache, cfg, bucket, objects[i].Key, objects[i].VersionId)
+					outcomes[i] = batchOutcome{deleteOutcome: outcome, err: err}
 				}
-				outcomes[i] = deleteStoredObject(ctx, mc, bc, bucket, objects[i].Key)
 			}
 		})
 	}
 
-	for i := range objects {
-		indices <- i
+	for _, key := range order {
+		keys <- key
 	}
-	close(indices)
+	close(keys)
 	wg.Wait()
 
 	return outcomes
+}
+
+// batchOutcome is one key's result: what the delete did, and whether it failed.
+type batchOutcome struct {
+	deleteOutcome
+
+	err error
 }
 
 // deleteFailure renders one key's failure as the code and message its Error

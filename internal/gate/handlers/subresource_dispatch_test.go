@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
@@ -51,18 +52,19 @@ func TestGetObjectAclIsNotImplemented(t *testing.T) {
 	assert.Equal(t, "NotImplemented", s3err.Code)
 }
 
-func TestPutBucketVersioningIsNotImplemented(t *testing.T) {
+// TestPutBucketVersioningIsNotCreateBucket keeps the sub-resource off the
+// create path now that it has a handler: falling through would answer
+// "already yours" to a request to enable versioning.
+func TestPutBucketVersioningIsNotCreateBucket(t *testing.T) {
 	t.Parallel()
 
-	req := httptest.NewRequest(http.MethodPut, "/"+testBucket+"?versioning", nil)
+	mc := newFakeMeta()
+	req := httptest.NewRequest(http.MethodPut, "/"+testBucket+"?versioning",
+		strings.NewReader(`<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>`))
 	req = req.WithContext(WithBucket(req.Context(), model.Bucket{Name: testBucket}))
 	w := httptest.NewRecorder()
 
-	CreateBucket(nil, testCache(), Config{}).ServeHTTP(w, req)
+	PutBucketVersioning(mc, testCache()).ServeHTTP(w, req)
 
-	require.Equal(t, http.StatusNotImplemented, w.Code, "body: %s", w.Body.String())
-
-	var s3err S3Error
-	require.NoError(t, xml.NewDecoder(w.Body).Decode(&s3err))
-	assert.Equal(t, "NotImplemented", s3err.Code)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
 }

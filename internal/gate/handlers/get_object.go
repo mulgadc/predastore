@@ -45,15 +45,22 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 		phase = recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseBucketCheck, phase)
 
-		place, size, err := loadPlacement(ctx, mc, ring, cfg, bucket, key)
+		target, err := resolveReadTarget(ctx, mc, cache, bucket, key, r.URL.Query().Get("versionId"))
+		if err != nil {
+			handleVersionedReadErr(w, r, key, target, err)
+			return
+		}
+
+		place, size, err := loadPlacementByHash(ctx, mc, ring, cfg, target.hash)
 		if err != nil {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
 		recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseMetaPlacement, phase)
 
-		handoff := handoffNode(ring, cfg, model.ObjectHash(bucket, key))
-		serveObject(ctx, w, r, bc, cfg, bucket, key, place, size, rangeStart, rangeEnd, handoff)
+		setVersionIDHeader(w.Header(), target.versionID)
+		handoff := handoffNode(ring, cfg, target.hash)
+		serveObject(ctx, w, r, bc, cfg, bucket, key, target.hash, place, size, rangeStart, rangeEnd, handoff)
 	})
 }
 
@@ -67,7 +74,7 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 // the header, which is why the count there is a floor rather than a total.
 func serveObject(
 	ctx context.Context, w http.ResponseWriter, r *http.Request,
-	bc BlobClient, cfg Config, bucket, key string,
+	bc BlobClient, cfg Config, bucket, key string, objectHash [32]byte,
 	place ObjectToShardNodes, size, rangeStart, rangeEnd int64, handoff config.NodeID,
 ) {
 	status := http.StatusOK
@@ -108,8 +115,6 @@ func serveObject(
 		header(0, 0)
 		return
 	}
-
-	objectHash := model.ObjectHash(bucket, key)
 
 	// A range inside one block is one ranged read of one shard, which is what
 	// makes a small read of a large object cost a small read.

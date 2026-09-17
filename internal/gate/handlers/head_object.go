@@ -39,12 +39,19 @@ func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Con
 			return
 		}
 
-		place, size, err := loadPlacement(ctx, mc, ring, cfg, bucket, key)
+		target, err := resolveReadTarget(ctx, mc, cache, bucket, key, r.URL.Query().Get("versionId"))
+		if err != nil {
+			handleVersionedReadErr(w, r, key, target, err)
+			return
+		}
+
+		place, size, err := loadPlacementByHash(ctx, mc, ring, cfg, target.hash)
 		if err != nil {
 			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
 			return
 		}
 
+		setVersionIDHeader(w.Header(), target.versionID)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		// A record with no stored digest omits the ETag rather than serving the
