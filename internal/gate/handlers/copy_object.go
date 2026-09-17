@@ -78,7 +78,7 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 
 		// x-amz-copy-source carries its own versionId, so a copy can name a
 		// version of the source rather than only its current one.
-		srcTarget, err := resolveReadTarget(ctx, mc, srcBucket, srcKey, versionID)
+		srcTarget, err := resolveReadTarget(ctx, mc, cache, srcBucket, srcKey, versionID)
 		if err != nil {
 			handleVersionedReadErr(w, r, srcKey, srcTarget, err)
 			return
@@ -92,7 +92,7 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 
 		srcHandoff := handoffNode(ring, cfg, srcTarget.hash)
 
-		destTarget, err := resolveWriteTarget(ctx, mc, destBucket, destKey)
+		destTarget, err := resolveWriteTarget(ctx, mc, cache, destBucket, destKey)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return

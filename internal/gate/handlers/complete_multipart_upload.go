@@ -113,7 +113,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 
 		// An assembled object is an object write like any other, so it lands in
 		// its own shard set on a versioned bucket rather than replacing one.
-		target, err := resolveWriteTarget(ctx, mc, bucket, key)
+		target, err := resolveWriteTarget(ctx, mc, cache, bucket, key)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return

@@ -74,7 +74,7 @@ func PutBucketVersioning(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
-		if err := setBucketVersioning(ctx, mc, bucket, doc.Status); err != nil {
+		if err := setBucketVersioning(ctx, mc, cache, bucket, doc.Status); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError,
 				"failed to store the versioning state: "+err.Error(), 500))
 			return

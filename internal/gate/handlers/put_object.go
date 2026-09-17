@@ -48,7 +48,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// moves, because the shards are addressed by the hash. On a versioned
 		// bucket that is a hash of its own, so the previous version stays live
 		// rather than becoming a generation the blob nodes will reclaim.
-		target, err := resolveWriteTarget(ctx, mc, bucket, key)
+		target, err := resolveWriteTarget(ctx, mc, cache, bucket, key)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return

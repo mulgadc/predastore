@@ -45,7 +45,7 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 		phase = recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseBucketCheck, phase)
 
-		target, err := resolveReadTarget(ctx, mc, bucket, key, r.URL.Query().Get("versionId"))
+		target, err := resolveReadTarget(ctx, mc, cache, bucket, key, r.URL.Query().Get("versionId"))
 		if err != nil {
 			handleVersionedReadErr(w, r, key, target, err)
 			return

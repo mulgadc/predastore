@@ -77,7 +77,7 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config)
 			return
 		}
 
-		outcomes := deleteBatch(ctx, mc, bc, cfg, bucket, request.Objects)
+		outcomes := deleteBatch(ctx, mc, bc, cache, cfg, bucket, request.Objects)
 
 		result := DeleteResult{}
 		for i, object := range request.Objects {
@@ -127,7 +127,8 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config)
 // exactly the shape a client emptying a versioned bucket sends, every version of
 // every key in one request. Keys still run in parallel with each other.
 func deleteBatch(
-	ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, bucket string, objects []DeleteRequestObject,
+	ctx context.Context, mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config,
+	bucket string, objects []DeleteRequestObject,
 ) []batchOutcome {
 	outcomes := make([]batchOutcome, len(objects))
 
@@ -154,7 +155,7 @@ func deleteBatch(
 						outcomes[i] = batchOutcome{err: err}
 						continue
 					}
-					outcome, err := deleteObjectVersion(ctx, mc, bc, cfg, bucket, objects[i].Key, objects[i].VersionId)
+					outcome, err := deleteObjectVersion(ctx, mc, bc, cache, cfg, bucket, objects[i].Key, objects[i].VersionId)
 					outcomes[i] = batchOutcome{deleteOutcome: outcome, err: err}
 				}
 			}

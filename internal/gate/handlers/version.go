@@ -131,9 +131,35 @@ func bucketVersioning(ctx context.Context, mc MetaClient, bucket string) (string
 	return string(data), nil
 }
 
+// objectPathVersioning is bucketVersioning for the object paths, which ask on
+// every request and so read through the cache. The bucket handlers do not: a
+// client reading the status back, or writing it, is entitled to the state
+// itself rather than to what this gate saw a moment ago.
+func objectPathVersioning(ctx context.Context, mc MetaClient, cache *BucketCache, bucket string) (string, error) {
+	if status, ok := cache.cachedVersioning(bucket); ok {
+		return status, nil
+	}
+
+	status, err := bucketVersioning(ctx, mc, bucket)
+	if err != nil {
+		return "", err
+	}
+	cache.rememberVersioning(bucket, status)
+	return status, nil
+}
+
 // setBucketVersioning records a bucket's versioning state.
-func setBucketVersioning(ctx context.Context, mc MetaClient, bucket, status string) error {
-	return metaPut(ctx, mc, model.TableBucketVersioning, bucket, []byte(status))
+//
+// The cache is updated rather than invalidated so the gate that served the
+// enable never writes through the unversioned path afterwards: dropping the
+// entry would leave the next object request to re-read, and a read that lost
+// the race with its own write would cache the status it just replaced.
+func setBucketVersioning(ctx context.Context, mc MetaClient, cache *BucketCache, bucket, status string) error {
+	if err := metaPut(ctx, mc, model.TableBucketVersioning, bucket, []byte(status)); err != nil {
+		return err
+	}
+	cache.rememberVersioning(bucket, status)
+	return nil
 }
 
 // putVersionRecord appends one version to the index.
@@ -254,8 +280,8 @@ type writeTarget struct {
 // under the unversioned hash, replacing whatever null version was there. That
 // is S3's semantics, and routing it through the existing path rather than a
 // parallel one means a suspended bucket cannot drift from an unversioned one.
-func resolveWriteTarget(ctx context.Context, mc MetaClient, bucket, key string) (writeTarget, error) {
-	status, err := bucketVersioning(ctx, mc, bucket)
+func resolveWriteTarget(ctx context.Context, mc MetaClient, cache *BucketCache, bucket, key string) (writeTarget, error) {
+	status, err := objectPathVersioning(ctx, mc, cache, bucket)
 	if err != nil {
 		return writeTarget{}, err
 	}
@@ -328,12 +354,12 @@ type readTarget struct {
 // from the key, no extra state read — because that is the hot path and nothing
 // about it has changed. Only a bucket that has ever been versioned pays for the
 // listing-key indirection, and only that bucket can need it.
-func resolveReadTarget(ctx context.Context, mc MetaClient, bucket, key, versionID string) (readTarget, error) {
+func resolveReadTarget(ctx context.Context, mc MetaClient, cache *BucketCache, bucket, key, versionID string) (readTarget, error) {
 	if versionID != "" {
 		return readTarget{hash: versionObjectHash(bucket, key, versionID), versionID: versionID}, nil
 	}
 
-	status, err := bucketVersioning(ctx, mc, bucket)
+	status, err := objectPathVersioning(ctx, mc, cache, bucket)
 	if err != nil {
 		return readTarget{}, err
 	}

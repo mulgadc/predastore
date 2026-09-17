@@ -23,8 +23,10 @@ type deleteOutcome struct {
 // bucket an unqualified delete destroys nothing: it appends a delete marker and
 // drops the listing key, so the key leaves ListObjects while every version it
 // ever had stays readable by id. Naming a version is the only permanent delete.
-func deleteObjectVersion(ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, bucket, key, versionID string) (deleteOutcome, error) {
-	status, err := bucketVersioning(ctx, mc, bucket)
+func deleteObjectVersion(
+	ctx context.Context, mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config, bucket, key, versionID string,
+) (deleteOutcome, error) {
+	status, err := objectPathVersioning(ctx, mc, cache, bucket)
 	if err != nil {
 		return deleteOutcome{}, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}

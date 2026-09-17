@@ -48,7 +48,7 @@ func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config) 
 			return
 		}
 
-		outcome, err := deleteObjectVersion(ctx, mc, bc, cfg, bucket, key, r.URL.Query().Get("versionId"))
+		outcome, err := deleteObjectVersion(ctx, mc, bc, cache, cfg, bucket, key, r.URL.Query().Get("versionId"))
 		if err != nil {
 			HandleError(w, r, err)
 			return
