@@ -37,6 +37,20 @@ func TestS3Action(t *testing.T) {
 		// write access empty a bucket.
 		{"POST", "/my-bucket?delete", "my-bucket", "", "s3:DeleteObject"},
 		{"POST", "/my-bucket?delete=", "my-bucket", "", "s3:DeleteObject"},
+		// A bucket sub-resource carries its own action. Mapping a tag write to
+		// s3:CreateBucket would let a policy granting only bucket creation
+		// rewrite the tags of every bucket the principal can name.
+		{"GET", "/my-bucket?location", "my-bucket", "", "s3:GetBucketLocation"},
+		{"GET", "/my-bucket?tagging", "my-bucket", "", "s3:GetBucketTagging"},
+		{"PUT", "/my-bucket?tagging", "my-bucket", "", "s3:PutBucketTagging"},
+		// AWS has no DeleteBucketTagging action: removing a tag set is
+		// authorized as writing one.
+		{"DELETE", "/my-bucket?tagging", "my-bucket", "", "s3:PutBucketTagging"},
+		// An object named tagging is not the bucket sub-resource.
+		{"PUT", "/my-bucket/key.txt?tagging", "my-bucket", "key.txt", "s3:PutObject"},
+		// A sub-resource predastore refuses gets no action of its own, so it
+		// cannot be authorized as something it does not serve.
+		{"PUT", "/my-bucket?encryption", "my-bucket", "", "s3:CreateBucket"},
 	}
 
 	for _, tt := range tests {

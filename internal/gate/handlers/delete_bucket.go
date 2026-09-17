@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"log/slog"
 	"net/http"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
@@ -59,6 +60,13 @@ func DeleteBucket(mc MetaClient, cache *BucketCache) http.Handler {
 		if err := metaDelete(ctx, mc, model.TableBuckets, bucket); err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "failed to delete bucket: "+err.Error(), 500))
 			return
+		}
+
+		// Drop the tags after the bucket record, so a failed delete leaves a
+		// live bucket with its tags rather than a live bucket that has lost
+		// them. A recycled name would otherwise inherit the old set.
+		if err := deleteBucketTags(ctx, mc, bucket); err != nil {
+			slog.ErrorContext(ctx, "failed to delete bucket tags", "bucket", bucket, "error", err)
 		}
 
 		cache.remove(bucket)

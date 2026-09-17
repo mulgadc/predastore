@@ -44,7 +44,6 @@ var subResourceRejections = []struct {
 	{"cors", http.StatusNotFound, "NoSuchCORSConfiguration", "The CORS configuration does not exist"},
 	{"lifecycle", http.StatusNotFound, "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist"},
 	{"encryption", http.StatusNotFound, "ServerSideEncryptionConfigurationNotFoundError", "The server side encryption configuration was not found"},
-	{"tagging", http.StatusNotFound, "NoSuchTagSet", "The TagSet does not exist"},
 	{"publicAccessBlock", http.StatusNotFound, "NoSuchPublicAccessBlockConfiguration", "The public access block configuration was not found"},
 	{"object-lock", http.StatusNotFound, "ObjectLockConfigurationNotFoundError", "Object Lock configuration does not exist for this bucket"},
 	{"versions", http.StatusNotImplemented, "NotImplemented", "Listing object versions is not implemented"},
