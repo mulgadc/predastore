@@ -34,7 +34,7 @@ type DeletedObjectInfo struct {
 }
 
 // DeleteObject serves DELETE /{bucket}/{key} with no uploadId.
-func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handler {
+func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		resource, ok := routedObject(w, r)
@@ -48,11 +48,16 @@ func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handler
 			return
 		}
 
-		if err := deleteStoredObject(ctx, mc, bc, bucket, key); err != nil {
+		outcome, err := deleteObjectVersion(ctx, mc, bc, cfg, bucket, key, r.URL.Query().Get("versionId"))
+		if err != nil {
 			HandleError(w, r, err)
 			return
 		}
 
+		if outcome.deleteMarker {
+			w.Header().Set(deleteMarkerHeader, "true")
+		}
+		setVersionIDHeader(w.Header(), outcome.versionID)
 		w.WriteHeader(http.StatusNoContent)
 	})
 }
@@ -72,8 +77,20 @@ func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache) http.Handler
 //
 // The caller has already established that the bucket exists.
 func deleteStoredObject(ctx context.Context, mc MetaClient, bc BlobClient, bucket, key string) error {
-	objectHash := model.ObjectHash(bucket, key)
+	if err := deleteStoredVersion(ctx, mc, bc, bucket, key, model.ObjectHash(bucket, key)); err != nil {
+		return err
+	}
+	if err := metaDelete(ctx, mc, model.TableObjects, objectARN(bucket, key)); err != nil {
+		return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
+	}
+	return nil
+}
 
+// deleteStoredVersion removes one shard set and the placement record naming it,
+// and nothing else. The listing key is the caller's business: on a versioned
+// bucket it may point at a different version than the one being removed, and
+// deleting it here would hide an object that is still current.
+func deleteStoredVersion(ctx context.Context, mc MetaClient, bc BlobClient, bucket, key string, objectHash [32]byte) error {
 	data, err := metaGet(ctx, mc, model.TableObjects, string(objectHash[:]))
 	if err != nil {
 		return model.ErrNoSuchKeyError.WithResource(key)
@@ -103,10 +120,6 @@ func deleteStoredObject(ctx context.Context, mc MetaClient, bc BlobClient, bucke
 		if err := metaPut(ctx, mc, model.TableObjects, DeletedObjectPrefix+bucket+"/"+key, deletedBuf.Bytes()); err != nil {
 			return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 		}
-	}
-
-	if err := metaDelete(ctx, mc, model.TableObjects, objectARN(bucket, key)); err != nil {
-		return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
 
 	if err := metaDelete(ctx, mc, model.TableObjects, string(objectHash[:])); err != nil {

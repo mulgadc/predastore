@@ -59,12 +59,15 @@ var routes = []Route{
 	{ID: "ListBuckets", Names: []string{"ListBuckets"}, Scope: ScopeService, Method: http.MethodGet, Pattern: "/"},
 
 	{ID: "PutBucketTagging", Names: []string{"PutBucketTagging"}, Scope: ScopeBucket, Method: http.MethodPut, Pattern: "/{bucket}", Query: "tagging"},
+	{ID: "PutBucketVersioning", Names: []string{"PutBucketVersioning"}, Scope: ScopeBucket, Method: http.MethodPut, Pattern: "/{bucket}", Query: "versioning"},
 	{ID: "CreateBucket", Names: []string{"CreateBucket"}, Scope: ScopeBucket, Method: http.MethodPut, Pattern: "/{bucket}"},
 	{ID: "HeadBucket", Names: []string{"HeadBucket"}, Scope: ScopeBucket, Method: http.MethodHead, Pattern: "/{bucket}"},
 	{ID: "DeleteBucketTagging", Names: []string{"DeleteBucketTagging"}, Scope: ScopeBucket, Method: http.MethodDelete, Pattern: "/{bucket}", Query: "tagging"},
 	{ID: "DeleteBucket", Names: []string{"DeleteBucket"}, Scope: ScopeBucket, Method: http.MethodDelete, Pattern: "/{bucket}"},
 	{ID: "GetBucketLocation", Names: []string{"GetBucketLocation"}, Scope: ScopeBucket, Method: http.MethodGet, Pattern: "/{bucket}", Query: "location"},
 	{ID: "GetBucketTagging", Names: []string{"GetBucketTagging"}, Scope: ScopeBucket, Method: http.MethodGet, Pattern: "/{bucket}", Query: "tagging"},
+	{ID: "GetBucketVersioning", Names: []string{"GetBucketVersioning"}, Scope: ScopeBucket, Method: http.MethodGet, Pattern: "/{bucket}", Query: "versioning"},
+	{ID: "ListObjectVersions", Names: []string{"ListObjectVersions"}, Scope: ScopeBucket, Method: http.MethodGet, Pattern: "/{bucket}", Query: "versions"},
 	{ID: "ListMultipartUploads", Names: []string{"ListMultipartUploads"}, Scope: ScopeBucket, Method: http.MethodGet, Pattern: "/{bucket}", Query: "uploads"},
 	{ID: "ListObjects", Names: []string{"ListObjects", "ListObjectsV2"}, Scope: ScopeBucket, Method: http.MethodGet, Pattern: "/{bucket}"},
 	// A POST at a bucket is the batch delete and nothing else. There is no

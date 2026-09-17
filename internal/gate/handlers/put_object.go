@@ -44,7 +44,16 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 		phase = recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseBucketCheck, phase)
 
-		objectHash := model.ObjectHash(bucket, key)
+		// Which shard set this write lands in is settled before the first byte
+		// moves, because the shards are addressed by the hash. On a versioned
+		// bucket that is a hash of its own, so the previous version stays live
+		// rather than becoming a generation the blob nodes will reclaim.
+		target, err := resolveWriteTarget(ctx, mc, bucket, key)
+		if err != nil {
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+			return
+		}
+		objectHash := target.hash
 
 		body, size, dec := decodeBody(r)
 		if size < 0 {
@@ -117,7 +126,20 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 		phase = recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseMetaPlacement, phase)
-		releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch)
+		// Nothing is superseded on a versioned write: the record this one
+		// replaced belongs to a different hash and is still a live version.
+		if !target.versioned {
+			releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch)
+		}
+
+		// The index row before the listing key, so a version is enumerable by the
+		// time it is current. The other order can leave the current version of a
+		// key missing from its own version listing.
+		if err := indexWrite(ctx, mc, bucket, key, target, place); err != nil {
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+			return
+		}
 
 		// Listing key -> object hash, for ListObjects.
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
@@ -148,6 +170,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		if etag, ok := place.ETag(); ok {
 			w.Header().Set("ETag", etag)
 		}
+		setVersionIDHeader(w.Header(), target.versionID)
 		w.WriteHeader(http.StatusOK)
 	})
 }

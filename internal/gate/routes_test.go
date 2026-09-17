@@ -31,7 +31,7 @@ func TestCheckHandlersRejectsDrift(t *testing.T) {
 	}
 
 	orphan := stubHandlers()
-	orphan["PutBucketVersioning"] = http.NotFoundHandler()
+	orphan["PutBucketReplication"] = http.NotFoundHandler()
 	if err := checkHandlers(orphan); err == nil {
 		t.Error("checkHandlers accepted a handler answering no declared route")
 	}

@@ -111,7 +111,15 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		assembled := streamParts(ctx, mc, bc, ring, cfg, bucket, key, uploadID, parts)
 		defer assembled.Close()
 
-		objectHash := model.ObjectHash(bucket, key)
+		// An assembled object is an object write like any other, so it lands in
+		// its own shard set on a versioned bucket rather than replacing one.
+		target, err := resolveWriteTarget(ctx, mc, bucket, key)
+		if err != nil {
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+			return
+		}
+		objectHash := target.hash
+
 		place, err := placeShards(ring, cfg, objectHash, finalSize)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to get shard placement", 500))
@@ -148,7 +156,15 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			return
 		}
 		commitShards(ctx, bc, objectHash, place, written)
-		releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch)
+		if !target.versioned {
+			releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch)
+		}
+
+		if err := indexWrite(ctx, mc, bucket, key, target, place); err != nil {
+			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+			return
+		}
 
 		if err := metaPut(ctx, mc, model.TableObjects, objectARN(bucket, key), objectHash[:]); err != nil {
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
@@ -175,6 +191,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		if len(written.handoff) > 0 {
 			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))
 		}
+		setVersionIDHeader(w.Header(), target.versionID)
 
 		if err := writeXML(w, http.StatusOK, CompleteMultipartUploadResult{
 			Location: fmt.Sprintf("https://%s/%s/%s", r.Host, bucket, key),

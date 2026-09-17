@@ -46,7 +46,6 @@ var subResourceRejections = []struct {
 	{"encryption", http.StatusNotFound, "ServerSideEncryptionConfigurationNotFoundError", "The server side encryption configuration was not found"},
 	{"publicAccessBlock", http.StatusNotFound, "NoSuchPublicAccessBlockConfiguration", "The public access block configuration was not found"},
 	{"object-lock", http.StatusNotFound, "ObjectLockConfigurationNotFoundError", "Object Lock configuration does not exist for this bucket"},
-	{"versions", http.StatusNotImplemented, "NotImplemented", "Listing object versions is not implemented"},
 }
 
 // ListObjects serves GET /{bucket}, answering ListObjectsV2 when list-type=2
@@ -72,10 +71,6 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 		}
 		if query.Has("acl") {
 			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "ACL is not implemented")
-			return
-		}
-		if query.Has("versioning") {
-			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "Versioning is not implemented")
 			return
 		}
 		for _, sr := range subResourceRejections {

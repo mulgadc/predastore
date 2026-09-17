@@ -425,8 +425,10 @@ func TestCopyObjectUnsupportedVariantsNeverAnswer200(t *testing.T) {
 			wantStatus: http.StatusNotImplemented,
 		},
 		{
-			name: "versioned source", destKey: "d4",
-			copySource: "/bucket/src?versionId=1a2b3c", wantStatus: http.StatusNotImplemented,
+			// A named source version is served now, so the refusal is gone and
+			// what is left is the ordinary answer for a version that is not there.
+			name: "source version that does not exist", destKey: "d4",
+			copySource: "/bucket/src?versionId=1a2b3c", wantStatus: http.StatusNotFound,
 		},
 		{
 			name: "self-copy without metadata REPLACE", destKey: "src",

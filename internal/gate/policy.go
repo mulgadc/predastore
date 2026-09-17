@@ -46,11 +46,14 @@ func isBulkDelete(r *http.Request, key string) bool {
 // its handler, and giving it an action here would imply it does something.
 var bucketSubResourceActions = map[string]map[string]string{
 	http.MethodGet: {
-		"location": "s3:GetBucketLocation",
-		"tagging":  "s3:GetBucketTagging",
+		"location":   "s3:GetBucketLocation",
+		"tagging":    "s3:GetBucketTagging",
+		"versioning": "s3:GetBucketVersioning",
+		"versions":   "s3:ListBucketVersions",
 	},
 	http.MethodPut: {
-		"tagging": "s3:PutBucketTagging",
+		"tagging":    "s3:PutBucketTagging",
+		"versioning": "s3:PutBucketVersioning",
 	},
 	http.MethodDelete: {
 		"tagging": "s3:PutBucketTagging",
@@ -84,16 +87,27 @@ func s3Action(r *http.Request, bucket, key string) string {
 		}
 	}
 
+	// Naming a version is a separate action on AWS, and the separation is the
+	// point of it: a principal may be allowed to read or delete the current
+	// object without being allowed to reach the history behind it.
+	namesVersion := hasKey && r.URL.Query().Get("versionId") != ""
+
 	switch r.Method {
 	case http.MethodGet:
 		if bucket == "" {
 			return "s3:ListAllMyBuckets"
+		}
+		if namesVersion {
+			return "s3:GetObjectVersion"
 		}
 		if hasKey {
 			return "s3:GetObject"
 		}
 		return "s3:ListBucket"
 	case http.MethodHead:
+		if namesVersion {
+			return "s3:GetObjectVersion"
+		}
 		if hasKey {
 			return "s3:GetObject"
 		}
@@ -109,6 +123,9 @@ func s3Action(r *http.Request, bucket, key string) string {
 		}
 		return "s3:PutObject" // multipart uploads
 	case http.MethodDelete:
+		if namesVersion {
+			return "s3:DeleteObjectVersion"
+		}
 		if hasKey {
 			return "s3:DeleteObject"
 		}

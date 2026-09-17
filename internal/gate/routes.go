@@ -70,10 +70,13 @@ func (s *Server) s3Handlers(ring *placement.Ring) map[string]http.Handler {
 		"GetBucketLocation":       handlers.GetBucketLocation(mc, cache),
 		"GetBucketTagging":        handlers.GetBucketTagging(mc, cache),
 		"PutBucketTagging":        handlers.PutBucketTagging(mc, cache),
+		"GetBucketVersioning":     handlers.GetBucketVersioning(mc, cache),
+		"PutBucketVersioning":     handlers.PutBucketVersioning(mc, cache),
+		"ListObjectVersions":      handlers.ListObjectVersions(mc, cache),
 		"DeleteBucketTagging":     handlers.DeleteBucketTagging(mc, cache),
 		"ListMultipartUploads":    handlers.ListMultipartUploads(mc, cache),
 		"ListObjects":             handlers.ListObjects(mc, cache),
-		"DeleteObjects":           handlers.DeleteObjects(mc, bc, cache),
+		"DeleteObjects":           handlers.DeleteObjects(mc, bc, cache, cfg),
 		"HeadObject":              handlers.HeadObject(mc, ring, cache, cfg),
 		"ListParts":               handlers.ListParts(mc, cache),
 		"GetObject":               bulkBody(handlers.GetObject(mc, bc, ring, cache, cfg)),
@@ -84,7 +87,7 @@ func (s *Server) s3Handlers(ring *placement.Ring) map[string]http.Handler {
 		"CompleteMultipartUpload": bulkBody(handlers.CompleteMultipartUpload(mc, bc, ring, cache, cfg)),
 		"CreateMultipartUpload":   handlers.CreateMultipartUpload(mc, cache),
 		"AbortMultipartUpload":    handlers.AbortMultipartUpload(mc, bc, cache),
-		"DeleteObject":            handlers.DeleteObject(mc, bc, cache),
+		"DeleteObject":            handlers.DeleteObject(mc, bc, cache, cfg),
 	}
 }
 

@@ -736,8 +736,13 @@ func forEachShard(written writeResult, fn func(index int, node config.NodeID)) {
 
 // loadPlacement retrieves shard location metadata for an object.
 func loadPlacement(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg Config, bucket string, object string) (ObjectToShardNodes, int64, error) {
-	objectHash := model.ObjectHash(bucket, object)
+	return loadPlacementByHash(ctx, mc, ring, cfg, model.ObjectHash(bucket, object))
+}
 
+// loadPlacementByHash retrieves shard location metadata for a named shard set.
+// A version is addressed by a hash of its own, so the caller that resolved it
+// passes the hash rather than having it recomputed from the key.
+func loadPlacementByHash(ctx context.Context, mc MetaClient, ring *placement.Ring, cfg Config, objectHash [32]byte) (ObjectToShardNodes, int64, error) {
 	shardNodes, err := ring.Nodes(objectHash, cfg.TotalShards())
 	if err != nil {
 		return ObjectToShardNodes{}, 0, err
