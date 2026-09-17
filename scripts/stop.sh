@@ -211,8 +211,20 @@ for cluster in "${clusters[@]}"; do
     aliases="$BASE_DIR/$cluster/aliases"
     [ -f "$aliases" ] || continue
 
-    while IFS= read -r ip; do
-        [ -n "$ip" ] || continue
+    while read -r how ip; do
+        [ -n "$how" ] || continue
+
+        # An address this run added is ours to remove. One it found already
+        # there belongs to whoever put it there — unless nothing is listening
+        # on it now, which means that run is gone and the address is litter.
+        if [ "$how" = adopted ]; then
+            if [ -n "$(ss -H -lnt src "$ip" 2>/dev/null)" ]; then
+                log_warn "$ip still has a listener — leaving it for its owner"
+                continue
+            fi
+            log_info "Removing $ip, whose owner left without removing it"
+        fi
+
         sudo ip addr del "${ip}/24" dev lo 2>/dev/null || true
     done < "$aliases"
     rm -f "$aliases"
