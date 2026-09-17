@@ -3,14 +3,17 @@
 Three jobs, all about making the run report honestly.
 
 **Cleanup fallback.** s3-tests empties a bucket with ListObjectVersions and
-DeleteObjects. Predastore answers 405 to DeleteObjects and serves a plain object
-listing for the versions request, which boto3 parses as zero versions, so nothing
-is deleted and every DeleteBucket fails with BucketNotEmpty. That failure lands
-in the *setup* of the next test, so one missing operation turns the whole suite
-into 880 errors that say nothing about the 880 operations they were meant to
-measure. Only the suite's own teardown helper is replaced -- no test body,
-assertion or fixture value changes, and cleanup is not a measured behaviour.
-Drop this half when DeleteObjects lands.
+DeleteObjects, both of which predastore now serves, so the replacement does the
+same rather than deleting current objects one at a time -- which left every
+version and delete marker of a versioned bucket in place, and no such bucket
+could ever be deleted. What the replacement still adds is the multipart sweep:
+an upload that was never completed holds parts under no key, so no listing
+reports it and the suite's own helper leaves the bucket undeletable. Either
+failure lands in the *setup* of the next test, so one uncleaned bucket turns the
+rest of the suite into errors that say nothing about the operations they were
+meant to measure. Only the suite's own teardown helper is replaced -- no test
+body, assertion or fixture value changes, and cleanup is not a measured
+behaviour.
 
 **Skip guard.** scripts/s3-tests-skips.txt names cases to deselect, by marker
 or node id, for features predastore has decided not to offer. A marker can
@@ -34,14 +37,30 @@ import botocore.exceptions
 
 
 def _nuke_bucket(client, bucket):
-    """Empty a bucket one key at a time, then delete it."""
-    paginator = client.get_paginator('list_objects_v2')
-    for page in paginator.paginate(Bucket=bucket):
-        for obj in page.get('Contents', []):
-            client.delete_object(Bucket=bucket, Key=obj['Key'])
+    """Empty a bucket of every version, then delete it."""
+    kwargs = {'Bucket': bucket, 'MaxKeys': 128}
+    truncated = True
+    while truncated:
+        listing = client.list_object_versions(**kwargs)
+        truncated = listing['IsTruncated']
+        # botocore rejects a None marker outright, so an absent one is dropped
+        # rather than passed on.
+        for param, field in (('KeyMarker', 'NextKeyMarker'),
+                             ('VersionIdMarker', 'NextVersionIdMarker')):
+            if listing.get(field):
+                kwargs[param] = listing[field]
+            else:
+                kwargs.pop(param, None)
 
-    # An upload that was never completed holds parts but no key, so the listing
-    # above does not see it and the bucket will not delete.
+        objects = listing.get('Versions', []) + listing.get('DeleteMarkers', [])
+        if objects:
+            client.delete_objects(Bucket=bucket, Delete={
+                'Objects': [{'Key': o['Key'], 'VersionId': o['VersionId']} for o in objects],
+                'Quiet': True,
+            })
+
+    # An upload that was never completed holds parts but no key, so no listing
+    # reports it and the bucket will not delete.
     try:
         uploads = client.list_multipart_uploads(Bucket=bucket).get('Uploads', [])
     except botocore.exceptions.ClientError:

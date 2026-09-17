@@ -59,6 +59,7 @@ func ListObjectVersions(mc MetaClient, cache *BucketCache) http.Handler {
 		// together so IsLatest is decided against the whole set rather than
 		// against whatever part of it landed on this page.
 		count := 0
+		lastKey, lastVersionID := "", ""
 		for _, key := range keys {
 			if keyMarker != "" && key <= keyMarker {
 				continue
@@ -73,12 +74,22 @@ func ListObjectVersions(mc MetaClient, cache *BucketCache) http.Handler {
 			}
 			if count+len(versions) > maxKeys && count > 0 {
 				result.IsTruncated = true
-				result.NextKeyMarker = result.Versions[len(result.Versions)-1].Key
+				// The marker is the last key this page reported, not the last
+				// version element in it: a page that ends on a delete marker has
+				// nothing in Versions to name, and resuming from an empty marker
+				// restarts the listing from the beginning.
+				result.NextKeyMarker = lastKey
+				// Both markers, always, because a client resumes with the pair it
+				// was given: boto3 feeds NextVersionIdMarker straight back, and a
+				// missing one is a validation error on the next request rather
+				// than a listing that quietly stops short.
+				result.NextVersionIdMarker = lastVersionID
 				break
 			}
 
 			appendVersions(&result, key, versions)
 			count += len(versions)
+			lastKey, lastVersionID = key, versions[len(versions)-1].VersionID
 		}
 
 		if err := writeXML(w, http.StatusOK, result); err != nil {

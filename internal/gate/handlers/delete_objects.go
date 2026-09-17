@@ -120,34 +120,51 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config)
 // deleteBatch deletes each key and returns the outcomes in request order. The
 // results are written by index rather than collected, so the answer follows the
 // order the client asked in without a lock over it.
+//
+// Entries are dealt out by key, not one at a time. Deleting a version reconciles
+// which version of that key is current, and two of those running concurrently
+// each decide it from a view taken before the other's delete landed -- which is
+// exactly the shape a client emptying a versioned bucket sends, every version of
+// every key in one request. Keys still run in parallel with each other.
 func deleteBatch(
 	ctx context.Context, mc MetaClient, bc BlobClient, cfg Config, bucket string, objects []DeleteRequestObject,
 ) []batchOutcome {
 	outcomes := make([]batchOutcome, len(objects))
 
-	workers := min(deleteObjectsWorkers, len(objects))
-	indices := make(chan int)
+	byKey := map[string][]int{}
+	order := make([]string, 0, len(objects))
+	for i, object := range objects {
+		if _, seen := byKey[object.Key]; !seen {
+			order = append(order, object.Key)
+		}
+		byKey[object.Key] = append(byKey[object.Key], i)
+	}
+
+	workers := min(deleteObjectsWorkers, len(order))
+	keys := make(chan string)
 
 	var wg sync.WaitGroup
 	for range workers {
 		wg.Go(func() {
-			for i := range indices {
-				// A request that ran out of time reports the keys it never
-				// reached rather than claiming them deleted.
-				if err := ctx.Err(); err != nil {
-					outcomes[i] = batchOutcome{err: err}
-					continue
+			for key := range keys {
+				for _, i := range byKey[key] {
+					// A request that ran out of time reports the keys it never
+					// reached rather than claiming them deleted.
+					if err := ctx.Err(); err != nil {
+						outcomes[i] = batchOutcome{err: err}
+						continue
+					}
+					outcome, err := deleteObjectVersion(ctx, mc, bc, cfg, bucket, objects[i].Key, objects[i].VersionId)
+					outcomes[i] = batchOutcome{deleteOutcome: outcome, err: err}
 				}
-				outcome, err := deleteObjectVersion(ctx, mc, bc, cfg, bucket, objects[i].Key, objects[i].VersionId)
-				outcomes[i] = batchOutcome{deleteOutcome: outcome, err: err}
 			}
 		})
 	}
 
-	for i := range objects {
-		indices <- i
+	for _, key := range order {
+		keys <- key
 	}
-	close(indices)
+	close(keys)
 	wg.Wait()
 
 	return outcomes

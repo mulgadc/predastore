@@ -131,18 +131,27 @@ func deleteNamedVersion(ctx context.Context, mc MetaClient, bc BlobClient, bucke
 		}
 	}
 
-	if index == 0 {
-		if err := promoteCurrent(ctx, mc, bucket, key, versions[1:]); err != nil {
-			return deleteOutcome{}, err
-		}
+	if err := reconcileCurrent(ctx, mc, bucket, key); err != nil {
+		return deleteOutcome{}, err
 	}
 
 	return deleteOutcome{versionID: versionID, deleteMarker: target.DeleteMarker}, nil
 }
 
-// promoteCurrent points the listing key at the newest surviving version, or
+// reconcileCurrent points the listing key at the newest surviving version, or
 // removes it when the newest is a delete marker or nothing is left.
-func promoteCurrent(ctx context.Context, mc MetaClient, bucket, key string, remaining []VersionRecord) error {
+//
+// It re-reads the index rather than promoting out of the list the caller read
+// before its delete. That list still holds the version just destroyed, so
+// promoting from it can leave the listing key naming a version that no longer
+// exists -- a key that lists with no bytes behind it, and a bucket that can
+// never be emptied.
+func reconcileCurrent(ctx context.Context, mc MetaClient, bucket, key string) error {
+	remaining, err := keyVersions(ctx, mc, bucket, key)
+	if err != nil {
+		return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
+	}
+
 	if len(remaining) == 0 || remaining[0].DeleteMarker {
 		if err := metaDelete(ctx, mc, model.TableObjects, objectARN(bucket, key)); err != nil && !errors.Is(err, meta.ErrNotFound) {
 			return model.NewS3Error(model.ErrInternalError, err.Error(), 500)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/xml"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -358,6 +359,116 @@ func TestVersionsOrderByWriteOrderNotByMillisecond(t *testing.T) {
 	got := f.get("bucket", "doc")
 	require.Equal(t, http.StatusOK, got.Code, got.Body.String())
 	assert.Equal(t, []byte{byte('a' + writes - 1)}, got.Body.Bytes(), "the current version must be the last written")
+}
+
+// TestBatchDeletingEveryVersionEmptiesTheBucket is how a client empties a
+// versioned bucket: list every version, then delete them all in one request.
+// Deleting a version reconciles which version of the key is current, so
+// entries for one key that run concurrently, or promote out of a list read
+// before the delete, can leave the listing key naming a version that no longer
+// exists -- a key that lists with no bytes and a bucket that cannot be deleted.
+func TestBatchDeletingEveryVersionEmptiesTheBucket(t *testing.T) {
+	f := newHandlerFixture()
+	createBucket(t, f, "bucket")
+	require.Equal(t, http.StatusOK, f.putVersioning(t, "bucket", "Enabled").Code)
+
+	for _, key := range []string{"k1", "k2"} {
+		require.Equal(t, http.StatusOK, f.put("bucket", key, []byte("one")).Code)
+		require.Equal(t, http.StatusOK, f.put("bucket", key, []byte("two")).Code)
+	}
+	require.Equal(t, http.StatusNoContent, f.del("bucket", "k2", "").Code)
+
+	listed := f.listVersions(t, "bucket")
+	require.Len(t, listed.Versions, 4)
+	require.Len(t, listed.DeleteMarkers, 1)
+
+	var body strings.Builder
+	body.WriteString("<Delete>")
+	for _, v := range listed.Versions {
+		body.WriteString("<Object><Key>" + v.Key + "</Key><VersionId>" + v.VersionId + "</VersionId></Object>")
+	}
+	for _, m := range listed.DeleteMarkers {
+		body.WriteString("<Object><Key>" + m.Key + "</Key><VersionId>" + m.VersionId + "</VersionId></Object>")
+	}
+	body.WriteString("</Delete>")
+
+	req := httptest.NewRequest(http.MethodPost, "/bucket?delete", strings.NewReader(body.String())).
+		WithContext(WithBucket(context.Background(), model.Bucket{Name: "bucket"}))
+	rr := httptest.NewRecorder()
+	DeleteObjects(f.mc, f.bc, f.cache, f.cfg).ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	assert.NotContains(t, rr.Body.String(), "<Error>")
+
+	after := f.listVersions(t, "bucket")
+	assert.Empty(t, after.Versions)
+	assert.Empty(t, after.DeleteMarkers)
+	assert.Empty(t, f.list(t, "bucket").Contents, "a listing key outlived every version behind it")
+
+	assert.Equal(t, http.StatusNoContent, f.deleteBucket("bucket").Code)
+}
+
+// TestListObjectVersionsPagesEveryKey walks the listing the way a client
+// emptying a bucket does, resuming from the markers it was handed. A page that
+// claims to be truncated and names no marker to resume from either restarts the
+// listing or is rejected outright by the SDK, and either way the keys past the
+// first page are never seen.
+func TestListObjectVersionsPagesEveryKey(t *testing.T) {
+	f := newHandlerFixture("bucket")
+	require.Equal(t, http.StatusOK, f.putVersioning(t, "bucket", "Enabled").Code)
+
+	const keys = 7
+	for i := range keys {
+		key := fmt.Sprintf("k%02d", i)
+		require.Equal(t, http.StatusOK, f.put("bucket", key, []byte("body")).Code)
+		// Every second key is hidden behind a delete marker, so a page can end on
+		// one -- the case that has nothing in Versions to name a marker from.
+		if i%2 == 1 {
+			require.Equal(t, http.StatusNoContent, f.del("bucket", key, "").Code)
+		}
+	}
+
+	seen := map[string]int{}
+	marker, pages := "", 0
+	for {
+		pages++
+		require.Less(t, pages, keys+2, "the listing is not making progress")
+
+		target := "/bucket?versions&max-keys=2"
+		if marker != "" {
+			target += "&key-marker=" + marker
+		}
+		req := httptest.NewRequest(http.MethodGet, target, nil).
+			WithContext(WithBucket(context.Background(), model.Bucket{Name: "bucket"}))
+		rr := httptest.NewRecorder()
+		ListObjectVersions(f.mc, f.cache).ServeHTTP(rr, req)
+		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+		var page ListVersionsResult
+		require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &page))
+		for _, v := range page.Versions {
+			seen[v.Key]++
+		}
+		for _, m := range page.DeleteMarkers {
+			seen[m.Key]++
+		}
+
+		if !page.IsTruncated {
+			break
+		}
+		require.NotEmpty(t, page.NextKeyMarker, "a truncated page named no marker to resume from")
+		require.NotEmpty(t, page.NextVersionIdMarker, "a truncated page named no version marker to resume from")
+		marker = page.NextKeyMarker
+	}
+
+	require.Len(t, seen, keys)
+	for i := range keys {
+		key := fmt.Sprintf("k%02d", i)
+		want := 1
+		if i%2 == 1 {
+			want = 2 // the object and the delete marker hiding it
+		}
+		assert.Equal(t, want, seen[key], "key %s", key)
+	}
 }
 
 // TestVersionIndexKeysSortNewestFirstWithinAMillisecond is the same property
