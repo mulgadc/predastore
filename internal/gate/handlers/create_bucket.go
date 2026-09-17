@@ -8,12 +8,56 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
+
+// unsupportedBucketWrites names every bucket sub-resource whose PUT predastore
+// does not serve, and what a client is told instead. Each is refused rather
+// than accepted and echoed back: storing a setting nothing applies would report
+// a bucket as encrypted, locked down or expiring when none of that is true.
+//
+// Matching is by exact parameter name. The AWS SDKs append x-id to ordinary
+// requests, so refusing anything unrecognised would break CreateBucket itself.
+var unsupportedBucketWrites = []struct {
+	param   string
+	message string
+}{
+	{"policy", "Bucket policy is not implemented"},
+	{"acl", "Bucket ACLs are not implemented"},
+	{"versioning", "Versioning is not implemented"},
+	{"encryption", "Bucket encryption configuration is not implemented"},
+	{"lifecycle", "Lifecycle configuration is not implemented"},
+	{"publicAccessBlock", "Public access block configuration is not implemented"},
+	{"ownershipControls", "Bucket ownership controls are not implemented"},
+	{"cors", "CORS configuration is not implemented"},
+	{"object-lock", "Object Lock configuration is not implemented"},
+	{"notification", "Bucket notification configuration is not implemented"},
+	{"logging", "Bucket logging is not implemented"},
+	{"replication", "Bucket replication is not implemented"},
+	{"website", "Bucket website configuration is not implemented"},
+	{"accelerate", "Transfer acceleration is not implemented"},
+	{"requestPayment", "Requester pays configuration is not implemented"},
+	{"analytics", "Bucket analytics configuration is not implemented"},
+	{"intelligent-tiering", "Intelligent tiering configuration is not implemented"},
+	{"inventory", "Bucket inventory configuration is not implemented"},
+	{"metrics", "Bucket metrics configuration is not implemented"},
+}
+
+// unsupportedBucketWrite reports whether a bucket PUT names a sub-resource
+// predastore does not serve, and what to say about it.
+func unsupportedBucketWrite(query url.Values) (string, bool) {
+	for _, sub := range unsupportedBucketWrites {
+		if query.Has(sub.param) {
+			return sub.message, true
+		}
+	}
+	return "", false
+}
 
 // CreateBucket serves PUT /{bucket}.
 func CreateBucket(mc MetaClient, cache *BucketCache, cfg Config) http.Handler {
@@ -25,15 +69,11 @@ func CreateBucket(mc MetaClient, cache *BucketCache, cfg Config) http.Handler {
 		}
 		bucket := resource.Name
 
-		// PUT /{bucket}?policy — bucket policies are not supported
-		if r.URL.Query().Has("policy") {
-			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "Bucket policy is not implemented")
-			return
-		}
-		// PUT /{bucket}?versioning — answering the create-bucket path here would
-		// report "already yours" rather than the truthful "not supported".
-		if r.URL.Query().Has("versioning") {
-			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "Versioning is not implemented")
+		// A sub-resource write is not CreateBucket. Falling through would answer
+		// "already yours", which reads as a name clash rather than as the
+		// truthful "this setting is not supported".
+		if message, unsupported := unsupportedBucketWrite(r.URL.Query()); unsupported {
+			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented", message)
 			return
 		}
 

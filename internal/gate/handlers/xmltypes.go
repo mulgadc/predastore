@@ -236,3 +236,24 @@ type CreateBucketResult struct {
 	XMLName  xml.Name `xml:"CreateBucketResult"`
 	Location string   `xml:"Location"`
 }
+
+// LocationConstraint is the response for GetBucketLocation. The region is the
+// element's own text, not a child element, which is why this is not
+// CreateBucketConfiguration read the other way round.
+type LocationConstraint struct {
+	XMLName xml.Name `xml:"LocationConstraint"`
+	Value   string   `xml:",chardata"`
+}
+
+// Tag is one bucket tag, in both the request and the response document.
+type Tag struct {
+	Key   string `xml:"Key"`
+	Value string `xml:"Value"`
+}
+
+// Tagging is the request body for PutBucketTagging and the response for
+// GetBucketTagging.
+type Tagging struct {
+	XMLName xml.Name `xml:"Tagging"`
+	TagSet  []Tag    `xml:"TagSet>Tag"`
+}

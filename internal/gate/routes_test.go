@@ -104,6 +104,46 @@ func TestSelectRouteTakesTheFirstMatch(t *testing.T) {
 	}
 }
 
+// Every bucket sub-resource predastore serves used to select the unconstrained
+// route for its method, so a tag write was answered as CreateBucket and a
+// location read as a listing.
+func TestSelectRouteDispatchesBucketSubResources(t *testing.T) {
+	var served string
+	built := map[string]http.Handler{}
+	for _, route := range s3api.Routes() {
+		built[route.ID] = http.HandlerFunc(func(http.ResponseWriter, *http.Request) { served = route.ID })
+	}
+
+	groups := map[string][]s3api.Route{}
+	for _, group := range groupRoutes(s3api.ScopeBucket) {
+		groups[group[0].Method] = group
+	}
+
+	for name, tc := range map[string]struct {
+		method string
+		target string
+		want   string
+	}{
+		"tag write":     {method: http.MethodPut, target: "/b?tagging", want: "PutBucketTagging"},
+		"plain create":  {method: http.MethodPut, target: "/b", want: "CreateBucket"},
+		"refused write": {method: http.MethodPut, target: "/b?encryption", want: "CreateBucket"},
+		"tag read":      {method: http.MethodGet, target: "/b?tagging", want: "GetBucketTagging"},
+		"location read": {method: http.MethodGet, target: "/b?location", want: "GetBucketLocation"},
+		"plain listing": {method: http.MethodGet, target: "/b", want: "ListObjects"},
+		"tag delete":    {method: http.MethodDelete, target: "/b?tagging", want: "DeleteBucketTagging"},
+		"bucket delete": {method: http.MethodDelete, target: "/b", want: "DeleteBucket"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			served = ""
+			selectRoute(groups[tc.method], built).ServeHTTP(
+				httptest.NewRecorder(), httptest.NewRequest(tc.method, tc.target, nil))
+			if served != tc.want {
+				t.Errorf("served %q, want %q", served, tc.want)
+			}
+		})
+	}
+}
+
 // A POST at a bucket is the batch delete and nothing else, so the group has no
 // fallback and an unselected request is answered rather than dropped.
 func TestSelectRouteAnswersAnUnselectedRequest(t *testing.T) {

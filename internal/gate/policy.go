@@ -40,11 +40,49 @@ func isBulkDelete(r *http.Request, key string) bool {
 	return r.Method == http.MethodPost && key == "" && r.URL.Query().Has("delete")
 }
 
+// bucketSubResourceActions maps each served bucket sub-resource to the IAM
+// action it authorizes against, keyed by method and query parameter. It covers
+// only the sub-resources predastore serves: an unsupported one is refused by
+// its handler, and giving it an action here would imply it does something.
+var bucketSubResourceActions = map[string]map[string]string{
+	http.MethodGet: {
+		"location": "s3:GetBucketLocation",
+		"tagging":  "s3:GetBucketTagging",
+	},
+	http.MethodPut: {
+		"tagging": "s3:PutBucketTagging",
+	},
+	http.MethodDelete: {
+		"tagging": "s3:PutBucketTagging",
+	},
+}
+
+// bucketSubResourceAction returns the action a bucket sub-resource request
+// authorizes against, or empty when the request names none that is served.
+func bucketSubResourceAction(r *http.Request) string {
+	query := r.URL.Query()
+	for param, action := range bucketSubResourceActions[r.Method] {
+		if query.Has(param) {
+			return action
+		}
+	}
+	return ""
+}
+
 // s3Action maps a request and the resolved bucket/key to the IAM S3 action.
 // The request is read rather than the method alone because S3 distinguishes
 // some operations by sub-resource rather than by method.
 func s3Action(r *http.Request, bucket, key string) string {
 	hasKey := key != ""
+
+	// A bucket sub-resource is its own operation and carries its own action.
+	// Without this a tag write would authorize as s3:CreateBucket, so a policy
+	// written for the AWS action set would not mean here what it means on AWS.
+	if !hasKey && bucket != "" {
+		if action := bucketSubResourceAction(r); action != "" {
+			return action
+		}
+	}
 
 	switch r.Method {
 	case http.MethodGet:
