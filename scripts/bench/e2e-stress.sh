@@ -65,6 +65,9 @@
 #                      TMPDIR, except when large-object is in the run: TMPDIR is
 #                      often tmpfs, which is RAM-backed, so it would both cap
 #                      the sizes and make the memory measurement meaningless.
+#   STRESS_LOCK_WAIT   Seconds to wait for the host benchmark lock, which is
+#                      shared with e2e-performance.sh (default: 3600)
+#   PREDA_BENCH_LOCK   Path of that lock (default: /var/lock/predastore-bench.lock)
 #   WARP               Path to the warp binary (default: bin/tools/warp)
 #
 
@@ -119,6 +122,12 @@ for command in aws awk curl diff git go openssl; do
 done
 [ -x "$WARP" ] || { echo "Warp not executable: $WARP (run make warp-install)" >&2; exit 1; }
 [ -f "$CONFIG_DIR/$CONFIG_NAME.toml" ] || { echo "missing config: $CONFIG_NAME" >&2; exit 1; }
+
+# Held for the whole run, and shared with e2e-performance.sh. The scenarios here
+# freeze and kill nodes by design, so a benchmark running beside one would read
+# the injected fault as its own result.
+take_host_lock "${STRESS_LOCK_WAIT:-3600}"
+echo "Holding host benchmark lock: $HOST_LOCK_PATH"
 
 mkdir -p "$RESULTS_ROOT"
 STAMP="$(date -u +%Y-%m-%dT%H%M%SZ)"
@@ -873,7 +882,7 @@ start_host() {
         -tls-cert "$PREDA_DIR/server.pem" \
         -tls-key "$PREDA_DIR/server.key" \
         -encryption-key "$PREDA_DIR/master.key" \
-        >> "$base/logs/host-${host}.log" 2>&1 &
+        >> "$base/logs/host-${host}.log" 2>&1 9>&- &
     echo $! > "$base/pids/host-${host}.pid"
     log "$NODE_MODE: host $host restarted as pid $(cat "$base/pids/host-${host}.pid")"
 }

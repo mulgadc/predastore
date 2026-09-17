@@ -16,7 +16,6 @@
 #
 # Environment:
 #   PREDA_DIR          cluster root to scan (default /tmp/predastore)
-#   PREDA_CONFIG_DIR   where profiles are read from (default: repo config/)
 #   STOP_TIMEOUT       seconds to wait after SIGTERM before SIGKILL (default 20)
 #   KILL_TIMEOUT       seconds to wait after SIGKILL before failing (default 5)
 #
@@ -26,16 +25,6 @@
 #
 
 set -euo pipefail
-
-SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
-REPO_DIR="$SCRIPT_DIR/.."
-# Matches start.sh: a harness that generated its profiles elsewhere aliased the
-# loopback addresses in those, so reading the repo's copy here would tear down
-# addresses from a different profile of the same name.
-CONFIG_DIR="${PREDA_CONFIG_DIR:-$REPO_DIR/config}"
-
-# shellcheck source=scripts/lib.sh
-source "$SCRIPT_DIR/lib.sh"
 
 BASE_DIR="${PREDA_DIR:-/tmp/predastore}"
 
@@ -210,20 +199,35 @@ if [ ${#pids[@]} -gt 0 ]; then
     fi
 fi
 
-# Teardown loopback IPs for each cluster that has a matching config. Only
-# addresses start.sh could have aliased are removed: loopback is the machine's
-# own and a single-host profile never aliased anything. Scoped to the clusters
-# actually stopped, so naming one does not pull the addresses out from under
-# another that is still serving on them.
+# Teardown loopback IPs, from the record start.sh wrote of the ones it actually
+# added. The profile is the wrong source for this: it names every address the
+# cluster used, including any that were already on lo because another cluster
+# put them there, and removing one of those strands a run that is still serving.
+#
+# An aliases file start.sh never wrote means addresses are left behind. That is
+# the safe direction to fail — a leaked alias costs a line in `ip addr`, while a
+# stolen one fails somebody else's benchmark with a connection error.
 for cluster in "${clusters[@]}"; do
-    config="$CONFIG_DIR/${cluster}.toml"
-    [ -f "$config" ] || continue
+    aliases="$BASE_DIR/$cluster/aliases"
+    [ -f "$aliases" ] || continue
 
-    # A profile with no routable host is normal, not an error: the pipeline
-    # must not abort the script under `set -e`.
-    for ip in $(routable_addrs "$config" || true); do
+    while read -r how ip; do
+        [ -n "$how" ] || continue
+
+        # An address this run added is ours to remove. One it found already
+        # there belongs to whoever put it there — unless nothing is listening
+        # on it now, which means that run is gone and the address is litter.
+        if [ "$how" = adopted ]; then
+            if [ -n "$(ss -H -lnt src "$ip" 2>/dev/null)" ]; then
+                log_warn "$ip still has a listener — leaving it for its owner"
+                continue
+            fi
+            log_info "Removing $ip, whose owner left without removing it"
+        fi
+
         sudo ip addr del "${ip}/24" dev lo 2>/dev/null || true
-    done
+    done < "$aliases"
+    rm -f "$aliases"
 done
 
 if [ "$stopped" -eq 0 ]; then
