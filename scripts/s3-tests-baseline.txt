@@ -829,7 +829,7 @@ SKIP|s3tests/functional/test_s3.py::test_restore_noncur_obj
 SKIP|s3tests/functional/test_s3.py::test_restore_object_permanent
 SKIP|s3tests/functional/test_s3.py::test_restore_object_temporary
 SKIP|s3tests/functional/test_s3.py::test_rm_bucket_logging
-FAIL|s3tests/functional/test_s3.py::test_set_bucket_tagging
+PASS|s3tests/functional/test_s3.py::test_set_bucket_tagging
 SKIP|s3tests/functional/test_s3.py::test_set_cors
 SKIP|s3tests/functional/test_s3.py::test_set_get_del_bucket_policy
 FAIL|s3tests/functional/test_s3.py::test_set_multipart_tagging
