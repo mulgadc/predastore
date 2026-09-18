@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -45,6 +46,11 @@ type Server struct {
 	fsm       *FSM
 	badgerDB  *badger.DB
 	bolt      *raftboltdb.BoltStore
+
+	// raftUp is set once raft exists. Callers outside Run reach the Server as
+	// soon as it is built, so they need a published answer rather than a read
+	// of a field Run has not written yet.
+	raftUp atomic.Bool
 
 	// unregisterMetrics detaches the raft and storage gauge callbacks. They are
 	// nil until raft exists, since both read it on every collection.
@@ -204,6 +210,7 @@ func (s *Server) open() (*rpc.Server, error) {
 	// from here on is one a leader sent because this replica fell outside the
 	// log it retains. That is the difference the FSM cannot see for itself.
 	s.fsm.serving.Store(true)
+	s.raftUp.Store(true)
 	// Consensus state is only observable once raft exists. A failure to
 	// register loses the gauges, not the replica, so it is logged and left.
 	unregister, err := telemetry.RegisterRaftGauges(s.raftSnapshot)
@@ -515,8 +522,12 @@ func (s *Server) leaderRead() string {
 
 // LeaderKnown reports whether this replica currently observes a leader. It
 // reads local raft state only, so a replica partitioned from the cluster
-// answers false rather than blocking on a peer it cannot reach.
+// answers false rather than blocking on a peer it cannot reach. A replica
+// whose raft node has not been built yet observes no leader either.
 func (s *Server) LeaderKnown() bool {
+	if !s.raftUp.Load() {
+		return false
+	}
 	return s.raft.Leader() != ""
 }
 
