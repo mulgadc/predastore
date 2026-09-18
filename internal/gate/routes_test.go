@@ -84,11 +84,16 @@ func TestSelectRouteTakesTheFirstMatch(t *testing.T) {
 		copy   string
 		want   string
 	}{
-		"plain put":     {target: "/b/k", want: "PutObject"},
-		"copy":          {target: "/b/k", copy: "/b/src", want: "CopyObject"},
-		"upload part":   {target: "/b/k?partNumber=1&uploadId=u", want: "UploadPart"},
-		"part copy":     {target: "/b/k?partNumber=1&uploadId=u", copy: "/b/src", want: "UploadPartCopy"},
-		"unknown query": {target: "/b/k?acl", want: "PutObject"},
+		"plain put":   {target: "/b/k", want: "PutObject"},
+		"copy":        {target: "/b/k", copy: "/b/src", want: "CopyObject"},
+		"upload part": {target: "/b/k?partNumber=1&uploadId=u", want: "UploadPart"},
+		"part copy":   {target: "/b/k?partNumber=1&uploadId=u", copy: "/b/src", want: "UploadPartCopy"},
+		// A sub-resource nobody serves selects nothing. Falling through to
+		// PutObject here stored the sub-resource document as the object body.
+		"unserved sub-resource": {target: "/b/k?acl", want: ""},
+		// versionId names a version of the object, not an operation of its own,
+		// so it still selects the route it modifies.
+		"version modifier": {target: "/b/k?versionId=v", want: "PutObject"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			served = ""
@@ -124,9 +129,11 @@ func TestSelectRouteDispatchesBucketSubResources(t *testing.T) {
 		target string
 		want   string
 	}{
-		"tag write":     {method: http.MethodPut, target: "/b?tagging", want: "PutBucketTagging"},
-		"plain create":  {method: http.MethodPut, target: "/b", want: "CreateBucket"},
-		"refused write": {method: http.MethodPut, target: "/b?encryption", want: "CreateBucket"},
+		"tag write":    {method: http.MethodPut, target: "/b?tagging", want: "PutBucketTagging"},
+		"plain create": {method: http.MethodPut, target: "/b", want: "CreateBucket"},
+		// A bucket sub-resource nobody serves is refused by the router rather
+		// than answered as a bucket create.
+		"refused write": {method: http.MethodPut, target: "/b?encryption", want: ""},
 		"tag read":      {method: http.MethodGet, target: "/b?tagging", want: "GetBucketTagging"},
 		"location read": {method: http.MethodGet, target: "/b?location", want: "GetBucketLocation"},
 		"plain listing": {method: http.MethodGet, target: "/b", want: "ListObjects"},
@@ -162,5 +169,95 @@ func TestSelectRouteAnswersAnUnselectedRequest(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "MethodNotAllowed") {
 		t.Errorf("body does not carry the S3 error code:\n%s", recorder.Body.String())
+	}
+}
+
+// objectSubResources are the sub-resources an object request can carry that no
+// route serves. Written out rather than read from s3api's own list, so removing
+// one from that list fails here instead of quietly restoring the fall-through.
+var objectSubResources = []string{
+	"acl", "tagging", "retention", "legal-hold", "torrent", "restore",
+	"select", "attributes", "policy", "policyStatus",
+}
+
+// Every one of these used to select the unconstrained route for its method. On
+// PUT that is PutObject, so asking about an object's tags stored the request
+// body as the object; on DELETE it is DeleteObject, so asking to clear them
+// deleted it.
+func TestUnservedObjectSubResourcesReachNoHandler(t *testing.T) {
+	groups := map[string][]s3api.Route{}
+	for _, group := range groupRoutes(s3api.ScopeObject) {
+		groups[group[0].Method] = group
+	}
+
+	for _, method := range []string{http.MethodPut, http.MethodGet, http.MethodDelete, http.MethodHead} {
+		for _, sub := range objectSubResources {
+			t.Run(method+" "+sub, func(t *testing.T) {
+				var served string
+				built := map[string]http.Handler{}
+				for _, route := range s3api.Routes() {
+					built[route.ID] = http.HandlerFunc(func(http.ResponseWriter, *http.Request) { served = route.ID })
+				}
+
+				recorder := httptest.NewRecorder()
+				selectRoute(groups[method], built).ServeHTTP(recorder,
+					httptest.NewRequest(method, "/b/k?"+sub, nil))
+
+				if served != "" {
+					t.Fatalf("%s ?%s was served by %q", method, sub, served)
+				}
+				if recorder.Code != http.StatusNotImplemented {
+					t.Errorf("status = %d, want %d", recorder.Code, http.StatusNotImplemented)
+				}
+				// HEAD carries no body, so the code is all there is to assert on.
+				if method != http.MethodHead && !strings.Contains(recorder.Body.String(), sub) {
+					t.Errorf("the refusal does not name the sub-resource:\n%s", recorder.Body.String())
+				}
+			})
+		}
+	}
+}
+
+// The parameters the SDKs add are modifiers on an operation rather than
+// operations, so each must still select the route it modifies. A guard written
+// as "any query key no route claims" would refuse every one of these.
+func TestModifiersStillSelectTheirRoute(t *testing.T) {
+	groups := map[string][]s3api.Route{}
+	for _, group := range groupRoutes(s3api.ScopeObject) {
+		groups[group[0].Method] = group
+	}
+
+	for name, tc := range map[string]struct {
+		method string
+		target string
+		want   string
+	}{
+		"put with sdk marker": {method: http.MethodPut, target: "/b/k?x-id=PutObject", want: "PutObject"},
+		"get a version":       {method: http.MethodGet, target: "/b/k?versionId=v", want: "GetObject"},
+		"get with overrides":  {method: http.MethodGet, target: "/b/k?response-content-type=text%2Fplain", want: "GetObject"},
+		"delete a version":    {method: http.MethodDelete, target: "/b/k?versionId=v", want: "DeleteObject"},
+		"head a version":      {method: http.MethodHead, target: "/b/k?versionId=v", want: "HeadObject"},
+		"list the parts":      {method: http.MethodGet, target: "/b/k?uploadId=u", want: "ListParts"},
+		"abort the upload":    {method: http.MethodDelete, target: "/b/k?uploadId=u", want: "AbortMultipartUpload"},
+		"start an upload":     {method: http.MethodPost, target: "/b/k?uploads", want: "CreateMultipartUpload"},
+		"complete an upload":  {method: http.MethodPost, target: "/b/k?uploadId=u", want: "CompleteMultipartUpload"},
+		"upload a part":       {method: http.MethodPut, target: "/b/k?partNumber=1&uploadId=u", want: "UploadPart"},
+		"plain object write":  {method: http.MethodPut, target: "/b/k", want: "PutObject"},
+		"plain object read":   {method: http.MethodGet, target: "/b/k", want: "GetObject"},
+		"plain object delete": {method: http.MethodDelete, target: "/b/k", want: "DeleteObject"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var served string
+			built := map[string]http.Handler{}
+			for _, route := range s3api.Routes() {
+				built[route.ID] = http.HandlerFunc(func(http.ResponseWriter, *http.Request) { served = route.ID })
+			}
+
+			selectRoute(groups[tc.method], built).ServeHTTP(
+				httptest.NewRecorder(), httptest.NewRequest(tc.method, tc.target, nil))
+			if served != tc.want {
+				t.Errorf("served %q, want %q", served, tc.want)
+			}
+		})
 	}
 }
