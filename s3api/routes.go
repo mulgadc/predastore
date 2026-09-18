@@ -39,9 +39,46 @@ type Route struct {
 	Header string
 }
 
+// subResources are the query parameters that name an S3 operation of their own
+// rather than modifying the one the method and path already name.
+//
+// The list is written out rather than derived from "a query key no route
+// claims", because the SDKs add parameters of their own -- x-id, versionId,
+// the response header overrides, the list parameters -- and those modify an
+// operation and must keep selecting the route they modify.
+var subResources = []string{
+	"accelerate", "acl", "analytics", "attributes", "cors", "encryption",
+	"intelligent-tiering", "inventory", "legal-hold", "lifecycle", "location",
+	"logging", "metrics", "notification", "object-lock", "ownershipControls",
+	"policy", "policyStatus", "publicAccessBlock", "replication",
+	"requestPayment", "restore", "retention", "select", "tagging", "torrent",
+	"uploads", "versioning", "versions", "website",
+}
+
+// SubResource returns the sub-resource a request addresses, or "" for a request
+// that addresses the bucket or object itself.
+func SubResource(req *http.Request) string {
+	query := req.URL.Query()
+	for _, name := range subResources {
+		if query.Has(name) {
+			return name
+		}
+	}
+	return ""
+}
+
 // Selects reports whether a request chooses this route, given that its method
 // and pattern have already matched.
+//
+// A route that names no sub-resource is the fallback for its method and path,
+// and a fallback must not answer for a sub-resource nobody serves. On the
+// object paths the fallbacks are PutObject, GetObject and DeleteObject, so a
+// request for an unserved sub-resource would otherwise be answered by writing,
+// reading or deleting the object itself.
 func (r Route) Selects(req *http.Request) bool {
+	if r.Query == "" && SubResource(req) != "" {
+		return false
+	}
 	if r.Query != "" && !req.URL.Query().Has(r.Query) {
 		return false
 	}
@@ -82,7 +119,7 @@ var routes = []Route{
 	{ID: "CopyObject", Names: []string{"CopyObject"}, Scope: ScopeObject, Method: http.MethodPut, Pattern: "/{bucket}/*", Header: copySourceHeader},
 	{ID: "PutObject", Names: []string{"PutObject"}, Scope: ScopeObject, Method: http.MethodPut, Pattern: "/{bucket}/*"},
 	{ID: "CompleteMultipartUpload", Names: []string{"CompleteMultipartUpload"}, Scope: ScopeObject, Method: http.MethodPost, Pattern: "/{bucket}/*", Query: "uploadId"},
-	{ID: "CreateMultipartUpload", Names: []string{"CreateMultipartUpload"}, Scope: ScopeObject, Method: http.MethodPost, Pattern: "/{bucket}/*"},
+	{ID: "CreateMultipartUpload", Names: []string{"CreateMultipartUpload"}, Scope: ScopeObject, Method: http.MethodPost, Pattern: "/{bucket}/*", Query: "uploads"},
 	{ID: "AbortMultipartUpload", Names: []string{"AbortMultipartUpload"}, Scope: ScopeObject, Method: http.MethodDelete, Pattern: "/{bucket}/*", Query: "uploadId"},
 	{ID: "DeleteObject", Names: []string{"DeleteObject"}, Scope: ScopeObject, Method: http.MethodDelete, Pattern: "/{bucket}/*"},
 }

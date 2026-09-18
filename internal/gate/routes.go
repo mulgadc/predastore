@@ -21,6 +21,10 @@ func selectRoute(routes []s3api.Route, handlers map[string]http.Handler) http.Ha
 				return
 			}
 		}
+		if sub := s3api.SubResource(r); sub != "" {
+			notImplemented(sub).ServeHTTP(w, r)
+			return
+		}
 		methodNotAllowed().ServeHTTP(w, r)
 	})
 }
@@ -31,6 +35,16 @@ func methodNotAllowed() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handlers.WriteS3Error(w, r, http.StatusMethodNotAllowed, "MethodNotAllowed",
 			"The specified method is not allowed against this resource")
+	})
+}
+
+// notImplemented answers a sub-resource no route serves, naming it. The
+// alternative is the fallback route for the method, which on an object path
+// writes, reads or deletes the object itself.
+func notImplemented(sub string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlers.WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
+			fmt.Sprintf("The %s sub-resource is not implemented", sub))
 	})
 }
 
