@@ -15,13 +15,14 @@ import (
 // so the first route the request selects wins and the table's order decides.
 func selectRoute(routes []s3api.Route, handlers map[string]http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
 		for _, route := range routes {
-			if route.Selects(r) {
+			if route.Selects(r, query) {
 				handlers[route.ID].ServeHTTP(w, r)
 				return
 			}
 		}
-		if sub := s3api.SubResource(r); sub != "" {
+		if sub := s3api.SubResource(query); sub != "" {
 			notImplemented(sub).ServeHTTP(w, r)
 			return
 		}

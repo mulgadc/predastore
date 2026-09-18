@@ -5,6 +5,7 @@ package s3api
 
 import (
 	"net/http"
+	"net/url"
 	"slices"
 )
 
@@ -55,10 +56,12 @@ var subResources = []string{
 	"uploads", "versioning", "versions", "website",
 }
 
-// SubResource returns the sub-resource a request addresses, or "" for a request
+// SubResource returns the sub-resource a query addresses, or "" for a request
 // that addresses the bucket or object itself.
-func SubResource(req *http.Request) string {
-	query := req.URL.Query()
+func SubResource(query url.Values) string {
+	if len(query) == 0 {
+		return ""
+	}
 	for _, name := range subResources {
 		if query.Has(name) {
 			return name
@@ -68,18 +71,19 @@ func SubResource(req *http.Request) string {
 }
 
 // Selects reports whether a request chooses this route, given that its method
-// and pattern have already matched.
+// and pattern have already matched. The caller passes the parsed query so that
+// a group of routes costs one parse rather than one per route.
 //
 // A route that names no sub-resource is the fallback for its method and path,
 // and a fallback must not answer for a sub-resource nobody serves. On the
 // object paths the fallbacks are PutObject, GetObject and DeleteObject, so a
 // request for an unserved sub-resource would otherwise be answered by writing,
 // reading or deleting the object itself.
-func (r Route) Selects(req *http.Request) bool {
-	if r.Query == "" && SubResource(req) != "" {
+func (r Route) Selects(req *http.Request, query url.Values) bool {
+	if r.Query == "" && SubResource(query) != "" {
 		return false
 	}
-	if r.Query != "" && !req.URL.Query().Has(r.Query) {
+	if r.Query != "" && !query.Has(r.Query) {
 		return false
 	}
 	return r.Header == "" || req.Header.Get(r.Header) != ""

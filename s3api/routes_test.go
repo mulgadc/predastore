@@ -80,7 +80,7 @@ func TestSelectsMatchesOnQueryAndHeader(t *testing.T) {
 			if tc.header != "" {
 				req.Header.Set("X-Amz-Copy-Source", tc.header)
 			}
-			if got := route.Selects(req); got != tc.want {
+			if got := route.Selects(req, req.URL.Query()); got != tc.want {
 				t.Errorf("Selects() = %v, want %v", got, tc.want)
 			}
 		})
