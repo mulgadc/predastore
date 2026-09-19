@@ -37,7 +37,7 @@
 # purpose: it only checks that GetObjectLockConfiguration answers
 # ObjectLockConfigurationNotFoundError on a bucket with no lock configured,
 # which is the sub-resource-routing gap (mulga-nv5p5), not object lock itself.
-# It stays a FAIL and should flip to PASS when that bead lands.
+# It passed once that gap was closed, and the baseline records it as PASS.
 #
 # test_object_lock_get_obj_lock is also left out, for a duller reason: pytest's
 # --deselect matches by nodeid prefix, and that name is a strict prefix of
