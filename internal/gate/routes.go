@@ -14,6 +14,10 @@ import (
 // distinguishes them by query parameter or header, which chi cannot match on,
 // so the first route the request selects wins and the table's order decides.
 func selectRoute(routes []s3api.Route, handlers map[string]http.Handler) http.Handler {
+	var scope s3api.Scope
+	if len(routes) > 0 {
+		scope = routes[0].Scope
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
 		for _, route := range routes {
@@ -23,7 +27,7 @@ func selectRoute(routes []s3api.Route, handlers map[string]http.Handler) http.Ha
 			}
 		}
 		if sub := s3api.SubResource(query); sub != "" {
-			notImplemented(sub).ServeHTTP(w, r)
+			unservedSubResource(sub, r.Method, scope).ServeHTTP(w, r)
 			return
 		}
 		methodNotAllowed().ServeHTTP(w, r)
@@ -39,10 +43,49 @@ func methodNotAllowed() http.Handler {
 	})
 }
 
-// notImplemented answers a sub-resource no route serves, naming it. The
+// unsetControlCodes names, per sub-resource, the error S3 answers a read of a
+// control that is not configured. Reading one of these from predastore is that
+// case permanently: the control is not set, and no write can set it, so the
+// not-configured code is the true answer and the one a client can carry on
+// from. The Terraform AWS provider reads these during refresh and takes the
+// code as "absent"; a 501 is an error that fails the plan instead.
+//
+// A sub-resource is absent from this table when AWS answers an unset read with
+// a populated 200 -- notification, logging, accelerate and requestPayment --
+// because synthesising that success would claim a control predastore does not
+// have. acl is absent for the same reason: every bucket has one, so there is no
+// not-configured code to return.
+var unsetControlCodes = map[string]string{
+	"cors":              "NoSuchCORSConfiguration",
+	"encryption":        "ServerSideEncryptionConfigurationNotFoundError",
+	"lifecycle":         "NoSuchLifecycleConfiguration",
+	"object-lock":       "ObjectLockConfigurationNotFoundError",
+	"ownershipControls": "OwnershipControlsNotFoundError",
+	"policy":            "NoSuchBucketPolicy",
+	"publicAccessBlock": "NoSuchPublicAccessBlockConfiguration",
+	"replication":       "ReplicationConfigurationNotFoundError",
+	"website":           "NoSuchWebsiteConfiguration",
+}
+
+// unservedSubResource answers a sub-resource no route serves, naming it. The
 // alternative is the fallback route for the method, which on an object path
 // writes, reads or deletes the object itself.
-func notImplemented(sub string) http.Handler {
+//
+// A read of an unset bucket control answers the code S3 answers for that;
+// everything else, including every write and every object sub-resource,
+// answers NotImplemented. This is the one place that answer is decided.
+//
+// The codes are bucket controls, so scope gates them: ?policy on an object is
+// not an unset bucket policy, it is a sub-resource S3 has no object form of.
+func unservedSubResource(sub, method string, scope s3api.Scope) http.Handler {
+	if method == http.MethodGet && scope == s3api.ScopeBucket {
+		if code, ok := unsetControlCodes[sub]; ok {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				handlers.WriteS3Error(w, r, http.StatusNotFound, code,
+					fmt.Sprintf("The %s configuration does not exist", sub))
+			})
+		}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		handlers.WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
 			fmt.Sprintf("The %s sub-resource is not implemented", sub))
