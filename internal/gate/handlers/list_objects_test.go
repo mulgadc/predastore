@@ -382,9 +382,9 @@ func TestListObjectsV1OmitsV2FieldsAndV2IsUnchanged(t *testing.T) {
 	assert.NotContains(t, v2Body, "<Marker>")
 }
 
-// The tempting fix for the sub-resources below is a whitelist: reject any query
-// parameter the listing does not recognise. The AWS SDKs append x-id to an
-// ordinary listing, and this proves it still lists rather than answering 501.
+// A sub-resource never reaches this handler — the route table answers it — but
+// the AWS SDKs do append x-id to an ordinary listing, so rejecting every query
+// parameter the listing does not recognise would break a working listing.
 func TestListObjectsIgnoresUnknownQueryParameters(t *testing.T) {
 	t.Parallel()
 
@@ -392,27 +392,4 @@ func TestListObjectsIgnoresUnknownQueryParameters(t *testing.T) {
 	result := f.list(t, url.Values{"x-id": {"ListObjectsV2"}})
 
 	assert.Equal(t, 2, result.KeyCount)
-}
-
-// Each sub-resource predastore does not implement answers the code S3 uses for
-// it, matched by name rather than by excluding what the handler recognises.
-// The cases are the dispatch table itself, so this cannot drift from what the
-// handler actually matches on.
-func TestListObjectsSubResourceRejections(t *testing.T) {
-	t.Parallel()
-
-	f := newListFixture(t, "a")
-
-	for _, sr := range subResourceRejections {
-		t.Run(sr.param, func(t *testing.T) {
-			t.Parallel()
-			rr := f.do(t, url.Values{sr.param: {""}})
-
-			assert.Equal(t, sr.status, rr.Code, "body: %s", rr.Body.String())
-
-			var s3err S3Error
-			require.NoError(t, xml.NewDecoder(rr.Body).Decode(&s3err))
-			assert.Equal(t, sr.code, s3err.Code)
-		})
-	}
 }
