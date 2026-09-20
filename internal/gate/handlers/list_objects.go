@@ -30,24 +30,6 @@ type listEntry struct {
 	hash []byte
 }
 
-// subResourceRejections maps the S3 bucket sub-resources predastore does not
-// implement to the code and status S3 answers each with. Matching is by exact
-// query parameter name, never by exclusion: the AWS SDKs append x-id to an
-// ordinary listing, and rejecting anything this handler does not recognise
-// would turn a working listing into a 501.
-var subResourceRejections = []struct {
-	param   string
-	status  int
-	code    string
-	message string
-}{
-	{"cors", http.StatusNotFound, "NoSuchCORSConfiguration", "The CORS configuration does not exist"},
-	{"lifecycle", http.StatusNotFound, "NoSuchLifecycleConfiguration", "The lifecycle configuration does not exist"},
-	{"encryption", http.StatusNotFound, "ServerSideEncryptionConfigurationNotFoundError", "The server side encryption configuration was not found"},
-	{"publicAccessBlock", http.StatusNotFound, "NoSuchPublicAccessBlockConfiguration", "The public access block configuration was not found"},
-	{"object-lock", http.StatusNotFound, "ObjectLockConfigurationNotFoundError", "Object Lock configuration does not exist for this bucket"},
-}
-
 // ListObjects serves GET /{bucket}, answering ListObjectsV2 when list-type=2
 // and ListObjects (v1) otherwise. Objects are listed by scanning their ARN
 // keys in global state.
@@ -61,24 +43,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 		bucket := resource.Name
 		query := r.URL.Query()
 
-		// Return proper errors for unsupported bucket sub-resource operations
-		// that Terraform and other tools may call.
 		slog.DebugContext(ctx, "listObjects called", "bucket", bucket)
-		if query.Has("policy") {
-			slog.DebugContext(ctx, "returning NoSuchBucketPolicy for ?policy request", "bucket", bucket)
-			WriteS3Error(w, r, http.StatusNotFound, "NoSuchBucketPolicy", "The bucket policy does not exist")
-			return
-		}
-		if query.Has("acl") {
-			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented", "ACL is not implemented")
-			return
-		}
-		for _, sr := range subResourceRejections {
-			if query.Has(sr.param) {
-				WriteS3Error(w, r, sr.status, sr.code, sr.message)
-				return
-			}
-		}
 
 		if bucket == "" {
 			HandleError(w, r, model.ErrNoSuchBucketError.WithResource(bucket))
