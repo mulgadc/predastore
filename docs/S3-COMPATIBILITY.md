@@ -1,6 +1,6 @@
 # S3 compatibility
 
-Measured, not asserted. The numbers here come from `ceph/s3-tests` — the suite Ceph RGW, MinIO and Garage are all validated against — run against a single-node predastore and recorded in `scripts/s3-tests-baseline.txt`.
+Measured, not asserted. The numbers here come from `ceph/s3-tests` — the suite Ceph RGW, MinIO and Garage are all validated against — run against a single-node predastore and recorded in `scripts/s3-tests-baseline.txt`. The suite is pinned by `S3TESTS_REF` in `scripts/s3-tests.sh`.
 
 Reproduce it with:
 
@@ -15,103 +15,95 @@ make s3-tests
 
 | | count |
 | --- | --- |
-| pass | 181 |
-| fail | 213 |
-| skip | 492 |
+| pass | 202 |
+| fail | 189 |
+| skip | 495 |
 | error | 0 |
 
 `skip` is two different things, and it matters which:
 
-- **The suite's own skips** (6 of the 492) — cases ceph/s3-tests excludes on any implementation, decided by the suite itself before predastore is ever reached.
-- **Predastore's deliberate skips** (486 of the 492, listed in `scripts/s3-tests-skips.txt`) — a feature predastore has decided not to offer for now: object lock, POST uploads, server-side encryption and encrypted copy, bucket logging, ACLs, bucket policy, lifecycle, versioning, cross-account bucket access, CORS and public access block. These are deselected before the run rather than executed and failed, which is the difference between this run taking about seven minutes and thirteen. A case only earns a line there when nobody is actively fixing it — see the header of that file for the exact bar, and `pytest_deselected` in `scripts/s3tests/predastore_cleanup.py` for how a deselected case still lands in the manifest as SKIP instead of silently vanishing.
+- **The suite's own skips** (6 of the 495) — the `cloud_restore` cases, which ceph/s3-tests excludes on any implementation before predastore is ever reached.
+- **Predastore's deliberate skips** (489 of the 495, selected by `scripts/s3-tests-skips.txt`) — object lock, POST uploads, server-side encryption and encrypted copy, bucket logging, ACLs, bucket policy, lifecycle, part of versioning, cross-account bucket access, CORS and public access block. These are deselected before the run rather than executed and failed. A case only earns a line there when nobody is actively fixing it — see the header of that file for the exact bar, and `pytest_deselected` in `scripts/s3tests/predastore_cleanup.py` for how a deselected case still lands in the manifest as SKIP instead of silently vanishing.
 
-A passing case is never one of the 486, whatever family's marker or node id would otherwise catch it. `pytest_collection_modifyitems` in `predastore_cleanup.py` computes the skip set from the file, then removes anything the committed baseline records as PASS before it deselects the rest, and prints the exception to stderr. The skip list exists to stop re-running known gaps, not to stop measuring what works — a marker written for one family can catch a case that belongs to a different, working one, as `encryption` did here with plain TLS-transfer tests. Fourteen cases are held back by this guard right now: `test_encrypted_transfer_13b/1MB/1b/1kb` and seven `test_sse_kms_*` cases, caught by the `encryption`/`sse_s3` markers meant for actual server-side encryption, and `test_object_lock_changing_mode_from_governance_with_bypass`, `test_object_lock_get_legal_hold` and `test_object_lock_put_legal_hold`, listed by node id alongside object lock cases that do fail. All fourteen pass and stay measured.
+A passing case is never one of the 489, whatever family's marker or node id would otherwise catch it. `pytest_collection_modifyitems` in `predastore_cleanup.py` computes the skip set from the file, then removes anything the committed baseline records as PASS before it deselects the rest, and prints the exception to stderr. The skip list exists to stop re-running known gaps, not to stop measuring what works. Eleven cases are held back by this guard: `test_encrypted_transfer_13b/1MB/1b/1kb` and seven `test_sse_kms_*` cases, all caught by the `encryption` marker, which ceph/s3-tests also puts on plain TLS-transfer cases. All eleven pass and stay measured.
 
-A skip is not a pass. It means the same thing it always did for the suite's own skips: predastore has not been measured against that case in this run, on purpose. `docs/development/bugs/` and `docs/development/improvements/` carry the beads for anything in progress; a deliberate skip here means no bead is open yet.
+A skip is not a pass. It means predastore has not been measured against that case in this run, on purpose.
 
-The 213 remaining fails are not features predastore has not started — those are now skipped — they are operations predastore attempts and gets wrong, or is actively being fixed: CopyObject and multipart copy, ETag, `ListObjects` v1 `Marker`, user metadata, sub-resource routing, and the request-validation cases in `test_headers.py`. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
+The 189 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, user metadata and stored response headers, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
 
 ## The gaps that break real clients
 
 | Operation | State | What happens |
 | --- | --- | --- |
-| ETag | **Wrong value** | Not the body MD5. `PUT` of `hello` returns `678f45d4…`, not `5d41402a…`. It is also unquoted, where S3 quotes it, and `ListObjectsV2` returns it as the empty string while `HEAD` and `GET` return a value. rclone rejects every upload as corrupt on this. |
-| `ListObjects` (v1) | **Partial** | `Marker` is ignored. A v1 listing with `Marker=baz&MaxKeys=2` returns the first two keys again rather than the ones after `baz`, so a v1 client paging a prefix loops. v2's `continuation-token` and `start-after` do work. |
-| `ListObjectVersions` | **Answers the wrong document** | `GET /{bucket}?versions` is not routed, so it falls through and serves a plain `ListBucketResult`. boto3 parses that as zero versions and reports success. A client asking what versions exist is told "none". |
-| User metadata | **Dropped** | `x-amz-meta-*` sent on `PutObject` does not come back on `HeadObject`. |
-| `POST` object | **Missing** | Browser-form uploads. All 36 cases are a deliberate skip below rather than a FAIL — no bead is open for this one yet. |
+| Conditional requests | **Ignored** | `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since` are not read on `PutObject`, `GetObject`, `DeleteObject` or `DeleteObjects`. A `PutObject` with `If-None-Match: *` over an existing key overwrites it and answers 200, so a client using it as a create-only lock loses the race silently. `CopyObject` and `UploadPartCopy` refuse the `x-amz-copy-source-if-*` headers with `NotImplemented` rather than ignoring them. `mulga-7oevb` covers `PutObject`. |
+| User metadata | **Dropped** | `x-amz-meta-*` sent on `PutObject` does not come back on `HeadObject` or `GetObject`, and `CopyObject` has none to retain or replace. |
+| `Content-Type` and other stored headers | **Dropped** | `GetObject` and `HeadObject` always answer `Content-Type: application/octet-stream`, whatever the upload sent. `Cache-Control` and `Expires` are not stored either. A browser or CDN served from predastore gets every object as a download. |
+| Object tagging | **Refused** | `PutObjectTagging`, `GetObjectTagging` and `DeleteObjectTagging` answer `NotImplemented`, and `x-amz-tagging` on `PutObject` is not applied. Bucket tagging is served. |
+| Object ACLs | **Refused** | `GetObjectAcl` and `PutObjectAcl` answer `NotImplemented`. |
+| `POST` object | **Missing** | Browser-form uploads. All 36 cases are a deliberate skip below rather than a FAIL. |
 
-### The pattern behind several of these
+### How an unserved sub-resource answers
 
-An unrecognised sub-resource query string is not rejected — the request falls through to the plain bucket or object handler and answers 200 with the wrong document. `?versions` above is the clearest case. The same shape shows up on read paths for configuration that does not exist:
+`s3api/routes.go` declares every operation the gate serves, and a route that names no sub-resource does not select a request carrying one. A sub-resource no route serves is refused by name rather than falling through to the plain bucket or object handler, so a client is never answered with the wrong document or has its object overwritten by a tagging or retention request.
 
-| Request | Predastore | S3 |
-| --- | --- | --- |
-| `GetBucketCors` on a bucket with no CORS | 200, empty | `NoSuchCORSConfiguration` |
-| `GetBucketLifecycleConfiguration`, none set | 200, empty | `NoSuchLifecycleConfiguration` |
-| `GetBucketEncryption`, none set | 200, empty | `ServerSideEncryptionConfigurationNotFoundError` |
-| `GetBucketTagging`, none set | 200, empty | `NoSuchTagSet` |
-| `GetPublicAccessBlock`, none set | 200, empty | `NoSuchPublicAccessBlockConfiguration` |
-| `GetObjectLockConfiguration`, none set | 200, empty | `ObjectLockConfigurationNotFoundError` |
-| `PutBucketVersioning` | `BucketAlreadyOwnedByYou` | 200 |
-| `PutObjectAcl` | 200, no effect | 200, ACL applied |
-| `GetObjectAcl` | 500 | 200 |
+What the refusal says depends on the request:
 
-A client cannot tell "predastore does not do this" from "this bucket has none of it configured". That is worse for the caller than a clean `NotImplemented`, which `GetBucketAcl` and `PutBucketPolicy` do return.
+| Request | Predastore |
+| --- | --- |
+| Read of an unconfigured bucket control that S3 has a "not configured" error for: `cors`, `encryption`, `lifecycle`, `object-lock`, `ownershipControls`, `policy`, `publicAccessBlock`, `replication`, `website` | 404 with S3's code for it, e.g. `NoSuchCORSConfiguration`, `ObjectLockConfigurationNotFoundError` (`internal/gate/routes.go`) |
+| Read of a bucket control S3 answers with a populated 200 when unset: `acl`, `notification`, `logging`, `accelerate`, `requestPayment` | `NotImplemented` |
+| Any write to an unserved control | `NotImplemented` |
+| Any unserved object sub-resource: `acl`, `tagging`, `retention`, `legal-hold`, `attributes`, `torrent`, … | `NotImplemented` |
+
+The not-configured code is the true answer, since nothing is configured and nothing can configure it, and it is the one a client can carry on from: the Terraform AWS provider reads these during refresh and treats the code as absent. A populated 200 is never synthesised, because that would claim a control predastore does not have.
+
+Served sub-resources: bucket `tagging`, `versioning`, `versions`, `location`, `uploads` and `delete`, and the multipart `uploads`/`uploadId`/`partNumber` object operations.
 
 ## By area
 
-Counts from the committed baseline, for the areas still running. `pass`/`fail`
-only — the suite's own skips are left out of the rows. An area predastore has
-deliberately not implemented is not here; see the next table.
+Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 202/189 above. An area predastore has deliberately not implemented is not here; see the next table.
 
-| Area | Pass | Fail | Note |
-| --- | --- | --- | --- |
-| ListObjectsV2 | 34 | 6 | The best-supported listing path. |
-| ListObjects (v1) | 28 | 16 | `Marker` ignored. |
-| CreateBucket / naming rules | 23 | 17 | |
-| Object create / write | 11 | 25 | Metadata and conditional headers. |
-| Multipart upload | 6 | 6 | |
-| Ranged GET | 4 | 1 | |
-| DeleteObjects | 3 | 6 | Implemented. What is left is versioned deletes, and the v1 key-limit case, which pages the bucket with `Marker`. |
-| CopyObject / copy part | 4 | 23 | Excludes encrypted copy, which is a deliberate skip below. |
+| Area | Pass | Fail | Selector (test name) | Note |
+| --- | --- | --- | --- | --- |
+| TLS transfer | 11 | 0 | `test_encrypted_transfer_*`, `test_sse_kms_*` | Held by the skip guard; plain transfers over TLS, not server-side encryption. |
+| Conditional requests | 9 | 38 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | Every pass is a case where ignoring the header gives the right answer anyway. |
+| Checksums and object attributes | 0 | 16 | contains `checksum`, `cksum` or `object_attributes` | |
+| Object and bucket tagging | 1 | 11 | ends `_tags`, or contains `tagging` | The pass is bucket tagging. |
+| CopyObject / UploadPartCopy | 13 | 12 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Metadata, invalid ranges, versioned sources and cross-owner copies fail. |
+| DeleteObjects | 7 | 1 | contains `multi_object` | The fail is the concurrent versioned delete. |
+| Multipart upload | 10 | 11 | contains `multipart` | `GetObject` by `partNumber`, empty and single-small uploads, resent parts. |
+| ListObjectsV2 | 36 | 6 | `test_bucket_listv2_*`, `test_bucketv2_*`, `test_basic_key_count` | |
+| ListObjects (v1) | 37 | 7 | `test_bucket_list_*` | Both versions fail `encoding-type=url`, unordered keys and anonymous listing. |
+| Versioning | 4 | 0 | `test_versioned_*`, `test_versioning_*` | Only the cases still selected; the rest are in the next table. |
+| Bucket create, delete, head | 33 | 31 | `test_bucket_*`, `test_create_bucket_*`, `test_buckets_*`, `test_list_buckets*`, `test_put_bucket_ownership_*`, `test_expected_bucket_owner` | Request validation (12, most of them Signature V2), ownership controls (7), and `ListBuckets` pagination and anonymous access. |
+| Object write and read | 27 | 34 | `test_object_{create,write,set_get,metadata,head,read,delete,put,anon,content}*`, `test_100_continue*`, `test_atomic_*` | Request validation, user metadata and stored headers. |
+| Raw and presigned HTTP | 8 | 11 | `test_object_raw_*`, `test_object_presigned_*`, `test_object_requestid*` | Anonymous reads, `X-Amz-Expires` bounds and response-header overrides. |
+| Ranged GET | 5 | 1 | `test_ranged_*` | |
+| Everything else | 1 | 10 | | Object ACLs, object lock, bucket policy, usage, torrent and public access block. |
+
+`test_get_undefined_public_block` is in the last row and still fails, although a `GetPublicAccessBlock` on a bucket with none set answers `NoSuchPublicAccessBlockConfiguration`. Why has not been established.
 
 ## Deliberate skips
 
-`scripts/s3-tests-skips.txt` names cases across the areas below, either by
-pytest marker or by node id where ceph/s3-tests has no marker for the
-feature. Each is a feature predastore has decided not to offer for now, not a
-case the suite itself would skip. The counts below are after the PASS guard
-described above removes anything actually passing — Object lock and SSE are
-each three and eleven lower than what the file's markers and node ids alone
-would catch, for the fourteen cases named above. The areas are not disjoint
-either — a bucket-policy case that also exercises SSE, or a lifecycle case
-that also exercises versioning's delete marker, is counted in both rows it
-belongs to — so the rows sum to 493 while the file skips 486 distinct cases.
+`scripts/s3-tests-skips.txt` names cases across the areas below, either by pytest marker or by node id where ceph/s3-tests has no marker for the feature. The counts are after the PASS guard described above removes anything actually passing, which is why SSE is eleven lower than its markers alone would catch. The areas are not disjoint — a bucket-policy case that also exercises SSE, or a lifecycle case that also exercises versioning's delete marker, is counted in both rows it belongs to — so the rows sum to 496 while the file skips 489 distinct cases.
 
 | Area | Cases | Selector |
 | --- | --- | --- |
 | SSE (S3, KMS, C) and encrypted copy | 136 | `marker:encryption`, `marker:sse_s3`, `marker:bucket_encryption` |
 | Bucket logging | 113 | `marker:bucket_logging` |
-| Bucket and object ACLs | 35 | node ids |
-| Bucket policy | 36 | `marker:bucket_policy` + 5 `GetBucketPolicyStatus` node ids |
-| Object lock | 34 | node ids |
 | Lifecycle | 48 | `marker:lifecycle` (a superset of `lifecycle_expiration`/`lifecycle_transition`) |
-| Versioning | 20 | node ids + `marker:delete_marker` |
+| Object lock | 37 | node ids |
+| Bucket policy | 36 | `marker:bucket_policy` + 5 `GetBucketPolicyStatus` node ids |
 | POST object uploads | 36 | node ids |
+| Bucket and object ACLs | 35 | node ids |
+| Versioning | 20 | `marker:delete_marker` + 16 node ids |
 | CORS | 14 | node ids |
 | Cross-account bucket access | 12 | node ids |
 | Public access block | 9 | node ids |
 
-Two cases stay a FAIL on purpose despite matching one of these areas by name:
-`test_object_lock_get_obj_lock_invalid_bucket` and
-`test_get_undefined_public_block` only check that the gate answers a proper
-"not configured" error, which is the sub-resource-routing gap
-(`mulga-nv5p5`), not the underlying feature. They should flip to PASS when
-that bead lands rather than staying hidden behind a skip. See the comments
-above each block in `scripts/s3-tests-skips.txt` for the versioning and
-CopyObject/DeleteObjects cases held back from their name-matching family for
-the same kind of reason.
+Versioning is the exception to the bar above: predastore serves it, and the file still deselects its suspended-bucket, null-version, delete-marker, versioned-ACL and version-id-on-upload cases as not implemented. Those 20 are unmeasured, not known to fail.
+
+Two cases stay selected on purpose despite matching one of these areas by name: `test_object_lock_get_obj_lock_invalid_bucket` and `test_get_undefined_public_block` only check that the gate answers the "not configured" error, which is sub-resource routing rather than the underlying feature. The first passes; the second is the open question above. See the comments above each block in `scripts/s3-tests-skips.txt` for the other cases held back from their name-matching family.
 
 ## What is not measured
 
@@ -127,8 +119,6 @@ When a fix lands, re-record in the same change:
 make s3-tests-baseline
 ```
 
-## Caveat: the run needs a cleanup fallback
+## The cleanup replacement
 
-s3-tests empties a bucket with `ListObjectVersions` and `DeleteObjects`. `DeleteObjects` works now, but `ListObjectVersions` still answers the wrong document, so nothing is deleted, every `DeleteBucket` answers `BucketNotEmpty`, and that failure lands in the *setup* of the next case. Unpatched, the run is 884 errors that say nothing about the 884 operations they were meant to measure.
-
-`scripts/s3tests/predastore_cleanup.py` replaces the suite's teardown helper with per-key deletes. No test body, assertion or fixture value changes, and cleanup is not a measured behaviour. It stays until `ListObjectVersions` answers the right document, which is the half of the problem the batch delete did not fix.
+`scripts/s3tests/predastore_cleanup.py` replaces the suite's bucket-teardown helper. It empties a bucket the same way the suite does, with `ListObjectVersions` and `DeleteObjects`, and then also aborts any multipart upload left incomplete. An incomplete upload holds parts under no key, so no listing reports it, the suite's own helper leaves the bucket undeletable, and the `BucketNotEmpty` lands in the setup of the next case as an error that says nothing about the operation it was meant to measure. No test body, assertion or fixture value changes, and cleanup is not a measured behaviour.
