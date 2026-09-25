@@ -33,6 +33,7 @@ type ListObjectsV2 struct {
 	Name                  string                    `xml:"Name"`
 	Prefix                string                    `xml:"Prefix"`
 	Delimiter             string                    `xml:"Delimiter,omitempty"`
+	EncodingType          string                    `xml:"EncodingType,omitempty"`
 	KeyCount              int                       `xml:"KeyCount"`
 	MaxKeys               int                       `xml:"MaxKeys"`
 	IsTruncated           bool                      `xml:"IsTruncated"`
@@ -54,6 +55,7 @@ type ListObjectsV1 struct {
 	Marker         string                    `xml:"Marker"`
 	NextMarker     string                    `xml:"NextMarker,omitempty"`
 	Delimiter      string                    `xml:"Delimiter,omitempty"`
+	EncodingType   string                    `xml:"EncodingType,omitempty"`
 	MaxKeys        int                       `xml:"MaxKeys"`
 	IsTruncated    bool                      `xml:"IsTruncated"`
 	Contents       *[]ListObjectsV2_Contents `xml:"Contents"`

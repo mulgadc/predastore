@@ -146,7 +146,7 @@ PASS|s3tests/functional/test_s3.py::test_bucket_list_delimiter_unreadable
 PASS|s3tests/functional/test_s3.py::test_bucket_list_delimiter_whitespace
 PASS|s3tests/functional/test_s3.py::test_bucket_list_distinct
 PASS|s3tests/functional/test_s3.py::test_bucket_list_empty
-FAIL|s3tests/functional/test_s3.py::test_bucket_list_encoding_basic
+PASS|s3tests/functional/test_s3.py::test_bucket_list_encoding_basic
 PASS|s3tests/functional/test_s3.py::test_bucket_list_long_name
 PASS|s3tests/functional/test_s3.py::test_bucket_list_many
 PASS|s3tests/functional/test_s3.py::test_bucket_list_marker_after_list
@@ -190,7 +190,7 @@ FAIL|s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_prefix_ends_wit
 PASS|s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_prefix_underscore
 PASS|s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_unreadable
 PASS|s3tests/functional/test_s3.py::test_bucket_listv2_delimiter_whitespace
-FAIL|s3tests/functional/test_s3.py::test_bucket_listv2_encoding_basic
+PASS|s3tests/functional/test_s3.py::test_bucket_listv2_encoding_basic
 PASS|s3tests/functional/test_s3.py::test_bucket_listv2_fetchowner_defaultempty
 PASS|s3tests/functional/test_s3.py::test_bucket_listv2_fetchowner_empty
 FAIL|s3tests/functional/test_s3.py::test_bucket_listv2_fetchowner_notempty
@@ -595,7 +595,7 @@ FAIL|s3tests/functional/test_s3.py::test_multipart_copy_improper_range
 FAIL|s3tests/functional/test_s3.py::test_multipart_copy_invalid_range
 PASS|s3tests/functional/test_s3.py::test_multipart_copy_multiple_sizes
 PASS|s3tests/functional/test_s3.py::test_multipart_copy_small
-FAIL|s3tests/functional/test_s3.py::test_multipart_copy_special_names
+PASS|s3tests/functional/test_s3.py::test_multipart_copy_special_names
 FAIL|s3tests/functional/test_s3.py::test_multipart_copy_versioned
 PASS|s3tests/functional/test_s3.py::test_multipart_copy_without_range
 FAIL|s3tests/functional/test_s3.py::test_multipart_get_part
@@ -658,7 +658,7 @@ PASS|s3tests/functional/test_s3.py::test_object_copy_to_itself
 PASS|s3tests/functional/test_s3.py::test_object_copy_to_itself_with_metadata
 PASS|s3tests/functional/test_s3.py::test_object_copy_verify_contenttype
 PASS|s3tests/functional/test_s3.py::test_object_copy_versioned_bucket
-FAIL|s3tests/functional/test_s3.py::test_object_copy_versioned_url_encoding
+PASS|s3tests/functional/test_s3.py::test_object_copy_versioned_url_encoding
 PASS|s3tests/functional/test_s3.py::test_object_copy_versioning_multipart_upload
 PASS|s3tests/functional/test_s3.py::test_object_copy_zero_size
 FAIL|s3tests/functional/test_s3.py::test_object_delete_key_bucket_gone

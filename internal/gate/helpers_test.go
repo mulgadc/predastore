@@ -13,7 +13,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/auth"
@@ -27,7 +26,7 @@ import (
 // chi, because the resolvers read the URL parameters a match produces.
 func resolveRouter(next http.Handler, mws ...func(http.Handler) http.Handler) http.Handler {
 	r := chi.NewRouter()
-	r.Use(middleware.StripSlashes)
+	r.Use(routeDecodedPath)
 
 	r.Group(func(r chi.Router) {
 		r.Use(mws...)

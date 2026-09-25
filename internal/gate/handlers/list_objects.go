@@ -13,6 +13,9 @@ import (
 	"github.com/mulgadc/predastore/internal/meta"
 )
 
+// encodingTypeURL is the one encoding-type S3 defines for a listing.
+const encodingTypeURL = "url"
+
 // defaultMaxKeys is the page size S3 reports when the client asks for none, and
 // the ceiling it clamps a larger request down to.
 const defaultMaxKeys = 1000
@@ -55,6 +58,21 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 		}
 
 		listV2 := query.Get("list-type") == "2"
+
+		// encoding-type=url is how a client asks for keys it can carry through
+		// XML whatever bytes they hold. Without it every field is the raw key.
+		encodingType := query.Get("encoding-type")
+		if encodingType != "" && encodingType != encodingTypeURL {
+			WriteS3Error(w, r, http.StatusBadRequest, string(model.ErrInvalidArgument),
+				"Invalid Encoding Method specified in Request")
+			return
+		}
+		encode := func(s string) string {
+			if encodingType == encodingTypeURL {
+				return urlEncodeKey(s)
+			}
+			return s
+		}
 
 		prefix := query.Get("prefix")
 		delimiter := query.Get("delimiter")
@@ -119,7 +137,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 		prefixes := make([]ListObjectsV2_Dir, 0)
 		for _, entry := range entries {
 			if entry.dir {
-				prefixes = append(prefixes, ListObjectsV2_Dir{Prefix: entry.sortKey})
+				prefixes = append(prefixes, ListObjectsV2_Dir{Prefix: encode(entry.sortKey)})
 				continue
 			}
 
@@ -140,7 +158,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			}
 
 			contents = append(contents, ListObjectsV2_Contents{
-				Key:          entry.sortKey,
+				Key:          encode(entry.sortKey),
 				LastModified: modified,
 				ETag:         etag,
 				Size:         objectSize,
@@ -149,11 +167,14 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 		}
 
 		if !listV2 {
+			// S3 leaves v1's top-level Prefix raw under encoding-type=url, and
+			// botocore decodes every v1 field but that one to match.
 			result := ListObjectsV1{
 				Name:           bucket,
 				Prefix:         prefix,
-				Marker:         marker,
-				Delimiter:      delimiter,
+				Marker:         encode(marker),
+				Delimiter:      encode(delimiter),
+				EncodingType:   encodingType,
 				MaxKeys:        maxKeys,
 				IsTruncated:    truncated,
 				Contents:       &contents,
@@ -162,7 +183,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			// NextMarker is only meaningful with a delimiter: without one, a
 			// client resumes from the last key in Contents instead.
 			if truncated && delimiter != "" {
-				result.NextMarker = entries[len(entries)-1].sortKey
+				result.NextMarker = encode(entries[len(entries)-1].sortKey)
 			}
 			if err := writeXML(w, http.StatusOK, result); err != nil {
 				slog.DebugContext(ctx, "failed to write XML response", "error", err)
@@ -172,13 +193,14 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 
 		result := ListObjectsV2{
 			Name:              bucket,
-			Prefix:            prefix,
-			Delimiter:         delimiter,
+			Prefix:            encode(prefix),
+			Delimiter:         encode(delimiter),
+			EncodingType:      encodingType,
 			KeyCount:          len(contents) + len(prefixes),
 			MaxKeys:           maxKeys,
 			IsTruncated:       truncated,
 			ContinuationToken: token,
-			StartAfter:        startAfter,
+			StartAfter:        encode(startAfter),
 			Contents:          &contents,
 			CommonPrefixes:    &prefixes,
 		}
@@ -236,4 +258,26 @@ func parseMaxKeys(raw string) (int, bool) {
 		return 0, false
 	}
 	return min(n, defaultMaxKeys), true
+}
+
+// urlEncodeKey is the form encoding-type=url returns a key in: every byte but
+// "/" and the RFC 3986 unreserved set is percent-encoded, so a space is %20 and
+// a plus is %2B, which a path decoder and a form decoder both read back alike.
+func urlEncodeKey(key string) string {
+	const hex = "0123456789ABCDEF"
+	var b strings.Builder
+	b.Grow(len(key))
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		switch {
+		case 'a' <= c && c <= 'z', 'A' <= c && c <= 'Z', '0' <= c && c <= '9',
+			c == '-', c == '_', c == '.', c == '~', c == '/':
+			b.WriteByte(c)
+		default:
+			b.WriteByte('%')
+			b.WriteByte(hex[c>>4])
+			b.WriteByte(hex[c&0x0f])
+		}
+	}
+	return b.String()
 }
