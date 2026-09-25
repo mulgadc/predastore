@@ -44,6 +44,12 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 		phase = recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseBucketCheck, phase)
 
+		attrs, err := attributesFromRequest(r.Header)
+		if err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		// Which shard set this write lands in is settled before the first byte
 		// moves, because the shards are addressed by the hash. On a versioned
 		// bucket that is a hash of its own, so the previous version stays live
@@ -95,6 +101,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// The record must already carry the digest here: after the commit
 		// point below, it is what every read will demand.
 		place.Digest = digest.Sum(nil)
+		place.Attributes = attrs
 
 		record, err := EncodePlacement(place)
 		if err != nil {

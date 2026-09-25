@@ -147,7 +147,7 @@ func TestPlacementRecordRejectsMalformedInput(t *testing.T) {
 	truncatedIDs := append([]byte(nil), good[:nodeIDStart+1]...)
 
 	unknownVersion := append([]byte(nil), good...)
-	unknownVersion[1] = 0x04
+	unknownVersion[1] = 0x05
 
 	malformedUvarint := append([]byte(nil), good[:nodeIDStart]...)
 	malformedUvarint = append(malformedUvarint, 0x80) // continuation bit with nothing after it
@@ -221,9 +221,9 @@ func TestPlacementRecordHeaderLayout(t *testing.T) {
 		t.Fatalf("EncodePlacement() error = %v", err)
 	}
 
-	if encoded[0] != placementMagic || encoded[1] != placementVersion {
+	if encoded[0] != placementMagic || encoded[1] != placementVersionV3 {
 		t.Errorf("header = %x %x, want magic %x version %x",
-			encoded[0], encoded[1], placementMagic, placementVersion)
+			encoded[0], encoded[1], placementMagic, placementVersionV3)
 	}
 	if encoded[2] != 2 {
 		t.Errorf("k = %d, want 2", encoded[2])

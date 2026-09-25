@@ -65,14 +65,20 @@ func getUploadMetadata(ctx context.Context, mc MetaClient, uploadID string) (*mo
 // the request addressed, so one upload's parts can never be committed under
 // another object's name.
 func requireUpload(ctx context.Context, mc MetaClient, bucket, key, uploadID string) error {
+	_, err := uploadFor(ctx, mc, bucket, key, uploadID)
+	return err
+}
+
+// uploadFor is requireUpload for a caller that needs the upload itself.
+func uploadFor(ctx context.Context, mc MetaClient, bucket, key, uploadID string) (*model.UploadMetadata, error) {
 	metadata, err := getUploadMetadata(ctx, mc, uploadID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if metadata.Bucket != bucket || metadata.Key != key {
-		return model.NewS3Error(model.ErrInvalidPart, "Bucket or key does not match upload", 400)
+		return nil, model.NewS3Error(model.ErrInvalidPart, "Bucket or key does not match upload", 400)
 	}
-	return nil
+	return metadata, nil
 }
 
 // storePart writes one part of an upload and records it. A part is stored as an

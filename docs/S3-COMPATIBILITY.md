@@ -15,8 +15,8 @@ make s3-tests
 
 | | count |
 | --- | --- |
-| pass | 202 |
-| fail | 189 |
+| pass | 211 |
+| fail | 180 |
 | skip | 495 |
 | error | 0 |
 
@@ -29,15 +29,14 @@ A passing case is never one of the 489, whatever family's marker or node id woul
 
 A skip is not a pass. It means predastore has not been measured against that case in this run, on purpose.
 
-The 189 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, user metadata and stored response headers, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
+The 180 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, stored response headers other than `Content-Type`, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
 
 ## The gaps that break real clients
 
 | Operation | State | What happens |
 | --- | --- | --- |
 | Conditional requests | **Ignored** | `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since` are not read on `PutObject`, `GetObject`, `DeleteObject` or `DeleteObjects`. A `PutObject` with `If-None-Match: *` over an existing key overwrites it and answers 200, so a client using it as a create-only lock loses the race silently. `CopyObject` and `UploadPartCopy` refuse the `x-amz-copy-source-if-*` headers with `NotImplemented` rather than ignoring them. `mulga-7oevb` covers `PutObject`. |
-| User metadata | **Dropped** | `x-amz-meta-*` sent on `PutObject` does not come back on `HeadObject` or `GetObject`, and `CopyObject` has none to retain or replace. |
-| `Content-Type` and other stored headers | **Dropped** | `GetObject` and `HeadObject` always answer `Content-Type: application/octet-stream`, whatever the upload sent. `Cache-Control` and `Expires` are not stored either. A browser or CDN served from predastore gets every object as a download. |
+| Stored headers other than `Content-Type` | **Dropped** | `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language` and `Expires` are not stored, so a CDN in front of predastore gets no caching directive from the object. `Content-Type` and `x-amz-meta-*` are stored and served back, and survive multipart upload and `CopyObject`. |
 | Object tagging | **Refused** | `PutObjectTagging`, `GetObjectTagging` and `DeleteObjectTagging` answer `NotImplemented`, and `x-amz-tagging` on `PutObject` is not applied. Bucket tagging is served. |
 | Object ACLs | **Refused** | `GetObjectAcl` and `PutObjectAcl` answer `NotImplemented`. |
 | `POST` object | **Missing** | Browser-form uploads. All 36 cases are a deliberate skip below rather than a FAIL. |
@@ -61,7 +60,7 @@ Served sub-resources: bucket `tagging`, `versioning`, `versions`, `location`, `u
 
 ## By area
 
-Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 202/189 above. An area predastore has deliberately not implemented is not here; see the next table.
+Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 211/180 above. An area predastore has deliberately not implemented is not here; see the next table.
 
 | Area | Pass | Fail | Selector (test name) | Note |
 | --- | --- | --- | --- | --- |
@@ -69,14 +68,14 @@ Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is
 | Conditional requests | 9 | 38 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | Every pass is a case where ignoring the header gives the right answer anyway. |
 | Checksums and object attributes | 0 | 16 | contains `checksum`, `cksum` or `object_attributes` | |
 | Object and bucket tagging | 1 | 11 | ends `_tags`, or contains `tagging` | The pass is bucket tagging. |
-| CopyObject / UploadPartCopy | 13 | 12 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Metadata, invalid ranges, versioned sources and cross-owner copies fail. |
+| CopyObject / UploadPartCopy | 18 | 7 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Invalid ranges, versioned sources and cross-owner copies fail. |
 | DeleteObjects | 7 | 1 | contains `multi_object` | The fail is the concurrent versioned delete. |
-| Multipart upload | 10 | 11 | contains `multipart` | `GetObject` by `partNumber`, empty and single-small uploads, resent parts. |
+| Multipart upload | 11 | 10 | contains `multipart` | `GetObject` by `partNumber`, empty and single-small uploads, completing an upload twice. |
 | ListObjectsV2 | 36 | 6 | `test_bucket_listv2_*`, `test_bucketv2_*`, `test_basic_key_count` | |
 | ListObjects (v1) | 37 | 7 | `test_bucket_list_*` | Both versions fail `encoding-type=url`, unordered keys and anonymous listing. |
 | Versioning | 4 | 0 | `test_versioned_*`, `test_versioning_*` | Only the cases still selected; the rest are in the next table. |
 | Bucket create, delete, head | 33 | 31 | `test_bucket_*`, `test_create_bucket_*`, `test_buckets_*`, `test_list_buckets*`, `test_put_bucket_ownership_*`, `test_expected_bucket_owner` | Request validation (12, most of them Signature V2), ownership controls (7), and `ListBuckets` pagination and anonymous access. |
-| Object write and read | 27 | 34 | `test_object_{create,write,set_get,metadata,head,read,delete,put,anon,content}*`, `test_100_continue*`, `test_atomic_*` | Request validation, user metadata and stored headers. |
+| Object write and read | 30 | 31 | `test_object_{create,write,set_get,metadata,head,read,delete,put,anon,content}*`, `test_100_continue*`, `test_atomic_*` | Request validation, stored headers other than `Content-Type`, and non-ASCII metadata, which S3 itself returns RFC 2047 encoded. |
 | Raw and presigned HTTP | 8 | 11 | `test_object_raw_*`, `test_object_presigned_*`, `test_object_requestid*` | Anonymous reads, `X-Amz-Expires` bounds and response-header overrides. |
 | Ranged GET | 5 | 1 | `test_ranged_*` | |
 | Everything else | 1 | 10 | | Object ACLs, object lock, bucket policy, usage, torrent and public access block. |

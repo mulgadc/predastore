@@ -54,12 +54,26 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 				return
 			}
 		}
-		// A copy to itself changes nothing unless the caller is explicitly
-		// replacing metadata, storage class or similar, none of which this
-		// store tracks per object. Real S3 refuses this rather than silently
-		// answering 200 for a no-op.
-		if srcBucket == destBucket && srcKey == destKey &&
-			!strings.EqualFold(r.Header.Get("X-Amz-Metadata-Directive"), "REPLACE") {
+		// COPY, the default, keeps the source's attributes; REPLACE takes the
+		// request's. Anything else is refused rather than read as either.
+		directive := r.Header.Get("X-Amz-Metadata-Directive")
+		replace := strings.EqualFold(directive, "REPLACE")
+		if directive != "" && !replace && !strings.EqualFold(directive, "COPY") {
+			HandleError(w, r, model.NewS3Error(model.ErrInvalidArgument, "Unknown metadata directive.", 400))
+			return
+		}
+		var attrs ObjectAttributes
+		if replace {
+			if attrs, err = attributesFromRequest(r.Header); err != nil {
+				HandleError(w, r, err)
+				return
+			}
+		}
+
+		// A copy to itself changes nothing unless the caller is replacing its
+		// metadata. Real S3 refuses this rather than silently answering 200
+		// for a no-op.
+		if srcBucket == destBucket && srcKey == destKey && !replace {
 			WriteS3Error(w, r, http.StatusBadRequest, "InvalidRequest",
 				"This copy request is illegal because it is trying to copy an object to itself "+
 					"without changing the object's metadata, storage class, website redirect "+
@@ -91,6 +105,9 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		}
 
 		srcHandoff := handoffNode(ring, cfg, srcTarget.hash)
+		if !replace {
+			attrs = srcPlace.Attributes
+		}
 
 		destTarget, err := resolveWriteTarget(ctx, mc, cache, destBucket, destKey)
 		if err != nil {
@@ -127,6 +144,7 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		}
 
 		place.Digest = digest.Sum(nil)
+		place.Attributes = attrs
 
 		record, err := EncodePlacement(place)
 		if err != nil {

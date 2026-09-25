@@ -1,10 +1,13 @@
 package handlers
 
 import (
+	"cmp"
 	"crypto/md5"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/mulgadc/predastore/internal/config"
@@ -19,10 +22,12 @@ import (
 //	3    8     object size, uint64 big-endian
 //	11   8     write epoch, uint64 big-endian (version 2+ carries a timestamp)
 //	19   8     block size, uint64 big-endian (version 2+ only)
-//	27   16    content MD5 (version 3 only), all zero when the record carries none
-//	43   var   digest marker, a uvarint (version 3 only): 0 means no digest, 1
+//	27   16    content MD5 (version 3+), all zero when the record carries none
+//	43   var   digest marker, a uvarint (version 3+): 0 means no digest, 1
 //	           means the 16 bytes above are a plain content digest, and N > 1
 //	           means they are the composite of N-1 multipart parts
+//	var  var   headers (version 4 only): a uvarint count, then that many
+//	           name/value pairs, each a uvarint length and its bytes
 //	var  var   k+m node ids as uvarints, data shards first then parity
 //
 // gob spent 217 bytes on a 66-byte payload because it emits a type descriptor
@@ -40,12 +45,19 @@ import (
 // not fit one byte, and a fixed two-byte field would spend a byte on every
 // object with no composite, which is nearly all of them, to cover a case only
 // multipart completion ever hits.
+//
+// Version 4 adds the object's attributes as the headers they are served as,
+// sorted by name: content-type, and each user metadata entry under its
+// x-amz-meta- name. An object with no attributes is still written as version
+// 3, so a gate that predates version 4 can read every object that does not
+// need it -- which during a rolling upgrade is the difference between some
+// objects and all of them.
 const (
 	placementMagic       = 0x00
 	placementVersionV1   = 0x01
 	placementVersionV2   = 0x02
 	placementVersionV3   = 0x03
-	placementVersion     = placementVersionV3
+	placementVersionV4   = 0x04
 	placementFixedSizeV1 = 19
 	placementFixedSizeV2 = 27
 	placementFixedSizeV3 = 43
@@ -82,7 +94,7 @@ func EncodePlacement(p ObjectToShardNodes) ([]byte, error) {
 
 	buf := make([]byte, placementFixedSizeV3, placementFixedSizeV3+binary.MaxVarintLen64+k+len(p.ParityShardNodes))
 	buf[0] = placementMagic
-	buf[1] = placementVersion
+	buf[1] = placementVersionV3
 	buf[2] = byte(k)
 	binary.BigEndian.PutUint64(buf[3:11], uint64(p.Size))
 	binary.BigEndian.PutUint64(buf[11:19], p.WriteEpoch)
@@ -97,6 +109,11 @@ func EncodePlacement(p ObjectToShardNodes) ([]byte, error) {
 		marker = uint64(p.PartCount) + 1
 	}
 	buf = binary.AppendUvarint(buf, marker)
+
+	if !p.Attributes.empty() {
+		buf[1] = placementVersionV4
+		buf = appendAttributes(buf, p.Attributes)
+	}
 
 	for _, id := range p.DataShardNodes {
 		buf = binary.AppendUvarint(buf, uint64(id))
@@ -129,7 +146,7 @@ func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
 			return ObjectToShardNodes{}, fmt.Errorf("placement record is %d bytes, want at least %d",
 				len(b), placementFixedSizeV2)
 		}
-	case placementVersionV3:
+	case placementVersionV3, placementVersionV4:
 		if len(b) < placementFixedSizeV3 {
 			return ObjectToShardNodes{}, fmt.Errorf("placement record is %d bytes, want at least %d",
 				len(b), placementFixedSizeV3)
@@ -157,7 +174,7 @@ func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
 	// node ids start after it rather than at the end of the fixed header
 	// itself for a version 3 record.
 	nodeIDStart := fixed
-	if b[1] == placementVersionV3 {
+	if b[1] >= placementVersionV3 {
 		marker, n := binary.Uvarint(b[placementFixedSizeV3:])
 		if n <= 0 {
 			return ObjectToShardNodes{}, errors.New("placement record has a malformed digest marker")
@@ -167,6 +184,14 @@ func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
 			p.Digest = append([]byte(nil), b[27:43]...)
 			p.PartCount = int(marker - 1) //nolint:gosec // marker is 1+PartCount, bounded by S3's own part limit.
 		}
+	}
+	if b[1] == placementVersionV4 {
+		attrs, n, err := parseAttributes(b[nodeIDStart:])
+		if err != nil {
+			return ObjectToShardNodes{}, err
+		}
+		p.Attributes = attrs
+		nodeIDStart += n
 	}
 
 	ids := make([]config.NodeID, 0, k)
@@ -212,4 +237,80 @@ func (p ObjectToShardNodes) ETag() (string, bool) {
 		return fmt.Sprintf("\"%x-%d\"", p.Digest, p.PartCount), true
 	}
 	return fmt.Sprintf("\"%x\"", p.Digest), true
+}
+
+// contentTypeHeader is the name Content-Type is recorded under.
+const contentTypeHeader = "content-type"
+
+// appendAttributes renders a record's header section. Sorting makes the
+// encoding a function of the attributes alone, not of map iteration order.
+func appendAttributes(buf []byte, a ObjectAttributes) []byte {
+	fields := make([][2]string, 0, len(a.Metadata)+1)
+	if a.ContentType != "" {
+		fields = append(fields, [2]string{contentTypeHeader, a.ContentType})
+	}
+	for name, value := range a.Metadata {
+		fields = append(fields, [2]string{userMetadataPrefix + name, value})
+	}
+	slices.SortFunc(fields, func(x, y [2]string) int { return cmp.Compare(x[0], y[0]) })
+
+	buf = binary.AppendUvarint(buf, uint64(len(fields)))
+	for _, f := range fields {
+		buf = appendField(buf, f[0])
+		buf = appendField(buf, f[1])
+	}
+	return buf
+}
+
+func appendField(buf []byte, s string) []byte {
+	buf = binary.AppendUvarint(buf, uint64(len(s)))
+	return append(buf, s...)
+}
+
+// parseAttributes reads a header section and reports how many bytes it took.
+// A name it does not know is skipped rather than refused, so a header a later
+// version records does not make the object unreadable here.
+func parseAttributes(b []byte) (ObjectAttributes, int, error) {
+	count, off := binary.Uvarint(b)
+	if off <= 0 {
+		return ObjectAttributes{}, 0, errors.New("placement record has a malformed header count")
+	}
+	// Every field costs at least its length byte, which bounds a count that
+	// would otherwise be trusted to size the loop.
+	if count > uint64(len(b)-off)/2 { //nolint:gosec // off <= len(b), so the difference is not negative.
+		return ObjectAttributes{}, 0, fmt.Errorf("placement record declares %d headers in %d bytes", count, len(b)-off)
+	}
+
+	var a ObjectAttributes
+	for range count {
+		name, n, err := parseField(b[off:])
+		if err != nil {
+			return ObjectAttributes{}, 0, err
+		}
+		off += n
+		value, n, err := parseField(b[off:])
+		if err != nil {
+			return ObjectAttributes{}, 0, err
+		}
+		off += n
+
+		if name == contentTypeHeader {
+			a.ContentType = value
+		} else if key, ok := strings.CutPrefix(name, userMetadataPrefix); ok {
+			if a.Metadata == nil {
+				a.Metadata = make(map[string]string)
+			}
+			a.Metadata[key] = value
+		}
+	}
+	return a, off, nil
+}
+
+func parseField(b []byte) (string, int, error) {
+	size, n := binary.Uvarint(b)
+	if n <= 0 || size > uint64(len(b)-n) { //nolint:gosec // n <= len(b), so the difference is not negative.
+		return "", 0, errors.New("placement record has a malformed header field")
+	}
+	end := n + int(size) //nolint:gosec // bounded by len(b) just above.
+	return string(b[n:end]), end, nil
 }
