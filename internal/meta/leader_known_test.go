@@ -77,3 +77,35 @@ func TestLeaderKnown_AfterElectionReportsLeader(t *testing.T) {
 
 	assert.Eventually(t, svc.LeaderKnown, 10*time.Second, 20*time.Millisecond)
 }
+
+// A probe holding no replica at all must answer, not dereference nothing.
+func TestLeaderKnown_NilServerReportsNoLeader(t *testing.T) {
+	var svc *meta.Server
+
+	assert.False(t, svc.LeaderKnown())
+}
+
+// The admin sampler polls from its own goroutine while Run builds raft, so
+// the read must be safe against that write rather than merely usually early.
+func TestLeaderKnown_PolledWhileRunStarts(t *testing.T) {
+	svc, start := newLeaderKnownReplica(t)
+
+	stop := make(chan struct{})
+	polled := make(chan struct{})
+	go func() {
+		defer close(polled)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = svc.LeaderKnown()
+			}
+		}
+	}()
+	start()
+
+	assert.Eventually(t, svc.LeaderKnown, 10*time.Second, 20*time.Millisecond)
+	close(stop)
+	<-polled
+}
