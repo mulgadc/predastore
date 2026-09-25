@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"slices"
 	"strconv"
 	"sync"
@@ -91,6 +92,9 @@ func Run(ctx context.Context, opts Options) error {
 	}) {
 		return fmt.Errorf("host %d has no data directory", opts.HostID)
 	}
+	if err := checkDataDirs(host); err != nil {
+		return err
+	}
 
 	// A host with no replica of its own has no local consensus to wait on, so
 	// its gate serves immediately.
@@ -133,6 +137,37 @@ func Run(ctx context.Context, opts Options) error {
 		g.Go(func() error { return run(gctx) })
 	}
 	return g.Wait()
+}
+
+// checkDataDirs proves every local node can write its directory before any
+// node starts, and names all that cannot. Found later, an unwritable drive
+// surfaces behind the readiness noise of the nodes already running.
+func checkDataDirs(host HostConfig) error {
+	var errs []error
+	for _, n := range host.Nodes {
+		if n.Role == RoleGate {
+			continue
+		}
+		dir := config.NodeDataDir(host, n)
+		if err := probeWritable(dir); err != nil {
+			errs = append(errs, fmt.Errorf("%s node %d data directory %s is not writable by uid %d: %w",
+				n.Role, n.ID, dir, os.Geteuid(), err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// probeWritable creates dir as its node would and writes a file in it. Mode
+// bits alone would miss ACLs, read-only mounts and a sandbox's view of them.
+func probeWritable(dir string) error {
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".write-probe-*")
+	if err != nil {
+		return err
+	}
+	return errors.Join(f.Close(), os.Remove(f.Name()))
 }
 
 // probeKey is a key nothing writes. A probe wants an answer rather than data,
@@ -441,7 +476,7 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 
 	run := func(ctx context.Context) error {
 		if err := serve(ctx); err != nil {
-			return fmt.Errorf("node %d: %w", n.ID, err)
+			return fmt.Errorf("%s node %d: %w", n.Role, n.ID, err)
 		}
 		return nil
 	}
