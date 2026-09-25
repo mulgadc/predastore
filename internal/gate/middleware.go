@@ -199,6 +199,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		publicBucketAccess := s.cfg.validatePublicBucketPermission(method, bucket)
 
+		restoreTransferEncoding(r)
 		// Parse recognizes both header-authed and presigned requests; only a request with
 		// neither returns ErrMissingAuthentication.
 		sig, err := sigv4.Parse(r)
@@ -312,6 +313,16 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		annotateSpanAccount(ctx, credResult.AccountID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// restoreTransferEncoding puts back the Transfer-Encoding header net/http moves
+// into r.TransferEncoding, since clients may sign it and SigV4 canonicalises headers.
+// The server has already undone the framing, so nothing downstream acts on it.
+func restoreTransferEncoding(r *http.Request) {
+	if len(r.TransferEncoding) == 0 || r.Header.Get("Transfer-Encoding") != "" {
+		return
+	}
+	r.Header.Set("Transfer-Encoding", strings.Join(r.TransferEncoding, ","))
 }
 
 // signedPayload is what the write path needs to decode and authenticate a body:
