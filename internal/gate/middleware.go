@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	"github.com/mulgadc/bluebottle/pkg/otelsetup"
@@ -151,11 +152,23 @@ func (s *Server) setupMiddleware() {
 		r.Use(middleware.Logger)
 	}
 	r.Use(middleware.Recoverer)
-	// AWS S3 accepts bucket-scoped URLs with or without a trailing slash
-	// (e.g. PUT /bucket/ == PUT /bucket for CreateBucket) without redirecting.
-	// StripSlashes only rewrites chi's routing context, not r.URL.Path, so
-	// SigV4 verification still sees the exact URI the client signed.
-	r.Use(middleware.StripSlashes)
+	r.Use(routeDecodedPath)
+}
+
+// routeDecodedPath routes on the decoded path that names an S3 key, not the
+// RawPath chi would pick, less one trailing slash. r.URL is left untouched, so
+// SigV4 still canonicalises the exact URI the client signed.
+func routeDecodedPath(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rctx := chi.RouteContext(r.Context()); rctx != nil {
+			path := r.URL.Path
+			if len(path) > 1 && strings.HasSuffix(path, "/") {
+				path = path[:len(path)-1]
+			}
+			rctx.RoutePath = path
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // throttleMiddleware limits requests per account and action, or returns nil

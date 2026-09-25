@@ -393,3 +393,132 @@ func TestListObjectsIgnoresUnknownQueryParameters(t *testing.T) {
 
 	assert.Equal(t, 2, result.KeyCount)
 }
+
+// encodingKeys are the keys the encoding-type tests list: a plus, a space and
+// a non-ASCII character, each of which reads differently once escaped.
+var encodingKeys = []string{"asdf+b", "foo+1/bar", "foo/bar/xyzzy", "quux ab/thud", "ü x/y"}
+
+// Without encoding-type a listing returns the keys as stored, and says nothing
+// about an encoding, so a client takes every name literally.
+func TestListObjectsReturnsRawKeysWithoutEncodingType(t *testing.T) {
+	t.Parallel()
+
+	f := newListFixture(t, encodingKeys...)
+	rr := f.do(t, url.Values{"list-type": {"2"}, "delimiter": {"/"}, "prefix": {""}})
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.NotContains(t, rr.Body.String(), "<EncodingType>")
+
+	result := f.list(t, url.Values{"delimiter": {"/"}})
+	assert.Equal(t, []string{"asdf+b"}, keysOf(contentsOf(result)))
+	assert.Equal(t, []string{"foo+1/", "foo/", "quux ab/", "ü x/"}, prefixListOf(prefixesOf(result)))
+}
+
+// With encoding-type=url, S3 encodes every field that carries a key and says
+// so. The expected forms are those ceph/s3-tests pins for S3.
+func TestListObjectsV2EncodesKeyFieldsWhenAsked(t *testing.T) {
+	t.Parallel()
+
+	f := newListFixture(t, encodingKeys...)
+	result := f.list(t, url.Values{"encoding-type": {"url"}, "delimiter": {"/"}})
+
+	assert.Equal(t, "url", result.EncodingType)
+	assert.Equal(t, "/", result.Delimiter)
+	assert.Equal(t, []string{"asdf%2Bb"}, keysOf(contentsOf(result)))
+	assert.Equal(t, []string{"foo%2B1/", "foo/", "quux%20ab/", "%C3%BC%20x/"}, prefixListOf(prefixesOf(result)))
+
+	result = f.list(t, url.Values{"encoding-type": {"url"}, "prefix": {"quux ab/"}, "start-after": {"quux ab/a"}})
+	assert.Equal(t, "quux%20ab/", result.Prefix)
+	assert.Equal(t, "quux%20ab/a", result.StartAfter)
+	assert.Equal(t, []string{"quux%20ab/thud"}, keysOf(contentsOf(result)))
+}
+
+// A continuation token is opaque and names the raw key, so paging an encoded
+// listing reaches every key exactly once.
+func TestListObjectsV2EncodedListingPagesOnRawKeys(t *testing.T) {
+	t.Parallel()
+
+	f := newListFixture(t, encodingKeys...)
+	got := f.walk(t, url.Values{"encoding-type": {"url"}}, 2)
+	assert.Equal(t, []string{"asdf%2Bb", "foo%2B1/bar", "foo/bar/xyzzy", "quux%20ab/thud", "%C3%BC%20x/y"}, got)
+}
+
+func TestListObjectsV1EncodesKeyFieldsWhenAsked(t *testing.T) {
+	t.Parallel()
+
+	f := newListFixture(t, encodingKeys...)
+	result, body := f.listV1(t, url.Values{
+		"encoding-type": {"url"}, "delimiter": {" "}, "marker": {"asdf+b"}, "max-keys": {"2"},
+	})
+
+	assert.Contains(t, body, "<EncodingType>url</EncodingType>")
+	assert.Equal(t, "%20", result.Delimiter)
+	assert.Equal(t, "asdf%2Bb", result.Marker)
+	assert.Equal(t, []string{"foo%2B1/bar", "foo/bar/xyzzy"}, keysOf(contentsOfV1(result)))
+	assert.True(t, result.IsTruncated)
+	assert.Equal(t, "foo/bar/xyzzy", result.NextMarker)
+
+	result, _ = f.listV1(t, url.Values{"encoding-type": {"url"}, "delimiter": {"/"}, "prefix": {"ü"}, "max-keys": {"1"}})
+	assert.Equal(t, "%C3%BC", result.Prefix)
+	assert.Equal(t, []string{"%C3%BC%20x/"}, prefixListOf(prefixesOfV1(result)))
+
+	result, body = f.listV1(t, url.Values{"delimiter": {"/"}, "prefix": {"ü"}})
+	assert.NotContains(t, body, "<EncodingType>")
+	assert.Equal(t, "ü", result.Prefix)
+	assert.Equal(t, []string{"ü x/"}, prefixListOf(prefixesOfV1(result)))
+}
+
+func TestListObjectsRejectsAnUnknownEncodingType(t *testing.T) {
+	t.Parallel()
+
+	f := newListFixture(t, "a")
+	for _, query := range []url.Values{
+		{"encoding-type": {"base64"}},
+		{"encoding-type": {"base64"}, "list-type": {"2"}},
+	} {
+		rr := f.do(t, query)
+		assert.Equal(t, http.StatusBadRequest, rr.Code)
+		assert.Contains(t, rr.Body.String(), "InvalidArgument")
+	}
+}
+
+func TestURLEncodeKey(t *testing.T) {
+	t.Parallel()
+
+	for key, want := range map[string]string{
+		"plain/key-1_2.txt~": "plain/key-1_2.txt~",
+		"a b":                "a%20b",
+		"a+b":                "a%2Bb",
+		"ü":                  "%C3%BC",
+		"100%":               "100%25",
+		"a=b&c?d#e":          "a%3Db%26c%3Fd%23e",
+		"tab\there\x01":      "tab%09here%01",
+		"":                   "",
+	} {
+		got := urlEncodeKey(key)
+		assert.Equal(t, want, got, "key %q", key)
+
+		// A form decoder and a path decoder must both recover the key.
+		decoded, err := url.QueryUnescape(got)
+		require.NoError(t, err)
+		assert.Equal(t, key, decoded)
+		decoded, err = url.PathUnescape(got)
+		require.NoError(t, err)
+		assert.Equal(t, key, decoded)
+	}
+}
+
+func keysOf(contents []ListObjectsV2_Contents) []string {
+	keys := make([]string, 0, len(contents))
+	for _, c := range contents {
+		keys = append(keys, c.Key)
+	}
+	return keys
+}
+
+func prefixListOf(dirs []ListObjectsV2_Dir) []string {
+	prefixes := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		prefixes = append(prefixes, d.Prefix)
+	}
+	return prefixes
+}

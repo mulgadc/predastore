@@ -197,23 +197,20 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 }
 
 // parseCopySource splits and URL-decodes an x-amz-copy-source header into the
-// bucket and key it names, and the version id if one was given. S3 accepts
-// both a leading slash and a bare bucket/key form, and clients percent-encode
-// the key the same way they would for the request path itself.
+// bucket and key it names, and the version id if one was given. The query is
+// cut off before decoding, so an encoded ? in the key stays part of the key.
 func parseCopySource(raw string) (bucket, key, versionID string, err error) {
 	if raw == "" {
 		return "", "", "", model.NewS3Error(model.ErrInvalidArgument, "x-amz-copy-source header is required", 400)
 	}
 
-	decoded, decErr := url.PathUnescape(raw)
-	if decErr != nil {
+	path, rawQuery, _ := strings.Cut(raw, "?")
+	decoded, decErr := url.PathUnescape(path)
+	query, queryErr := url.ParseQuery(rawQuery)
+	if decErr != nil || queryErr != nil {
 		return "", "", "", model.NewS3Error(model.ErrInvalidArgument, "x-amz-copy-source is not valid URL encoding", 400)
 	}
-
-	if idx := strings.IndexByte(decoded, '?'); idx >= 0 {
-		versionID = strings.TrimPrefix(decoded[idx:], "?versionId=")
-		decoded = decoded[:idx]
-	}
+	versionID = query.Get("versionId")
 
 	decoded = strings.TrimPrefix(decoded, "/")
 	bucket, key, ok := strings.Cut(decoded, "/")

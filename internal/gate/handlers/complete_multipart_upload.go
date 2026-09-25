@@ -196,7 +196,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		setVersionIDHeader(w.Header(), target.versionID)
 
 		if err := writeXML(w, http.StatusOK, CompleteMultipartUploadResult{
-			Location: fmt.Sprintf("https://%s/%s/%s", r.Host, bucket, key),
+			Location: fmt.Sprintf("https://%s/%s/%s", r.Host, bucket, urlEncodeKey(key)),
 			Bucket:   bucket,
 			Key:      key,
 			ETag:     composite.String(),
