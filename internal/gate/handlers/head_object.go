@@ -24,7 +24,8 @@ func lastModified(p ObjectToShardNodes) string {
 	return at.Format(httpTimeFormat)
 }
 
-// HeadObject serves HEAD /{bucket}/{key}: size and entity tag, no body.
+// HeadObject serves HEAD /{bucket}/{key}: size, entity tag and the object's
+// attributes, no body.
 func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Config) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
@@ -52,7 +53,7 @@ func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Con
 		}
 
 		setVersionIDHeader(w.Header(), target.versionID)
-		w.Header().Set("Content-Type", "application/octet-stream")
+		setAttributeHeaders(w.Header(), place.Attributes)
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		// A record with no stored digest omits the ETag rather than serving the
 		// old name-derived value; see the same choice in GetObject.

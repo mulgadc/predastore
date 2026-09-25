@@ -94,7 +94,7 @@ func serveObject(
 		if degraded > 0 {
 			w.Header().Set(degradedHeader, strconv.Itoa(degraded))
 		}
-		w.Header().Set("Content-Type", "application/octet-stream")
+		setAttributeHeaders(w.Header(), place.Attributes)
 		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 		// A record with no stored digest omits the ETag rather than serving the
 		// old name-derived value: a client comparing that against the body it

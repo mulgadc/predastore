@@ -56,7 +56,8 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			HandleError(w, r, err)
 			return
 		}
-		if err := requireUpload(ctx, mc, bucket, key, uploadID); err != nil {
+		upload, err := uploadFor(ctx, mc, bucket, key, uploadID)
+		if err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -141,6 +142,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		digest := composite.Digest()
 		place.Digest = digest[:]
 		place.PartCount = composite.PartCount()
+		place.Attributes = ObjectAttributes{ContentType: upload.ContentType, Metadata: upload.Metadata}
 
 		shardRecord, err := EncodePlacement(place)
 		if err != nil {

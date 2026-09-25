@@ -39,6 +39,10 @@ type UploadMetadata struct {
 	ContentType string         `json:"content_type,omitempty"`
 	CreatedAt   time.Time      `json:"created_at"`
 	Parts       []PartMetadata `json:"parts,omitempty"`
+
+	// Metadata is the user metadata the completed object will carry, keyed
+	// the way the object's own record keys it.
+	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
 // PartMetadata contains metadata about a single uploaded part.

@@ -46,6 +46,10 @@ type ObjectToShardNodes struct {
 	// is meaningless when Digest is nil.
 	PartCount int
 
+	// Attributes are what the writer said about the object, served back on
+	// every read. A record before version 4 carries none.
+	Attributes ObjectAttributes
+
 	DataShardNodes   []config.NodeID
 	ParityShardNodes []config.NodeID
 }

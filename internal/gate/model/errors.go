@@ -34,6 +34,7 @@ const (
 	ErrSignatureDoesNotMatch   S3ErrorCode = "SignatureDoesNotMatch"
 	ErrMalformedChunkedBody    S3ErrorCode = "InvalidRequest"
 	ErrMalformedXML            S3ErrorCode = "MalformedXML"
+	ErrMetadataTooLarge        S3ErrorCode = "MetadataTooLarge"
 )
 
 // S3Error represents a typed S3 error with code and message.
@@ -161,6 +162,14 @@ var (
 	ErrChecksumMismatchError = &S3Error{
 		Code:       ErrChecksumMismatch,
 		Message:    "The checksum the client sent does not match what was computed",
+		StatusCode: http.StatusBadRequest,
+	}
+
+	// ErrMetadataTooLargeError is returned when a write's user metadata is over
+	// S3's 2 KB limit.
+	ErrMetadataTooLargeError = &S3Error{
+		Code:       ErrMetadataTooLarge,
+		Message:    "Your metadata headers exceed the maximum allowed metadata size.",
 		StatusCode: http.StatusBadRequest,
 	}
 )
