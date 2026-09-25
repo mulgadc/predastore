@@ -167,9 +167,11 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 		}
 
 		if !listV2 {
+			// S3 leaves v1's top-level Prefix raw under encoding-type=url, and
+			// botocore decodes every v1 field but that one to match.
 			result := ListObjectsV1{
 				Name:           bucket,
-				Prefix:         encode(prefix),
+				Prefix:         prefix,
 				Marker:         encode(marker),
 				Delimiter:      encode(delimiter),
 				EncodingType:   encodingType,

@@ -458,7 +458,7 @@ func TestListObjectsV1EncodesKeyFieldsWhenAsked(t *testing.T) {
 	assert.Equal(t, "foo/bar/xyzzy", result.NextMarker)
 
 	result, _ = f.listV1(t, url.Values{"encoding-type": {"url"}, "delimiter": {"/"}, "prefix": {"ü"}, "max-keys": {"1"}})
-	assert.Equal(t, "%C3%BC", result.Prefix)
+	assert.Equal(t, "ü", result.Prefix, "v1 returns the top-level Prefix raw")
 	assert.Equal(t, []string{"%C3%BC%20x/"}, prefixListOf(prefixesOfV1(result)))
 
 	result, body = f.listV1(t, url.Values{"delimiter": {"/"}, "prefix": {"ü"}})
