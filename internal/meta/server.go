@@ -520,12 +520,11 @@ func (s *Server) leaderRead() string {
 	}
 }
 
-// LeaderKnown reports whether this replica currently observes a leader. It
-// reads local raft state only, so a replica partitioned from the cluster
-// answers false rather than blocking on a peer it cannot reach. A replica
-// whose raft node has not been built yet observes no leader either.
+// LeaderKnown reports whether this replica observes a leader, from local raft
+// state only so a partitioned replica answers false rather than blocking. A
+// nil replica, or one whose raft node is not built yet, observes no leader.
 func (s *Server) LeaderKnown() bool {
-	if !s.raftUp.Load() {
+	if s == nil || !s.raftUp.Load() {
 		return false
 	}
 	return s.raft.Leader() != ""

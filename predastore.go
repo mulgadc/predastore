@@ -161,17 +161,20 @@ type leaderReporter interface {
 	LeaderKnown() bool
 }
 
+var _ leaderReporter = (*meta.Server)(nil)
+
 type shardProber interface {
 	Get(ctx context.Context, node NodeID, req blob.GetRequest) (io.ReadCloser, error)
 }
 
 // leaderObserved fails while this replica sees no leader. Writes cannot commit
 // without one, so a gate in front of it would accept requests it cannot serve.
+// A missing replica is unready too: a probe must never take its process down.
 func leaderObserved(svc leaderReporter) admin.Check {
 	return admin.Check{
 		Name: "meta_leader",
 		Probe: func(context.Context) error {
-			if !svc.LeaderKnown() {
+			if svc == nil || !svc.LeaderKnown() {
 				return errors.New("no raft leader observed")
 			}
 			return nil

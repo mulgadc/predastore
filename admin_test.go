@@ -1,9 +1,12 @@
 package predastore_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 	"github.com/mulgadc/predastore"
 	"github.com/mulgadc/predastore/internal/config"
@@ -32,17 +37,23 @@ func freePort(t *testing.T) int {
 	return port
 }
 
+func newMasterKey(t *testing.T) *masterkey.Key {
+	t.Helper()
+	secret := make([]byte, 32)
+	_, err := rand.Read(secret)
+	require.NoError(t, err)
+	key, err := masterkey.New(secret)
+	require.NoError(t, err)
+	return key
+}
+
 // startHost runs one process holding a gate, a meta replica and three blob
 // nodes, and returns the ports its two listeners were given.
 func startHost(t *testing.T, adminPort int) (gatePort int) {
 	t.Helper()
 	certPath, keyPath, _ := testcerts.Generate(t)
 
-	secret := make([]byte, 32)
-	_, err := rand.Read(secret)
-	require.NoError(t, err)
-	key, err := masterkey.New(secret)
-	require.NoError(t, err)
+	key := newMasterKey(t)
 
 	gatePort = freePort(t)
 	nodes := []config.Node{
@@ -67,6 +78,13 @@ func startHost(t *testing.T, adminPort int) (gatePort int) {
 			Nodes:     nodes,
 		}},
 	}
+	runHost(t, cfg, key)
+	return gatePort
+}
+
+// runHost runs host 1 of cfg until the test ends.
+func runHost(t *testing.T, cfg *config.Config, key *masterkey.Key) {
+	t.Helper()
 	require.NoError(t, cfg.Validate())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -82,7 +100,6 @@ func startHost(t *testing.T, adminPort int) (gatePort int) {
 			t.Error("host did not stop")
 		}
 	})
-	return gatePort
 }
 
 // awaitProbe polls until the probe answers with want, which is what a load
@@ -181,4 +198,75 @@ func TestHostWithoutAdminPortRunsNoListener(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(unused))
 	require.NoError(t, err, "a port was bound with no admin_port configured")
 	require.NoError(t, ln.Close())
+}
+
+// The single-node profile runs one of each role with no parity. The sampler
+// probes the meta replica from the moment the admin listener starts, which is
+// before raft exists, and the process must come up and serve S3 regardless.
+func TestSingleNodeProfileServesWithAdminListener(t *testing.T) {
+	certPath, keyPath, _ := testcerts.Generate(t)
+	adminPort, gatePort := freePort(t), freePort(t)
+	const accessKey, secretKey = "AKIASINGLENODETEST01", "single-node-test-secret-key-0000000000000"
+
+	cfg := &config.Config{
+		Version: config.Version,
+		Region:  "ap-southeast-2",
+		RS:      config.RS{Data: 1, Parity: 0},
+		Hosts: []config.Host{{
+			ID:        1,
+			Addr:      "127.0.0.1",
+			DataDir:   t.TempDir(),
+			TLSCert:   certPath,
+			TLSKey:    keyPath,
+			AdminPort: adminPort,
+			Nodes: []config.Node{
+				{ID: 1, Role: config.RoleGate, Port: gatePort, BindAddr: "127.0.0.1"},
+				{ID: 2, Role: config.RoleMeta, Port: 7201},
+				{ID: 3, Role: config.RoleBlob, Port: 7301},
+			},
+		}},
+		Auth: []config.AuthEntry{{AccessKeyID: accessKey, SecretAccessKey: secretKey, AccountID: "123456789012"}},
+	}
+	runHost(t, cfg, newMasterKey(t))
+
+	base := "http://127.0.0.1:" + strconv.Itoa(adminPort)
+	ready := awaitProbe(t, base+"/readyz", http.StatusOK)
+	checks, isMap := ready["checks"].(map[string]any)
+	require.True(t, isMap, "checks is %T, want an object", ready["checks"])
+	require.Equal(t, "ok", checks["meta_leader"])
+
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}}
+	s3 := "https://127.0.0.1:" + strconv.Itoa(gatePort)
+	send := func(method, path string, body []byte) (int, []byte) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(t.Context(), method, s3+path, bytes.NewReader(body))
+		require.NoError(t, err)
+		sum := sha256.Sum256(body)
+		hash := hex.EncodeToString(sum[:])
+		req.Header.Set("X-Amz-Content-Sha256", hash)
+		signer := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+		require.NoError(t, signer.SignHTTP(t.Context(),
+			aws.Credentials{AccessKeyID: accessKey, SecretAccessKey: secretKey},
+			req, hash, "s3", cfg.Region, time.Now().UTC()))
+		resp, err := client.Do(req)
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		got, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		return resp.StatusCode, got
+	}
+
+	// The gate binds after the election, so the first request waits for it.
+	awaitGate(t, client, s3+"/")
+
+	status, body := send(http.MethodPut, "/single-node", nil)
+	require.Equal(t, http.StatusOK, status, "CreateBucket: %s", body)
+	want := []byte("served by a single-node profile")
+	status, body = send(http.MethodPut, "/single-node/object", want)
+	require.Equal(t, http.StatusOK, status, "PutObject: %s", body)
+	status, body = send(http.MethodGet, "/single-node/object", nil)
+	require.Equal(t, http.StatusOK, status, "GetObject: %s", body)
+	require.Equal(t, want, body)
 }

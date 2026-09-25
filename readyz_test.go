@@ -61,6 +61,17 @@ func TestLeaderObservedFollowsTheReplica(t *testing.T) {
 	}
 }
 
+// A host with no replica reports unready rather than panicking the sampler,
+// whether the reporter is absent or is a nil replica behind the interface.
+func TestLeaderObservedWithoutAReplicaIsUnready(t *testing.T) {
+	var nilReplica *meta.Server
+	for name, svc := range map[string]leaderReporter{"nil interface": nil, "nil replica": nilReplica} {
+		if err := leaderObserved(svc).Probe(context.Background()); err == nil {
+			t.Errorf("%s: probe returned nil with no replica", name)
+		}
+	}
+}
+
 // A missing key is the healthy answer: the read reached a replica and came
 // back. Treating it as a failure would leave every cluster permanently unready.
 func TestMetaReachableTreatsNotFoundAsReached(t *testing.T) {
