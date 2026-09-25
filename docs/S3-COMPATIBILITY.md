@@ -15,8 +15,8 @@ make s3-tests
 
 | | count |
 | --- | --- |
-| pass | 211 |
-| fail | 180 |
+| pass | 215 |
+| fail | 176 |
 | skip | 495 |
 | error | 0 |
 
@@ -29,7 +29,7 @@ A passing case is never one of the 489, whatever family's marker or node id woul
 
 A skip is not a pass. It means predastore has not been measured against that case in this run, on purpose.
 
-The 180 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, stored response headers other than `Content-Type`, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
+The 176 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, stored response headers other than `Content-Type`, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
 
 ## The gaps that break real clients
 
@@ -60,7 +60,7 @@ Served sub-resources: bucket `tagging`, `versioning`, `versions`, `location`, `u
 
 ## By area
 
-Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 211/180 above. An area predastore has deliberately not implemented is not here; see the next table.
+Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 215/176 above. An area predastore has deliberately not implemented is not here; see the next table.
 
 | Area | Pass | Fail | Selector (test name) | Note |
 | --- | --- | --- | --- | --- |
@@ -68,11 +68,11 @@ Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is
 | Conditional requests | 9 | 38 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | Every pass is a case where ignoring the header gives the right answer anyway. |
 | Checksums and object attributes | 0 | 16 | contains `checksum`, `cksum` or `object_attributes` | |
 | Object and bucket tagging | 1 | 11 | ends `_tags`, or contains `tagging` | The pass is bucket tagging. |
-| CopyObject / UploadPartCopy | 18 | 7 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Invalid ranges, versioned sources and cross-owner copies fail. |
+| CopyObject / UploadPartCopy | 20 | 5 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Invalid ranges, versioned sources and cross-owner copies fail. |
 | DeleteObjects | 7 | 1 | contains `multi_object` | The fail is the concurrent versioned delete. |
 | Multipart upload | 11 | 10 | contains `multipart` | `GetObject` by `partNumber`, empty and single-small uploads, completing an upload twice. |
-| ListObjectsV2 | 36 | 6 | `test_bucket_listv2_*`, `test_bucketv2_*`, `test_basic_key_count` | |
-| ListObjects (v1) | 37 | 7 | `test_bucket_list_*` | Both versions fail `encoding-type=url`, unordered keys and anonymous listing. |
+| ListObjectsV2 | 37 | 5 | `test_bucket_listv2_*`, `test_bucketv2_*`, `test_basic_key_count` | |
+| ListObjects (v1) | 38 | 6 | `test_bucket_list_*` | Both versions fail unordered keys and anonymous listing. |
 | Versioning | 4 | 0 | `test_versioned_*`, `test_versioning_*` | Only the cases still selected; the rest are in the next table. |
 | Bucket create, delete, head | 33 | 31 | `test_bucket_*`, `test_create_bucket_*`, `test_buckets_*`, `test_list_buckets*`, `test_put_bucket_ownership_*`, `test_expected_bucket_owner` | Request validation (12, most of them Signature V2), ownership controls (7), and `ListBuckets` pagination and anonymous access. |
 | Object write and read | 30 | 31 | `test_object_{create,write,set_get,metadata,head,read,delete,put,anon,content}*`, `test_100_continue*`, `test_atomic_*` | Request validation, stored headers other than `Content-Type`, and non-ASCII metadata, which S3 itself returns RFC 2047 encoded. |
