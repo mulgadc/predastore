@@ -233,10 +233,14 @@ type DeleteError struct {
 	Message string `xml:"Message"`
 }
 
-// CreateBucketConfiguration is the request body for CreateBucket.
+// CreateBucketConfiguration is the request body for CreateBucket. Tags are the
+// tag-on-create set: S3 applies them as part of the create, so a client that
+// sends them here never calls PutBucketTagging and the tags are simply lost if
+// this is ignored.
 type CreateBucketConfiguration struct {
 	XMLName            xml.Name `xml:"CreateBucketConfiguration"`
 	LocationConstraint string   `xml:"LocationConstraint"`
+	Tags               []Tag    `xml:"Tags>Tag"`
 }
 
 // CreateBucketResult is the response for CreateBucket.
