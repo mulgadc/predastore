@@ -5,7 +5,6 @@ import (
 	"encoding/gob"
 	"encoding/xml"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -80,6 +79,7 @@ func CreateBucket(mc MetaClient, cache *BucketCache, cfg Config) http.Handler {
 		accountID := auth.AccountID(ctx)
 
 		region := cfg.Region
+		var tags map[string]string
 		if r.ContentLength > 0 {
 			var config CreateBucketConfiguration
 			// The read carries the SigV4 payload check on a streamed body, so discarding
@@ -97,8 +97,18 @@ func CreateBucket(mc MetaClient, cache *BucketCache, cfg Config) http.Handler {
 					"The bucket configuration could not be read", http.StatusBadRequest))
 				return
 			}
-			if xml.Unmarshal(body, &config) == nil && config.LocationConstraint != "" {
-				region = config.LocationConstraint
+			if xml.Unmarshal(body, &config) == nil {
+				if config.LocationConstraint != "" {
+					region = config.LocationConstraint
+				}
+				var invalid string
+				// Refused before the bucket exists, as S3 does: a create that
+				// reports success having dropped the tags leaves the caller
+				// believing they were applied.
+				if tags, invalid = tagSetToMap(config.Tags); invalid != "" {
+					WriteS3Error(w, r, http.StatusBadRequest, "InvalidTag", invalid)
+					return
+				}
 			}
 		}
 		if region == "" {
@@ -145,7 +155,18 @@ func CreateBucket(mc MetaClient, cache *BucketCache, cfg Config) http.Handler {
 
 		cache.add(bucket, region, accountID, false)
 
-		w.Header().Set("Location", fmt.Sprintf("http://%s.s3.%s.amazonaws.com/", bucket, region))
+		// After the bucket, so a tag write can never leave a tag set behind for a
+		// bucket that does not exist.
+		if err := putBucketTags(ctx, mc, bucket, tags); err != nil {
+			HandleError(w, r, model.NewS3Error(model.ErrInternalError,
+				"failed to store bucket tags: "+err.Error(), 500))
+			return
+		}
+
+		// Relative to the endpoint that served the create, which is the form S3
+		// returns for us-east-1 and the only truthful one here: the global URL it
+		// returns elsewhere names a host this deployment does not serve.
+		w.Header().Set("Location", "/"+bucket)
 		w.WriteHeader(http.StatusOK)
 	})
 }

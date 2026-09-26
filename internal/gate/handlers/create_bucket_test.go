@@ -56,3 +56,93 @@ func TestCreateBucketRejectsUnreadableConfiguration(t *testing.T) {
 		})
 	}
 }
+
+// createBucketWithBody drives CreateBucket the way the router leaves a request,
+// with a configuration document the handler has to read.
+func createBucketWithBody(mc MetaClient, cache *BucketCache, body string) *httptest.ResponseRecorder {
+	req := subResourceRequest(http.MethodPut, "/"+testBucket, body)
+	req.ContentLength = int64(len(body))
+	w := httptest.NewRecorder()
+	CreateBucket(mc, cache, Config{Region: "ap-southeast-2"}).ServeHTTP(w, req)
+	return w
+}
+
+// emptyCache is a cluster the bucket under test does not exist in yet, which is
+// what CreateBucket needs: testCache seeds it and the create answers
+// BucketAlreadyOwnedByYou.
+func emptyCache() *BucketCache { return NewBucketCache(nil) }
+
+// The AWS provider sends a bucket's tags inside CreateBucket and only falls
+// back to PutBucketTagging when the create refuses them, so accepting the body
+// and dropping the tags loses them silently — the apply reports success and the
+// bucket comes back untagged.
+func TestCreateBucketAppliesTagsFromTheConfiguration(t *testing.T) {
+	t.Parallel()
+
+	mc := newFakeMeta()
+	cache := emptyCache()
+
+	w := createBucketWithBody(mc, cache, `<CreateBucketConfiguration>`+
+		`<LocationConstraint>ap-southeast-2</LocationConstraint>`+
+		`<Tags><Tag><Key>Name</Key><Value>uploads</Value></Tag>`+
+		`<Tag><Key>Example</Key><Value>s3-webapp</Value></Tag></Tags>`+
+		`</CreateBucketConfiguration>`)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	w = httptest.NewRecorder()
+	GetBucketTagging(mc, cache).ServeHTTP(w, subResourceRequest(http.MethodGet, "/"+testBucket+"?tagging", ""))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	var got Tagging
+	require.NoError(t, xml.NewDecoder(w.Body).Decode(&got))
+	assert.Equal(t, []Tag{{Key: "Example", Value: "s3-webapp"}, {Key: "Name", Value: "uploads"}}, got.TagSet)
+}
+
+// The Location header names the bucket on the endpoint that served the create.
+// It used to be built as an s3.<region>.amazonaws.com URL, which is a host this
+// deployment does not serve and a client that follows it leaves the cluster.
+func TestCreateBucketReportsALocationOnThisEndpoint(t *testing.T) {
+	t.Parallel()
+
+	w := createBucketWithBody(newFakeMeta(), emptyCache(),
+		`<CreateBucketConfiguration><LocationConstraint>ap-southeast-2</LocationConstraint></CreateBucketConfiguration>`)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, "/"+testBucket, w.Header().Get("Location"))
+}
+
+// A configuration carrying no tags leaves the bucket untagged rather than
+// carrying an empty tag set, which is a different answer to GetBucketTagging.
+func TestCreateBucketWithoutTagsLeavesTheBucketUntagged(t *testing.T) {
+	t.Parallel()
+
+	mc := newFakeMeta()
+	cache := emptyCache()
+
+	w := createBucketWithBody(mc, cache,
+		`<CreateBucketConfiguration><LocationConstraint>ap-southeast-2</LocationConstraint></CreateBucketConfiguration>`)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+
+	w = httptest.NewRecorder()
+	GetBucketTagging(mc, cache).ServeHTTP(w, subResourceRequest(http.MethodGet, "/"+testBucket+"?tagging", ""))
+	require.Equal(t, http.StatusNotFound, w.Code)
+	assert.Equal(t, "NoSuchTagSet", decodeS3Error(t, w).Code)
+}
+
+// The tag set is validated before the bucket is stored: a create that reports
+// success having dropped an invalid tag leaves the caller believing it applied.
+func TestCreateBucketRefusesAnInvalidTagAndCreatesNothing(t *testing.T) {
+	t.Parallel()
+
+	mc := newFakeMeta()
+	cache := emptyCache()
+
+	w := createBucketWithBody(mc, cache, `<CreateBucketConfiguration>`+
+		`<Tags><Tag><Key>aws:managed</Key><Value>x</Value></Tag></Tags>`+
+		`</CreateBucketConfiguration>`)
+	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, "InvalidTag", decodeS3Error(t, w).Code)
+
+	w = httptest.NewRecorder()
+	GetBucketTagging(mc, cache).ServeHTTP(w, subResourceRequest(http.MethodGet, "/"+testBucket+"?tagging", ""))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
