@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/meta"
@@ -133,7 +134,7 @@ func deleteNamedVersion(ctx context.Context, mc MetaClient, bc BlobClient, bucke
 		}
 	}
 
-	if err := reconcileCurrent(ctx, mc, bucket, key); err != nil {
+	if err := reconcileCurrent(ctx, mc, bucket, key, versionID); err != nil {
 		return deleteOutcome{}, err
 	}
 
@@ -148,11 +149,19 @@ func deleteNamedVersion(ctx context.Context, mc MetaClient, bc BlobClient, bucke
 // promoting from it can leave the listing key naming a version that no longer
 // exists -- a key that lists with no bytes behind it, and a bucket that can
 // never be emptied.
-func reconcileCurrent(ctx context.Context, mc MetaClient, bucket, key string) error {
-	remaining, err := keyVersions(ctx, mc, bucket, key)
+//
+// The re-read cannot see the delete either, though: a meta read is answered by
+// any replica that still holds the key, so one that has not applied the delete
+// yet returns the version just destroyed. Hence deleted — whatever a replica
+// says, the version this call removed is never a candidate for promotion.
+func reconcileCurrent(ctx context.Context, mc MetaClient, bucket, key, deleted string) error {
+	found, err := keyVersions(ctx, mc, bucket, key)
 	if err != nil {
 		return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 	}
+	remaining := slices.DeleteFunc(found, func(rec VersionRecord) bool {
+		return rec.VersionID == deleted
+	})
 
 	if len(remaining) == 0 || remaining[0].DeleteMarker {
 		if err := metaDelete(ctx, mc, model.TableObjects, objectARN(bucket, key)); err != nil && !errors.Is(err, meta.ErrNotFound) {
