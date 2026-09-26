@@ -78,7 +78,16 @@ func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config) 
 // The caller has already established that the bucket exists.
 func deleteStoredObject(ctx context.Context, mc MetaClient, bc BlobClient, bucket, key string) error {
 	if err := deleteStoredVersion(ctx, mc, bc, bucket, key, model.ObjectHash(bucket, key)); err != nil {
-		return err
+		if !isNoSuchKey(err) {
+			return err
+		}
+		// A listing row with no placement behind it is still an object to every
+		// client that can see it. Refusing to remove it leaves a key nothing can
+		// delete and a bucket that can never be emptied, so the listing row is
+		// dropped below and only an unlisted key is a genuine 404.
+		if _, listErr := metaGet(ctx, mc, model.TableObjects, objectARN(bucket, key)); listErr != nil {
+			return err
+		}
 	}
 	if err := metaDelete(ctx, mc, model.TableObjects, objectARN(bucket, key)); err != nil {
 		return model.NewS3Error(model.ErrInternalError, err.Error(), 500)

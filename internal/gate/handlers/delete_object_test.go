@@ -147,6 +147,24 @@ func TestFailedTombstoneWriteAfterFailedFanOutLeavesBothIndexEntries(t *testing.
 	assert.Error(t, tombErr, "no tombstone should exist when its own write failed")
 }
 
+// A listing row whose placement record has gone still names an object every
+// client can see, so it has to be removable. It used to answer NoSuchKey and
+// leave the row in place, which left a key nothing could delete and a bucket
+// that could never be emptied or removed.
+func TestDeleteStoredObjectRemovesAListingRowWithNoPlacement(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	f := newDeleteFixture(t, "a.txt")
+	objectHash := model.ObjectHash(deleteTestBucket, "a.txt")
+	require.NoError(t, metaDelete(ctx, f.write.mc, model.TableObjects, string(objectHash[:])))
+
+	require.NoError(t, deleteStoredObject(ctx, f.write.mc, f.write.bc, deleteTestBucket, "a.txt"))
+
+	_, arnErr := metaGet(ctx, f.write.mc, model.TableObjects, objectARN(deleteTestBucket, "a.txt"))
+	assert.Error(t, arnErr, "the listing row must be removed")
+}
+
 // A missing key is still model.ErrNoSuchKeyError, unaffected by whether the
 // fan-out would have succeeded: both the single-object 404 and the batch's
 // idempotent report depend on it.
