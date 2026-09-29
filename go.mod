@@ -13,7 +13,7 @@ require (
 	github.com/hashicorp/raft-boltdb/v2 v2.4.2
 	github.com/klauspost/reedsolomon v1.14.2
 	github.com/minio/crc64nvme v1.1.1
-	github.com/mulgadc/bluebottle v1.20.1-0.20260916040751-5a5ca6f0fb33
+	github.com/mulgadc/bluebottle v1.21.0
 	github.com/nats-io/nats.go v1.54.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/quic-go/quic-go v0.63.0
@@ -28,7 +28,7 @@ require (
 )
 
 require (
-	github.com/aws/smithy-go v1.28.1 // indirect
+	github.com/aws/smithy-go v1.28.2 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.4.0 // indirect
