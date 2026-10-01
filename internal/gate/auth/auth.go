@@ -572,7 +572,7 @@ func (p *NATSIAMProvider) lookupSessionCredentials(ctx context.Context, accessKe
 // each changed key. A watcher that cannot start leaves that bucket's changes to
 // the cache TTL. The caller must hold p.mu.
 func (p *NATSIAMProvider) startWatcher(ctx context.Context, bucket jetstream.KeyValue, name string, invalidate func(key string)) {
-	watcher, err := bucket.WatchAll(ctx, jetstream.UpdatesOnly())
+	watcher, err := bucket.WatchAll(ctx, jetstream.UpdatesOnly(), jetstream.MetaOnly())
 	if err != nil {
 		slog.Error("Failed to start NATS KV watcher — changes to this bucket "+
 			"will only take effect after cache TTL expiry",
@@ -595,9 +595,6 @@ func (p *NATSIAMProvider) watchChanges(watcher jetstream.KeyWatcher, name string
 				p.flushCacheLocked("")
 				p.mu.Unlock()
 				return
-			}
-			if entry == nil {
-				continue // end-of-initial-values marker
 			}
 			p.mu.Lock()
 			invalidate(entry.Key())
