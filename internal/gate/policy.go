@@ -149,9 +149,21 @@ func s3Resource(bucket, key string) string {
 	return "arn:aws:s3:::" + bucket + "/" + key
 }
 
+// maxKeysCondition is s3:max-keys for a listing's max-keys parameter: the
+// client's value, unclamped, as AWS supplies it. A value S3 refuses as a page
+// size leaves the key absent; the handler answers it with InvalidArgument.
+func maxKeysCondition(raw string) (string, bool) {
+	n, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || n < 0 {
+		return "", false
+	}
+	return strconv.FormatInt(n, 10), true
+}
+
 // conditionKeys resolves the IAM condition context keys for one S3 request.
-// s3:prefix is set only for a bucket listing, matching AWS: on any other action
-// the key is absent, which evaluates a condition on it false.
+// s3:prefix is set only for a bucket listing, and s3:max-keys only for a listing
+// that names a page size, matching AWS: elsewhere each key is absent, which
+// evaluates a condition on it false.
 //
 // Every key is omitted rather than set empty when unknown: an empty value reads
 // as a real value that matches nothing, and on a Deny that silently widens
@@ -184,6 +196,11 @@ func conditionKeys(r *http.Request, action string, cred *auth.CredentialResult) 
 	}
 	if action == "s3:ListBucket" {
 		keys[iampolicy.KeyS3Prefix] = r.URL.Query().Get("prefix")
+	}
+	if action == "s3:ListBucket" || action == "s3:ListBucketVersions" {
+		if v, ok := maxKeysCondition(r.URL.Query().Get("max-keys")); ok {
+			keys[iampolicy.KeyS3MaxKeys] = v
+		}
 	}
 	// Resolved from the credential record, never from anything the caller
 	// supplies, so unlike aws:username it is safe for a role session too.
