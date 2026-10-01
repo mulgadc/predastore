@@ -77,7 +77,7 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config)
 			return
 		}
 
-		outcomes := deleteBatch(ctx, mc, bc, cache, cfg, bucket, request.Objects)
+		outcomes := deleteBatch(ctx, mc, bc, cache, cfg, bucket, request.Objects, objectAuthorizerFrom(ctx))
 
 		result := DeleteResult{}
 		for i, object := range request.Objects {
@@ -128,7 +128,7 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config)
 // every key in one request. Keys still run in parallel with each other.
 func deleteBatch(
 	ctx context.Context, mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config,
-	bucket string, objects []DeleteRequestObject,
+	bucket string, objects []DeleteRequestObject, authorize ObjectAuthorizer,
 ) []batchOutcome {
 	outcomes := make([]batchOutcome, len(objects))
 
@@ -155,6 +155,12 @@ func deleteBatch(
 						outcomes[i] = batchOutcome{err: err}
 						continue
 					}
+					// AWS authorizes each key on its own, so one the caller may not
+					// delete is an Error entry beside the ones it may.
+					if !authorize(deleteAction(objects[i]), objects[i].Key) {
+						outcomes[i] = batchOutcome{err: model.ErrAccessDeniedError}
+						continue
+					}
 					outcome, err := deleteObjectVersion(ctx, mc, bc, cache, cfg, bucket, objects[i].Key, objects[i].VersionId)
 					outcomes[i] = batchOutcome{deleteOutcome: outcome, err: err}
 				}
@@ -169,6 +175,15 @@ func deleteBatch(
 	wg.Wait()
 
 	return outcomes
+}
+
+// deleteAction is the permission one batch entry needs, as for the single-key
+// route: destroying a named version is a separate grant from deleting a key.
+func deleteAction(object DeleteRequestObject) string {
+	if object.VersionId != "" {
+		return "s3:DeleteObjectVersion"
+	}
+	return "s3:DeleteObject"
 }
 
 // batchOutcome is one key's result: what the delete did, and whether it failed.

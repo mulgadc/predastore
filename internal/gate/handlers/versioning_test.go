@@ -393,7 +393,8 @@ func TestBatchDeletingEveryVersionEmptiesTheBucket(t *testing.T) {
 	body.WriteString("</Delete>")
 
 	req := httptest.NewRequest(http.MethodPost, "/bucket?delete", strings.NewReader(body.String())).
-		WithContext(WithBucket(context.Background(), model.Bucket{Name: "bucket"}))
+		WithContext(WithObjectAuthorizer(WithBucket(context.Background(), model.Bucket{Name: "bucket"}),
+			func(string, string) bool { return true }))
 	rr := httptest.NewRecorder()
 	DeleteObjects(f.mc, f.bc, f.cache, f.cfg).ServeHTTP(rr, req)
 	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
