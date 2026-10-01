@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -58,6 +59,7 @@ var cacheTestPolicyARN = "arn:aws:iam::" + cacheTestAccount + ":policy/" + cache
 type cacheFixture struct {
 	t        *testing.T
 	p        *NATSIAMProvider
+	keys     *fakeKV
 	users    *fakeKV
 	groups   *fakeKV
 	policies *fakeKV
@@ -89,20 +91,22 @@ func newCacheFixture(t *testing.T, viaGroup bool) *cacheFixture {
 	}
 	f.policies.data[cacheTestAccount+"."+cacheTestPolicy] = f.policyRecord(allowAllS3Policy)
 
+	f.keys = &fakeKV{data: map[string][]byte{
+		cacheTestAKID: mustMarshal(t, iamAccessKey{
+			AccessKeyID:     cacheTestAKID,
+			SecretAccessKey: encryptSessionSecret(t, k.AEAD, "secret"),
+			UserName:        cacheTestUser,
+			AccountID:       cacheTestAccount,
+			Status:          "Active",
+		}),
+	}}
+
 	js := &fakeJetStream{buckets: map[string]*fakeKV{
-		"spinifex-iam-access-keys": {data: map[string][]byte{
-			cacheTestAKID: mustMarshal(t, iamAccessKey{
-				AccessKeyID:     cacheTestAKID,
-				SecretAccessKey: encryptSessionSecret(t, k.AEAD, "secret"),
-				UserName:        cacheTestUser,
-				AccountID:       cacheTestAccount,
-				Status:          "Active",
-			}),
-		}},
-		kvBucketUsers:    f.users,
-		kvBucketRoles:    {data: map[string][]byte{}},
-		kvBucketPolicies: f.policies,
-		kvBucketGroups:   f.groups,
+		"spinifex-iam-access-keys": f.keys,
+		kvBucketUsers:              f.users,
+		kvBucketRoles:              {data: map[string][]byte{}},
+		kvBucketPolicies:           f.policies,
+		kvBucketGroups:             f.groups,
 	}}
 	f.p = &NATSIAMProvider{
 		js:         js,
@@ -154,12 +158,32 @@ func TestNATSIAMProvider_PolicyDocumentChangeEvictsCachedCredential(t *testing.T
 
 func TestNATSIAMProvider_GroupPolicyDetachEvictsCachedCredential(t *testing.T) {
 	f := newCacheFixture(t, true)
+	// The first lookup opens the groups bucket, which flushes the cache mid-lookup,
+	// so only the second lookup leaves an entry for the group watcher to evict.
 	require.True(t, f.canGetObject())
+	require.True(t, f.canGetObject())
+	require.Len(t, f.p.cache, 1, "the group-path lookup is cached")
 
 	f.groups.put(cacheTestAccount+"."+cacheTestGroup, mustMarshal(t, iamGroup{
 		GroupName: cacheTestGroup, AccountID: cacheTestAccount,
 	}))
 	f.requireRevoked()
+}
+
+func TestNATSIAMProvider_AccessKeyDeactivationEvictsCachedCredential(t *testing.T) {
+	f := newCacheFixture(t, false)
+	require.True(t, f.canGetObject())
+	require.Len(t, f.p.cache, 1, "the AKIA lookup is cached")
+
+	var ak iamAccessKey
+	require.NoError(t, json.Unmarshal(f.keys.data[cacheTestAKID], &ak))
+	ak.Status = "Inactive"
+	f.keys.put(cacheTestAKID, mustMarshal(t, ak))
+
+	require.Eventually(t, func() bool {
+		_, err := f.p.LookupCredentials(cacheTestAKID)
+		return err != nil
+	}, 2*time.Second, 10*time.Millisecond)
 }
 
 func TestNATSIAMProvider_InvalidationDuringLookupIsNotCachedOver(t *testing.T) {

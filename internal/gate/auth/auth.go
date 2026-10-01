@@ -389,11 +389,9 @@ func (p *NATSIAMProvider) ensureBuckets(ctx context.Context) error {
 	p.policiesBucket = policiesBucket
 	p.bucketsReady = true
 
-	// Start KV watchers for cache invalidation. ensureBuckets is only ever called
-	// with Background, so the watchers live for the process, not a single request.
-	// A cached credential is keyed by access key but built from the user record,
-	// its groups and their managed policies, so a change to any of those flushes
-	// the cache. Roles are not watched: only uncached session lookups read them.
+	// ctx is always Background, so the watchers live for the process. One user,
+	// group or policy record feeds many cached keys, so its change flushes the cache.
+	// Roles are not watched: only uncached session lookups read them.
 	p.startWatcher(ctx, akBucket, p.bucketName, p.invalidateKeyLocked)
 	p.startWatcher(ctx, usersBucket, kvBucketUsers, p.flushCacheLocked)
 	p.startWatcher(ctx, policiesBucket, kvBucketPolicies, p.flushCacheLocked)
