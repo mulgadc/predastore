@@ -69,7 +69,7 @@ func TestResolveUserPolicies_UserInlineDenyOverridesManagedAllow(t *testing.T) {
 	}
 	policies := map[string][]byte{
 		inlineTestAccount + ".DirectAllowS3": mustMarshal(t, iamPolicy{
-			PolicyName: "DirectAllowS3", PolicyDocument: allowAllS3Policy,
+			PolicyName: "DirectAllowS3", ARN: "arn:aws:iam::" + inlineTestAccount + ":policy/DirectAllowS3", PolicyDocument: allowAllS3Policy,
 		}),
 	}
 	p := newGroupProvider(users, policies, nil)

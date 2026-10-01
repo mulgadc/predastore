@@ -70,7 +70,7 @@ func TestResolveUserPolicies_GroupManagedAllow(t *testing.T) {
 	}
 	policies := map[string][]byte{
 		inlineTestAccount + ".GroupAllowS3": mustMarshal(t, iamPolicy{
-			PolicyName: "GroupAllowS3", PolicyDocument: allowAllS3Policy,
+			PolicyName: "GroupAllowS3", ARN: "arn:aws:iam::" + inlineTestAccount + ":policy/GroupAllowS3", PolicyDocument: allowAllS3Policy,
 		}),
 	}
 	p := newGroupProvider(users, policies, groups)
@@ -127,7 +127,7 @@ func TestResolveUserPolicies_GroupDenyOverridesDirectAllow(t *testing.T) {
 	}
 	policies := map[string][]byte{
 		inlineTestAccount + ".DirectAllowS3": mustMarshal(t, iamPolicy{
-			PolicyName: "DirectAllowS3", PolicyDocument: allowAllS3Policy,
+			PolicyName: "DirectAllowS3", ARN: "arn:aws:iam::" + inlineTestAccount + ":policy/DirectAllowS3", PolicyDocument: allowAllS3Policy,
 		}),
 	}
 	p := newGroupProvider(users, policies, groups)
@@ -159,10 +159,10 @@ func TestResolveUserPolicies_CombineDirectAndGroup(t *testing.T) {
 	}
 	policies := map[string][]byte{
 		inlineTestAccount + ".DirectAllowS3": mustMarshal(t, iamPolicy{
-			PolicyName: "DirectAllowS3", PolicyDocument: allowAllS3Policy,
+			PolicyName: "DirectAllowS3", ARN: "arn:aws:iam::" + inlineTestAccount + ":policy/DirectAllowS3", PolicyDocument: allowAllS3Policy,
 		}),
 		inlineTestAccount + ".GroupAllowS3": mustMarshal(t, iamPolicy{
-			PolicyName: "GroupAllowS3", PolicyDocument: allowAllS3Policy,
+			PolicyName: "GroupAllowS3", ARN: "arn:aws:iam::" + inlineTestAccount + ":policy/GroupAllowS3", PolicyDocument: allowAllS3Policy,
 		}),
 	}
 	p := newGroupProvider(users, policies, groups)
@@ -185,7 +185,7 @@ func TestResolveUserPolicies_MissingGroupSkipped(t *testing.T) {
 	}
 	policies := map[string][]byte{
 		inlineTestAccount + ".DirectAllowS3": mustMarshal(t, iamPolicy{
-			PolicyName: "DirectAllowS3", PolicyDocument: allowAllS3Policy,
+			PolicyName: "DirectAllowS3", ARN: "arn:aws:iam::" + inlineTestAccount + ":policy/DirectAllowS3", PolicyDocument: allowAllS3Policy,
 		}),
 	}
 	p := newGroupProvider(users, policies, map[string][]byte{})
@@ -252,7 +252,7 @@ func TestResolveUserPolicies_GroupsBucketAbsent(t *testing.T) {
 	}
 	policies := map[string][]byte{
 		inlineTestAccount + ".DirectAllowS3": mustMarshal(t, iamPolicy{
-			PolicyName: "DirectAllowS3", PolicyDocument: allowAllS3Policy,
+			PolicyName: "DirectAllowS3", ARN: "arn:aws:iam::" + inlineTestAccount + ":policy/DirectAllowS3", PolicyDocument: allowAllS3Policy,
 		}),
 	}
 	// groups map nil → groupsReady false; js returns ErrBucketNotFound on open.
@@ -294,7 +294,7 @@ func TestResolveUserPolicies_NoGroupsUnchanged(t *testing.T) {
 	}
 	policies := map[string][]byte{
 		inlineTestAccount + ".DirectAllowS3": mustMarshal(t, iamPolicy{
-			PolicyName: "DirectAllowS3", PolicyDocument: allowAllS3Policy,
+			PolicyName: "DirectAllowS3", ARN: "arn:aws:iam::" + inlineTestAccount + ":policy/DirectAllowS3", PolicyDocument: allowAllS3Policy,
 		}),
 	}
 	p := newGroupProvider(users, policies, nil) // groupsBucket nil, groupsReady false, js nil
@@ -332,7 +332,7 @@ func TestResolveUserPolicies_MultipleGroups(t *testing.T) {
 	}
 	policies := map[string][]byte{
 		inlineTestAccount + ".GroupAllowS3": mustMarshal(t, iamPolicy{
-			PolicyName: "GroupAllowS3", PolicyDocument: allowAllS3Policy,
+			PolicyName: "GroupAllowS3", ARN: "arn:aws:iam::" + inlineTestAccount + ":policy/GroupAllowS3", PolicyDocument: allowAllS3Policy,
 		}),
 	}
 	p := newGroupProvider(users, policies, groups)
@@ -396,7 +396,7 @@ func TestLookupSession_UserGroupPoliciesResolve(t *testing.T) {
 	}
 	policies := map[string][]byte{
 		testSessionAccount + ".GroupAllowS3": mustMarshal(t, iamPolicy{
-			PolicyName: "GroupAllowS3", PolicyDocument: allowAllS3Policy,
+			PolicyName: "GroupAllowS3", ARN: "arn:aws:iam::" + testSessionAccount + ":policy/GroupAllowS3", PolicyDocument: allowAllS3Policy,
 		}),
 	}
 	p := newSessionProvider(k, sessions, users, nil, policies)
