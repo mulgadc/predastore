@@ -25,6 +25,8 @@ var gatewayDoorKeys = []string{
 	iampolicy.KeyPrincipalAccount,
 	iampolicy.KeySourceIP,
 	iampolicy.KeyPrincipalType,
+	iampolicy.KeyCurrentTime,
+	iampolicy.KeyEpochTime,
 }
 
 // s3:prefix is the only key this door adds over the gateway's set: it is the one
@@ -38,6 +40,7 @@ var allOperators = []string{
 	iampolicy.OpStringLike,
 	iampolicy.OpIPAddress,
 	iampolicy.OpBool,
+	iampolicy.OpDateEquals,
 }
 
 // emittedKeys drives conditionKeys with everything a request can carry, over the
