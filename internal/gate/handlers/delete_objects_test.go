@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
@@ -21,8 +22,9 @@ const deleteTestBucket = "b"
 // path and recorded under the keys production records — behind the batch
 // delete handler.
 type deleteFixture struct {
-	write   writeFixture
-	handler http.Handler
+	write     writeFixture
+	handler   http.Handler
+	authorize ObjectAuthorizer
 }
 
 func newDeleteFixture(t *testing.T, keys ...string) deleteFixture {
@@ -30,7 +32,11 @@ func newDeleteFixture(t *testing.T, keys ...string) deleteFixture {
 	f := newWriteFixture(4, 2)
 	cache := NewBucketCache([]BucketConfig{{Name: deleteTestBucket, Region: "ap-southeast-2"}})
 
-	fixture := deleteFixture{write: f, handler: DeleteObjects(f.mc, f.bc, cache, f.cfg)}
+	fixture := deleteFixture{
+		write:     f,
+		handler:   DeleteObjects(f.mc, f.bc, cache, f.cfg),
+		authorize: func(string, string) bool { return true },
+	}
 	for _, key := range keys {
 		fixture.seed(t, key, []byte("body of "+key))
 	}
@@ -79,7 +85,11 @@ func (f deleteFixture) deleteKeys(t *testing.T, quiet bool, keys ...string) (*ht
 func (f deleteFixture) post(t *testing.T, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/"+deleteTestBucket+"?delete=", strings.NewReader(body))
-	req = req.WithContext(WithBucket(req.Context(), model.Bucket{Name: deleteTestBucket}))
+	ctx := WithBucket(req.Context(), model.Bucket{Name: deleteTestBucket})
+	if f.authorize != nil {
+		ctx = WithObjectAuthorizer(ctx, f.authorize)
+	}
+	req = req.WithContext(ctx)
 	rr := httptest.NewRecorder()
 	f.handler.ServeHTTP(rr, req)
 	return rr
@@ -152,6 +162,58 @@ func TestDeleteObjectsReportsPerKeyFailure(t *testing.T) {
 	assert.Equal(t, "corrupt.txt", result.Errors[0].Key)
 	assert.Equal(t, string(model.ErrInternalError), result.Errors[0].Code)
 	assert.False(t, f.exists(t, "good.txt"))
+}
+
+// Each key is authorized on its own, as AWS does: a refused key is an
+// AccessDenied entry and survives, and its neighbours are still deleted.
+func TestDeleteObjectsAuthorizesEachKey(t *testing.T) {
+	f := newDeleteFixture(t, "public/a.txt", "secret/b.txt")
+	f.authorize = func(action, key string) bool {
+		return action == "s3:DeleteObject" && !strings.HasPrefix(key, "secret/")
+	}
+
+	rr, result := f.deleteKeys(t, false, "public/a.txt", "secret/b.txt")
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, []string{"public/a.txt"}, deletedKeys(result))
+	require.Len(t, result.Errors, 1)
+	assert.Equal(t, "secret/b.txt", result.Errors[0].Key)
+	assert.Equal(t, string(model.ErrAccessDenied), result.Errors[0].Code)
+	assert.False(t, f.exists(t, "public/a.txt"))
+	assert.True(t, f.exists(t, "secret/b.txt"), "a refused key must survive the batch")
+}
+
+// Destroying a named version needs its own grant, as on the single-key route.
+func TestDeleteObjectsAuthorizesAVersionAsDeleteObjectVersion(t *testing.T) {
+	f := newDeleteFixture(t)
+	var mu sync.Mutex
+	var asked []string
+	f.authorize = func(action, _ string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		asked = append(asked, action)
+		return false
+	}
+
+	rr := f.post(t, "<Delete><Object><Key>k</Key><VersionId>v1</VersionId></Object><Object><Key>j</Key></Object></Delete>")
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.ElementsMatch(t, []string{"s3:DeleteObjectVersion", "s3:DeleteObject"}, asked)
+}
+
+// A request that reached the handler without an authorizer was never
+// authorized, so it deletes nothing.
+func TestDeleteObjectsWithoutAnAuthorizerRefusesEveryKey(t *testing.T) {
+	f := newDeleteFixture(t, "a.txt")
+	f.authorize = nil
+
+	rr, result := f.deleteKeys(t, false, "a.txt")
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.Empty(t, deletedKeys(result))
+	require.Len(t, result.Errors, 1)
+	assert.Equal(t, string(model.ErrAccessDenied), result.Errors[0].Code)
+	assert.True(t, f.exists(t, "a.txt"))
 }
 
 func TestDeleteObjectsQuietReturnsErrorsOnly(t *testing.T) {

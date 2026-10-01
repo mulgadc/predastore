@@ -99,25 +99,12 @@ func allowed(action, resource string, policies []iampolicy.PolicyDocument) bool 
 	return iampolicy.EvaluateWithKeys(action, resource, policies, nil) == iampolicy.Allow
 }
 
-// The batch delete is authorized as a delete of every key in the bucket. Write
-// access alone must not reach it, and delete access on one key must not carry
-// the whole batch.
-func TestEvaluateS3Access_BulkDelete(t *testing.T) {
+// The batch delete maps to s3:DeleteObject, never the multipart PutObject
+// mapping: write access alone must not reach it. Its keys are authorized one
+// by one in the handler.
+func TestS3Action_BulkDelete(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/my-bucket?delete=", nil)
-	action := s3Action(r, "my-bucket", "")
-	resource := s3Resource("my-bucket", "*")
-
-	assert.Equal(t, "s3:DeleteObject", action)
-	assert.Equal(t, "arn:aws:s3:::my-bucket/*", resource)
-
-	writeOnly := []iampolicy.PolicyDocument{doc("Allow", "s3:PutObject", "arn:aws:s3:::my-bucket/*")}
-	assert.False(t, allowed(action, resource, writeOnly))
-
-	oneKey := []iampolicy.PolicyDocument{doc("Allow", "s3:DeleteObject", "arn:aws:s3:::my-bucket/one.txt")}
-	assert.False(t, allowed(action, resource, oneKey))
-
-	bucketWide := []iampolicy.PolicyDocument{doc("Allow", "s3:DeleteObject", "arn:aws:s3:::my-bucket/*")}
-	assert.True(t, allowed(action, resource, bucketWide))
+	assert.Equal(t, "s3:DeleteObject", s3Action(r, "my-bucket", ""))
 }
 
 func TestEvaluateS3Access_DefaultDeny(t *testing.T) {

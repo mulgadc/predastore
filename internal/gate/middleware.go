@@ -255,12 +255,9 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		action := s3Action(r, bucket, key)
 		resource := s3Resource(bucket, key)
-		// The batch delete names its keys in the body, which is not read here.
-		// Authorizing it against every key in the bucket denies a caller who may
-		// delete only some of them, which is the safe direction to be wrong in.
-		if isBulkDelete(r, key) {
-			resource = s3Resource(bucket, "*")
-		}
+		// The batch delete names its keys in the body, which is not read here,
+		// so the handler authorizes each key through this instead.
+		authorize := handlers.ObjectAuthorizer(func(string, string) bool { return true })
 
 		// IAM policy evaluation (NATS-sourced credentials only).
 		if !credResult.SkipPolicyCheck {
@@ -275,7 +272,16 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 					"accessKeyID", accessKey, "accountID", credResult.AccountID)
 			}
 			keys := conditionKeys(r, action, credResult)
-			if iampolicy.EvaluateWithKeys(action, resource, credResult.PolicyDocuments, keys) == iampolicy.Deny {
+			authorize = func(objectAction, objectKey string) bool {
+				objectResource := s3Resource(bucket, objectKey)
+				if iampolicy.EvaluateWithKeys(objectAction, objectResource, credResult.PolicyDocuments, keys) == iampolicy.Allow {
+					return true
+				}
+				slog.DebugContext(r.Context(), "S3 access denied by policy",
+					"action", objectAction, "resource", objectResource, "accessKeyID", accessKey)
+				return false
+			}
+			if !isBulkDelete(r, key) && iampolicy.EvaluateWithKeys(action, resource, credResult.PolicyDocuments, keys) == iampolicy.Deny {
 				slog.DebugContext(r.Context(), "S3 access denied by policy",
 					"action", action, "resource", resource,
 					"accessKeyID", accessKey, "policyCount", len(credResult.PolicyDocuments))
@@ -319,6 +325,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		ctx = context.WithValue(ctx, auth.ContextKeyAccountID, credResult.AccountID)
 		ctx = context.WithValue(ctx, auth.ContextKeyServiceAccount, credResult.SkipPolicyCheck)
 		ctx = handlers.WithSignedPayload(ctx, signedPayload(verified))
+		ctx = handlers.WithObjectAuthorizer(ctx, authorize)
 		// The transaction span opens before authentication, so the account it
 		// resolved to can only be named here. One cluster serves many accounts
 		// and S3 is where a tenant's data lives, so an unattributed request is
