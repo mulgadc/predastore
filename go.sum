@@ -86,8 +86,8 @@ github.com/mattn/go-isatty v0.0.24 h1:tGZZoVgT/KiqK1c8ocVLeDS8BSWMRd47J3Lbz7vsRe
 github.com/mattn/go-isatty v0.0.24/go.mod h1:nMCL3Zebbrt45jsMDgnfIwz6ydEQApk5oEI3HqDio6A=
 github.com/minio/crc64nvme v1.1.1 h1:8dwx/Pz49suywbO+auHCBpCtlW1OfpcLN7wYgVR6wAI=
 github.com/minio/crc64nvme v1.1.1/go.mod h1:eVfm2fAzLlxMdUGc0EEBGSMmPwmXD5XiNRpnu9J3bvg=
-github.com/mulgadc/bluebottle v1.21.1-0.20261001011202-4904308df7ef h1:7xjmp8lTRhxnZqviKV0tDbNcCnBwp6PGr6eNJm+ZDYs=
-github.com/mulgadc/bluebottle v1.21.1-0.20261001011202-4904308df7ef/go.mod h1:LH0MuQcFxet0dDEISlZsuULIYj592eCN2Fv39A6EH5o=
+github.com/mulgadc/bluebottle v1.21.1-0.20261001012726-c8e8261ae573 h1:rVlqvXN8+nA1q8MGYtKfY4GTCMgBjQZBMiHwfNjDiB0=
+github.com/mulgadc/bluebottle v1.21.1-0.20261001012726-c8e8261ae573/go.mod h1:LH0MuQcFxet0dDEISlZsuULIYj592eCN2Fv39A6EH5o=
 github.com/nats-io/nats.go v1.54.0 h1:vsXoOxjHp/GmPUN+EcI7uOf/uB+iAP+kEsAFNQN0yzA=
 github.com/nats-io/nats.go v1.54.0/go.mod h1:y+DZoD1oBOYfZTU681eTUiUjI0vbqYGixNVFHcjHJ0k=
 github.com/nats-io/nkeys v0.4.16 h1:rd5oAuLOb8mnAycB0xleuEBNS1pVVnN0fv/FF34Eypg=
