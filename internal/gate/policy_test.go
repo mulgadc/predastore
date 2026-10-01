@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // --- s3Action tests ---
@@ -186,8 +188,17 @@ func TestConditionKeys_PopulatesEverySupportedKey(t *testing.T) {
 		UserID: "AIDAALICE", PrincipalType: "user",
 	}
 
+	before := time.Now().Truncate(time.Second)
 	keys := conditionKeys(r, "s3:ListBucket", cred)
+	after := time.Now()
 
+	// The request time is the server clock at the call, in both spellings.
+	for _, key := range []string{iampolicy.KeyCurrentTime, iampolicy.KeyEpochTime} {
+		at, err := iampolicy.ParseDate(keys[key])
+		require.NoError(t, err, key)
+		assert.False(t, at.Before(before) || at.After(after), "%s is %s, outside the call", key, at)
+		delete(keys, key)
+	}
 	assert.Equal(t, iampolicy.ConditionKeys{
 		iampolicy.KeySourceIP:         "10.4.1.9",
 		iampolicy.KeySecureTransport:  "true",
@@ -274,6 +285,30 @@ func TestConditionKeys_PrefixOnlyForListBucket(t *testing.T) {
 
 	assert.NotContains(t, keys, iampolicy.KeyS3Prefix)
 	assert.Equal(t, "false", keys[iampolicy.KeySecureTransport])
+}
+
+// A time-boxed Deny fires once its time has passed and not before, read against
+// the clock this door supplies.
+func TestConditionKeys_TimeBoxedDeny(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/my-bucket/obj", nil)
+	keys := conditionKeys(r, "s3:GetObject", &auth.CredentialResult{PrincipalType: "user"})
+
+	for after, want := range map[string]iampolicy.Decision{
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339): iampolicy.Deny,
+		time.Now().Add(time.Hour).UTC().Format(time.RFC3339):  iampolicy.Allow,
+	} {
+		policies := []iampolicy.PolicyDocument{{Statement: []iampolicy.Statement{
+			{Effect: iampolicy.EffectAllow, Action: iampolicy.StringOrArr{"s3:*"}, Resource: iampolicy.StringOrArr{"*"}},
+			{
+				Effect: iampolicy.EffectDeny, Action: iampolicy.StringOrArr{"s3:*"}, Resource: iampolicy.StringOrArr{"*"},
+				Condition: map[string]map[string]iampolicy.ConditionValue{
+					iampolicy.OpDateGreaterThan: {iampolicy.KeyCurrentTime: {after}},
+				},
+			},
+		}}}
+		assert.Equal(t, want, iampolicy.EvaluateWithKeys("s3:GetObject", "arn:aws:s3:::my-bucket/obj", policies, keys),
+			"Deny after %s", after)
+	}
 }
 
 func TestConditionKeys_SourceIPForms(t *testing.T) {

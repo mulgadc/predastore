@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	"github.com/mulgadc/predastore/internal/gate/auth"
@@ -189,5 +190,7 @@ func conditionKeys(r *http.Request, action string, cred *auth.CredentialResult) 
 	if v, ok := cred.PrincipalTypeCondition(); ok {
 		keys[iampolicy.KeyPrincipalType] = v
 	}
+	// The server clock, never a request header, as aws:CurrentTime is in AWS.
+	keys.SetRequestTime(time.Now())
 	return keys
 }
