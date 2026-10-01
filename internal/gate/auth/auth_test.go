@@ -254,6 +254,7 @@ func TestResolveRolePolicies_InlineDenyOverridesManagedAllow(t *testing.T) {
 	}
 	policies := map[string][]byte{
 		inlineTestAccount + ".AllowAll": mustMarshal(t, iamPolicy{
+			ARN:            "arn:aws:iam::" + inlineTestAccount + ":policy/AllowAll",
 			PolicyName:     "AllowAll",
 			PolicyDocument: allowAllS3Policy,
 		}),

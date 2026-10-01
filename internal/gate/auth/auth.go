@@ -147,6 +147,7 @@ type iamGroup struct {
 // iamPolicy mirrors the spinifex IAM Policy stored in NATS KV.
 type iamPolicy struct {
 	PolicyName     string `json:"policy_name"`
+	ARN            string `json:"arn"`
 	PolicyDocument string `json:"policy_document"` // JSON string
 }
 
@@ -885,29 +886,36 @@ func (p *NATSIAMProvider) resolveManagedPolicies(ctx context.Context, accountID,
 			continue
 		}
 
-		arnAccount, policyName, err := iamarn.ParsePolicyARN(arn)
-		if err != nil {
+		var policy iamPolicy
+		_, policyName, err := iamarn.ResolvePolicyARN(arn, func(arnAccount, policyName string) (string, error) {
+			// Scoping a foreign ARN's name to this account would load an unrelated
+			// same-named policy; there is no correct grant to return for it.
+			if arnAccount != accountID {
+				slog.Error("Attached policy ARN names a foreign account — failing closed",
+					"accountID", accountID, "principal", label, "arn", arn, "arnAccountID", arnAccount)
+				return "", fmt.Errorf("%w: %s attached policy ARN %q is not in account %s", ErrPrincipalConfig, label, arn, accountID)
+			}
+			policyKey := accountID + "." + policyName
+			pEntry, err := p.policiesBucket.Get(ctx, policyKey)
+			if err != nil {
+				return "", fmt.Errorf("lookup policy %s: %w", policyKey, err)
+			}
+			if err := json.Unmarshal(pEntry.Value(), &policy); err != nil {
+				return "", fmt.Errorf("unmarshal policy: %w", err)
+			}
+			return policy.ARN, nil
+		})
+		switch {
+		case errors.Is(err, iamarn.ErrInvalidPolicyARN):
 			slog.Error("Attached policy ARN is unparseable — failing closed",
 				"accountID", accountID, "principal", label, "arn", arn, "err", err)
 			return nil, fmt.Errorf("%w: %s attached policy ARN %q: %w", ErrPrincipalConfig, label, arn, err)
-		}
-		// Scoping a foreign ARN's name to this account would load an unrelated
-		// same-named policy; there is no correct grant to return for it.
-		if arnAccount != accountID {
-			slog.Error("Attached policy ARN names a foreign account — failing closed",
-				"accountID", accountID, "principal", label, "arn", arn, "arnAccountID", arnAccount)
-			return nil, fmt.Errorf("%w: %s attached policy ARN %q is not in account %s", ErrPrincipalConfig, label, arn, accountID)
-		}
-
-		policyKey := accountID + "." + policyName
-		pEntry, err := p.policiesBucket.Get(ctx, policyKey)
-		if err != nil {
-			return nil, fmt.Errorf("lookup policy %s: %w", policyKey, err)
-		}
-
-		var policy iamPolicy
-		if err := json.Unmarshal(pEntry.Value(), &policy); err != nil {
-			return nil, fmt.Errorf("unmarshal policy: %w", err)
+		case errors.Is(err, iamarn.ErrPolicyARNMismatch):
+			slog.Error("Attached policy ARN is not the stored policy ARN — failing closed",
+				"accountID", accountID, "principal", label, "arn", arn, "storedArn", policy.ARN)
+			return nil, fmt.Errorf("%w: %s attached policy ARN %q does not match stored ARN %q", ErrPrincipalConfig, label, arn, policy.ARN)
+		case err != nil:
+			return nil, err
 		}
 
 		var doc iampolicy.PolicyDocument

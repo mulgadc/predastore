@@ -138,6 +138,7 @@ func userSessionFixture(t *testing.T, k *masterkey.Key, secret string, expiresAt
 	}
 	policies = map[string][]byte{
 		testSessionAccount + ".AdministratorAccess": mustMarshal(t, iamPolicy{
+			ARN:            "arn:aws:iam::" + testSessionAccount + ":policy/AdministratorAccess",
 			PolicyName:     "AdministratorAccess",
 			PolicyDocument: `{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}`,
 		}),
@@ -176,6 +177,7 @@ func roleWithPolicy(t *testing.T, policyName, policyDoc string) (roles, policies
 	}
 	policies = map[string][]byte{
 		testSessionAccount + "." + policyName: mustMarshal(t, iamPolicy{
+			ARN:            "arn:aws:iam::" + testSessionAccount + ":policy/" + policyName,
 			PolicyName:     policyName,
 			PolicyDocument: policyDoc,
 		}),
@@ -386,9 +388,16 @@ func roleAttaching(t *testing.T, arns ...string) map[string][]byte {
 // seededPolicy builds a policies KV record for a single same-account policy.
 func seededPolicy(t *testing.T, policyName, policyDoc string) map[string][]byte {
 	t.Helper()
+	return seededPolicyAtPath(t, "/", policyName, policyDoc)
+}
+
+// seededPolicyAtPath is seededPolicy for a policy created under path.
+func seededPolicyAtPath(t *testing.T, path, policyName, policyDoc string) map[string][]byte {
+	t.Helper()
 	return map[string][]byte{
 		testSessionAccount + "." + policyName: mustMarshal(t, iamPolicy{
 			PolicyName:     policyName,
+			ARN:            "arn:aws:iam::" + testSessionAccount + ":policy" + path + policyName,
 			PolicyDocument: policyDoc,
 		}),
 	}
@@ -401,23 +410,26 @@ func seededPolicy(t *testing.T, policyName, policyDoc string) map[string][]byte 
 func TestLookupSession_AttachedPolicyARNRejected(t *testing.T) {
 	local := "arn:aws:iam::" + testSessionAccount
 	tests := []struct {
-		name string
-		arns []string
-		seed string
+		name     string
+		arns     []string
+		seed     string
+		seedPath string
 	}{
-		{"foreign account", []string{"arn:aws:iam::999999999999:policy/AdministratorAccess"}, "AdministratorAccess"},
-		{"policy-backup near miss", []string{local + ":policy-backup/AdministratorAccess"}, "AdministratorAccess"},
-		{"malformed AWS managed", []string{"arn:aws:iam::aws:policy/", local + ":policy/S3FullAccess"}, "S3FullAccess"},
-		{"malformed", []string{"not-an-arn", local + ":policy/S3FullAccess"}, "S3FullAccess"},
+		{"foreign account", []string{"arn:aws:iam::999999999999:policy/AdministratorAccess"}, "AdministratorAccess", "/"},
+		{"policy-backup near miss", []string{local + ":policy-backup/AdministratorAccess"}, "AdministratorAccess", "/"},
+		{"malformed AWS managed", []string{"arn:aws:iam::aws:policy/", local + ":policy/S3FullAccess"}, "S3FullAccess", "/"},
+		{"malformed", []string{"not-an-arn", local + ":policy/S3FullAccess"}, "S3FullAccess", "/"},
 		// A skipped ARN used to drop whatever it named — a Deny among them — and
 		// leave the sibling Allow standing. Fail rather than narrow the set.
-		{"malformed after a valid allow", []string{local + ":policy/S3FullAccess", "not-an-arn"}, "S3FullAccess"},
+		{"malformed after a valid allow", []string{local + ":policy/S3FullAccess", "not-an-arn"}, "S3FullAccess", "/"},
+		{"invented path on a pathless policy", []string{local + ":policy/decoy/S3FullAccess"}, "S3FullAccess", "/"},
+		{"pathless ARN for a pathed policy", []string{local + ":policy/S3FullAccess"}, "S3FullAccess", "/team/"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			k := loadTestKey(t)
 			sessions := assumedRoleSession(t, k, "secret", testSessionRoleARN, time.Now().UTC().Add(time.Hour))
-			p := newSessionProvider(k, sessions, nil, roleAttaching(t, tt.arns...), seededPolicy(t, tt.seed, allowAllS3Policy))
+			p := newSessionProvider(k, sessions, nil, roleAttaching(t, tt.arns...), seededPolicyAtPath(t, tt.seedPath, tt.seed, allowAllS3Policy))
 
 			res, err := p.LookupCredentials(testSessionAKID)
 			require.Error(t, err, "an unresolvable attached ARN must fail the resolution")
@@ -445,17 +457,17 @@ func TestLookupSession_AttachedPolicyARNAWSManaged(t *testing.T) {
 }
 
 // TestLookupSession_AttachedPolicyARNWithPath: a path-bearing same-account ARN
-// resolves off its final segment.
+// resolves when it is the policy's stored ARN.
 func TestLookupSession_AttachedPolicyARNWithPath(t *testing.T) {
 	k := loadTestKey(t)
 	roles := roleAttaching(t, "arn:aws:iam::"+testSessionAccount+":policy/team/S3FullAccess")
-	policies := seededPolicy(t, "S3FullAccess", allowAllS3Policy)
+	policies := seededPolicyAtPath(t, "/team/", "S3FullAccess", allowAllS3Policy)
 	sessions := assumedRoleSession(t, k, "secret", testSessionRoleARN, time.Now().UTC().Add(time.Hour))
 	p := newSessionProvider(k, sessions, nil, roles, policies)
 
 	res, err := p.LookupCredentials(testSessionAKID)
 	require.NoError(t, err)
-	require.Len(t, res.PolicyDocuments, 1, "the path-bearing ARN must resolve off its final segment")
+	require.Len(t, res.PolicyDocuments, 1, "the path-bearing ARN must resolve to its stored policy")
 	assert.True(t, allowed("s3:ListBucket", "arn:aws:s3:::session-bucket", res.PolicyDocuments))
 }
 
