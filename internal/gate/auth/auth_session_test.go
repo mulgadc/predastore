@@ -23,19 +23,26 @@ import (
 type fakeKVEntry struct {
 	jetstream.KeyValueEntry
 
+	key string
 	val []byte
 }
 
+func (e fakeKVEntry) Key() string   { return e.key }
 func (e fakeKVEntry) Value() []byte { return e.val }
 
 type fakeKV struct {
 	jetstream.KeyValue
 
-	data   map[string][]byte
-	getErr error // when set, Get returns this error (simulates a non-NotFound KV fault)
+	data    map[string][]byte
+	getErr  error  // when set, Get returns this error (simulates a non-NotFound KV fault)
+	onGet   func() // when set, runs at the start of every Get
+	watcher *fakeWatcher
 }
 
 func (k *fakeKV) Get(_ context.Context, key string) (jetstream.KeyValueEntry, error) {
+	if k.onGet != nil {
+		k.onGet()
+	}
 	if k.getErr != nil {
 		return nil, k.getErr
 	}
@@ -43,7 +50,7 @@ func (k *fakeKV) Get(_ context.Context, key string) (jetstream.KeyValueEntry, er
 	if !ok {
 		return nil, jetstream.ErrKeyNotFound
 	}
-	return fakeKVEntry{val: v}, nil
+	return fakeKVEntry{key: key, val: v}, nil
 }
 
 // --- session test helpers ---
