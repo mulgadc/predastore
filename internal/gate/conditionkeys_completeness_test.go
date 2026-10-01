@@ -29,9 +29,9 @@ var gatewayDoorKeys = []string{
 	iampolicy.KeyEpochTime,
 }
 
-// s3:prefix is the only key this door adds over the gateway's set: it is the one
-// piece of request context that exists on the S3 data plane and nowhere else.
-var s3GateExtraKeys = []string{iampolicy.KeyS3Prefix}
+// s3:prefix and s3:max-keys are the keys this door adds over the gateway's set:
+// request context that exists on the S3 data plane and nowhere else.
+var s3GateExtraKeys = []string{iampolicy.KeyS3Prefix, iampolicy.KeyS3MaxKeys}
 
 // Every operator the evaluator implements, so "is this key usable in a policy"
 // is asked of the whole allowlist rather than one operator of it.
@@ -41,6 +41,7 @@ var allOperators = []string{
 	iampolicy.OpIPAddress,
 	iampolicy.OpBool,
 	iampolicy.OpDateEquals,
+	iampolicy.OpNumericEquals,
 }
 
 // emittedKeys drives conditionKeys with everything a request can carry, over the
@@ -62,7 +63,7 @@ func emittedKeys(t *testing.T) map[string]string {
 	union := make(map[string]string)
 	for name, cred := range creds {
 		for _, action := range []string{"s3:ListBucket", "s3:GetObject"} {
-			r := httptest.NewRequest(http.MethodGet, "/reports?prefix=home/", nil)
+			r := httptest.NewRequest(http.MethodGet, "/reports?prefix=home/&max-keys=100", nil)
 			r.TLS = &tls.ConnectionState{}
 			r.RemoteAddr = "192.0.2.10:41288"
 			for key := range conditionKeys(r, action, cred) {
@@ -91,10 +92,10 @@ func TestConditionKeys_EveryEmittedKeyIsUsableInAPolicy(t *testing.T) {
 	}
 }
 
-// The S3 gate must resolve everything the AWS gateway does, plus s3:prefix. A
+// The S3 gate must resolve everything the AWS gateway does, plus its S3 keys. A
 // key present at one door and not the other makes the same policy document mean
 // different things, which is the disagreement this pair of gates exists to stop.
-func TestConditionKeys_IsTheGatewaySetPlusS3Prefix(t *testing.T) {
+func TestConditionKeys_IsTheGatewaySetPlusS3Keys(t *testing.T) {
 	emitted := make([]string, 0, len(gatewayDoorKeys)+len(s3GateExtraKeys))
 	for key := range emittedKeys(t) {
 		emitted = append(emitted, key)

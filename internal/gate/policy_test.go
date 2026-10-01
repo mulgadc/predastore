@@ -180,7 +180,7 @@ func TestEvaluateS3Access_CaseInsensitiveAction(t *testing.T) {
 // --- conditionKeys tests ---
 
 func TestConditionKeys_PopulatesEverySupportedKey(t *testing.T) {
-	r := httptest.NewRequest(http.MethodGet, "/my-bucket?prefix=home/alice/", nil)
+	r := httptest.NewRequest(http.MethodGet, "/my-bucket?prefix=home/alice/&max-keys=100", nil)
 	r.RemoteAddr = "10.4.1.9:52344"
 	r.TLS = &tls.ConnectionState{}
 	cred := &auth.CredentialResult{
@@ -206,6 +206,7 @@ func TestConditionKeys_PopulatesEverySupportedKey(t *testing.T) {
 		iampolicy.KeyUserID:           "AIDAALICE",
 		iampolicy.KeyPrincipalAccount: "000000000001",
 		iampolicy.KeyS3Prefix:         "home/alice/",
+		iampolicy.KeyS3MaxKeys:        "100",
 		iampolicy.KeyPrincipalType:    iampolicy.PrincipalTypeUser,
 	}, keys)
 }
@@ -285,6 +286,65 @@ func TestConditionKeys_PrefixOnlyForListBucket(t *testing.T) {
 
 	assert.NotContains(t, keys, iampolicy.KeyS3Prefix)
 	assert.Equal(t, "false", keys[iampolicy.KeySecureTransport])
+}
+
+// s3:max-keys carries the page size a listing asked for, unclamped as AWS
+// supplies it, and is absent when none was asked for or on any other action.
+func TestConditionKeys_MaxKeys(t *testing.T) {
+	tests := []struct {
+		name, action, query string
+		want                string
+		absent              bool
+	}{
+		{name: "listing", action: "s3:ListBucket", query: "max-keys=5", want: "5"},
+		{name: "versions listing", action: "s3:ListBucketVersions", query: "versions&max-keys=5", want: "5"},
+		{name: "above the S3 cap", action: "s3:ListBucket", query: "max-keys=5000", want: "5000"},
+		{name: "zero", action: "s3:ListBucket", query: "max-keys=0", want: "0"},
+		{name: "leading zeros", action: "s3:ListBucket", query: "max-keys=005", want: "5"},
+		{name: "plus sign", action: "s3:ListBucket", query: "max-keys=%2B5", want: "5"},
+		{name: "omitted", action: "s3:ListBucket", query: "prefix=home/", absent: true},
+		{name: "empty", action: "s3:ListBucket", query: "max-keys=", absent: true},
+		{name: "negative", action: "s3:ListBucket", query: "max-keys=-1", absent: true},
+		{name: "not a number", action: "s3:ListBucket", query: "max-keys=abc", absent: true},
+		{name: "decimal", action: "s3:ListBucket", query: "max-keys=5.0", absent: true},
+		{name: "beyond 32 bits", action: "s3:ListBucket", query: "max-keys=99999999999", absent: true},
+		{name: "object read", action: "s3:GetObject", query: "max-keys=5", absent: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/my-bucket?"+tt.query, nil)
+			keys := conditionKeys(r, tt.action, &auth.CredentialResult{PrincipalType: "user"})
+			if tt.absent {
+				assert.NotContains(t, keys, iampolicy.KeyS3MaxKeys)
+				return
+			}
+			assert.Equal(t, tt.want, keys[iampolicy.KeyS3MaxKeys])
+		})
+	}
+}
+
+// A page-size cap: a Deny on a listing that asks for more than the limit fires,
+// and one at or under it, or naming no page size, is let through.
+func TestConditionKeys_MaxKeysCapDeny(t *testing.T) {
+	policies := []iampolicy.PolicyDocument{{Statement: []iampolicy.Statement{
+		{Effect: iampolicy.EffectAllow, Action: iampolicy.StringOrArr{"s3:*"}, Resource: iampolicy.StringOrArr{"*"}},
+		{
+			Effect: iampolicy.EffectDeny, Action: iampolicy.StringOrArr{"s3:ListBucket"}, Resource: iampolicy.StringOrArr{"*"},
+			Condition: map[string]map[string]iampolicy.ConditionValue{
+				iampolicy.OpNumericGreaterThan: {iampolicy.KeyS3MaxKeys: {"100"}},
+			},
+		},
+	}}}
+	for query, want := range map[string]iampolicy.Decision{
+		"max-keys=101": iampolicy.Deny,
+		"max-keys=100": iampolicy.Allow,
+		"prefix=home/": iampolicy.Allow,
+	} {
+		r := httptest.NewRequest(http.MethodGet, "/my-bucket?"+query, nil)
+		keys := conditionKeys(r, "s3:ListBucket", &auth.CredentialResult{PrincipalType: "user"})
+		assert.Equal(t, want, iampolicy.EvaluateWithKeys("s3:ListBucket", "arn:aws:s3:::my-bucket", policies, keys),
+			"listing with %s", query)
+	}
 }
 
 // A time-boxed Deny fires once its time has passed and not before, read against
