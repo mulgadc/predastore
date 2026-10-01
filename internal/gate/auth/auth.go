@@ -240,6 +240,10 @@ type NATSIAMProvider struct {
 
 	mu    sync.RWMutex
 	cache map[string]*cachedCredential
+	// cacheGen advances on every invalidation. A lookup only caches its result if
+	// the generation it started under is still current, so a KV change that lands
+	// mid-lookup cannot be overwritten by the stale result.
+	cacheGen uint64
 
 	// Lazy-initialized KV buckets — nil until spinifex daemon creates them.
 	accessKeysBucket jetstream.KeyValue
@@ -259,7 +263,7 @@ type NATSIAMProvider struct {
 	groupsBucket jetstream.KeyValue
 	groupsReady  bool
 
-	watcher   jetstream.KeyWatcher
+	watchers  []jetstream.KeyWatcher
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -385,17 +389,12 @@ func (p *NATSIAMProvider) ensureBuckets(ctx context.Context) error {
 	p.policiesBucket = policiesBucket
 	p.bucketsReady = true
 
-	// Start KV watcher for cache invalidation. ensureBuckets is only ever called
-	// with Background, so the watcher lives for the process, not a single request.
-	watcher, err := akBucket.WatchAll(ctx)
-	if err != nil {
-		slog.Error("Failed to start NATS KV watcher — cache invalidation will not work, "+
-			"credential changes will only take effect after cache TTL expiry",
-			"error", err, "ttl", cacheTTL)
-	} else {
-		p.watcher = watcher
-		go p.watchChanges()
-	}
+	// ctx is always Background, so the watchers live for the process. One user,
+	// group or policy record feeds many cached keys, so its change flushes the cache.
+	// Roles are not watched: only uncached session lookups read them.
+	p.startWatcher(ctx, akBucket, p.bucketName, p.invalidateKeyLocked)
+	p.startWatcher(ctx, usersBucket, kvBucketUsers, p.flushCacheLocked)
+	p.startWatcher(ctx, policiesBucket, kvBucketPolicies, p.flushCacheLocked)
 
 	slog.Info("IAM KV buckets now available — IAM authentication is active")
 	return nil
@@ -442,6 +441,10 @@ func (p *NATSIAMProvider) ensureGroupsBucket(ctx context.Context) error {
 
 	p.groupsBucket = bucket
 	p.groupsReady = true
+
+	// Credentials cached while the bucket was absent skipped group resolution.
+	p.flushCacheLocked("")
+	p.startWatcher(ctx, bucket, kvBucketGroups, p.flushCacheLocked)
 	slog.Info("IAM groups bucket now available — group-inherited S3 permissions are active")
 	return nil
 }
@@ -565,30 +568,60 @@ func (p *NATSIAMProvider) lookupSessionCredentials(ctx context.Context, accessKe
 	}, nil
 }
 
-func (p *NATSIAMProvider) watchChanges() {
+// startWatcher watches bucket for changes and calls invalidate, under p.mu, with
+// each changed key. A watcher that cannot start leaves that bucket's changes to
+// the cache TTL. The caller must hold p.mu.
+func (p *NATSIAMProvider) startWatcher(ctx context.Context, bucket jetstream.KeyValue, name string, invalidate func(key string)) {
+	watcher, err := bucket.WatchAll(ctx, jetstream.UpdatesOnly())
+	if err != nil {
+		slog.Error("Failed to start NATS KV watcher — changes to this bucket "+
+			"will only take effect after cache TTL expiry",
+			"bucket", name, "error", err, "ttl_ms", cacheTTL.Milliseconds())
+		return
+	}
+	p.watchers = append(p.watchers, watcher)
+	go p.watchChanges(watcher, name, invalidate)
+}
+
+func (p *NATSIAMProvider) watchChanges(watcher jetstream.KeyWatcher, name string, invalidate func(key string)) {
 	for {
 		select {
-		case entry, ok := <-p.watcher.Updates():
+		case entry, ok := <-watcher.Updates():
 			if !ok {
-				slog.Error("NATS KV watcher channel closed unexpectedly — " +
-					"cache invalidation is disabled, cached credentials may become stale")
+				slog.Error("NATS KV watcher channel closed unexpectedly — "+
+					"cache invalidation is disabled, cached credentials may become stale",
+					"bucket", name)
 				p.mu.Lock()
-				p.cache = make(map[string]*cachedCredential)
+				p.flushCacheLocked("")
 				p.mu.Unlock()
 				return
 			}
 			if entry == nil {
-				continue // initial nil sentinel
+				continue // end-of-initial-values marker
 			}
-			// Invalidate cache for this access key
 			p.mu.Lock()
-			delete(p.cache, entry.Key())
+			invalidate(entry.Key())
 			p.mu.Unlock()
-			slog.Debug("Cache invalidated for access key", "key", entry.Key())
+			slog.Debug("IAM credential cache invalidated", "bucket", name, "key", entry.Key())
 		case <-p.done:
 			return
 		}
 	}
+}
+
+// invalidateKeyLocked evicts one access key's cached credential. The caller
+// must hold p.mu.
+func (p *NATSIAMProvider) invalidateKeyLocked(accessKeyID string) {
+	delete(p.cache, accessKeyID)
+	p.cacheGen++
+}
+
+// flushCacheLocked evicts every cached credential. The key is ignored: a user,
+// group or policy record feeds an unknown set of cached credentials. The caller
+// must hold p.mu.
+func (p *NATSIAMProvider) flushCacheLocked(string) {
+	clear(p.cache)
+	p.cacheGen++
 }
 
 func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResult, error) {
@@ -629,6 +662,7 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 			return nil, fmt.Errorf("IAM lookup unavailable: %w", err)
 		}
 	}
+	gen := p.cacheGen
 	p.mu.Unlock()
 
 	// Lookup access key in NATS KV
@@ -685,11 +719,13 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 		UserID:          userID,
 	}
 
-	// Cache the result
+	// Cache the result unless an invalidation landed while it was being built.
 	p.mu.Lock()
-	p.cache[accessKeyID] = &cachedCredential{
-		result:    result,
-		expiresAt: time.Now().Add(cacheTTL),
+	if p.cacheGen == gen {
+		p.cache[accessKeyID] = &cachedCredential{
+			result:    result,
+			expiresAt: time.Now().Add(cacheTTL),
+		}
 	}
 	p.mu.Unlock()
 
@@ -931,8 +967,11 @@ func (p *NATSIAMProvider) resolveManagedPolicies(ctx context.Context, accountID,
 func (p *NATSIAMProvider) Close() {
 	p.closeOnce.Do(func() {
 		close(p.done)
-		if p.watcher != nil {
-			if err := p.watcher.Stop(); err != nil {
+		p.mu.Lock()
+		watchers := p.watchers
+		p.mu.Unlock()
+		for _, w := range watchers {
+			if err := w.Stop(); err != nil {
 				slog.Warn("Failed to stop NATS KV watcher during cleanup", "error", err)
 			}
 		}
