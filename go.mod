@@ -3,7 +3,7 @@ module github.com/mulgadc/predastore
 go 1.27.0
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.47.0
+	github.com/aws/aws-sdk-go-v2 v1.47.1
 	github.com/buraksezer/consistent v1.1.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dgraph-io/badger/v4 v4.9.6
