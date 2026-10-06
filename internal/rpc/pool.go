@@ -20,6 +20,11 @@ import (
 // reconnect must build a new one.
 var ErrPoolClosed = errors.New("connection pool closed")
 
+// ErrDialResult is returned by Dial when a dial that reported no error handed
+// back something other than a connection. It is a bug in the pool, surfaced as
+// a failed dial so that it costs the caller one request rather than the node.
+var ErrDialResult = errors.New("connection pool dial returned no connection")
+
 // maxStreamStalls is how many streams in a row may get no response at all
 // before the pool drops the connection carrying them. One stall is ordinary
 // and three in a row is not a connection worth keeping.
@@ -154,8 +159,7 @@ func (p *ConnPool) Dial(ctx context.Context, remote config.NodeID) (transport.Co
 		}
 		conn, ok := res.Val.(transport.Conn)
 		if !ok {
-			//nolint:forbidigo // Temporary until ConnPool returns a sentinel error for this invariant violation.
-			panic("singleflight did not return a valid Conn")
+			return nil, ErrDialResult
 		}
 		return conn, nil
 	case <-ctx.Done():
