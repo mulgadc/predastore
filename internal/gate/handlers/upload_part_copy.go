@@ -72,7 +72,7 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 
 		srcPlace, srcSize, err := loadPlacement(ctx, mc, ring, cfg, srcBucket, srcKey)
 		if err != nil {
-			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(srcKey))
+			HandleError(w, r, placementReadError(ctx, srcBucket, srcKey, err))
 			return
 		}
 

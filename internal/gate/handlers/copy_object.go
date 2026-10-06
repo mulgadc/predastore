@@ -100,7 +100,7 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 
 		srcPlace, srcSize, err := loadPlacementByHash(ctx, mc, ring, cfg, srcTarget.hash)
 		if err != nil {
-			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(srcKey))
+			HandleError(w, r, placementReadError(ctx, srcBucket, srcKey, err))
 			return
 		}
 

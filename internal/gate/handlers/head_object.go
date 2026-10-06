@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 )
 
@@ -48,7 +47,7 @@ func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Con
 
 		place, size, err := loadPlacementByHash(ctx, mc, ring, cfg, target.hash)
 		if err != nil {
-			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
+			HandleError(w, r, placementReadError(ctx, bucket, key, err))
 			return
 		}
 

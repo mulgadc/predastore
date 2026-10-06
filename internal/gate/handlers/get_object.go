@@ -53,7 +53,7 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		place, size, err := loadPlacementByHash(ctx, mc, ring, cfg, target.hash)
 		if err != nil {
-			HandleError(w, r, model.ErrNoSuchKeyError.WithResource(key))
+			HandleError(w, r, placementReadError(ctx, bucket, key, err))
 			return
 		}
 		recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseMetaPlacement, phase)
