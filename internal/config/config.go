@@ -43,6 +43,13 @@ type (
 	HostID uint64
 )
 
+// LogValue logs the id as a number. The OTel slog bridge has no case for a named
+// integer type, so without this it ships as "unhandled: (config.NodeID) 4".
+func (id NodeID) LogValue() slog.Value { return slog.Uint64Value(uint64(id)) }
+
+// LogValue logs the id as a number, for the same reason as NodeID.LogValue.
+func (id HostID) LogValue() slog.Value { return slog.Uint64Value(uint64(id)) }
+
 // Role is the function a node performs within the cluster, as written under
 // [[host.node]].
 type Role string

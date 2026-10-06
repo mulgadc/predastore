@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -280,4 +281,14 @@ func TestValidate_AdminPort(t *testing.T) {
 			assert.Contains(t, err.Error(), "is not a port")
 		}
 	})
+}
+
+// The OTel bridge stringifies a named integer it has no case for, so an id that
+// stopped resolving to a plain integer could no longer be grouped by in the sink.
+func TestIDsResolveToIntegerLogValues(t *testing.T) {
+	for _, v := range []any{NodeID(4), HostID(2)} {
+		got := slog.AnyValue(v).Resolve()
+		require.Equal(t, slog.KindUint64, got.Kind(), "%T", v)
+	}
+	assert.Equal(t, uint64(4), slog.AnyValue(NodeID(4)).Resolve().Uint64())
 }
