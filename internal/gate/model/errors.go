@@ -82,6 +82,12 @@ var (
 		StatusCode: 404,
 	}
 
+	ErrInternalErrorError = &S3Error{
+		Code:       ErrInternalError,
+		Message:    "We encountered an internal error. Please try again.",
+		StatusCode: http.StatusInternalServerError,
+	}
+
 	ErrAccessDeniedError = &S3Error{
 		Code:       ErrAccessDenied,
 		Message:    "Access Denied",

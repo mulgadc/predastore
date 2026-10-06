@@ -19,6 +19,7 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/chunked"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/meta"
 	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
@@ -763,10 +764,25 @@ func loadPlacementByHash(ctx context.Context, mc MetaClient, ring *placement.Rin
 	}
 
 	if len(shardNodes) != (len(objectToShardNodes.DataShardNodes) + len(objectToShardNodes.ParityShardNodes)) {
-		return ObjectToShardNodes{}, 0, errors.New("number of shards does not match number of hash ring shards")
+		return ObjectToShardNodes{}, 0, errShardCountMismatch
 	}
 
 	return objectToShardNodes, objectToShardNodes.Size, nil
+}
+
+// errShardCountMismatch is a placement record naming a different number of
+// shards than the ring places for its object: corrupt state, not a missing key.
+var errShardCountMismatch = errors.New("number of shards does not match number of hash ring shards")
+
+// placementReadError answers a failed placement read. Only an absent record is
+// NoSuchKey; anything else is a fault in the gate or its state, so it is logged
+// here and the client gets a bare InternalError rather than a false 404.
+func placementReadError(ctx context.Context, bucket, key string, err error) error {
+	if errors.Is(err, meta.ErrNotFound) {
+		return model.ErrNoSuchKeyError.WithResource(key)
+	}
+	slog.ErrorContext(ctx, "Placement read failed", "bucket", bucket, "key", key, "error", err)
+	return model.ErrInternalErrorError
 }
 
 // recordShardReadError counts a failed shard read under a bounded reason. The
