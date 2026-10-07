@@ -1,3 +1,6 @@
+// Package rpc carries predastore's intra-cluster requests: a framed header per
+// stream, a client and server keyed by opcode, and a pool holding one connection
+// per peer node.
 package rpc
 
 import "errors"

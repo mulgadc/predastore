@@ -1,3 +1,5 @@
+// Package storetest provides test fixtures for the blob engine: an in-memory
+// reference store to check the real store against, and a fixed master key.
 package storetest
 
 import (

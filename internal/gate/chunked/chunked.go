@@ -1,3 +1,5 @@
+// Package chunked decodes aws-chunked upload bodies, verifying per-chunk
+// signatures and trailing checksums while streaming out the object bytes.
 package chunked
 
 import (

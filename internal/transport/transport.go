@@ -1,3 +1,5 @@
+// Package transport abstracts the streams predastore nodes exchange, with a QUIC
+// transport between nodes and an in-process pipe transport within one.
 package transport
 
 import (
