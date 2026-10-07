@@ -294,7 +294,7 @@ func natsIAMOptions(cfg *IAMConfig) []nats.Option {
 	return opts
 }
 
-// The provider connects to NATS eagerly but opens KV buckets lazily — this allows
+// NewNATSIAMProvider connects to NATS eagerly but opens KV buckets lazily — this allows
 // predastore to start before the spinifex daemon creates the IAM buckets during bootstrap.
 func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 	if cfg.NATSUrl == "" {
