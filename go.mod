@@ -3,7 +3,7 @@ module github.com/mulgadc/predastore
 go 1.27.2
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.47.1
+	github.com/aws/aws-sdk-go-v2 v1.47.2
 	github.com/buraksezer/consistent v1.1.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dgraph-io/badger/v4 v4.9.6
@@ -18,17 +18,17 @@ require (
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/quic-go/quic-go v0.63.0
 	github.com/stretchr/testify v1.12.1
-	go.opentelemetry.io/otel v1.46.0
-	go.opentelemetry.io/otel/metric v1.46.0
-	go.opentelemetry.io/otel/sdk v1.46.0
-	go.opentelemetry.io/otel/sdk/metric v1.46.0
-	go.opentelemetry.io/otel/trace v1.46.0
+	go.opentelemetry.io/otel v1.47.0
+	go.opentelemetry.io/otel/metric v1.47.0
+	go.opentelemetry.io/otel/sdk v1.47.0
+	go.opentelemetry.io/otel/sdk/metric v1.47.0
+	go.opentelemetry.io/otel/trace v1.47.0
 	golang.org/x/sync v0.24.0
 	pgregory.net/rapid v1.3.0
 )
 
 require (
-	github.com/aws/smithy-go v1.28.2 // indirect
+	github.com/aws/smithy-go v1.28.4 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.4.0 // indirect
@@ -59,7 +59,7 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc v1.46.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.46.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.46.0 // indirect
-	go.opentelemetry.io/otel/log v0.22.0 // indirect
+	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/sdk/log v0.22.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	go.uber.org/mock v0.6.0 // indirect
