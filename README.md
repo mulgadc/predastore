@@ -12,11 +12,11 @@
 
 <p align="center">
   <a href="#standalone-or-spinifex">Standalone or Spinifex</a> ·
-  <a href="#quick-start">Quick start</a> ·
-  <a href="#s3-api-support">S3 API support</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#s3-api-support">S3 API Support</a> ·
   <a href="#architecture">Architecture</a> ·
   <a href="#configuration">Configuration</a> ·
-  <a href="#spinifex-integration">Spinifex integration</a> ·
+  <a href="#spinifex-integration">Spinifex Integration</a> ·
   <a href="#development">Development</a> ·
   <a href="#roadmap">Roadmap</a>
 </p>
