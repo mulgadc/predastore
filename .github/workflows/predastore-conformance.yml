@@ -50,16 +50,16 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@v7.0.0
         with:
           cache-dependency-path: "go.sum"
           go-version-file: "go.mod"
 
       - name: Setup Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: "3.13"
 
@@ -86,7 +86,7 @@ jobs:
 
       - name: Upload Manifest
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: s3-tests-manifest
           path: /tmp/predastore-s3-tests/manifest.txt
