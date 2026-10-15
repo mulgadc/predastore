@@ -54,7 +54,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
 
       # Builds the image the same way an operator would, which is also the
       # only place the FIPS build guard runs: a binary built without GOFIPS140
@@ -143,10 +143,10 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@v7.0.0
         with:
           cache: true
           go-version-file: "go.mod"
@@ -189,7 +189,7 @@ jobs:
 
       - name: Upload Results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: stress-${{ matrix.scenario }}
           path: scripts/bench/results/e2e-stress/
@@ -280,7 +280,7 @@ jobs:
 
       - name: Checkout Code
         if: steps.gate.outputs.paused != 'true'
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7.0.1
 
       # runner.temp is not reachable from job-level env:, and the runner's /tmp
       # may be tmpfs, so HW_WORK is resolved here against RUNNER_TEMP.
@@ -295,7 +295,7 @@ jobs:
       # to upload it back. The toolchain itself is found locally in 0.1s.
       - name: Setup Go
         if: steps.gate.outputs.paused != 'true'
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@v7.0.0
         with:
           cache: false
           go-version-file: "go.mod"
@@ -497,7 +497,7 @@ jobs:
 
       - name: Upload Results
         if: always() && steps.gate.outputs.paused != 'true' && steps.config.outcome == 'success'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: performance
           # Two roots, not one. A loopback figure and a bare-metal one are not
