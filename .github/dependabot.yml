@@ -32,3 +32,24 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  - package-ecosystem: docker
+    target-branch: dev
+    directory: /
+    schedule:
+      interval: weekly
+      day: sunday
+      timezone: Australia/Sydney
+    cooldown:
+      default-days: 3
+    # The golang version is deliberate and changes with go.mod; only its digest moves here.
+    ignore:
+      - dependency-name: golang
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+          - "version-update:semver-patch"
+    groups:
+      docker-images:
+        patterns:
+          - "*"
