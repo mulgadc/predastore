@@ -463,6 +463,8 @@ func TestCurrentBehaviour_PredastoreBootstrap_ConfigShadowsIAM(t *testing.T) {
 func TestCurrentBehaviour_PredastoreBootstrap_ConfigIgnoresAccountStatus(t *testing.T) {
 	f := auth.NewCharFixture(t, allowAllS3)
 	f.SetAccountStatus("TERMINATING")
+	// IAM can no longer admit this key, so only the config entry can.
+	f.SetKeyStatus("Inactive")
 	config := auth.NewConfigProvider([]auth.Entry{{
 		AccessKeyID: auth.CharAKID, SecretAccessKey: auth.CharSecret, AccountID: auth.TestSessionAccount,
 	}})
