@@ -56,7 +56,7 @@ Checked at startup, and the run exits rather than half-working without them:
 aws  awk  curl  diff  git  go  openssl
 ```
 
-Plus Go **1.27.0** (from `go.mod`) and `warp`, which `make warp-install` fetches
+Plus Go **1.27.3** (from `go.mod`) and `warp`, which `make warp-install` fetches
 into `bin/tools/warp` if it is missing.
 
 `shellcheck` is a `make preflight` dependency, not an e2e one, but you want it on
@@ -194,7 +194,7 @@ full run nightly on a self-hosted box.
 
 ```bash
 sudo apt-get install -y awscli curl git openssl shellcheck
-# Go 1.27.0 — match go.mod; actions/setup-go with go-version-file works too
+# Go 1.27.3 — match go.mod; actions/setup-go with go-version-file works too
 ```
 
 The runner user needs passwordless sudo for `ip` and `update-ca-certificates`.
