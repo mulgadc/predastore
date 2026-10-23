@@ -970,6 +970,10 @@ func tombstoneSegNum(key []byte) uint64 {
 	return binary.BigEndian.Uint64(key[1:9])
 }
 
+func tombstoneOff(key []byte) int64 {
+	return int64(binary.BigEndian.Uint64(key[9:17])) //nolint:gosec // round-trips bit-for-bit with the int64 cast in tombstoneKey.
+}
+
 func tombstoneValue(psize int64) []byte {
 	v := make([]byte, 8)
 	binary.BigEndian.PutUint64(v, uint64(psize)) //nolint:gosec // PSize is a non-negative on-disk byte count.

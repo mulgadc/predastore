@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -352,17 +353,30 @@ func (store *Store) sweepRetained(maxAge time.Duration) (int, error) {
 	return dropped, nil
 }
 
+// tombstoneTotals summarises one segment's tombstones: the dead bytes they
+// account for, how many there are, and one example slot. The example is what
+// identifies the writer when the segment a tombstone names is already gone.
+type tombstoneTotals struct {
+	bytes   int64
+	count   int
+	sampOff int64
+	sampLen int64
+}
+
 // candidateSegments scans the tombstone namespace, sums dead bytes per segment,
 // and returns segments whose live fraction is below the threshold, plus a
 // count of segments that could not be inspected. The active append segment is
 // never a candidate — it is the relocation destination.
 //
-// A segment that fails to open or stat is skipped rather than aborting the
-// whole scan: one bad segment (e.g. dropped out from under a stale tombstone)
-// must not strand every other reclaimable candidate. The skip is logged loudly
-// so a persistently bad segment stays visible rather than silently dropped.
+// A segment whose file is gone has its tombstones reclaimed here, since nothing
+// else ever would: deleteTombstones is reachable only for a candidate, and the
+// missing file is what stops the segment becoming one.
+//
+// A segment that exists but cannot be opened or stat'd is a real fault. That
+// one is logged loudly and counted, and skipped rather than aborting the scan,
+// so one bad segment does not strand every other reclaimable candidate.
 func (store *Store) candidateSegments() ([]uint64, int, error) {
-	dead := make(map[uint64]int64)
+	dead := make(map[uint64]tombstoneTotals)
 	err := store.indexScan([]byte{tombstonePrefix}, func(k, v []byte) error {
 		// Keys carry no namespace prefix, so roughly one hash in
 		// 256 starts with tombstonePrefix and lands in this scan. Reading a
@@ -371,7 +385,15 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 		if len(k) != tombstoneKeySize {
 			return nil
 		}
-		dead[tombstoneSegNum(k)] += int64(binary.BigEndian.Uint64(v)) //nolint:gosec // tombstone value is a non-negative byte count.
+		psize := int64(binary.BigEndian.Uint64(v)) //nolint:gosec // tombstone value is a non-negative byte count.
+		num := tombstoneSegNum(k)
+		totals := dead[num]
+		totals.bytes += psize
+		totals.count++
+		if totals.count == 1 {
+			totals.sampOff, totals.sampLen = tombstoneOff(k), psize
+		}
+		dead[num] = totals
 		return nil
 	})
 	if err != nil {
@@ -381,20 +403,23 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 	store.recordOccupancy(dead)
 
 	store.mutex.Lock()
-	defer store.mutex.Unlock()
 
-	var candidates []uint64
+	var candidates, dropped []uint64
 	var failed int
-	for num, deadBytes := range dead {
+	for num, totals := range dead {
 		if num == store.segNum {
 			continue
 		}
 
-		// Read path: a candidate must already exist. If it doesn't (e.g. a
-		// tombstone survived a segment already dropped), skip it and keep
-		// going rather than fabricating a stub or stalling the whole scan.
 		seg, err := store.getSegment(num, false)
 		if err != nil {
+			// A segment file that is not there cannot hold live data, so every
+			// tombstone naming it is dead weight. Reclaim it below, outside the
+			// mutex, rather than reporting it on every cycle forever.
+			if errors.Is(err, fs.ErrNotExist) {
+				dropped = append(dropped, num)
+				continue
+			}
 			slog.Error("compaction candidate segment unreadable, skipping", "segNum", num, "error", err)
 			failed++
 			continue
@@ -410,10 +435,30 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 		if size <= segHeaderSize {
 			continue
 		}
-		if float64(size-deadBytes)/float64(size) < compactionLiveThreshold {
+		if float64(size-totals.bytes)/float64(size) < compactionLiveThreshold {
 			candidates = append(candidates, num)
 		}
 	}
+	store.mutex.Unlock()
+
+	for _, num := range dropped {
+		totals := dead[num]
+		// The slot is the diagnostic: a tombstone in a segment that has already
+		// been dropped was written by something holding a row that still named
+		// it, and the offset and size are what identify which extent that was.
+		slog.Warn("reclaiming tombstones naming a dropped segment",
+			"segNum", num,
+			"tombstones", totals.count,
+			"deadBytes", totals.bytes,
+			"sampleOff", totals.sampOff,
+			"samplePSize", totals.sampLen)
+
+		if err := store.deleteTombstones(num); err != nil {
+			slog.Error("could not reclaim tombstones naming a dropped segment", "segNum", num, "error", err)
+			failed++
+		}
+	}
+
 	return candidates, failed, nil
 }
 
@@ -421,10 +466,10 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 // Snapshot to report. It runs once per compaction cycle, where a directory walk
 // is affordable, precisely so the reporting path never has to do one.
 //
-// dead carries every tombstone, including any left behind for a segment that
-// has already been dropped, so the live figure is clamped at zero rather than
-// trusted to be consistent with the files on disk.
-func (store *Store) recordOccupancy(dead map[uint64]int64) {
+// dead carries every tombstone, including any naming a segment that has
+// already been dropped and is reclaimed later in this cycle, so the live figure
+// is clamped at zero rather than trusted to agree with the files on disk.
+func (store *Store) recordOccupancy(dead map[uint64]tombstoneTotals) {
 	entries, err := os.ReadDir(store.dir)
 	if err != nil {
 		slog.Warn("occupancy measurement skipped", "dir", store.dir, "error", err)
@@ -445,8 +490,8 @@ func (store *Store) recordOccupancy(dead map[uint64]int64) {
 	}
 
 	var deadBytes int64
-	for _, b := range dead {
-		deadBytes += b
+	for _, totals := range dead {
+		deadBytes += totals.bytes
 	}
 
 	store.mutex.Lock()

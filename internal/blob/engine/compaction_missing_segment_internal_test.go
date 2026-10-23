@@ -117,7 +117,7 @@ func TestCompactOnceSkipsUnopenableSegment(t *testing.T) {
 // between the read/create split and per-segment error isolation: a segment
 // whose file is already gone but whose tombstones are still live in the index
 // (e.g. a crash between dropSegment and deleteTombstones leaves this exact
-// state) must be skipped, not stall the cycle.
+// state) must not stall the cycle, and its tombstones must be reclaimed.
 //
 // Before the read/create split, getSegment fabricated a header-only stand-in
 // for the missing segment, which candidateSegments then discarded as
@@ -172,6 +172,12 @@ func TestCompactOnceSkipsDroppedButStillTombstonedSegment(t *testing.T) {
 	// The dropped segment must not be resurrected by the cycle that just skipped it.
 	if _, err := os.Stat(filepath.Join(dir, fmt.Sprintf(segFilename, victim))); !os.IsNotExist(err) {
 		t.Errorf("dropped segment %d was resurrected on disk, stat gave %v", victim, err)
+	}
+
+	// Nothing else ever clears these, so a cycle that leaves them rescans the
+	// same gone segment on every pass for the life of the process.
+	if n := tombstoneCount(t, st, victim); n != 0 {
+		t.Errorf("already-dropped segment %d still has %d tombstones after a cycle", victim, n)
 	}
 
 	// Every other candidate must still have been reclaimed: the missing one
