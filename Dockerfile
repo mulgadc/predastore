@@ -9,7 +9,7 @@
 
 # Base images are pinned by digest so a rebuild of the same commit gets the
 # same bytes; Dependabot bumps the tag and digest together.
-FROM golang:1.27.3-trixie@sha256:1896654cfc5c2b5ad74c07f29cb36f5d2d1cbed42e3054070fbfe444e521e83c AS builder
+FROM golang:1.27.3-trixie@sha256:fbb7ae40b62ff8afe31662df570d39b4f5052ac32b90dae8e60d7657a20a74f4 AS builder
 
 # GOFIPS140 is a build-time contract, not a preference. bluebottle/pkg/fipsboot
 # is a blank import in cmd/s3d, and its init() panics unless the binary was
@@ -44,7 +44,7 @@ RUN out="$(/out/s3d -h 2>&1 || true)"; \
     esac
 
 
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f AS runtime
+FROM debian:trixie-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad AS runtime
 
 # openssl generates the TLS identity and the at-rest key on first start; curl
 # backs the healthcheck below. Both could go once s3d grows subcommands for
