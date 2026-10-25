@@ -16,7 +16,7 @@ require (
 	github.com/mulgadc/bluebottle v1.22.0
 	github.com/nats-io/nats.go v1.54.0
 	github.com/pelletier/go-toml/v2 v2.4.3
-	github.com/quic-go/quic-go v0.63.0
+	github.com/quic-go/quic-go v0.64.1
 	github.com/stretchr/testify v1.12.1
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/metric v1.47.0
