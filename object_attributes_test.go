@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strconv"
 	"testing"
 	"time"
@@ -120,6 +121,7 @@ func TestObjectAttributesSurviveTheWholeStack(t *testing.T) {
 		var err error
 		put, err = client.Do(signedRequest(t, http.MethodPut, url, []byte("bar"), map[string]string{
 			"Content-Type": "audio/ogg", "X-Amz-Meta-Key1": "value1", "X-Amz-Meta-Empty": "",
+			"Cache-Control": "public, max-age=31536000, immutable", "Content-Disposition": `attachment; filename="doc.txt"`,
 		}))
 		if err == nil || time.Now().After(deadline) {
 			require.NoError(t, err)
@@ -141,8 +143,28 @@ func TestObjectAttributesSurviveTheWholeStack(t *testing.T) {
 		require.Equal(t, "audio/ogg", resp.Header.Get("Content-Type"), method)
 		require.Equal(t, "value1", resp.Header.Get("X-Amz-Meta-Key1"), method)
 		require.Equal(t, []string{""}, resp.Header.Values("X-Amz-Meta-Empty"), method)
+		require.Equal(t, "public, max-age=31536000, immutable", resp.Header.Get("Cache-Control"), method)
+		require.Equal(t, `attachment; filename="doc.txt"`, resp.Header.Get("Content-Disposition"), method)
 		if method == http.MethodGet {
 			require.Equal(t, "bar", string(got))
 		}
 	}
+
+	// A presigned URL carries its overrides in the signed query, which is how a
+	// browser download is given its file name.
+	req, err := http.NewRequest(http.MethodGet, //nolint:noctx // bounded by the test.
+		url+"?X-Amz-Expires=300&response-content-disposition="+neturl.QueryEscape(`attachment; filename="renamed.txt"`), nil)
+	require.NoError(t, err)
+	signer := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	presigned, _, err := signer.PresignHTTP(context.Background(),
+		aws.Credentials{AccessKeyID: attrsAccessKey, SecretAccessKey: attrsSecretKey},
+		req, "UNSIGNED-PAYLOAD", "s3", attrsRegion, time.Now().UTC())
+	require.NoError(t, err)
+	resp, err := client.Get(presigned) //nolint:noctx // bounded by the test.
+	require.NoError(t, err)
+	got, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(got))
+	require.Equal(t, `attachment; filename="renamed.txt"`, resp.Header.Get("Content-Disposition"))
+	require.Equal(t, "public, max-age=31536000, immutable", resp.Header.Get("Cache-Control"))
 }

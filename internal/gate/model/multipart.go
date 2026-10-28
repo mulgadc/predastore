@@ -40,6 +40,14 @@ type UploadMetadata struct {
 	CreatedAt   time.Time      `json:"created_at"`
 	Parts       []PartMetadata `json:"parts,omitempty"`
 
+	// The stored system headers the completed object will carry. An upload
+	// created before they were recorded decodes with them empty.
+	CacheControl       string `json:"cache_control,omitempty"`
+	ContentDisposition string `json:"content_disposition,omitempty"`
+	ContentEncoding    string `json:"content_encoding,omitempty"`
+	ContentLanguage    string `json:"content_language,omitempty"`
+	Expires            string `json:"expires,omitempty"`
+
 	// Metadata is the user metadata the completed object will carry, keyed
 	// the way the object's own record keys it.
 	Metadata map[string]string `json:"metadata,omitempty"`

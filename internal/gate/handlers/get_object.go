@@ -35,6 +35,11 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
+		if err := checkResponseOverrides(r); err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		// -1 for both ends means "no Range header"; any value >= 0 is a range request.
 		rangeStart, rangeEnd := parseRangeHeader(r.Header.Get("Range"))
 
@@ -59,6 +64,7 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseMetaPlacement, phase)
 
 		setVersionIDHeader(w.Header(), target.versionID)
+		place.Attributes = withResponseOverrides(place.Attributes, r.URL.Query())
 		handoff := handoffNode(ring, cfg, target.hash)
 		serveObject(ctx, w, r, bc, cfg, bucket, key, target.hash, place, size, rangeStart, rangeEnd, handoff)
 	})

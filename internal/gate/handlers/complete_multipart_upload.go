@@ -142,7 +142,15 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		digest := composite.Digest()
 		place.Digest = digest[:]
 		place.PartCount = composite.PartCount()
-		place.Attributes = ObjectAttributes{ContentType: upload.ContentType, Metadata: upload.Metadata}
+		place.Attributes = ObjectAttributes{
+			ContentType:        upload.ContentType,
+			CacheControl:       upload.CacheControl,
+			ContentDisposition: upload.ContentDisposition,
+			ContentEncoding:    upload.ContentEncoding,
+			ContentLanguage:    upload.ContentLanguage,
+			Expires:            upload.Expires,
+			Metadata:           upload.Metadata,
+		}
 
 		shardRecord, err := EncodePlacement(place)
 		if err != nil {
