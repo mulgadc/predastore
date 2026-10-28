@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 )
 
@@ -35,6 +36,12 @@ func NewAddr(network Network, hostPort string) *Addr {
 
 func (a *Addr) Network() string { return string(a.network) }
 func (a *Addr) String() string  { return a.hostPort }
+
+// LogValue logs the host:port, which slog would otherwise render from the
+// unexported fields as an empty object.
+func (a *Addr) LogValue() slog.Value { return slog.StringValue(a.hostPort) }
+
+var _ slog.LogValuer = (*Addr)(nil)
 
 // Transport carries streams over one network for one node: it owns a single
 // endpoint, bound at construction, that it both dials from and listens on.
