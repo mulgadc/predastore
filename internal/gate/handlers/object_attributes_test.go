@@ -26,12 +26,23 @@ func TestAttributesFromRequest(t *testing.T) {
 	h.Add("X-Amz-Meta-Repeated", "two")
 	h["x-amz-meta-raw"] = []string{"uncanonicalised"}
 	h.Set("X-Amz-Meta", "not user metadata: no name separator")
-	h.Set("Cache-Control", "no-store")
+	h.Add("Cache-Control", "public")
+	h.Add("Cache-Control", "max-age=60")
+	h.Set("Content-Disposition", `attachment; filename="x.bin"`)
+	h.Set("Content-Encoding", "deflate, gzip")
+	h.Set("Content-Language", "en-AU")
+	h.Set("Expires", "not a date, kept as sent")
+	h.Set("X-Amz-Website-Redirect-Location", "/not-stored")
 
 	got, err := attributesFromRequest(h)
 	require.NoError(t, err)
 	assert.Equal(t, ObjectAttributes{
-		ContentType: "audio/ogg",
+		ContentType:        "audio/ogg",
+		CacheControl:       "public,max-age=60",
+		ContentDisposition: `attachment; filename="x.bin"`,
+		ContentEncoding:    "deflate, gzip",
+		ContentLanguage:    "en-AU",
+		Expires:            "not a date, kept as sent",
 		Metadata: map[string]string{
 			"mixed-case": "Value Kept As Sent",
 			"empty":      "",
@@ -46,6 +57,38 @@ func TestAttributesFromRequestWithNoneIsEmpty(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, got.empty())
 	assert.Nil(t, got.Metadata)
+}
+
+// The cases are the ones ceph/s3-tests checks against S3.
+func TestAttributesFromRequestDropsAWSChunkedFromContentEncoding(t *testing.T) {
+	tests := []struct{ sent, stored string }{
+		{"gzip", "gzip"},
+		{"deflate, gzip", "deflate, gzip"},
+		{"gzip, aws-chunked", "gzip"},
+		{"aws-chunked, gzip", "gzip"},
+		{"AWS-Chunked,deflate,gzip", "deflate, gzip"},
+		{"aws-chunked", ""},
+		{"aws-chunked, aws-chunked", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.sent, func(t *testing.T) {
+			h := http.Header{}
+			h.Set("Content-Encoding", tt.sent)
+			got, err := attributesFromRequest(h)
+			require.NoError(t, err)
+			assert.Equal(t, tt.stored, got.ContentEncoding)
+		})
+	}
+}
+
+// The system headers are not user metadata, so they do not count towards its
+// limit however long they are.
+func TestAttributesFromRequestLimitsOnlyUserMetadata(t *testing.T) {
+	h := http.Header{}
+	h.Set("Cache-Control", strings.Repeat("x", 2*maxUserMetadataSize))
+	h.Set("Content-Disposition", strings.Repeat("y", 2*maxUserMetadataSize))
+	_, err := attributesFromRequest(h)
+	require.NoError(t, err)
 }
 
 // The limit counts the bytes of each name and value, not the x-amz-meta-
@@ -74,9 +117,23 @@ func TestSetAttributeHeaders(t *testing.T) {
 	assert.NotContains(t, h, "X-Amz-Meta-Foo")
 
 	h = http.Header{}
+	setAttributeHeaders(h, ObjectAttributes{
+		CacheControl: "no-cache", ContentDisposition: "inline", ContentEncoding: "gzip",
+		ContentLanguage: "fr", Expires: "123",
+	})
+	assert.Equal(t, http.Header{
+		"Content-Type":        {defaultContentType},
+		"Cache-Control":       {"no-cache"},
+		"Content-Disposition": {"inline"},
+		"Content-Encoding":    {"gzip"},
+		"Content-Language":    {"fr"},
+		"Expires":             {"123"},
+	}, h)
+
+	h = http.Header{}
 	setAttributeHeaders(h, ObjectAttributes{})
 	assert.Equal(t, defaultContentType, h.Get("Content-Type"))
-	assert.Len(t, h, 1)
+	assert.Len(t, h, 1, "a header the writer did not send is not served")
 }
 
 // S3 reads a header's bytes as Latin-1 and returns anything outside ASCII as
@@ -94,7 +151,12 @@ func TestPlacementRecordCarriesAttributes(t *testing.T) {
 		Size: 3, WriteEpoch: 7, BlockSize: 1024, Timestamped: true,
 		Digest: bytes.Repeat([]byte{0xcd}, 16), PartCount: 2,
 		Attributes: ObjectAttributes{
-			ContentType: "audio/ogg",
+			ContentType:        "audio/ogg",
+			CacheControl:       "public, max-age=31536000, immutable",
+			ContentDisposition: `attachment; filename="x.bin"`,
+			ContentEncoding:    "gzip",
+			ContentLanguage:    "en",
+			Expires:            "Thu, 01 Dec 1994 16:00:00 GMT",
 			Metadata: map[string]string{
 				"key1": "value1", "empty": "", "latin1": "Hello World\xe9",
 			},
@@ -156,16 +218,20 @@ func TestPlacementRecordSkipsAnUnknownHeader(t *testing.T) {
 	b := []byte{placementMagic, placementVersionV4, 1}
 	b = append(b, make([]byte, placementFixedSizeV3-3)...)
 	b = append(b, 0) // no digest
-	b = append(b, 2)
+	b = append(b, 3)
 	b = appendField(b, "cache-control")
 	b = appendField(b, "no-store")
 	b = appendField(b, "x-amz-meta-foo")
 	b = appendField(b, "bar")
+	b = appendField(b, "x-amz-website-redirect-location")
+	b = appendField(b, "/elsewhere")
 	b = append(b, 5) // one node id
 
 	got, err := DecodePlacement(b)
 	require.NoError(t, err)
-	assert.Equal(t, map[string]string{"foo": "bar"}, got.Attributes.Metadata)
+	assert.Equal(t, ObjectAttributes{
+		CacheControl: "no-store", Metadata: map[string]string{"foo": "bar"},
+	}, got.Attributes)
 	assert.Equal(t, []config.NodeID{5}, got.DataShardNodes)
 }
 
@@ -319,6 +385,11 @@ func TestMultipartUploadCarriesTheUploadsAttributes(t *testing.T) {
 
 	createReq := httptest.NewRequest(http.MethodPost, "/"+bucket+"/"+key, nil).WithContext(objectCtx(bucket, key))
 	createReq.Header = metadataHeaders("text/bla", meta)
+	createReq.Header.Set("Cache-Control", "no-cache")
+	createReq.Header.Set("Content-Disposition", "attachment")
+	createReq.Header.Set("Content-Encoding", "aws-chunked, gzip")
+	createReq.Header.Set("Content-Language", "de")
+	createReq.Header.Set("Expires", "Thu, 01 Dec 1994 16:00:00 GMT")
 	createRR := httptest.NewRecorder()
 	CreateMultipartUpload(f.mc, f.cache).ServeHTTP(createRR, createReq)
 	require.Equal(t, http.StatusOK, createRR.Code, createRR.Body.String())
@@ -349,6 +420,11 @@ func TestMultipartUploadCarriesTheUploadsAttributes(t *testing.T) {
 		require.Equal(t, http.StatusOK, rr.Code)
 		assert.Equal(t, "text/bla", rr.Header().Get("Content-Type"))
 		assert.Equal(t, meta, userMetadata(t, rr.Header()))
+		assert.Equal(t, "no-cache", rr.Header().Get("Cache-Control"))
+		assert.Equal(t, "attachment", rr.Header().Get("Content-Disposition"))
+		assert.Equal(t, "gzip", rr.Header().Get("Content-Encoding"))
+		assert.Equal(t, "de", rr.Header().Get("Content-Language"))
+		assert.Equal(t, "Thu, 01 Dec 1994 16:00:00 GMT", rr.Header().Get("Expires"))
 	}
 }
 
@@ -369,23 +445,28 @@ func TestCopyObjectMetadataDirective(t *testing.T) {
 
 	seed := func(t *testing.T) handlerFixture {
 		f := newHandlerFixture(copyTestBucket)
-		rr := f.putWith(copyTestBucket, "src", []byte("foo"), metadataHeaders("audio/ogg", srcMeta))
+		headers := metadataHeaders("audio/ogg", srcMeta)
+		headers.Set("Cache-Control", "max-age=60")
+		rr := f.putWith(copyTestBucket, "src", []byte("foo"), headers)
 		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 		return f
 	}
 	requestAttrs := map[string]string{
 		"Content-Type": "audio/mpeg", "X-Amz-Meta-Key3": "value3", "X-Amz-Meta-Key2": "value2",
+		"Content-Language": "en",
 	}
 
 	tests := []struct {
-		name      string
-		directive string
-		wantType  string
-		wantMeta  map[string]string
+		name         string
+		directive    string
+		wantType     string
+		wantMeta     map[string]string
+		wantCache    string
+		wantLanguage string
 	}{
-		{"no directive copies", "", "audio/ogg", srcMeta},
-		{"COPY copies", "COPY", "audio/ogg", srcMeta},
-		{"REPLACE takes the request's", "REPLACE", "audio/mpeg", map[string]string{"key3": "value3", "key2": "value2"}},
+		{"no directive copies", "", "audio/ogg", srcMeta, "max-age=60", ""},
+		{"COPY copies", "COPY", "audio/ogg", srcMeta, "max-age=60", ""},
+		{"REPLACE takes the request's", "REPLACE", "audio/mpeg", map[string]string{"key3": "value3", "key2": "value2"}, "", "en"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -402,6 +483,8 @@ func TestCopyObjectMetadataDirective(t *testing.T) {
 				require.Equal(t, http.StatusOK, got.Code)
 				assert.Equal(t, tt.wantType, got.Header().Get("Content-Type"))
 				assert.Equal(t, tt.wantMeta, userMetadata(t, got.Header()))
+				assert.Equal(t, tt.wantCache, got.Header().Get("Cache-Control"))
+				assert.Equal(t, tt.wantLanguage, got.Header().Get("Content-Language"))
 			}
 		})
 	}
@@ -434,4 +517,117 @@ func TestCopyObjectMetadataDirective(t *testing.T) {
 		require.Equal(t, http.StatusBadRequest, rr.Code)
 		assert.Equal(t, "MetadataTooLarge", s3ErrorCode(t, rr))
 	})
+}
+
+// storedHeadersSent is one value for every stored system header S3 serves back.
+func storedHeadersSent() http.Header {
+	h := http.Header{}
+	h.Set("Content-Type", "application/gzip")
+	h.Set("Cache-Control", "public, max-age=31536000, immutable")
+	h.Set("Content-Disposition", `attachment; filename="model.bin"`)
+	h.Set("Content-Encoding", "gzip")
+	h.Set("Content-Language", "en-AU")
+	h.Set("Expires", "Thu, 01 Dec 2094 16:00:00 GMT")
+	return h
+}
+
+func assertStoredHeaders(t *testing.T, want, got http.Header) {
+	t.Helper()
+	for name := range want {
+		assert.Equal(t, want.Get(name), got.Get(name), name)
+	}
+}
+
+func TestPutObjectStoredHeadersRoundTrip(t *testing.T) {
+	f := newHandlerFixture("bucket")
+	sent := storedHeadersSent()
+	require.Equal(t, http.StatusOK, f.putWith("bucket", "doc", []byte("bar"), sent).Code)
+
+	for _, rr := range []*httptest.ResponseRecorder{f.head("bucket", "doc"), f.get("bucket", "doc")} {
+		require.Equal(t, http.StatusOK, rr.Code)
+		assertStoredHeaders(t, sent, rr.Header())
+	}
+
+	// A PUT without them leaves none, as it does for user metadata.
+	require.Equal(t, http.StatusOK, f.put("bucket", "doc", []byte("two")).Code)
+	rr := f.head("bucket", "doc")
+	for name := range sent {
+		if name != "Content-Type" {
+			assert.Empty(t, rr.Header().Values(name), name)
+		}
+	}
+}
+
+// read sends a GET or HEAD with a query, signed or as an anonymous caller.
+func (f handlerFixture) read(method, bucket, key string, query url.Values, signed bool) *httptest.ResponseRecorder {
+	ctx := objectCtx(bucket, key)
+	if signed {
+		ctx = WithSignedPayload(ctx, SignedPayload{Signed: true})
+	}
+	req := httptest.NewRequest(method, "/"+bucket+"/"+key+"?"+query.Encode(), nil).WithContext(ctx)
+	rr := httptest.NewRecorder()
+	if method == http.MethodHead {
+		HeadObject(f.mc, f.ring, f.cache, f.cfg).ServeHTTP(rr, req)
+	} else {
+		GetObject(f.mc, f.bc, f.ring, f.cache, f.cfg).ServeHTTP(rr, req)
+	}
+	return rr
+}
+
+func TestResponseOverridesReplaceTheStoredHeaders(t *testing.T) {
+	f := newHandlerFixture("bucket")
+	sent := storedHeadersSent()
+	require.Equal(t, http.StatusOK, f.putWith("bucket", "doc", []byte("bar"), sent).Code)
+
+	query := url.Values{
+		"response-cache-control":       {"no-cache"},
+		"response-content-disposition": {"bla"},
+		"response-content-encoding":    {"aaa"},
+		"response-content-language":    {"esperanto"},
+		"response-content-type":        {"foo/bar"},
+		"response-expires":             {"123"},
+	}
+	overridden := http.Header{
+		"Cache-Control":       {"no-cache"},
+		"Content-Disposition": {"bla"},
+		"Content-Encoding":    {"aaa"},
+		"Content-Language":    {"esperanto"},
+		"Content-Type":        {"foo/bar"},
+		"Expires":             {"123"},
+	}
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			rr := f.read(method, "bucket", "doc", query, true)
+			require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+			assertStoredHeaders(t, overridden, rr.Header())
+
+			plain := f.read(method, "bucket", "doc", nil, true)
+			assertStoredHeaders(t, sent, plain.Header())
+		})
+	}
+
+	t.Run("one override leaves the rest stored", func(t *testing.T) {
+		rr := f.read(http.MethodGet, "bucket", "doc", url.Values{"response-content-language": {"fr"}}, true)
+		require.Equal(t, http.StatusOK, rr.Code)
+		assert.Equal(t, "fr", rr.Header().Get("Content-Language"))
+		assert.Equal(t, sent.Get("Cache-Control"), rr.Header().Get("Cache-Control"))
+	})
+}
+
+func TestAnonymousReadRefusesResponseOverrides(t *testing.T) {
+	f := newHandlerFixture("bucket")
+	require.Equal(t, http.StatusOK, f.put("bucket", "doc", []byte("bar")).Code)
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(method, func(t *testing.T) {
+			rr := f.read(method, "bucket", "doc", url.Values{"response-cache-control": {"no-cache"}}, false)
+			require.Equal(t, http.StatusBadRequest, rr.Code)
+			if method == http.MethodGet {
+				assert.Equal(t, "InvalidRequest", s3ErrorCode(t, rr))
+			}
+
+			assert.Equal(t, http.StatusOK, f.read(method, "bucket", "doc", nil, false).Code,
+				"an anonymous read without overrides is unaffected")
+		})
+	}
 }

@@ -33,6 +33,7 @@ const (
 	ErrInvalidArgument         S3ErrorCode = "InvalidArgument"
 	ErrSignatureDoesNotMatch   S3ErrorCode = "SignatureDoesNotMatch"
 	ErrMalformedChunkedBody    S3ErrorCode = "InvalidRequest"
+	ErrInvalidRequest          S3ErrorCode = "InvalidRequest"
 	ErrMalformedXML            S3ErrorCode = "MalformedXML"
 	ErrMetadataTooLarge        S3ErrorCode = "MetadataTooLarge"
 )
@@ -176,6 +177,14 @@ var (
 	ErrMetadataTooLargeError = &S3Error{
 		Code:       ErrMetadataTooLarge,
 		Message:    "Your metadata headers exceed the maximum allowed metadata size.",
+		StatusCode: http.StatusBadRequest,
+	}
+
+	// ErrAnonymousResponseOverrideError is returned when an unsigned GET or
+	// HEAD names a response-* parameter, which S3 allows only a signed read.
+	ErrAnonymousResponseOverrideError = &S3Error{
+		Code:       ErrInvalidRequest,
+		Message:    "Request specific response headers cannot be used for anonymous GET requests.",
 		StatusCode: http.StatusBadRequest,
 	}
 )

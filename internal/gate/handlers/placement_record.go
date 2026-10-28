@@ -47,11 +47,11 @@ import (
 // multipart completion ever hits.
 //
 // Version 4 adds the object's attributes as the headers they are served as,
-// sorted by name: content-type, and each user metadata entry under its
-// x-amz-meta- name. An object with no attributes is still written as version
-// 3, so a gate that predates version 4 can read every object that does not
-// need it -- which during a rolling upgrade is the difference between some
-// objects and all of them.
+// sorted by name: each stored system header under its lowercase name, and each
+// user metadata entry under its x-amz-meta- name. An object with no attributes
+// is still written as version 3, so a gate that predates version 4 can read
+// every object that does not need it -- which during a rolling upgrade is the
+// difference between some objects and all of them.
 const (
 	placementMagic       = 0x00
 	placementVersionV1   = 0x01
@@ -239,15 +239,14 @@ func (p ObjectToShardNodes) ETag() (string, bool) {
 	return fmt.Sprintf("\"%x\"", p.Digest), true
 }
 
-// contentTypeHeader is the name Content-Type is recorded under.
-const contentTypeHeader = "content-type"
-
 // appendAttributes renders a record's header section. Sorting makes the
 // encoding a function of the attributes alone, not of map iteration order.
 func appendAttributes(buf []byte, a ObjectAttributes) []byte {
-	fields := make([][2]string, 0, len(a.Metadata)+1)
-	if a.ContentType != "" {
-		fields = append(fields, [2]string{contentTypeHeader, a.ContentType})
+	fields := make([][2]string, 0, len(a.Metadata)+len(storedHeaders))
+	for _, sh := range storedHeaders {
+		if v := *sh.field(&a); v != "" {
+			fields = append(fields, [2]string{sh.record, v})
+		}
 	}
 	for name, value := range a.Metadata {
 		fields = append(fields, [2]string{userMetadataPrefix + name, value})
@@ -294,8 +293,8 @@ func parseAttributes(b []byte) (ObjectAttributes, int, error) {
 		}
 		off += n
 
-		if name == contentTypeHeader {
-			a.ContentType = value
+		if sh, ok := storedHeaderRecorded(name); ok {
+			*sh.field(&a) = value
 		} else if key, ok := strings.CutPrefix(name, userMetadataPrefix); ok {
 			if a.Metadata == nil {
 				a.Metadata = make(map[string]string)

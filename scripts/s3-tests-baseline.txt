@@ -643,7 +643,7 @@ PASS|s3tests/functional/test_s3.py::test_object_anon_put
 FAIL|s3tests/functional/test_s3.py::test_object_anon_put_write_access
 FAIL|s3tests/functional/test_s3.py::test_object_checksum_crc64nvme
 FAIL|s3tests/functional/test_s3.py::test_object_checksum_sha256
-FAIL|s3tests/functional/test_s3.py::test_object_content_encoding_aws_chunked
+PASS|s3tests/functional/test_s3.py::test_object_content_encoding_aws_chunked
 PASS|s3tests/functional/test_s3.py::test_object_copy_16m
 PASS|s3tests/functional/test_s3.py::test_object_copy_bucket_not_found
 PASS|s3tests/functional/test_s3.py::test_object_copy_canned_acl
@@ -724,7 +724,7 @@ FAIL|s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_max_ra
 FAIL|s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_positive_range
 FAIL|s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_range_zero
 FAIL|s3tests/functional/test_s3.py::test_object_raw_put_authenticated_expired
-FAIL|s3tests/functional/test_s3.py::test_object_raw_response_headers
+PASS|s3tests/functional/test_s3.py::test_object_raw_response_headers
 PASS|s3tests/functional/test_s3.py::test_object_read_not_exist
 FAIL|s3tests/functional/test_s3.py::test_object_read_unreadable
 FAIL|s3tests/functional/test_s3.py::test_object_requestid_matches_header_on_error
@@ -732,9 +732,9 @@ PASS|s3tests/functional/test_s3.py::test_object_set_get_metadata_none_to_empty
 PASS|s3tests/functional/test_s3.py::test_object_set_get_metadata_none_to_good
 PASS|s3tests/functional/test_s3.py::test_object_set_get_metadata_overwrite_to_empty
 FAIL|s3tests/functional/test_s3.py::test_object_set_get_unicode_metadata
-FAIL|s3tests/functional/test_s3.py::test_object_write_cache_control
+PASS|s3tests/functional/test_s3.py::test_object_write_cache_control
 PASS|s3tests/functional/test_s3.py::test_object_write_check_etag
-FAIL|s3tests/functional/test_s3.py::test_object_write_expires
+PASS|s3tests/functional/test_s3.py::test_object_write_expires
 PASS|s3tests/functional/test_s3.py::test_object_write_file
 PASS|s3tests/functional/test_s3.py::test_object_write_read_update_read_delete
 PASS|s3tests/functional/test_s3.py::test_object_write_to_nonexist_bucket

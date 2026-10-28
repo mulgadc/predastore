@@ -34,6 +34,11 @@ func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Con
 		}
 		bucket, key := resource.Bucket.Name, resource.Key
 
+		if err := checkResponseOverrides(r); err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)
 			return
@@ -52,7 +57,7 @@ func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Con
 		}
 
 		setVersionIDHeader(w.Header(), target.versionID)
-		setAttributeHeaders(w.Header(), place.Attributes)
+		setAttributeHeaders(w.Header(), withResponseOverrides(place.Attributes, r.URL.Query()))
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		// A record with no stored digest omits the ETag rather than serving the
 		// old name-derived value; see the same choice in GetObject.

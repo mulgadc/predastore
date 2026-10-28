@@ -36,13 +36,18 @@ func CreateMultipartUpload(mc MetaClient, cache *BucketCache) http.Handler {
 
 		uploadID := uuid.NewV4().String()
 		metadata := model.UploadMetadata{
-			UploadID:    uploadID,
-			Bucket:      bucket,
-			Key:         key,
-			ContentType: attrs.ContentType,
-			Metadata:    attrs.Metadata,
-			CreatedAt:   time.Now(),
-			Parts:       []model.PartMetadata{},
+			UploadID:           uploadID,
+			Bucket:             bucket,
+			Key:                key,
+			ContentType:        attrs.ContentType,
+			CacheControl:       attrs.CacheControl,
+			ContentDisposition: attrs.ContentDisposition,
+			ContentEncoding:    attrs.ContentEncoding,
+			ContentLanguage:    attrs.ContentLanguage,
+			Expires:            attrs.Expires,
+			Metadata:           attrs.Metadata,
+			CreatedAt:          time.Now(),
+			Parts:              []model.PartMetadata{},
 		}
 
 		var buf bytes.Buffer
