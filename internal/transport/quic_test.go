@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -171,6 +172,29 @@ func TestQUICStreamReadFromWriteTo(t *testing.T) {
 	}
 	if dst.String() != src {
 		t.Fatalf("payload mismatch: got %d bytes, want %d", dst.Len(), len(src))
+	}
+}
+
+func TestQUICPeerCloseIsConnClosed(t *testing.T) {
+	dc, ac := quicPair(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	dc.Close()
+	if _, err := ac.AcceptStream(ctx); !errors.Is(err, transport.ErrConnClosed) {
+		t.Fatalf("peer side: got %v, want ErrConnClosed", err)
+	}
+	if _, err := dc.AcceptStream(ctx); !errors.Is(err, transport.ErrConnClosed) {
+		t.Fatalf("closing side: got %v, want ErrConnClosed", err)
+	}
+}
+
+func TestAddrLogsHostPort(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	logger.Info("conn", "addr", transport.NewAddr(transport.NetworkQUIC, "10.2.0.2:6660"))
+	if !strings.Contains(buf.String(), `"addr":"10.2.0.2:6660"`) {
+		t.Fatalf("addr not logged as host:port: %s", buf.String())
 	}
 }
 

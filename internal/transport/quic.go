@@ -317,7 +317,7 @@ func (qc *QUICConn) OpenStream(ctx context.Context) (Stream, error) {
 func (qc *QUICConn) AcceptStream(ctx context.Context) (Stream, error) {
 	s, err := qc.conn.AcceptStream(ctx)
 	if err != nil {
-		return nil, err
+		return nil, translateConnErr(err)
 	}
 	return &QUICStream{s: s, laddr: qc.laddr, raddr: qc.raddr}, nil
 }
@@ -375,6 +375,19 @@ func (qs *QUICStream) WriteTo(w io.Writer) (int64, error) {
 
 // translateQUICErr maps quic-go stream aborts onto the transport's
 // StreamError so callers handle one error surface across transports.
+// translateConnErr reports a connection closed on purpose, by either side, as
+// ErrConnClosed: a plain Close sends code 0, a closing listener
+// ConnCodeShutdown. The quic error stays wrapped for the log.
+func translateConnErr(err error) error {
+	if ae, ok := errors.AsType[*quic.ApplicationError](err); ok {
+		switch ConnErrorCode(ae.ErrorCode) {
+		case 0, ConnCodeShutdown:
+			return fmt.Errorf("%w: %w", ErrConnClosed, err)
+		}
+	}
+	return err
+}
+
 func translateQUICErr(err error) error {
 	if err == nil {
 		return nil
