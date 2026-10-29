@@ -289,10 +289,18 @@ func (s *Server) serveConn(
 // expectedTermination reports whether err is a shutdown or a deliberate close
 // by either side rather than a fault. A stream in flight when the connection
 // goes away fails the same way an accept does, so both paths ask this.
+//
+// StreamCodeCallerGone is the one stream abort that qualifies: the caller is
+// saying it no longer wants the answer. An idle abort and an expired deadline
+// are the peer failing to answer, and stay faults.
 func expectedTermination(err error) bool {
-	return errors.Is(err, context.Canceled) ||
+	if errors.Is(err, context.Canceled) ||
 		errors.Is(err, transport.ErrListenerClosed) ||
-		errors.Is(err, transport.ErrConnClosed)
+		errors.Is(err, transport.ErrConnClosed) {
+		return true
+	}
+	var se *transport.StreamError
+	return errors.As(err, &se) && se.Code == transport.StreamCodeCallerGone
 }
 
 func (s *Server) acceptStreams(
