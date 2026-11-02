@@ -263,28 +263,14 @@ type NATSIAMProvider struct {
 	groupsBucket jetstream.KeyValue
 	groupsReady  bool
 
-	// Accounts bucket is attach-only and has its own readiness flag. accountActive
-	// holds ACTIVE answers only, so a status change never waits on a cached refusal.
+	// Accounts bucket is attach-only and has its own readiness flag. Status is read
+	// on every request and never cached.
 	accountsBucket jetstream.KeyValue
 	accountsReady  bool
-	accountActive  map[string]time.Time
 
 	watchers  []jetstream.KeyWatcher
 	done      chan struct{}
 	closeOnce sync.Once
-
-	// lifeCtx lives as long as the provider, for watchers that outlive the request
-	// that happened to open them.
-	lifeCtx    context.Context
-	lifeCancel context.CancelFunc
-}
-
-// lifetimeCtx is the context a long-lived watcher runs under.
-func (p *NATSIAMProvider) lifetimeCtx() context.Context {
-	if p.lifeCtx == nil {
-		return context.Background()
-	}
-	return p.lifeCtx
 }
 
 var _ CredentialProvider = (*NATSIAMProvider)(nil)
@@ -348,18 +334,13 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 		bucketName = "spinifex-iam-access-keys"
 	}
 
-	lifeCtx, lifeCancel := context.WithCancel(context.Background())
 	p := &NATSIAMProvider{
-		lifeCtx:    lifeCtx,
-		lifeCancel: lifeCancel,
 		conn:       conn,
 		js:         js,
 		key:        key,
 		bucketName: bucketName,
 		cache:      make(map[string]*cachedCredential),
 		done:       make(chan struct{}),
-
-		accountActive: make(map[string]time.Time),
 	}
 
 	// Try to open KV buckets now. If they don't exist yet (spinifex daemon hasn't
@@ -642,7 +623,6 @@ func (p *NATSIAMProvider) invalidateKeyLocked(accessKeyID string) {
 // must hold p.mu.
 func (p *NATSIAMProvider) flushCacheLocked(string) {
 	clear(p.cache)
-	clear(p.accountActive)
 	p.cacheGen++
 }
 
@@ -989,9 +969,6 @@ func (p *NATSIAMProvider) resolveManagedPolicies(ctx context.Context, accountID,
 func (p *NATSIAMProvider) Close() {
 	p.closeOnce.Do(func() {
 		close(p.done)
-		if p.lifeCancel != nil {
-			p.lifeCancel()
-		}
 		p.mu.Lock()
 		watchers := p.watchers
 		p.mu.Unlock()

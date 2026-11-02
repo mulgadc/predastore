@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -15,9 +14,18 @@ import (
 // creates it, so a node without IAM cannot invent account records.
 const kvBucketAccounts = "spinifex-accounts"
 
-// accountActiveTTL bounds how long an ACTIVE answer is trusted when the accounts
-// watcher is down. A running watcher evicts the entry on the change itself.
-const accountActiveTTL = 5 * time.Second
+// Operator-provisioned control-plane [[auth]] entries for these accounts are the only
+// credentials that skip admission (ADR-0005:S7). IAM refuses every non-ACTIVE status
+// for them, so their availability never depends on the accounts bucket.
+const (
+	systemAccountID = "000000000000"
+	adminAccountID  = "000000000001"
+)
+
+// ProtectedAccount reports whether accountID may skip admission.
+func ProtectedAccount(accountID string) bool {
+	return accountID == systemAccountID || accountID == adminAccountID
+}
 
 const accountStatusActive = "ACTIVE"
 
@@ -39,17 +47,10 @@ var (
 	_ AccountGate = (*ChainProvider)(nil)
 )
 
-// CheckAccountActive reads the account record, caching only ACTIVE answers.
+// CheckAccountActive reads the account record on every call; no answer is cached.
 func (p *NATSIAMProvider) CheckAccountActive(ctx context.Context, accountID string) error {
 	if accountID == "" {
 		return ErrAccountNotActive
-	}
-
-	p.mu.RLock()
-	until, hit := p.accountActive[accountID]
-	p.mu.RUnlock()
-	if hit && time.Now().Before(until) {
-		return nil
 	}
 
 	p.mu.Lock()
@@ -61,7 +62,6 @@ func (p *NATSIAMProvider) CheckAccountActive(ctx context.Context, accountID stri
 		return fmt.Errorf("account status unavailable: %w", err)
 	}
 	bucket := p.accountsBucket
-	gen := p.cacheGen
 	p.mu.Unlock()
 
 	entry, err := bucket.Get(ctx, accountID)
@@ -81,16 +81,10 @@ func (p *NATSIAMProvider) CheckAccountActive(ctx context.Context, accountID stri
 		return ErrAccountNotActive
 	}
 
-	p.mu.Lock()
-	// A change that landed during the read has already invalidated this answer.
-	if p.cacheGen == gen {
-		p.accountActive[accountID] = time.Now().Add(accountActiveTTL)
-	}
-	p.mu.Unlock()
 	return nil
 }
 
-// ensureAccountsBucket attaches to the accounts bucket and starts its watcher. The
+// ensureAccountsBucket attaches to the accounts bucket. The
 // caller must hold p.mu.
 func (p *NATSIAMProvider) ensureAccountsBucket(ctx context.Context) error {
 	if p.accountsReady {
@@ -105,16 +99,8 @@ func (p *NATSIAMProvider) ensureAccountsBucket(ctx context.Context) error {
 	}
 	p.accountsBucket = bucket
 	p.accountsReady = true
-	p.startWatcher(p.lifetimeCtx(), bucket, kvBucketAccounts, p.invalidateAccountLocked)
 	slog.Info("Accounts bucket now available — account status is enforced")
 	return nil
-}
-
-// invalidateAccountLocked evicts one account's cached ACTIVE answer. The caller must
-// hold p.mu.
-func (p *NATSIAMProvider) invalidateAccountLocked(accountID string) {
-	delete(p.accountActive, accountID)
-	p.cacheGen++
 }
 
 // CheckAccountActive asks the IAM-backed provider. Config credentials never reach
