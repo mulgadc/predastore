@@ -214,6 +214,22 @@ func (s *Server) accountActive(w http.ResponseWriter, r *http.Request, accountID
 	return true
 }
 
+// publicOwnerActive gates the owner of a public bucket for an unsigned request.
+func (s *Server) publicOwnerActive(w http.ResponseWriter, r *http.Request, bucket string) bool {
+	meta, err := handlers.ResolveBucketMetadata(r.Context(), s.cfg.Meta, s.handlerCfg, bucket)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "Failed to resolve bucket metadata for public owner check",
+			"bucket", bucket, "error", err)
+		handlers.WriteS3Error(w, r, http.StatusInternalServerError, "InternalError",
+			"An internal error occurred")
+		return false
+	}
+	if meta == nil || meta.AccountID == "" {
+		return true
+	}
+	return s.accountActive(w, r, meta.AccountID, true)
+}
+
 // sigV4AuthMiddleware authenticates and authorizes incoming S3 requests:
 // public-bucket short-circuit, SigV4 verify, IAM policy eval, and
 // cross-account bucket-ownership check.
@@ -235,6 +251,10 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			// Unsigned: fall back to public-bucket access rather than a parse error.
 			if errors.Is(err, sigv4.ErrMissingAuthentication) {
 				if publicBucketAccess == nil {
+					// A public grant must not keep a closed account's data reachable.
+					if !s.publicOwnerActive(w, r, bucket) {
+						return
+					}
 					next.ServeHTTP(w, r)
 					return
 				}

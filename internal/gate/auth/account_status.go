@@ -105,7 +105,7 @@ func (p *NATSIAMProvider) ensureAccountsBucket(ctx context.Context) error {
 	}
 	p.accountsBucket = bucket
 	p.accountsReady = true
-	p.startWatcher(ctx, bucket, kvBucketAccounts, p.invalidateAccountLocked)
+	p.startWatcher(p.lifetimeCtx(), bucket, kvBucketAccounts, p.invalidateAccountLocked)
 	slog.Info("Accounts bucket now available — account status is enforced")
 	return nil
 }

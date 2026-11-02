@@ -22,9 +22,15 @@ type fakeWatcher struct {
 func (w *fakeWatcher) Updates() <-chan jetstream.KeyValueEntry { return w.updates }
 func (w *fakeWatcher) Stop() error                             { return nil }
 
-func (k *fakeKV) WatchAll(context.Context, ...jetstream.WatchOpt) (jetstream.KeyWatcher, error) {
-	k.watcher = &fakeWatcher{updates: make(chan jetstream.KeyValueEntry, 1)}
-	return k.watcher, nil
+// WatchAll stops delivering when ctx ends, as a JetStream watcher does.
+func (k *fakeKV) WatchAll(ctx context.Context, _ ...jetstream.WatchOpt) (jetstream.KeyWatcher, error) {
+	w := &fakeWatcher{updates: make(chan jetstream.KeyValueEntry, 1)}
+	k.watcher = w
+	go func() {
+		<-ctx.Done()
+		close(w.updates)
+	}()
+	return w, nil
 }
 
 // put writes a record and publishes it to the bucket's watcher, as a KV Put does.

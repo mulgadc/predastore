@@ -347,9 +347,9 @@ func TestCurrentBehaviour_PredastoreRevocation_UserReplaced(t *testing.T) {
 }
 
 // Pins CURRENT behaviour: unsigned requests are served only as public-bucket
-// reads; no IAM state is consulted.
+// reads, and only while the bucket owner's account is ACTIVE.
 func TestCurrentBehaviour_PredastoreAnonymous_Access(t *testing.T) {
-	h := charGate(t, auth.NewBootstrappingIAMProvider(t))
+	h := charGate(t, auth.NewBootstrappingIAMProviderWithActiveAccount(t))
 
 	assert.Equal(t, replyDenied, charServe(t, h, http.MethodHead, "/"+charPrivateBucket, "", "", ""))
 	assert.Equal(t, replyDenied, charServe(t, h, http.MethodGet, "/", "", "", ""))

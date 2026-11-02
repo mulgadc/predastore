@@ -50,6 +50,7 @@ func accountGateServer(t *testing.T, status map[string]error) (*Server, *gatedCr
 			model.BucketMetadata{Name: "owner-bucket", Region: "ap-southeast-2", AccountID: acctOwner},
 			model.BucketMetadata{Name: "public-bucket", Region: "ap-southeast-2", AccountID: acctOwner, Public: true},
 		),
+		Buckets:  []handlers.BucketConfig{{Name: "public-bucket", Region: "ap-southeast-2", AccountID: acctOwner, Public: true}},
 		CredProv: prov,
 	})
 	return server, prov
@@ -95,6 +96,33 @@ func TestAccountGate_ActiveOwnerStillServesAPublicBucket(t *testing.T) {
 	assert.True(t, nextCalled)
 	assert.Equal(t, http.StatusOK, status)
 	assert.Equal(t, []string{acctOther, acctOwner}, prov.asked)
+}
+
+// An unsigned read of a public bucket must not keep a closed account's data reachable.
+func TestAccountGate_UnsignedPublicReadRefusedWhenOwnerNotActive(t *testing.T) {
+	server, _ := accountGateServer(t, map[string]error{acctOwner: auth.ErrAccountNotActive})
+	req := httptest.NewRequest(http.MethodGet, "/public-bucket", nil)
+	status, nextCalled, body := runMiddleware(t, server, req)
+	assert.False(t, nextCalled)
+	assert.Equal(t, http.StatusForbidden, status)
+	assert.Contains(t, body, "AllAccessDisabled")
+}
+
+func TestAccountGate_UnsignedPublicReadServedWhenOwnerActive(t *testing.T) {
+	server, prov := accountGateServer(t, nil)
+	req := httptest.NewRequest(http.MethodGet, "/public-bucket", nil)
+	status, nextCalled, _ := runMiddleware(t, server, req)
+	assert.True(t, nextCalled)
+	assert.Equal(t, http.StatusOK, status)
+	assert.Equal(t, []string{acctOwner}, prov.asked)
+}
+
+func TestAccountGate_UnsignedPublicReadOwnerUnreadableIsInternalError(t *testing.T) {
+	server, _ := accountGateServer(t, map[string]error{acctOwner: errors.New("kv down")})
+	req := httptest.NewRequest(http.MethodGet, "/public-bucket", nil)
+	status, nextCalled, _ := runMiddleware(t, server, req)
+	assert.False(t, nextCalled)
+	assert.Equal(t, http.StatusInternalServerError, status)
 }
 
 func TestAccountGate_OwnerUnreadableIsInternalError(t *testing.T) {

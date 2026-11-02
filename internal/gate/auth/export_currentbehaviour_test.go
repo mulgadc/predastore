@@ -208,6 +208,21 @@ func NewBootstrappingIAMProvider(t *testing.T) *NATSIAMProvider {
 	}
 }
 
+// NewBootstrappingIAMProviderWithActiveAccount is a bootstrapping provider whose
+// accounts bucket holds TestSessionAccount as ACTIVE.
+func NewBootstrappingIAMProviderWithActiveAccount(t *testing.T) *NATSIAMProvider {
+	t.Helper()
+	accounts := &fakeKV{data: map[string][]byte{}}
+	accounts.data[testSessionAccount] = mustMarshal(t, struct {
+		Status string `json:"status"`
+	}{"ACTIVE"})
+	p := NewBootstrappingIAMProvider(t)
+	p.js = &fakeJetStream{buckets: map[string]*fakeKV{kvBucketAccounts: accounts}}
+	p.accountActive = make(map[string]time.Time)
+	t.Cleanup(p.Close)
+	return p
+}
+
 // ErrKVUnavailable stands in for a JetStream fault that is not a not-found.
 var ErrKVUnavailable = jetstream.ErrJetStreamNotEnabled
 

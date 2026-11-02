@@ -130,6 +130,25 @@ func TestCheckAccountActive_WatcherEvictsOnChange(t *testing.T) {
 	}, 2*time.Second, 5*time.Millisecond, "the change must evict before the TTL")
 }
 
+// The watcher belongs to the provider, not to the request that opened the bucket.
+func TestCheckAccountActive_WatcherOutlivesTheRequestThatStartedIt(t *testing.T) {
+	kv := &fakeKV{data: map[string][]byte{gateAccount: accountRecord("ACTIVE")}}
+	p := newGateProvider(t, kv)
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, p.CheckAccountActive(reqCtx, gateAccount))
+	cancel()
+	// Let a watcher wrongly bound to reqCtx notice the cancellation.
+	time.Sleep(50 * time.Millisecond)
+
+	require.NoError(t, p.CheckAccountActive(context.Background(), gateAccount))
+	kv.put(gateAccount, accountRecord("TERMINATING"))
+
+	require.Eventually(t, func() bool {
+		return errors.Is(p.CheckAccountActive(context.Background(), gateAccount), ErrAccountNotActive)
+	}, 2*time.Second, 5*time.Millisecond, "the change must evict before the TTL")
+}
+
 func TestCheckAccountActive_ClosedWatcherFlushesTheCache(t *testing.T) {
 	kv := &fakeKV{data: map[string][]byte{gateAccount: accountRecord("ACTIVE")}}
 	p := newGateProvider(t, kv)
