@@ -263,6 +263,12 @@ type NATSIAMProvider struct {
 	groupsBucket jetstream.KeyValue
 	groupsReady  bool
 
+	// Accounts bucket is attach-only and has its own readiness flag. accountActive
+	// holds ACTIVE answers only, so a status change never waits on a cached refusal.
+	accountsBucket jetstream.KeyValue
+	accountsReady  bool
+	accountActive  map[string]time.Time
+
 	watchers  []jetstream.KeyWatcher
 	done      chan struct{}
 	closeOnce sync.Once
@@ -336,6 +342,8 @@ func NewNATSIAMProvider(cfg *IAMConfig) (*NATSIAMProvider, error) {
 		bucketName: bucketName,
 		cache:      make(map[string]*cachedCredential),
 		done:       make(chan struct{}),
+
+		accountActive: make(map[string]time.Time),
 	}
 
 	// Try to open KV buckets now. If they don't exist yet (spinifex daemon hasn't
@@ -618,6 +626,7 @@ func (p *NATSIAMProvider) invalidateKeyLocked(accessKeyID string) {
 // must hold p.mu.
 func (p *NATSIAMProvider) flushCacheLocked(string) {
 	clear(p.cache)
+	clear(p.accountActive)
 	p.cacheGen++
 }
 

@@ -112,6 +112,12 @@ func newSessionProvider(k *masterkey.Key, sessions, users, roles, policies map[s
 		done:           make(chan struct{}),
 		sessionsBucket: &fakeKV{data: sessions},
 		sessionsReady:  true,
+
+		accountsBucket: &fakeKV{data: map[string][]byte{
+			testSessionAccount: []byte(`{"status":"ACTIVE"}`),
+		}},
+		accountsReady: true,
+		accountActive: make(map[string]time.Time),
 	}
 	if users != nil || roles != nil || policies != nil {
 		p.usersBucket = &fakeKV{data: users}
