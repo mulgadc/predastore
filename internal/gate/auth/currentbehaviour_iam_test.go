@@ -451,17 +451,17 @@ func TestCurrentBehaviour_PredastoreBootstrap_ConfigShadowsIAM(t *testing.T) {
 	f := auth.NewCharFixture(t, allowAllS3)
 	f.SetKeyStatus("Inactive")
 	config := auth.NewConfigProvider([]auth.Entry{{
-		AccessKeyID: auth.CharAKID, SecretAccessKey: auth.CharSecret, AccountID: "999999999999",
+		AccessKeyID: auth.CharAKID, SecretAccessKey: auth.CharSecret, AccountID: "000000000000",
 	}})
 	h := charGate(t, auth.NewChainProvider(f.Provider, config))
 
 	// CURRENT: deactivating the key in IAM does not revoke it here, and a
-	// foreign-account config entry still reaches a bucket it does not own.
+	// platform-account config entry still reaches a bucket it does not own.
 	assert.Equal(t, replyOK, headPrivate(t, h, auth.CharAKID, auth.CharSecret))
 }
 
-// CURRENT: a configured [[auth]] credential also bypasses an IAM account
-// termination record, as it bypasses every other IAM read and policy check.
+// CURRENT: a configured [[auth]] credential for a protected account bypasses an
+// IAM account termination record, as it bypasses every other IAM read and policy check.
 func TestCurrentBehaviour_PredastoreBootstrap_ConfigIgnoresAccountStatus(t *testing.T) {
 	f := auth.NewCharFixture(t, allowAllS3)
 	f.SetAccountStatus("TERMINATING")

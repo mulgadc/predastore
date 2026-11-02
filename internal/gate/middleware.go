@@ -294,13 +294,17 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		// so the handler authorizes each key through this instead.
 		authorize := handlers.ObjectAuthorizer(func(string, string) bool { return true })
 
+		// Only protected control-plane accounts skip admission; any other account,
+		// including one selected by a configured credential, must be ACTIVE.
+		if (!credResult.SkipPolicyCheck || !auth.ProtectedAccount(credResult.AccountID)) &&
+			!s.accountActive(w, r, credResult.AccountID, false) {
+			return
+		}
+
 		// IAM policy evaluation (NATS-sourced credentials only). Config-defined service
 		// accounts (SkipPolicyCheck) belong to no tenant account and bypass the account
 		// gate as they bypass policy, so platform work such as teardown is never refused.
 		if !credResult.SkipPolicyCheck {
-			if !s.accountActive(w, r, credResult.AccountID, false) {
-				return
-			}
 			if action == "" {
 				slog.WarnContext(r.Context(), "Unsupported HTTP method for S3 action mapping",
 					"method", method, "path", r.URL.Path, "remoteAddr", handlers.ClientAddr(r))

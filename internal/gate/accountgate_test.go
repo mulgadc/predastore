@@ -34,14 +34,21 @@ func (p *gatedCredProvider) CheckAccountActive(_ context.Context, accountID stri
 	return p.status[accountID]
 }
 
+const (
+	keyConfigTenant = "AKIACONFIGTENANT"
+	keyConfigBlank  = "AKIACONFIGBLANK"
+)
+
 func accountGateServer(t *testing.T, status map[string]error) (*Server, *gatedCredProvider) {
 	t.Helper()
 	prov := &gatedCredProvider{
 		status: status,
 		stubCredProvider: stubCredProvider{creds: map[string]*auth.CredentialResult{
-			keyOwner:  {SecretAccessKey: secret, AccountID: acctOwner, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
-			keyOther:  {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
-			keyConfig: {SecretAccessKey: secret, AccountID: acctSys, SkipPolicyCheck: true},
+			keyOwner:        {SecretAccessKey: secret, AccountID: acctOwner, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
+			keyOther:        {SecretAccessKey: secret, AccountID: acctOther, PolicyDocuments: []iampolicy.PolicyDocument{allowAllPolicy}},
+			keyConfig:       {SecretAccessKey: secret, AccountID: acctSys, SkipPolicyCheck: true},
+			keyConfigTenant: {SecretAccessKey: secret, AccountID: acctOther, SkipPolicyCheck: true},
+			keyConfigBlank:  {SecretAccessKey: secret, AccountID: "", SkipPolicyCheck: true},
 		}},
 	}
 	server := newTestGate(t, Config{
@@ -148,6 +155,43 @@ func TestAccountGate_ServiceAccountIsNeverAsked(t *testing.T) {
 	server, prov := accountGateServer(t, map[string]error{
 		acctSys: auth.ErrAccountNotActive, acctOwner: auth.ErrAccountNotActive,
 	})
+	status, nextCalled, _ := runMiddleware(t, server, signedReq(t, http.MethodGet, "/owner-bucket", keyConfig))
+	assert.True(t, nextCalled)
+	assert.Equal(t, http.StatusOK, status)
+	assert.Empty(t, prov.asked)
+}
+
+// A configured credential for a terminable account is admitted like an IAM credential.
+func TestAccountGate_ConfigCredentialForTerminableAccountIsRefusedWhenNotActive(t *testing.T) {
+	server, prov := accountGateServer(t, map[string]error{acctOther: auth.ErrAccountNotActive})
+	status, nextCalled, body := runMiddleware(t, server, signedReq(t, http.MethodGet, "/owner-bucket", keyConfigTenant))
+	assert.False(t, nextCalled)
+	assert.Equal(t, http.StatusForbidden, status)
+	assert.Contains(t, body, "AccountProblem")
+	assert.Equal(t, []string{acctOther}, prov.asked)
+}
+
+func TestAccountGate_ConfigCredentialForActiveTerminableAccountPasses(t *testing.T) {
+	server, prov := accountGateServer(t, nil)
+	_, nextCalled, _ := runMiddleware(t, server, signedReq(t, http.MethodGet, "/owner-bucket", keyConfigTenant))
+	assert.True(t, nextCalled)
+	assert.Equal(t, []string{acctOther}, prov.asked)
+}
+
+// An [[auth]] entry with no account cannot be shown to be ACTIVE, so it fails closed.
+func TestAccountGate_ConfigCredentialWithoutAccountIsRefused(t *testing.T) {
+	server, _ := accountGateServer(t, nil)
+	prov := server.credProv.(*gatedCredProvider)
+	prov.status = map[string]error{"": auth.ErrAccountNotActive}
+	status, nextCalled, body := runMiddleware(t, server, signedReq(t, http.MethodGet, "/owner-bucket", keyConfigBlank))
+	assert.False(t, nextCalled)
+	assert.Equal(t, http.StatusForbidden, status)
+	assert.Contains(t, body, "AccountProblem")
+}
+
+// A protected account is served even when the account directory cannot be read.
+func TestAccountGate_ProtectedConfigCredentialServedWhileStatusUnreadable(t *testing.T) {
+	server, prov := accountGateServer(t, map[string]error{acctSys: errors.New("kv down"), acctOwner: errors.New("kv down")})
 	status, nextCalled, _ := runMiddleware(t, server, signedReq(t, http.MethodGet, "/owner-bucket", keyConfig))
 	assert.True(t, nextCalled)
 	assert.Equal(t, http.StatusOK, status)

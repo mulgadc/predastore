@@ -72,7 +72,6 @@ func NewCharFixture(t *testing.T, policyDoc string) *CharFixture {
 	f.Provider = &NATSIAMProvider{
 		js: js, key: k, bucketName: "spinifex-iam-access-keys",
 		cache: make(map[string]*cachedCredential), done: make(chan struct{}),
-		accountActive: make(map[string]time.Time),
 	}
 	f.SetAccountStatus("ACTIVE")
 	t.Cleanup(f.Provider.Close)
@@ -218,7 +217,6 @@ func NewBootstrappingIAMProviderWithActiveAccount(t *testing.T) *NATSIAMProvider
 	}{"ACTIVE"})
 	p := NewBootstrappingIAMProvider(t)
 	p.js = &fakeJetStream{buckets: map[string]*fakeKV{kvBucketAccounts: accounts}}
-	p.accountActive = make(map[string]time.Time)
 	t.Cleanup(p.Close)
 	return p
 }
