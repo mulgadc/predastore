@@ -67,12 +67,14 @@ func NewCharFixture(t *testing.T, policyDoc string) *CharFixture {
 		kvBucketRoles:              {data: map[string][]byte{}},
 		kvBucketPolicies:           f.policies,
 		kvBucketSessionCredentials: f.sessions,
-		"spinifex-iam-accounts":    f.accounts,
+		kvBucketAccounts:           f.accounts,
 	}}
 	f.Provider = &NATSIAMProvider{
 		js: js, key: k, bucketName: "spinifex-iam-access-keys",
 		cache: make(map[string]*cachedCredential), done: make(chan struct{}),
+		accountActive: make(map[string]time.Time),
 	}
+	f.SetAccountStatus("ACTIVE")
 	t.Cleanup(f.Provider.Close)
 	return f
 }
@@ -105,9 +107,7 @@ func (f *CharFixture) SetKeyAccount(accountID string) {
 	publish(f.keys, CharAKID)
 }
 
-// SetAccountStatus writes the IAM account shape used only to characterize
-// Predastore's current admission behavior. The production provider does not
-// open this bucket today.
+// SetAccountStatus writes the IAM account record the account gate reads.
 func (f *CharFixture) SetAccountStatus(status string) {
 	f.t.Helper()
 	f.accounts.data[testSessionAccount] = mustMarshal(f.t, struct {
@@ -206,6 +206,21 @@ func NewBootstrappingIAMProvider(t *testing.T) *NATSIAMProvider {
 		bucketName: "spinifex-iam-access-keys",
 		cache:      make(map[string]*cachedCredential), done: make(chan struct{}),
 	}
+}
+
+// NewBootstrappingIAMProviderWithActiveAccount is a bootstrapping provider whose
+// accounts bucket holds TestSessionAccount as ACTIVE.
+func NewBootstrappingIAMProviderWithActiveAccount(t *testing.T) *NATSIAMProvider {
+	t.Helper()
+	accounts := &fakeKV{data: map[string][]byte{}}
+	accounts.data[testSessionAccount] = mustMarshal(t, struct {
+		Status string `json:"status"`
+	}{"ACTIVE"})
+	p := NewBootstrappingIAMProvider(t)
+	p.js = &fakeJetStream{buckets: map[string]*fakeKV{kvBucketAccounts: accounts}}
+	p.accountActive = make(map[string]time.Time)
+	t.Cleanup(p.Close)
+	return p
 }
 
 // ErrKVUnavailable stands in for a JetStream fault that is not a not-found.

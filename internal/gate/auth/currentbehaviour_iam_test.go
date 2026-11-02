@@ -127,15 +127,17 @@ func TestCurrentBehaviour_PredastoreLongLived_ValidKey(t *testing.T) {
 	assert.Equal(t, replyOK, record(t, h, httptest.NewRequest(http.MethodHead, url, nil)))
 }
 
-// CURRENT: Predastore never opens the IAM accounts bucket, so an account
-// record marked SUSPENDED or TERMINATING still serves a valid IAM key.
-func TestCurrentBehaviour_PredastoreAccountStatusIsNotConsulted(t *testing.T) {
+// A valid IAM key of an account that is SUSPENDED or TERMINATING is refused with
+// AccountProblem before policy is evaluated.
+func TestPredastoreAccountStatusIsEnforced(t *testing.T) {
 	for _, status := range []string{"SUSPENDED", "TERMINATING"} {
 		t.Run(status, func(t *testing.T) {
 			f := auth.NewCharFixture(t, allowAllS3)
 			f.SetAccountStatus(status)
 
-			assert.Equal(t, replyOK, headPrivate(t, charGate(t, f.Provider), auth.CharAKID, auth.CharSecret))
+			assert.Equal(t, s3Reply{Status: http.StatusForbidden, Code: "AccountProblem",
+				Message: "There is a problem with your AWS account that prevents the operation from completing successfully."},
+				headPrivate(t, charGate(t, f.Provider), auth.CharAKID, auth.CharSecret))
 		})
 	}
 }
@@ -345,9 +347,9 @@ func TestCurrentBehaviour_PredastoreRevocation_UserReplaced(t *testing.T) {
 }
 
 // Pins CURRENT behaviour: unsigned requests are served only as public-bucket
-// reads; no IAM state is consulted.
+// reads, and only while the bucket owner's account is ACTIVE.
 func TestCurrentBehaviour_PredastoreAnonymous_Access(t *testing.T) {
-	h := charGate(t, auth.NewBootstrappingIAMProvider(t))
+	h := charGate(t, auth.NewBootstrappingIAMProviderWithActiveAccount(t))
 
 	assert.Equal(t, replyDenied, charServe(t, h, http.MethodHead, "/"+charPrivateBucket, "", "", ""))
 	assert.Equal(t, replyDenied, charServe(t, h, http.MethodGet, "/", "", "", ""))

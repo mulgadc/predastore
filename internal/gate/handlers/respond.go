@@ -97,6 +97,23 @@ func RespondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string
 	}
 }
 
+// RespondAccountGateError maps an account-status refusal. S3 documents AccountProblem
+// for the caller's own account and AllAccessDisabled for the account that owns the
+// resource; anything else is a status we could not read, which must not look like a
+// verdict on the account.
+func RespondAccountGateError(w http.ResponseWriter, r *http.Request, err error, ownerAccount bool) {
+	if errors.Is(err, auth.ErrAccountNotActive) {
+		if ownerAccount {
+			WriteS3Error(w, r, http.StatusForbidden, "AllAccessDisabled", "All access to this Amazon S3 resource has been disabled.")
+			return
+		}
+		WriteS3Error(w, r, http.StatusForbidden, "AccountProblem", "There is a problem with your AWS account that prevents the operation from completing successfully.")
+		return
+	}
+	slog.ErrorContext(r.Context(), "Account status check failed", "error", err, "remoteAddr", ClientAddr(r))
+	WriteS3Error(w, r, http.StatusInternalServerError, "InternalError", "An internal error occurred")
+}
+
 // WriteS3Error writes an S3 error response.
 func WriteS3Error(w http.ResponseWriter, r *http.Request, statusCode int, code, message string) {
 	s3error := S3Error{

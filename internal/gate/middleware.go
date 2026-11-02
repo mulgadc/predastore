@@ -199,6 +199,37 @@ func (s *Server) throttleMiddleware() func(http.Handler) http.Handler {
 	)
 }
 
+// accountActive reports whether accountID may proceed and writes the refusal when it may
+// not. A provider without account directory access has nothing to ask.
+func (s *Server) accountActive(w http.ResponseWriter, r *http.Request, accountID string, owner bool) bool {
+	gate, ok := s.credProv.(auth.AccountGate)
+	if !ok {
+		return true
+	}
+	if err := gate.CheckAccountActive(r.Context(), accountID); err != nil {
+		slog.WarnContext(r.Context(), "Account gate refused request", "accountID", accountID, "owner", owner, "error", err)
+		handlers.RespondAccountGateError(w, r, err, owner)
+		return false
+	}
+	return true
+}
+
+// publicOwnerActive gates the owner of a public bucket for an unsigned request.
+func (s *Server) publicOwnerActive(w http.ResponseWriter, r *http.Request, bucket string) bool {
+	meta, err := handlers.ResolveBucketMetadata(r.Context(), s.cfg.Meta, s.handlerCfg, bucket)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "Failed to resolve bucket metadata for public owner check",
+			"bucket", bucket, "error", err)
+		handlers.WriteS3Error(w, r, http.StatusInternalServerError, "InternalError",
+			"An internal error occurred")
+		return false
+	}
+	if meta == nil || meta.AccountID == "" {
+		return true
+	}
+	return s.accountActive(w, r, meta.AccountID, true)
+}
+
 // sigV4AuthMiddleware authenticates and authorizes incoming S3 requests:
 // public-bucket short-circuit, SigV4 verify, IAM policy eval, and
 // cross-account bucket-ownership check.
@@ -220,6 +251,10 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			// Unsigned: fall back to public-bucket access rather than a parse error.
 			if errors.Is(err, sigv4.ErrMissingAuthentication) {
 				if publicBucketAccess == nil {
+					// A public grant must not keep a closed account's data reachable.
+					if !s.publicOwnerActive(w, r, bucket) {
+						return
+					}
 					next.ServeHTTP(w, r)
 					return
 				}
@@ -259,8 +294,13 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		// so the handler authorizes each key through this instead.
 		authorize := handlers.ObjectAuthorizer(func(string, string) bool { return true })
 
-		// IAM policy evaluation (NATS-sourced credentials only).
+		// IAM policy evaluation (NATS-sourced credentials only). Config-defined service
+		// accounts (SkipPolicyCheck) belong to no tenant account and bypass the account
+		// gate as they bypass policy, so platform work such as teardown is never refused.
 		if !credResult.SkipPolicyCheck {
+			if !s.accountActive(w, r, credResult.AccountID, false) {
+				return
+			}
 			if action == "" {
 				slog.WarnContext(r.Context(), "Unsupported HTTP method for S3 action mapping",
 					"method", method, "path", r.URL.Path, "remoteAddr", handlers.ClientAddr(r))
@@ -317,6 +357,13 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 					"action", action,
 					"resource", resource)
 				handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
+				return
+			}
+			// A grant from a bucket policy or the public flag must not keep a suspended or
+			// terminating account's data reachable, so its owner is gated too. A request
+			// refused above never learns the owner's state.
+			if meta != nil && !credResult.SkipPolicyCheck && meta.AccountID != "" && meta.AccountID != credResult.AccountID &&
+				!s.accountActive(w, r, meta.AccountID, true) {
 				return
 			}
 		}
