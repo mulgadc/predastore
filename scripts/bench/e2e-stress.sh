@@ -3097,10 +3097,24 @@ log "starting Warp GET load over $SURVIVOR_LIST"
     --no-color --noclear --full > "$WARP_LOG" 2>&1 &
 WARP_PID=$!
 
+# corpus_count prints how many objects are in a bucket. Warp creates its bucket
+# only once prepare starts, so NoSuchBucket counts as zero; any other listing
+# failure is returned, with the CLI's error kept in $RUN_DIR/corpus-ls.err.
+corpus_count() {
+    local listing err="$RUN_DIR/corpus-ls.err" rc=0
+    listing="$(aws_s3 "$1" s3 ls "s3://$2/" --recursive 2>"$err")" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        grep -q 'NoSuchBucket' "$err" || return "$rc"
+        listing=""
+    fi
+    if [ -z "$listing" ]; then echo 0; else printf '%s\n' "$listing" | wc -l; fi
+}
+
 log "waiting for the Warp corpus to be written"
 deadline=$(( $(date +%s) + 300 ))
 while :; do
-    count="$(aws_s3 "$SURVIVOR_ENDPOINT" s3 ls "s3://$GET_BUCKET/" --recursive 2>/dev/null | wc -l)"
+    count="$(corpus_count "$SURVIVOR_ENDPOINT" "$GET_BUCKET")" \
+        || fail "listing the Warp corpus failed; see $RUN_DIR/corpus-ls.err"
     [ "$count" -ge "$OBJECTS" ] && break
     kill -0 "$WARP_PID" 2>/dev/null || fail "Warp exited during prepare; see $WARP_LOG"
     [ "$(date +%s)" -lt "$deadline" ] || fail "Warp corpus not ready after 300s"
