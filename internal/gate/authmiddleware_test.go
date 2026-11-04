@@ -223,7 +223,15 @@ func TestSigV4AuthMiddleware_PayloadBinding(t *testing.T) {
 				signTestReq(t, req, signed, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3")
 				req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED")
 			},
-			expectCode: "InvalidRequest",
+			expectCode: "InvalidArgument",
+		},
+		{
+			name: "non-hex digest",
+			setup: func(t *testing.T, req *http.Request) {
+				signTestReq(t, req, signed, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3")
+				req.Header.Set("X-Amz-Content-Sha256", strings.Repeat("z", 64))
+			},
+			expectCode: "InvalidArgument",
 		},
 	}
 

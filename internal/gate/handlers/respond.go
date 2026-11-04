@@ -57,7 +57,8 @@ func RespondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string
 	case errors.Is(err, sigv4.ErrMissingContentSHA256):
 		WriteS3Error(w, r, http.StatusBadRequest, "InvalidRequest", "Missing required header: X-Amz-Content-Sha256")
 	case errors.Is(err, sigv4.ErrInvalidContentSHA256):
-		WriteS3Error(w, r, http.StatusBadRequest, "InvalidRequest", "Invalid X-Amz-Content-Sha256 header: it must be a SHA-256 digest or a supported payload sentinel")
+		WriteS3Error(w, r, http.StatusBadRequest, string(model.ErrInvalidArgument),
+			"x-amz-content-sha256 must be UNSIGNED-PAYLOAD, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER, STREAMING-UNSIGNED-PAYLOAD-TRAILER or a valid sha256 value.")
 	case errors.Is(err, sigv4.ErrContentSHA256Mismatch):
 		slog.WarnContext(r.Context(), "Request body does not match the signed payload hash",
 			"accessKeyID", claimedKey,
