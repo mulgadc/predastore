@@ -66,6 +66,13 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			HandleError(w, r, model.ErrMissingContentLengthError)
 			return
 		}
+		// Refused before placement, so an oversized body is never read and no
+		// shard is prepared for it.
+		if size > model.MaxPutObjectSize {
+			HandleError(w, r, model.NewS3Error(model.ErrEntityTooLarge,
+				"Your proposed upload exceeds the maximum allowed size", http.StatusBadRequest))
+			return
+		}
 
 		// Placement, and the write epoch every shard is stamped with, are fixed
 		// before the first byte moves: the record the read path will dial has to
