@@ -18,6 +18,9 @@ const (
 	// MaxPartSize is the maximum size for any single part (5GB).
 	MaxPartSize int64 = 5 * 1024 * 1024 * 1024
 
+	// MaxPutObjectSize is the largest object a single PutObject may upload (5GB).
+	MaxPutObjectSize int64 = 5 * 1024 * 1024 * 1024
+
 	// MaxPartsCount is the maximum number of parts in a multipart upload (10,000).
 	MaxPartsCount = 10000
 
