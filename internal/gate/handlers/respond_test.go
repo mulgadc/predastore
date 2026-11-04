@@ -3,11 +3,13 @@ package handlers
 import (
 	"encoding/xml"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"testing"
 
+	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -103,4 +105,50 @@ func TestHandleError_GenericError(t *testing.T) {
 	var s3error S3Error
 	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &s3error))
 	assert.Equal(t, "InternalError", s3error.Code)
+}
+
+func TestRespondSigV4Error_ContentSHA256(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		code    string
+		message []string
+	}{
+		{
+			name: "unrecognised value",
+			err:  fmt.Errorf("%w: %q", sigv4.ErrInvalidContentSHA256, "junk"),
+			code: string(model.ErrInvalidArgument),
+			message: []string{
+				string(sigv4.UnsignedPayload),
+				string(sigv4.StreamingSigned) + ",",
+				string(sigv4.StreamingSignedTrailer),
+				string(sigv4.StreamingUnsignedTrailer),
+				"a valid sha256 value",
+			},
+		},
+		{
+			name:    "missing header",
+			err:     sigv4.ErrMissingContentSHA256,
+			code:    "InvalidRequest",
+			message: []string{"Missing required header: X-Amz-Content-Sha256"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPut, "/bucket/key", nil)
+			rr := httptest.NewRecorder()
+
+			RespondSigV4Error(rr, req, "AKID", tt.err, nil)
+
+			assert.Equal(t, http.StatusBadRequest, rr.Code)
+			var s3error S3Error
+			require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &s3error))
+			assert.Equal(t, tt.code, s3error.Code)
+			for _, want := range tt.message {
+				assert.Contains(t, s3error.Message, want)
+			}
+			assert.NotContains(t, s3error.Message, "junk", "the client's value is not echoed")
+		})
+	}
 }
