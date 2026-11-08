@@ -3,7 +3,7 @@ module github.com/mulgadc/predastore
 go 1.27.3
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.47.5
+	github.com/aws/aws-sdk-go-v2 v1.47.6
 	github.com/buraksezer/consistent v1.1.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/dgraph-io/badger/v4 v4.9.6
@@ -16,7 +16,7 @@ require (
 	github.com/mulgadc/bluebottle v1.24.0
 	github.com/nats-io/nats.go v1.55.0
 	github.com/pelletier/go-toml/v2 v2.4.3
-	github.com/quic-go/quic-go v0.64.1
+	github.com/quic-go/quic-go v0.65.0
 	github.com/stretchr/testify v1.12.1
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/metric v1.47.0
@@ -28,7 +28,7 @@ require (
 )
 
 require (
-	github.com/aws/smithy-go v1.28.7 // indirect
+	github.com/aws/smithy-go v1.28.8 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.4.0 // indirect
