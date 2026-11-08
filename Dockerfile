@@ -44,7 +44,7 @@ RUN out="$(/out/s3d -h 2>&1 || true)"; \
     esac
 
 
-FROM debian:trixie-slim@sha256:f6b08b09a05725f9431502d3b5714f5c4576e82c1a84fa1debe0c24a7e0c3ec4 AS runtime
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
 
 # openssl generates the TLS identity and the at-rest key on first start; curl
 # backs the healthcheck below. Both could go once s3d grows subcommands for
