@@ -9,7 +9,7 @@
 
 # Base images are pinned by digest so a rebuild of the same commit gets the
 # same bytes; Dependabot bumps the tag and digest together.
-FROM golang:1.27.3-trixie@sha256:af1bfc2614ebb1dbd31af514b78740fd678850e76498762b425ecee4c5c6ea80 AS builder
+FROM golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9 AS builder
 
 # GOFIPS140 is a build-time contract, not a preference. bluebottle/pkg/fipsboot
 # is a blank import in cmd/s3d, and its init() panics unless the binary was
