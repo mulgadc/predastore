@@ -122,6 +122,8 @@ func VerifyShards(ctx context.Context, cfg *Config, rootCAs *x509.CertPool, opts
 				metaIDs = append(metaIDs, n.ID)
 			case RoleBlob:
 				blobIDs = append(blobIDs, n.ID)
+			case RoleGate:
+				// A gate holds no shards.
 			}
 		}
 	}

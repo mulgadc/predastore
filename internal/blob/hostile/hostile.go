@@ -167,6 +167,9 @@ func (s *Server) handleGet(ctx context.Context, header blob.Request, stream tran
 			default:
 			}
 		}
+
+	case FaultNone, FaultStallAfterEnvelope, FaultSlowDrip, FaultTruncate, FaultAbort:
+		// These act once the value is found, below.
 	}
 
 	value, ok := s.cfg.Values[header.Index]
@@ -220,6 +223,9 @@ func (s *Server) handleGet(ctx context.Context, header blob.Request, stream tran
 		}
 		stream.CancelWrite(1)
 		return nil
+
+	case FaultNone, FaultStall, FaultEnvelopeGarbage:
+		// None serves the value whole below; the stall and garbage faults returned above.
 	}
 
 	if err := writeEnvelope(stream, blob.Response{BodyLen: int64(len(value))}); err != nil {
