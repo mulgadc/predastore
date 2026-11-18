@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/mulgadc/bluebottle/pkg/ratelimit"
 	"github.com/mulgadc/bluebottle/pkg/tlsconfig"
+	"github.com/mulgadc/predastore/endpointproxy"
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/placement"
@@ -41,6 +42,9 @@ type Server struct {
 	// cert is loaded by New, so a gate that cannot serve TLS fails to build
 	// rather than at its first request.
 	cert tls.Certificate
+	// endpointTLS is the node-to-node session config, or nil when the gate
+	// serves no endpoint listener.
+	endpointTLS *tls.Config
 
 	router    chi.Router
 	credProv  auth.CredentialProvider
@@ -96,6 +100,16 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 	}
 
+	var endpointTLS *tls.Config
+	if cfg.EndpointPort != 0 {
+		if cfg.TLSCA == "" {
+			return nil, errors.New("an endpoint listener needs Config.TLSCA")
+		}
+		if endpointTLS, err = endpointTLSConfig(cert, cfg.TLSCA); err != nil {
+			return nil, err
+		}
+	}
+
 	if cfg.Addr == "" {
 		cfg.Addr = defaultAddr
 	}
@@ -122,12 +136,13 @@ func New(cfg Config) (*Server, error) {
 	}
 	handlerCfg.Epochs = minter
 	s := &Server{
-		cfg:        cfg,
-		cert:       cert,
-		router:     chi.NewRouter(),
-		credProv:   credProv,
-		handlerCfg: handlerCfg,
-		buckets:    handlers.NewBucketCache(handlerCfg.Buckets),
+		cfg:         cfg,
+		cert:        cert,
+		endpointTLS: endpointTLS,
+		router:      chi.NewRouter(),
+		credProv:    credProv,
+		handlerCfg:  handlerCfg,
+		buckets:     handlers.NewBucketCache(handlerCfg.Buckets),
 	}
 	if cfg.RateLimit.Enabled {
 		s.throttler = ratelimit.New(cfg.RateLimit)
@@ -325,6 +340,33 @@ func (s *Server) Run(ctx context.Context) error {
 		<-serveErr
 	}()
 
+	// The endpoint listener serves the same routes to guests behind a node's
+	// VPC endpoint proxy: the guest's TLS terminates here as on the S3 port,
+	// inside a node-to-node session whose header names the guest.
+	endpointErr := make(chan error, 1)
+	if s.endpointTLS != nil {
+		eaddr := net.JoinHostPort(s.cfg.Addr, strconv.Itoa(s.cfg.EndpointPort))
+		eln, err := net.Listen("tcp", eaddr)
+		if err != nil {
+			return fmt.Errorf("listen on %s: %w", eaddr, err)
+		}
+		endpointSrv := newHTTPServer(eaddr, s.router, tlsCfg, protocols)
+		endpointSrv.ConnContext = endpointConnContext
+		go func() {
+			endpointErr <- endpointSrv.Serve(tls.NewListener(newEndpointListener(eln, s.endpointTLS), tlsCfg))
+			close(endpointErr)
+		}()
+		defer func() {
+			drainCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+			defer cancel()
+			if err := endpointSrv.Shutdown(drainCtx); err != nil {
+				slog.Error("S3 endpoint listener did not drain within grace period", "error", err)
+			}
+			<-endpointErr
+		}()
+		slog.Info("Starting S3 endpoint listener", "addr", eaddr, "contract_version", endpointproxy.ContractVersion1)
+	}
+
 	// The sweep is scoped to Run so no goroutine outlives it, and it is stopped
 	// before the listener drains: a rebuild in flight holds streams to peers
 	// that the drain would otherwise wait behind.
@@ -398,5 +440,10 @@ func (s *Server) Run(ctx context.Context) error {
 			return nil
 		}
 		return err
+	case err := <-endpointErr:
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("endpoint listener: %w", err)
 	}
 }

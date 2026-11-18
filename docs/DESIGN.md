@@ -167,6 +167,45 @@ The gate is the S3 implementation, not a front end onto one. It erasure codes, p
 
 TLS 1.3 minimum, HTTP/2 advertised over ALPN with HTTP/1.1 as fallback. Read and write timeouts 60s, idle 120s, header read 10s, max header 1 MiB. `Run` serves until the context is cancelled, then drains in-flight requests within a 10s grace period. A gate that cannot bind takes the process down rather than leave the cluster running headless.
 
+## VPC endpoint listener
+
+A gate with `endpoint_port` set serves the same routes a second time, to guests that reach S3 through a VPC endpoint.
+A node's endpoint proxy captures the guest's connection to the S3 service address and relays it here; the guest's own TLS still terminates at the gate, against the same certificate as the S3 port.
+
+Each connection carries two layers before the guest's bytes:
+
+1. **Node session.** TLS 1.3, with a client certificate that chains to the formation CA in `tls_ca` and carries the client-authentication usage. Node certificates have it; guest service certificates signed by the same CA have server authentication only, so they are refused.
+2. **PROXY v2 header.** One header per connection, read in full before the guest's first byte, then the stream is handed to the HTTP server.
+
+A request on this listener is addressed as the guest: `RemoteAddr` is the header's source, and its context carries the endpoint.
+Authorisation then supplies `aws:SourceVpce`, `aws:SourceVpc` and `aws:VpcSourceIp` and omits `aws:SourceIp`, as AWS does for a request through a gateway endpoint.
+A `NotIpAddress` deny on `aws:SourceIp` therefore holds, and an allow on it does not match.
+
+The handshake and header read share a 10s deadline, and each connection is admitted concurrently so a stalled peer blocks no other.
+Shutdown closes every connection still in its handshake rather than waiting out that deadline.
+
+### Proxy-to-gate contract
+
+The header is a cross-component contract between spinifex's endpoint proxy (producer) and this listener (consumer).
+The codec is `endpointproxy`, which both import, so the two sides cannot disagree on the encoding.
+
+| Field | Encoding |
+|---|---|
+| Command | `PROXY` over TCP/IPv4 (`0x21`, `0x11`); `LOCAL` and IPv6 are refused |
+| Addresses | the guest's source and the S3 address it dialled; the source must be a routable IPv4 address with a port |
+| `0xE0` | contract version, one byte; required, first |
+| `0xEA` subtype `0x01` | the `vpce-` ID, AWS's own `PP2_TYPE_AWS` / `PP2_SUBTYPE_AWS_VPCE_ID` |
+| `0xE1` | the VPC ID |
+| `0xE2` | the endpoint owner's 12-digit account |
+
+The header is at most 32 KiB, every TLV is required exactly once, and unknown TLV types are skipped so a later version can add optional fields.
+A version this gate does not speak closes the connection and logs `unsupported_version`; it is never served under a guessed identity.
+
+The listener speaks contract version 1.
+The two sides are released independently, so the proxy chooses the version for each new session from the cluster feature level, which reports this listener only once every gate serves it.
+Rolling a gate back below the listener is safe only after the feature level's drain check reports no endpoint in use; until then the proxy keeps opening sessions to gates that would refuse them.
+The contract is retired by removing the version from both sides after the feature level that introduced its successor is finalised.
+
 ## S3 surface
 
 | Area | Operations |
@@ -609,12 +648,14 @@ addr = "10.11.12.1"             # what peers dial; no port — nodes carry those
 # encryption_key = "/etc/predastore/master.key"
 # tls_cert       = "/etc/predastore/server.pem"
 # tls_key        = "/etc/predastore/server.key"
+# tls_ca         = "/etc/predastore/ca.pem"     # formation CA; needed by endpoint_port
 
   [[host.node]]
   id   = 1
   role = "gate"                 # the S3 endpoint; port is the S3 port
   port = 8443
   # bind_addr = "0.0.0.0"       # where S3 listens; gate only, defaults to the host's
+  # endpoint_port = 8474        # VPC endpoint listener; gate only, absent runs none
 
   [[host.node]]
   id   = 2
@@ -678,7 +719,7 @@ None of that runs on the request path. A background sampler re-runs every check 
 
 ## What validation rejects
 
-Version mismatch, missing region, an erasure code that is absent or invalid, `parity = 0` at any width but 1, `data + parity` exceeding the blob node count, duplicate host or node ids, an unknown role, a missing or duplicated port within a host, an `admin_port` that is out of range or already a node's, a port on a host or node address, a wildcard `addr`, a relative path anywhere, a `data_dir` on a gate, a `bind_addr` on anything but a gate, two gates on one host, two nodes deriving the same data directory, and two nodes at the same address. A malformed bucket name is dropped with a warning rather than being fatal, since the rest of the config is still serviceable.
+Version mismatch, missing region, an erasure code that is absent or invalid, `parity = 0` at any width but 1, `data + parity` exceeding the blob node count, duplicate host or node ids, an unknown role, a missing or duplicated port within a host, an `admin_port` that is out of range or already a node's, an `endpoint_port` off a gate, out of range, already a port on its host, or without the host's `tls_ca`, a port on a host or node address, a wildcard `addr`, a relative path anywhere, a `data_dir` on a gate, a `bind_addr` on anything but a gate, two gates on one host, two nodes deriving the same data directory, and two nodes at the same address. A malformed bucket name is dropped with a warning rather than being fatal, since the rest of the config is still serviceable.
 
 ## Dev profiles
 

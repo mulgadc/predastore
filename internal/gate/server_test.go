@@ -1,6 +1,7 @@
 package gate
 
 import (
+	"crypto/tls"
 	"testing"
 
 	"github.com/mulgadc/predastore/internal/testcerts"
@@ -66,6 +67,20 @@ func TestNew_BadCertificate(t *testing.T) {
 	_, err := New(cfg)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "TLS certificate")
+}
+
+// An endpoint listener with no CA would verify node certificates against
+// nothing, so New refuses it rather than serving it open.
+func TestNew_EndpointListenerNeedsACA(t *testing.T) {
+	cfg := wired(t)
+	cfg.EndpointPort = 8474
+	_, err := New(cfg)
+	require.ErrorContains(t, err, "Config.TLSCA")
+
+	cfg.TLSCA = cfg.TLSCert
+	s, err := New(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, tls.RequireAndVerifyClientCert, s.endpointTLS.ClientAuth)
 }
 
 // TestNew_BuildsRouter builds the routing surface without a listener: the seam

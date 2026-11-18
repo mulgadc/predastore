@@ -89,6 +89,9 @@ type Host struct {
 	// TLSCert and TLSKey identify the host to its peers and to S3 clients.
 	TLSCert string `toml:"tls_cert"`
 	TLSKey  string `toml:"tls_key"`
+	// TLSCA is the formation CA a node's VPC endpoint proxy proves itself
+	// under. Only a gate with an endpoint_port reads it.
+	TLSCA string `toml:"tls_ca"`
 	// AdminPort serves /healthz and /readyz on BindAddr. It is a property of
 	// the process rather than a role, so it sits here rather than becoming a
 	// fourth node role. Zero runs no admin listener.
@@ -111,6 +114,10 @@ type Node struct {
 	// this on the public interface and leaves the host's bind_addr on the
 	// private one. Empty follows the host. Only a gate may set it.
 	BindAddr string `toml:"bind_addr"`
+	// EndpointPort is where a gate takes VPC endpoint connections from node
+	// proxies, over mTLS, on the gate's own bind address. Zero serves none.
+	// Only a gate may set it, and its host must name tls_ca.
+	EndpointPort int `toml:"endpoint_port"`
 	// DataDir is an absolute directory this node owns outright, so that blob
 	// nodes on one host can sit on separate disks. Empty derives one under the
 	// host's root instead. It has no flag: it is per-node, and a flag is not.
@@ -452,6 +459,7 @@ func (c *Config) validateTopology() error {
 			{"encryption_key", h.EncryptionKey},
 			{"tls_cert", h.TLSCert},
 			{"tls_key", h.TLSKey},
+			{"tls_ca", h.TLSCA},
 		} {
 			if isRelative(p[1]) {
 				return fmt.Errorf("host %d %s %q must be absolute", h.ID, p[0], p[1])
@@ -495,6 +503,19 @@ func (c *Config) validateTopology() error {
 			if hasPort(n.BindAddr) {
 				return fmt.Errorf("node %d bind_addr %q must not carry a port", n.ID, n.BindAddr)
 			}
+			if n.EndpointPort != 0 {
+				if n.Role != RoleGate {
+					return fmt.Errorf("node %d has role %q and must not set endpoint_port", n.ID, n.Role)
+				}
+				if n.EndpointPort < 1 || n.EndpointPort > 65535 {
+					return fmt.Errorf("node %d endpoint_port %d is not a port", n.ID, n.EndpointPort)
+				}
+				// Without the CA the listener could verify nothing, and the
+				// system pool would admit any public CA's client certificate.
+				if h.TLSCA == "" {
+					return fmt.Errorf("node %d sets endpoint_port but host %d has no tls_ca", n.ID, h.ID)
+				}
+			}
 			if n.Role == RoleGate {
 				// A gate keeps nothing on disk, so a data_dir on one is a
 				// misunderstanding rather than something to ignore.
@@ -520,6 +541,20 @@ func (c *Config) validateTopology() error {
 				return fmt.Errorf("nodes %d and %d both use data dir %s on host %d", other, n.ID, dir, h.ID)
 			}
 			dirs[dir] = n.ID
+		}
+
+		// The endpoint listener binds beside the S3 port, so it collides with
+		// every other port on the host the same way.
+		for _, n := range h.Nodes {
+			if n.EndpointPort == 0 {
+				continue
+			}
+			if other, ok := ports[n.EndpointPort]; ok {
+				return fmt.Errorf("node %d endpoint_port %d is already used by node %d", n.ID, n.EndpointPort, other)
+			}
+			if n.EndpointPort == h.AdminPort {
+				return fmt.Errorf("node %d endpoint_port %d is host %d's admin_port", n.ID, n.EndpointPort, h.ID)
+			}
 		}
 
 		// The admin listener shares the host's cluster plane with the nodes, so
