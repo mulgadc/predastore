@@ -283,6 +283,49 @@ func TestValidate_AdminPort(t *testing.T) {
 	})
 }
 
+// The endpoint listener is a gate's, sits beside the host's other ports, and
+// verifies node certificates against tls_ca, so a gate without one is refused.
+func TestValidate_EndpointPort(t *testing.T) {
+	cfg := func(gateEndpoint, blobEndpoint int, ca string) *Config {
+		return &Config{
+			Version: Version,
+			Region:  "ap-southeast-2",
+			RS:      RS{Data: 1, Parity: 0},
+			Hosts: []Host{{
+				ID:        1,
+				Addr:      "10.0.0.1",
+				AdminPort: 9100,
+				TLSCA:     ca,
+				Nodes: []Node{
+					{ID: 1, Role: RoleGate, Port: 8443, EndpointPort: gateEndpoint},
+					{ID: 2, Role: RoleBlob, Port: 9991, DataDir: "/var/lib/predastore/blob", EndpointPort: blobEndpoint},
+				},
+			}},
+		}
+	}
+	const ca = "/etc/spinifex/ca.pem"
+
+	require.NoError(t, cfg(0, 0, "").Validate(), "absent runs no listener and needs no CA")
+	require.NoError(t, cfg(8474, 0, ca).Validate())
+
+	for name, tc := range map[string]struct {
+		c    *Config
+		want string
+	}{
+		"without tls_ca":           {cfg(8474, 0, ""), "has no tls_ca"},
+		"relative tls_ca":          {cfg(8474, 0, "ca.pem"), "must be absolute"},
+		"on a blob node":           {cfg(0, 8474, ca), "must not set endpoint_port"},
+		"not a port":               {cfg(70000, 0, ca), "is not a port"},
+		"on the gate's S3 port":    {cfg(8443, 0, ca), "already used by node 1"},
+		"on a blob node's port":    {cfg(9991, 0, ca), "already used by node 2"},
+		"on the host's admin port": {cfg(9100, 0, ca), "admin_port"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.ErrorContains(t, tc.c.Validate(), tc.want)
+		})
+	}
+}
+
 // The OTel bridge stringifies a named integer it has no case for, so an id that
 // stopped resolving to a plain integer could no longer be grouped by in the sink.
 func TestIDsResolveToIntegerLogValues(t *testing.T) {

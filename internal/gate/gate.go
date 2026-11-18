@@ -146,6 +146,11 @@ type Config struct {
 	TLSCert string
 	TLSKey  string
 
+	// EndpointPort serves VPC endpoint connections from node proxies on Addr,
+	// over mTLS against TLSCA; zero serves none. See package endpointproxy.
+	EndpointPort int
+	TLSCA        string
+
 	// EnableHTTP2 advertises h2 over ALPN. Off leaves http/1.1 as the only
 	// offer, so a client that would otherwise multiplex falls back to a
 	// connection pool.

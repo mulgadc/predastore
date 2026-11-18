@@ -224,12 +224,14 @@ func gateConfig(
 			Interval: time.Duration(c.Reaper.IntervalSeconds) * time.Second,
 		},
 
-		Addr:        config.NodeBindAddr(host, n),
-		Port:        n.Port,
-		TLSCert:     host.TLSCert,
-		TLSKey:      host.TLSKey,
-		EnableHTTP2: c.S3.HTTP2Enabled(),
-		Meta:        mc,
-		Blob:        bc,
+		Addr:         config.NodeBindAddr(host, n),
+		Port:         n.Port,
+		TLSCert:      host.TLSCert,
+		TLSKey:       host.TLSKey,
+		TLSCA:        host.TLSCA,
+		EndpointPort: n.EndpointPort,
+		EnableHTTP2:  c.S3.HTTP2Enabled(),
+		Meta:         mc,
+		Blob:         bc,
 	}
 }

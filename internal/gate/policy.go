@@ -169,16 +169,25 @@ func maxKeysCondition(raw string) (string, bool) {
 // as a real value that matches nothing, and on a Deny that silently widens
 // access instead of narrowing it.
 func conditionKeys(r *http.Request, action string, cred *auth.CredentialResult) iampolicy.ConditionKeys {
-	// A RemoteAddr with no port is passed through rather than dropped.
-	sourceIP := r.RemoteAddr
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		sourceIP = host
-	}
 	keys := iampolicy.ConditionKeys{
 		iampolicy.KeySecureTransport: strconv.FormatBool(r.TLS != nil),
 	}
-	if sourceIP != "" {
-		keys[iampolicy.KeySourceIP] = sourceIP
+	// Through a VPC endpoint AWS supplies the guest's private address and the
+	// endpoint's identity, and no aws:SourceIp: the node's address must never
+	// stand in for the guest's.
+	if ep, ok := endpointFrom(r.Context()); ok {
+		keys[iampolicy.KeySourceVpce] = ep.VpceID
+		keys[iampolicy.KeySourceVpc] = ep.VpcID
+		keys[iampolicy.KeyVpcSourceIP] = ep.Source.Addr().String()
+	} else {
+		// A RemoteAddr with no port is passed through rather than dropped.
+		sourceIP := r.RemoteAddr
+		if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			sourceIP = host
+		}
+		if sourceIP != "" {
+			keys[iampolicy.KeySourceIP] = sourceIP
+		}
 	}
 	// aws:username is user-only in AWS. A role session's UserName is the
 	// caller-chosen RoleSessionName, so gating authorization on it here would

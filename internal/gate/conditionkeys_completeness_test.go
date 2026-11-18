@@ -4,6 +4,7 @@
 package gate
 
 import (
+	"context"
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
@@ -29,9 +30,13 @@ var gatewayDoorKeys = []string{
 	iampolicy.KeyEpochTime,
 }
 
-// s3:prefix and s3:max-keys are the keys this door adds over the gateway's set:
-// request context that exists on the S3 data plane and nowhere else.
-var s3GateExtraKeys = []string{iampolicy.KeyS3Prefix, iampolicy.KeyS3MaxKeys}
+// The keys this door adds over the gateway's set: s3:prefix and s3:max-keys, and
+// the VPC endpoint keys, since guests reach S3 through an endpoint and never the
+// gateway. aws:SourceIp is in the gateway set; an endpoint request omits it.
+var s3GateExtraKeys = []string{
+	iampolicy.KeyS3Prefix, iampolicy.KeyS3MaxKeys,
+	iampolicy.KeySourceVpce, iampolicy.KeySourceVpc, iampolicy.KeyVpcSourceIP,
+}
 
 // Every operator the evaluator implements, so "is this key usable in a policy"
 // is asked of the whole allowlist rather than one operator of it.
@@ -68,6 +73,10 @@ func emittedKeys(t *testing.T) map[string]string {
 			r.RemoteAddr = "192.0.2.10:41288"
 			for key := range conditionKeys(r, action, cred) {
 				union[key] = name + "/" + action
+			}
+			ep := r.WithContext(context.WithValue(r.Context(), endpointCtxKey{}, testHeader()))
+			for key := range conditionKeys(ep, action, cred) {
+				union[key] = name + "/" + action + " via an endpoint"
 			}
 		}
 	}

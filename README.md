@@ -289,6 +289,7 @@ addr = "10.11.12.1"        # what other hosts dial; no port — nodes carry thos
   role = "gate"            # the S3 endpoint; port is the S3 port
   port = 8443
   # bind_addr = "0.0.0.0"  # where S3 listens; gate only, defaults to the host's
+  # endpoint_port = 8474   # VPC endpoint listener; gate only, needs the host's tls_ca
 
   [[host.node]]
   id   = 2
