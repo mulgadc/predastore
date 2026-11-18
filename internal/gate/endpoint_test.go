@@ -2,6 +2,7 @@ package gate
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -9,9 +10,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/json"
 	"encoding/pem"
+	"encoding/xml"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -19,12 +21,15 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	"github.com/mulgadc/predastore/endpointproxy"
 	"github.com/mulgadc/predastore/internal/gate/auth"
+	"github.com/mulgadc/predastore/internal/gate/handlers"
+	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -263,40 +268,199 @@ func TestConditionKeys_ThroughAnEndpoint(t *testing.T) {
 	assert.False(t, present, "aws:SourceIp must be absent through an endpoint")
 }
 
-func policy(t *testing.T, js string) []iampolicy.PolicyDocument {
-	t.Helper()
-	var d iampolicy.PolicyDocument
-	require.NoError(t, json.Unmarshal([]byte(js), &d))
-	return []iampolicy.PolicyDocument{d}
+// fakeInner is a listener whose connections the test hands over one at a time,
+// so the order of Accept and Close is the test's to choose.
+type fakeInner struct {
+	conns  chan net.Conn
+	closed chan struct{}
+	once   sync.Once
 }
 
-// The policies customers write about endpoints decide as on AWS: an allow on a
-// public address range does not admit endpoint traffic, a NotIpAddress deny on
-// aws:SourceIp catches it, and aws:SourceVpce scopes it.
-func TestConditionKeys_EndpointPoliciesDecideAsOnAWS(t *testing.T) {
-	decide := func(js string) iampolicy.Decision {
-		r := endpointRequest()
-		return iampolicy.EvaluateWithKeys("s3:GetObject", "arn:aws:s3:::reports/q3.csv",
-			policy(t, js), conditionKeys(r, "s3:GetObject", &auth.CredentialResult{}))
+func (f *fakeInner) Accept() (net.Conn, error) {
+	c, ok := <-f.conns
+	if !ok {
+		return nil, net.ErrClosed
 	}
+	return c, nil
+}
 
-	assert.NotEqual(t, iampolicy.Allow, decide(`{"Version":"2012-10-17","Statement":[
-		{"Effect":"Allow","Action":"s3:GetObject","Resource":"*",
-		 "Condition":{"IpAddress":{"aws:SourceIp":["0.0.0.0/0"]}}}]}`),
-		"an allow on aws:SourceIp must not match a request that carries none")
+// Close leaves Accept blocked, as a connection already in the kernel's queue
+// is still returned after the listening socket starts closing.
+func (f *fakeInner) Close() error   { f.once.Do(func() { close(f.closed) }); return nil }
+func (f *fakeInner) Addr() net.Addr { return &net.TCPAddr{} }
 
-	assert.Equal(t, iampolicy.Deny, decide(`{"Version":"2012-10-17","Statement":[
-		{"Effect":"Allow","Action":"s3:*","Resource":"*"},
-		{"Effect":"Deny","Action":"s3:*","Resource":"*",
-		 "Condition":{"NotIpAddress":{"aws:SourceIp":["203.0.113.0/24"]}}}]}`),
-		"a NotIpAddress deny on aws:SourceIp holds when the key is absent")
+// A connection accepted after Close has swept the pending set is closed at once,
+// not left holding a handshake until its deadline.
+func TestEndpointListener_ConnectionAcceptedDuringCloseIsNotAdmitted(t *testing.T) {
+	pki := newEndpointPKI(t)
+	outer, err := endpointTLSConfig(pki.node, pki.caPath)
+	require.NoError(t, err)
+	inner := &fakeInner{conns: make(chan net.Conn), closed: make(chan struct{})}
+	l := newEndpointListener(inner, outer)
 
-	assert.Equal(t, iampolicy.Allow, decide(`{"Version":"2012-10-17","Statement":[
-		{"Effect":"Allow","Action":"s3:GetObject","Resource":"*",
-		 "Condition":{"StringEquals":{"aws:SourceVpce":"vpce-0a1b2c3d4e5f60718"},
-		              "IpAddress":{"aws:VpcSourceIp":"10.99.0.0/16"}}}]}`))
+	closed := make(chan error, 1)
+	go func() { closed <- l.Close() }()
+	require.Eventually(t, func() bool {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		return l.closed
+	}, 5*time.Second, time.Millisecond)
 
-	assert.NotEqual(t, iampolicy.Allow, decide(`{"Version":"2012-10-17","Statement":[
-		{"Effect":"Allow","Action":"s3:GetObject","Resource":"*",
-		 "Condition":{"StringEquals":{"aws:SourceVpce":"vpce-00000000000000000"}}}]}`))
+	server, peer := net.Pipe()
+	defer peer.Close()
+	inner.conns <- server
+	close(inner.conns)
+
+	_ = peer.SetReadDeadline(time.Now().Add(endpointHandshakeTimeout / 2))
+	_, err = peer.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "the late connection must be closed, not left to its handshake deadline")
+	require.NoError(t, <-closed)
+}
+
+// A connection already handed to the HTTP server belongs to its drain: closing
+// the listener must not cut it.
+func TestEndpointListener_CloseLeavesAnAdmittedConnectionOpen(t *testing.T) {
+	pki := newEndpointPKI(t)
+	outer, err := endpointTLSConfig(pki.node, pki.caPath)
+	require.NoError(t, err)
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	l := newEndpointListener(raw, outer)
+
+	header, err := testHeader().Marshal()
+	require.NoError(t, err)
+	client, err := dialEndpoint(t, raw.Addr().String(), pki, &pki.node, header)
+	require.NoError(t, err)
+	admitted, err := l.Accept()
+	require.NoError(t, err)
+	defer admitted.Close()
+
+	require.NoError(t, l.Close())
+	_, err = admitted.Write([]byte("still open"))
+	require.NoError(t, err)
+	got := make([]byte, len("still open"))
+	_, err = io.ReadFull(client, got)
+	require.NoError(t, err)
+	assert.Equal(t, "still open", string(got))
+}
+
+// endpointDecision sends a signed ListBucket through the whole server, through
+// an endpoint or not, as a principal holding policy, and returns the status.
+func endpointDecision(t *testing.T, viaEndpoint bool, statements ...iampolicy.Statement) int {
+	t.Helper()
+	server := newTestGate(t, Config{
+		Region: "ap-southeast-2",
+		Meta: newFakeMeta(t,
+			model.BucketMetadata{Name: "owner-bucket", Region: "ap-southeast-2", AccountID: acctOwner, OwnerID: keyCreator}),
+		CredProv: &stubCredProvider{creds: map[string]*auth.CredentialResult{
+			keyOwner: {SecretAccessKey: secret, AccountID: acctOwner, PolicyDocuments: []iampolicy.PolicyDocument{{
+				Version: "2012-10-17", Statement: statements,
+			}}},
+		}},
+	})
+	req := httptest.NewRequest(http.MethodGet, "/owner-bucket", nil)
+	if viaEndpoint {
+		h := testHeader()
+		req.RemoteAddr = h.Source.String()
+		req = req.WithContext(context.WithValue(req.Context(), endpointCtxKey{}, h))
+	} else {
+		req.RemoteAddr = "192.0.2.10:41288"
+	}
+	signTestReq(t, req, nil, keyOwner, secret, "ap-southeast-2", "s3")
+	rr := httptest.NewRecorder()
+	server.ServeHTTP(rr, req)
+	require.Contains(t, []int{http.StatusOK, http.StatusForbidden}, rr.Code, rr.Body.String())
+	return rr.Code
+}
+
+func onCondition(effect, op, key string, values ...string) iampolicy.Statement {
+	cv := iampolicy.ConditionValue(values)
+	return iampolicy.Statement{
+		Effect: effect, Action: iampolicy.StringOrArr{"s3:*"}, Resource: iampolicy.StringOrArr{"*"},
+		Condition: map[string]map[string]iampolicy.ConditionValue{op: {key: cv}},
+	}
+}
+
+// The policies customers write about endpoints decide as on AWS through the real
+// authorizer, and the same policy on the ordinary path decides as before.
+// The ordinary request comes from 192.0.2.10; the guest is 10.99.0.5.
+func TestEndpointPolicies_DecideAsOnAWS(t *testing.T) {
+	allowAll := allowAllPolicy.Statement[0]
+	for name, tc := range map[string]struct {
+		statements         []iampolicy.Statement
+		ordinary, endpoint int
+	}{
+		"allow on aws:SourceIp does not match endpoint traffic": {
+			[]iampolicy.Statement{onCondition("Allow", "IpAddress", "aws:SourceIp", "192.0.2.0/24")},
+			http.StatusOK, http.StatusForbidden,
+		},
+		"NotIpAddress deny on aws:SourceIp holds with the key absent": {
+			[]iampolicy.Statement{allowAll, onCondition("Deny", "NotIpAddress", "aws:SourceIp", "192.0.2.0/24")},
+			http.StatusOK, http.StatusForbidden,
+		},
+		"IpAddress deny on the guest CIDR in aws:SourceIp does not match": {
+			[]iampolicy.Statement{allowAll, onCondition("Deny", "IpAddress", "aws:SourceIp", "10.99.0.0/16")},
+			http.StatusOK, http.StatusOK,
+		},
+		"aws:VpcSourceIp deny on the guest CIDR matches only endpoint traffic": {
+			[]iampolicy.Statement{allowAll, onCondition("Deny", "IpAddress", "aws:VpcSourceIp", "10.99.0.0/16")},
+			http.StatusOK, http.StatusForbidden,
+		},
+		"allow scoped to this endpoint": {
+			[]iampolicy.Statement{onCondition("Allow", "StringEquals", "aws:SourceVpce", "vpce-0a1b2c3d4e5f60718")},
+			http.StatusForbidden, http.StatusOK,
+		},
+		"allow scoped to another endpoint": {
+			[]iampolicy.Statement{onCondition("Allow", "StringEquals", "aws:SourceVpce", "vpce-00000000000000000")},
+			http.StatusForbidden, http.StatusForbidden,
+		},
+		"allow scoped to this VPC": {
+			[]iampolicy.Statement{onCondition("Allow", "StringEquals", "aws:SourceVpc", "vpc-0123456789abcdef0")},
+			http.StatusForbidden, http.StatusOK,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.ordinary, endpointDecision(t, false, tc.statements...), "ordinary path")
+			assert.Equal(t, tc.endpoint, endpointDecision(t, true, tc.statements...), "through the endpoint")
+		})
+	}
+}
+
+// The per-object authorizer of a batch delete sees the endpoint's keys too, so
+// an endpoint-scoped deny fences keys inside a batch as it does a single call.
+func TestEndpointPolicies_ReachThePerObjectAuthorizer(t *testing.T) {
+	server := newTestGate(t, Config{
+		Region: "ap-southeast-2",
+		Meta: newFakeMeta(t,
+			model.BucketMetadata{Name: "owner-bucket", Region: "ap-southeast-2", AccountID: acctOwner, OwnerID: keyCreator}),
+		CredProv: &stubCredProvider{creds: map[string]*auth.CredentialResult{
+			keyOwner: {SecretAccessKey: secret, AccountID: acctOwner, PolicyDocuments: []iampolicy.PolicyDocument{{
+				Version: "2012-10-17",
+				Statement: []iampolicy.Statement{allowAllPolicy.Statement[0], {
+					Effect: "Deny", Action: iampolicy.StringOrArr{"s3:DeleteObject"},
+					Resource: iampolicy.StringOrArr{"arn:aws:s3:::owner-bucket/secret/*"},
+					Condition: map[string]map[string]iampolicy.ConditionValue{
+						"StringEquals": {"aws:SourceVpce": {"vpce-0a1b2c3d4e5f60718"}},
+					},
+				}},
+			}}},
+		}},
+	})
+	body := []byte("<Delete><Object><Key>public/a</Key></Object><Object><Key>secret/b</Key></Object></Delete>")
+	req := httptest.NewRequest(http.MethodPost, "/owner-bucket?delete=", bytes.NewReader(body))
+	h := testHeader()
+	req.RemoteAddr = h.Source.String()
+	req = req.WithContext(context.WithValue(req.Context(), endpointCtxKey{}, h))
+	signTestReq(t, req, body, keyOwner, secret, "ap-southeast-2", "s3")
+	rr := httptest.NewRecorder()
+	server.ServeHTTP(rr, req)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	var result handlers.DeleteResult
+	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &result))
+	require.Len(t, result.Errors, 1)
+	assert.Equal(t, "secret/b", result.Errors[0].Key)
+	assert.Equal(t, string(model.ErrAccessDenied), result.Errors[0].Code)
+	require.Len(t, result.Deleted, 1)
+	assert.Equal(t, "public/a", result.Deleted[0].Key)
 }

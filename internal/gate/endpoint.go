@@ -80,6 +80,7 @@ type endpointListener struct {
 	once    sync.Once
 	wg      sync.WaitGroup
 	mu      sync.Mutex
+	closed  bool
 	failed  error
 	pending map[net.Conn]struct{} // connections still in their handshake
 }
@@ -111,7 +112,14 @@ func (l *endpointListener) acceptLoop() {
 			l.once.Do(func() { close(l.done) })
 			return
 		}
+		// Registration and Close's sweep of pending are one critical section, so
+		// a connection accepted as Close runs is either swept or never admitted.
 		l.mu.Lock()
+		if l.closed {
+			l.mu.Unlock()
+			_ = raw.Close()
+			return
+		}
 		l.pending[raw] = struct{}{}
 		l.mu.Unlock()
 		l.wg.Go(func() { l.admit(raw) })
@@ -121,31 +129,40 @@ func (l *endpointListener) acceptLoop() {
 // admit completes one connection or closes it. A refusal is logged without the
 // header's identifiers, which are the peer's claim until the header validates.
 func (l *endpointListener) admit(raw net.Conn) {
-	defer func() {
-		l.mu.Lock()
-		delete(l.pending, raw)
-		l.mu.Unlock()
-	}()
-	_ = raw.SetDeadline(time.Now().Add(endpointHandshakeTimeout))
-	outer := tls.Server(raw, l.tls)
-	if err := outer.Handshake(); err != nil {
-		slog.Warn("gate: endpoint handshake refused", "peer", raw.RemoteAddr().String(), "error", err)
+	outer, header, ok := l.handshake(raw)
+	// Leaving pending hands the connection over: from here Close no longer
+	// owns it, and once served, only the HTTP server's drain does.
+	l.mu.Lock()
+	delete(l.pending, raw)
+	closed := l.closed
+	l.mu.Unlock()
+	if !ok || closed {
 		_ = raw.Close()
 		return
 	}
-	header, err := endpointproxy.Read(outer)
-	if err != nil {
-		slog.Warn("gate: endpoint header refused", "peer", raw.RemoteAddr().String(),
-			"unsupported_version", errors.Is(err, endpointproxy.ErrUnsupportedVersion), "error", err)
-		_ = outer.Close()
-		return
-	}
-	_ = raw.SetDeadline(time.Time{})
 	select {
 	case l.ready <- &endpointConn{Conn: outer, header: header}:
 	case <-l.done:
 		_ = outer.Close()
 	}
+}
+
+// handshake runs the node session and reads its header under one deadline.
+func (l *endpointListener) handshake(raw net.Conn) (*tls.Conn, endpointproxy.Header, bool) {
+	_ = raw.SetDeadline(time.Now().Add(endpointHandshakeTimeout))
+	outer := tls.Server(raw, l.tls)
+	if err := outer.Handshake(); err != nil {
+		slog.Warn("gate: endpoint handshake refused", "peer", raw.RemoteAddr().String(), "error", err)
+		return nil, endpointproxy.Header{}, false
+	}
+	header, err := endpointproxy.Read(outer)
+	if err != nil {
+		slog.Warn("gate: endpoint header refused", "peer", raw.RemoteAddr().String(),
+			"unsupported_version", errors.Is(err, endpointproxy.ErrUnsupportedVersion), "error", err)
+		return nil, endpointproxy.Header{}, false
+	}
+	_ = raw.SetDeadline(time.Time{})
+	return outer, header, true
 }
 
 func (l *endpointListener) Accept() (net.Conn, error) {
@@ -178,6 +195,7 @@ func (l *endpointListener) Close() error {
 	l.once.Do(func() { close(l.done) })
 	err := l.inner.Close()
 	l.mu.Lock()
+	l.closed = true
 	for c := range l.pending {
 		_ = c.Close()
 	}
