@@ -270,6 +270,8 @@ func TestLookupSession_AssumedRoleResolvesPolicies(t *testing.T) {
 		"the resolved role policy must authorize the allowed action")
 	assert.Equal(t, testSessionRoleID, res.UserID,
 		"a session's aws:userid is the ID STS minted, carried on the record rather than derived here")
+	assert.Equal(t, testSessionRoleARN, res.PrincipalARN,
+		"a role session's aws:PrincipalArn is its role's ARN, as on AWS")
 }
 
 // TestLookupSession_AssumedRoleNoAttachedPolicies: a role with zero attached
@@ -307,6 +309,7 @@ func TestLookupSession_AssumedRoleAccountMismatch(t *testing.T) {
 	res, err := p.LookupCredentials(testSessionAKID)
 	require.NoError(t, err)
 	assert.Empty(t, res.PolicyDocuments, "ARN account ≠ session account must fail closed, never resolve")
+	assert.Empty(t, res.PrincipalARN, "a role ARN that failed to resolve is not one the door vouches for")
 }
 
 // TestLookupSession_AssumedRoleEmptyAccountARN: an ARN with a blank account field

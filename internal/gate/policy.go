@@ -179,6 +179,11 @@ func conditionKeys(r *http.Request, action string, cred *auth.CredentialResult) 
 		keys[iampolicy.KeySourceVpce] = ep.VpceID
 		keys[iampolicy.KeySourceVpc] = ep.VpcID
 		keys[iampolicy.KeyVpcSourceIP] = ep.Source.Addr().String()
+		// Only an endpoint policy may name aws:PrincipalArn, so only an endpoint
+		// request carries it.
+		if cred.PrincipalARN != "" {
+			keys[iampolicy.KeyPrincipalArn] = cred.PrincipalARN
+		}
 	} else {
 		// A RemoteAddr with no port is passed through rather than dropped.
 		sourceIP := r.RemoteAddr

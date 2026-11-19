@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	"github.com/mulgadc/bluebottle/pkg/tlsconfig"
 	"github.com/mulgadc/predastore/endpointproxy"
 )
@@ -22,10 +23,44 @@ const endpointHandshakeTimeout = 10 * time.Second
 
 type endpointCtxKey struct{}
 
+// endpointIdentity is the endpoint a connection arrived through, with its
+// policy parsed once per connection. A version 1 connection has no policy: its
+// endpoint holds the default, which allows everything.
+type endpointIdentity struct {
+	endpointproxy.Header
+
+	policy *iampolicy.PolicyDocument
+}
+
+// allows reports whether the endpoint policy, the second gate, permits action
+// on resource; an action the gate could not name is not one it can permit.
+func (e endpointIdentity) allows(action, resource string, keys iampolicy.ConditionKeys) bool {
+	if e.policy == nil {
+		return true
+	}
+	return action != "" && iampolicy.EvaluateEndpointPolicy(action, resource, *e.policy, keys) == iampolicy.Allow
+}
+
 // endpointFrom returns the endpoint a request arrived through, if any.
-func endpointFrom(ctx context.Context) (endpointproxy.Header, bool) {
-	h, ok := ctx.Value(endpointCtxKey{}).(endpointproxy.Header)
-	return h, ok
+func endpointFrom(ctx context.Context) (endpointIdentity, bool) {
+	e, ok := ctx.Value(endpointCtxKey{}).(endpointIdentity)
+	return e, ok
+}
+
+// parseEndpointPolicy reads a version 2 header's policy, refusing one the gate
+// would not enforce as written, as the write path refuses it.
+func parseEndpointPolicy(h endpointproxy.Header) (*iampolicy.PolicyDocument, error) {
+	if h.Version < endpointproxy.ContractVersion2 {
+		return nil, nil
+	}
+	doc, err := iampolicy.ParseEndpointPolicy([]byte(h.Policy))
+	if err != nil {
+		return nil, fmt.Errorf("endpoint policy does not parse: %w", err)
+	}
+	if err := iampolicy.CheckEndpointPolicy(doc); err != nil {
+		return nil, fmt.Errorf("endpoint policy is not enforceable: %w", err)
+	}
+	return &doc, nil
 }
 
 // endpointConnContext attaches the endpoint identity of the connection under
@@ -33,7 +68,7 @@ func endpointFrom(ctx context.Context) (endpointproxy.Header, bool) {
 func endpointConnContext(ctx context.Context, c net.Conn) context.Context {
 	if tc, ok := c.(*tls.Conn); ok {
 		if ec, ok := tc.NetConn().(*endpointConn); ok {
-			return context.WithValue(ctx, endpointCtxKey{}, ec.header)
+			return context.WithValue(ctx, endpointCtxKey{}, ec.endpoint)
 		}
 	}
 	return ctx
@@ -44,10 +79,10 @@ func endpointConnContext(ctx context.Context, c net.Conn) context.Context {
 type endpointConn struct {
 	net.Conn
 
-	header endpointproxy.Header
+	endpoint endpointIdentity
 }
 
-func (c *endpointConn) RemoteAddr() net.Addr { return net.TCPAddrFromAddrPort(c.header.Source) }
+func (c *endpointConn) RemoteAddr() net.Addr { return net.TCPAddrFromAddrPort(c.endpoint.Source) }
 
 // endpointTLSConfig is the outer session: TLS 1.3 with a client certificate
 // that chains to the formation CA for client authentication, which only node
@@ -129,7 +164,7 @@ func (l *endpointListener) acceptLoop() {
 // admit completes one connection or closes it. A refusal is logged without the
 // header's identifiers, which are the peer's claim until the header validates.
 func (l *endpointListener) admit(raw net.Conn) {
-	outer, header, ok := l.handshake(raw)
+	outer, endpoint, ok := l.handshake(raw)
 	// Leaving pending hands the connection over: from here Close no longer
 	// owns it, and once served, only the HTTP server's drain does.
 	l.mu.Lock()
@@ -141,28 +176,36 @@ func (l *endpointListener) admit(raw net.Conn) {
 		return
 	}
 	select {
-	case l.ready <- &endpointConn{Conn: outer, header: header}:
+	case l.ready <- &endpointConn{Conn: outer, endpoint: endpoint}:
 	case <-l.done:
 		_ = outer.Close()
 	}
 }
 
-// handshake runs the node session and reads its header under one deadline.
-func (l *endpointListener) handshake(raw net.Conn) (*tls.Conn, endpointproxy.Header, bool) {
+// handshake runs the node session and reads its header under one deadline. A
+// policy the gate cannot enforce closes the connection, which the proxy reads
+// as a failed check, rather than serve it under a narrower reading.
+func (l *endpointListener) handshake(raw net.Conn) (*tls.Conn, endpointIdentity, bool) {
 	_ = raw.SetDeadline(time.Now().Add(endpointHandshakeTimeout))
 	outer := tls.Server(raw, l.tls)
 	if err := outer.Handshake(); err != nil {
 		slog.Warn("gate: endpoint handshake refused", "peer", raw.RemoteAddr().String(), "error", err)
-		return nil, endpointproxy.Header{}, false
+		return nil, endpointIdentity{}, false
 	}
 	header, err := endpointproxy.Read(outer)
 	if err != nil {
 		slog.Warn("gate: endpoint header refused", "peer", raw.RemoteAddr().String(),
 			"unsupported_version", errors.Is(err, endpointproxy.ErrUnsupportedVersion), "error", err)
-		return nil, endpointproxy.Header{}, false
+		return nil, endpointIdentity{}, false
+	}
+	policy, err := parseEndpointPolicy(header)
+	if err != nil {
+		slog.Warn("gate: endpoint policy refused", "peer", raw.RemoteAddr().String(),
+			"vpce_id", header.VpceID, "policy_generation", header.PolicyGeneration, "error", err)
+		return nil, endpointIdentity{}, false
 	}
 	_ = raw.SetDeadline(time.Time{})
-	return outer, header, true
+	return outer, endpointIdentity{Header: header, policy: policy}, true
 }
 
 func (l *endpointListener) Accept() (net.Conn, error) {
