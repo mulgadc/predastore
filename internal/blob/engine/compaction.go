@@ -67,7 +67,7 @@ func (c *compactor) loop() {
 		case <-c.done:
 			return
 		case <-retained.C:
-			released, err := c.store.sweepRetained(retainedMaxAge)
+			released, err := c.store.sweepRetained(c.store.retainedMaxAge)
 			if err != nil {
 				slog.Error("retained sweep failed", "error", err)
 			} else if released > 0 {
@@ -132,7 +132,7 @@ func (store *Store) compactOnce() error {
 
 	// Likewise for superseded generations: a commit demotes rather than
 	// tombstones, so this is where that space comes back.
-	released, err := store.sweepRetained(retainedMaxAge)
+	released, err := store.sweepRetained(store.retainedMaxAge)
 	if err != nil {
 		return fmt.Errorf("sweep retained generations: %w", err)
 	}

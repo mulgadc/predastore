@@ -62,6 +62,10 @@ type Config struct {
 	// fills. Zero uses the engine's default interval.
 	Compaction time.Duration
 
+	// RetainedMaxAge is how long a superseded generation stays answerable.
+	// Zero takes the store's default.
+	RetainedMaxAge time.Duration
+
 	// BodyIdleTimeout bounds a response body whose peer has stopped reading.
 	// Zero uses DefaultBodyIdleTimeout.
 	BodyIdleTimeout time.Duration
@@ -118,7 +122,8 @@ func (s *Server) Run(ctx context.Context) error {
 			return fmt.Errorf("create store directory %s: %w", s.cfg.DataDir, err)
 		}
 		st, err := engine.Open(s.cfg.DataDir,
-			engine.WithAEAD(s.cfg.AEAD), engine.WithCompaction(s.cfg.Compaction))
+			engine.WithAEAD(s.cfg.AEAD), engine.WithCompaction(s.cfg.Compaction),
+			engine.WithRetainedMaxAge(s.cfg.RetainedMaxAge))
 		if err != nil {
 			return fmt.Errorf("open store %s: %w", s.cfg.DataDir, err)
 		}

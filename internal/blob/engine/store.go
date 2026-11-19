@@ -62,6 +62,7 @@ type Store struct {
 
 	compactionEnabled  bool
 	compactionInterval time.Duration
+	retainedMaxAge     time.Duration
 	compactor          *compactor
 
 	// Free-space watermark fractions gating Append; see WithFreeSpaceWatermark.
@@ -170,6 +171,18 @@ func WithCompaction(interval time.Duration) Option {
 	}
 }
 
+// WithRetainedMaxAge overrides how long a superseded generation stays
+// answerable. A non-positive duration keeps the default. It exists so a test
+// can reach the far side of the window without waiting out wall-clock time.
+func WithRetainedMaxAge(d time.Duration) Option {
+	return func(s *Store) error {
+		if d > 0 {
+			s.retainedMaxAge = d
+		}
+		return nil
+	}
+}
+
 // WithFreeSpaceWatermark overrides the free-space fractions that gate Append:
 // crossing below nearfullFreeFrac kicks an immediate compaction pass but
 // still accepts the write; crossing below fullFreeFrac rejects it with
@@ -213,6 +226,7 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		segCache:           make(map[uint64]*segment),
 		maxSegSize:         DefaultMaxSegSize,
 		compactionInterval: defaultCompactionInterval,
+		retainedMaxAge:     retainedMaxAge,
 		nearfullFreeFrac:   defaultNearfullFreeFrac,
 		fullFreeFrac:       defaultFullFreeFrac,
 	}
