@@ -412,7 +412,9 @@ A demoted generation is reclaimable only once a publisher reports that its recor
 
 Age cannot decide on its own. A writer that commits and never publishes starts no clock anybody can see, the gate's PUT path carries no total deadline, and reclaiming such a generation destroys an object every client was acknowledged for. The sweep therefore reclaims released generations past their grace and nothing else, ever. A release that does not arrive costs disk until the generation is released again, which is the safe direction: failure retains.
 
-The retained row's stamp field is written `math.MaxInt64` and is never read here. It exists for an engine from before the release namespace, which reclaims on that field and will not find the value old enough, so rolling back strands disk rather than destroying data.
+The retained row's stamp field is written `math.MaxInt64` and is never read here. It exists for an engine from before the release namespace, which reclaims on that field and will not find the value old enough, so a generation this engine demoted is stranded rather than destroyed by a downgrade.
+
+That is not a rollback guarantee, and there is none. A retained row written before the release namespace existed carries the real stamp its own commit wrote, this sweep holds it because nothing released it, and an older engine then reclaims it on age. Where a live placement record still names such a generation, going back destroys an object every client was acknowledged for, and no scan answers whether one does. A defect found on this engine is fixed forward.
 
 ### Compaction
 
