@@ -137,6 +137,75 @@ func TestS7_AnAmbiguousSwapIsNotRetried(t *testing.T) {
 		"the writer was told which generation it displaced by an attempt it cannot trust, and will release it")
 }
 
+// A replica that answers at all may still have applied the command. Raft
+// reports a leadership lost while committing after the entry is in the log, and
+// the next leader can commit it, so that answer is as ambiguous as a lost
+// response and must not be retried either.
+//
+// Verifies: ADR-0003:S7.
+func TestS7_ASwapIsNotRetriedAfterALeadershipLoss(t *testing.T) {
+	cfg := swapRetryCfg()
+	replica := &applyThenFailReplica{fail: "raft apply failed: leadership lost while committing log"}
+	startApplyThenFailReplica(t, replica)
+	client := newSwapRetryClient(t, cfg)
+
+	previous, err := client.Swap(context.Background(), "placement-key", []byte("generation-A"))
+
+	assert.Equal(t, 1, replica.calls(),
+		"the swap was applied %d times: a lost leadership is not proof the command was rejected",
+		replica.calls())
+	require.Error(t, err)
+	assert.Empty(t, previous)
+}
+
+// applyThenFailReplica applies the swap and answers with an error envelope,
+// which is how a raft apply that cannot be accounted for reaches the client.
+type applyThenFailReplica struct {
+	mu   sync.Mutex
+	fail string
+	seen int
+}
+
+func (r *applyThenFailReplica) handleSwap(_ context.Context, h MetaRequest, stream transport.Stream) error {
+	if _, err := io.ReadAll(stream); err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	r.seen++
+	r.mu.Unlock()
+
+	return respond(stream, &MetaResponse{Err: r.fail})
+}
+
+func (r *applyThenFailReplica) calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.seen
+}
+
+func startApplyThenFailReplica(t *testing.T, r *applyThenFailReplica) {
+	t.Helper()
+	tr := transport.NewPipeTransport("swap-retry-host", 6301)
+	t.Cleanup(func() { tr.Close() })
+	ln, err := tr.Listen()
+	require.NoError(t, err)
+
+	mux := rpc.NewMux()
+	rpc.RegisterHandler(mux, OpMetaSwap, r.handleSwap)
+	srv, err := rpc.NewServer(mux, []transport.Listener{ln}, nil)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
 // The retry that is safe is the one a replica refuses outright: it names the
 // leader, which proves nothing was applied, and following that redirect is how
 // a write survives an election. Narrowing the ambiguous case must not narrow
