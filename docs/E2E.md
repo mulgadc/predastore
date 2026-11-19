@@ -23,7 +23,7 @@ unrelated, and passing this gate does not put anything on a server.
 ## What a default run does
 
 Fifteen scenarios in order, then a Warp load test. A default run is about **43
-minutes** and asserts about **380** things.
+minutes** and asserts about **470** things.
 
 | Scenario | Asserts | What it does |
 |---|---|---|
@@ -36,7 +36,7 @@ minutes** and asserts about **380** things.
 | `last-modified` | 10 | Timestamp semantics across overwrite |
 | `large-object` | 10 | 2 GiB and 4 GiB objects, with an RSS sampler — a size with no disk is **skipped loudly** |
 | `concurrent-put` | 24 | 6 writers race one key, 8 keys × 3 rounds, on a healthy cluster |
-| `retained-reclaim` | ~200 | Seeds 24 keys, races 6 writers across every gate on each, then reads all 24 for 7 minutes with nothing writing; asserts no key stops answering or changes body once the writers stop. The count varies with how many sweeps fit in the dwell |
+| `retained-reclaim` | ~290 | Seeds 24 keys with a body no writer uses, races 6 writers across every gate on each, then reads all 24 for 7 minutes with nothing writing. Asserts each key took at least two acknowledged overwrites and no longer answers the seed, so a generation really was demoted under it, then that no key stops answering or changes body once the writers stop. The count varies with how many sweeps fit in the dwell |
 | `torn-overwrite` | 5 | Overwrites with the host holding one named shard stopped; asserts the failed write left the object exactly as it was |
 | `stale-shard` | 48 | Overwrites with a host frozen, asserts no read ever splices generations |
 | `freeze` | 6 | Warp GET load while a host is SIGSTOPped; survivors keep serving, frozen host rejoins raft and takes writes |

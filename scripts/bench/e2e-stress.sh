@@ -2691,6 +2691,11 @@ run_retained_reclaim() {
     rm -rf "$outdir"
     mkdir -p "$outdir"
 
+    # The seed is a body no racer writes, so a key that settled on the seed is
+    # a key no overwrite ever displaced. Seeding with a racer's body would make
+    # that case indistinguishable from a race that worked.
+    make_state seed "$WORK_DIR/reclaim-bodies/seed.json" "$lines"
+
     # Every key is written twice: once to establish a generation, then raced,
     # because a first write has no previous generation to demote and cannot
     # produce the state.
@@ -2698,7 +2703,7 @@ run_retained_reclaim() {
     local k key pids=() p
     for k in $(seq 1 "$keys_n"); do
         key="$(printf 'reclaim-k%03d.json' "$k")"
-        aws_s3 "$first_gate" s3 cp "$WORK_DIR/reclaim-bodies/g1.json" "s3://$BUCKET/$key" >/dev/null
+        aws_s3 "$first_gate" s3 cp "$WORK_DIR/reclaim-bodies/seed.json" "s3://$BUCKET/$key" >/dev/null
     done
 
     pids=()
@@ -2721,6 +2726,22 @@ run_retained_reclaim() {
     } END { for (s in n) printf "%s=%d ", s, n[s]; printf "\n" }' "$outdir"/*.race)"
     log "retained-reclaim: writer verdicts $verdicts"
 
+    # A run where every overwrite failed would re-read the seeded objects for
+    # the whole dwell and pass, reporting a guarantee it never tested. Two
+    # acknowledged racers per key is the minimum that can produce the state:
+    # one commit to demote a generation and one record to name it.
+    local acked
+    for k in $(seq 1 "$keys_n"); do
+        key="$(printf 'reclaim-k%03d.json' "$k")"
+        RECLAIM_CASES=$(( RECLAIM_CASES + 1 ))
+        acked="$(grep -c 'status=200' "$outdir/${key}.race" 2>/dev/null || true)"
+        [ -n "$acked" ] || acked=0
+        if [ "$acked" -lt 2 ]; then
+            log "retained-reclaim: FAIL $key had $acked acknowledged overwrites, needs 2 to race at all"
+            RECLAIM_FAILURES=$(( RECLAIM_FAILURES + 1 ))
+        fi
+    done
+
     # What the cluster settled on is the promise it has to keep. Taken through
     # a gate that did not write it last, so nothing local can answer for the
     # cluster.
@@ -2738,6 +2759,15 @@ run_retained_reclaim() {
         else
             log "retained-reclaim: FAIL $key is unreadable before the dwell even starts"
             RECLAIM_FAILURES=$(( RECLAIM_FAILURES + 1 ))
+            continue
+        fi
+
+        # Still answering the seed means no overwrite ever took, so there is no
+        # demoted generation under this key and holding it proves nothing.
+        RECLAIM_CASES=$(( RECLAIM_CASES + 1 ))
+        if cmp -s "$WORK_DIR/reclaim-bodies/seed.json" "$settled_dir/$key"; then
+            log "retained-reclaim: FAIL $key still answers the seed, no racer displaced a generation"
+            RECLAIM_FAILURES=$(( RECLAIM_FAILURES + 1 ))
         fi
     done
     log "retained-reclaim: $settled_n of $keys_n keys settled; holding them for ${dwell}s"
@@ -2746,11 +2776,10 @@ run_retained_reclaim() {
     # the same object. A generation reclaimed underneath one shows up as a 500
     # on a key that was answering a moment ago, which is the prod symptom.
     local started elapsed cycles=0 got="$WORK_DIR/reclaim-got.json"
-    local broken=() first_break=""
+    local broken=() first_break="" final=0
     started="$(date +%s)"
     while :; do
         elapsed=$(( $(date +%s) - started ))
-        [ "$elapsed" -ge "$dwell" ] && break
         cycles=$(( cycles + 1 ))
 
         for k in $(seq 1 "$keys_n"); do
@@ -2777,8 +2806,15 @@ run_retained_reclaim() {
             fi
         done
 
+        [ "$final" -eq 1 ] && break
         elapsed=$(( $(date +%s) - started ))
-        [ "$elapsed" -ge "$dwell" ] && break
+        if [ "$elapsed" -ge "$dwell" ]; then
+            # The sweep that counts is the one after the whole dwell has run
+            # out. Breaking on the deadline leaves the last stretch of it
+            # unread, which is exactly where a reclaim comes due.
+            final=1
+            continue
+        fi
         command sleep "$poll"
     done
 
