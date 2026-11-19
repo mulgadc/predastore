@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
+	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -185,6 +187,63 @@ func bucketExists(ctx context.Context, mc MetaClient, cache *BucketCache, bucket
 	}
 
 	return false, "", nil
+}
+
+// ExpectedBucketOwnerHeader names the account a caller believes owns the
+// bucket it is addressing. The server applies it, which is what makes it a
+// precondition rather than a check the caller performs and then races.
+// https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html
+const ExpectedBucketOwnerHeader = "X-Amz-Expected-Bucket-Owner"
+
+// requireExpectedBucketOwner refuses a request whose expected owner is not the
+// bucket's account. An absent header asserts nothing, so every caller that
+// does not send one is unaffected.
+//
+// The owner comes from a leader read rather than the config cache or whichever
+// replica answers first: the caller is asserting against the bucket as it is
+// now, and the cache carries no owner at all. A read that cannot be answered
+// refuses the request, because an unproven precondition on a destructive call
+// is not a satisfied one.
+func requireExpectedBucketOwner(ctx context.Context, mc MetaClient, cache *BucketCache, r *http.Request, bucket string) error {
+	want := r.Header.Get(ExpectedBucketOwnerHeader)
+	if want == "" {
+		return nil
+	}
+
+	data, err := metaLeaderGet(ctx, mc, model.TableBuckets, bucket)
+	switch {
+	case err == nil && len(data) > 0:
+	case err == nil, errors.Is(err, meta.ErrNotFound):
+		// A config-declared bucket exists with no owner recorded, so no
+		// expected owner can match one. Refusing is the safe direction, and
+		// nothing addresses a platform bucket with this header: an owner-scoped
+		// listing never returns one.
+		//
+		// Only the declared set counts. The cache also holds buckets created at
+		// runtime, and a delete removes the entry on the serving gate alone, so
+		// find would answer AccessDenied on another gate for a tenant bucket
+		// that is simply gone.
+		if cache.isDeclared(bucket) {
+			return model.ErrAccessDeniedError.WithResource(bucket)
+		}
+		return model.ErrNoSuchBucketError.WithResource(bucket)
+	default:
+		return model.NewS3Error(model.ErrInternalError, "cannot confirm the bucket owner: "+err.Error(), 500)
+	}
+
+	var metadata model.BucketMetadata
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&metadata); err != nil {
+		return model.NewS3Error(model.ErrInternalError, "failed to decode bucket metadata: "+err.Error(), 500)
+	}
+
+	if metadata.AccountID != want {
+		// The supplied value is not logged. A caller controls it, and a header
+		// filled in by mistake can carry a credential.
+		slog.WarnContext(ctx, "Expected bucket owner did not match",
+			"bucket", bucket, "bucketAccountID", metadata.AccountID)
+		return model.ErrAccessDeniedError.WithResource(bucket)
+	}
+	return nil
 }
 
 // getBucketMetadata reads a bucket's metadata straight from global state,

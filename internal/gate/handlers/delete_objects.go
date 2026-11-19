@@ -52,6 +52,11 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config)
 			return
 		}
 
+		if err := requireExpectedBucketOwner(ctx, mc, cache, r, bucket); err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, deleteObjectsBodyLimit))
 		if err != nil {
 			// A rewritten body keeps its own error rather than being reported as bad XML.

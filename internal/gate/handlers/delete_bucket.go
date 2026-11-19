@@ -23,6 +23,11 @@ func DeleteBucket(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
+		if err := requireExpectedBucketOwner(ctx, mc, cache, r, bucket); err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		// A config-declared bucket is part of the deployment, not tenant data,
 		// and is shared by every account. Nothing may delete one — not even a
 		// service credential, which the ownership check waves through.

@@ -50,8 +50,12 @@ func (b *failingBlob) Delete(_ context.Context, _ config.NodeID, _ blob.DeleteRe
 
 var _ BlobClient = (*failingBlob)(nil)
 
-// tombstoneKey is the stored key one delete's tombstone lands under.
-func tombstoneKey(bucket, key string) string { return DeletedObjectPrefix + bucket + "/" + key }
+// tombstoneKey is the stored key one delete's tombstone lands under. An
+// unversioned delete removes the shard set under the plain object hash, which
+// is what ends the key.
+func tombstoneKey(bucket, key string) string {
+	return DeletedObjectKey(bucket, key, model.ObjectHash(bucket, key))
+}
 
 // decodeTombstone reads and gob-decodes the tombstone a delete left.
 func decodeTombstone(t *testing.T, mc MetaClient, bucket, key string) DeletedObjectInfo {

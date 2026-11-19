@@ -25,6 +25,11 @@ func AbortMultipartUpload(mc MetaClient, bc BlobClient, cache *BucketCache) http
 			HandleError(w, r, err)
 			return
 		}
+
+		if err := requireExpectedBucketOwner(ctx, mc, cache, r, bucket); err != nil {
+			HandleError(w, r, err)
+			return
+		}
 		if err := requireUpload(ctx, mc, bucket, key, uploadID); err != nil {
 			HandleError(w, r, err)
 			return
