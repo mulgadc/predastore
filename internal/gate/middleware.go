@@ -230,6 +230,22 @@ func (s *Server) publicOwnerActive(w http.ResponseWriter, r *http.Request, bucke
 	return s.accountActive(w, r, meta.AccountID, true)
 }
 
+// anonymousEndpointAllows reports whether an unsigned request's endpoint, if it
+// came through one, permits it.
+func anonymousEndpointAllows(r *http.Request, bucket, key string) bool {
+	endpoint, ok := endpointFrom(r.Context())
+	if !ok {
+		return true
+	}
+	action, resource := s3Action(r, bucket, key), s3Resource(bucket, key)
+	if endpoint.allows(action, resource, conditionKeys(r, action, &auth.CredentialResult{})) {
+		return true
+	}
+	slog.DebugContext(r.Context(), "S3 anonymous access denied by endpoint policy",
+		"action", action, "resource", resource, "vpce_id", endpoint.VpceID)
+	return false
+}
+
 // sigV4AuthMiddleware authenticates and authorizes incoming S3 requests:
 // public-bucket short-circuit, SigV4 verify, IAM policy eval, and
 // cross-account bucket-ownership check.
@@ -253,6 +269,12 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 				if publicBucketAccess == nil {
 					// A public grant must not keep a closed account's data reachable.
 					if !s.publicOwnerActive(w, r, bucket) {
+						return
+					}
+					// An endpoint policy holds an anonymous caller too, who carries
+					// no principal keys, so one naming a principal grants it nothing.
+					if !anonymousEndpointAllows(r, bucket, key) {
+						handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 						return
 					}
 					next.ServeHTTP(w, r)
@@ -313,7 +335,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 				return true
 			}
 			slog.DebugContext(r.Context(), "S3 access denied by endpoint policy",
-				"action", objectAction, "resource", objectResource, "accessKeyID", accessKey, "vpce_id", endpoint.VpceID)
+				"action", objectAction, "resource", objectResource, "vpce_id", endpoint.VpceID)
 			return false
 		}
 		if viaEndpoint {

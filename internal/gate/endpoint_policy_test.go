@@ -12,6 +12,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -98,10 +100,43 @@ func seedIAM(t *testing.T, js jetstream.JetStream, key *masterkey.Key) {
 	}
 }
 
+// recordingMeta notes which batch keys the delete path reached. A key no delete
+// reached was never touched, which the response alone cannot show: S3 reports
+// a missing key as deleted.
+type recordingMeta struct {
+	*fakeMeta
+
+	mu      sync.Mutex
+	reached map[string]bool
+}
+
+func (m *recordingMeta) Get(ctx context.Context, key string) ([]byte, error) {
+	m.mu.Lock()
+	for _, k := range []string{"public/a", "secret/b"} {
+		if strings.Contains(key, k) {
+			m.reached[k] = true
+		}
+	}
+	m.mu.Unlock()
+	return m.fakeMeta.Get(ctx, key)
+}
+
+// take returns the batch keys reached since the last call.
+func (m *recordingMeta) take() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for k := range m.reached {
+		out = append(out, k)
+	}
+	m.reached = map[string]bool{}
+	return out
+}
+
 // policyGate is the whole gate behind the endpoint listener, authenticating
 // against an embedded NATS that holds seedIAM's records, with one service
 // account in config as a node's Predastore has.
-func policyGate(t *testing.T) (addr string, pki endpointPKI, gate *Server) {
+func policyGate(t *testing.T) (addr string, pki endpointPKI, gate *Server, objects *recordingMeta) {
 	t.Helper()
 	ns, err := server.NewServer(&server.Options{
 		Host: "127.0.0.1", Port: -1, JetStream: true, StoreDir: t.TempDir(), NoLog: true, NoSigs: true,
@@ -133,15 +168,13 @@ func policyGate(t *testing.T) (addr string, pki endpointPKI, gate *Server) {
 		AccessKeyID: serviceKey, SecretAccessKey: callerSecret, AccountID: policyAccount,
 	}}))
 
-	gate = newTestGate(t, Config{
-		Region: "ap-southeast-2",
-		Meta: newFakeMeta(t,
-			model.BucketMetadata{Name: "owner-bucket", Region: "ap-southeast-2", AccountID: policyAccount, OwnerID: keyCreator}),
-		CredProv: creds,
-	})
+	objects = &recordingMeta{fakeMeta: newFakeMeta(t,
+		model.BucketMetadata{Name: "owner-bucket", Region: "ap-southeast-2", AccountID: policyAccount, OwnerID: keyCreator}),
+		reached: map[string]bool{}}
+	gate = newTestGate(t, Config{Region: "ap-southeast-2", Meta: objects, CredProv: creds})
 	pki = newEndpointPKI(t)
 	addr, _, _ = endpointServerFor(t, pki, gate)
-	return addr, pki, gate
+	return addr, pki, gate, objects
 }
 
 // policyHeaderFor is the endpoint's header at contract version 2 carrying policy.
@@ -184,9 +217,11 @@ func throughEndpoint(t *testing.T, addr string, pki endpointPKI, header []byte,
 }
 
 // batchOutcome deletes public/a and secret/b in one batch and returns the keys
-// deleted and the keys refused.
-func batchOutcome(t *testing.T, addr string, pki endpointPKI, header []byte, accessKey string) (deleted, refused []string) {
+// reported deleted and refused, and the keys the delete path reached.
+func batchOutcome(t *testing.T, addr string, pki endpointPKI, objects *recordingMeta,
+	header []byte, accessKey string) (deleted, refused, reached []string) {
 	t.Helper()
+	objects.take()
 	body := []byte("<Delete><Object><Key>public/a</Key></Object><Object><Key>secret/b</Key></Object></Delete>")
 	status, got, err := throughEndpoint(t, addr, pki, header, accessKey, http.MethodPost, "/owner-bucket?delete=", body)
 	require.NoError(t, err)
@@ -200,7 +235,7 @@ func batchOutcome(t *testing.T, addr string, pki endpointPKI, header []byte, acc
 		assert.Equal(t, string(model.ErrAccessDenied), e.Code, "key %s", e.Key)
 		refused = append(refused, e.Key)
 	}
-	return deleted, refused
+	return deleted, refused, objects.take()
 }
 
 // endpointPolicyFor lets principal list the bucket and delete under public/,
@@ -218,7 +253,7 @@ func endpointPolicyFor(principal string, arnCondition string) string {
 // The endpoint policy decides for callers the authenticator resolved, at the
 // request check and per key of a batch, as on AWS.
 func TestEndpointPolicy_DecidesForAuthenticatedCallers(t *testing.T) {
-	addr, pki, _ := policyGate(t)
+	addr, pki, _, objects := policyGate(t)
 	for name, tc := range map[string]struct {
 		policy           string
 		allowed, refused string
@@ -239,16 +274,18 @@ func TestEndpointPolicy_DecidesForAuthenticatedCallers(t *testing.T) {
 				status, body, err := throughEndpoint(t, addr, pki, header, tc.allowed, http.MethodGet, "/owner-bucket", nil)
 				require.NoError(t, err)
 				assert.Equal(t, http.StatusOK, status, string(body))
-				deleted, refused := batchOutcome(t, addr, pki, header, tc.allowed)
+				deleted, refused, reached := batchOutcome(t, addr, pki, objects, header, tc.allowed)
 				assert.Equal(t, []string{"public/a"}, deleted)
 				assert.Equal(t, []string{"secret/b"}, refused)
+				assert.Equal(t, []string{"public/a"}, reached, "only the allowed key may reach the delete")
 			}
 			status, body, err := throughEndpoint(t, addr, pki, header, tc.refused, http.MethodGet, "/owner-bucket", nil)
 			require.NoError(t, err)
 			assert.Equal(t, http.StatusForbidden, status, string(body))
-			deleted, refused := batchOutcome(t, addr, pki, header, tc.refused)
+			deleted, refused, reached := batchOutcome(t, addr, pki, objects, header, tc.refused)
 			assert.Empty(t, deleted)
 			assert.ElementsMatch(t, []string{"public/a", "secret/b"}, refused)
+			assert.Empty(t, reached, "a refused key reached the delete")
 		})
 	}
 }
@@ -256,7 +293,7 @@ func TestEndpointPolicy_DecidesForAuthenticatedCallers(t *testing.T) {
 // An account principal names the account's root user only, so it grants an IAM
 // user of that account nothing, by account ID or by root ARN.
 func TestEndpointPolicy_AccountPrincipalDoesNotNameAUser(t *testing.T) {
-	addr, pki, _ := policyGate(t)
+	addr, pki, _, objects := policyGate(t)
 	for _, principal := range []string{
 		`{"AWS":"` + policyAccount + `"}`,
 		`{"AWS":"arn:aws:iam::` + policyAccount + `:root"}`,
@@ -265,16 +302,17 @@ func TestEndpointPolicy_AccountPrincipalDoesNotNameAUser(t *testing.T) {
 		status, body, err := throughEndpoint(t, addr, pki, header, aliceKey, http.MethodGet, "/owner-bucket", nil)
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusForbidden, status, "%s: %s", principal, body)
-		deleted, refused := batchOutcome(t, addr, pki, header, aliceKey)
+		deleted, refused, reached := batchOutcome(t, addr, pki, objects, header, aliceKey)
 		assert.Empty(t, deleted, principal)
 		assert.ElementsMatch(t, []string{"public/a", "secret/b"}, refused, principal)
+		assert.Empty(t, reached, principal)
 	}
 }
 
 // AWS applies an endpoint policy to every principal, so a service account that
 // skips identity policy is still held to it.
 func TestEndpointPolicy_HoldsAServiceAccount(t *testing.T) {
-	addr, pki, _ := policyGate(t)
+	addr, pki, _, _ := policyGate(t)
 	header := policyHeaderFor(t, endpointPolicyFor(`"*"`, aliceARN))
 
 	status, body, err := throughEndpoint(t, addr, pki, header, serviceKey, http.MethodGet, "/owner-bucket", nil)
@@ -300,7 +338,7 @@ const malformedDeny = `{"Version":"2012-10-17","Statement":[` +
 // A policy the gate would not enforce as written closes the session, which the
 // proxy reads as a failed check, so it is never served under a narrower reading.
 func TestEndpointPolicy_UnenforceablePolicyClosesTheSession(t *testing.T) {
-	addr, pki, _ := policyGate(t)
+	addr, pki, _, _ := policyGate(t)
 	doc, err := iampolicy.ParseEndpointPolicy([]byte(malformedDeny))
 	require.NoError(t, err)
 	require.Error(t, iampolicy.CheckEndpointPolicy(doc), "the write path must refuse this policy")
@@ -319,7 +357,7 @@ func TestEndpointPolicy_UnenforceablePolicyClosesTheSession(t *testing.T) {
 // Injected past both the write path and the handshake, the malformed Deny still
 // denies: an operand the evaluator cannot read fails closed.
 func TestEndpointPolicy_MalformedDenyFailsClosedAtTheGate(t *testing.T) {
-	_, _, gate := policyGate(t)
+	_, _, gate, _ := policyGate(t)
 	doc, err := iampolicy.ParseEndpointPolicy([]byte(malformedDeny))
 	require.NoError(t, err)
 
@@ -336,5 +374,36 @@ func TestEndpointPolicy_MalformedDenyFailsClosedAtTheGate(t *testing.T) {
 			want = http.StatusOK
 		}
 		assert.Equal(t, want, rr.Code, "%s: %s", name, rr.Body.String())
+	}
+}
+
+// An anonymous read of a public bucket is held to the endpoint policy too, and
+// one that names a principal grants it nothing; the direct path still serves it.
+func TestEndpointPolicy_HoldsAnAnonymousRead(t *testing.T) {
+	server, _ := accountGateServer(t, nil)
+	doc, err := iampolicy.ParseEndpointPolicy([]byte(endpointPolicyFor(`"*"`, aliceARN)))
+	require.NoError(t, err)
+	everyone, err := iampolicy.ParseEndpointPolicy([]byte(
+		`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:*","Resource":"*"}]}`))
+	require.NoError(t, err)
+
+	for name, tc := range map[string]struct {
+		via    bool
+		policy *iampolicy.PolicyDocument
+		want   int
+	}{
+		"direct":                         {false, nil, http.StatusOK},
+		"through a default endpoint":     {true, nil, http.StatusOK},
+		"through a policy for everyone":  {true, &everyone, http.StatusOK},
+		"through a policy naming a user": {true, &doc, http.StatusForbidden},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/public-bucket", nil)
+		if tc.via {
+			h := testHeader()
+			req.RemoteAddr = h.Source.String()
+			req = req.WithContext(withEndpoint(req.Context(), h, tc.policy))
+		}
+		status, _, body := runMiddleware(t, server, req)
+		assert.Equal(t, tc.want, status, "%s: %s", name, body)
 	}
 }
