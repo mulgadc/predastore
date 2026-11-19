@@ -2,12 +2,17 @@ package predastore_test
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"crypto/tls"
 	"net/http"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/model"
@@ -26,6 +31,7 @@ const (
 	staleSecret  = "stale-placement-test-secret-aaaaaaaaaaaa"
 	staleBucket  = "stale-placement-bucket"
 	staleObject  = "zone-file"
+	staleType    = "text/dns"
 
 	staleRetention = 2 * time.Second
 )
@@ -83,6 +89,34 @@ func startStaleHost(t *testing.T) (*s3Client, *config.Config) {
 		accessKey: staleKey, secretKey: staleSecret, http: client}, cfg
 }
 
+// sendTyped signs and issues one request, optionally declaring a content type,
+// and returns the response headers the caller compares a readback against.
+func (c *s3Client) sendTyped(method, path, contentType string, body []byte) (int, []byte, http.Header) {
+	c.t.Helper()
+	req, err := http.NewRequestWithContext(c.t.Context(), method, c.base+path, bytes.NewReader(body))
+	require.NoError(c.t, err)
+
+	sum := sha256.Sum256(body)
+	hash := hex.EncodeToString(sum[:])
+	req.Header.Set("X-Amz-Content-Sha256", hash)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+
+	signer := v4.NewSigner(func(o *v4.SignerOptions) { o.DisableURIPathEscaping = true })
+	require.NoError(c.t, signer.SignHTTP(c.t.Context(),
+		aws.Credentials{AccessKeyID: c.accessKey, SecretAccessKey: c.secretKey},
+		req, hash, "s3", c.region, time.Now().UTC()))
+
+	resp, err := c.http.Do(req)
+	require.NoError(c.t, err)
+	defer func() { require.NoError(c.t, resp.Body.Close()) }()
+
+	got, err := io.ReadAll(resp.Body)
+	require.NoError(c.t, err)
+	return resp.StatusCode, got, resp.Header
+}
+
 // commitOrphanGeneration writes and commits a newer generation of every shard
 // of one object on every blob node, and never publishes a placement record.
 // That is what a writer that dies in the window between the two leaves behind.
@@ -137,24 +171,37 @@ func TestS7_AnOrphanedCommitDoesNotDestroyAnAcknowledgedObject(t *testing.T) {
 	require.Equal(t, http.StatusOK, status, "CreateBucket: %s", body)
 
 	want := []byte("$ORIGIN spx3.net.\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n")
-	status, body = c.send(http.MethodPut, "/"+staleBucket+"/"+staleObject, "", want)
+	status, body, putHeaders := c.sendTyped(http.MethodPut, "/"+staleBucket+"/"+staleObject, staleType, want)
 	require.Equal(t, http.StatusOK, status, "PutObject: %s", body)
+	etag := putHeaders.Get("ETag")
+	require.NotEmpty(t, etag, "PutObject returned no ETag to compare against")
 
-	status, got := c.send(http.MethodGet, "/"+staleBucket+"/"+staleObject, "", nil)
+	status, got, before := c.sendTyped(http.MethodGet, "/"+staleBucket+"/"+staleObject, "", nil)
 	require.Equal(t, http.StatusOK, status, "GetObject before the orphan commit: %s", got)
 	require.Equal(t, want, got)
 
 	hash := model.ObjectHash(staleBucket, staleObject)
 	commitOrphanGeneration(t, cfg, hash, cfg.RS.Data+cfg.RS.Parity)
 
-	// Past the retention window, with several sweeps behind it. The object is
-	// still the one the client stored, so every read has to return it.
+	// Long enough to span many sweep intervals and several retention windows,
+	// which is what destroyed this object before a commit stopped starting a
+	// clock. The sweep's own accounting is asserted in the engine tests, which
+	// call it directly; nothing here can observe it.
 	deadline := time.Now().Add(3 * staleRetention)
 	for time.Now().Before(deadline) {
-		status, got = c.send(http.MethodGet, "/"+staleBucket+"/"+staleObject, "", nil)
+		status, got, after := c.sendTyped(http.MethodGet, "/"+staleBucket+"/"+staleObject, "", nil)
 		require.Equal(t, http.StatusOK, status,
 			"an acknowledged object stopped reading back after an orphaned commit: %s", got)
 		require.Equal(t, want, got, "the object read back as another generation's body")
+
+		// The orphaned generation holds a different body, so metadata that
+		// still matches is what says the read was served from the right one.
+		require.Equal(t, etag, after.Get("ETag"), "ETag changed after the orphaned commit")
+		require.Equal(t, before.Get("Content-Length"), after.Get("Content-Length"),
+			"Content-Length changed after the orphaned commit")
+		require.Equal(t, staleType, after.Get("Content-Type"),
+			"Content-Type changed after the orphaned commit")
+
 		time.Sleep(200 * time.Millisecond)
 	}
 }

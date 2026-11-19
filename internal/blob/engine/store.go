@@ -858,7 +858,7 @@ func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) 
 				return nil
 			}
 
-			return txn.Set(rowKey, encodePreparedValue(ext, epoch, time.Now().UnixNano()))
+			return txn.Set(rowKey, encodePreparedValue(ext, epoch, -time.Now().UnixNano()))
 		})
 		if errors.Is(err, badger.ErrConflict) {
 			continue

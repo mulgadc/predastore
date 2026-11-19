@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -284,11 +285,28 @@ func (store *Store) sweepPrepared(maxAge time.Duration) (int, error) {
 // which is not this change.
 const retainedMaxAge = 5 * time.Minute
 
-// generationHeld is the timestamp a commit stamps on the generation it
-// demotes: no clock at all. Nothing but a publisher reporting its record
-// displaced that generation starts one, because nothing else knows whether a
-// record still names it.
-const generationHeld int64 = 0
+// generationHeld is the stamp a commit puts on the generation it demotes. A
+// publisher reporting its record displaced that generation is the only thing
+// that starts a clock, because nothing else knows whether a record still
+// names it.
+//
+// It is the far future rather than zero so that an earlier release, which
+// reclaims a retained row once its stamp predates the cutoff, also leaves a
+// held row alone. A rollback then strands disk instead of destroying data.
+const generationHeld int64 = math.MaxInt64
+
+// releasedAt reports when a publisher released a retained generation. A
+// release is stored negated, which is what tells it apart from the commit
+// stamp written before held rows existed: that stamp is indistinguishable
+// from a release time, so a row carrying one is held and never reclaimed.
+// Those rows are bounded by the retention window of the release being
+// upgraded from, since anything older had already been reclaimed.
+func releasedAt(at int64) (int64, bool) {
+	if at < 0 {
+		return -at, true
+	}
+	return 0, false
+}
 
 // retainedSweepInterval is how often superseded generations are reclaimed. It
 // is far shorter than the compaction cycle because it bounds the disk a
@@ -321,7 +339,7 @@ func (store *Store) sweepRetained(maxAge time.Duration) (int, error) {
 	// generations arrive contiguously and oldest first.
 	flush := func() {
 		for _, r := range group {
-			if r.at != generationHeld && r.at < cutoff {
+			if released, ok := releasedAt(r.at); ok && released < cutoff {
 				stale = append(stale, r.key)
 			}
 		}
