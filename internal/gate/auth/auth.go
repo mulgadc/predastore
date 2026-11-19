@@ -48,6 +48,10 @@ type CredentialResult struct {
 	// caller-chosen, so a policy may key on it for either principal type. Empty
 	// when the record predates the field, which omits the key.
 	UserID string
+	// PrincipalARN is aws:PrincipalArn: an IAM user's ARN, or for a role session
+	// the role's ARN, not the session's, as on AWS. Empty when the record names
+	// none it can vouch for, which omits the key.
+	PrincipalARN string
 }
 
 // IsIAMUser reports whether the credential resolves to a real IAM user rather
@@ -116,6 +120,7 @@ type iamUser struct {
 	UserName         string            `json:"user_name"`
 	UserID           string            `json:"user_id"` // unique ID (AIDA...), supplied as aws:userid
 	AccountID        string            `json:"account_id"`
+	ARN              string            `json:"arn"`
 	AttachedPolicies []string          `json:"attached_policies"` // policy ARNs
 	Groups           []string          `json:"groups"`            // group NAMES the user belongs to (≤10)
 	InlinePolicies   map[string]string `json:"inline_policies"`   // policyName → document JSON
@@ -520,16 +525,18 @@ func (p *NATSIAMProvider) lookupSessionCredentials(ctx context.Context, accessKe
 	var policies []iampolicy.PolicyDocument
 	// A user session's aws:userid is the user's own ID; a role session carries
 	// the one STS minted. Both are read from the record, never from SessionName.
-	userID := cred.AssumedRoleID
+	userID, principalARN := cred.AssumedRoleID, ""
 	switch cred.PrincipalType {
 	case principalTypeUser:
 		if err := p.ensureIAMBucketsForSession(ctx, accessKeyID); err != nil {
 			return nil, err
 		}
-		policies, userID, err = p.resolveUserPolicies(ctx, cred.AccountID, cred.SessionName)
+		var principal userPrincipal
+		policies, principal, err = p.resolveUserPolicies(ctx, cred.AccountID, cred.SessionName)
 		if err != nil {
 			return nil, mapSessionPrincipalError(accessKeyID, err)
 		}
+		userID, principalARN = principal.ID, principal.ARN
 	case principalTypeAssumedRole, "":
 		arnAccount, roleName, arnErr := iamarn.ParseRoleARN(cred.UnderlyingRoleARN)
 		switch {
@@ -555,6 +562,8 @@ func (p *NATSIAMProvider) lookupSessionCredentials(ctx context.Context, accessKe
 			if err != nil {
 				return nil, mapSessionPrincipalError(accessKeyID, err)
 			}
+			// A role session's aws:PrincipalArn is its role's ARN, as on AWS.
+			principalARN = cred.UnderlyingRoleARN
 		}
 	default:
 		slog.Warn("Unrecognised session principal_type — failing closed (implicit deny)",
@@ -570,6 +579,7 @@ func (p *NATSIAMProvider) lookupSessionCredentials(ctx context.Context, accessKe
 		PolicyDocuments: policies,
 		PrincipalType:   cred.PrincipalType,
 		UserID:          userID,
+		PrincipalARN:    principalARN,
 	}, nil
 }
 
@@ -706,7 +716,7 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 	}
 
 	// Resolve user policies
-	policies, userID, err := p.resolveUserPolicies(ctx, ak.AccountID, ak.UserName)
+	policies, principal, err := p.resolveUserPolicies(ctx, ak.AccountID, ak.UserName)
 	if err != nil {
 		return nil, fmt.Errorf("resolve policies: %w", err)
 	}
@@ -718,7 +728,8 @@ func (p *NATSIAMProvider) LookupCredentials(accessKeyID string) (*CredentialResu
 		SkipPolicyCheck: false,
 		PolicyDocuments: policies,
 		PrincipalType:   principalTypeUser,
-		UserID:          userID,
+		UserID:          principal.ID,
+		PrincipalARN:    principal.ARN,
 	}
 
 	// Cache the result unless an invalidation landed while it was being built.
@@ -763,26 +774,42 @@ func mapSessionPrincipalError(accessKeyID string, err error) error {
 	return fmt.Errorf("resolve session policies: %w", err)
 }
 
-// resolveUserPolicies returns the user's policy set and their unique ID, which
-// the door supplies as aws:userid. The ID comes back from here rather than from
-// a second lookup because the record it lives on is already read.
+// userPrincipal is what the door supplies about a user beside its policies:
+// aws:userid and aws:PrincipalArn.
+type userPrincipal struct {
+	ID, ARN string
+}
+
+// userARN returns the record's ARN if it names this user in this account, and
+// "" otherwise, so a misfiled record cannot satisfy an aws:PrincipalArn match.
+func userARN(user iamUser, accountID, userName string) string {
+	prefix := "arn:aws:iam::" + accountID + ":user/"
+	if strings.HasPrefix(user.ARN, prefix) && (user.ARN == prefix+userName || strings.HasSuffix(user.ARN, "/"+userName)) {
+		return user.ARN
+	}
+	return ""
+}
+
+// resolveUserPolicies returns the user's policy set and the identity the door
+// supplies as aws:userid and aws:PrincipalArn. They come back from here rather
+// than from a second lookup because the record they live on is already read.
 func (p *NATSIAMProvider) resolveUserPolicies(
 	ctx context.Context, accountID, userName string,
-) ([]iampolicy.PolicyDocument, string, error) {
+) ([]iampolicy.PolicyDocument, userPrincipal, error) {
 	kvKey := accountID + "." + userName
 	entry, err := p.usersBucket.Get(ctx, kvKey)
 	if err != nil {
-		return nil, "", fmt.Errorf("lookup user %s: %w", kvKey, err)
+		return nil, userPrincipal{}, fmt.Errorf("lookup user %s: %w", kvKey, err)
 	}
 
 	var user iamUser
 	if err := json.Unmarshal(entry.Value(), &user); err != nil {
-		return nil, "", fmt.Errorf("unmarshal user: %w", err)
+		return nil, userPrincipal{}, fmt.Errorf("unmarshal user: %w", err)
 	}
 
 	docs, err := p.resolveManagedPolicies(ctx, accountID, "user "+userName, user.AttachedPolicies)
 	if err != nil {
-		return nil, "", err
+		return nil, userPrincipal{}, err
 	}
 
 	// User-own inline policies. Shares the group/role parse helper so a malformed
@@ -790,7 +817,7 @@ func (p *NATSIAMProvider) resolveUserPolicies(
 	// spinifex's GetUserPolicies user-inline loop.
 	inline, err := resolveInlinePolicies(user.InlinePolicies, "user "+userName)
 	if err != nil {
-		return nil, "", err
+		return nil, userPrincipal{}, err
 	}
 	docs = append(docs, inline...)
 
@@ -800,12 +827,12 @@ func (p *NATSIAMProvider) resolveUserPolicies(
 	if len(user.Groups) > 0 {
 		groupDocs, err := p.resolveGroupPolicies(ctx, accountID, userName, user.Groups)
 		if err != nil {
-			return nil, "", err
+			return nil, userPrincipal{}, err
 		}
 		docs = append(docs, groupDocs...)
 	}
 
-	return docs, user.UserID, nil
+	return docs, userPrincipal{ID: user.UserID, ARN: userARN(user, accountID, userName)}, nil
 }
 
 // resolveGroupPolicies resolves the managed and inline policies inherited from a

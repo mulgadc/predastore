@@ -4,7 +4,6 @@
 package gate
 
 import (
-	"context"
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
@@ -36,6 +35,7 @@ var gatewayDoorKeys = []string{
 var s3GateExtraKeys = []string{
 	iampolicy.KeyS3Prefix, iampolicy.KeyS3MaxKeys,
 	iampolicy.KeySourceVpce, iampolicy.KeySourceVpc, iampolicy.KeyVpcSourceIP,
+	iampolicy.KeyPrincipalArn,
 }
 
 // Every operator the evaluator implements, so "is this key usable in a policy"
@@ -58,10 +58,12 @@ func emittedKeys(t *testing.T) map[string]string {
 		"user": {
 			AccountID: "000000000001", UserName: "alice",
 			UserID: "AIDAALICE", PrincipalType: "user",
+			PrincipalARN: "arn:aws:iam::000000000001:user/alice",
 		},
 		"assumed-role": {
 			AccountID: "000000000001", UserName: "session",
 			UserID: "AROASHAREDOPS:session", PrincipalType: "assumed-role",
+			PrincipalARN: "arn:aws:iam::000000000001:role/shared-ops",
 		},
 	}
 
@@ -74,7 +76,7 @@ func emittedKeys(t *testing.T) map[string]string {
 			for key := range conditionKeys(r, action, cred) {
 				union[key] = name + "/" + action
 			}
-			ep := r.WithContext(context.WithValue(r.Context(), endpointCtxKey{}, testHeader()))
+			ep := r.WithContext(withEndpoint(r.Context(), testHeader(), nil))
 			for key := range conditionKeys(ep, action, cred) {
 				union[key] = name + "/" + action + " via an endpoint"
 			}
@@ -89,7 +91,7 @@ func TestConditionKeys_EveryEmittedKeyIsUsableInAPolicy(t *testing.T) {
 	for key, source := range emittedKeys(t) {
 		supported := false
 		for _, op := range allOperators {
-			if iampolicy.SupportedCondition(op, key) {
+			if iampolicy.SupportedCondition(op, key) || iampolicy.SupportedEndpointCondition(op, key) {
 				supported = true
 				break
 			}

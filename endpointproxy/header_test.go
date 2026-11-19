@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/mulgadc/predastore/endpointproxy"
@@ -69,10 +70,64 @@ func TestRead_RefusesAnUnknownContractVersion(t *testing.T) {
 	body := bodyOf(t, validHeader())
 	at := bytes.Index(body, []byte{endpointproxy.TypeVersion, 0x00, 0x01, 0x01})
 	require.GreaterOrEqual(t, at, 0)
-	body[at+3] = 2
+	body[at+3] = 3
 
 	_, err := endpointproxy.Read(bytes.NewReader(reframe(0x21, 0x11, body)))
 	assert.ErrorIs(t, err, endpointproxy.ErrUnsupportedVersion)
+}
+
+func policyHeader() endpointproxy.Header {
+	h := validHeader()
+	h.Version = endpointproxy.ContractVersion2
+	h.PolicyGeneration = 7
+	h.Policy = `{"Statement":[{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}]}`
+	return h
+}
+
+// Version 2 carries the endpoint policy and its generation, so the gate needs
+// no store of its own to evaluate it.
+func TestRead_RoundTripsAVersion2Header(t *testing.T) {
+	raw, err := policyHeader().Marshal()
+	require.NoError(t, err)
+	got, err := endpointproxy.Read(bytes.NewReader(raw))
+	require.NoError(t, err)
+	assert.Equal(t, policyHeader(), got)
+
+	long := policyHeader()
+	long.Policy = strings.Repeat("x", endpointproxy.MaxPolicyLength)
+	raw, err = long.Marshal()
+	require.NoError(t, err, "a policy at AWS's limit fits the header")
+	got, err = endpointproxy.Read(bytes.NewReader(raw))
+	require.NoError(t, err)
+	assert.Len(t, got.Policy, endpointproxy.MaxPolicyLength)
+}
+
+// The policy TLVs belong to version 2 alone: a version 1 header carrying one,
+// or a version 2 header missing one, is a contract the gate does not read.
+func TestRead_RefusesAPolicyAtTheWrongVersion(t *testing.T) {
+	v1 := bodyOf(t, validHeader())
+	gen := tlv(endpointproxy.TypePolicyGen, 0, 0, 0, 0, 0, 0, 0, 7)
+	v2 := bodyOf(t, policyHeader())
+	at := bytes.Index(v2, []byte{endpointproxy.TypePolicy})
+	require.Positive(t, at)
+	short := []byte(nil)
+	short = append(short, v2...)
+	short = bytes.Replace(short, gen, tlv(endpointproxy.TypePolicyGen, 0, 7), 1)
+
+	cases := []struct {
+		name string
+		body []byte
+	}{
+		{"version 1 with a policy", join(v1, gen, tlv(endpointproxy.TypePolicy, '{', '}'))},
+		{"version 2 without its policy", v2[:at]},
+		{"version 2 with a short generation", short},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := endpointproxy.Read(bytes.NewReader(reframe(0x21, 0x11, tc.body)))
+			assert.Error(t, err)
+		})
+	}
 }
 
 func TestRead_IgnoresTLVsOutsideTheContract(t *testing.T) {
@@ -119,7 +174,13 @@ func TestMarshal_RefusesWhatReadWouldRefuse(t *testing.T) {
 		{"account ID", func(h *endpointproxy.Header) { h.AccountID = "1111" }},
 		{"destination", func(h *endpointproxy.Header) { h.Destination = netip.AddrPort{} }},
 		{"loopback source", func(h *endpointproxy.Header) { h.Source = netip.MustParseAddrPort("127.0.0.1:40000") }},
-		{"version", func(h *endpointproxy.Header) { h.Version = 2 }},
+		{"version", func(h *endpointproxy.Header) { h.Version = 3 }},
+		{"version 1 with a policy", func(h *endpointproxy.Header) { h.Policy = "{}" }},
+		{"version 2 without a policy", func(h *endpointproxy.Header) { h.Version = 2; h.PolicyGeneration = 1 }},
+		{"version 2 without a generation", func(h *endpointproxy.Header) { h.Version = 2; h.Policy = "{}" }},
+		{"version 2 policy too long", func(h *endpointproxy.Header) {
+			h.Version, h.PolicyGeneration, h.Policy = 2, 1, strings.Repeat("x", endpointproxy.MaxPolicyLength+1)
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

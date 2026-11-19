@@ -38,20 +38,46 @@ func TestResolveUserPolicies_ReturnsTheUserID(t *testing.T) {
 			UserName: "alice", UserID: "AIDAALICE", AccountID: inlineTestAccount,
 		}),
 	}
-	_, userID, err := newGroupProvider(withID, map[string][]byte{}, nil).
+	_, principal, err := newGroupProvider(withID, map[string][]byte{}, nil).
 		resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err)
-	assert.Equal(t, "AIDAALICE", userID)
+	assert.Equal(t, "AIDAALICE", principal.ID)
 
 	legacy := map[string][]byte{
 		inlineTestAccount + ".alice": mustMarshal(t, iamUser{
 			UserName: "alice", AccountID: inlineTestAccount,
 		}),
 	}
-	_, userID, err = newGroupProvider(legacy, map[string][]byte{}, nil).
+	_, principal, err = newGroupProvider(legacy, map[string][]byte{}, nil).
 		resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
 	require.NoError(t, err)
-	assert.Empty(t, userID)
+	assert.Empty(t, principal.ID)
+}
+
+// aws:PrincipalArn comes from the user record, and only when that ARN names this
+// user in this account: a misfiled record must not let a caller pass for another.
+func TestResolveUserPolicies_ReturnsTheUserARNItCanVouchFor(t *testing.T) {
+	prefix := "arn:aws:iam::" + inlineTestAccount + ":user/"
+	cases := []struct{ name, arn, want string }{
+		{"plain", prefix + "alice", prefix + "alice"},
+		{"with a path", prefix + "eng/alice", prefix + "eng/alice"},
+		{"absent", "", ""},
+		{"another user", prefix + "bob", ""},
+		{"a suffix of another name", prefix + "malice", ""},
+		{"another account", "arn:aws:iam::999999999999:user/alice", ""},
+		{"a role", "arn:aws:iam::" + inlineTestAccount + ":role/alice", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			users := map[string][]byte{
+				inlineTestAccount + ".alice": mustMarshal(t, iamUser{UserName: "alice", AccountID: inlineTestAccount, ARN: tc.arn}),
+			}
+			_, principal, err := newGroupProvider(users, map[string][]byte{}, nil).
+				resolveUserPolicies(context.Background(), inlineTestAccount, "alice")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, principal.ARN)
+		})
+	}
 }
 
 // TestResolveUserPolicies_UserInlineDenyOverridesManagedAllow proves a user's

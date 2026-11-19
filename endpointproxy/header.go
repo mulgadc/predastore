@@ -14,9 +14,17 @@ import (
 	"regexp"
 )
 
-// ContractVersion1 is the only version this build reads or writes: the guest's
-// addresses, the endpoint ID, its VPC and its owning account.
-const ContractVersion1 = 1
+// Contract versions this build reads and writes. Version 1 is the guest's
+// addresses, the endpoint ID, its VPC and its owning account; version 2 adds the
+// endpoint policy and its generation, which the gate evaluates as a second gate.
+const (
+	ContractVersion1 = 1
+	ContractVersion2 = 2
+)
+
+// MaxPolicyLength bounds the endpoint policy a version 2 header carries, AWS's
+// 20,480-character limit, counted in bytes so it always fits one TLV.
+const MaxPolicyLength = 20480
 
 // TLV types. TypeAWS with SubtypeVpceID is AWS's own encoding of the endpoint
 // ID; the rest sit in the range PROXY v2 reserves for applications.
@@ -26,6 +34,8 @@ const (
 	TypeVersion     = 0xE0
 	TypeVpcID       = 0xE1
 	TypeAccountID   = 0xE2
+	TypePolicyGen   = 0xE3 // version 2: the policy's generation, eight bytes big-endian
+	TypePolicy      = 0xE4 // version 2: the endpoint policy document
 	maxHeaderLength = 32 << 10
 )
 
@@ -55,11 +65,25 @@ type Header struct {
 	VpceID      string
 	VpcID       string
 	AccountID   string // the endpoint's owning account
+
+	// Version 2 only: the endpoint's policy and the generation it was read at.
+	PolicyGeneration uint64
+	Policy           string
 }
 
-// Validate reports whether h is a complete version 1 header.
+// Validate reports whether h is a complete header at its version: a version 1
+// header carries no policy, and a version 2 header always carries one.
 func (h Header) Validate() error {
-	if h.Version != ContractVersion1 {
+	switch h.Version {
+	case ContractVersion1:
+		if h.PolicyGeneration != 0 || h.Policy != "" {
+			return errors.New("endpointproxy: a version 1 header carries no policy")
+		}
+	case ContractVersion2:
+		if h.PolicyGeneration == 0 || h.Policy == "" || len(h.Policy) > MaxPolicyLength {
+			return fmt.Errorf("endpointproxy: a version 2 header needs a generation and a policy of 1 to %d bytes", MaxPolicyLength)
+		}
+	default:
 		return fmt.Errorf("%w: %d", ErrUnsupportedVersion, h.Version)
 	}
 	for _, a := range []netip.AddrPort{h.Source, h.Destination} {
@@ -97,17 +121,21 @@ func (h Header) Marshal() ([]byte, error) {
 	writeTLV(&body, TypeAWS, append([]byte{SubtypeVpceID}, h.VpceID...))
 	writeTLV(&body, TypeVpcID, []byte(h.VpcID))
 	writeTLV(&body, TypeAccountID, []byte(h.AccountID))
+	if h.Version == ContractVersion2 {
+		writeTLV(&body, TypePolicyGen, binary.BigEndian.AppendUint64(nil, h.PolicyGeneration))
+		writeTLV(&body, TypePolicy, []byte(h.Policy))
+	}
 
 	out := make([]byte, 0, 16+body.Len())
 	out = append(out, signature...)
 	out = append(out, cmdProxy, famTCPv4)
-	out = binary.BigEndian.AppendUint16(out, uint16(body.Len())) //nolint:gosec // G115: bounded by the four short TLVs above.
+	out = binary.BigEndian.AppendUint16(out, uint16(body.Len())) //nolint:gosec // G115: Validate bounds the policy, the one long TLV, well under 64 KiB.
 	return append(out, body.Bytes()...), nil
 }
 
 func writeTLV(b *bytes.Buffer, typ byte, v []byte) {
 	b.WriteByte(typ)
-	_ = binary.Write(b, binary.BigEndian, uint16(len(v))) //nolint:gosec // G115: every value is an identifier or one byte.
+	_ = binary.Write(b, binary.BigEndian, uint16(len(v))) //nolint:gosec // G115: the longest value is a policy Validate bounds.
 	b.Write(v)
 }
 
@@ -167,6 +195,13 @@ func Read(r io.Reader) (Header, error) {
 			h.VpcID = string(v)
 		case TypeAccountID:
 			h.AccountID = string(v)
+		case TypePolicyGen:
+			if l != 8 {
+				return Header{}, errors.New("endpointproxy: policy generation TLV is not eight bytes")
+			}
+			h.PolicyGeneration = binary.BigEndian.Uint64(v)
+		case TypePolicy:
+			h.Policy = string(v)
 		}
 	}
 	if !seen[TypeVersion] {

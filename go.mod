@@ -13,7 +13,7 @@ require (
 	github.com/hashicorp/raft-boltdb/v2 v2.4.2
 	github.com/klauspost/reedsolomon v1.14.2
 	github.com/minio/crc64nvme v1.1.1
-	github.com/mulgadc/bluebottle v1.25.1-0.20261118003950-05fa4c716542
+	github.com/mulgadc/bluebottle v1.25.1-0.20261119052434-6261addd31b9
 	github.com/nats-io/nats.go v1.55.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/quic-go/quic-go v0.65.0
@@ -28,6 +28,7 @@ require (
 )
 
 require (
+	github.com/antithesishq/antithesis-sdk-go v0.9.0-default-no-op // indirect
 	github.com/aws/smithy-go v1.28.9 // indirect
 	github.com/boltdb/bolt v1.3.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
@@ -37,6 +38,7 @@ require (
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
+	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 // indirect
 	github.com/hashicorp/go-hclog v1.6.3 // indirect
@@ -49,7 +51,10 @@ require (
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
-	github.com/nats-io/nkeys v0.4.16 // indirect
+	github.com/minio/highwayhash v1.0.4 // indirect
+	github.com/nats-io/jwt/v2 v2.8.3 // indirect
+	github.com/nats-io/nats-server/v2 v2.15.3 // indirect
+	github.com/nats-io/nkeys v0.4.17 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
@@ -69,7 +74,7 @@ require (
 	golang.org/x/exp/typeparams v0.0.0-20260611194520-c48552f49976 // indirect
 	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/net v0.61.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260924152758-ed294f943157 // indirect
 	golang.org/x/text v0.43.0 // indirect
 	golang.org/x/time v0.16.0 // indirect

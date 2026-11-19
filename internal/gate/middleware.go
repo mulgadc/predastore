@@ -230,6 +230,22 @@ func (s *Server) publicOwnerActive(w http.ResponseWriter, r *http.Request, bucke
 	return s.accountActive(w, r, meta.AccountID, true)
 }
 
+// anonymousEndpointAllows reports whether an unsigned request's endpoint, if it
+// came through one, permits it.
+func anonymousEndpointAllows(r *http.Request, bucket, key string) bool {
+	endpoint, ok := endpointFrom(r.Context())
+	if !ok {
+		return true
+	}
+	action, resource := s3Action(r, bucket, key), s3Resource(bucket, key)
+	if endpoint.allows(action, resource, conditionKeys(r, action, &auth.CredentialResult{})) {
+		return true
+	}
+	slog.DebugContext(r.Context(), "S3 anonymous access denied by endpoint policy",
+		"action", action, "resource", resource, "vpce_id", endpoint.VpceID)
+	return false
+}
+
 // sigV4AuthMiddleware authenticates and authorizes incoming S3 requests:
 // public-bucket short-circuit, SigV4 verify, IAM policy eval, and
 // cross-account bucket-ownership check.
@@ -253,6 +269,12 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 				if publicBucketAccess == nil {
 					// A public grant must not keep a closed account's data reachable.
 					if !s.publicOwnerActive(w, r, bucket) {
+						return
+					}
+					// An endpoint policy holds an anonymous caller too, who carries
+					// no principal keys, so one naming a principal grants it nothing.
+					if !anonymousEndpointAllows(r, bucket, key) {
+						handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 						return
 					}
 					next.ServeHTTP(w, r)
@@ -301,6 +323,27 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
+		// The endpoint policy is a second gate on every request through an endpoint,
+		// a service account's included, as AWS applies it to every principal.
+		endpoint, viaEndpoint := endpointFrom(r.Context())
+		var keys iampolicy.ConditionKeys
+		if viaEndpoint || !credResult.SkipPolicyCheck {
+			keys = conditionKeys(r, action, credResult)
+		}
+		endpointAllows := func(objectAction, objectResource string) bool {
+			if !viaEndpoint || endpoint.allows(objectAction, objectResource, keys) {
+				return true
+			}
+			slog.DebugContext(r.Context(), "S3 access denied by endpoint policy",
+				"action", objectAction, "resource", objectResource, "vpce_id", endpoint.VpceID)
+			return false
+		}
+		if viaEndpoint {
+			authorize = func(objectAction, objectKey string) bool {
+				return endpointAllows(objectAction, s3Resource(bucket, objectKey))
+			}
+		}
+
 		// IAM policy evaluation (NATS-sourced credentials only). Config-defined service
 		// accounts (SkipPolicyCheck) belong to no tenant account and bypass the account
 		// gate as they bypass policy, so platform work such as teardown is never refused.
@@ -315,15 +358,14 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 				slog.DebugContext(r.Context(), "No policies resolved for user, implicit deny",
 					"accessKeyID", accessKey, "accountID", credResult.AccountID)
 			}
-			keys := conditionKeys(r, action, credResult)
 			authorize = func(objectAction, objectKey string) bool {
 				objectResource := s3Resource(bucket, objectKey)
-				if iampolicy.EvaluateWithKeys(objectAction, objectResource, credResult.PolicyDocuments, keys) == iampolicy.Allow {
-					return true
+				if iampolicy.EvaluateWithKeys(objectAction, objectResource, credResult.PolicyDocuments, keys) != iampolicy.Allow {
+					slog.DebugContext(r.Context(), "S3 access denied by policy",
+						"action", objectAction, "resource", objectResource, "accessKeyID", accessKey)
+					return false
 				}
-				slog.DebugContext(r.Context(), "S3 access denied by policy",
-					"action", objectAction, "resource", objectResource, "accessKeyID", accessKey)
-				return false
+				return endpointAllows(objectAction, objectResource)
 			}
 			if !isBulkDelete(r, key) && iampolicy.EvaluateWithKeys(action, resource, credResult.PolicyDocuments, keys) == iampolicy.Deny {
 				slog.DebugContext(r.Context(), "S3 access denied by policy",
@@ -332,6 +374,10 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 				handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 				return
 			}
+		}
+		if !isBulkDelete(r, key) && !endpointAllows(action, resource) {
+			handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
+			return
 		}
 
 		// Bucket-ownership check (default-deny on cross-account access).
