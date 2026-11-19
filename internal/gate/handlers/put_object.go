@@ -135,7 +135,6 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		previous, err := metaSwap(ctx, mc, model.TableObjects, string(objectHash[:]), record)
 		if err != nil {
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
-			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}

@@ -160,7 +160,6 @@ func storePart(
 	previous, err := metaSwap(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber), shardRecord)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to store part shard metadata", "uploadID", uploadID, "part", partNumber, "error", err)
-		abortShards(ctx, bc, objectHash, place, written)
 		return model.PartMetadata{}, written, model.NewS3Error(model.ErrInternalError, "Failed to store part shard metadata", 500)
 	}
 

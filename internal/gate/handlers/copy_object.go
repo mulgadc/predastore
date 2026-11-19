@@ -152,14 +152,17 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
+		// Shards before the record, as PutObject does. The other order let a
+		// swap this writer could not account for abort the prepared shards the
+		// record may already name.
+		commitShards(ctx, bc, destHash, place, written)
+
 		previous, err := metaSwap(ctx, mc, model.TableObjects, string(destHash[:]), record)
 		if err != nil {
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
-			abortShards(ctx, bc, destHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
-		commitShards(ctx, bc, destHash, place, written)
 		if !destTarget.versioned {
 			releaseSuperseded(ctx, bc, destHash, previous, place.WriteEpoch, handoffNode(ring, cfg, destHash))
 		}

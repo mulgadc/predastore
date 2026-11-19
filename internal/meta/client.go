@@ -491,7 +491,8 @@ func (c *Client) write(ctx context.Context, op rpc.Opcode, req *MetaRequest, bod
 // populates that; every other write leaves it nil.
 //
 // Put, PutMax and Delete are idempotent, so an attempt whose outcome is
-// unknown is simply tried again. A swap is not: see the guard below.
+// unknown is simply tried again. A swap is not: it retries only on an attempt
+// that never reached a replica, or a refusal that names a leader.
 func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest, body []byte) ([]byte, error) {
 	candidates := c.readOrder()
 	next := 0
@@ -529,6 +530,12 @@ func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest
 			telemetry.RecordMetaRedirect(ctx, telemetry.RedirectNoLeader)
 		default:
 			lastErr = fmt.Errorf("replica %d: %s", target, resp.Err)
+			// A replica that answered with anything but a redirect may have
+			// applied the command first: raft reports a lost leadership once
+			// the entry is in the log, and the next leader can commit it.
+			if op == OpMetaSwap {
+				return nil, fmt.Errorf("swap %q: %w", req.Key, lastErr)
+			}
 		}
 
 		// No redirect to follow — rotate to the next replica after a
