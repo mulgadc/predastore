@@ -86,6 +86,50 @@ func TestAPartReUploadReleasesTheGenerationItReplaces(t *testing.T) {
 		"the replaced part generation was never released, so nothing will reclaim it")
 }
 
+// Publishing an object is two independent races. Whoever commits last owns the
+// shards; whoever swaps last owns the record. When they disagree the record
+// names a generation the other writer's commit demoted, which is correct and
+// readable — and it must never be the generation a release names, because
+// nothing else would ever bring it back.
+func TestTheRecordThatLandsLastKeepsItsOwnGeneration(t *testing.T) {
+	t.Parallel()
+
+	f := newHandoffFixture(2, 1, 1)
+	ctx := context.Background()
+	objectHash := model.ObjectHash("b", "k")
+
+	// A generation to displace, so both racing writers are overwrites.
+	seed, _, err := f.write(ctx, objectHash, randomBytes(t, 1<<16))
+	require.NoError(t, err)
+
+	// P commits first and Q second, so Q is live and P's generation is
+	// retained even though P's record is the one that lands last.
+	p, _, err := f.write(ctx, objectHash, randomBytes(t, 1<<16))
+	require.NoError(t, err)
+	q, _, err := f.write(ctx, objectHash, randomBytes(t, 1<<16))
+	require.NoError(t, err)
+	require.Less(t, p.WriteEpoch, q.WriteEpoch, "the fixture has to hand out increasing epochs")
+
+	seedRecord, err := EncodePlacement(seed)
+	require.NoError(t, err)
+	qRecord, err := EncodePlacement(q)
+	require.NoError(t, err)
+
+	// Q swaps first and displaces the seed; P swaps last and displaces Q, so
+	// the record ends up naming P.
+	handoff := handoffNode(f.ring, f.cfg, objectHash)
+	releaseSuperseded(ctx, f.bc, objectHash, seedRecord, q.WriteEpoch, handoff)
+	releaseSuperseded(ctx, f.bc, objectHash, qRecord, p.WriteEpoch, handoff)
+
+	for index, node := range p.AllNodes() {
+		released := f.bc.releasedEpochs(node, objectHash, uint32(index))
+		assert.NotContains(t, released, p.WriteEpoch,
+			"node %d released the generation the record names, so nothing will bring it back", node)
+		assert.Contains(t, released, seed.WriteEpoch,
+			"node %d never released the generation Q displaced", node)
+	}
+}
+
 // mustHolder reports which node holds a committed shard.
 func mustHolder(t *testing.T, f handoffFixture, key [32]byte, index uint32) config.NodeID {
 	t.Helper()

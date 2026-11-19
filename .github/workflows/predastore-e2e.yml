@@ -34,7 +34,7 @@ on:
         required: false
         default: ""
       stress_scenarios:
-        description: "Stress scenarios to run (empty = all fourteen)"
+        description: "Stress scenarios to run (empty = all fifteen)"
         required: false
         default: ""
       run_performance:
@@ -117,7 +117,7 @@ jobs:
           REQUESTED: ${{ inputs.stress_scenarios }}
         run: |
           set -euo pipefail
-          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put torn-overwrite stale-shard object-sizes freeze multipart-upload partial-put"
+          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put retained-reclaim torn-overwrite stale-shard object-sizes freeze multipart-upload partial-put"
           # shellcheck disable=SC2086
           printf '%s\n' ${REQUESTED:-$default} | jq -Rsc 'split("\n") | map(select(length > 0))' \
             | sed 's/^/scenarios=/' >> "$GITHUB_OUTPUT"
@@ -131,7 +131,8 @@ jobs:
     # minutes' worth of work each, and they queue behind the performance job
     # for the one self-hosted runner while they do it.
     runs-on: ubuntu-26.04
-    # No leg has taken over three minutes. This is room for a bad run.
+    # No leg but retained-reclaim has taken over three minutes, and that one
+    # holds a key for seven by design. This is room for a bad run.
     timeout-minutes: 30
 
     strategy:

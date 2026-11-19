@@ -97,7 +97,7 @@ STALE_KEYS="${STRESS_STALE_KEYS:-12}"
 SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
     all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff|large-object|multipart-upload) ;;
-    last-modified|concurrent-put|object-sizes) ;;
+    last-modified|concurrent-put|object-sizes|retained-reclaim) ;;
     node-rejoin|node-resync|node-rebuild) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
@@ -2622,6 +2622,202 @@ if [ "$SCENARIO" = all ] || [ "$SCENARIO" = concurrent-put ]; then
         || fail "the cluster did not take writes after the concurrent-put scenario"
 fi
 
+# --- Scenario: retained-reclaim ---
+#
+# A commit demotes the generation it replaces rather than destroying it, and
+# only a publisher reporting that its record displaced that generation makes it
+# reclaimable. A record that ends up naming a demoted generation nobody
+# released is readable, and reclaiming that generation on age alone destroys an
+# object every client was acknowledged for.
+#
+# Racing writers produce that state without any fault. The shard order and the
+# record order are different races: whoever commits last owns the shards,
+# whoever swaps last owns the record. When they disagree the record names the
+# generation the other writer's commit demoted, and nothing released it.
+#
+# What makes it worth a scenario of its own is that it is a delayed failure.
+# The object reads back perfectly for the whole retention window and then
+# stops, so any test that writes and reads immediately passes on both the
+# broken and the fixed engine. The dwell is the assertion.
+#
+# Many keys, because the orders agreeing or disagreeing is a coin flip per key,
+# and only the last write to a key leaves state that survives: the next
+# overwrite's swap releases the stale generation and heals it. So rounds buy
+# nothing and keys buy everything — each key is one independent trial, and one
+# broken key fails the run.
+#
+# Writers are spread across every gate, because two requests arriving at one
+# gate could serialise somewhere and prove less than they look like proving.
+#
+# It is slow by construction. The retention window is not operator-settable —
+# a shorter one would take shards from under an in-flight read — so the dwell
+# is real time, about seven minutes.
+RECLAIM_FAILURES=0
+RECLAIM_CASES=0
+
+run_retained_reclaim() {
+    BUCKET="stress-reclaim-${RUN_ID}"
+    local writers="${STRESS_RECLAIM_WRITERS:-6}"
+    local keys_n="${STRESS_RECLAIM_KEYS:-24}"
+    local lines="${STRESS_RECLAIM_LINES:-512}"
+    local dwell="${STRESS_RECLAIM_DWELL:-420}"
+    local poll="${STRESS_RECLAIM_POLL:-20}"
+
+    RECLAIM_FAILURES=0
+    RECLAIM_CASES=0
+
+    local first_gate read_gate gates=() endpoint_list
+    mapfile -t gates < <(gate_endpoints "$CONFIG_FILE" | sed 's#^#https://#')
+    [ "${#gates[@]}" -gt 0 ] || fail "retained-reclaim: no gate in $CONFIG_NAME"
+    first_gate="${gates[0]}"
+    read_gate="${gates[${#gates[@]} - 1]}"
+    endpoint_list="$(printf '%s\n' "${gates[@]}" | paste -sd,)"
+
+    local RACE_PROBE="$WORK_DIR/racedput"
+    go build -o "$RACE_PROBE" "$REPO_DIR/scripts/bench/racedput"
+
+    mkdir -p "$WORK_DIR/reclaim-bodies"
+    local i body_list=()
+    for i in $(seq 1 "$writers"); do
+        make_state "g${i}" "$WORK_DIR/reclaim-bodies/g${i}.json" "$lines"
+        body_list+=("$WORK_DIR/reclaim-bodies/g${i}.json")
+    done
+    local bodies
+    bodies="$(printf '%s\n' "${body_list[@]}" | paste -sd,)"
+
+    aws_s3 "$first_gate" s3 mb "s3://$BUCKET" >/dev/null
+
+    local outdir="$WORK_DIR/reclaim-out"
+    rm -rf "$outdir"
+    mkdir -p "$outdir"
+
+    # Every key is written twice: once to establish a generation, then raced,
+    # because a first write has no previous generation to demote and cannot
+    # produce the state.
+    log "retained-reclaim: seeding $keys_n keys, then racing $writers writers on each"
+    local k key pids=() p
+    for k in $(seq 1 "$keys_n"); do
+        key="$(printf 'reclaim-k%03d.json' "$k")"
+        aws_s3 "$first_gate" s3 cp "$WORK_DIR/reclaim-bodies/g1.json" "s3://$BUCKET/$key" >/dev/null
+    done
+
+    pids=()
+    for k in $(seq 1 "$keys_n"); do
+        key="$(printf 'reclaim-k%03d.json' "$k")"
+        (
+            "$RACE_PROBE" -endpoints "$endpoint_list" -bucket "$BUCKET" -key "$key" \
+                -bodies "$bodies" -region "$REGION" \
+                -access-key "$ACCESS_KEY" -secret-key "$SECRET_KEY" \
+                > "$outdir/${key}.race" 2>>"$outdir/put-errors.txt"
+        ) &
+        pids+=("$!")
+    done
+    for p in "${pids[@]}"; do wait "$p" || true; done
+
+    local verdicts
+    verdicts="$(awk '/^writer=/ {
+        for (i = 1; i <= NF; i++) if ($i ~ /^status=/) { sub(/^status=/, "", $i); n[$i]++ }
+        if ($0 ~ /outcome=client_error/) n["client_error"]++
+    } END { for (s in n) printf "%s=%d ", s, n[s]; printf "\n" }' "$outdir"/*.race)"
+    log "retained-reclaim: writer verdicts $verdicts"
+
+    # What the cluster settled on is the promise it has to keep. Taken through
+    # a gate that did not write it last, so nothing local can answer for the
+    # cluster.
+    local settled_dir="$WORK_DIR/reclaim-settled"
+    rm -rf "$settled_dir"
+    mkdir -p "$settled_dir"
+    local settled_n=0
+    for k in $(seq 1 "$keys_n"); do
+        key="$(printf 'reclaim-k%03d.json' "$k")"
+        RECLAIM_CASES=$(( RECLAIM_CASES + 1 ))
+        if aws_s3 "$read_gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+            s3api get-object --bucket "$BUCKET" --key "$key" "$settled_dir/$key" \
+            >/dev/null 2>>"$outdir/get-errors.txt"; then
+            settled_n=$(( settled_n + 1 ))
+        else
+            log "retained-reclaim: FAIL $key is unreadable before the dwell even starts"
+            RECLAIM_FAILURES=$(( RECLAIM_FAILURES + 1 ))
+        fi
+    done
+    log "retained-reclaim: $settled_n of $keys_n keys settled; holding them for ${dwell}s"
+
+    # The dwell. Nothing writes these keys again, so every read has to answer
+    # the same object. A generation reclaimed underneath one shows up as a 500
+    # on a key that was answering a moment ago, which is the prod symptom.
+    local started elapsed cycles=0 got="$WORK_DIR/reclaim-got.json"
+    local broken=() first_break=""
+    started="$(date +%s)"
+    while :; do
+        elapsed=$(( $(date +%s) - started ))
+        [ "$elapsed" -ge "$dwell" ] && break
+        cycles=$(( cycles + 1 ))
+
+        for k in $(seq 1 "$keys_n"); do
+            key="$(printf 'reclaim-k%03d.json' "$k")"
+            [ -s "$settled_dir/$key" ] || continue
+            case " ${broken[*]} " in *" $key "*) continue ;; esac
+            RECLAIM_CASES=$(( RECLAIM_CASES + 1 ))
+
+            if ! aws_s3 "$read_gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+                s3api get-object --bucket "$BUCKET" --key "$key" "$got" \
+                >/dev/null 2>>"$outdir/get-errors.txt"; then
+                log "retained-reclaim: FAIL $key stopped reading ${elapsed}s after its last write"
+                RECLAIM_FAILURES=$(( RECLAIM_FAILURES + 1 ))
+                broken+=("$key")
+                [ -z "$first_break" ] && first_break="$elapsed"
+                continue
+            fi
+            if ! cmp -s "$settled_dir/$key" "$got"; then
+                log "retained-reclaim: FAIL $key changed body ${elapsed}s after its last write"
+                cp "$got" "$RUN_DIR/retained-reclaim-${key}-${elapsed}s"
+                RECLAIM_FAILURES=$(( RECLAIM_FAILURES + 1 ))
+                broken+=("$key")
+                [ -z "$first_break" ] && first_break="$elapsed"
+            fi
+        done
+
+        elapsed=$(( $(date +%s) - started ))
+        [ "$elapsed" -ge "$dwell" ] && break
+        command sleep "$poll"
+    done
+
+    if [ -n "$first_break" ]; then
+        log "retained-reclaim: ${#broken[@]} of $settled_n keys broke, first at ${first_break}s"
+        grep -oE 'An error occurred \([A-Za-z]+\)' "$outdir/get-errors.txt" 2>/dev/null \
+            | sort | uniq -c | while read -r n code; do
+                log "retained-reclaim: read error $code x$n"
+            done
+    fi
+    log "retained-reclaim: $cycles sweeps of $settled_n keys over ${dwell}s"
+
+    mkdir -p "$RUN_DIR/retained-reclaim"
+    cp "$outdir"/*.race "$outdir"/*errors.txt "$RUN_DIR/retained-reclaim/" 2>/dev/null || true
+
+    aws_s3 "$first_gate" s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true
+
+    if [ "$RECLAIM_FAILURES" -eq 0 ]; then
+        log "retained-reclaim: passed $RECLAIM_CASES assertions"
+    else
+        log "retained-reclaim: FAILED $RECLAIM_FAILURES of $RECLAIM_CASES assertions"
+    fi
+}
+
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = retained-reclaim ]; then
+    run_retained_reclaim
+
+    if [ "$SCENARIO" = retained-reclaim ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$RECLAIM_FAILURES" -eq 0 ] \
+            || fail "retained-reclaim failed $RECLAIM_FAILURES of $RECLAIM_CASES assertions"
+        exit 0
+    fi
+
+    log "round trip after retained-reclaim, before the torn-overwrite scenario"
+    round_trip "https://$(gate_endpoints "$CONFIG_FILE" | head -1)" post-reclaim \
+        || fail "the cluster did not take writes after the retained-reclaim scenario"
+fi
+
 # --- Scenario: torn-overwrite ---
 #
 # An overwrite is not atomic across an object's shards. writeObject sends every
@@ -3285,6 +3481,13 @@ log "Warp completed with no errors"
     else
         echo "concurrent_put=fail ($CPUT_FAILURES of $CPUT_CASES)"
     fi
+    if [ "$RECLAIM_CASES" -eq 0 ]; then
+        echo "retained_reclaim=skipped"
+    elif [ "$RECLAIM_FAILURES" -eq 0 ]; then
+        echo "retained_reclaim=pass"
+    else
+        echo "retained_reclaim=fail ($RECLAIM_FAILURES of $RECLAIM_CASES)"
+    fi
     if [ "$STALE_CASES" -eq 0 ]; then
         echo "stale_shard=skipped"
     elif [ "$STALE_FAILURES" -eq 0 ]; then
@@ -3361,6 +3564,8 @@ echo "Stress results: $RUN_DIR"
     || fail "last-modified failed $LM_FAILURES of $LM_CASES assertions"
 [ "$CPUT_FAILURES" -eq 0 ] \
     || fail "concurrent-put failed $CPUT_FAILURES of $CPUT_CASES assertions"
+[ "$RECLAIM_FAILURES" -eq 0 ] \
+    || fail "retained-reclaim failed $RECLAIM_FAILURES of $RECLAIM_CASES assertions"
 [ "$NODE_FAILURES" -eq 0 ] \
     || fail "node recovery failed $NODE_FAILURES of $NODE_CASES assertions"
 [ "$MP_FAILURES" -eq 0 ] \
