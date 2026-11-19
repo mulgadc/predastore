@@ -149,6 +149,11 @@ func storePart(
 		abortShards(ctx, bc, objectHash, place, written)
 		return model.PartMetadata{}, written, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500)
 	}
+	// Shards before the record, as the object path does. The other order lets a
+	// re-upload of the same part number release a generation its own commit has
+	// not retained yet, which leaves a row no sweep can reclaim.
+	commitShards(ctx, bc, objectHash, place, written)
+
 	// Swapping rather than writing tells this writer which generation it
 	// displaced. Re-uploading a part is an overwrite like any other, and
 	// without that answer the generation it supersedes is never released.
@@ -159,8 +164,7 @@ func storePart(
 		return model.PartMetadata{}, written, model.NewS3Error(model.ErrInternalError, "Failed to store part shard metadata", 500)
 	}
 
-	commitShards(ctx, bc, objectHash, place, written)
-	releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch)
+	releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch, handoffNode(ring, cfg, objectHash))
 	telemetry.RecordMultipartPart(ctx, size)
 	slog.DebugContext(ctx, "Part uploaded", "uploadID", uploadID, "partNumber", partNumber,
 		"size", size, "etag", partMeta.ETag)

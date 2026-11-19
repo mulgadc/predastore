@@ -167,7 +167,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		}
 		commitShards(ctx, bc, objectHash, place, written)
 		if !target.versioned {
-			releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch)
+			releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch, handoffNode(ring, cfg, objectHash))
 		}
 
 		if err := indexWrite(ctx, mc, bucket, key, target, place); err != nil {

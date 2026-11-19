@@ -161,7 +161,7 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		}
 		commitShards(ctx, bc, destHash, place, written)
 		if !destTarget.versioned {
-			releaseSuperseded(ctx, bc, destHash, previous, place.WriteEpoch)
+			releaseSuperseded(ctx, bc, destHash, previous, place.WriteEpoch, handoffNode(ring, cfg, destHash))
 		}
 
 		if err := indexWrite(ctx, mc, destBucket, destKey, destTarget, place); err != nil {

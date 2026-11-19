@@ -404,6 +404,16 @@ The writer then owns a disjoint byte range. It assembles fragments into an in-me
 
 Tombstones are keyed by physical slot — `'d'` ‖ big-endian `segNum` ‖ big-endian `off`, 17 bytes — with the dead byte count as the value. Keying by slot rather than by object key is what lets one key die repeatedly: on delete, on overwrite, and on a relocation that lost its race. They only accelerate compaction's candidate selection and are never consulted for correctness.
 
+### Retained generations
+
+A `Commit` promotes the new generation and **demotes** the one it replaces to `'r'` ‖ key ‖ index ‖ big-endian epoch, rather than destroying it. Shards are published before the placement record, so a record can name a generation the nodes have already passed, and a demoted generation still answers `LookupAt` for exactly that reason.
+
+A demoted generation is reclaimable only once a publisher reports that its record displaced it. That report is `Release`, and it writes `'R'` ‖ key ‖ index ‖ epoch, a row whose presence is the whole eligibility test. `retainedMaxAge` (5 minutes) then applies to the release, not to the demotion: it is the grace window a reader that already resolved the old generation keeps answering in.
+
+Age cannot decide on its own. A writer that commits and never publishes starts no clock anybody can see, the gate's PUT path carries no total deadline, and reclaiming such a generation destroys an object every client was acknowledged for. The sweep therefore reclaims released generations past their grace and nothing else, ever. A release that does not arrive costs disk until the generation is released again, which is the safe direction: failure retains.
+
+The retained row's stamp field is written `math.MaxInt64` and is never read here. It exists for an engine from before the release namespace, which reclaims on that field and will not find the value old enough, so rolling back strands disk rather than destroying data.
+
 ### Compaction
 
 Compaction is always on. Without it, overwrite and delete churn frees nothing and the store fills. The interval comes from `[compaction] interval_seconds`, defaulting to 5 minutes, and a nearfull `Append` kicks an out-of-cycle pass.
@@ -452,7 +462,9 @@ The milliseconds are the object's `LastModified` on every surface that serves on
 
 The body is split into `K` data shard buffers in memory and each is streamed to its node in parallel. Parity is encoded into buffers of its own and written from those. It is deliberately not piped from a single encoder: one parity node refusing would close its pipe, fail the encode and take every other parity write down with it, losing all redundancy at once rather than one shard of it.
 
-**The write is two-phase.** Each shard put makes the bytes durable and invisible. The placement record landing in raft is the commit point — the moment the object's new generation exists — and the shards are published only afterwards. A reader that finds a prepared-but-unpublished shard at the record's epoch completes the commit itself, so an interrupted writer costs a round trip rather than the object.
+**The write is two-phase.** Each shard put makes the bytes durable and invisible. The shards are published first, then the placement record lands in raft, which is the commit point and the moment the object's new generation becomes visible. That order is what stops a record naming shards that have not landed; the reverse is possible — a record can name a generation the nodes have already passed — which is why a commit demotes rather than destroys. A reader that finds a prepared-but-unpublished shard at the record's epoch completes the commit itself, so an interrupted writer costs a round trip rather than the object.
+
+Swapping the record rather than writing it tells the writer which generation it displaced, and the writer then **releases** exactly that one on every node behind the old record, including the handoff holder. A generation nobody released is never reclaimed: see §7, *Retained generations*. A writer that does not reach the release leaves disk held, which is the direction to fail in.
 
 The write is acknowledged once `K` shards are durable, so one node down does not refuse writes; the response then carries `X-Spx-Degraded-Write: <n>`. Setting `rs.degraded_writes = false` restores a full-width floor. `K` is the floor and not `K+1`, because any `K` of the `K+M` reconstruct — at RS(2,1) one more buys no redundancy and would refuse three quarters of writes with a single node down.
 

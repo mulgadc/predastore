@@ -143,7 +143,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// Nothing is superseded on a versioned write: the record this one
 		// replaced belongs to a different hash and is still a live version.
 		if !target.versioned {
-			releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch)
+			releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch, handoffNode(ring, cfg, objectHash))
 		}
 
 		// The index row before the listing key, so a version is enumerable by the
