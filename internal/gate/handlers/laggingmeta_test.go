@@ -54,6 +54,13 @@ func (m *laggingMeta) Get(ctx context.Context, key string) ([]byte, error) {
 	return nil, meta.ErrNotFound
 }
 
+// LeaderGet does not lag. That is the whole difference between it and Get: a
+// leader read is answered only by a replica that has applied the delete, so a
+// pending stale value is not a candidate answer.
+func (m *laggingMeta) LeaderGet(ctx context.Context, key string) ([]byte, error) {
+	return m.fakeMeta.LeaderGet(ctx, key)
+}
+
 // Put lands everywhere, so a key written again is no longer lagging behind a
 // delete that preceded it.
 func (m *laggingMeta) Put(ctx context.Context, key string, value []byte) error {

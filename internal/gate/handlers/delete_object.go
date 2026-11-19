@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,18 @@ import (
 // it needs to reclaim. Exported so the reaper package, which pages only these
 // rows, can build the same scan prefix without duplicating it.
 const DeletedObjectPrefix = "deleted:"
+
+// deletedObjectKey names one deleted shard set's tombstone.
+//
+// The object hash ends the key because every version of a key is its own shard
+// set under its own hash: without it, emptying a versioned bucket overwrites
+// one version's record with the next and loses the first's shards. It is a
+// fixed-width hex suffix, so two rows collide only when they name the same
+// shard set. Nothing parses this key — the reclaim worker reads the row's
+// value — so the prefix stays the one it already scans.
+func deletedObjectKey(bucket, key string, objectHash [32]byte) string {
+	return DeletedObjectPrefix + bucket + "/" + key + "#" + hex.EncodeToString(objectHash[:])
+}
 
 // DeletedObjectInfo names the shards a failed fan-out left behind, so the
 // reaper sweep can reclaim them once it is safe to. It is load-bearing: once
@@ -44,6 +57,11 @@ func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config) 
 		bucket, key := resource.Bucket.Name, resource.Key
 
 		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
+		if err := requireExpectedBucketOwner(ctx, mc, cache, r, bucket); err != nil {
 			HandleError(w, r, err)
 			return
 		}
@@ -126,7 +144,7 @@ func deleteStoredVersion(ctx context.Context, mc MetaClient, bc BlobClient, buck
 		if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err != nil {
 			return model.NewS3Error(model.ErrInternalError, fmt.Sprintf("encode tombstone: %v", err), 500)
 		}
-		if err := metaPut(ctx, mc, model.TableObjects, DeletedObjectPrefix+bucket+"/"+key, deletedBuf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableObjects, deletedObjectKey(bucket, key, objectHash), deletedBuf.Bytes()); err != nil {
 			return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 		}
 	}
