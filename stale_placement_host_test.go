@@ -3,9 +3,9 @@ package predastore_test
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"io"
-	"crypto/tls"
 	"net/http"
 	"strconv"
 	"testing"

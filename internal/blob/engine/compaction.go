@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -285,34 +284,34 @@ func (store *Store) sweepPrepared(maxAge time.Duration) (int, error) {
 // which is not this change.
 const retainedMaxAge = 5 * time.Minute
 
-// generationHeld is the stamp a commit puts on the generation it demotes. A
-// publisher reporting its record displaced that generation is the only thing
-// that starts a clock, because nothing else knows whether a record still
-// names it.
-//
-// It is the far future rather than zero so that an earlier release, which
-// reclaims a retained row once its stamp predates the cutoff, also leaves a
-// held row alone. A rollback then strands disk instead of destroying data.
-const generationHeld int64 = math.MaxInt64
-
-// releasedAt reports when a publisher released a retained generation. A
-// release is stored negated, which is what tells it apart from the commit
-// stamp written before held rows existed: that stamp is indistinguishable
-// from a release time, so a row carrying one is held and never reclaimed.
-// Those rows are bounded by the retention window of the release being
-// upgraded from, since anything older had already been reclaimed.
-func releasedAt(at int64) (int64, bool) {
-	if at < 0 {
-		return -at, true
-	}
-	return 0, false
-}
-
 // retainedSweepInterval is how often superseded generations are reclaimed. It
 // is far shorter than the compaction cycle because it bounds the disk a
 // released generation holds after its writer has finished with it, and the
 // scan it runs is cheap next to a compaction pass.
 const retainedSweepInterval = 15 * time.Second
+
+// releaseStamp reports when a retained generation was released, or zero if no
+// publisher has released it.
+func (store *Store) releaseStamp(retained []byte) (int64, error) {
+	var at int64
+	err := store.index.View(func(txn *badger.Txn) error {
+		raw, err := readRaw(txn, releasedKeyFor(retained))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		at, err = decodeReleasedAt(raw)
+
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("read release: %w", err)
+	}
+
+	return at, nil
+}
 
 // sweepRetained reclaims generations that a commit superseded and nothing has
 // asked for since. It is the only thing that decides a generation is dead —
@@ -339,7 +338,7 @@ func (store *Store) sweepRetained(maxAge time.Duration) (int, error) {
 	// generations arrive contiguously and oldest first.
 	flush := func() {
 		for _, r := range group {
-			if released, ok := releasedAt(r.at); ok && released < cutoff {
+			if r.at < cutoff {
 				stale = append(stale, r.key)
 			}
 		}
@@ -352,11 +351,15 @@ func (store *Store) sweepRetained(maxAge time.Duration) (int, error) {
 		if len(k) != retainedKeySize || len(v) != preparedValueSize {
 			return nil
 		}
-		at, err := decodePreparedAt(v)
-		if err != nil {
-			return fmt.Errorf("decode retained row: %w", err)
-		}
 		key := append([]byte(nil), k...)
+		at, err := store.releaseStamp(key)
+		if err != nil {
+			return err
+		}
+		if at == 0 {
+			// Not released: nothing has reported a record displacing it.
+			return nil
+		}
 		if len(group) > 0 && !bytes.Equal(group[0].key[:retainedKeySize-8], key[:retainedKeySize-8]) {
 			flush()
 		}

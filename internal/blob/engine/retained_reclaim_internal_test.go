@@ -5,8 +5,6 @@ import (
 	"io"
 	"testing"
 	"time"
-
-	"github.com/dgraph-io/badger/v4"
 )
 
 // A generation is dead when a publisher says its record no longer names it,
@@ -114,12 +112,32 @@ func TestAnOvertakenWriterKeepsTheGenerationItsRecordWillName(t *testing.T) {
 	}
 }
 
-// retainedStamps collects the timestamp field of every retained row of one
-// shard position, which is what both upgrade and rollback turn on.
-func retainedStamps(t *testing.T, st *Store, oh [32]byte, idx uint32) []int64 {
+// reopen closes the store and opens the same directory again, which is what
+// an upgrade or a rollback does to the rows already on disk.
+func reopen(t *testing.T, st *Store, dir string) *Store {
 	t.Helper()
-	var stamps []int64
-	if err := st.indexScan(retainedScan(MakeKey(oh, idx)), func(k, v []byte) error {
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	next, err := Open(dir, WithFreeSpaceWatermark(0, 0), WithAEAD(testAEAD(t)))
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	t.Cleanup(func() { _ = next.Close() })
+
+	return next
+}
+
+// sweepRetainedByAge is the sweep an earlier release runs: it reclaims a
+// retained generation whenever the stamp its commit wrote predates the cutoff,
+// and knows nothing about a release. Running it against rows this engine wrote
+// is what a rollback does to them.
+func sweepRetainedByAge(t *testing.T, st *Store, maxAge time.Duration) {
+	t.Helper()
+	cutoff := time.Now().Add(-maxAge).UnixNano()
+
+	var stale [][]byte
+	if err := st.indexScan([]byte{retainedPrefix}, func(k, v []byte) error {
 		if len(k) != retainedKeySize || len(v) != preparedValueSize {
 			return nil
 		}
@@ -127,74 +145,94 @@ func retainedStamps(t *testing.T, st *Store, oh [32]byte, idx uint32) []int64 {
 		if err != nil {
 			return err
 		}
-		stamps = append(stamps, at)
+		if at < cutoff {
+			stale = append(stale, append([]byte(nil), k...))
+		}
+
 		return nil
 	}); err != nil {
 		t.Fatalf("scan retained: %v", err)
 	}
-	return stamps
+	for _, k := range stale {
+		if err := st.dropGeneration(k, func(uint64) bool { return true }); err != nil {
+			t.Fatalf("drop: %v", err)
+		}
+	}
 }
 
-// A row written before this change carries the time its commit demoted the
-// generation, which cannot be told apart from the time a publisher released
-// one. Reclaiming it on that stamp destroys whatever the placement record
-// still names, so an upgrade has to hold it.
-func TestALegacyRetainedRowIsHeld(t *testing.T) {
-	st, _ := openTestStore(t)
+// An acknowledged object whose generation was demoted by an orphaned commit
+// before the upgrade survives it. Rows written by an earlier release carry the
+// time their commit demoted them and no release, and a release is the only
+// thing that makes a generation reclaimable.
+func TestAnAcknowledgedObjectSurvivesTheUpgrade(t *testing.T) {
+	st, dir := openTestStore(t)
 	oh := [32]byte{0x54}
+	body := []byte("written before the upgrade and never released")
 
-	epochs, _, _ := raceWriters(t, st, oh, 2)
-	legacy := epochs[0]
-
-	// Restamp the retained row the way the previous release wrote it.
-	rowKey := retainedKey(MakeKey(oh, 0), legacy)
-	if err := st.index.Update(func(txn *badger.Txn) error {
-		raw, err := readRaw(txn, rowKey)
-		if err != nil {
-			return err
-		}
-		ext, held, err := decodeIndexValue(raw)
-		if err != nil {
-			return err
-		}
-		return txn.Set(rowKey, encodePreparedValue(ext, held, time.Now().UnixNano()))
-	}); err != nil {
-		t.Fatalf("write legacy row: %v", err)
+	// The state an earlier release leaves on disk: a generation a placement
+	// record still names, demoted by a commit that never published.
+	named := prepareValue(t, st, oh, 0, body)
+	if _, err := st.Commit(oh, 0, named); err != nil {
+		t.Fatalf("commit the named generation: %v", err)
 	}
+	orphan := prepareValue(t, st, oh, 0, []byte("a commit that never published"))
+	if _, err := st.Commit(oh, 0, orphan); err != nil {
+		t.Fatalf("commit the orphan generation: %v", err)
+	}
+
+	st = reopen(t, st, dir)
 
 	if _, err := st.sweepRetained(-1); err != nil {
 		t.Fatalf("sweep: %v", err)
 	}
 
-	r, err := st.LookupAt(oh, 0, legacy)
+	r, err := st.LookupAt(oh, 0, named)
 	if err != nil {
-		t.Fatalf("a generation retained before the upgrade was reclaimed on its commit stamp: %v", err)
+		t.Fatalf("the upgrade reclaimed a generation the record still names: %v", err)
 	}
-	if err := r.Close(); err != nil {
-		t.Fatalf("close: %v", err)
+	got, err := io.ReadAll(r)
+	if closeErr := r.Close(); closeErr != nil {
+		t.Fatalf("close: %v", closeErr)
+	}
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatalf("the object read back as another generation's body")
 	}
 }
 
-// Rolling back reinstates a sweep that reclaims a retained row whenever its
-// stamp is older than the cutoff. A held generation must never satisfy that,
-// or the rollback destroys acknowledged data within one sweep interval.
-func TestAnOlderSweeperDoesNotReclaimAHeldGeneration(t *testing.T) {
-	st, _ := openTestStore(t)
+// Rolling back reinstates a sweep that knows nothing about a release row and
+// reclaims on the retained row's own stamp. That row is unchanged by this
+// engine, so a rollback is the earlier release's behaviour and not a new
+// hazard: an orphaned commit is reclaimed exactly as it was before, and a
+// release this engine recorded reclaims nothing on its own.
+func TestARollbackSeesTheRowsItWrote(t *testing.T) {
+	st, dir := openTestStore(t)
 	oh := [32]byte{0x55}
 
-	// Two writers leave one generation demoted, and nobody has released it.
-	raceWriters(t, st, oh, 2)
-
-	stamps := retainedStamps(t, st, oh, 0)
-	if len(stamps) != 1 {
-		t.Fatalf("expected one retained generation, got %d", len(stamps))
+	epochs, _, _ := raceWriters(t, st, oh, 2)
+	if err := st.ReleaseGeneration(oh, 0, epochs[0]); err != nil {
+		t.Fatalf("release: %v", err)
 	}
 
-	// The predicate the previous release sweeps with, at its own default age.
-	cutoff := time.Now().Add(-retainedMaxAge).UnixNano()
-	if stamps[0] < cutoff {
-		t.Fatalf("a held generation reads as %d, older than an earlier release's cutoff %d, so a rollback reclaims it",
-			stamps[0], cutoff)
+	st = reopen(t, st, dir)
+
+	// An earlier release reclaims the demoted generation on its commit stamp.
+	sweepRetainedByAge(t, st, -1)
+	if r, err := st.LookupAt(oh, 0, epochs[0]); err == nil {
+		_ = r.Close()
+		t.Fatalf("the earlier sweep did not reclaim a generation past its cutoff")
+	}
+
+	// And the live generation is untouched by it, which is the property that
+	// makes the rollback safe rather than merely unchanged.
+	r, err := st.LookupAt(oh, 0, epochs[1])
+	if err != nil {
+		t.Fatalf("the earlier sweep took the live generation: %v", err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 }
 
