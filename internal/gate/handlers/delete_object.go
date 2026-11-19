@@ -20,16 +20,20 @@ import (
 // rows, can build the same scan prefix without duplicating it.
 const DeletedObjectPrefix = "deleted:"
 
-// deletedObjectKey names one deleted shard set's tombstone.
+// DeletedObjectKey names one deleted shard set's tombstone. Exported so the
+// reclaim worker's tests can build a row the way a delete writes one.
 //
-// The object hash ends the key because every version of a key is its own shard
-// set under its own hash: without it, emptying a versioned bucket overwrites
-// one version's record with the next and loses the first's shards. It is a
-// fixed-width hex suffix, so two rows collide only when they name the same
-// shard set. Nothing parses this key — the reclaim worker reads the row's
-// value — so the prefix stays the one it already scans.
-func deletedObjectKey(bucket, key string, objectHash [32]byte) string {
-	return DeletedObjectPrefix + bucket + "/" + key + "#" + hex.EncodeToString(objectHash[:])
+// The object hash is in the key because every version of a key is its own
+// shard set under its own hash: without it, emptying a versioned bucket
+// overwrites one version's record with the next and loses the first's shards.
+//
+// It leads rather than trails, behind a byte a bucket name may not contain, so
+// no row can collide with one written in the older layout for an object key
+// that happens to end in a hash. Nothing parses this key — the reclaim worker
+// reads the row's value — so the prefix stays the one it already scans and one
+// pass still reads both layouts.
+func DeletedObjectKey(bucket, key string, objectHash [32]byte) string {
+	return DeletedObjectPrefix + "#" + hex.EncodeToString(objectHash[:]) + "/" + bucket + "/" + key
 }
 
 // DeletedObjectInfo names the shards a failed fan-out left behind, so the
@@ -144,7 +148,7 @@ func deleteStoredVersion(ctx context.Context, mc MetaClient, bc BlobClient, buck
 		if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err != nil {
 			return model.NewS3Error(model.ErrInternalError, fmt.Sprintf("encode tombstone: %v", err), 500)
 		}
-		if err := metaPut(ctx, mc, model.TableObjects, deletedObjectKey(bucket, key, objectHash), deletedBuf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableObjects, DeletedObjectKey(bucket, key, objectHash), deletedBuf.Bytes()); err != nil {
 			return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 		}
 	}

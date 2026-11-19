@@ -303,6 +303,28 @@ func TestExpectedBucketOwnerDeniesAConfigBucket(t *testing.T) {
 	assert.Equal(t, string(model.ErrAccessDenied), decodeS3Error(t, w).Code)
 }
 
+// A tenant bucket deleted through another gate is gone, not forbidden. This
+// gate's cache still holds the entry it created, and answering AccessDenied
+// there would turn an already-deleted bucket into a permanent refusal for a
+// caller retrying with the owner it had.
+func TestExpectedBucketOwnerReportsADeletedTenantBucketAsMissing(t *testing.T) {
+	t.Parallel()
+
+	f := newWriteFixture(4, 2)
+	cache := NewBucketCache(nil)
+
+	// Created here, so the cache knows it, then removed from global state the
+	// way a delete served by another gate leaves it.
+	cache.add(ownedBucket, "ap-southeast-2", ownerAccount, false)
+
+	w := httptest.NewRecorder()
+	DeleteBucket(f.mc, cache).ServeHTTP(w,
+		ownerRequest(http.MethodDelete, "/"+ownedBucket, ownedBucket, ownerAccount))
+
+	require.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, string(model.ErrNoSuchBucket), decodeS3Error(t, w).Code)
+}
+
 // An owner that cannot be read is not an owner that matches. This guards a
 // destructive call, so an unreadable bucket record fails the request closed
 // rather than letting the delete through on an unproven precondition.

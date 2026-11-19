@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"encoding/hex"
 	"strings"
 	"testing"
 
@@ -134,22 +135,27 @@ func TestLegacyReclaimRecordIsStillFound(t *testing.T) {
 	assert.Equal(t, uint64(7), info.WriteEpoch)
 }
 
+// writeLegacyRecord stores a reclaim record in the layout used before the
+// object hash was in the key.
+func writeLegacyRecord(t *testing.T, mc MetaClient, bucket, key string) {
+	t.Helper()
+	var buf bytes.Buffer
+	require.NoError(t, gob.NewEncoder(&buf).Encode(DeletedObjectInfo{
+		Bucket: bucket, Key: key, ObjectHash: model.ObjectHash(bucket, key),
+		DeletedAt: 1, WriteEpoch: 7, DataShardNodes: []config.NodeID{1, 2},
+	}))
+	require.NoError(t, metaPut(context.Background(), mc, model.TableObjects,
+		DeletedObjectPrefix+bucket+"/"+key, buf.Bytes()))
+}
+
 // Writing a version's record must not overwrite a legacy record for the same
-// key, which is the collision the two shapes coexisting has to survive.
+// key, which is the collision the two layouts coexisting has to survive.
 func TestVersionRecordDoesNotOverwriteALegacyOne(t *testing.T) {
 	t.Parallel()
 
 	const key = "a.txt"
 	f := newWriteFixture(4, 2)
-	legacyHash := model.ObjectHash(deleteTestBucket, key)
-
-	var buf bytes.Buffer
-	require.NoError(t, gob.NewEncoder(&buf).Encode(DeletedObjectInfo{
-		Bucket: deleteTestBucket, Key: key, ObjectHash: legacyHash,
-		DeletedAt: 1, WriteEpoch: 7, DataShardNodes: []config.NodeID{1, 2},
-	}))
-	require.NoError(t, metaPut(context.Background(), f.mc, model.TableObjects,
-		DeletedObjectPrefix+deleteTestBucket+"/"+key, buf.Bytes()))
+	writeLegacyRecord(t, f.mc, deleteTestBucket, key)
 
 	versionHash := seedVersion(t, f, deleteTestBucket, key, "V1", []byte("body"))
 	require.NoError(t, deleteStoredVersion(context.Background(), f.mc,
@@ -157,4 +163,33 @@ func TestVersionRecordDoesNotOverwriteALegacyOne(t *testing.T) {
 
 	found := tombstones(t, f.mc)
 	require.Len(t, found, 2, "the version's record replaced the legacy one: %v", found)
+}
+
+// The other half of the collision, and the one that nearly shipped: a legacy
+// record for an object key that itself ends in a hash must not be reachable by
+// a new record for the key that hash belongs to.
+//
+// Laying the key out as bucket/key#hash made these two the same row, so the
+// new write destroyed the only record of the legacy object's shards.
+func TestVersionRecordDoesNotOverwriteALegacyRecordOfAHashSuffixedKey(t *testing.T) {
+	t.Parallel()
+
+	const key = "a.txt"
+	f := newWriteFixture(4, 2)
+	versionHash := seedVersion(t, f, deleteTestBucket, key, "V1", []byte("body"))
+
+	// An object whose own key ends in the hash the new record would append.
+	collidingKey := key + "#" + hex.EncodeToString(versionHash[:])
+	writeLegacyRecord(t, f.mc, deleteTestBucket, collidingKey)
+
+	require.NoError(t, deleteStoredVersion(context.Background(), f.mc,
+		&failingBlob{fakeBlob: f.bc}, deleteTestBucket, key, versionHash))
+
+	found := tombstones(t, f.mc)
+	require.Len(t, found, 2, "a legacy record was overwritten: %v", found)
+
+	legacy, ok := found[DeletedObjectPrefix+deleteTestBucket+"/"+collidingKey]
+	require.True(t, ok, "the legacy record for %q is gone: %v", collidingKey, found)
+	assert.Equal(t, collidingKey, legacy.Key)
+	assert.Equal(t, model.ObjectHash(deleteTestBucket, collidingKey), legacy.ObjectHash)
 }

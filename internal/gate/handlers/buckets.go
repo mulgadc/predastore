@@ -218,7 +218,12 @@ func requireExpectedBucketOwner(ctx context.Context, mc MetaClient, cache *Bucke
 		// expected owner can match one. Refusing is the safe direction, and
 		// nothing addresses a platform bucket with this header: an owner-scoped
 		// listing never returns one.
-		if _, declared := cache.find(bucket); declared {
+		//
+		// Only the declared set counts. The cache also holds buckets created at
+		// runtime, and a delete removes the entry on the serving gate alone, so
+		// find would answer AccessDenied on another gate for a tenant bucket
+		// that is simply gone.
+		if cache.isDeclared(bucket) {
 			return model.ErrAccessDeniedError.WithResource(bucket)
 		}
 		return model.ErrNoSuchBucketError.WithResource(bucket)
@@ -232,8 +237,10 @@ func requireExpectedBucketOwner(ctx context.Context, mc MetaClient, cache *Bucke
 	}
 
 	if metadata.AccountID != want {
+		// The supplied value is not logged. A caller controls it, and a header
+		// filled in by mistake can carry a credential.
 		slog.WarnContext(ctx, "Expected bucket owner did not match",
-			"bucket", bucket, "expectedAccountID", want, "bucketAccountID", metadata.AccountID)
+			"bucket", bucket, "bucketAccountID", metadata.AccountID)
 		return model.ErrAccessDeniedError.WithResource(bucket)
 	}
 	return nil

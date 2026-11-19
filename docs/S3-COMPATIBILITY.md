@@ -39,6 +39,7 @@ The 172 fails are operations predastore attempts and gets wrong, or refuses: con
 | Object tagging | **Refused** | `PutObjectTagging`, `GetObjectTagging` and `DeleteObjectTagging` answer `NotImplemented`, and `x-amz-tagging` on `PutObject` is not applied. Bucket tagging is served. |
 | Object ACLs | **Refused** | `GetObjectAcl` and `PutObjectAcl` answer `NotImplemented`. |
 | `POST` object | **Missing** | Browser-form uploads. All 36 cases are a deliberate skip below rather than a FAIL. |
+| `x-amz-expected-bucket-owner` | **Partly served** | Applied on `DeleteObject`, `DeleteObjects`, `DeleteBucket`, `AbortMultipartUpload`, `ListObjects` (v1 and v2) and `ListObjectVersions`: a value that is not the bucket's account id answers `403 AccessDenied`, and an absent header asserts nothing. Every other operation ignores the header rather than refusing it, so a client cannot rely on it outside that list. A config-declared bucket records no owner, so any expected owner is refused for one. |
 
 ### How an unserved sub-resource answers
 

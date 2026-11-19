@@ -6,8 +6,12 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/xml"
+	"flag"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"testing"
 	"time"
@@ -250,6 +254,11 @@ func TestVersionedBucketEmptiesByVersionOverHTTP(t *testing.T) {
 	status, body = a.send(http.MethodGet, "/"+bucket+"?versions", accountA, nil)
 	require.Equal(t, http.StatusOK, status, "%s", body)
 
+	// Pin the bytes, not only the decode. The spinifex reaper reads this
+	// response through the aws-sdk-go v1 decoder, and its test is fed from this
+	// same fixture, so a drift here shows up as a diff rather than silently.
+	pinVersionsFixture(t, body)
+
 	var listed versionsResult
 	require.NoError(t, xml.Unmarshal(body, &listed), "body: %s", body)
 	require.Len(t, listed.Versions, 1, "body: %s", body)
@@ -267,3 +276,42 @@ func TestVersionedBucketEmptiesByVersionOverHTTP(t *testing.T) {
 	status, body = a.send(http.MethodDelete, "/"+bucket, accountA, nil)
 	require.Equal(t, http.StatusNoContent, status, "DeleteBucket after emptying: %s", body)
 }
+
+// versionsFixturePath holds the ListObjectVersions body a teardown reads. The
+// spinifex reaper decodes this response with aws-sdk-go v1, and its decoder
+// test is fed from a copy of this file.
+const versionsFixturePath = "testdata/list_object_versions.xml"
+
+// pinVersionsFixture compares the served body against the committed fixture,
+// with the ids and timestamps that change per run normalised away. Run with
+// -update to rewrite it.
+func pinVersionsFixture(t *testing.T, body []byte) {
+	t.Helper()
+	normalised := normaliseVersionsBody(body)
+
+	if *updateFixtures {
+		require.NoError(t, os.MkdirAll(filepath.Dir(versionsFixturePath), 0o750))
+		require.NoError(t, os.WriteFile(versionsFixturePath, normalised, 0o600))
+		return
+	}
+
+	want, err := os.ReadFile(versionsFixturePath)
+	require.NoError(t, err, "the fixture is missing; regenerate it with -update")
+	require.Equal(t, string(want), string(normalised),
+		"the ListObjectVersions body changed; the spinifex decoder test reads a copy of this")
+}
+
+// normaliseVersionsBody replaces the parts of the body that differ per run.
+// The element order, names and nesting are what the decoder depends on, and
+// those are what stay.
+func normaliseVersionsBody(body []byte) []byte {
+	out := versionIDPattern.ReplaceAll(body, []byte("<VersionId>VERSIONID</VersionId>"))
+	out = lastModifiedPattern.ReplaceAll(out, []byte("<LastModified>TIMESTAMP</LastModified>"))
+	return append(out, '\n')
+}
+
+var (
+	updateFixtures      = flag.Bool("update", false, "rewrite the committed response fixtures")
+	versionIDPattern    = regexp.MustCompile(`<VersionId>[^<]*</VersionId>`)
+	lastModifiedPattern = regexp.MustCompile(`<LastModified>[^<]*</LastModified>`)
+)

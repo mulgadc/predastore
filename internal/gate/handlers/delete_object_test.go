@@ -54,7 +54,7 @@ var _ BlobClient = (*failingBlob)(nil)
 // unversioned delete removes the shard set under the plain object hash, which
 // is what ends the key.
 func tombstoneKey(bucket, key string) string {
-	return deletedObjectKey(bucket, key, model.ObjectHash(bucket, key))
+	return DeletedObjectKey(bucket, key, model.ObjectHash(bucket, key))
 }
 
 // decodeTombstone reads and gob-decodes the tombstone a delete left.
