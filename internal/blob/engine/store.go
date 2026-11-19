@@ -670,7 +670,7 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 			// so a record naming this generation can land after the newer one
 			// has already taken the position, and it has to resolve.
 			case liveErr == nil && liveEpoch > epoch:
-				if err := txn.Set(retainedKey(idxKey, epoch), encodePreparedValue(ext, epoch, time.Now().UnixNano())); err != nil {
+				if err := txn.Set(retainedKey(idxKey, epoch), encodePreparedValue(ext, epoch, generationHeld)); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
 				}
 				return txn.Delete(prepKey)
@@ -679,7 +679,7 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 			// answerable until the sweep decides otherwise. Riding the same txn
 			// is what stops the row existing in both places or in neither.
 			case liveErr == nil:
-				if err := txn.Set(retainedKey(idxKey, liveEpoch), encodePreparedValue(old, liveEpoch, time.Now().UnixNano())); err != nil {
+				if err := txn.Set(retainedKey(idxKey, liveEpoch), encodePreparedValue(old, liveEpoch, generationHeld)); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
 				}
 			}
@@ -858,7 +858,7 @@ func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) 
 				return nil
 			}
 
-			return txn.Set(rowKey, encodePreparedValue(ext, epoch, 0))
+			return txn.Set(rowKey, encodePreparedValue(ext, epoch, time.Now().UnixNano()))
 		})
 		if errors.Is(err, badger.ErrConflict) {
 			continue

@@ -284,6 +284,12 @@ func (store *Store) sweepPrepared(maxAge time.Duration) (int, error) {
 // which is not this change.
 const retainedMaxAge = 5 * time.Minute
 
+// generationHeld is the timestamp a commit stamps on the generation it
+// demotes: no clock at all. Nothing but a publisher reporting its record
+// displaced that generation starts one, because nothing else knows whether a
+// record still names it.
+const generationHeld int64 = 0
+
 // retainedSweepInterval is how often superseded generations are reclaimed. It
 // is far shorter than the compaction cycle because it bounds the disk a
 // released generation holds after its writer has finished with it, and the
@@ -294,12 +300,12 @@ const retainedSweepInterval = 15 * time.Second
 // asked for since. It is the only thing that decides a generation is dead —
 // commit demotes, and never destroys.
 //
-// Age is the only bound, because age is the only thing that bounds who can
-// still name a generation. A count bound ranked them by epoch, which is write
-// *start* order, while the record that survives is the one whose write
-// finished last. Those are different writes whenever PUTs overlap, so the cap
-// evicted generations the metadata still pointed at, and the object read back
-// as a 500 having acknowledged every writer.
+// A release is what makes a generation reclaimable, and age only bounds how
+// long a reader that already resolved it keeps answering. Age alone cannot
+// decide: a writer that commits and dies before publishing starts no clock,
+// leaves the record naming the generation its commit demoted, and the write
+// path has no deadline that bounds when it could still publish. Reclaiming on
+// age destroyed objects every writer had been acknowledged for.
 func (store *Store) sweepRetained(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge).UnixNano()
 
@@ -315,7 +321,7 @@ func (store *Store) sweepRetained(maxAge time.Duration) (int, error) {
 	// generations arrive contiguously and oldest first.
 	flush := func() {
 		for _, r := range group {
-			if r.at < cutoff {
+			if r.at != generationHeld && r.at < cutoff {
 				stale = append(stale, r.key)
 			}
 		}
