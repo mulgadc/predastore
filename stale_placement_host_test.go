@@ -207,10 +207,9 @@ func TestS7_AnOrphanedCommitDoesNotDestroyAnAcknowledgedObject(t *testing.T) {
 }
 
 // Holding a generation until it is released must not stop an ordinary
-// overwrite from replacing it. A PUT that publishes releases the generation it
-// displaced, and the sweep then reclaims it: the readback is what says both
-// halves ran, since a release that never happened leaves the old body
-// answerable and one that happened too early takes the new one with it.
+// overwrite from replacing it. This covers publication and readback over S3:
+// a release that fired too early takes the new generation with it. Whether the
+// displaced one is reclaimed is asserted in the engine tests.
 func TestAPublishedOverwriteReplacesTheGenerationItDisplaced(t *testing.T) {
 	c, _ := startStaleHost(t)
 
