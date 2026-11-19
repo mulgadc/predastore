@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"sync"
 	"time"
@@ -62,6 +63,7 @@ type Store struct {
 
 	compactionEnabled  bool
 	compactionInterval time.Duration
+	retainedMaxAge     time.Duration
 	compactor          *compactor
 
 	// Free-space watermark fractions gating Append; see WithFreeSpaceWatermark.
@@ -170,6 +172,18 @@ func WithCompaction(interval time.Duration) Option {
 	}
 }
 
+// WithRetainedMaxAge overrides how long a superseded generation stays
+// answerable. A non-positive duration keeps the default. It exists so a test
+// can reach the far side of the window without waiting out wall-clock time.
+func WithRetainedMaxAge(d time.Duration) Option {
+	return func(s *Store) error {
+		if d > 0 {
+			s.retainedMaxAge = d
+		}
+		return nil
+	}
+}
+
 // WithFreeSpaceWatermark overrides the free-space fractions that gate Append:
 // crossing below nearfullFreeFrac kicks an immediate compaction pass but
 // still accepts the write; crossing below fullFreeFrac rejects it with
@@ -213,6 +227,7 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		segCache:           make(map[uint64]*segment),
 		maxSegSize:         DefaultMaxSegSize,
 		compactionInterval: defaultCompactionInterval,
+		retainedMaxAge:     retainedMaxAge,
 		nearfullFreeFrac:   defaultNearfullFreeFrac,
 		fullFreeFrac:       defaultFullFreeFrac,
 	}
@@ -656,7 +671,7 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 			// so a record naming this generation can land after the newer one
 			// has already taken the position, and it has to resolve.
 			case liveErr == nil && liveEpoch > epoch:
-				if err := txn.Set(retainedKey(idxKey, epoch), encodePreparedValue(ext, epoch, time.Now().UnixNano())); err != nil {
+				if err := txn.Set(retainedKey(idxKey, epoch), encodePreparedValue(ext, epoch, retainedHoldStamp)); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
 				}
 				return txn.Delete(prepKey)
@@ -665,7 +680,7 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 			// answerable until the sweep decides otherwise. Riding the same txn
 			// is what stops the row existing in both places or in neither.
 			case liveErr == nil:
-				if err := txn.Set(retainedKey(idxKey, liveEpoch), encodePreparedValue(old, liveEpoch, time.Now().UnixNano())); err != nil {
+				if err := txn.Set(retainedKey(idxKey, liveEpoch), encodePreparedValue(old, liveEpoch, retainedHoldStamp)); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
 				}
 			}
@@ -727,6 +742,11 @@ func (store *Store) dropGeneration(rowKey []byte, want func(epoch uint64) bool) 
 			}
 			if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
 				return fmt.Errorf("put tombstone: %w", err)
+			}
+			// The release outlives nothing: it exists to make this row
+			// reclaimable, and rides the same txn so neither can be orphaned.
+			if err := txn.Delete(releasedKeyFor(rowKey)); err != nil {
+				return fmt.Errorf("delete release: %w", err)
 			}
 			return txn.Delete(rowKey)
 		})
@@ -810,13 +830,12 @@ func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
 // retained namespace, so it cannot touch the generation the node is serving
 // however stale the caller's idea of that is.
 //
-// It backdates the row rather than dropping it, and the sweep reclaims it on
-// its next pass. A reader that resolved the old record a moment ago is still
-// streaming shards from that generation, and taking the bytes out from under
-// it would turn a rare lost write into a routine failed read. The delay is
-// what keeps that reader whole; the marking is what stops retention growing
-// with everything written inside the age window rather than with the writes
-// actually in flight.
+// It records the release rather than dropping the generation, and the sweep
+// reclaims it once the grace window has passed. A reader that resolved the old
+// record a moment ago is still streaming shards from that generation, and
+// taking the bytes out from under it would turn a rare lost write into a
+// routine failed read. The delay is what keeps that reader whole; the release
+// is what makes the generation reclaimable at all.
 func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) error {
 	store.mutex.Lock()
 	closed := store.closed
@@ -836,7 +855,7 @@ func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) 
 			if err != nil {
 				return err
 			}
-			ext, held, err := decodeIndexValue(raw)
+			_, held, err := decodeIndexValue(raw)
 			if err != nil {
 				return fmt.Errorf("decode retained row: %w", err)
 			}
@@ -844,7 +863,7 @@ func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) 
 				return nil
 			}
 
-			return txn.Set(rowKey, encodePreparedValue(ext, epoch, 0))
+			return txn.Set(releasedKeyFor(rowKey), encodeReleasedValue(time.Now().UnixNano()))
 		})
 		if errors.Is(err, badger.ErrConflict) {
 			continue
@@ -1037,6 +1056,55 @@ func retainedScan(idxKey []byte) []byte {
 	key := make([]byte, 0, retainedKeySize-8)
 
 	return append(append(key, retainedPrefix), idxKey...)
+}
+
+// A release lives at R ‖ MakeKey(...) ‖ BE(epoch) and records that a publisher
+// reported its placement record displaced that generation. It is what makes
+// the generation reclaimable, and the only thing that does.
+//
+// It is a row of its own rather than a mark on the retained row because the
+// retained row's stamp is the time its commit demoted the generation, and a
+// release time written into that field is indistinguishable from one. A
+// separate key needs no such inference: a generation with no release row has
+// not been released, whichever version of this engine wrote it.
+//
+// Nothing before this change scans the prefix, so an older engine reading the
+// same store sees only the retained rows it already understands.
+const releasedPrefix = 'R'
+
+// retainedHoldStamp goes in the retained row's stamp field, which nothing in
+// this engine reads: the release namespace above is the only thing a sweep
+// consults. An engine from before that namespace existed reclaims on this
+// field, and never finds this value old enough.
+const retainedHoldStamp = math.MaxInt64
+
+const (
+	releasedKeySize   = 45
+	releasedValueSize = 8
+)
+
+// releasedKeyFor maps a retained row's key onto its release, which differ only
+// in their prefix byte.
+func releasedKeyFor(retained []byte) []byte {
+	key := append([]byte(nil), retained...)
+	key[0] = releasedPrefix
+
+	return key
+}
+
+func encodeReleasedValue(at int64) []byte {
+	buf := make([]byte, releasedValueSize)
+	binary.BigEndian.PutUint64(buf, uint64(at)) //nolint:gosec // round-trips bit-for-bit via int64 cast on decode.
+
+	return buf
+}
+
+func decodeReleasedAt(buf []byte) (int64, error) {
+	if len(buf) != releasedValueSize {
+		return 0, fmt.Errorf("invalid released value length %d, want %d", len(buf), releasedValueSize)
+	}
+
+	return int64(binary.BigEndian.Uint64(buf)), nil //nolint:gosec // round-trips bit-for-bit from encode.
 }
 
 // MakeKey builds a 36-byte index key: the 32-byte key || 4-byte big-endian index.

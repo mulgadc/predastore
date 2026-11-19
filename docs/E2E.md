@@ -22,8 +22,9 @@ unrelated, and passing this gate does not put anything on a server.
 
 ## What a default run does
 
-Thirteen scenarios in order, then a Warp load test. A default run is about **35
-minutes** and asserts **180** things.
+Fifteen scenarios in order, then a Warp load test. A default run is about **43
+minutes** and asserts about **470** things, more on a fast runner where extra
+reclaim sweeps fit in the dwell.
 
 | Scenario | Asserts | What it does |
 |---|---|---|
@@ -36,6 +37,7 @@ minutes** and asserts **180** things.
 | `last-modified` | 10 | Timestamp semantics across overwrite |
 | `large-object` | 10 | 2 GiB and 4 GiB objects, with an RSS sampler — a size with no disk is **skipped loudly** |
 | `concurrent-put` | 24 | 6 writers race one key, 8 keys × 3 rounds, on a healthy cluster |
+| `retained-reclaim` | 290 to 390 | Seeds 24 keys with a body no writer uses, races 6 writers across every gate on each, then reads all 24 for 7 minutes with nothing writing. Asserts each key took at least two acknowledged overwrites and no longer answers the seed, so a generation really was demoted under it, then that no key stops answering or changes body once the writers stop. The count varies with how many sweeps fit in the dwell |
 | `torn-overwrite` | 5 | Overwrites with the host holding one named shard stopped; asserts the failed write left the object exactly as it was |
 | `stale-shard` | 48 | Overwrites with a host frozen, asserts no read ever splices generations |
 | `freeze` | 6 | Warp GET load while a host is SIGSTOPped; survivors keep serving, frozen host rejoins raft and takes writes |
@@ -150,6 +152,7 @@ Results land in `scripts/bench/results/e2e-stress/<UTC-stamp>-<short-sha>/`:
 | `events.txt` | Timeline alone |
 | `logs/` | Every node's log |
 | `concurrent-put/` | Per-key `.race` files — what each writer was told |
+| `retained-reclaim/` | Per-key `.race` files and the read errors from the dwell |
 | `get-latency.txt` | Warp throughput and percentiles |
 | `*.json` | Objects preserved from a failing assertion |
 

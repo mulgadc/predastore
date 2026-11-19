@@ -158,16 +158,19 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500))
 			return
 		}
+		// Shards before the record, as PutObject does. The other order let a
+		// swap this writer could not account for abort the prepared shards the
+		// record may already name.
+		commitShards(ctx, bc, objectHash, place, written)
+
 		previous, err := metaSwap(ctx, mc, model.TableObjects, string(objectHash[:]), shardRecord)
 		if err != nil {
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
-			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, "Failed to store object metadata", 500))
 			return
 		}
-		commitShards(ctx, bc, objectHash, place, written)
 		if !target.versioned {
-			releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch)
+			releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch, handoffNode(ring, cfg, objectHash))
 		}
 
 		if err := indexWrite(ctx, mc, bucket, key, target, place); err != nil {

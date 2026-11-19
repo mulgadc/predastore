@@ -218,8 +218,15 @@ func (r Reaper) IsEnabled() bool { return r.Enabled == nil || *r.Enabled }
 // Compaction tunes the shard store's background compactor. A zero interval
 // falls back to the store's default; compaction itself is never off, because
 // without it overwrite and delete churn never reclaims dead shards.
+//
+// RetainedMaxAgeSeconds is the grace a released generation keeps before it is
+// reclaimed, and it carries no toml tag on purpose: a value below the gate's
+// request deadline would take shards from under a GET that has already
+// resolved the placement record. An in-process test sets it to reach the far
+// side of the window without a sleep; an operator cannot.
 type Compaction struct {
-	IntervalSeconds int `toml:"interval_seconds"`
+	IntervalSeconds       int `toml:"interval_seconds"`
+	RetainedMaxAgeSeconds int `toml:"-"`
 }
 
 // Meta tunes the metadata plane's raft log retention. Every zero takes the

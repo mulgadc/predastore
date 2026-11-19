@@ -67,7 +67,7 @@ func (c *compactor) loop() {
 		case <-c.done:
 			return
 		case <-retained.C:
-			released, err := c.store.sweepRetained(retainedMaxAge)
+			released, err := c.store.sweepRetained(c.store.retainedMaxAge)
 			if err != nil {
 				slog.Error("retained sweep failed", "error", err)
 			} else if released > 0 {
@@ -132,7 +132,7 @@ func (store *Store) compactOnce() error {
 
 	// Likewise for superseded generations: a commit demotes rather than
 	// tombstones, so this is where that space comes back.
-	released, err := store.sweepRetained(retainedMaxAge)
+	released, err := store.sweepRetained(store.retainedMaxAge)
 	if err != nil {
 		return fmt.Errorf("sweep retained generations: %w", err)
 	}
@@ -290,16 +290,39 @@ const retainedMaxAge = 5 * time.Minute
 // scan it runs is cheap next to a compaction pass.
 const retainedSweepInterval = 15 * time.Second
 
+// releaseStamp reports when a retained generation was released, or zero if no
+// publisher has released it.
+func (store *Store) releaseStamp(retained []byte) (int64, error) {
+	var at int64
+	err := store.index.View(func(txn *badger.Txn) error {
+		raw, err := readRaw(txn, releasedKeyFor(retained))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		at, err = decodeReleasedAt(raw)
+
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("read release: %w", err)
+	}
+
+	return at, nil
+}
+
 // sweepRetained reclaims generations that a commit superseded and nothing has
 // asked for since. It is the only thing that decides a generation is dead —
 // commit demotes, and never destroys.
 //
-// Age is the only bound, because age is the only thing that bounds who can
-// still name a generation. A count bound ranked them by epoch, which is write
-// *start* order, while the record that survives is the one whose write
-// finished last. Those are different writes whenever PUTs overlap, so the cap
-// evicted generations the metadata still pointed at, and the object read back
-// as a 500 having acknowledged every writer.
+// A release is what makes a generation reclaimable, and age only bounds how
+// long a reader that already resolved it keeps answering. Age alone cannot
+// decide: a writer that commits and dies before publishing starts no clock,
+// leaves the record naming the generation its commit demoted, and the write
+// path has no deadline that bounds when it could still publish. Reclaiming on
+// age destroyed objects every writer had been acknowledged for.
 func (store *Store) sweepRetained(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge).UnixNano()
 
@@ -328,11 +351,15 @@ func (store *Store) sweepRetained(maxAge time.Duration) (int, error) {
 		if len(k) != retainedKeySize || len(v) != preparedValueSize {
 			return nil
 		}
-		at, err := decodePreparedAt(v)
-		if err != nil {
-			return fmt.Errorf("decode retained row: %w", err)
-		}
 		key := append([]byte(nil), k...)
+		at, err := store.releaseStamp(key)
+		if err != nil {
+			return err
+		}
+		if at == 0 {
+			// Not released: nothing has reported a record displacing it.
+			return nil
+		}
 		if len(group) > 0 && !bytes.Equal(group[0].key[:retainedKeySize-8], key[:retainedKeySize-8]) {
 			flush()
 		}

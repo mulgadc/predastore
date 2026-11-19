@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,6 +35,8 @@ type nodeBlob struct {
 	committed map[nodeAddr]fakeShard
 	prepared  map[nodeAddr]fakeShard
 	down      map[config.NodeID]bool
+	retained  map[nodeAddr][]uint64
+	released  map[nodeAddr][]uint64
 
 	puts, deletes atomic.Int64
 }
@@ -43,6 +46,8 @@ func newNodeBlob(down ...config.NodeID) *nodeBlob {
 		committed: make(map[nodeAddr]fakeShard),
 		prepared:  make(map[nodeAddr]fakeShard),
 		down:      make(map[config.NodeID]bool),
+		retained:  make(map[nodeAddr][]uint64),
+		released:  make(map[nodeAddr][]uint64),
 	}
 	for _, n := range down {
 		b.down[n] = true
@@ -84,6 +89,11 @@ func (b *nodeBlob) Commit(_ context.Context, node config.NodeID, req blob.Commit
 		return false, blob.ErrNotPrepared
 	}
 	delete(b.prepared, addr)
+	// Commit demotes rather than destroys, as the engine does, so a release
+	// can only be honoured for a generation some commit has already retained.
+	if prev, ok := b.committed[addr]; ok && prev.epoch != shard.epoch {
+		b.retained[addr] = append(b.retained[addr], prev.epoch)
+	}
 	b.committed[addr] = shard
 
 	return false, nil
@@ -97,8 +107,27 @@ func (b *nodeBlob) Abort(_ context.Context, node config.NodeID, req blob.CommitR
 	return nil
 }
 
-func (b *nodeBlob) Release(_ context.Context, _ config.NodeID, _ blob.ReleaseRequest) error {
+func (b *nodeBlob) Release(_ context.Context, node config.NodeID, req blob.ReleaseRequest) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	addr := nodeAddr{node, req.Key, req.Index}
+	// A release for a generation this node never retained is a no-op on the
+	// engine, so it must not count as one here either.
+	if !slices.Contains(b.retained[addr], req.Epoch) {
+		return nil
+	}
+	b.released[addr] = append(b.released[addr], req.Epoch)
+
 	return nil
+}
+
+// releasedEpochs reports the epochs a node acted on a release for, which is
+// only ever a generation one of its commits retained.
+func (b *nodeBlob) releasedEpochs(node config.NodeID, key [32]byte, index uint32) []uint64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return append([]uint64(nil), b.released[nodeAddr{node, key, index}]...)
 }
 
 func (b *nodeBlob) Get(_ context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {

@@ -39,7 +39,7 @@ WRITE_BASELINE="${STRESS_WRITE_BASELINE:-}"
 ALL_SCENARIOS=(
     repair handoff
     node-rejoin node-resync node-rebuild
-    multipart-upload last-modified large-object concurrent-put
+    multipart-upload last-modified large-object concurrent-put retained-reclaim
     partial-put torn-overwrite stale-shard object-sizes freeze
 )
 

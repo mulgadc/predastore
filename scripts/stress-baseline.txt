@@ -9,6 +9,7 @@ PASS|multipart-upload
 PASS|last-modified
 PASS|large-object
 PASS|concurrent-put
+PASS|retained-reclaim
 PASS|partial-put
 PASS|torn-overwrite
 PASS|stale-shard
