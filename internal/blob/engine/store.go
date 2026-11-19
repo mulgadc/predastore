@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"sync"
 	"time"
@@ -670,7 +671,7 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 			// so a record naming this generation can land after the newer one
 			// has already taken the position, and it has to resolve.
 			case liveErr == nil && liveEpoch > epoch:
-				if err := txn.Set(retainedKey(idxKey, epoch), encodePreparedValue(ext, epoch, time.Now().UnixNano())); err != nil {
+				if err := txn.Set(retainedKey(idxKey, epoch), encodePreparedValue(ext, epoch, retainedHoldStamp)); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
 				}
 				return txn.Delete(prepKey)
@@ -679,7 +680,7 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 			// answerable until the sweep decides otherwise. Riding the same txn
 			// is what stops the row existing in both places or in neither.
 			case liveErr == nil:
-				if err := txn.Set(retainedKey(idxKey, liveEpoch), encodePreparedValue(old, liveEpoch, time.Now().UnixNano())); err != nil {
+				if err := txn.Set(retainedKey(idxKey, liveEpoch), encodePreparedValue(old, liveEpoch, retainedHoldStamp)); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
 				}
 			}
@@ -1070,6 +1071,12 @@ func retainedScan(idxKey []byte) []byte {
 // Nothing before this change scans the prefix, so an older engine reading the
 // same store sees only the retained rows it already understands.
 const releasedPrefix = 'R'
+
+// retainedHoldStamp goes in the retained row's stamp field, which nothing in
+// this engine reads: the release namespace above is the only thing a sweep
+// consults. An engine from before that namespace existed reclaims on this
+// field, and never finds this value old enough.
+const retainedHoldStamp = math.MaxInt64
 
 const (
 	releasedKeySize   = 45

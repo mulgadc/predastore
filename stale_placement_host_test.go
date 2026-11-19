@@ -205,3 +205,38 @@ func TestS7_AnOrphanedCommitDoesNotDestroyAnAcknowledgedObject(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 }
+
+// Holding a generation until it is released must not stop an ordinary
+// overwrite from replacing it. A PUT that publishes releases the generation it
+// displaced, and the sweep then reclaims it: the readback is what says both
+// halves ran, since a release that never happened leaves the old body
+// answerable and one that happened too early takes the new one with it.
+func TestAPublishedOverwriteReplacesTheGenerationItDisplaced(t *testing.T) {
+	c, _ := startStaleHost(t)
+
+	status, body := c.send(http.MethodPut, "/"+staleBucket, "", nil)
+	require.Equal(t, http.StatusOK, status, "CreateBucket: %s", body)
+
+	first := []byte("$ORIGIN spx3.net.\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n")
+	status, body, _ = c.sendTyped(http.MethodPut, "/"+staleBucket+"/"+staleObject, staleType, first)
+	require.Equal(t, http.StatusOK, status, "PutObject: %s", body)
+
+	second := []byte("$ORIGIN spx3.net.\n@ IN SOA ns1 hostmaster 2 7200 3600 1209600 3600\n")
+	status, body, putHeaders := c.sendTyped(http.MethodPut, "/"+staleBucket+"/"+staleObject, staleType, second)
+	require.Equal(t, http.StatusOK, status, "PutObject overwrite: %s", body)
+	etag := putHeaders.Get("ETag")
+	require.NotEmpty(t, etag, "the overwrite returned no ETag to compare against")
+
+	// Spans the retention window the release starts and many sweep intervals,
+	// so the reclaim of the displaced generation happens inside the loop.
+	deadline := time.Now().Add(3 * staleRetention)
+	for time.Now().Before(deadline) {
+		status, got, headers := c.sendTyped(http.MethodGet, "/"+staleBucket+"/"+staleObject, "", nil)
+		require.Equal(t, http.StatusOK, status, "GetObject after the overwrite: %s", got)
+		require.Equal(t, second, got, "the overwrite did not replace the generation it displaced")
+		require.Equal(t, etag, headers.Get("ETag"), "ETag changed after the overwrite")
+		require.Equal(t, staleType, headers.Get("Content-Type"), "Content-Type changed after the overwrite")
+
+		time.Sleep(200 * time.Millisecond)
+	}
+}

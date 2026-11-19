@@ -5,6 +5,8 @@ import (
 	"io"
 	"testing"
 	"time"
+
+	"github.com/dgraph-io/badger/v4"
 )
 
 // A generation is dead when a publisher says its record no longer names it,
@@ -160,6 +162,44 @@ func sweepRetainedByAge(t *testing.T, st *Store, maxAge time.Duration) {
 	}
 }
 
+// ageRetainedRows rewrites every retained row's stamp to at, which is the one
+// thing an earlier release wrote differently: the time its commit demoted the
+// generation. It is how a store left behind by that release is modelled.
+func ageRetainedRows(t *testing.T, st *Store, at int64) {
+	t.Helper()
+
+	type aged struct {
+		key []byte
+		val []byte
+	}
+	var rows []aged
+	if err := st.indexScan([]byte{retainedPrefix}, func(k, v []byte) error {
+		if len(k) != retainedKeySize || len(v) != preparedValueSize {
+			return nil
+		}
+		ext, epoch, err := decodeIndexValue(v)
+		if err != nil {
+			return err
+		}
+		rows = append(rows, aged{key: append([]byte(nil), k...), val: encodePreparedValue(ext, epoch, at)})
+
+		return nil
+	}); err != nil {
+		t.Fatalf("scan retained: %v", err)
+	}
+	if err := st.index.Update(func(txn *badger.Txn) error {
+		for _, r := range rows {
+			if err := txn.Set(r.key, r.val); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("age retained rows: %v", err)
+	}
+}
+
 // An acknowledged object whose generation was demoted by an orphaned commit
 // before the upgrade survives it. Rows written by an earlier release carry the
 // time their commit demoted them and no release, and a release is the only
@@ -180,6 +220,7 @@ func TestAnAcknowledgedObjectSurvivesTheUpgrade(t *testing.T) {
 		t.Fatalf("commit the orphan generation: %v", err)
 	}
 
+	ageRetainedRows(t, st, time.Now().Add(-time.Hour).UnixNano())
 	st = reopen(t, st, dir)
 
 	if _, err := st.sweepRetained(-1); err != nil {
@@ -203,30 +244,67 @@ func TestAnAcknowledgedObjectSurvivesTheUpgrade(t *testing.T) {
 }
 
 // Rolling back reinstates a sweep that knows nothing about a release row and
-// reclaims on the retained row's own stamp. That row is unchanged by this
-// engine, so a rollback is the earlier release's behaviour and not a new
-// hazard: an orphaned commit is reclaimed exactly as it was before, and a
-// release this engine recorded reclaims nothing on its own.
-func TestARollbackSeesTheRowsItWrote(t *testing.T) {
+// reclaims on the retained row's own stamp. A generation this engine demoted
+// carries a stamp that sweep never finds old enough, so the rollback cannot
+// take a generation a placement record still names. Holding it costs disk on a
+// rolled-back node, which is the direction to err in.
+func TestARollbackCannotReclaimWhatThisEngineDemoted(t *testing.T) {
 	st, dir := openTestStore(t)
 	oh := [32]byte{0x55}
 
-	epochs, _, _ := raceWriters(t, st, oh, 2)
+	epochs, bodies, _ := raceWriters(t, st, oh, 2)
+
+	// An orphaned commit: it demoted the generation the record names and died
+	// before publishing, so nothing released it.
+	st = reopen(t, st, dir)
+	sweepRetainedByAge(t, st, -1)
+
+	r, err := st.LookupAt(oh, 0, epochs[0])
+	if err != nil {
+		t.Fatalf("a rollback reclaimed a generation the record still names: %v", err)
+	}
+	got, err := io.ReadAll(r)
+	if closeErr := r.Close(); closeErr != nil {
+		t.Fatalf("close: %v", closeErr)
+	}
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(got, bodies[0]) {
+		t.Fatalf("the demoted generation read back as another generation's body")
+	}
+
+	// A release this engine recorded is invisible to that sweep, so the space
+	// stays held until the upgrade goes back on rather than being reclaimed
+	// without its grace window.
 	if err := st.ReleaseGeneration(oh, 0, epochs[0]); err != nil {
 		t.Fatalf("release: %v", err)
 	}
+	sweepRetainedByAge(t, st, -1)
+	if r, err := st.LookupAt(oh, 0, epochs[0]); err != nil {
+		t.Fatalf("a rollback reclaimed a released generation inside its grace window: %v", err)
+	} else if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
 
+// Rows an earlier release wrote are reclaimed by that release exactly as they
+// always were. Rolling back changes nothing about them, in either direction.
+func TestARollbackStillReclaimsTheRowsItWroteItself(t *testing.T) {
+	st, dir := openTestStore(t)
+	oh := [32]byte{0x56}
+
+	epochs, _, _ := raceWriters(t, st, oh, 2)
+	ageRetainedRows(t, st, time.Now().Add(-time.Hour).UnixNano())
 	st = reopen(t, st, dir)
 
-	// An earlier release reclaims the demoted generation on its commit stamp.
-	sweepRetainedByAge(t, st, -1)
+	sweepRetainedByAge(t, st, retainedMaxAge)
 	if r, err := st.LookupAt(oh, 0, epochs[0]); err == nil {
 		_ = r.Close()
-		t.Fatalf("the earlier sweep did not reclaim a generation past its cutoff")
+		t.Fatalf("the earlier sweep left a row of its own past its cutoff")
 	}
 
-	// And the live generation is untouched by it, which is the property that
-	// makes the rollback safe rather than merely unchanged.
+	// The live generation is untouched by it either way.
 	r, err := st.LookupAt(oh, 0, epochs[1])
 	if err != nil {
 		t.Fatalf("the earlier sweep took the live generation: %v", err)
