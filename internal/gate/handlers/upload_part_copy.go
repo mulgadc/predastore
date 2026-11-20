@@ -62,7 +62,14 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 			return
 		}
 
-		srcPlace, srcSize, err := loadPlacement(ctx, mc, ring, cfg, srcBucket, srcKey)
+		// The current version, as S3 resolves an unqualified source: on a
+		// versioned bucket that is neither the null version nor a hidden key.
+		srcTarget, err := resolveReadTarget(ctx, mc, cache, srcBucket, srcKey, "")
+		if err != nil {
+			handleVersionedReadErr(w, r, srcKey, srcTarget, err)
+			return
+		}
+		srcPlace, srcSize, err := loadPlacementByHash(ctx, mc, ring, cfg, srcTarget.hash)
 		if err != nil {
 			HandleError(w, r, placementReadError(ctx, srcBucket, srcKey, err))
 			return
@@ -83,8 +90,7 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 		}
 
 		stream, err := openCopyStream(ctx, bc, cfg,
-			model.ObjectHash(srcBucket, srcKey), srcPlace,
-			handoffNode(ring, cfg, model.ObjectHash(srcBucket, srcKey)),
+			srcTarget.hash, srcPlace, handoffNode(ring, cfg, srcTarget.hash),
 			srcSize, start, partSize)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))

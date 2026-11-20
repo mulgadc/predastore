@@ -52,13 +52,14 @@ const (
 
 // evalPreconditions applies S3's precedence: If-Match decides over
 // If-Unmodified-Since, and If-None-Match over If-Modified-Since. A record with
-// no ETag matches only "*", and one with no time skips the date conditions.
+// no ETag matches only "*", one with no time skips the date conditions, and a
+// malformed ETag list fails rather than being read as a non-match.
 func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModified bool, p preconditions) preconditionResult {
 	// Last-Modified is served to the second, so it is compared to the second.
 	modified = modified.Truncate(time.Second)
 
 	if p.ifMatch != "" {
-		if !etagListMatches(p.ifMatch, etag, hasETag) {
+		if matched, ok := etagListMatches(p.ifMatch, etag, hasETag); !ok || !matched {
 			return preconditionFailed
 		}
 	} else if since, err := http.ParseTime(p.ifUnmodifiedSince); err == nil && hasModified && modified.After(since) {
@@ -66,7 +67,11 @@ func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModifie
 	}
 
 	if p.ifNoneMatch != "" {
-		if etagListMatches(p.ifNoneMatch, etag, hasETag) {
+		matched, ok := etagListMatches(p.ifNoneMatch, etag, hasETag)
+		if !ok {
+			return preconditionFailed
+		}
+		if matched {
 			return preconditionNotModified
 		}
 	} else if since, err := http.ParseTime(p.ifModifiedSince); err == nil && hasModified && !modified.After(since) {
@@ -77,22 +82,21 @@ func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModifie
 }
 
 // etagListMatches reports whether any entity tag in a comma-separated list
-// names the record, quoted or not. "*" names any record that exists, a comma
-// inside a quoted tag is part of that tag, and a malformed list names nothing.
-func etagListMatches(list, etag string, hasETag bool) bool {
+// names the record, quoted or not, and whether the list is well formed. "*"
+// names any record that exists; a comma inside a quoted tag is part of it.
+func etagListMatches(list, etag string, hasETag bool) (matched, ok bool) {
 	want := strings.Trim(etag, `"`)
-	matched := false
 	for rest := list; rest != ""; {
 		tag, next, ok := nextEntityTag(rest)
 		if !ok {
-			return false
+			return false, false
 		}
 		if tag == "*" || (hasETag && tag != "" && strings.Trim(tag, `"`) == want) {
 			matched = true
 		}
 		rest = next
 	}
-	return matched
+	return matched, true
 }
 
 // nextEntityTag splits the first entity tag off a list. A quoted tag runs to
