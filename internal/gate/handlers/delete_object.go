@@ -69,6 +69,9 @@ func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config) 
 			HandleError(w, r, err)
 			return
 		}
+		if refuseConditionalWrite(w, r) {
+			return
+		}
 
 		outcome, err := deleteObjectVersion(ctx, mc, bc, cache, cfg, bucket, key, r.URL.Query().Get("versionId"))
 		if err != nil {

@@ -29,6 +29,9 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 		bucket, key := resource.Bucket.Name, resource.Key
+		if refuseConditionalWrite(w, r) {
+			return
+		}
 
 		// PUT /{bucket}/{key}?acl — answering 200 here would discard the ACL the
 		// caller sent rather than say object ACLs are not supported.
