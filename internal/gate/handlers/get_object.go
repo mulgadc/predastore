@@ -64,6 +64,10 @@ func GetObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		recordPhase(ctx, telemetry.GateOpGet, telemetry.PhaseMetaPlacement, phase)
 
 		setVersionIDHeader(w.Header(), target.versionID)
+		// Evaluated before the range, so a failing condition serves no part.
+		if answerReadPreconditions(w, r, place) {
+			return
+		}
 		place.Attributes = withResponseOverrides(place.Attributes, r.URL.Query())
 		handoff := handoffNode(ring, cfg, target.hash)
 		serveObject(ctx, w, r, bc, cfg, bucket, key, target.hash, place, size, rangeStart, rangeEnd, handoff)

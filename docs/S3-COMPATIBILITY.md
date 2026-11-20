@@ -15,8 +15,8 @@ make s3-tests
 
 | | count |
 | --- | --- |
-| pass | 214 |
-| fail | 177 |
+| pass | 218 |
+| fail | 173 |
 | skip | 495 |
 | error | 0 |
 
@@ -29,14 +29,14 @@ A passing case is never one of the 489, whatever family's marker or node id woul
 
 A skip is not a pass. It means predastore has not been measured against that case in this run, on purpose.
 
-The 177 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
+The 173 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
 
 ## The gaps that break real clients
 
 | Operation | State | What happens |
 | --- | --- | --- |
 | Conditional writes and deletes | **Refused** | `PutObject`, `CompleteMultipartUpload` and the `CopyObject` destination answer `NotImplemented` to `If-Match` or `If-None-Match`, before the body is read and without writing anything. `DeleteObject` does the same for `If-Match`, and `DeleteObjects` refuses the whole batch when any object carries an `ETag`. A Terraform S3 backend with `use_lockfile = true` therefore fails at `terraform init` instead of running unlocked. `mulga-7oevb` covers conditional writes and `mulga-7oevb.3` conditional deletes. |
-| Conditional reads and copies | **Ignored** | `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since` are not read on `GetObject` or `HeadObject`. `CopyObject` and `UploadPartCopy` refuse the `x-amz-copy-source-if-*` headers with `NotImplemented` rather than ignoring them. `mulga-7oevb.1` and `mulga-7oevb.2` cover them. |
+| Conditional copies | **Refused** | `CopyObject` and `UploadPartCopy` refuse the `x-amz-copy-source-if-*` headers with `NotImplemented` rather than ignoring them. `mulga-7oevb.2` covers them. |
 | Object tagging | **Refused** | `PutObjectTagging`, `GetObjectTagging` and `DeleteObjectTagging` answer `NotImplemented`, and `x-amz-tagging` on `PutObject` is not applied. Bucket tagging is served. |
 | Object ACLs | **Refused** | `GetObjectAcl` and `PutObjectAcl` answer `NotImplemented`. |
 | `POST` object | **Missing** | Browser-form uploads. All 36 cases are a deliberate skip below rather than a FAIL. |
@@ -61,12 +61,12 @@ Served sub-resources: bucket `tagging`, `versioning`, `versions`, `location`, `u
 
 ## By area
 
-Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 214/177 above. An area predastore has deliberately not implemented is not here; see the next table.
+Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 218/173 above. An area predastore has deliberately not implemented is not here; see the next table.
 
 | Area | Pass | Fail | Selector (test name) | Note |
 | --- | --- | --- | --- | --- |
 | TLS transfer | 11 | 0 | `test_encrypted_transfer_*`, `test_sse_kms_*` | Held by the skip guard; plain transfers over TLS, not server-side encryption. |
-| Conditional requests | 4 | 43 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | Every pass is a `GetObject` case where ignoring the header gives the right answer anyway; conditional `PutObject` cases fail with the refusal. |
+| Conditional requests | 8 | 39 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | The passes are the eight `GetObject` cases; conditional `PutObject`, `CopyObject` and `DeleteObjects` cases fail with the refusal. |
 | Checksums and object attributes | 0 | 16 | contains `checksum`, `cksum` or `object_attributes` | |
 | Object and bucket tagging | 1 | 11 | ends `_tags`, or contains `tagging` | The pass is bucket tagging. |
 | CopyObject / UploadPartCopy | 20 | 5 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Invalid ranges, versioned sources and cross-owner copies fail. |
