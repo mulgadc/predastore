@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/dgraph-io/badger/v4"
 )
@@ -11,14 +12,6 @@ import (
 // A release row is reachable only through the retained row it hangs off, so a
 // delete that takes the retained row and leaves the release behind leaves a row
 // nothing can ever find again.
-
-// releasedScan is the prefix every release row for a position shares. Only the
-// tests scan it; production code reaches a release through its retained row.
-func releasedScan(idxKey []byte) []byte {
-	key := make([]byte, 0, releasedKeySize-8)
-
-	return append(append(key, releasedPrefix), idxKey...)
-}
 
 // countRowsUnder returns how many rows carry prefix.
 func countRowsUnder(t *testing.T, st *Store, prefix []byte) int {
@@ -77,16 +70,9 @@ func TestDeleteTakesTheReleaseRowsWithTheRetainedRows(t *testing.T) {
 	}
 }
 
-// Why the release is paired with its retained row rather than scanned for.
-//
-// A delete opens a transaction, then a release commits a new row, then the
-// delete commits. A prefix scan inside the delete cannot see that row, and
-// Badger conflicts only on keys a transaction read, so the scan reads nothing
-// and the delete commits without conflict. The row then outlives the retained
-// row it hangs off.
-//
-// Driven through explicit transactions because the hole is between a scan and
-// a commit, which is a window no amount of goroutine racing reaches reliably.
+// Why the delete's release scan needs releaseMu. A release committed between
+// a scan and its commit is a key the scan never read, so Badger has nothing to
+// conflict on and the row outlives the retained row it hangs off.
 func TestAScanCannotSeeAReleaseCommittedAfterItsSnapshot(t *testing.T) {
 	st, _ := openTestStore(t)
 	oh := [32]byte{0x68}
@@ -131,42 +117,93 @@ func TestAScanCannotSeeAReleaseCommittedAfterItsSnapshot(t *testing.T) {
 	}
 }
 
-// A release that commits after the delete has scanned, and before it commits.
-// The delete never read the release key, so nothing conflicts; the blind
-// companion delete commits later and is what removes the row.
-func TestAReleaseInsideTheDeleteWindowIsRemovedWithIt(t *testing.T) {
+// A release that arrives while a delete is in progress waits for it, so it
+// cannot commit between the delete's scan and its commit. The test holds
+// releaseMu and runs the delete body, which is what Store.Delete does.
+func TestAReleaseCannotCommitInsideADelete(t *testing.T) {
 	st, _ := openTestStore(t)
 	oh := [32]byte{0x62}
 
 	epochs, _, _ := raceWriters(t, st, oh, 2)
 	idxKey := MakeKey(oh, 0)
 
+	st.releaseMu.Lock()
 	del := st.index.NewTransaction(true)
 	defer del.Discard()
-	deleted, err := deleteIn(del, idxKey)
-	if err != nil {
+	if _, err := deleteIn(del, idxKey); err != nil {
+		st.releaseMu.Unlock()
 		t.Fatalf("delete: %v", err)
 	}
-	if !deleted {
-		t.Fatalf("delete reported nothing removed for a live object")
+
+	released := make(chan error, 1)
+	go func() { released <- st.ReleaseGeneration(oh, 0, epochs[0]) }()
+	select {
+	case err := <-released:
+		st.releaseMu.Unlock()
+		t.Fatalf("a release ran while a delete held releaseMu (err %v)", err)
+	case <-time.After(100 * time.Millisecond):
 	}
 
-	if err := st.ReleaseGeneration(oh, 0, epochs[0]); err != nil {
-		t.Fatalf("release: %v", err)
-	}
-	if got := countRowsUnder(t, st, releasedScan(idxKey)); got != 1 {
-		t.Fatalf("the release did not land inside the delete's window: %d rows", got)
-	}
-
-	if err := del.Commit(); err != nil {
+	err := del.Commit()
+	st.releaseMu.Unlock()
+	if err != nil {
 		t.Fatalf("delete commit: %v", err)
+	}
+	if err := <-released; err != nil {
+		t.Fatalf("release after the delete: %v", err)
 	}
 
 	if got := countRowsUnder(t, st, retainedScan(idxKey)); got != 0 {
 		t.Fatalf("delete left %d retained rows", got)
 	}
 	if got := countRowsUnder(t, st, releasedScan(idxKey)); got != 0 {
-		t.Fatalf("a release committed inside the delete's window survived it: %d rows", got)
+		t.Fatalf("a release that waited on the delete wrote %d rows for a deleted generation", got)
+	}
+}
+
+// And the other side of the lock: a delete waits for a release in progress,
+// so its scan sees the release row once that release commits.
+func TestADeleteWaitsForAReleaseInProgress(t *testing.T) {
+	st, _ := openTestStore(t)
+	oh := [32]byte{0x6a}
+
+	epochs, _, _ := raceWriters(t, st, oh, 2)
+	idxKey := MakeKey(oh, 0)
+
+	st.releaseMu.Lock()
+	rel := st.index.NewTransaction(true)
+	defer rel.Discard()
+	if err := releaseIn(rel, retainedKey(idxKey, epochs[0]), epochs[0]); err != nil {
+		st.releaseMu.Unlock()
+		t.Fatalf("release: %v", err)
+	}
+
+	deleted := make(chan error, 1)
+	go func() {
+		_, err := st.Delete(oh, 0)
+		deleted <- err
+	}()
+	select {
+	case err := <-deleted:
+		st.releaseMu.Unlock()
+		t.Fatalf("a delete ran while a release held releaseMu (err %v)", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	err := rel.Commit()
+	st.releaseMu.Unlock()
+	if err != nil {
+		t.Fatalf("release commit: %v", err)
+	}
+	if err := <-deleted; err != nil {
+		t.Fatalf("delete after the release: %v", err)
+	}
+
+	if got := countRowsUnder(t, st, retainedScan(idxKey)); got != 0 {
+		t.Fatalf("delete left %d retained rows", got)
+	}
+	if got := countRowsUnder(t, st, releasedScan(idxKey)); got != 0 {
+		t.Fatalf("a release committed just before the delete survived it: %d rows", got)
 	}
 }
 
@@ -217,20 +254,18 @@ func TestDeleteTombstonesEveryExtentAndNoReleaseRow(t *testing.T) {
 	if err := st.ReleaseGeneration(oh, 0, epochs[0]); err != nil {
 		t.Fatalf("release: %v", err)
 	}
+	prepareValue(t, st, oh, 0, []byte("a third generation, prepared and never committed"))
+
+	idxKey := MakeKey(oh, 0)
+	for name, prefix := range map[string][]byte{"live": idxKey, "retained": retainedScan(idxKey), "prepared": preparedScan(idxKey)} {
+		if countRowsUnder(t, st, prefix) == 0 {
+			t.Fatalf("fixture has no %s row, so its tombstone goes unchecked", name)
+		}
+	}
 
 	// Every extent the position's rows name, before the delete removes them.
 	want := map[string]int64{}
-	for _, epoch := range epochs {
-		r, err := st.LookupAt(oh, 0, epoch)
-		if err != nil {
-			t.Fatalf("lookup epoch %016x: %v", epoch, err)
-		}
-		if err := r.Close(); err != nil {
-			t.Fatalf("close: %v", err)
-		}
-	}
 	err := st.index.View(func(txn *badger.Txn) error {
-		idxKey := MakeKey(oh, 0)
 		for _, prefix := range [][]byte{idxKey, retainedScan(idxKey), preparedScan(idxKey)} {
 			opts := badger.DefaultIteratorOptions
 			opts.Prefix = prefix
@@ -256,8 +291,8 @@ func TestDeleteTombstonesEveryExtentAndNoReleaseRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("collect extents: %v", err)
 	}
-	if len(want) == 0 {
-		t.Fatalf("fixture named no extents, so the assertion below proves nothing")
+	if len(want) != 3 {
+		t.Fatalf("fixture named %d extents, want one live, one retained and one prepared", len(want))
 	}
 
 	before := countRowsUnder(t, st, []byte{tombstonePrefix})
@@ -287,21 +322,24 @@ func TestDeleteTombstonesEveryExtentAndNoReleaseRow(t *testing.T) {
 	if after := countRowsUnder(t, st, []byte{tombstonePrefix}); after-before != len(want) {
 		t.Fatalf("delete wrote %d tombstones, want %d: a release row names no extent and must not add one", after-before, len(want))
 	}
-	if got := countRowsUnder(t, st, releasedScan(MakeKey(oh, 0))); got != 0 {
+	if got := countRowsUnder(t, st, releasedScan(idxKey)); got != 0 {
 		t.Fatalf("delete left %d release rows", got)
 	}
 }
 
-// The ordinary delete, with nothing released, so the companion cannot have
-// changed the path every object takes.
+// An overwritten object whose old generation was never released, so the
+// release scan finds nothing and the delete must still remove the rest.
 func TestDeleteWithNoReleasedGenerationIsUnchanged(t *testing.T) {
 	st, _ := openTestStore(t)
 	oh := [32]byte{0x64}
-	body := []byte("one generation, never overwritten, never released")
 
-	epoch := prepareValue(t, st, oh, 0, body)
-	if _, err := st.Commit(oh, 0, epoch); err != nil {
-		t.Fatalf("commit: %v", err)
+	raceWriters(t, st, oh, 2)
+	idxKey := MakeKey(oh, 0)
+	if got := countRowsUnder(t, st, retainedScan(idxKey)); got != 1 {
+		t.Fatalf("fixture has %d retained rows, want 1", got)
+	}
+	if got := countRowsUnder(t, st, releasedScan(idxKey)); got != 0 {
+		t.Fatalf("fixture has %d release rows, want none", got)
 	}
 
 	deleted, err := st.Delete(oh, 0)
@@ -314,13 +352,15 @@ func TestDeleteWithNoReleasedGenerationIsUnchanged(t *testing.T) {
 	if _, err := st.Lookup(oh, 0); err == nil {
 		t.Fatalf("the object still answers after a delete")
 	}
-	idxKey := MakeKey(oh, 0)
+	if got := countRowsUnder(t, st, retainedScan(idxKey)); got != 0 {
+		t.Fatalf("delete left %d retained rows", got)
+	}
 	if got := countRowsUnder(t, st, releasedScan(idxKey)); got != 0 {
 		t.Fatalf("a delete with nothing released wrote %d release rows", got)
 	}
 }
 
-// Reclaim still pairs the two rows itself. The companion added to the delete
+// Reclaim still pairs the two rows itself. Clearing releases on the delete
 // path must not have moved that responsibility out of the sweep.
 func TestReclaimStillTakesTheReleaseRowWithTheRetainedRow(t *testing.T) {
 	st, _ := openTestStore(t)
@@ -346,10 +386,9 @@ func TestReclaimStillTakesTheReleaseRowWithTheRetainedRow(t *testing.T) {
 	}
 }
 
-// A key under the release prefix that is not a release row is left alone, the
-// same width discrimination dropRowsUnder applies to the rows it tombstones.
-// Without it, an object hash whose first byte is 'R' would be swept by a delete
-// of an unrelated position.
+// A delete reaches only its own position's release rows. A neighbour with its
+// own released generation, and a live object whose hash begins with the
+// release prefix byte, both survive it.
 func TestDeleteLeavesAForeignKeyUnderTheReleasePrefix(t *testing.T) {
 	st, _ := openTestStore(t)
 	oh := [32]byte{0x66}
@@ -359,8 +398,14 @@ func TestDeleteLeavesAForeignKeyUnderTheReleasePrefix(t *testing.T) {
 		t.Fatalf("release: %v", err)
 	}
 
-	// A live row for a position whose hash begins with the release prefix. It
-	// is 36 bytes, so it sorts into the same scan and must survive.
+	neighbour := [32]byte{0x66, 0x01}
+	nEpochs, _, _ := raceWriters(t, st, neighbour, 2)
+	if err := st.ReleaseGeneration(neighbour, 0, nEpochs[0]); err != nil {
+		t.Fatalf("release the neighbour: %v", err)
+	}
+	nKey := MakeKey(neighbour, 0)
+
+	// A live row whose key starts with the release prefix byte.
 	foreign := [32]byte{releasedPrefix, 0x67}
 	foreignKey := MakeKey(foreign, 0)
 	body := []byte("a live object whose hash starts with the release prefix")
@@ -373,6 +418,12 @@ func TestDeleteLeavesAForeignKeyUnderTheReleasePrefix(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 
+	if got := countRowsUnder(t, st, releasedScan(nKey)); got != 1 {
+		t.Fatalf("deleting one position removed %d-of-1 release rows of its neighbour", 1-got)
+	}
+	if got := countRowsUnder(t, st, retainedScan(nKey)); got != 1 {
+		t.Fatalf("deleting one position removed %d-of-1 retained rows of its neighbour", 1-got)
+	}
 	if got := countRowsUnder(t, st, foreignKey); got != 1 {
 		t.Fatalf("deleting one position removed the live row of another under the same prefix byte: %d rows left", got)
 	}
@@ -382,5 +433,50 @@ func TestDeleteLeavesAForeignKeyUnderTheReleasePrefix(t *testing.T) {
 	}
 	if err := r.Close(); err != nil {
 		t.Fatalf("close: %v", err)
+	}
+}
+
+// A live row and 52,426 unreleased retained rows is the largest history the
+// delete fit in one transaction before release rows were cleared, measured on
+// the prior code. Clearing them must not cost an unreleased history anything.
+func TestDeleteStillFitsTheLargestUnreleasedHistoryItDidBefore(t *testing.T) {
+	if testing.Short() {
+		t.Skip("writes 52,426 retained rows")
+	}
+	st, _ := openTestStore(t)
+	oh := [32]byte{0x69}
+	idxKey := MakeKey(oh, 0)
+
+	const rows = 52426
+	if got := st.index.MaxBatchCount(); got != 104857 {
+		t.Fatalf("maxBatchCount is %d, not the 104,857 that %d rows was measured against", got, rows)
+	}
+	live := prepareValue(t, st, oh, 0, []byte("the live generation"))
+	if _, err := st.Commit(oh, 0, live); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	for start := 0; start < rows; start += 5000 {
+		wb := st.index.NewWriteBatch()
+		for i := start; i < min(start+5000, rows); i++ {
+			e := uint64(i + 1)
+			ext := extent{SegNum: e + 100, Off: int64(i) * 4096, PSize: 4096}
+			if err := wb.Set(retainedKey(idxKey, e), encodeIndexValue(ext, e)); err != nil {
+				t.Fatalf("stage retained row: %v", err)
+			}
+		}
+		if err := wb.Flush(); err != nil {
+			t.Fatalf("write retained rows: %v", err)
+		}
+	}
+
+	deleted, err := st.Delete(oh, 0)
+	if err != nil {
+		t.Fatalf("a history the delete handled before now fails: %v", err)
+	}
+	if !deleted {
+		t.Fatalf("delete reported nothing removed for a live object")
+	}
+	if got := countRowsUnder(t, st, retainedScan(idxKey)); got != 0 {
+		t.Fatalf("delete left %d retained rows", got)
 	}
 }
