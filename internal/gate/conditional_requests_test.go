@@ -56,9 +56,10 @@ func TestPutObjectIfMatchRefusesAStaleETag(t *testing.T) {
 	g.requireBody(key, "v2")
 }
 
-// An If-Match delete naming a superseded ETag must leave the object in place.
+// Conditional deletes are not supported yet, so one must be refused outright
+// rather than delete an object its precondition should have protected.
 // Verifies: Q-68
-func TestDeleteObjectIfMatchRefusesAStaleETag(t *testing.T) {
+func TestDeleteObjectIfMatchIsRefusedAndKeepsTheObject(t *testing.T) {
 	g := newKeyGate(t)
 	const key = "doomed"
 	stale := g.putETag(key, []byte("v1"))
@@ -66,7 +67,7 @@ func TestDeleteObjectIfMatchRefusesAStaleETag(t *testing.T) {
 
 	rr := g.do(http.MethodDelete, sdkPath(key), nil, http.Header{"If-Match": {stale}})
 
-	assert.Equal(t, http.StatusPreconditionFailed, rr.Code, "body: %s", rr.Body.String())
-	assert.Contains(t, rr.Body.String(), "<Code>PreconditionFailed</Code>")
+	assert.Equal(t, http.StatusNotImplemented, rr.Code, "body: %s", rr.Body.String())
+	assert.Contains(t, rr.Body.String(), "<Code>NotImplemented</Code>")
 	g.requireBody(key, "v2")
 }
