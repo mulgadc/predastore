@@ -67,17 +67,7 @@ func (c *compactor) loop() {
 		case <-c.done:
 			return
 		case <-retained.C:
-			released, err := c.store.sweepRetained(c.store.retainedMaxAge)
-			if err != nil {
-				slog.Error("retained sweep failed", "error", err)
-			} else if released > 0 {
-				slog.Debug("released superseded generations", "count", released)
-			}
-			if orphans, err := c.store.sweepOrphanedReleases(); err != nil {
-				slog.Error("orphaned release sweep failed", "error", err)
-			} else if orphans > 0 {
-				slog.Debug("dropped orphaned release rows", "count", orphans)
-			}
+			c.store.retainedTick()
 		case <-ticker.C:
 			if err := c.store.compactOnce(); err != nil {
 				slog.Error("compaction cycle failed", "error", err)
@@ -87,6 +77,22 @@ func (c *compactor) loop() {
 				slog.Error("kicked compaction cycle failed", "error", err)
 			}
 		}
+	}
+}
+
+// retainedTick runs the two sweeps of the retained cycle. Each logs its own
+// failure, so neither stops the other or the compaction cycle.
+func (store *Store) retainedTick() {
+	released, err := store.sweepRetained(store.retainedMaxAge)
+	if err != nil {
+		slog.Error("retained sweep failed", "error", err)
+	} else if released > 0 {
+		slog.Debug("released superseded generations", "count", released)
+	}
+	if orphans, err := store.sweepOrphanedReleases(); err != nil {
+		slog.Error("orphaned release sweep failed", "error", err)
+	} else if orphans > 0 {
+		slog.Debug("dropped orphaned release rows", "count", orphans)
 	}
 }
 
@@ -145,12 +151,6 @@ func (store *Store) compactOnce() error {
 		slog.Info("released superseded generations",
 			"count", released, "older_than_ms", retainedMaxAge.Milliseconds())
 	}
-	if orphans, err := store.sweepOrphanedReleases(); err != nil {
-		return fmt.Errorf("sweep orphaned release rows: %w", err)
-	} else if orphans > 0 {
-		slog.Info("dropped orphaned release rows", "count", orphans)
-	}
-
 	candidates, failed, err := store.candidateSegments()
 	if err != nil {
 		return fmt.Errorf("select candidates: %w", err)
@@ -323,12 +323,12 @@ func (store *Store) releaseStamp(retained []byte) (int64, error) {
 	return at, nil
 }
 
-// orphanReleaseBatch bounds the deletes one orphaned-release transaction makes,
-// and orphanScanPerSweep the release rows one sweep reads, so a sweep's cost
-// does not grow with the release namespace or the backlog.
+// orphanScanPerSweep bounds the release rows one sweep reads. Every commit
+// holds back new transactions until it is applied, so drops commit in small
+// batches that request paths can interleave with.
 const (
-	orphanReleaseBatch = 1000
-	orphanScanPerSweep = 10 * orphanReleaseBatch
+	orphanReleaseBatch = 100
+	orphanScanPerSweep = 10000
 )
 
 // retainedKeyFor maps a release row's key back onto the retained row it marks.
@@ -410,26 +410,12 @@ func (store *Store) dropOrphanedReleases(orphans [][]byte) (int, error) {
 	dropped := 0
 	for start := 0; start < len(orphans); start += orphanReleaseBatch {
 		batch := orphans[start:min(start+orphanReleaseBatch, len(orphans))]
-		n := 0
+		var n int
 		err := store.index.Update(func(txn *badger.Txn) error {
-			n = 0
-			for _, key := range batch {
-				// Checked again in the deleting transaction, so this read
-				// conflicts with any commit that changes the answer.
-				_, err := txn.Get(retainedKeyFor(key))
-				if err == nil {
-					continue
-				}
-				if !errors.Is(err, badger.ErrKeyNotFound) {
-					return err
-				}
-				if err := txn.Delete(key); err != nil {
-					return err
-				}
-				n++
-			}
+			var err error
+			n, err = dropOrphanBatch(txn, batch)
 
-			return nil
+			return err
 		})
 		if errors.Is(err, badger.ErrConflict) {
 			// The next sweep finds whatever this batch left.
@@ -442,6 +428,28 @@ func (store *Store) dropOrphanedReleases(orphans [][]byte) (int, error) {
 	}
 
 	return dropped, nil
+}
+
+// dropOrphanBatch deletes the release rows in batch whose retained row txn
+// cannot see. The read joins txn's conflict set, so a commit that writes the
+// retained row back before txn commits fails txn rather than orphaning it.
+func dropOrphanBatch(txn *badger.Txn, batch [][]byte) (int, error) {
+	n := 0
+	for _, key := range batch {
+		_, err := txn.Get(retainedKeyFor(key))
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, badger.ErrKeyNotFound) {
+			return n, err
+		}
+		if err := txn.Delete(key); err != nil {
+			return n, err
+		}
+		n++
+	}
+
+	return n, nil
 }
 
 // sweepRetained reclaims generations that a commit superseded and nothing has

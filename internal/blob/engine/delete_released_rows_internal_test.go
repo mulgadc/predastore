@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/dgraph-io/badger/v4"
@@ -233,16 +234,45 @@ func TestTheOrphanSweepResumesWhereTheLastOneStopped(t *testing.T) {
 	}
 }
 
-// The full compaction cycle runs the orphan sweep beside the retained sweep.
-func TestACompactionCycleDropsOrphanedReleases(t *testing.T) {
+// The retained cycle runs the orphan sweep beside the retained sweep.
+func TestTheRetainedTickDropsOrphanedReleases(t *testing.T) {
 	st, _ := openTestStore(t)
 	writeOrphans(t, st, 0x72, 3)
 
-	if err := st.compactOnce(); err != nil {
-		t.Fatalf("compaction: %v", err)
-	}
+	st.retainedTick()
 	if got := countRowsUnder(t, st, []byte{releasedPrefix}); got != 0 {
-		t.Fatalf("compaction left %d orphaned release rows", got)
+		t.Fatalf("the retained tick left %d orphaned release rows", got)
+	}
+}
+
+// A retained row written back after the drop read it as absent, but before the
+// drop commits, fails the drop, so the release row it marks survives.
+func TestARestoreInsideTheDropFailsTheDrop(t *testing.T) {
+	st, _ := openTestStore(t)
+	writeOrphans(t, st, 0x76, 1)
+
+	orphans, err := st.collectOrphanedReleases()
+	if err != nil || len(orphans) != 1 {
+		t.Fatalf("collect: %d rows, %v", len(orphans), err)
+	}
+	txn := st.index.NewTransaction(true)
+	defer txn.Discard()
+	if n, err := dropOrphanBatch(txn, orphans); err != nil || n != 1 {
+		t.Fatalf("stage the drop: %d rows, %v", n, err)
+	}
+
+	ext := extent{SegNum: 1, Off: 0, PSize: 4096}
+	if err := st.index.Update(func(rt *badger.Txn) error {
+		return rt.Set(retainedKeyFor(orphans[0]), encodeIndexValue(ext, 1))
+	}); err != nil {
+		t.Fatalf("restore the retained row: %v", err)
+	}
+
+	if err := txn.Commit(); !errors.Is(err, badger.ErrConflict) {
+		t.Fatalf("the drop committed over a restore: %v", err)
+	}
+	if got := countRowsUnder(t, st, []byte{releasedPrefix}); got != 1 {
+		t.Fatalf("%d release rows left, want the restored row's release", got)
 	}
 }
 

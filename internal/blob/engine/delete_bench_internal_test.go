@@ -2,11 +2,14 @@ package engine
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 )
@@ -190,4 +193,102 @@ func BenchmarkLookupUnderDeleteAndRelease(b *testing.B) {
 	b.StopTimer()
 	close(stop)
 	wg.Wait()
+}
+
+// underOrphanChurn writes 10,000 orphaned release rows and calls
+// benchOrphanSweep once per period, until stopped. On a revision without the
+// sweep the hook does nothing and the writes still land.
+func underOrphanChurn(b *testing.B, st *Store) func() {
+	b.Helper()
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		tick := time.NewTicker(churnPeriod())
+		defer tick.Stop()
+		for {
+			wb := st.index.NewWriteBatch()
+			for range 10000 {
+				var o [32]byte
+				o[0] = 0xee
+				binary.BigEndian.PutUint64(o[1:9], benchSeq.Add(1))
+				if err := wb.Set(releasedKeyFor(retainedKey(MakeKey(o, 0), 1)), encodeReleasedValue(1)); err != nil {
+					b.Errorf("stage orphan: %v", err)
+					return
+				}
+			}
+			if err := wb.Flush(); err != nil {
+				b.Errorf("write orphans: %v", err)
+				return
+			}
+			benchOrphanSweep(st)
+			select {
+			case <-stop:
+				return
+			case <-tick.C:
+			}
+		}
+	})
+
+	return func() { close(stop); wg.Wait() }
+}
+
+// churnPeriod is 200 ms, 75 times the production sweep cadence, unless
+// BENCH_CHURN_PERIOD overrides it, for example with 15s.
+func churnPeriod() time.Duration {
+	if d, err := time.ParseDuration(os.Getenv("BENCH_CHURN_PERIOD")); err == nil {
+		return d
+	}
+
+	return 200 * time.Millisecond
+}
+
+// Request paths while the orphan sweep runs against a steady backlog.
+func BenchmarkUnderOrphanSweep(b *testing.B) {
+	b.Run("lookup", func(b *testing.B) {
+		st := openBenchStore(b)
+		reader := mustBenchPosition(b, st, 0, 0)
+		defer underOrphanChurn(b, st)()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				r, err := st.Lookup(reader, 0)
+				if err != nil {
+					b.Errorf("lookup: %v", err)
+					return
+				}
+				_ = r.Close()
+			}
+		})
+		b.StopTimer()
+	})
+	b.Run("release", func(b *testing.B) {
+		st := openBenchStore(b)
+		oh := mustBenchPosition(b, st, b.N, 0)
+		var next atomic.Uint64
+		defer underOrphanChurn(b, st)()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				if err := st.ReleaseGeneration(oh, 0, next.Add(1)); err != nil {
+					b.Errorf("release: %v", err)
+					return
+				}
+			}
+		})
+		b.StopTimer()
+	})
+	for _, c := range []struct{ retained, released int }{{10, 10}, {1000, 100}, {52426, 1000}} {
+		b.Run(fmt.Sprintf("delete/retained=%d/released=%d", c.retained, c.released), func(b *testing.B) {
+			st := openBenchStore(b)
+			defer underOrphanChurn(b, st)()
+			for b.Loop() {
+				b.StopTimer()
+				oh := mustBenchPosition(b, st, c.retained, c.released)
+				b.StartTimer()
+				if _, err := st.Delete(oh, 0); err != nil {
+					b.Fatalf("delete: %v", err)
+				}
+			}
+		})
+	}
 }

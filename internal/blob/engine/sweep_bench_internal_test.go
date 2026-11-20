@@ -44,3 +44,5 @@ func BenchmarkSweepOrphanedReleases(b *testing.B) {
 		})
 	}
 }
+
+func benchOrphanSweep(st *Store) { _, _ = st.sweepOrphanedReleases() }
