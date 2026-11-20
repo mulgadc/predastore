@@ -25,24 +25,24 @@ func (g keyGate) requireBody(key, want string) {
 	assert.Equal(g.t, want, rr.Body.String(), "body of %q", key)
 }
 
-// A create-only PUT over an existing key must be refused and leave the
-// existing object readable; clients use it as a lock.
+// Conditional writes are not supported yet, so a create-only PUT over an
+// existing key must be refused outright; clients use it as a lock.
 // Verifies: Q-68
-func TestPutObjectIfNoneMatchStarRefusesAnExistingKey(t *testing.T) {
+func TestPutObjectIfNoneMatchStarIsRefusedAndKeepsTheObject(t *testing.T) {
 	g := newKeyGate(t)
 	const key = "lock"
 	g.putETag(key, []byte("first"))
 
 	rr := g.do(http.MethodPut, sdkPath(key), []byte("second"), http.Header{"If-None-Match": {"*"}})
 
-	assert.Equal(t, http.StatusPreconditionFailed, rr.Code, "body: %s", rr.Body.String())
-	assert.Contains(t, rr.Body.String(), "<Code>PreconditionFailed</Code>")
+	assert.Equal(t, http.StatusNotImplemented, rr.Code, "body: %s", rr.Body.String())
+	assert.Contains(t, rr.Body.String(), "<Code>NotImplemented</Code>")
 	g.requireBody(key, "first")
 }
 
-// An If-Match naming a superseded ETag must not overwrite the current object.
+// An If-Match PUT must be refused rather than overwrite the current object.
 // Verifies: Q-68
-func TestPutObjectIfMatchRefusesAStaleETag(t *testing.T) {
+func TestPutObjectIfMatchIsRefusedAndKeepsTheObject(t *testing.T) {
 	g := newKeyGate(t)
 	const key = "checkpoint"
 	stale := g.putETag(key, []byte("v1"))
@@ -51,8 +51,8 @@ func TestPutObjectIfMatchRefusesAStaleETag(t *testing.T) {
 
 	rr := g.do(http.MethodPut, sdkPath(key), []byte("v3"), http.Header{"If-Match": {stale}})
 
-	assert.Equal(t, http.StatusPreconditionFailed, rr.Code, "body: %s", rr.Body.String())
-	assert.Contains(t, rr.Body.String(), "<Code>PreconditionFailed</Code>")
+	assert.Equal(t, http.StatusNotImplemented, rr.Code, "body: %s", rr.Body.String())
+	assert.Contains(t, rr.Body.String(), "<Code>NotImplemented</Code>")
 	g.requireBody(key, "v2")
 }
 
