@@ -26,10 +26,30 @@ func TestPreconditionsOnALegacyRecord(t *testing.T) {
 		{"If-Modified-Since", preconditions{ifModifiedSince: when}, preconditionsHold},
 		{"If-Unmodified-Since", preconditions{ifUnmodifiedSince: when}, preconditionsHold},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			assert.Equal(t, c.want, evalPreconditions("", false, time.Time{}, false, c.p))
-		})
+	// The earlier time would fail If-Modified-Since and the later one
+	// If-Unmodified-Since, so only the missing flag can make both pass.
+	for _, behind := range []time.Time{
+		time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		for _, c := range cases {
+			t.Run(c.name+" "+behind.Format("2006"), func(t *testing.T) {
+				assert.Equal(t, c.want, evalPreconditions("", false, behind, false, c.p))
+			})
+		}
+	}
+}
+
+// A comma inside one quoted entity tag is part of that tag, so a tag that
+// merely contains the record's digest between commas does not name it.
+// Verifies: Q-68.
+func TestPreconditionQuotedTagsAreCompared(t *testing.T) {
+	etag := `"abc"`
+	for _, list := range []string{`"other,abc,tag"`, `"abc,"`, `",abc"`} {
+		assert.Equal(t, preconditionFailed, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifMatch: list}), list)
+		assert.Equal(t, preconditionsHold, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifNoneMatch: list}), list)
+	}
+	for _, list := range []string{`"x", "abc"`, `"x,y" ,abc`, `abc`, ` "abc" `} {
+		assert.Equal(t, preconditionsHold, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifMatch: list}), list)
 	}
 }
 

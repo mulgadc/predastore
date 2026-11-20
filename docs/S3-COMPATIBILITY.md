@@ -66,7 +66,7 @@ Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is
 | Area | Pass | Fail | Selector (test name) | Note |
 | --- | --- | --- | --- | --- |
 | TLS transfer | 11 | 0 | `test_encrypted_transfer_*`, `test_sse_kms_*` | Held by the skip guard; plain transfers over TLS, not server-side encryption. |
-| Conditional requests | 8 | 39 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | The passes are the eight `GetObject` cases; conditional `PutObject`, `CopyObject` and `DeleteObjects` cases fail with the refusal. |
+| Conditional requests | 8 | 39 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | `GetObject` and `HeadObject` evaluate `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`; the eight passes are `GetObject` cases, and `HeadObject` is covered by the gate's own tests and the `s3compat` probe. Conditional `PutObject`, `CopyObject` and `DeleteObjects` cases fail with the refusal. |
 | Checksums and object attributes | 0 | 16 | contains `checksum`, `cksum` or `object_attributes` | |
 | Object and bucket tagging | 1 | 11 | ends `_tags`, or contains `tagging` | The pass is bucket tagging. |
 | CopyObject / UploadPartCopy | 20 | 5 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Invalid ranges, versioned sources and cross-owner copies fail. |

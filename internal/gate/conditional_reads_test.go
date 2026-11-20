@@ -86,19 +86,34 @@ func TestConditionalReadsAnswerAsS3Does(t *testing.T) {
 	}
 }
 
-// A ranged read whose condition fails answers 412 and serves no range.
+// A ranged read whose condition fails answers 412 and serves no range, even
+// when the range itself could not be satisfied.
 // Verifies: Q-68.
 func TestConditionalRangedReadFailsBeforeTheRange(t *testing.T) {
 	f := newReadFixture(t)
+	for _, byteRange := range []string{"bytes=2-5", "bytes=99-100"} {
+		rr := f.g.do(http.MethodGet, sdkPath("obj"), nil, http.Header{
+			"If-Match": {`"other"`},
+			"Range":    {byteRange},
+		})
 
-	rr := f.g.do(http.MethodGet, sdkPath("obj"), nil, http.Header{
-		"If-Match": {`"other"`},
-		"Range":    {"bytes=2-5"},
-	})
+		require.Equal(t, http.StatusPreconditionFailed, rr.Code, "%s: %s", byteRange, rr.Body.String())
+		assert.Empty(t, rr.Header().Get("Content-Range"), byteRange)
+		assert.Contains(t, rr.Body.String(), "<Code>PreconditionFailed</Code>", byteRange)
+	}
+}
 
-	require.Equal(t, http.StatusPreconditionFailed, rr.Code, "body: %s", rr.Body.String())
-	assert.Empty(t, rr.Header().Get("Content-Range"))
-	assert.Contains(t, rr.Body.String(), "<Code>PreconditionFailed</Code>")
+// A wildcard names only an object that exists, so on an absent key both
+// wildcard headers leave the read to answer 404.
+// Verifies: Q-68.
+func TestConditionalWildcardOnAnAbsentKey(t *testing.T) {
+	g := newKeyGate(t)
+	for _, header := range []string{"If-Match", "If-None-Match"} {
+		for _, method := range []string{http.MethodGet, http.MethodHead} {
+			rr := g.do(method, sdkPath("absent"), nil, http.Header{header: {"*"}})
+			assert.Equal(t, http.StatusNotFound, rr.Code, "%s %s: *: %s", method, header, rr.Body.String())
+		}
+	}
 }
 
 // A versionId read evaluates its conditions against that version, not the

@@ -76,19 +76,38 @@ func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModifie
 	return preconditionsHold
 }
 
-// etagListMatches reports whether any member of a comma-separated ETag list
-// names the record, quoted or not. "*" names any record that exists.
+// etagListMatches reports whether any entity tag in a comma-separated list
+// names the record, quoted or not. "*" names any record that exists, and a
+// comma inside a quoted tag is part of that tag.
 func etagListMatches(list, etag string, hasETag bool) bool {
-	for member := range strings.SplitSeq(list, ",") {
-		member = strings.TrimSpace(member)
-		if member == "*" {
+	want := strings.Trim(etag, `"`)
+	for rest := list; rest != ""; {
+		var tag string
+		tag, rest = nextEntityTag(rest)
+		if tag == "*" {
 			return true
 		}
-		if hasETag && member != "" && strings.Trim(member, `"`) == strings.Trim(etag, `"`) {
+		if hasETag && tag != "" && strings.Trim(tag, `"`) == want {
 			return true
 		}
 	}
 	return false
+}
+
+// nextEntityTag splits the first entity tag off a list. A quoted tag runs to
+// its closing quote; an unquoted one, which S3 also accepts, to the next comma.
+func nextEntityTag(list string) (tag, rest string) {
+	list = strings.TrimLeft(list, " \t,")
+	if strings.HasPrefix(list, `"`) {
+		if end := strings.IndexByte(list[1:], '"'); end >= 0 {
+			return list[:end+2], list[end+2:]
+		}
+		return list, ""
+	}
+	if end := strings.IndexByte(list, ','); end >= 0 {
+		return strings.TrimSpace(list[:end]), list[end:]
+	}
+	return strings.TrimSpace(list), ""
 }
 
 // preconditionFailedMessage is S3's text for a 412.
