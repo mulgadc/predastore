@@ -44,10 +44,6 @@ type Store struct {
 	// are pre-allocated via Truncate and written lock-free through WriteAt.
 	mutex sync.Mutex
 
-	// Serializes ReleaseGeneration against Delete, so a release row cannot
-	// commit between a delete's scan of the release namespace and its commit.
-	releaseMu sync.Mutex
-
 	// Shared by every reader and writer; GCM permits concurrent Seal/Open.
 	aead cipher.AEAD
 
@@ -69,6 +65,10 @@ type Store struct {
 	compactionInterval time.Duration
 	retainedMaxAge     time.Duration
 	compactor          *compactor
+
+	// Where the next orphaned-release sweep resumes; nil starts at the front.
+	orphanMu     sync.Mutex
+	orphanCursor []byte
 
 	// Free-space watermark fractions gating Append; see WithFreeSpaceWatermark.
 	nearfullFreeFrac float64
@@ -820,34 +820,6 @@ func dropRowsUnder(txn *badger.Txn, prefix []byte) error {
 	return nil
 }
 
-// dropReleasedUnder deletes every release row for one shard position. A
-// release row names no extent, so there is nothing to tombstone. The caller
-// holds releaseMu, so no release can commit behind this scan.
-func dropReleasedUnder(txn *badger.Txn, idxKey []byte) error {
-	prefix := releasedScan(idxKey)
-	opts := badger.DefaultIteratorOptions
-	opts.Prefix = prefix
-	opts.PrefetchValues = false
-	it := txn.NewIterator(opts)
-	defer it.Close()
-
-	var keys [][]byte
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		if len(it.Item().Key()) != releasedKeySize {
-			continue
-		}
-		keys = append(keys, it.Item().KeyCopy(nil))
-	}
-
-	// Deleting inside the iteration would invalidate it.
-	for _, k := range keys {
-		if err := txn.Delete(k); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // readIndexValue decodes the extent and epoch a key currently points at.
 func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
 	raw, err := readRaw(txn, key)
@@ -876,13 +848,26 @@ func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) 
 		return ErrClosedStore
 	}
 
-	store.releaseMu.Lock()
-	defer store.releaseMu.Unlock()
-
 	rowKey := retainedKey(MakeKey(key, index), epoch)
 	for {
 		err := store.index.Update(func(txn *badger.Txn) error {
-			return releaseIn(txn, rowKey, epoch)
+			raw, err := readRaw(txn, rowKey)
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				// Already reclaimed, which is the outcome the caller wanted.
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			_, held, err := decodeIndexValue(raw)
+			if err != nil {
+				return fmt.Errorf("decode retained row: %w", err)
+			}
+			if held != epoch {
+				return nil
+			}
+
+			return txn.Set(releasedKeyFor(rowKey), encodeReleasedValue(time.Now().UnixNano()))
 		})
 		if errors.Is(err, badger.ErrConflict) {
 			continue
@@ -895,37 +880,11 @@ func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) 
 	}
 }
 
-// releaseIn writes the release row for one retained generation inside txn. A
-// row already reclaimed, or now held by another epoch, is left alone.
-func releaseIn(txn *badger.Txn, rowKey []byte, epoch uint64) error {
-	raw, err := readRaw(txn, rowKey)
-	if errors.Is(err, badger.ErrKeyNotFound) {
-		// Already reclaimed, which is the outcome the caller wanted.
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	_, held, err := decodeIndexValue(raw)
-	if err != nil {
-		return fmt.Errorf("decode retained row: %w", err)
-	}
-	if held != epoch {
-		return nil
-	}
-
-	return txn.Set(releasedKeyFor(rowKey), encodeReleasedValue(time.Now().UnixNano()))
-}
-
 // Delete removes a key's index entry and tombstones its extent, in one
 // transaction so the dead-space hint cannot outlive or precede the deletion.
 // Reports whether an extent existed; a missing key is not an error, which
 // keeps deletes idempotent.
 func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
-	// releaseMu first, so waiting on an in-flight release never holds
-	// store.mutex and stalls unrelated lookups.
-	store.releaseMu.Lock()
-	defer store.releaseMu.Unlock()
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
@@ -936,48 +895,36 @@ func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
 	idxKey := MakeKey(key, index)
 	deleted := false
 	err := store.index.Update(func(txn *badger.Txn) error {
-		var err error
-		deleted, err = deleteIn(txn, idxKey)
+		// Every generation goes, not just the live one: a prepared row would
+		// resurrect the value on a later commit, and a retained row would keep
+		// answering a record that names it.
+		for _, scan := range [][]byte{preparedScan(idxKey), retainedScan(idxKey)} {
+			if err := dropRowsUnder(txn, scan); err != nil {
+				return fmt.Errorf("delete: %w", err)
+			}
+		}
 
-		return err
+		ext, _, err := readIndexValue(txn, idxKey)
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("delete: read extent: %w", err)
+		}
+
+		if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
+			return fmt.Errorf("delete: put tombstone: %w", err)
+		}
+		if err := txn.Delete(idxKey); err != nil {
+			return err
+		}
+		deleted = true
+		return nil
 	})
 	if err != nil {
 		return false, err
 	}
 	return deleted, nil
-}
-
-// deleteIn removes every generation of a shard position inside txn and reports
-// whether a live row existed.
-func deleteIn(txn *badger.Txn, idxKey []byte) (bool, error) {
-	// Every generation goes, not just the live one: a prepared row would
-	// resurrect the value on a later commit, and a retained row would keep
-	// answering a record that names it.
-	for _, scan := range [][]byte{preparedScan(idxKey), retainedScan(idxKey)} {
-		if err := dropRowsUnder(txn, scan); err != nil {
-			return false, fmt.Errorf("delete: %w", err)
-		}
-	}
-	// A release row is reachable only through its retained row, so it goes too.
-	if err := dropReleasedUnder(txn, idxKey); err != nil {
-		return false, fmt.Errorf("delete: %w", err)
-	}
-
-	ext, _, err := readIndexValue(txn, idxKey)
-	if errors.Is(err, badger.ErrKeyNotFound) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("delete: read extent: %w", err)
-	}
-
-	if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
-		return false, fmt.Errorf("delete: put tombstone: %w", err)
-	}
-	if err := txn.Delete(idxKey); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 // Close blocks until all outstanding segment references drain, then closes
@@ -1139,13 +1086,6 @@ const (
 	releasedKeySize   = 45
 	releasedValueSize = 8
 )
-
-// releasedScan is the prefix every release row for one shard position shares.
-func releasedScan(idxKey []byte) []byte {
-	key := make([]byte, 0, releasedKeySize-8)
-
-	return append(append(key, releasedPrefix), idxKey...)
-}
 
 // releasedKeyFor maps a retained row's key onto its release, which differ only
 // in their prefix byte.
