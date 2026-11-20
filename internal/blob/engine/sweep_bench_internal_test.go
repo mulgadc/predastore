@@ -23,7 +23,7 @@ func BenchmarkSweepOrphanedReleases(b *testing.B) {
 				for i := range c.orphans {
 					var o [32]byte
 					o[0] = 0xee
-					binary.BigEndian.PutUint32(o[1:5], uint32(i)) //nolint:gosec // bounded fixture.
+					binary.BigEndian.PutUint32(o[1:5], uint32(i))
 					if err := wb.Set(releasedKeyFor(retainedKey(MakeKey(o, 0), 1)), encodeReleasedValue(1)); err != nil {
 						b.Fatalf("stage orphan: %v", err)
 					}

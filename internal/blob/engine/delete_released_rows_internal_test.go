@@ -50,7 +50,7 @@ func writeOrphans(t *testing.T, st *Store, first byte, n int) {
 	wb := st.index.NewWriteBatch()
 	for i := range n {
 		oh := [32]byte{first}
-		binary.BigEndian.PutUint32(oh[1:5], uint32(i)) //nolint:gosec // bounded by n in a test.
+		binary.BigEndian.PutUint32(oh[1:5], uint32(i))
 		key := releasedKeyFor(retainedKey(MakeKey(oh, 0), 1))
 		if err := wb.Set(key, encodeReleasedValue(1)); err != nil {
 			t.Fatalf("stage orphan: %v", err)
@@ -69,7 +69,7 @@ func writeInUse(t *testing.T, st *Store, first byte, n int) {
 	wb := st.index.NewWriteBatch()
 	for i := range n {
 		oh := [32]byte{first}
-		binary.BigEndian.PutUint32(oh[1:5], uint32(i)) //nolint:gosec // bounded by n in a test.
+		binary.BigEndian.PutUint32(oh[1:5], uint32(i))
 		retained := retainedKey(MakeKey(oh, 0), 1)
 		ext := extent{SegNum: 1, Off: int64(i) * 4096, PSize: 4096}
 		if err := wb.Set(retained, encodeIndexValue(ext, 1)); err != nil {
@@ -312,7 +312,7 @@ func TestDeleteTombstonesEveryExtentAndNoReleaseRow(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			got = int64(binary.BigEndian.Uint64(raw)) //nolint:gosec // round-trips the int64 written.
+			got = int64(binary.BigEndian.Uint64(raw))
 
 			return nil
 		})
@@ -436,7 +436,7 @@ func TestDeleteStillFitsTheLargestHistoryItDidBefore(t *testing.T) {
 	for start := 0; start < rows; start += 5000 {
 		wb := st.index.NewWriteBatch()
 		for i := start; i < min(start+5000, rows); i++ {
-			e := uint64(i + 1) //nolint:gosec // bounded by rows.
+			e := uint64(i + 1)
 			ext := extent{SegNum: e + 100, Off: int64(i) * 4096, PSize: 4096}
 			if err := wb.Set(retainedKey(idxKey, e), encodeIndexValue(ext, e)); err != nil {
 				t.Fatalf("stage retained row: %v", err)
