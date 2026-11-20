@@ -108,7 +108,9 @@ func newPartUpload(t *testing.T, g keyGate) partUpload {
 
 func (u partUpload) copyPart(header http.Header) *httptest.ResponseRecorder {
 	header = header.Clone()
-	header.Set("X-Amz-Copy-Source", strings.TrimPrefix(sdkPath("obj"), "/"))
+	if header.Get("X-Amz-Copy-Source") == "" {
+		header.Set("X-Amz-Copy-Source", strings.TrimPrefix(sdkPath("obj"), "/"))
+	}
 	return u.g.do(http.MethodPut, u.target+"&partNumber=1", nil, header)
 }
 
@@ -167,8 +169,8 @@ func TestConditionalUploadPartCopyEvaluatesTheSource(t *testing.T) {
 	}
 }
 
-// An unqualified part-copy source is the current version: a retained null
-// version is not, and a current delete marker hides the key.
+// An unqualified part-copy source is the current version, versionId=null is
+// the retained null version, and a current delete marker hides the key.
 // Verifies: Q-68.
 func TestConditionalUploadPartCopyUsesTheCurrentVersion(t *testing.T) {
 	f := newReadFixture(t)
@@ -182,6 +184,13 @@ func TestConditionalUploadPartCopyUsesTheCurrentVersion(t *testing.T) {
 	rr := u.copyPart(http.Header{"X-Amz-Copy-Source-If-Match": {current}})
 	require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
 	assert.Equal(t, "newer", u.complete(u.parts()[1]))
+
+	null := strings.TrimPrefix(sdkPath("obj"), "/") + "?versionId=null"
+	u = newPartUpload(t, f.g)
+	requirePreconditionFailed(t, u.copyPart(http.Header{"X-Amz-Copy-Source": {null}, "X-Amz-Copy-Source-If-Match": {current}}))
+	rr = u.copyPart(http.Header{"X-Amz-Copy-Source": {null}, "X-Amz-Copy-Source-If-Match": {f.etag}})
+	require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
+	assert.Equal(t, "0123456789", u.complete(u.parts()[1]))
 
 	rr = f.g.do(http.MethodDelete, sdkPath("obj"), nil, nil)
 	require.Equal(t, http.StatusNoContent, rr.Code, "delete: %s", rr.Body.String())
