@@ -57,6 +57,9 @@ func HeadObject(mc MetaClient, ring *placement.Ring, cache *BucketCache, cfg Con
 		}
 
 		setVersionIDHeader(w.Header(), target.versionID)
+		if answerReadPreconditions(w, r, place) {
+			return
+		}
 		setAttributeHeaders(w.Header(), withResponseOverrides(place.Attributes, r.URL.Query()))
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		// A record with no stored digest omits the ETag rather than serving the
