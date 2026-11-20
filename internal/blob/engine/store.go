@@ -66,6 +66,10 @@ type Store struct {
 	retainedMaxAge     time.Duration
 	compactor          *compactor
 
+	// Where the next orphaned-release sweep resumes; nil starts at the front.
+	orphanMu     sync.Mutex
+	orphanCursor []byte
+
 	// Free-space watermark fractions gating Append; see WithFreeSpaceWatermark.
 	nearfullFreeFrac float64
 	fullFreeFrac     float64
