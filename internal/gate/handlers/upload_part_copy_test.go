@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
+	"github.com/mulgadc/predastore/internal/meta"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -309,4 +310,34 @@ func TestUploadPartCopyRefusesRequestsItCannotHonour(t *testing.T) {
 			assert.Error(t, err)
 		})
 	}
+}
+
+// A part copy names its source without scanning the key's version history,
+// so a request refused on its source conditions does no work that scales with
+// the number of versions.
+// Verifies: Q-68.
+func TestCopySourceHashDoesNotScanVersions(t *testing.T) {
+	ctx := context.Background()
+	m := newFakeMeta()
+	cache := emptyCache()
+	require.NoError(t, setBucketVersioning(ctx, m, cache, "b", "Enabled"))
+	current := model.VersionHash("b", "k", "v2")
+	require.NoError(t, metaPut(ctx, m, model.TableObjects, objectARN("b", "k"), current[:]))
+	for _, id := range []string{"v1", "v2"} {
+		require.NoError(t, metaPut(ctx, m, model.TableObjectVersions, versionKeyPrefix("b", "k")+id, []byte("x")))
+	}
+	m.resetOps()
+
+	got, err := copySourceHash(ctx, m, cache, "b", "k", "")
+	require.NoError(t, err)
+	assert.Equal(t, current, got)
+
+	got, err = copySourceHash(ctx, m, cache, "b", "k", nullVersionID)
+	require.NoError(t, err)
+	assert.Equal(t, model.ObjectHash("b", "k"), got)
+
+	_, err = copySourceHash(ctx, m, cache, "b", "hidden", "")
+	require.ErrorIs(t, err, meta.ErrNotFound)
+
+	assert.Zero(t, m.ops["scan"], "version-history scans")
 }

@@ -87,7 +87,7 @@ func TestPreconditionHeaderForms(t *testing.T) {
 // Verifies: Q-68.
 func TestPreconditionMalformedListsFail(t *testing.T) {
 	etag := `"abc"`
-	for _, list := range []string{`"x""abc"`, `"abc" "x"`, `"abc`, `"abc"x`, `"abc", "x`} {
+	for _, list := range []string{`"x""abc"`, `"abc" "x"`, `"abc`, `"abc"x`, `"abc", "x`, `other"unterminated`, `"abc", x"y`} {
 		assert.Equal(t, preconditionFailed, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifMatch: list}), list)
 		assert.Equal(t, preconditionFailed, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifNoneMatch: list}), list)
 	}

@@ -101,14 +101,15 @@ func etagListMatches(list, etag string, hasETag bool) (matched, ok bool) {
 
 // nextEntityTag splits the first entity tag off a list. A quoted tag runs to
 // its closing quote and must be followed by a comma or the end; an unquoted
-// one, which S3 also accepts, runs to the next comma.
+// one, which S3 also accepts, runs to the next comma and holds no quote.
 func nextEntityTag(list string) (tag, rest string, ok bool) {
 	list = strings.TrimLeft(list, " \t,")
 	if !strings.HasPrefix(list, `"`) {
+		tag, rest = list, ""
 		if end := strings.IndexByte(list, ','); end >= 0 {
-			return strings.TrimSpace(list[:end]), list[end:], true
+			tag, rest = list[:end], list[end:]
 		}
-		return strings.TrimSpace(list), "", true
+		return strings.TrimSpace(tag), rest, !strings.Contains(tag, `"`)
 	}
 	end := strings.IndexByte(list[1:], '"')
 	if end < 0 {
