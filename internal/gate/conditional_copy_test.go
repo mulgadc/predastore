@@ -58,9 +58,10 @@ func requirePreconditionFailed(t *testing.T, rr *httptest.ResponseRecorder) {
 // never 304, and leaves the destination as it was without any blob write.
 // Verifies: Q-68.
 func TestConditionalCopyObjectEvaluatesTheSource(t *testing.T) {
-	for _, c := range copySourceCases(newReadFixture(t)) {
-		t.Run(c.name, func(t *testing.T) {
+	for i, name := range copyCaseNames() {
+		t.Run(name, func(t *testing.T) {
 			f := newReadFixture(t)
+			c := copySourceCases(f)[i]
 			f.g.putETag("dest", []byte("original"))
 			before, mutations := f.g.state("dest"), f.g.blob.mutationCount()
 
@@ -80,34 +81,112 @@ func TestConditionalCopyObjectEvaluatesTheSource(t *testing.T) {
 	}
 }
 
+// copyCaseNames lists the cases once so each subtest can build its headers
+// from the fixture it copies from.
+func copyCaseNames() []string {
+	var names []string
+	for _, c := range copySourceCases(readFixture{modified: time.Unix(0, 0)}) {
+		names = append(names, c.name)
+	}
+	return names
+}
+
+// partUpload is a multipart upload on key "assembled".
+type partUpload struct {
+	g      keyGate
+	target string
+}
+
+func newPartUpload(t *testing.T, g keyGate) partUpload {
+	t.Helper()
+	rr := g.do(http.MethodPost, sdkPath("assembled")+"?uploads", nil, nil)
+	require.Equal(t, http.StatusOK, rr.Code, "initiate: %s", rr.Body.String())
+	var initiated handlers.InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &initiated))
+	return partUpload{g: g, target: sdkPath("assembled") + "?uploadId=" + url.QueryEscape(initiated.UploadId)}
+}
+
+func (u partUpload) copyPart(header http.Header) *httptest.ResponseRecorder {
+	header = header.Clone()
+	header.Set("X-Amz-Copy-Source", strings.TrimPrefix(sdkPath("obj"), "/"))
+	return u.g.do(http.MethodPut, u.target+"&partNumber=1", nil, header)
+}
+
+// parts answers the upload's parts by number with their ETags.
+func (u partUpload) parts() map[int]string {
+	u.g.t.Helper()
+	rr := u.g.do(http.MethodGet, u.target, nil, nil)
+	require.Equal(u.g.t, http.StatusOK, rr.Code, "list parts: %s", rr.Body.String())
+	var listed handlers.ListPartsResult
+	require.NoError(u.g.t, xml.Unmarshal(rr.Body.Bytes(), &listed))
+	got := map[int]string{}
+	for _, p := range listed.Parts {
+		got[p.PartNumber] = p.ETag
+	}
+	return got
+}
+
+// complete assembles part 1 under etag and answers the assembled body.
+func (u partUpload) complete(etag string) string {
+	u.g.t.Helper()
+	body := "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" + etag +
+		"</ETag></Part></CompleteMultipartUpload>"
+	rr := u.g.do(http.MethodPost, u.target, []byte(body), nil)
+	require.Equal(u.g.t, http.StatusOK, rr.Code, "complete: %s", rr.Body.String())
+	rr = u.g.do(http.MethodGet, sdkPath("assembled"), nil, nil)
+	require.Equal(u.g.t, http.StatusOK, rr.Code, "get assembled: %s", rr.Body.String())
+	return rr.Body.String()
+}
+
 // A part copy runs only when its source conditions hold, and a failing one
-// stores no part.
+// leaves the part already uploaded under that number as it was.
 // Verifies: Q-68.
 func TestConditionalUploadPartCopyEvaluatesTheSource(t *testing.T) {
-	for _, c := range copySourceCases(newReadFixture(t)) {
-		t.Run(c.name, func(t *testing.T) {
+	for i, name := range copyCaseNames() {
+		t.Run(name, func(t *testing.T) {
 			f := newReadFixture(t)
-			rr := f.g.do(http.MethodPost, sdkPath("assembled")+"?uploads", nil, nil)
-			require.Equal(t, http.StatusOK, rr.Code, "initiate: %s", rr.Body.String())
-			var initiated handlers.InitiateMultipartUploadResult
-			require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &initiated))
-			upload := sdkPath("assembled") + "?uploadId=" + url.QueryEscape(initiated.UploadId)
+			c := copySourceCases(f)[i]
+			u := newPartUpload(t, f.g)
+			rr := f.g.do(http.MethodPut, u.target+"&partNumber=1", []byte("seeded"), nil)
+			require.Equal(t, http.StatusOK, rr.Code, "upload part: %s", rr.Body.String())
+			seeded := rr.Header().Get("ETag")
 			mutations := f.g.blob.mutationCount()
 
-			header := c.header.Clone()
-			header.Set("X-Amz-Copy-Source", strings.TrimPrefix(sdkPath("obj"), "/"))
-			rr = f.g.do(http.MethodPut, upload+"&partNumber=1", nil, header)
+			rr = u.copyPart(c.header)
 
-			parts := f.g.do(http.MethodGet, upload, nil, nil)
-			require.Equal(t, http.StatusOK, parts.Code, "list parts: %s", parts.Body.String())
 			if c.copies {
 				require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
-				assert.Contains(t, parts.Body.String(), "<PartNumber>1</PartNumber>")
+				assert.Equal(t, "0123456789", u.complete(u.parts()[1]))
 				return
 			}
 			requirePreconditionFailed(t, rr)
 			assert.Equal(t, mutations, f.g.blob.mutationCount(), "blob calls made by a refused part copy")
-			assert.NotContains(t, parts.Body.String(), "<PartNumber>")
+			assert.Equal(t, map[int]string{1: seeded}, u.parts())
+			assert.Equal(t, "seeded", u.complete(seeded))
 		})
 	}
+}
+
+// An unqualified part-copy source is the current version: a retained null
+// version is not, and a current delete marker hides the key.
+// Verifies: Q-68.
+func TestConditionalUploadPartCopyUsesTheCurrentVersion(t *testing.T) {
+	f := newReadFixture(t)
+	f.g.enableVersioning()
+	current := f.g.putETag("obj", []byte("newer"))
+
+	u := newPartUpload(t, f.g)
+	requirePreconditionFailed(t, u.copyPart(http.Header{"X-Amz-Copy-Source-If-Match": {f.etag}}))
+	assert.Empty(t, u.parts())
+
+	rr := u.copyPart(http.Header{"X-Amz-Copy-Source-If-Match": {current}})
+	require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
+	assert.Equal(t, "newer", u.complete(u.parts()[1]))
+
+	rr = f.g.do(http.MethodDelete, sdkPath("obj"), nil, nil)
+	require.Equal(t, http.StatusNoContent, rr.Code, "delete: %s", rr.Body.String())
+	u = newPartUpload(t, f.g)
+	rr = u.copyPart(http.Header{"X-Amz-Copy-Source-If-Match": {"*"}})
+	assert.Equal(t, http.StatusNotFound, rr.Code, "body: %s", rr.Body.String())
+	assert.Empty(t, u.parts())
 }
