@@ -13,17 +13,6 @@ import (
 	"github.com/mulgadc/predastore/internal/telemetry"
 )
 
-// copySourceConditionHeaders are the S3 conditional-copy headers this gate
-// does not evaluate. Ignoring one silently would answer 200 to a client that
-// asked for a precondition to gate the copy, so a request carrying any of
-// them is refused instead.
-var copySourceConditionHeaders = []string{
-	"X-Amz-Copy-Source-If-Match",
-	"X-Amz-Copy-Source-If-None-Match",
-	"X-Amz-Copy-Source-If-Modified-Since",
-	"X-Amz-Copy-Source-If-Unmodified-Since",
-}
-
 // CopyObject serves PUT /{bucket}/{key} carrying x-amz-copy-source. The
 // source is streamed stripe by stripe into the same streaming write
 // PutObject uses, so the destination gets its own placement record, its own
@@ -50,13 +39,6 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			return
 		}
 
-		for _, h := range copySourceConditionHeaders {
-			if r.Header.Get(h) != "" {
-				WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
-					"Conditional CopyObject requests are not implemented")
-				return
-			}
-		}
 		// COPY, the default, keeps the source's attributes; REPLACE takes the
 		// request's. Anything else is refused rather than read as either.
 		directive := r.Header.Get("X-Amz-Metadata-Directive")
@@ -104,6 +86,11 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		srcPlace, srcSize, err := loadPlacementByHash(ctx, mc, ring, cfg, srcTarget.hash)
 		if err != nil {
 			HandleError(w, r, placementReadError(ctx, srcBucket, srcKey, err))
+			return
+		}
+		// Evaluated against the record that is then streamed, so the condition
+		// and the copied bytes name the same source generation.
+		if refuseCopySource(w, r, srcPlace) {
 			return
 		}
 

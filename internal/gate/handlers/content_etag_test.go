@@ -419,10 +419,11 @@ func TestCopyObjectUnsupportedVariantsNeverAnswer200(t *testing.T) {
 			copySource: "/bucket/does-not-exist", wantStatus: http.StatusNotFound,
 		},
 		{
-			name: "conditional copy-source-if-match", destKey: "d3",
+			// Source conditions are evaluated now, so a failing one is a 412.
+			name: "failing copy-source-if-match", destKey: "d3",
 			copySource: "/bucket/src",
 			headers:    map[string]string{"X-Amz-Copy-Source-If-Match": `"abc"`},
-			wantStatus: http.StatusNotImplemented,
+			wantStatus: http.StatusPreconditionFailed,
 		},
 		{
 			// A named source version is served now, so the refusal is gone and
