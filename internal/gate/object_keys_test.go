@@ -40,6 +40,8 @@ type memBlob struct {
 	mu       sync.Mutex
 	live     map[memShardID]memShard
 	prepared map[memShardID]memShard
+	// mutations counts every call that could change a shard, whatever it did.
+	mutations int
 }
 
 var _ BlobClient = (*memBlob)(nil)
@@ -55,6 +57,7 @@ func (b *memBlob) Put(_ context.Context, node config.NodeID, req blob.PutRequest
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.mutations++
 	b.prepared[memShardID{node, req.Key, req.Index}] = memShard{data: data, epoch: req.Epoch}
 	return &blob.PutResponse{Size: int64(len(data)), Epoch: req.Epoch}, nil
 }
@@ -62,6 +65,7 @@ func (b *memBlob) Put(_ context.Context, node config.NodeID, req blob.PutRequest
 func (b *memBlob) Commit(_ context.Context, node config.NodeID, req blob.CommitRequest) (bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.mutations++
 	id := memShardID{node, req.Key, req.Index}
 	if shard, ok := b.prepared[id]; ok && shard.epoch == req.Epoch {
 		b.live[id] = shard
@@ -77,6 +81,7 @@ func (b *memBlob) Commit(_ context.Context, node config.NodeID, req blob.CommitR
 func (b *memBlob) Abort(_ context.Context, node config.NodeID, req blob.CommitRequest) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.mutations++
 	delete(b.prepared, memShardID{node, req.Key, req.Index})
 	return nil
 }
@@ -101,6 +106,7 @@ func (b *memBlob) Get(_ context.Context, node config.NodeID, req blob.GetRequest
 func (b *memBlob) Delete(_ context.Context, node config.NodeID, req blob.DeleteRequest) (*blob.DeleteResponse, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	b.mutations++
 	id := memShardID{node, req.Key, req.Index}
 	_, ok := b.live[id]
 	delete(b.live, id)
@@ -118,7 +124,12 @@ func (b *memBlob) Stat(_ context.Context, node config.NodeID, req blob.StatReque
 	return &blob.StatResponse{Epoch: shard.epoch, Size: int64(len(shard.data))}, nil
 }
 
-func (b *memBlob) Release(context.Context, config.NodeID, blob.ReleaseRequest) error { return nil }
+func (b *memBlob) Release(context.Context, config.NodeID, blob.ReleaseRequest) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.mutations++
+	return nil
+}
 
 // keyGate drives a gate backed by memBlob with SigV4-signed requests, so every
 // request also passes signature verification over the path it was sent with.
@@ -139,11 +150,11 @@ func newKeyGate(t *testing.T) keyGate {
 	return keyGate{t: t, server: newTestGate(t, cfg), region: cfg.Region, blob: blob}
 }
 
-// shardCount is every shard the blob store holds, published or prepared.
-func (b *memBlob) shardCount() int {
+// mutationCount is how many shard-changing calls the blob store has served.
+func (b *memBlob) mutationCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return len(b.live) + len(b.prepared)
+	return b.mutations
 }
 
 // do sends target exactly as given: the escaping in it is the wire form.

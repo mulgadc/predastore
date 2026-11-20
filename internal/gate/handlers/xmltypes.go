@@ -210,8 +210,8 @@ type DeleteRequestObject struct {
 	// bucket appends a delete marker instead, exactly as the single-key route does.
 	VersionId string `xml:"VersionId"`
 	// ETag is a per-object precondition, read only so that a request carrying
-	// one is refused rather than deleted unconditionally.
-	ETag string `xml:"ETag"`
+	// one, even empty, is refused rather than deleted unconditionally.
+	ETag *string `xml:"ETag"`
 }
 
 // DeleteResult answers POST /{bucket}?delete. A key that could not be deleted

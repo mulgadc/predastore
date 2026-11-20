@@ -8,10 +8,10 @@ import "net/http"
 var conditionalWriteHeaders = []string{"If-Match", "If-None-Match"}
 
 // refuseConditionalWrite answers 501 to a write or delete carrying a
-// precondition, and reports whether it did. Call it before reading the body.
+// precondition, even an empty one, and reports whether it did.
 func refuseConditionalWrite(w http.ResponseWriter, r *http.Request) bool {
 	for _, h := range conditionalWriteHeaders {
-		if r.Header.Get(h) != "" {
+		if _, present := r.Header[h]; present {
 			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
 				"Conditional writes and deletes are not implemented")
 			return true

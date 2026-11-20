@@ -84,7 +84,7 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config)
 		// The whole batch is refused: deleting the other keys would act on a
 		// request whose conditions were never evaluated.
 		for _, object := range request.Objects {
-			if object.ETag != "" {
+			if object.ETag != nil {
 				WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
 					"Conditional deletes are not implemented")
 				return
