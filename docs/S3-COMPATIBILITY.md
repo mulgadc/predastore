@@ -15,8 +15,8 @@ make s3-tests
 
 | | count |
 | --- | --- |
-| pass | 219 |
-| fail | 172 |
+| pass | 214 |
+| fail | 177 |
 | skip | 495 |
 | error | 0 |
 
@@ -29,7 +29,7 @@ A passing case is never one of the 489, whatever family's marker or node id woul
 
 A skip is not a pass. It means predastore has not been measured against that case in this run, on purpose.
 
-The 172 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
+The 177 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
 
 ## The gaps that break real clients
 
@@ -61,12 +61,12 @@ Served sub-resources: bucket `tagging`, `versioning`, `versions`, `location`, `u
 
 ## By area
 
-Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 219/172 above. An area predastore has deliberately not implemented is not here; see the next table.
+Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 214/177 above. An area predastore has deliberately not implemented is not here; see the next table.
 
 | Area | Pass | Fail | Selector (test name) | Note |
 | --- | --- | --- | --- | --- |
 | TLS transfer | 11 | 0 | `test_encrypted_transfer_*`, `test_sse_kms_*` | Held by the skip guard; plain transfers over TLS, not server-side encryption. |
-| Conditional requests | 9 | 38 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | Every pass is a case where ignoring the header gives the right answer anyway. |
+| Conditional requests | 4 | 43 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | Every pass is a `GetObject` case where ignoring the header gives the right answer anyway; conditional `PutObject` cases fail with the refusal. |
 | Checksums and object attributes | 0 | 16 | contains `checksum`, `cksum` or `object_attributes` | |
 | Object and bucket tagging | 1 | 11 | ends `_tags`, or contains `tagging` | The pass is bucket tagging. |
 | CopyObject / UploadPartCopy | 20 | 5 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Invalid ranges, versioned sources and cross-owner copies fail. |
