@@ -81,3 +81,14 @@ func TestPreconditionHeaderForms(t *testing.T) {
 	h.Add("If-Match", `"e"`)
 	assert.Equal(t, preconditionsHold, evalPreconditions(`"e"`, true, modified, true, readPreconditions(h)))
 }
+
+// A malformed list names nothing: two quoted tags with no comma between them
+// are not read as two tags, so neither can satisfy the condition.
+// Verifies: Q-68.
+func TestPreconditionMalformedListsMatchNothing(t *testing.T) {
+	etag := `"abc"`
+	for _, list := range []string{`"x""abc"`, `"abc" "x"`, `"abc`, `"abc"x`} {
+		assert.Equal(t, preconditionFailed, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifMatch: list}), list)
+		assert.Equal(t, preconditionsHold, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifNoneMatch: list}), list)
+	}
+}

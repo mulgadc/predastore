@@ -37,20 +37,12 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 			return
 		}
 
-		// Same two refusals CopyObject makes, for the same reason: honouring
-		// neither silently would answer 200 to a request whose terms were
-		// ignored.
+		// Honouring a source version silently would answer 200 to a request
+		// whose terms were ignored, so it is refused.
 		if versionID != "" && versionID != "null" {
 			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
 				"Copying a specific object version is not implemented")
 			return
-		}
-		for _, h := range copySourceConditionHeaders {
-			if r.Header.Get(h) != "" {
-				WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
-					"Conditional copy requests are not implemented")
-				return
-			}
 		}
 
 		if err := model.ValidatePartNumber(partNumber); err != nil {
@@ -73,6 +65,9 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 		srcPlace, srcSize, err := loadPlacement(ctx, mc, ring, cfg, srcBucket, srcKey)
 		if err != nil {
 			HandleError(w, r, placementReadError(ctx, srcBucket, srcKey, err))
+			return
+		}
+		if refuseCopySource(w, r, srcPlace) {
 			return
 		}
 

@@ -279,9 +279,10 @@ func TestUploadPartCopyRefusesRequestsItCannotHonour(t *testing.T) {
 			status: http.StatusNotImplemented, code: "NotImplemented",
 		},
 		{
-			name: "conditional source", uploadID: "u1", partNumber: 1,
+			// Source conditions are evaluated now, so a failing one is a 412.
+			name: "failing conditional source", uploadID: "u1", partNumber: 1,
 			source: "/" + copyTestBucket + "/src", header: "X-Amz-Copy-Source-If-Match",
-			status: http.StatusNotImplemented, code: "NotImplemented",
+			status: http.StatusPreconditionFailed, code: "PreconditionFailed",
 		},
 	}
 
