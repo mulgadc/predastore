@@ -36,6 +36,9 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		}
 		bucket, key := resource.Bucket.Name, resource.Key
 		uploadID := r.URL.Query().Get("uploadId")
+		if refuseConditionalWrite(w, r) {
+			return
+		}
 
 		body, err := io.ReadAll(r.Body)
 		if err != nil {

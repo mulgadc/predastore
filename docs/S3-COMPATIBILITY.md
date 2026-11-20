@@ -35,7 +35,8 @@ The 172 fails are operations predastore attempts and gets wrong, or refuses: con
 
 | Operation | State | What happens |
 | --- | --- | --- |
-| Conditional requests | **Ignored** | `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since` are not read on `PutObject`, `GetObject`, `DeleteObject` or `DeleteObjects`. A `PutObject` with `If-None-Match: *` over an existing key overwrites it and answers 200, so a client using it as a create-only lock loses the race silently. `CopyObject` and `UploadPartCopy` refuse the `x-amz-copy-source-if-*` headers with `NotImplemented` rather than ignoring them. `mulga-7oevb` covers `PutObject`. |
+| Conditional writes and deletes | **Refused** | `PutObject`, `CompleteMultipartUpload` and the `CopyObject` destination answer `NotImplemented` to `If-Match` or `If-None-Match`, before the body is read and without writing anything. `DeleteObject` does the same for `If-Match`, and `DeleteObjects` refuses the whole batch when any object carries an `ETag`. A Terraform S3 backend with `use_lockfile = true` therefore fails at `terraform init` instead of running unlocked. `mulga-7oevb` covers conditional writes and `mulga-7oevb.3` conditional deletes. |
+| Conditional reads and copies | **Ignored** | `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since` are not read on `GetObject` or `HeadObject`. `CopyObject` and `UploadPartCopy` refuse the `x-amz-copy-source-if-*` headers with `NotImplemented` rather than ignoring them. `mulga-7oevb.1` and `mulga-7oevb.2` cover them. |
 | Object tagging | **Refused** | `PutObjectTagging`, `GetObjectTagging` and `DeleteObjectTagging` answer `NotImplemented`, and `x-amz-tagging` on `PutObject` is not applied. Bucket tagging is served. |
 | Object ACLs | **Refused** | `GetObjectAcl` and `PutObjectAcl` answer `NotImplemented`. |
 | `POST` object | **Missing** | Browser-form uploads. All 36 cases are a deliberate skip below rather than a FAIL. |

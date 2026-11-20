@@ -59,6 +59,9 @@ func DeleteObject(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config) 
 			return
 		}
 		bucket, key := resource.Bucket.Name, resource.Key
+		if refuseConditionalWrite(w, r) {
+			return
+		}
 
 		if err := requireBucket(ctx, mc, cache, bucket); err != nil {
 			HandleError(w, r, err)

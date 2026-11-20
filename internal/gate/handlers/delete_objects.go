@@ -81,6 +81,15 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config)
 				fmt.Sprintf("A delete request must name between 1 and %d objects", maxDeleteObjects), 400))
 			return
 		}
+		// The whole batch is refused: deleting the other keys would act on a
+		// request whose conditions were never evaluated.
+		for _, object := range request.Objects {
+			if object.ETag != "" {
+				WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
+					"Conditional deletes are not implemented")
+				return
+			}
+		}
 
 		outcomes := deleteBatch(ctx, mc, bc, cache, cfg, bucket, request.Objects, objectAuthorizerFrom(ctx))
 

@@ -36,6 +36,9 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			return
 		}
 		destBucket, destKey := resource.Bucket.Name, resource.Key
+		if refuseConditionalWrite(w, r) {
+			return
+		}
 
 		srcBucket, srcKey, versionID, err := parseCopySource(r.Header.Get("X-Amz-Copy-Source"))
 		if err != nil {

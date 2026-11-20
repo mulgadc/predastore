@@ -126,15 +126,24 @@ type keyGate struct {
 	t      *testing.T
 	server *Server
 	region string
+	blob   *memBlob
 }
 
 func newKeyGate(t *testing.T) keyGate {
 	t.Helper()
 	cfg := newAuthTestConfig()
-	cfg.Blob = newMemBlob()
+	blob := newMemBlob()
+	cfg.Blob = blob
 	cfg.RS = RS{Data: 2, Parity: 1}
 	cfg.BlobNodeIDs = []config.NodeID{1, 2, 3}
-	return keyGate{t: t, server: newTestGate(t, cfg), region: cfg.Region}
+	return keyGate{t: t, server: newTestGate(t, cfg), region: cfg.Region, blob: blob}
+}
+
+// shardCount is every shard the blob store holds, published or prepared.
+func (b *memBlob) shardCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.live) + len(b.prepared)
 }
 
 // do sends target exactly as given: the escaping in it is the wire form.
