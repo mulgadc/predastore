@@ -260,6 +260,28 @@ func TestTheRetainedTickYieldsToAPendingKick(t *testing.T) {
 	}
 }
 
+// A kick that arrives after the sweep starts stops it before its next batch,
+// and the next sweep resumes at the first orphan it did not drop.
+func TestADropStopsForAKickAndResumesAfterIt(t *testing.T) {
+	st, _ := openTestStore(t)
+	writeOrphans(t, st, 0x78, orphanScanPerSweep+50)
+	orphans, err := st.collectOrphanedReleases()
+	if err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+	st.compactor = &compactor{kick: make(chan struct{}, 1)}
+	defer func() { st.compactor = nil }()
+	st.compactor.kick <- struct{}{}
+
+	if n, err := st.dropOrphanedReleases(orphans); err != nil || n != 0 {
+		t.Fatalf("drop with a kick pending: %d rows, %v", n, err)
+	}
+	<-st.compactor.kick
+	if got := sweepOrphans(t, st); got != orphanScanPerSweep {
+		t.Fatalf("the next sweep dropped %d, want the %d the stopped one held", got, orphanScanPerSweep)
+	}
+}
+
 // The tombstones one sweep's drops leave count toward the next sweep's cap, so
 // a namespace full of deleted rows cannot stretch a sweep without bound.
 func TestTheOrphanScanCountsDeletedRowsTowardItsCap(t *testing.T) {

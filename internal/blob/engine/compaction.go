@@ -91,7 +91,7 @@ func (store *Store) retainedTick() {
 		slog.Debug("released superseded generations", "count", released)
 	}
 	// A pending kick means the disk is filling; reclamation goes first.
-	if store.compactor != nil && len(store.compactor.kick) > 0 {
+	if store.kickPending() {
 		return
 	}
 	if orphans, err := store.sweepOrphanedReleases(); err != nil {
@@ -99,6 +99,11 @@ func (store *Store) retainedTick() {
 	} else if orphans > 0 {
 		slog.Debug("dropped orphaned release rows", "count", orphans)
 	}
+}
+
+// kickPending reports whether a compaction kick is waiting for the loop.
+func (store *Store) kickPending() bool {
+	return store.compactor != nil && len(store.compactor.kick) > 0
 }
 
 // kickCompaction signals the compactor goroutine to run an immediate pass,
@@ -423,6 +428,14 @@ func (store *Store) collectOrphanedReleases() ([][]byte, error) {
 func (store *Store) dropOrphanedReleases(orphans [][]byte) (int, error) {
 	dropped := 0
 	for start := 0; start < len(orphans); start += orphanReleaseBatch {
+		if store.kickPending() {
+			// Resume at the first undropped orphan once the kick is served.
+			store.orphanMu.Lock()
+			store.orphanCursor = orphans[start]
+			store.orphanMu.Unlock()
+
+			return dropped, nil
+		}
 		batch := orphans[start:min(start+orphanReleaseBatch, len(orphans))]
 		var n int
 		err := store.index.Update(func(txn *badger.Txn) error {
