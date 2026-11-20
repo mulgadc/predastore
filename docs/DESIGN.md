@@ -410,6 +410,8 @@ A `Commit` promotes the new generation and **demotes** the one it replaces to `'
 
 A demoted generation is reclaimable only once a publisher reports that its record displaced it. That report is `Release`, and it writes `'R'` ‖ key ‖ index ‖ epoch, a row whose presence is the whole eligibility test. `retainedMaxAge` (5 minutes) then applies to the release, not to the demotion: it is the grace window a reader that already resolved the old generation keeps answering in.
 
+A release row is found only through its retained row, so a shard delete that removes the retained row leaves the release behind. A background sweep on the same 15-second tick reads at most 10,000 release rows, resuming where the last sweep stopped, and drops any whose retained row is gone, checking again inside the deleting transaction so a retained row written back in between keeps its release.
+
 Age cannot decide on its own. A writer that commits and never publishes starts no clock anybody can see, the gate's PUT path carries no total deadline, and reclaiming such a generation destroys an object every client was acknowledged for. The sweep therefore reclaims released generations past their grace and nothing else, ever. A release that does not arrive costs disk until the generation is released again, which is the safe direction: failure retains.
 
 The retained row's stamp field is written `math.MaxInt64` and is never read here. It exists for an engine from before the release namespace, which reclaims on that field and will not find the value old enough, so a generation this engine demoted is stranded rather than destroyed by a downgrade.
