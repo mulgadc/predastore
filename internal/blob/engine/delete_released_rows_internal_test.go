@@ -245,6 +245,44 @@ func TestTheRetainedTickDropsOrphanedReleases(t *testing.T) {
 	}
 }
 
+// A pending compaction kick means the disk is filling, so the retained tick
+// leaves the orphans for a later tick rather than delay reclamation.
+func TestTheRetainedTickYieldsToAPendingKick(t *testing.T) {
+	st, _ := openTestStore(t)
+	writeOrphans(t, st, 0x77, 3)
+	st.compactor = &compactor{kick: make(chan struct{}, 1)}
+	defer func() { st.compactor = nil }()
+	st.compactor.kick <- struct{}{}
+
+	st.retainedTick()
+	if got := countRowsUnder(t, st, []byte{releasedPrefix}); got != 3 {
+		t.Fatalf("the tick dropped orphans with a kick pending: %d of 3 left", got)
+	}
+}
+
+// The tombstones one sweep's drops leave count toward the next sweep's cap, so
+// a namespace full of deleted rows cannot stretch a sweep without bound.
+func TestTheOrphanScanCountsDeletedRowsTowardItsCap(t *testing.T) {
+	st, _ := openTestStore(t)
+	writeOrphans(t, st, 0x10, orphanScanPerSweep)
+	if got := sweepOrphans(t, st); got != orphanScanPerSweep {
+		t.Fatalf("first sweep dropped %d, want %d", got, orphanScanPerSweep)
+	}
+	writeOrphans(t, st, 0x80, 5)
+
+	// Each dropped key leaves its delete marker and its old version.
+	if got := sweepOrphans(t, st); got != 0 {
+		t.Fatalf("a sweep over a window of tombstones dropped %d", got)
+	}
+	got := 0
+	for range 3 {
+		got += sweepOrphans(t, st)
+	}
+	if got != 5 {
+		t.Fatalf("the next sweeps dropped %d, want the 5 past the tombstones", got)
+	}
+}
+
 // A retained row written back after the drop read it as absent, but before the
 // drop commits, fails the drop, so the release row it marks survives.
 func TestARestoreInsideTheDropFailsTheDrop(t *testing.T) {

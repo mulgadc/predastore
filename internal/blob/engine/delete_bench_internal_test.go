@@ -84,7 +84,11 @@ func openBenchStore(b *testing.B) *Store {
 	if err != nil {
 		b.Fatalf("aead: %v", err)
 	}
-	st, err := Open(b.TempDir(), WithFreeSpaceWatermark(0, 0), WithAEAD(aead))
+	opts := []Option{WithFreeSpaceWatermark(0, 0), WithAEAD(aead)}
+	if realLoop() {
+		opts = append(opts, WithCompaction(defaultCompactionInterval))
+	}
+	st, err := Open(b.TempDir(), opts...)
 	if err != nil {
 		b.Fatalf("open: %v", err)
 	}
@@ -220,7 +224,9 @@ func underOrphanChurn(b *testing.B, st *Store) func() {
 				b.Errorf("write orphans: %v", err)
 				return
 			}
-			benchOrphanSweep(st)
+			if !realLoop() {
+				benchOrphanSweep(st)
+			}
 			select {
 			case <-stop:
 				return
@@ -231,6 +237,10 @@ func underOrphanChurn(b *testing.B, st *Store) func() {
 
 	return func() { close(stop); wg.Wait() }
 }
+
+// realLoop, set by BENCH_REAL_LOOP, opens bench stores with the production
+// compaction loop, which then runs the sweep itself on its own ticker.
+func realLoop() bool { return os.Getenv("BENCH_REAL_LOOP") != "" }
 
 // churnPeriod is 200 ms, 75 times the production sweep cadence, unless
 // BENCH_CHURN_PERIOD overrides it, for example with 15s.

@@ -81,13 +81,18 @@ func (c *compactor) loop() {
 }
 
 // retainedTick runs the two sweeps of the retained cycle. Each logs its own
-// failure, so neither stops the other or the compaction cycle.
+// failure, so neither stops the other or the compaction cycle, and the orphan
+// sweep yields to a pending compaction kick.
 func (store *Store) retainedTick() {
 	released, err := store.sweepRetained(store.retainedMaxAge)
 	if err != nil {
 		slog.Error("retained sweep failed", "error", err)
 	} else if released > 0 {
 		slog.Debug("released superseded generations", "count", released)
+	}
+	// A pending kick means the disk is filling; reclamation goes first.
+	if store.compactor != nil && len(store.compactor.kick) > 0 {
+		return
 	}
 	if orphans, err := store.sweepOrphanedReleases(); err != nil {
 		slog.Error("orphaned release sweep failed", "error", err)
@@ -368,22 +373,31 @@ func (store *Store) collectOrphanedReleases() ([][]byte, error) {
 		opts := badger.DefaultIteratorOptions
 		opts.Prefix = []byte{releasedPrefix}
 		opts.PrefetchValues = false
+		// Every version, deleted ones included, counts toward the cap, so the
+		// tombstones a drop leaves cannot make a sweep's scan unbounded.
+		opts.AllVersions = true
 		it := txn.NewIterator(opts)
 		defer it.Close()
 
 		scanned := 0
+		var key []byte
 		for it.Seek(start); it.Valid(); it.Next() {
-			if scanned == orphanScanPerSweep {
-				next = it.Item().KeyCopy(nil)
-				break
-			}
+			item := it.Item()
 			scanned++
-			// A live row whose object hash starts with releasedPrefix sorts in
-			// here too; only a release row has this width.
-			if len(it.Item().Key()) != releasedKeySize {
+			if key != nil && bytes.Equal(item.Key(), key) {
 				continue
 			}
-			key := it.Item().KeyCopy(nil)
+			// Stop only between keys, so a resumed sweep starts at a newest version.
+			if scanned > orphanScanPerSweep {
+				next = item.KeyCopy(nil)
+				break
+			}
+			key = item.KeyCopy(nil)
+			// A live row whose object hash starts with releasedPrefix sorts in
+			// here too; only a release row has this width.
+			if item.IsDeletedOrExpired() || len(key) != releasedKeySize {
+				continue
+			}
 			_, err := txn.Get(retainedKeyFor(key))
 			if errors.Is(err, badger.ErrKeyNotFound) {
 				orphans = append(orphans, key)
