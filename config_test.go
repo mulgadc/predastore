@@ -98,3 +98,20 @@ func TestGateOnlyHostRepairsForNothing(t *testing.T) {
 	assert.Empty(t, got.LocalBlobNodeIDs)
 	assert.NotEmpty(t, got.BlobNodeIDs, "the ring still spans the other host's nodes")
 }
+
+// Every blob node derives its compaction slot from the same sorted list, so
+// the slots are distinct whatever order the file lists the nodes in.
+func TestEveryBlobNodeTakesADistinctCompactionSlot(t *testing.T) {
+	t.Parallel()
+	c := twoHostCluster()
+	c.Hosts[0].Nodes[1], c.Hosts[0].Nodes[2] = c.Hosts[0].Nodes[2], c.Hosts[0].Nodes[1]
+
+	for id, want := range map[NodeID]int{2: 0, 3: 1, 6: 2, 7: 3} {
+		slot, slots := compactionSlot(c, id)
+		assert.Equal(t, want, slot, "node %d", id)
+		assert.Equal(t, 4, slots)
+	}
+	slot, slots := compactionSlot(c, 99)
+	assert.Equal(t, 0, slot)
+	assert.Equal(t, 1, slots)
+}

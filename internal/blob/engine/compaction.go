@@ -40,6 +40,9 @@ type compactor struct {
 	kick chan struct{}
 
 	wg sync.WaitGroup
+
+	// When the retained sweep last ran, from the loop or from inside a pass.
+	lastRetained time.Time
 }
 
 func (store *Store) startCompactor() {
@@ -52,8 +55,15 @@ func (store *Store) startCompactor() {
 
 func (c *compactor) loop() {
 	defer c.wg.Done()
-	ticker := time.NewTicker(c.store.compactionInterval)
-	defer ticker.Stop()
+	store := c.store
+	// A timer re-armed after each pass at this node's next aligned start, so a
+	// long pass skips to the next slot rather than running back to back.
+	routine := time.NewTimer(time.Until(nextCompactionStart(store.clock.Now(), store.compactionInterval, store.compactionSlot, store.compactionSlots)))
+	defer routine.Stop()
+	rearm := func() {
+		routine.Reset(time.Until(nextCompactionStart(store.clock.Now(), store.compactionInterval, store.compactionSlot, store.compactionSlots)))
+	}
+	c.lastRetained = store.clock.Now()
 
 	// Retained generations are swept on their own, much faster cycle. A full
 	// cycle relocates extents and rewrites segments; this is one scan of the
@@ -67,16 +77,32 @@ func (c *compactor) loop() {
 		case <-c.done:
 			return
 		case <-retained.C:
-			c.store.retainedTick()
-		case <-ticker.C:
-			if err := c.store.compactOnce(); err != nil {
-				slog.Error("compaction cycle failed", "error", err)
+			if store.clock.Now().Sub(c.lastRetained) >= retainedSweepInterval/2 {
+				c.lastRetained = store.clock.Now()
+				store.retainedTick()
 			}
+		case <-routine.C:
+			c.runPass(false)
+			rearm()
 		case <-c.kick:
-			if err := c.store.compactOnce(); err != nil {
-				slog.Error("kicked compaction cycle failed", "error", err)
-			}
+			c.runPass(true)
 		}
+	}
+}
+
+// runPass runs one pass, unpaced if kicked or the store starts near full, and
+// asks for a fresh unpaced pass if this one turned urgent part way.
+func (c *compactor) runPass(kicked bool) {
+	p := c.store.newPacer(c, kicked || c.store.belowNearfull())
+	err := c.store.compactPass(p)
+	switch {
+	case errors.Is(err, errCompactionStopped), errors.Is(err, ErrClosedStore):
+		return
+	case err != nil:
+		slog.Error("compaction cycle failed", "kicked", kicked, "error", err)
+	}
+	if p.rekick {
+		c.store.kickCompaction()
 	}
 }
 
@@ -126,9 +152,15 @@ func (c *compactor) stop() {
 	slog.Info("compactor stopped")
 }
 
-// compactOnce runs one full compaction cycle: select under-occupied segments,
-// relocate their live extents into the active append segment, and drop them.
+// compactOnce runs one full compaction cycle at the configured pacing:
+// select under-occupied segments, relocate their live extents into the active
+// append segment, and drop them.
 func (store *Store) compactOnce() error {
+	return store.compactPass(store.newPacer(store.compactor, store.belowNearfull()))
+}
+
+// compactPass is one cycle under pacer p.
+func (store *Store) compactPass(p *pacer) error {
 	store.mutex.Lock()
 	closed := store.closed
 	store.mutex.Unlock()
@@ -137,7 +169,9 @@ func (store *Store) compactOnce() error {
 	}
 
 	start := time.Now()
-	slog.Info("compaction started", "interval", store.compactionInterval, "liveThreshold", compactionLiveThreshold)
+	slog.Info("compaction started", "interval", store.compactionInterval, "liveThreshold", compactionLiveThreshold,
+		"slot", store.compactionSlot, "slots", store.compactionSlots, "paced", !p.urgent,
+		"maxBytesPerSec", store.compactionMaxBytesPerSec)
 
 	// Before selecting candidates: a prepared row keeps its extent alive, so a
 	// caller that died between prepare and commit would otherwise pin the space
@@ -186,8 +220,10 @@ func (store *Store) compactOnce() error {
 	var dropped int64
 	for _, num := range candidates {
 		segStart := time.Now()
-		stats, err := store.compactSegment(num)
+		stats, err := store.compactSegment(num, p)
 		switch {
+		case errors.Is(err, errCompactionStopped):
+			return err
 		// A reader or writer still holds the segment. Its extents have already
 		// been relocated, so the next cycle finds nothing to move and only
 		// retries the drop.
@@ -227,6 +263,9 @@ func (store *Store) compactOnce() error {
 	store.mutex.Unlock()
 
 	slog.Info("compaction finished",
+		"paced", !p.urgent,
+		"paceWait", p.waitedTotal,
+		"yielded", p.yielded,
 		"segments", len(candidates),
 		"extents", totalExtents,
 		"bytes", totalBytes,
@@ -704,7 +743,7 @@ type segmentStats struct {
 
 // compactSegment relocates a segment's live extents into the active append
 // segment, then drops it and clears its tombstones.
-func (store *Store) compactSegment(num uint64) (segmentStats, error) {
+func (store *Store) compactSegment(num uint64, p *pacer) (segmentStats, error) {
 	var stats segmentStats
 
 	entries, err := scanIdx(store.dir, num)
@@ -714,7 +753,10 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 
 	unresolved := 0
 	for _, e := range entries {
-		moved, size, err := store.relocateSlot(e.Key, num, e.Off)
+		if p.stopped() {
+			return stats, errCompactionStopped
+		}
+		moved, size, err := store.relocateSlot(e.Key, num, e.Off, p)
 		if err != nil {
 			return stats, err
 		}
@@ -765,7 +807,7 @@ const relocateAttempts = 3
 // means a commit moved that row, possibly into a namespace still naming this
 // slot, so the slot is read afresh and tried again. moved reports a relocation;
 // a zero size with moved false means no row names the slot any more.
-func (store *Store) relocateSlot(idxKey [36]byte, num uint64, off int64) (moved bool, size int64, err error) {
+func (store *Store) relocateSlot(idxKey [36]byte, num uint64, off int64, p *pacer) (moved bool, size int64, err error) {
 	for range relocateAttempts {
 		badgerKey, raw, cur, err := store.rowAt(idxKey, num, off)
 		if err != nil {
@@ -776,7 +818,7 @@ func (store *Store) relocateSlot(idxKey [36]byte, num uint64, off int64) (moved 
 		if badgerKey == nil {
 			return false, 0, nil
 		}
-		moved, err := store.relocateExtent(badgerKey, idxKey, raw, cur)
+		moved, err := store.relocateExtent(badgerKey, idxKey, raw, cur, p)
 		if err != nil {
 			return false, 0, fmt.Errorf("relocate extent: %w", err)
 		}
@@ -876,7 +918,7 @@ func scanRowAt(txn *badger.Txn, prefix []byte, num uint64, off int64) (*slotRow,
 // the index at it, unless a concurrent overwrite or delete of the same key gets
 // there first, which moved reports as false. badgerKey is the live, prepared or
 // retained row; idxKey is always the 36-byte form the sidecar records.
-func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []byte, old extent) (moved bool, err error) {
+func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []byte, old extent, p *pacer) (moved bool, err error) {
 	fragCount := uint64(old.PSize / totalFragSize) //nolint:gosec // PSize is a non-negative multiple of totalFragSize.
 
 	store.mutex.Lock()
@@ -916,7 +958,7 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 
 	// Verbatim is load-bearing: fragNum rides inside the copied bytes, so the
 	// nonce moves with them and is never reissued.
-	if err := copyExtent(srcSeg, old.Off, dstSeg, dstOff, old.PSize); err != nil {
+	if err := copyExtent(srcSeg, old.Off, dstSeg, dstOff, old.PSize, p); err != nil {
 		return false, fmt.Errorf("copy extent bytes: %w", err)
 	}
 	if err := dstSeg.Sync(); err != nil {
@@ -972,8 +1014,9 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 }
 
 // copyExtent streams size bytes from src@srcOff to dst@dstOff via disjoint
-// ReadAt/WriteAt, so it runs lock-free against concurrent reads and writes.
-func copyExtent(src *segment, srcOff int64, dst *segment, dstOff int64, size int64) error {
+// ReadAt/WriteAt, so it runs lock-free against concurrent reads and writes,
+// pacing after each buffer.
+func copyExtent(src *segment, srcOff int64, dst *segment, dstOff int64, size int64, p *pacer) error {
 	if size == 0 {
 		return nil
 	}
@@ -987,6 +1030,7 @@ func copyExtent(src *segment, srcOff int64, dst *segment, dstOff int64, size int
 			return err
 		}
 		pos += n
+		p.copied(n)
 	}
 	return nil
 }

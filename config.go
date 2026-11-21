@@ -129,6 +129,18 @@ func hostNodesByRole(h HostConfig, role Role) []NodeConfig {
 }
 
 // nodeIDs names a set of nodes by id, which is how every client addresses one.
+// compactionSlot is a blob node's position among the cluster's blob node IDs,
+// sorted, and their count, so every node derives the same slots.
+func compactionSlot(c *Config, id NodeID) (slot, slots int) {
+	ids := nodeIDs(nodesByRole(c, RoleBlob))
+	slices.Sort(ids)
+	i := slices.Index(ids, id)
+	if i < 0 {
+		return 0, 1
+	}
+	return i, len(ids)
+}
+
 func nodeIDs(nodes []NodeConfig) []NodeID {
 	ids := make([]NodeID, 0, len(nodes))
 	for _, n := range nodes {

@@ -66,6 +66,17 @@ type Config struct {
 	// Zero takes the store's default.
 	RetainedMaxAge time.Duration
 
+	// CompactionSlot of CompactionSlots offsets this node's routine passes
+	// from its peers'. Zero slots means slot 0 of 1.
+	CompactionSlot  int
+	CompactionSlots int
+
+	// Pacing for routine passes; zeros take the store's defaults, and a zero
+	// YieldLatency leaves the foreground yield off.
+	CompactionMaxBytesPerSec int64
+	CompactionYieldLatency   time.Duration
+	CompactionMaxYield       time.Duration
+
 	// BodyIdleTimeout bounds a response body whose peer has stopped reading.
 	// Zero uses DefaultBodyIdleTimeout.
 	BodyIdleTimeout time.Duration
@@ -121,9 +132,15 @@ func (s *Server) Run(ctx context.Context) error {
 		if err := os.MkdirAll(s.cfg.DataDir, 0750); err != nil {
 			return fmt.Errorf("create store directory %s: %w", s.cfg.DataDir, err)
 		}
+		slot, slots := s.cfg.CompactionSlot, s.cfg.CompactionSlots
+		if slots < 1 {
+			slot, slots = 0, 1
+		}
 		st, err := engine.Open(s.cfg.DataDir,
 			engine.WithAEAD(s.cfg.AEAD), engine.WithCompaction(s.cfg.Compaction),
-			engine.WithRetainedMaxAge(s.cfg.RetainedMaxAge))
+			engine.WithRetainedMaxAge(s.cfg.RetainedMaxAge),
+			engine.WithCompactionSlot(slot, slots),
+			engine.WithCompactionPacing(s.cfg.CompactionMaxBytesPerSec, s.cfg.CompactionYieldLatency, s.cfg.CompactionMaxYield))
 		if err != nil {
 			return fmt.Errorf("open store %s: %w", s.cfg.DataDir, err)
 		}

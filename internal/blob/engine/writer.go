@@ -130,14 +130,14 @@ func (w *writer) Close() (err error) {
 		}
 	}
 
-	if err = w.seg.Sync(); err != nil {
+	if err = w.store.latency.timed(latencySync, w.seg.Sync); err != nil {
 		return fmt.Errorf("sync segment %d: %w", w.ext.SegNum, err)
 	}
 
 	// The .idx row must be durable before the index commit: it is compaction's
 	// only enumeration source, so every index-committed extent must already be
 	// findable in .idx or a drop could lose a live extent.
-	if err = w.seg.syncIdx(); err != nil {
+	if err = w.store.latency.timed(latencySync, w.seg.syncIdx); err != nil {
 		return fmt.Errorf("sync idx %d: %w", w.ext.SegNum, err)
 	}
 
