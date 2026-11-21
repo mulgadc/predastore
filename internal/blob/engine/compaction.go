@@ -712,32 +712,31 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 		return stats, fmt.Errorf("scan idx %d: %w", num, err)
 	}
 
+	unresolved := 0
 	for _, e := range entries {
-		badgerKey, raw, cur, err := store.rowAt(e.Key, num, e.Off)
+		moved, size, err := store.relocateSlot(e.Key, num, e.Off)
 		if err != nil {
 			return stats, err
 		}
-		// A .idx row is only live if some index key still points at this exact
-		// slot; anything deleted or superseded is already dead.
-		if badgerKey == nil {
-			continue
+		switch {
+		case moved:
+			stats.extents++
+			stats.bytes += size
+		case size > 0:
+			unresolved++
 		}
-		if err := store.relocateExtent(badgerKey, e.Key, raw, cur); err != nil {
-			return stats, fmt.Errorf("relocate extent: %w", err)
-		}
-		stats.extents++
-		stats.bytes += cur.PSize
+	}
+	// A row still names a slot here after every attempt, so the segment holds
+	// data someone can read; keep it, and the next cycle tries again.
+	if unresolved > 0 {
+		return stats, fmt.Errorf("%w: segment %d, %d extents still named after relocation", errSegmentBusy, num, unresolved)
 	}
 
-	// The relocations above CAS-committed the repointed rows into badger, which
-	// runs with SyncWrites off, so they may still be only in the OS page cache.
-	// dropSegment durably unlinks the source, so without this fsync a power loss
-	// or kernel panic between the two could revert the index to a segment that is
-	// already gone. Skip it when nothing moved: an empty drop repoints nothing.
-	if stats.extents > 0 {
-		if err := store.index.Sync(); err != nil {
-			return stats, fmt.Errorf("sync index before drop %d: %w", num, err)
-		}
+	// The repoints above, and any made by an earlier pass that failed before its
+	// drop, may be only in the page cache: badger runs with SyncWrites off. The
+	// unlink is durable, so the index is synced first on every drop.
+	if err := store.syncIndex(); err != nil {
+		return stats, fmt.Errorf("sync index before drop %d: %w", num, err)
 	}
 
 	store.mutex.Lock()
@@ -758,6 +757,44 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 	return stats, store.deleteTombstones(num)
 }
 
+// relocateAttempts bounds how often one slot is re-read and re-relocated after
+// losing its swap to a concurrent commit, which moves the row it raced.
+const relocateAttempts = 3
+
+// relocateSlot relocates whichever row occupies segment num at off. A lost swap
+// means a commit moved that row, possibly into a namespace still naming this
+// slot, so the slot is read afresh and tried again. moved reports a relocation;
+// a zero size with moved false means no row names the slot any more.
+func (store *Store) relocateSlot(idxKey [36]byte, num uint64, off int64) (moved bool, size int64, err error) {
+	for range relocateAttempts {
+		badgerKey, raw, cur, err := store.rowAt(idxKey, num, off)
+		if err != nil {
+			return false, 0, err
+		}
+		// A .idx row is only live if some index key still points at this exact
+		// slot; anything deleted or superseded is already dead.
+		if badgerKey == nil {
+			return false, 0, nil
+		}
+		moved, err := store.relocateExtent(badgerKey, idxKey, raw, cur)
+		if err != nil {
+			return false, 0, fmt.Errorf("relocate extent: %w", err)
+		}
+		if moved {
+			return true, cur.PSize, nil
+		}
+		size = cur.PSize
+	}
+	badgerKey, _, _, err := store.rowAt(idxKey, num, off)
+	if err != nil {
+		return false, 0, err
+	}
+	if badgerKey == nil {
+		return false, 0, nil
+	}
+	return false, size, nil
+}
+
 // rowAt finds the index key, if any, whose extent occupies segment num at off.
 // It checks the live row, then the prepared and retained generations: a
 // prepared extent is data a commit is about to publish and a retained one is
@@ -767,57 +804,79 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 // Prepared and retained rows are keyed by epoch, so there may be several of
 // each and none can be addressed directly — hence the scan.
 func (store *Store) rowAt(idxKey [36]byte, num uint64, off int64) (badgerKey, raw []byte, ext extent, err error) {
-	value, err := store.indexGet(idxKey[:])
-	switch {
-	case err == nil:
-		cur, _, decodeErr := decodeIndexValue(value)
-		if decodeErr != nil {
-			return nil, nil, extent{}, fmt.Errorf("decode extent: %w", decodeErr)
-		}
-		if cur.SegNum == num && cur.Off == off {
-			return idxKey[:], value, cur, nil
-		}
-	case !errors.Is(err, badger.ErrKeyNotFound):
-		return nil, nil, extent{}, fmt.Errorf("get extent: %w", err)
-	}
-
-	for _, prefix := range [][]byte{preparedScan(idxKey[:]), retainedScan(idxKey[:])} {
-		var (
-			found    []byte
-			foundRaw []byte
-			foundExt extent
-		)
-		scanErr := store.indexScan(prefix, func(k, v []byte) error {
-			if found != nil || len(k) != len(prefix)+8 {
-				return nil
-			}
-			cur, _, decodeErr := decodeIndexValue(v)
+	// One snapshot for all three namespaces, so a commit moving a row between
+	// them mid-lookup cannot hide it from every one.
+	err = store.index.View(func(txn *badger.Txn) error {
+		value, err := readRaw(txn, idxKey[:])
+		switch {
+		case err == nil:
+			cur, _, decodeErr := decodeIndexValue(value)
 			if decodeErr != nil {
 				return fmt.Errorf("decode extent: %w", decodeErr)
 			}
 			if cur.SegNum == num && cur.Off == off {
-				found = append([]byte(nil), k...)
-				foundRaw = append([]byte(nil), v...)
-				foundExt = cur
+				badgerKey, raw, ext = idxKey[:], value, cur
+				return nil
 			}
-			return nil
-		})
-		if scanErr != nil {
-			return nil, nil, extent{}, scanErr
+		case !errors.Is(err, badger.ErrKeyNotFound):
+			return fmt.Errorf("get extent: %w", err)
 		}
-		if found != nil {
-			return found, foundRaw, foundExt, nil
+
+		for _, prefix := range [][]byte{preparedScan(idxKey[:]), retainedScan(idxKey[:])} {
+			found, err := scanRowAt(txn, prefix, num, off)
+			if err != nil {
+				return err
+			}
+			if found != nil {
+				badgerKey, raw, ext = found.key, found.raw, found.ext
+				return nil
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, extent{}, err
+	}
+	return badgerKey, raw, ext, nil
+}
+
+type slotRow struct {
+	key, raw []byte
+	ext      extent
+}
+
+// scanRowAt returns the epoch-keyed row under prefix whose extent occupies
+// segment num at off, or nil.
+func scanRowAt(txn *badger.Txn, prefix []byte, num uint64, off int64) (*slotRow, error) {
+	opts := badger.DefaultIteratorOptions
+	opts.Prefix = prefix
+	it := txn.NewIterator(opts)
+	defer it.Close()
+	for it.Rewind(); it.Valid(); it.Next() {
+		item := it.Item()
+		if len(item.Key()) != len(prefix)+8 {
+			continue
+		}
+		v, err := item.ValueCopy(nil)
+		if err != nil {
+			return nil, err
+		}
+		cur, _, err := decodeIndexValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("decode extent: %w", err)
+		}
+		if cur.SegNum == num && cur.Off == off {
+			return &slotRow{key: item.KeyCopy(nil), raw: v, ext: cur}, nil
 		}
 	}
-
-	return nil, nil, extent{}, nil
+	return nil, nil
 }
 
 // relocateExtent moves an extent into the active append segment and repoints
 // the index at it, unless a concurrent overwrite or delete of the same key gets
-// there first. badgerKey is the row being repointed, which is the live row or
-// the prepared one; idxKey is always the 36-byte form the sidecar records.
-func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []byte, old extent) error {
+// there first, which moved reports as false. badgerKey is the live, prepared or
+// retained row; idxKey is always the 36-byte form the sidecar records.
+func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []byte, old extent) (moved bool, err error) {
 	fragCount := uint64(old.PSize / totalFragSize) //nolint:gosec // PSize is a non-negative multiple of totalFragSize.
 
 	store.mutex.Lock()
@@ -826,7 +885,7 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 	srcSeg, err := store.getSegment(old.SegNum, false)
 	if err != nil {
 		store.mutex.Unlock()
-		return fmt.Errorf("get source segment %d: %w", old.SegNum, err)
+		return false, fmt.Errorf("get source segment %d: %w", old.SegNum, err)
 	}
 	srcSeg.addRef()
 
@@ -834,7 +893,7 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 	if err != nil {
 		srcSeg.releaseRef()
 		store.mutex.Unlock()
-		return fmt.Errorf("reserve destination: %w", err)
+		return false, fmt.Errorf("reserve destination: %w", err)
 	}
 	dstSeg.addRef()
 
@@ -846,7 +905,7 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 		srcSeg.releaseRef()
 		dstSeg.releaseRef()
 		store.mutex.Unlock()
-		return fmt.Errorf("append destination idx: %w", err)
+		return false, fmt.Errorf("append destination idx: %w", err)
 	}
 	// Copy without the mutex so compaction never stalls the write path. This is
 	// the window a racing overwrite or delete lands in.
@@ -858,19 +917,23 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 	// Verbatim is load-bearing: fragNum rides inside the copied bytes, so the
 	// nonce moves with them and is never reissued.
 	if err := copyExtent(srcSeg, old.Off, dstSeg, dstOff, old.PSize); err != nil {
-		return fmt.Errorf("copy extent bytes: %w", err)
+		return false, fmt.Errorf("copy extent bytes: %w", err)
 	}
 	if err := dstSeg.Sync(); err != nil {
-		return fmt.Errorf("sync destination segment: %w", err)
+		return false, fmt.Errorf("sync destination segment: %w", err)
 	}
 	if err := dstSeg.syncIdx(); err != nil {
-		return fmt.Errorf("sync destination idx: %w", err)
+		return false, fmt.Errorf("sync destination idx: %w", err)
+	}
+	if store.beforeRelocateSwap != nil {
+		store.beforeRelocateSwap()
 	}
 
 	// Swap onto the new slot only if the key still holds the one we copied from.
 	for {
+		var stale bool
 		err := store.index.Update(func(txn *badger.Txn) error {
-			var stale bool
+			stale = false
 			item, err := txn.Get(badgerKey)
 			switch {
 			case errors.Is(err, badger.ErrKeyNotFound):
@@ -902,9 +965,9 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("commit relocation: %w", err)
+			return false, fmt.Errorf("commit relocation: %w", err)
 		}
-		return nil
+		return !stale, nil
 	}
 }
 

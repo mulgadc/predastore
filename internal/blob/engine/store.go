@@ -91,6 +91,19 @@ type Store struct {
 	stats storeStats
 
 	closed bool
+
+	// Test hooks, nil in production: one runs between a relocation's copy and
+	// its swap, and syncIndexHook replaces the index sync before a drop.
+	beforeRelocateSwap func()
+	syncIndexHook      func() error
+}
+
+// syncIndex makes every index commit so far durable.
+func (store *Store) syncIndex() error {
+	if store.syncIndexHook != nil {
+		return store.syncIndexHook()
+	}
+	return store.index.Sync()
 }
 
 // storeStats is everything Snapshot reports that is not already a field on
