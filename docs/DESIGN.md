@@ -429,7 +429,8 @@ Routine passes are paced so reclaim does not take the foreground's latency, and 
 - **Foreground yield, off by default.** With `yield_latency_ms` set, the pass waits in 100 ms steps while the highest foreground segment read or sync latency of the last second is above it, for at most `max_yield_seconds` (default 60) per pass. Compaction's own reads and syncs are not counted.
 - **Urgent reclaim is unpaced.** A pass that starts below the nearfull watermark, or is kicked, runs without pacing or yields. A kick, or the store crossing nearfull, during a paced pass makes the rest of it unpaced and re-arms a fresh pass.
 - **The retained sweep keeps its 15 s cadence** through a long pass: it runs between copy buffers once 15 s have passed.
-- **Close** finishes the extent in flight unpaced and ends the pass at the next extent boundary, leaving the segment for a later pass.
+- **Close** finishes the extent in flight unpaced and ends the pass, leaving the segment for a later pass even when that extent was its last.
+- **Bounded waits.** One rate wait lasts at most 1 s before the pass checks free space, the full band included, and the retained sweep again.
 
 One cycle:
 
@@ -441,7 +442,7 @@ One cycle:
 
 Relocation copies extent bytes **verbatim** — `fragNum` rides inside the copied bytes, so the nonce moves with them and is never reissued — then commits the repoint only if the row still holds the extent it copied from. Losing that race strands the copy for good, since only that swap could ever have referenced it, so the loser tombstones its own copy rather than let it pad the destination segment's live count. The copy itself runs without `store.mutex`, so compaction never stalls the write path.
 
-A lost swap does not mean the slot is dead. The commit that won it can have moved the row into another namespace still naming the slot: an overwrite demotes the live row to a retained one, and a commit publishes a prepared row as live. So the slot is read again, in one snapshot across the live, prepared and retained namespaces, and relocated again under whichever row now names it, up to three times. If a row still names a slot after that, the segment is kept and the next cycle retries.
+A lost swap does not mean the slot is dead. The commit that won it can have moved the row into another namespace still naming the slot: an overwrite demotes the live row to a retained one, and a commit publishes a prepared row as live. So the slot is read again, in one snapshot across the live, prepared and retained namespaces, and relocated again under whichever row now names it, up to three times. If a row still names a slot after that, the segment is kept and the next cycle retries. A segment with a writer still open in it is deferred before its sidecar is read: the writer reserved its slot before the segment rolled and has not prepared its row yet, so enumerating it would miss that extent.
 
 The index runs with badger's sync writes off, so relocations may still be in the page cache. The index is fsynced before **every** drop, including one whose pass moved nothing because an earlier pass relocated everything and then failed: that is what stops a power loss from reverting the index to a segment that is already gone.
 
