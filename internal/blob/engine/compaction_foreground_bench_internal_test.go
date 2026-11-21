@@ -36,12 +36,7 @@ func fgBenchValue() int {
 
 func fgBenchDir(b *testing.B) string {
 	if d := os.Getenv("PREDASTORE_BENCH_DIR"); d != "" {
-		dir, err := os.MkdirTemp(d, "compaction-fg-")
-		if err != nil {
-			b.Fatalf("bench dir: %v", err)
-		}
-		b.Cleanup(func() { _ = os.RemoveAll(dir) })
-		return dir
+		b.Setenv("TMPDIR", d)
 	}
 	return b.TempDir()
 }

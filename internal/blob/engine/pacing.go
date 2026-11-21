@@ -73,10 +73,10 @@ const (
 )
 
 func (m *latencyMeter) rotate(sec int64) {
-	switch {
-	case sec == m.sec:
+	switch sec {
+	case m.sec:
 		return
-	case sec == m.sec+1:
+	case m.sec + 1:
 		m.prev = m.cur
 	default:
 		m.prev = [2]time.Duration{}
