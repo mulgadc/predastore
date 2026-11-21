@@ -125,7 +125,8 @@ func percentile(d []time.Duration, p float64) time.Duration {
 }
 
 // BenchmarkForegroundDuringCompaction reports foreground PUT and GET p50 and
-// p99, in ms, with no compaction and while one pass relocates every candidate.
+// p99, in ms, with no compaction and while one pass relocates every candidate:
+// sampling starts at the first relocation and runs until the pass ends.
 func BenchmarkForegroundDuringCompaction(b *testing.B) {
 	for _, compacting := range []bool{false, true} {
 		name := "idle"
@@ -141,8 +142,12 @@ func BenchmarkForegroundDuringCompaction(b *testing.B) {
 				st := fgBenchStore(b)
 				var wg sync.WaitGroup
 				passDone := make(chan struct{})
+				started := make(chan struct{})
 				if compacting {
+					var once sync.Once
+					st.beforeRelocateSwap = func() { once.Do(func() { close(started) }) }
 					wg.Go(func() {
+						defer once.Do(func() { close(started) })
 						defer close(passDone)
 						t0 := time.Now()
 						if err := st.compactOnce(); err != nil {
@@ -151,8 +156,11 @@ func BenchmarkForegroundDuringCompaction(b *testing.B) {
 						passes = append(passes, time.Since(t0))
 					})
 				}
+				if compacting {
+					<-started
+				}
 				b.StartTimer()
-				for i := range fgBenchOps {
+				for i := 0; compacting || i < fgBenchOps; i++ {
 					if compacting && passFinished(passDone) {
 						break
 					}

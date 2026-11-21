@@ -584,6 +584,7 @@ func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64)
 	}
 
 	seg.addRef()
+	seg.writers.Add(1)
 
 	ext := extent{
 		SegNum: store.segNum,
@@ -594,6 +595,7 @@ func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64)
 
 	idxKey := MakeKey(key, index)
 	if err := seg.appendIdx(idxEntry{Off: off, Key: [36]byte(idxKey), PSize: ext.PSize}); err != nil {
+		seg.writers.Add(-1)
 		seg.releaseRef()
 		return nil, fmt.Errorf("append idx: %w", err)
 	}

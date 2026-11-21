@@ -61,7 +61,7 @@ func (c *compactor) loop() {
 	routine := time.NewTimer(time.Until(nextCompactionStart(store.clock.Now(), store.compactionInterval, store.compactionSlot, store.compactionSlots)))
 	defer routine.Stop()
 	rearm := func() {
-		routine.Reset(time.Until(nextCompactionStart(store.clock.Now(), store.compactionInterval, store.compactionSlot, store.compactionSlots)))
+		rearmTimer(routine, time.Until(nextCompactionStart(store.clock.Now(), store.compactionInterval, store.compactionSlot, store.compactionSlots)))
 	}
 	c.lastRetained = store.clock.Now()
 
@@ -85,9 +85,23 @@ func (c *compactor) loop() {
 			c.runPass(false)
 			rearm()
 		case <-c.kick:
+			// A kicked pass can run over this node's slot; the routine pass
+			// then waits for the next one rather than starting at once.
 			c.runPass(true)
+			rearm()
 		}
 	}
+}
+
+// rearmTimer stops t, drains a fire it missed, and resets it to d.
+func rearmTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
 }
 
 // runPass runs one pass, unpaced if kicked or the store starts near full, and
@@ -634,16 +648,22 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 
 	store.recordOccupancy(dead)
 
-	store.mutex.Lock()
-
 	var candidates, dropped []uint64
 	var failed int
+	// One short locked section per segment, so foreground requests never wait
+	// behind a scan that grows with the store.
 	for num, totals := range dead {
-		if num == store.segNum {
+		store.mutex.Lock()
+		active := num == store.segNum
+		var seg *segment
+		var err error
+		if !active {
+			seg, err = store.getSegment(num, false)
+		}
+		store.mutex.Unlock()
+		if active {
 			continue
 		}
-
-		seg, err := store.getSegment(num, false)
 		if err != nil {
 			// A segment file that is not there cannot hold live data, so every
 			// tombstone naming it is dead weight. Reclaim it below, outside the
@@ -671,7 +691,6 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 			candidates = append(candidates, num)
 		}
 	}
-	store.mutex.Unlock()
 
 	for _, num := range dropped {
 		totals := dead[num]
@@ -746,6 +765,16 @@ type segmentStats struct {
 func (store *Store) compactSegment(num uint64, p *pacer) (segmentStats, error) {
 	var stats segmentStats
 
+	// A writer still open in this segment has not prepared its row yet, so the
+	// enumeration below would skip its extent and the drop would lose it.
+	store.mutex.Lock()
+	src, err := store.getSegment(num, false)
+	writing := err == nil && src.writers.Load() > 0
+	store.mutex.Unlock()
+	if writing {
+		return stats, fmt.Errorf("%w: segment %d has an open writer", errSegmentBusy, num)
+	}
+
 	entries, err := scanIdx(store.dir, num)
 	if err != nil {
 		return stats, fmt.Errorf("scan idx %d: %w", num, err)
@@ -767,6 +796,11 @@ func (store *Store) compactSegment(num uint64, p *pacer) (segmentStats, error) {
 		case size > 0:
 			unresolved++
 		}
+	}
+	// Closing: the extent in flight finished, but the segment is left for the
+	// next pass rather than dropped on the way out.
+	if p.stopped() {
+		return stats, errCompactionStopped
 	}
 	// A row still names a slot here after every attempt, so the segment holds
 	// data someone can read; keep it, and the next cycle tries again.

@@ -20,6 +20,10 @@ const (
 	// urgencyCheckInterval spaces the pass's free-space checks, each of which
 	// takes store.mutex.
 	urgencyCheckInterval = 100 * time.Millisecond
+
+	// maxPaceStep bounds one uninterrupted rate wait, so a low cap still sees a
+	// full store and keeps the retained sweep's cadence.
+	maxPaceStep = time.Second
 )
 
 // errCompactionStopped ends a pass at an extent boundary because the store is
@@ -228,7 +232,15 @@ func (p *pacer) copied(n int64) {
 		p.next = now
 	}
 	p.next = p.next.Add(time.Duration(float64(n) / float64(rate) * float64(time.Second)))
-	p.wait(p.next.Sub(now))
+	for !p.urgent {
+		left := p.next.Sub(p.clock.Now())
+		if left <= 0 {
+			return
+		}
+		p.wait(min(left, maxPaceStep))
+		p.checkUrgency()
+		p.c.maybeRetainedTick()
+	}
 }
 
 // yield waits in steps while foreground latency is over the threshold, until

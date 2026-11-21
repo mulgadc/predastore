@@ -122,6 +122,8 @@ func (w *writer) Close() (err error) {
 
 	w.closed = true
 	defer w.seg.releaseRef()
+	// After the prepare below, so a compactor that sees no writers sees its row.
+	defer w.seg.writers.Add(-1)
 	defer func() { dropFragWindow(w.held); w.held, w.buf = nil, nil }()
 
 	if w.cursor > w.flushedTo {

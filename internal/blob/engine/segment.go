@@ -174,6 +174,10 @@ type segment struct {
 	// lock is exact — no new reference can appear while it is held.
 	refs atomic.Int64
 
+	// Open writers, a subset of refs. A sealed segment gains none, so once this
+	// reads zero every row a writer will prepare in it is already in the index.
+	writers atomic.Int64
+
 	// Caches the on-disk full flag, sparing the hot Append path a ReadAt.
 	full atomic.Bool
 }
