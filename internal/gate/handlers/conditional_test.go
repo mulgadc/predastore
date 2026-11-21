@@ -81,3 +81,14 @@ func TestPreconditionHeaderForms(t *testing.T) {
 	h.Add("If-Match", `"e"`)
 	assert.Equal(t, preconditionsHold, evalPreconditions(`"e"`, true, modified, true, readPreconditions(h)))
 }
+
+// A malformed list fails either condition rather than being read as a
+// non-match, so it can never let a read or a copy through.
+// Verifies: Q-68.
+func TestPreconditionMalformedListsFail(t *testing.T) {
+	etag := `"abc"`
+	for _, list := range []string{`"x""abc"`, `"abc" "x"`, `"abc`, `"abc"x`, `"abc", "x`, `other"unterminated`, `"abc", x"y`} {
+		assert.Equal(t, preconditionFailed, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifMatch: list}), list)
+		assert.Equal(t, preconditionFailed, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifNoneMatch: list}), list)
+	}
+}

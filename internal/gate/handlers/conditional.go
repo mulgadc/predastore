@@ -52,13 +52,14 @@ const (
 
 // evalPreconditions applies S3's precedence: If-Match decides over
 // If-Unmodified-Since, and If-None-Match over If-Modified-Since. A record with
-// no ETag matches only "*", and one with no time skips the date conditions.
+// no ETag matches only "*", one with no time skips the date conditions, and a
+// malformed ETag list fails rather than being read as a non-match.
 func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModified bool, p preconditions) preconditionResult {
 	// Last-Modified is served to the second, so it is compared to the second.
 	modified = modified.Truncate(time.Second)
 
 	if p.ifMatch != "" {
-		if !etagListMatches(p.ifMatch, etag, hasETag) {
+		if matched, ok := etagListMatches(p.ifMatch, etag, hasETag); !ok || !matched {
 			return preconditionFailed
 		}
 	} else if since, err := http.ParseTime(p.ifUnmodifiedSince); err == nil && hasModified && modified.After(since) {
@@ -66,7 +67,11 @@ func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModifie
 	}
 
 	if p.ifNoneMatch != "" {
-		if etagListMatches(p.ifNoneMatch, etag, hasETag) {
+		matched, ok := etagListMatches(p.ifNoneMatch, etag, hasETag)
+		if !ok {
+			return preconditionFailed
+		}
+		if matched {
 			return preconditionNotModified
 		}
 	} else if since, err := http.ParseTime(p.ifModifiedSince); err == nil && hasModified && !modified.After(since) {
@@ -77,37 +82,44 @@ func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModifie
 }
 
 // etagListMatches reports whether any entity tag in a comma-separated list
-// names the record, quoted or not. "*" names any record that exists, and a
-// comma inside a quoted tag is part of that tag.
-func etagListMatches(list, etag string, hasETag bool) bool {
+// names the record, quoted or not, and whether the list is well formed. "*"
+// names any record that exists; a comma inside a quoted tag is part of it.
+func etagListMatches(list, etag string, hasETag bool) (matched, ok bool) {
 	want := strings.Trim(etag, `"`)
 	for rest := list; rest != ""; {
-		var tag string
-		tag, rest = nextEntityTag(rest)
-		if tag == "*" {
-			return true
+		tag, next, ok := nextEntityTag(rest)
+		if !ok {
+			return false, false
 		}
-		if hasETag && tag != "" && strings.Trim(tag, `"`) == want {
-			return true
+		if tag == "*" || (hasETag && tag != "" && strings.Trim(tag, `"`) == want) {
+			matched = true
 		}
+		rest = next
 	}
-	return false
+	return matched, true
 }
 
 // nextEntityTag splits the first entity tag off a list. A quoted tag runs to
-// its closing quote; an unquoted one, which S3 also accepts, to the next comma.
-func nextEntityTag(list string) (tag, rest string) {
+// its closing quote and must be followed by a comma or the end; an unquoted
+// one, which S3 also accepts, runs to the next comma and holds no quote.
+func nextEntityTag(list string) (tag, rest string, ok bool) {
 	list = strings.TrimLeft(list, " \t,")
-	if strings.HasPrefix(list, `"`) {
-		if end := strings.IndexByte(list[1:], '"'); end >= 0 {
-			return list[:end+2], list[end+2:]
+	if !strings.HasPrefix(list, `"`) {
+		tag, rest = list, ""
+		if end := strings.IndexByte(list, ','); end >= 0 {
+			tag, rest = list[:end], list[end:]
 		}
-		return list, ""
+		return strings.TrimSpace(tag), rest, !strings.Contains(tag, `"`)
 	}
-	if end := strings.IndexByte(list, ','); end >= 0 {
-		return strings.TrimSpace(list[:end]), list[end:]
+	end := strings.IndexByte(list[1:], '"')
+	if end < 0 {
+		return "", "", false
 	}
-	return strings.TrimSpace(list), ""
+	tag, rest = list[:end+2], strings.TrimLeft(list[end+2:], " \t")
+	if rest != "" && rest[0] != ',' {
+		return "", "", false
+	}
+	return tag, rest, true
 }
 
 // preconditionFailedMessage is S3's text for a 412.
@@ -136,4 +148,27 @@ func answerReadPreconditions(w http.ResponseWriter, r *http.Request, place Objec
 	default:
 		return false
 	}
+}
+
+// copySourcePreconditions takes the x-amz-copy-source-if-* conditions a copy
+// carries, which are evaluated against its source.
+func copySourcePreconditions(h http.Header) preconditions {
+	return preconditions{
+		ifMatch:           strings.Join(h.Values("X-Amz-Copy-Source-If-Match"), ","),
+		ifNoneMatch:       strings.Join(h.Values("X-Amz-Copy-Source-If-None-Match"), ","),
+		ifModifiedSince:   h.Get("X-Amz-Copy-Source-If-Modified-Since"),
+		ifUnmodifiedSince: h.Get("X-Amz-Copy-Source-If-Unmodified-Since"),
+	}
+}
+
+// refuseCopySource answers 412 when a copy's source conditions do not hold,
+// and reports whether it did. A copy has no 304: S3 answers 412 for both.
+func refuseCopySource(w http.ResponseWriter, r *http.Request, source ObjectToShardNodes) bool {
+	etag, hasETag := source.ETag()
+	modified, hasModified := source.ModifiedAt()
+	if evalPreconditions(etag, hasETag, modified, hasModified, copySourcePreconditions(r.Header)) == preconditionsHold {
+		return false
+	}
+	WriteS3Error(w, r, http.StatusPreconditionFailed, "PreconditionFailed", preconditionFailedMessage)
+	return true
 }

@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"context"
+	"crypto/sha256"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -37,20 +40,12 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 			return
 		}
 
-		// Same two refusals CopyObject makes, for the same reason: honouring
-		// neither silently would answer 200 to a request whose terms were
-		// ignored.
+		// Honouring a source version silently would answer 200 to a request
+		// whose terms were ignored, so it is refused.
 		if versionID != "" && versionID != "null" {
 			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
 				"Copying a specific object version is not implemented")
 			return
-		}
-		for _, h := range copySourceConditionHeaders {
-			if r.Header.Get(h) != "" {
-				WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
-					"Conditional copy requests are not implemented")
-				return
-			}
 		}
 
 		if err := model.ValidatePartNumber(partNumber); err != nil {
@@ -70,9 +65,17 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 			return
 		}
 
-		srcPlace, srcSize, err := loadPlacement(ctx, mc, ring, cfg, srcBucket, srcKey)
+		srcHash, err := copySourceHash(ctx, mc, cache, srcBucket, srcKey, versionID)
 		if err != nil {
 			HandleError(w, r, placementReadError(ctx, srcBucket, srcKey, err))
+			return
+		}
+		srcPlace, srcSize, err := loadPlacementByHash(ctx, mc, ring, cfg, srcHash)
+		if err != nil {
+			HandleError(w, r, placementReadError(ctx, srcBucket, srcKey, err))
+			return
+		}
+		if refuseCopySource(w, r, srcPlace) {
 			return
 		}
 
@@ -88,8 +91,7 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 		}
 
 		stream, err := openCopyStream(ctx, bc, cfg,
-			model.ObjectHash(srcBucket, srcKey), srcPlace,
-			handoffNode(ring, cfg, model.ObjectHash(srcBucket, srcKey)),
+			srcHash, srcPlace, handoffNode(ring, cfg, srcHash),
 			srcSize, start, partSize)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
@@ -140,4 +142,25 @@ func copySourceRange(header string, size int64) (start, end int64, err error) {
 	}
 
 	return start, end, nil
+}
+
+// copySourceHash names the record a part copy reads with at most two metadata
+// lookups: the null version, or the key's current version. A key a delete
+// marker hides has no listing key, and answers not found as S3 does.
+func copySourceHash(ctx context.Context, mc MetaClient, cache *BucketCache, bucket, key, versionID string) ([32]byte, error) {
+	if versionID == nullVersionID {
+		return model.ObjectHash(bucket, key), nil
+	}
+	status, err := objectPathVersioning(ctx, mc, cache, bucket)
+	if err != nil || status == "" {
+		return model.ObjectHash(bucket, key), err
+	}
+	data, err := metaGet(ctx, mc, model.TableObjects, objectARN(bucket, key))
+	if err != nil {
+		return [32]byte{}, err
+	}
+	if len(data) != sha256.Size {
+		return [32]byte{}, fmt.Errorf("listing key for %s/%s holds %d bytes", bucket, key, len(data))
+	}
+	return [32]byte(data), nil
 }
