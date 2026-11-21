@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -17,13 +18,20 @@ import (
 // Foreground latency while a compaction pass runs, against the same store
 // idle. fsync cost is what this measures, so point PREDASTORE_BENCH_DIR at a
 // real disk: on tmpfs both cases sync for free and show no difference.
+// PREDASTORE_BENCH_VALUE sets the foreground value size, default 64 KiB.
 const (
 	fgBenchSegSize   = 32 << 20
 	fgBenchFillValue = 256 << 10
 	fgBenchFillBytes = 192 << 20
-	fgBenchValue     = 64 << 10
 	fgBenchOps       = 150
 )
+
+func fgBenchValue() int {
+	if v, err := strconv.Atoi(os.Getenv("PREDASTORE_BENCH_VALUE")); err == nil && v > 0 {
+		return v
+	}
+	return 64 << 10
+}
 
 func fgBenchDir(b *testing.B) string {
 	if d := os.Getenv("PREDASTORE_BENCH_DIR"); d != "" {
@@ -79,7 +87,8 @@ func fgBenchStore(b *testing.B) *Store {
 	if err != nil {
 		b.Fatalf("aead: %v", err)
 	}
-	st, err := Open(fgBenchDir(b), WithFreeSpaceWatermark(0, 0), WithMaxSegSize(fgBenchSegSize), WithAEAD(aead))
+	opts := append([]Option{WithFreeSpaceWatermark(0, 0), WithMaxSegSize(fgBenchSegSize), WithAEAD(aead)}, fgBenchOptions()...)
+	st, err := Open(fgBenchDir(b), opts...)
 	if err != nil {
 		b.Fatalf("open: %v", err)
 	}
@@ -124,8 +133,8 @@ func BenchmarkForegroundDuringCompaction(b *testing.B) {
 			name = "compacting"
 		}
 		b.Run(name, func(b *testing.B) {
-			var puts, gets []time.Duration
-			body := make([]byte, fgBenchValue)
+			var puts, gets, passes []time.Duration
+			body := make([]byte, fgBenchValue())
 			_, _ = rand.Read(body)
 			for b.Loop() {
 				b.StopTimer()
@@ -135,9 +144,11 @@ func BenchmarkForegroundDuringCompaction(b *testing.B) {
 				if compacting {
 					wg.Go(func() {
 						defer close(passDone)
+						t0 := time.Now()
 						if err := st.compactOnce(); err != nil {
 							b.Errorf("compact: %v", err)
 						}
+						passes = append(passes, time.Since(t0))
 					})
 				}
 				b.StartTimer()
@@ -166,6 +177,9 @@ func BenchmarkForegroundDuringCompaction(b *testing.B) {
 			b.ReportMetric(ms(percentile(gets, 0.50)), "get-p50-ms")
 			b.ReportMetric(ms(percentile(gets, 0.99)), "get-p99-ms")
 			b.ReportMetric(float64(len(puts)), "ops")
+			if len(passes) > 0 {
+				b.ReportMetric(ms(percentile(passes, 0.50)), "pass-ms")
+			}
 		})
 	}
 }
