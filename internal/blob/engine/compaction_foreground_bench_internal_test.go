@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"io"
+	"log/slog"
 	"os"
 	"slices"
 	"strconv"
@@ -128,6 +129,10 @@ func percentile(d []time.Duration, p float64) time.Duration {
 // p99, in ms, with no compaction and while one pass relocates every candidate:
 // sampling starts at the first relocation and runs until the pass ends.
 func BenchmarkForegroundDuringCompaction(b *testing.B) {
+	// The store logs every pass; benchmark output must parse.
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.DiscardHandler))
+	b.Cleanup(func() { slog.SetDefault(prev) })
 	for _, compacting := range []bool{false, true} {
 		name := "idle"
 		if compacting {
