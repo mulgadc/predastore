@@ -422,6 +422,16 @@ That is not a rollback guarantee, and there is none. A retained row written befo
 
 Compaction is always on. Without it, overwrite and delete churn frees nothing and the store fills. The interval comes from `[compaction] interval_seconds`, defaulting to 5 minutes, and a nearfull `Append` kicks an out-of-cycle pass.
 
+Routine passes are paced so reclaim does not take the foreground's latency, and never on every node at once:
+
+- **Staggered start.** Each blob node takes a slot, its position among the cluster's blob node IDs, sorted. A routine pass starts at the next wall-clock instant aligned to the interval plus `slot × interval / slots`, so three nodes on 5 minutes start 100 s apart and a restart keeps its node's phase. The timer re-arms after each pass, so a pass longer than the interval skips to the next slot.
+- **Byte-rate cap.** `[compaction] max_bytes_per_sec`, default 64 MiB/s, paid per 256 KiB copy buffer, so a large extent is paced inside itself. Every wait runs outside `store.mutex`.
+- **Foreground yield, off by default.** With `yield_latency_ms` set, the pass waits in 100 ms steps while the highest foreground segment read or sync latency of the last second is above it, for at most `max_yield_seconds` (default 60) per pass. Compaction's own reads and syncs are not counted.
+- **Urgent reclaim is unpaced.** A pass that starts below the nearfull watermark, or is kicked, runs without pacing or yields. A kick, or the store crossing nearfull, during a paced pass makes the rest of it unpaced and re-arms a fresh pass.
+- **The retained sweep keeps its 15 s cadence** through a long pass: it runs between copy buffers once 15 s have passed.
+- **Close** finishes the extent in flight unpaced and ends the pass, leaving the segment for a later pass even when that extent was its last.
+- **Bounded waits.** One rate wait lasts at most 1 s before the pass checks free space, the full band included, and the retained sweep again.
+
 One cycle:
 
 1. Scan the tombstone namespace and sum dead bytes per segment. Keys carry no namespace prefix, so roughly one hash in 256 starts with `'d'` — the fixed tombstone width is matched before the key is trusted.
@@ -430,9 +440,11 @@ One cycle:
 4. For each candidate, walk its `.idx`, back-check each row against the index, and relocate the rows that are still live.
 5. Fsync the index, drop the segment and its sidecar, and clear its tombstones.
 
-Relocation copies extent bytes **verbatim** — `fragNum` rides inside the copied bytes, so the nonce moves with them and is never reissued — then commits the repoint only if the key still points at the extent it copied from. Losing that race strands the copy for good, since only that swap could ever have referenced it, so the loser tombstones its own copy rather than let it pad the destination segment's live count. The copy itself runs without `store.mutex`, so compaction never stalls the write path.
+Relocation copies extent bytes **verbatim** — `fragNum` rides inside the copied bytes, so the nonce moves with them and is never reissued — then commits the repoint only if the row still holds the extent it copied from. Losing that race strands the copy for good, since only that swap could ever have referenced it, so the loser tombstones its own copy rather than let it pad the destination segment's live count. The copy itself runs without `store.mutex`, so compaction never stalls the write path.
 
-The index runs with badger's sync writes off, so relocations may still be in the page cache; the explicit index fsync before a drop is what stops a power loss from reverting the index to a segment that is already gone.
+A lost swap does not mean the slot is dead. The commit that won it can have moved the row into another namespace still naming the slot: an overwrite demotes the live row to a retained one, and a commit publishes a prepared row as live. So the slot is read again, in one snapshot across the live, prepared and retained namespaces, and relocated again under whichever row now names it, up to three times. If a row still names a slot after that, the segment is kept and the next cycle retries. A segment with a writer still open in it is deferred before its sidecar is read: the writer reserved its slot before the segment rolled and has not prepared its row yet, so enumerating it would miss that extent.
+
+The index runs with badger's sync writes off, so relocations may still be in the page cache. The index is fsynced before **every** drop, including one whose pass moved nothing because an earlier pass relocated everything and then failed: that is what stops a power loss from reverting the index to a segment that is already gone.
 
 ### Persistent state
 
@@ -649,6 +661,9 @@ parity = 1
 
 # [compaction]
 # interval_seconds = 300        # zero uses the engine default; compaction is never off
+# max_bytes_per_sec = 0         # routine-pass copy cap; zero defaults to 64 MiB/s
+# yield_latency_ms  = 0         # foreground latency a routine pass yields to; zero is off
+# max_yield_seconds = 0         # most one pass yields; zero defaults to 60
 
 # [meta]                        # raft log retention on the metadata plane
 # snapshot_interval_seconds = 0 # zero defaults to 120
@@ -825,6 +840,8 @@ A meta quorum loss stops all writes and leaves reads serving whatever the surviv
 | `fragNumReservation` | 1 048 576 | fragNums per durable reservation |
 | `defaultCompactionInterval` | 5 min | Overridden by `[compaction] interval_seconds` |
 | `compactionLiveThreshold` | 0.70 | Live-byte fraction below which a segment is a candidate |
+| `DefaultCompactionMaxBytesPerSec` | 64 MiB/s | Overridden by `[compaction] max_bytes_per_sec` |
+| `DefaultCompactionMaxYield` | 60 s | Overridden by `[compaction] max_yield_seconds` |
 | `defaultNearfullFreeFrac` | 0.15 | Kicks compaction, flags pressure |
 | `defaultFullFreeFrac` | 0.05 | Rejects writes with `ErrStoreFull` |
 | `statfsThrottleInterval` | 1s | Free-space check throttle |

@@ -146,6 +146,31 @@ func TestValidate_NodeBindAddr(t *testing.T) {
 
 // TestLoad_RepairTable proves the sweep's settings survive the file, and that a
 // file saying nothing about repair leaves it off.
+func TestLoad_CompactionPacing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "s3d.toml")
+	const base = "version = 1\nregion = \"ap-southeast-2\"\n\n[rs]\ndata = 2\nparity = 1\n"
+	require.NoError(t, os.WriteFile(path, []byte(base+`
+[compaction]
+interval_seconds = 300
+max_bytes_per_sec = 16777216
+yield_latency_ms = 25
+max_yield_seconds = 30
+`), 0o600))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, int64(16<<20), cfg.Compaction.MaxBytesPerSec)
+	assert.Equal(t, 25, cfg.Compaction.YieldLatencyMs)
+	assert.Equal(t, 30, cfg.Compaction.MaxYieldSeconds)
+
+	// Absent keys are zero, which the store reads as its defaults: the cap at
+	// its default and the yield off.
+	require.NoError(t, os.WriteFile(path, []byte(base), 0o600))
+	cfg, err = Load(path)
+	require.NoError(t, err)
+	assert.Zero(t, cfg.Compaction.MaxBytesPerSec)
+	assert.Zero(t, cfg.Compaction.YieldLatencyMs)
+}
+
 func TestLoad_RepairTable(t *testing.T) {
 	write := func(t *testing.T, body string) string {
 		t.Helper()

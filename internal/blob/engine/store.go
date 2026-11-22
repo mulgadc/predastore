@@ -66,6 +66,19 @@ type Store struct {
 	retainedMaxAge     time.Duration
 	compactor          *compactor
 
+	// This node's slot among the cluster's blob nodes, which offsets its
+	// routine passes, and the pacing a routine pass runs under.
+	compactionSlot           int
+	compactionSlots          int
+	compactionMaxBytesPerSec int64
+	compactionYieldLatency   time.Duration
+	compactionMaxYield       time.Duration
+
+	// Foreground read and sync latency, kept only when the yield is on.
+	latency *latencyMeter
+
+	clock clock
+
 	// Where the next orphaned-release sweep resumes; nil starts at the front.
 	orphanMu     sync.Mutex
 	orphanCursor []byte
@@ -91,6 +104,19 @@ type Store struct {
 	stats storeStats
 
 	closed bool
+
+	// Test hooks, nil in production: one runs between a relocation's copy and
+	// its swap, and syncIndexHook replaces the index sync before a drop.
+	beforeRelocateSwap func()
+	syncIndexHook      func() error
+}
+
+// syncIndex makes every index commit so far durable.
+func (store *Store) syncIndex() error {
+	if store.syncIndexHook != nil {
+		return store.syncIndexHook()
+	}
+	return store.index.Sync()
 }
 
 // storeStats is everything Snapshot reports that is not already a field on
@@ -176,6 +202,45 @@ func WithCompaction(interval time.Duration) Option {
 	}
 }
 
+// WithCompactionSlot places this node at slot of slots, so routine passes on
+// a cluster's nodes start interval/slots apart. Out of range means slot 0 of 1.
+func WithCompactionSlot(slot, slots int) Option {
+	return func(s *Store) error {
+		if slots < 1 || slot < 0 || slot >= slots {
+			return fmt.Errorf("compaction slot %d of %d out of range", slot, slots)
+		}
+		s.compactionSlot, s.compactionSlots = slot, slots
+		return nil
+	}
+}
+
+// WithCompactionPacing sets a routine pass's copy rate cap, the foreground
+// latency above which it yields (zero disables the yield), and the most one
+// pass may yield. A non-positive cap or yield budget keeps its default.
+func WithCompactionPacing(maxBytesPerSec int64, yieldLatency, maxYield time.Duration) Option {
+	return func(s *Store) error {
+		if maxBytesPerSec > 0 {
+			s.compactionMaxBytesPerSec = maxBytesPerSec
+		}
+		if yieldLatency < 0 {
+			return fmt.Errorf("compaction yield latency %v is negative", yieldLatency)
+		}
+		s.compactionYieldLatency = yieldLatency
+		if maxYield > 0 {
+			s.compactionMaxYield = maxYield
+		}
+		return nil
+	}
+}
+
+// withClock injects the time source pacing uses. Tests only.
+func withClock(c clock) Option {
+	return func(s *Store) error {
+		s.clock = c
+		return nil
+	}
+}
+
 // WithRetainedMaxAge overrides how long a superseded generation stays
 // answerable. A non-positive duration keeps the default. It exists so a test
 // can reach the far side of the window without waiting out wall-clock time.
@@ -234,12 +299,20 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		retainedMaxAge:     retainedMaxAge,
 		nearfullFreeFrac:   defaultNearfullFreeFrac,
 		fullFreeFrac:       defaultFullFreeFrac,
+
+		compactionSlots:          1,
+		compactionMaxBytesPerSec: DefaultCompactionMaxBytesPerSec,
+		compactionMaxYield:       DefaultCompactionMaxYield,
+		clock:                    wallClock{},
 	}
 
 	for _, opt := range opts {
 		if err := opt(store); err != nil {
 			return nil, err
 		}
+	}
+	if store.compactionYieldLatency > 0 {
+		store.latency = &latencyMeter{clock: store.clock}
 	}
 
 	if store.aead == nil {
@@ -457,6 +530,7 @@ func (store *Store) lookup(rowKey []byte, key [32]byte, index uint32) (Reader, e
 		ext:     ext,
 		buf:     buf,
 		held:    held,
+		latency: store.latency,
 	}, nil
 }
 
@@ -510,6 +584,7 @@ func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64)
 	}
 
 	seg.addRef()
+	seg.writers.Add(1)
 
 	ext := extent{
 		SegNum: store.segNum,
@@ -520,6 +595,7 @@ func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64)
 
 	idxKey := MakeKey(key, index)
 	if err := seg.appendIdx(idxEntry{Off: off, Key: [36]byte(idxKey), PSize: ext.PSize}); err != nil {
+		seg.writers.Add(-1)
 		seg.releaseRef()
 		return nil, fmt.Errorf("append idx: %w", err)
 	}
