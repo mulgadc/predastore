@@ -127,6 +127,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 	txn := f.db.NewTransaction(true)
 	commit := func() {
 		if err := f.commitBatch(txn); err != nil {
+			//nolint:forbidigo // A part-applied commit cannot be answered; restart rebuilds the store from the log.
 			panic(fmt.Sprintf("meta: committing applied entries %d-%d failed; stopping so the log rebuilds the store: %v",
 				logs[0].Index, logs[len(logs)-1].Index, err))
 		}

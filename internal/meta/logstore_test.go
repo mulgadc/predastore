@@ -19,7 +19,7 @@ func writtenBytes(t *testing.T) int64 {
 	t.Helper()
 	raw, err := os.ReadFile("/proc/self/io")
 	require.NoError(t, err)
-	for _, line := range strings.Split(string(raw), "\n") {
+	for line := range strings.SplitSeq(string(raw), "\n") {
 		if v, ok := strings.CutPrefix(line, "wchar:"); ok {
 			n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 			require.NoError(t, err)

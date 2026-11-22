@@ -69,9 +69,7 @@ func BenchmarkMetaApply(b *testing.B) {
 				// same on every host rather than scaled by GOMAXPROCS.
 				var wg sync.WaitGroup
 				for range callers {
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
+					wg.Go(func() {
 						for {
 							i := n.Add(1)
 							if i > uint64(b.N) {
@@ -83,7 +81,7 @@ func BenchmarkMetaApply(b *testing.B) {
 								return
 							}
 						}
-					}()
+					})
 				}
 				wg.Wait()
 			})
