@@ -211,8 +211,8 @@ It applies to every principal, including a configured service account that skips
 On these requests the gate also supplies `aws:PrincipalArn`, a user's ARN or a role session's role ARN, the only key a statement can use to name a user or role.
 A policy the gate would not enforce as written (it does not parse, names a user or role as `Principal`, or has an operand or variable the evaluator cannot read) closes the connection, as an unknown version does.
 
-The two sides are released independently, so the proxy chooses the version for each new session from the cluster feature level, which reports this listener only once every gate serves it.
-Rolling a gate back below the listener is safe only after the feature level's drain check reports no endpoint in use; until then the proxy keeps opening sessions to gates that would refuse them.
+The two sides are released independently, so the cluster feature level reports this listener only once every gate reads version 2, and an endpoint exists only at that level; the proxy then sends version 2 on every session.
+Rolling a gate back below the listener is safe only after the feature level's drain check reports no endpoint in use.
 The contract is retired by removing the version from both sides after the feature level that introduced its successor is finalised.
 
 ## S3 surface
@@ -640,6 +640,8 @@ Standalone operators must install the cluster CA into the host trust store befor
 - **Config-defined accounts** in `[[auth]]` are trusted service accounts: the policy table is only consulted for IAM accounts. Each must carry an `account_id`, so buckets it creates land with a real owner.
 - **IAM via NATS JetStream KV**, when `[iam]` is configured: access keys, users, roles and policies are read from KV buckets and layered over the config accounts through a chain provider. Predastore serves S3 over HTTP and does not subscribe to any NATS request topic; KV is the only thing NATS is used for.
 - **Bucket ownership** is checked cross-account after policy evaluation.
+- **Copy sources** are authorized as reads: `CopyObject` and `UploadPartCopy` need `s3:GetObject` on the source, or `s3:GetObjectVersion` when it names a version, under identity policy, the source bucket's ownership and any endpoint policy, as on AWS.
+- **Multipart operations** carry their own actions where AWS names one: `s3:ListMultipartUploadParts`, `s3:AbortMultipartUpload` and `s3:ListBucketMultipartUploads`.
 - **Public buckets** short-circuit authentication for GET and HEAD only; everything else still requires a signature, and listing buckets is never public.
 
 ## Rate limiting

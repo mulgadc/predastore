@@ -51,6 +51,7 @@ var bucketSubResourceActions = map[string]map[string]string{
 		"tagging":    "s3:GetBucketTagging",
 		"versioning": "s3:GetBucketVersioning",
 		"versions":   "s3:ListBucketVersions",
+		"uploads":    "s3:ListBucketMultipartUploads",
 	},
 	http.MethodPut: {
 		"tagging":    "s3:PutBucketTagging",
@@ -85,6 +86,17 @@ func s3Action(r *http.Request, bucket, key string) string {
 	if !hasKey && bucket != "" {
 		if action := bucketSubResourceAction(r); action != "" {
 			return action
+		}
+	}
+
+	// Listing an upload's parts and aborting it are actions of their own on AWS,
+	// so a deny on either is not escaped through the object action.
+	if hasKey && r.URL.Query().Has("uploadId") {
+		switch r.Method {
+		case http.MethodGet:
+			return "s3:ListMultipartUploadParts"
+		case http.MethodDelete:
+			return "s3:AbortMultipartUpload"
 		}
 	}
 

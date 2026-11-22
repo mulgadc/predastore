@@ -41,6 +41,16 @@ func (e endpointIdentity) allows(action, resource string, keys iampolicy.Conditi
 	return action != "" && iampolicy.EvaluateEndpointPolicy(action, resource, *e.policy, keys) == iampolicy.Allow
 }
 
+// permits is allows, logging a refusal.
+func (e endpointIdentity) permits(ctx context.Context, action, resource string, keys iampolicy.ConditionKeys) bool {
+	if e.allows(action, resource, keys) {
+		return true
+	}
+	slog.DebugContext(ctx, "S3 access denied by endpoint policy",
+		"action", action, "resource", resource, "vpce_id", e.VpceID)
+	return false
+}
+
 // endpointFrom returns the endpoint a request arrived through, if any.
 func endpointFrom(ctx context.Context) (endpointIdentity, bool) {
 	e, ok := ctx.Value(endpointCtxKey{}).(endpointIdentity)

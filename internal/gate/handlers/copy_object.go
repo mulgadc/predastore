@@ -40,7 +40,7 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			return
 		}
 
-		srcBucket, srcKey, versionID, err := parseCopySource(r.Header.Get("X-Amz-Copy-Source"))
+		srcBucket, srcKey, versionID, err := ParseCopySource(r.Header.Get("X-Amz-Copy-Source"))
 		if err != nil {
 			HandleError(w, r, err)
 			return
@@ -202,10 +202,10 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 	})
 }
 
-// parseCopySource splits and URL-decodes an x-amz-copy-source header into the
+// ParseCopySource splits and URL-decodes an x-amz-copy-source header into the
 // bucket and key it names, and the version id if one was given. The query is
 // cut off before decoding, so an encoded ? in the key stays part of the key.
-func parseCopySource(raw string) (bucket, key, versionID string, err error) {
+func ParseCopySource(raw string) (bucket, key, versionID string, err error) {
 	if raw == "" {
 		return "", "", "", model.NewS3Error(model.ErrInvalidArgument, "x-amz-copy-source header is required", 400)
 	}

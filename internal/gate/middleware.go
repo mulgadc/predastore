@@ -230,22 +230,6 @@ func (s *Server) publicOwnerActive(w http.ResponseWriter, r *http.Request, bucke
 	return s.accountActive(w, r, meta.AccountID, true)
 }
 
-// anonymousEndpointAllows reports whether an unsigned request's endpoint, if it
-// came through one, permits it.
-func anonymousEndpointAllows(r *http.Request, bucket, key string) bool {
-	endpoint, ok := endpointFrom(r.Context())
-	if !ok {
-		return true
-	}
-	action, resource := s3Action(r, bucket, key), s3Resource(bucket, key)
-	if endpoint.allows(action, resource, conditionKeys(r, action, &auth.CredentialResult{})) {
-		return true
-	}
-	slog.DebugContext(r.Context(), "S3 anonymous access denied by endpoint policy",
-		"action", action, "resource", resource, "vpce_id", endpoint.VpceID)
-	return false
-}
-
 // sigV4AuthMiddleware authenticates and authorizes incoming S3 requests:
 // public-bucket short-circuit, SigV4 verify, IAM policy eval, and
 // cross-account bucket-ownership check.
@@ -273,7 +257,9 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 					}
 					// An endpoint policy holds an anonymous caller too, who carries
 					// no principal keys, so one naming a principal grants it nothing.
-					if !anonymousEndpointAllows(r, bucket, key) {
+					endpoint, _ := endpointFrom(r.Context())
+					action := s3Action(r, bucket, key)
+					if !endpoint.permits(r.Context(), action, s3Resource(bucket, key), conditionKeys(r, action, &auth.CredentialResult{})) {
 						handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 						return
 					}
@@ -312,36 +298,22 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		action := s3Action(r, bucket, key)
 		resource := s3Resource(bucket, key)
+		// The endpoint policy is a second gate on every request through an endpoint,
+		// a service account's included, as AWS applies it to every principal. The
+		// zero identity, off an endpoint, permits everything.
+		endpoint, _ := endpointFrom(r.Context())
+		keys := conditionKeys(r, action, credResult)
 		// The batch delete names its keys in the body, which is not read here,
 		// so the handler authorizes each key through this instead.
-		authorize := handlers.ObjectAuthorizer(func(string, string) bool { return true })
+		authorize := handlers.ObjectAuthorizer(func(objectAction, objectKey string) bool {
+			return endpoint.permits(r.Context(), objectAction, s3Resource(bucket, objectKey), keys)
+		})
 
 		// Only protected control-plane accounts skip admission; any other account,
 		// including one selected by a configured credential, must be ACTIVE.
 		if (!credResult.SkipPolicyCheck || !auth.ProtectedAccount(credResult.AccountID)) &&
 			!s.accountActive(w, r, credResult.AccountID, false) {
 			return
-		}
-
-		// The endpoint policy is a second gate on every request through an endpoint,
-		// a service account's included, as AWS applies it to every principal.
-		endpoint, viaEndpoint := endpointFrom(r.Context())
-		var keys iampolicy.ConditionKeys
-		if viaEndpoint || !credResult.SkipPolicyCheck {
-			keys = conditionKeys(r, action, credResult)
-		}
-		endpointAllows := func(objectAction, objectResource string) bool {
-			if !viaEndpoint || endpoint.allows(objectAction, objectResource, keys) {
-				return true
-			}
-			slog.DebugContext(r.Context(), "S3 access denied by endpoint policy",
-				"action", objectAction, "resource", objectResource, "vpce_id", endpoint.VpceID)
-			return false
-		}
-		if viaEndpoint {
-			authorize = func(objectAction, objectKey string) bool {
-				return endpointAllows(objectAction, s3Resource(bucket, objectKey))
-			}
 		}
 
 		// IAM policy evaluation (NATS-sourced credentials only). Config-defined service
@@ -365,7 +337,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 						"action", objectAction, "resource", objectResource, "accessKeyID", accessKey)
 					return false
 				}
-				return endpointAllows(objectAction, objectResource)
+				return endpoint.permits(r.Context(), objectAction, objectResource, keys)
 			}
 			if !isBulkDelete(r, key) && iampolicy.EvaluateWithKeys(action, resource, credResult.PolicyDocuments, keys) == iampolicy.Deny {
 				slog.DebugContext(r.Context(), "S3 access denied by policy",
@@ -375,7 +347,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if !isBulkDelete(r, key) && !endpointAllows(action, resource) {
+		if !isBulkDelete(r, key) && !endpoint.permits(r.Context(), action, resource, keys) {
 			handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 			return
 		}
@@ -418,6 +390,10 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
+		if key != "" && !s.copySourceReadable(w, r, credResult, endpoint, keys) {
+			return
+		}
+
 		ctx := context.WithValue(r.Context(), auth.ContextKeyAccessKeyID, accessKey)
 		ctx = context.WithValue(ctx, auth.ContextKeyAccountID, credResult.AccountID)
 		ctx = context.WithValue(ctx, auth.ContextKeyServiceAccount, credResult.SkipPolicyCheck)
@@ -430,6 +406,55 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		annotateSpanAccount(ctx, credResult.AccountID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// copySourceReadable authorizes the source a CopyObject or UploadPartCopy reads,
+// as AWS does: s3:GetObject, or s3:GetObjectVersion for a named version, under
+// identity policy, the source bucket's ownership and the endpoint policy.
+func (s *Server) copySourceReadable(w http.ResponseWriter, r *http.Request, cred *auth.CredentialResult,
+	endpoint endpointIdentity, keys iampolicy.ConditionKeys) bool {
+	raw := r.Header.Get("X-Amz-Copy-Source")
+	if r.Method != http.MethodPut || raw == "" {
+		return true
+	}
+	// The handler parses the same header and refuses a malformed one.
+	bucket, key, versionID, err := handlers.ParseCopySource(raw)
+	if err != nil {
+		return true
+	}
+	action := "s3:GetObject"
+	if versionID != "" {
+		action = "s3:GetObjectVersion"
+	}
+	resource := s3Resource(bucket, key)
+	if !cred.SkipPolicyCheck && iampolicy.EvaluateWithKeys(action, resource, cred.PolicyDocuments, keys) != iampolicy.Allow {
+		slog.DebugContext(r.Context(), "S3 copy source denied by policy",
+			"action", action, "resource", resource, "accountID", cred.AccountID)
+		handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
+		return false
+	}
+	if !endpoint.permits(r.Context(), action, resource, keys) {
+		handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
+		return false
+	}
+	meta, err := handlers.ResolveBucketMetadata(r.Context(), s.cfg.Meta, s.handlerCfg, bucket)
+	if err != nil {
+		slog.ErrorContext(r.Context(), "Failed to resolve copy source bucket metadata", "bucket", bucket, "error", err)
+		handlers.WriteS3Error(w, r, http.StatusInternalServerError, "InternalError", "An internal error occurred")
+		return false
+	}
+	// An unknown source bucket is left to the handler, which answers NoSuchBucket.
+	if meta == nil {
+		return true
+	}
+	if !bucketAccessAllowed(http.MethodGet, cred.AccountID, meta, cred.SkipPolicyCheck) {
+		slog.WarnContext(r.Context(), "Cross-account copy source denied",
+			"callerAccountID", cred.AccountID, "bucketAccountID", meta.AccountID, "bucket", bucket)
+		handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
+		return false
+	}
+	return cred.SkipPolicyCheck || meta.AccountID == "" || meta.AccountID == cred.AccountID ||
+		s.accountActive(w, r, meta.AccountID, true)
 }
 
 // restoreTransferEncoding puts back the Transfer-Encoding header net/http moves

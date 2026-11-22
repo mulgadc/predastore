@@ -91,7 +91,7 @@ func TestConditionKeys_EveryEmittedKeyIsUsableInAPolicy(t *testing.T) {
 	for key, source := range emittedKeys(t) {
 		supported := false
 		for _, op := range allOperators {
-			if iampolicy.SupportedCondition(op, key) || iampolicy.SupportedEndpointCondition(op, key) {
+			if iampolicy.SupportedEndpointCondition(op, key) {
 				supported = true
 				break
 			}

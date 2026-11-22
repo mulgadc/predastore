@@ -31,6 +31,13 @@ func TestS3Action(t *testing.T) {
 		{"PUT", "/my-bucket", "my-bucket", "", "s3:CreateBucket"},
 		{"PUT", "/my-bucket/key.txt", "my-bucket", "key.txt", "s3:PutObject"},
 		{"POST", "/my-bucket/key.txt?uploads", "my-bucket", "key.txt", "s3:PutObject"},
+		// The multipart operations AWS names on their own: a deny on listing parts,
+		// aborting or listing uploads is not escaped through the object action.
+		{"GET", "/my-bucket/key.txt?uploadId=u", "my-bucket", "key.txt", "s3:ListMultipartUploadParts"},
+		{"DELETE", "/my-bucket/key.txt?uploadId=u", "my-bucket", "key.txt", "s3:AbortMultipartUpload"},
+		{"GET", "/my-bucket?uploads", "my-bucket", "", "s3:ListBucketMultipartUploads"},
+		{"PUT", "/my-bucket/key.txt?partNumber=1&uploadId=u", "my-bucket", "key.txt", "s3:PutObject"},
+		{"POST", "/my-bucket/key.txt?uploadId=u", "my-bucket", "key.txt", "s3:PutObject"},
 		{"DELETE", "/my-bucket", "my-bucket", "", "s3:DeleteBucket"},
 		{"DELETE", "/my-bucket/key.txt", "my-bucket", "key.txt", "s3:DeleteObject"},
 		{"PATCH", "/my-bucket/key.txt", "my-bucket", "key.txt", ""},

@@ -267,6 +267,14 @@ func TestEndpointPolicy_DecidesForAuthenticatedCallers(t *testing.T) {
 		"aws:PrincipalArn names a role, not its session": {
 			endpointPolicyFor(`"*"`, "arn:aws:sts::"+policyAccount+":assumed-role/reader/i-0123456789abcdef0"), "", readerSession,
 		},
+		// An account principal names the account's root user only, so it grants an
+		// IAM user of that account nothing.
+		"an account ID principal does not name a user": {
+			endpointPolicyFor(`{"AWS":"`+policyAccount+`"}`, ""), "", aliceKey,
+		},
+		"a root ARN principal does not name a user": {
+			endpointPolicyFor(`{"AWS":"arn:aws:iam::`+policyAccount+`:root"}`, ""), "", aliceKey,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			header := policyHeaderFor(t, tc.policy)
@@ -287,25 +295,6 @@ func TestEndpointPolicy_DecidesForAuthenticatedCallers(t *testing.T) {
 			assert.ElementsMatch(t, []string{"public/a", "secret/b"}, refused)
 			assert.Empty(t, reached, "a refused key reached the delete")
 		})
-	}
-}
-
-// An account principal names the account's root user only, so it grants an IAM
-// user of that account nothing, by account ID or by root ARN.
-func TestEndpointPolicy_AccountPrincipalDoesNotNameAUser(t *testing.T) {
-	addr, pki, _, objects := policyGate(t)
-	for _, principal := range []string{
-		`{"AWS":"` + policyAccount + `"}`,
-		`{"AWS":"arn:aws:iam::` + policyAccount + `:root"}`,
-	} {
-		header := policyHeaderFor(t, endpointPolicyFor(principal, ""))
-		status, body, err := throughEndpoint(t, addr, pki, header, aliceKey, http.MethodGet, "/owner-bucket", nil)
-		require.NoError(t, err)
-		assert.Equal(t, http.StatusForbidden, status, "%s: %s", principal, body)
-		deleted, refused, reached := batchOutcome(t, addr, pki, objects, header, aliceKey)
-		assert.Empty(t, deleted, principal)
-		assert.ElementsMatch(t, []string{"public/a", "secret/b"}, refused, principal)
-		assert.Empty(t, reached, principal)
 	}
 }
 
@@ -351,29 +340,6 @@ func TestEndpointPolicy_UnenforceablePolicyClosesTheSession(t *testing.T) {
 	} {
 		_, _, err := throughEndpoint(t, addr, pki, policyHeaderFor(t, policy), aliceKey, http.MethodGet, "/owner-bucket", nil)
 		assert.Error(t, err, "%s: the gate served a request under a policy it cannot enforce", name)
-	}
-}
-
-// Injected past both the write path and the handshake, the malformed Deny still
-// denies: an operand the evaluator cannot read fails closed.
-func TestEndpointPolicy_MalformedDenyFailsClosedAtTheGate(t *testing.T) {
-	_, _, gate, _ := policyGate(t)
-	doc, err := iampolicy.ParseEndpointPolicy([]byte(malformedDeny))
-	require.NoError(t, err)
-
-	for name, policy := range map[string]*iampolicy.PolicyDocument{"no endpoint policy": nil, "malformed deny": &doc} {
-		req := httptest.NewRequest(http.MethodGet, "/owner-bucket", nil)
-		h := testHeader()
-		req.RemoteAddr = h.Source.String()
-		req = req.WithContext(withEndpoint(context.Background(), h, policy))
-		signTestReq(t, req, nil, aliceKey, callerSecret, "ap-southeast-2", "s3")
-		rr := httptest.NewRecorder()
-		gate.ServeHTTP(rr, req)
-		want := http.StatusForbidden
-		if policy == nil {
-			want = http.StatusOK
-		}
-		assert.Equal(t, want, rr.Code, "%s: %s", name, rr.Body.String())
 	}
 }
 

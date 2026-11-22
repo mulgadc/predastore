@@ -24,7 +24,7 @@ func TestParseCopySource(t *testing.T) {
 		{"/src/a%20b?versionId=abc", "src", "a b", "abc"},
 	} {
 		t.Run(tc.raw, func(t *testing.T) {
-			bucket, key, versionID, err := parseCopySource(tc.raw)
+			bucket, key, versionID, err := ParseCopySource(tc.raw)
 			require.NoError(t, err)
 			assert.Equal(t, tc.bucket, bucket)
 			assert.Equal(t, tc.key, key)
@@ -36,7 +36,7 @@ func TestParseCopySource(t *testing.T) {
 func TestParseCopySourceRejects(t *testing.T) {
 	for _, raw := range []string{"", "/src", "/src/", "/src/bad%zz", "/src/a?versionId=%zz"} {
 		t.Run(raw, func(t *testing.T) {
-			_, _, _, err := parseCopySource(raw)
+			_, _, _, err := ParseCopySource(raw)
 			assert.Error(t, err)
 		})
 	}
