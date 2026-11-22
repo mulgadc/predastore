@@ -160,6 +160,10 @@ var openFile = func(path string, create bool) (file, error) {
 	return os.OpenFile(path, flags, 0600)
 }
 
+// removeFile unlinks a dropped segment's files. On ext4 it frees every extent
+// before returning, seconds for a sealed segment; tests override it to hold it.
+var removeFile = os.Remove
+
 // segment is an open segment file handle with a reference count.
 type segment struct {
 	file // .seg
@@ -239,10 +243,10 @@ func (store *Store) dropSegment(num uint64) error {
 	if err := seg.idx.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close idx %d: %w", num, err))
 	}
-	if err := os.Remove(filepath.Join(store.dir, fmt.Sprintf(segFilename, num))); err != nil {
+	if err := removeFile(filepath.Join(store.dir, fmt.Sprintf(segFilename, num))); err != nil {
 		errs = append(errs, fmt.Errorf("unlink segment %d: %w", num, err))
 	}
-	if err := os.Remove(filepath.Join(store.dir, fmt.Sprintf(idxSegFilename, num))); err != nil {
+	if err := removeFile(filepath.Join(store.dir, fmt.Sprintf(idxSegFilename, num))); err != nil {
 		errs = append(errs, fmt.Errorf("unlink idx %d: %w", num, err))
 	}
 	return errors.Join(errs...)
