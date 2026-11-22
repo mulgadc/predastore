@@ -197,13 +197,22 @@ The codec is `endpointproxy`, which both import, so the two sides cannot disagre
 | `0xEA` subtype `0x01` | the `vpce-` ID, AWS's own `PP2_TYPE_AWS` / `PP2_SUBTYPE_AWS_VPCE_ID` |
 | `0xE1` | the VPC ID |
 | `0xE2` | the endpoint owner's 12-digit account |
+| `0xE3` | version 2 only: the policy generation, 8 bytes big-endian, never zero |
+| `0xE4` | version 2 only: the endpoint policy document, 1 to 20,480 bytes |
 
-The header is at most 32 KiB, every TLV is required exactly once, and unknown TLV types are skipped so a later version can add optional fields.
+The header is at most 32 KiB, every TLV its version defines is required exactly once, and unknown TLV types are skipped so a later version can add optional fields.
+A version 1 header carrying either policy TLV is refused.
 A version this gate does not speak closes the connection and logs `unsupported_version`; it is never served under a guessed identity.
 
-The listener speaks contract version 1.
-The two sides are released independently, so the proxy chooses the version for each new session from the cluster feature level, which reports this listener only once every gate serves it.
-Rolling a gate back below the listener is safe only after the feature level's drain check reports no endpoint in use; until then the proxy keeps opening sessions to gates that would refuse them.
+The listener speaks contract versions 1 and 2.
+A version 1 session is the endpoint's default policy, which allows everything, so only identity policy decides.
+A version 2 session carries the endpoint policy, parsed once per connection and evaluated as a second gate: a request is served only if identity policy and the endpoint policy both allow it, at the request check and for each key of a `DeleteObjects` batch.
+It applies to every principal, including a configured service account that skips identity policy, as AWS applies an endpoint policy to every caller.
+On these requests the gate also supplies `aws:PrincipalArn`, a user's ARN or a role session's role ARN, the only key a statement can use to name a user or role.
+A policy the gate would not enforce as written (it does not parse, names a user or role as `Principal`, or has an operand or variable the evaluator cannot read) closes the connection, as an unknown version does.
+
+The two sides are released independently, so the cluster feature level reports this listener only once every gate reads version 2, and an endpoint exists only at that level; the proxy then sends version 2 on every session.
+Rolling a gate back below the listener is safe only after the feature level's drain check reports no endpoint in use.
 The contract is retired by removing the version from both sides after the feature level that introduced its successor is finalised.
 
 ## S3 surface
@@ -637,6 +646,8 @@ Standalone operators must install the cluster CA into the host trust store befor
 - **Config-defined accounts** in `[[auth]]` are trusted service accounts: the policy table is only consulted for IAM accounts. Each must carry an `account_id`, so buckets it creates land with a real owner.
 - **IAM via NATS JetStream KV**, when `[iam]` is configured: access keys, users, roles and policies are read from KV buckets and layered over the config accounts through a chain provider. Predastore serves S3 over HTTP and does not subscribe to any NATS request topic; KV is the only thing NATS is used for.
 - **Bucket ownership** is checked cross-account after policy evaluation.
+- **Copy sources** are authorized as reads: `CopyObject` and `UploadPartCopy` need `s3:GetObject` on the source, or `s3:GetObjectVersion` when it names a version, under identity policy, the source bucket's ownership and any endpoint policy, as on AWS.
+- **Multipart operations** carry their own actions where AWS names one: `s3:ListMultipartUploadParts`, `s3:AbortMultipartUpload` and `s3:ListBucketMultipartUploads`.
 - **Public buckets** short-circuit authentication for GET and HEAD only; everything else still requires a signature, and listing buckets is never public.
 
 ## Rate limiting

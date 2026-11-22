@@ -42,22 +42,24 @@ func isBulkDelete(r *http.Request, key string) bool {
 }
 
 // bucketSubResourceActions maps each served bucket sub-resource to the IAM
-// action it authorizes against, keyed by method and query parameter. It covers
-// only the sub-resources predastore serves: an unsupported one is refused by
-// its handler, and giving it an action here would imply it does something.
-var bucketSubResourceActions = map[string]map[string]string{
+// action it authorizes against, keyed by method, in the order s3api dispatches
+// them, so a request naming two authorizes as the operation it is routed to. It
+// covers only the sub-resources predastore serves: an unsupported one is refused
+// by its handler, and giving it an action here would imply it does something.
+var bucketSubResourceActions = map[string][]struct{ query, action string }{
 	http.MethodGet: {
-		"location":   "s3:GetBucketLocation",
-		"tagging":    "s3:GetBucketTagging",
-		"versioning": "s3:GetBucketVersioning",
-		"versions":   "s3:ListBucketVersions",
+		{"location", "s3:GetBucketLocation"},
+		{"tagging", "s3:GetBucketTagging"},
+		{"versioning", "s3:GetBucketVersioning"},
+		{"versions", "s3:ListBucketVersions"},
+		{"uploads", "s3:ListBucketMultipartUploads"},
 	},
 	http.MethodPut: {
-		"tagging":    "s3:PutBucketTagging",
-		"versioning": "s3:PutBucketVersioning",
+		{"tagging", "s3:PutBucketTagging"},
+		{"versioning", "s3:PutBucketVersioning"},
 	},
 	http.MethodDelete: {
-		"tagging": "s3:PutBucketTagging",
+		{"tagging", "s3:PutBucketTagging"},
 	},
 }
 
@@ -65,9 +67,9 @@ var bucketSubResourceActions = map[string]map[string]string{
 // authorizes against, or empty when the request names none that is served.
 func bucketSubResourceAction(r *http.Request) string {
 	query := r.URL.Query()
-	for param, action := range bucketSubResourceActions[r.Method] {
-		if query.Has(param) {
-			return action
+	for _, sub := range bucketSubResourceActions[r.Method] {
+		if query.Has(sub.query) {
+			return sub.action
 		}
 	}
 	return ""
@@ -85,6 +87,17 @@ func s3Action(r *http.Request, bucket, key string) string {
 	if !hasKey && bucket != "" {
 		if action := bucketSubResourceAction(r); action != "" {
 			return action
+		}
+	}
+
+	// Listing an upload's parts and aborting it are actions of their own on AWS,
+	// so a deny on either is not escaped through the object action.
+	if hasKey && r.URL.Query().Has("uploadId") {
+		switch r.Method {
+		case http.MethodGet:
+			return "s3:ListMultipartUploadParts"
+		case http.MethodDelete:
+			return "s3:AbortMultipartUpload"
 		}
 	}
 
@@ -179,6 +192,11 @@ func conditionKeys(r *http.Request, action string, cred *auth.CredentialResult) 
 		keys[iampolicy.KeySourceVpce] = ep.VpceID
 		keys[iampolicy.KeySourceVpc] = ep.VpcID
 		keys[iampolicy.KeyVpcSourceIP] = ep.Source.Addr().String()
+		// Only an endpoint policy may name aws:PrincipalArn, so only an endpoint
+		// request carries it.
+		if cred.PrincipalARN != "" {
+			keys[iampolicy.KeyPrincipalArn] = cred.PrincipalARN
+		}
 	} else {
 		// A RemoteAddr with no port is passed through rather than dropped.
 		sourceIP := r.RemoteAddr

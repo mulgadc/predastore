@@ -364,7 +364,7 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 			<-endpointErr
 		}()
-		slog.Info("Starting S3 endpoint listener", "addr", eaddr, "contract_version", endpointproxy.ContractVersion1)
+		slog.Info("Starting S3 endpoint listener", "addr", eaddr, "max_contract_version", endpointproxy.ContractVersion2)
 	}
 
 	// The sweep is scoped to Run so no goroutine outlives it, and it is stopped

@@ -94,9 +94,24 @@ func testHeader() endpointproxy.Header {
 	}
 }
 
+// withEndpoint is ctx as the endpoint listener hands it to the routes, with the
+// endpoint's policy already parsed; a nil policy is a version 1 connection.
+func withEndpoint(ctx context.Context, h endpointproxy.Header, policy *iampolicy.PolicyDocument) context.Context {
+	return context.WithValue(ctx, endpointCtxKey{}, endpointIdentity{Header: h, policy: policy})
+}
+
 // endpointServer serves, behind the endpoint listener, a handler that reports
 // what each request learned about where it came from.
 func endpointServer(t *testing.T, pki endpointPKI) (addr string, inner *tls.Config, l *endpointListener) {
+	t.Helper()
+	return endpointServerFor(t, pki, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h, ok := endpointFrom(r.Context())
+		_, _ = fmt.Fprintf(w, "%s %t %s", r.RemoteAddr, ok, h.VpceID)
+	}))
+}
+
+// endpointServerFor serves handler behind the endpoint listener.
+func endpointServerFor(t *testing.T, pki endpointPKI, handler http.Handler) (addr string, inner *tls.Config, l *endpointListener) {
 	t.Helper()
 	outer, err := endpointTLSConfig(pki.node, pki.caPath)
 	require.NoError(t, err)
@@ -108,10 +123,7 @@ func endpointServer(t *testing.T, pki endpointPKI) (addr string, inner *tls.Conf
 	srv := &http.Server{
 		ReadHeaderTimeout: 5 * time.Second,
 		ConnContext:       endpointConnContext,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			h, ok := endpointFrom(r.Context())
-			_, _ = fmt.Fprintf(w, "%s %t %s", r.RemoteAddr, ok, h.VpceID)
-		}),
+		Handler:           handler,
 	}
 	go func() { _ = srv.Serve(tls.NewListener(l, inner)) }()
 	t.Cleanup(func() { _ = srv.Close() })
@@ -139,8 +151,13 @@ func dialEndpoint(t *testing.T, addr string, pki endpointPKI, clientCert *tls.Ce
 }
 
 // guestGet sends one HTTPS request over the session, as the guest's own TLS.
+// guestTLS is the guest's own TLS session, riding the endpoint stream.
+func guestTLS(stream net.Conn, pki endpointPKI) *tls.Conn {
+	return tls.Client(stream, &tls.Config{RootCAs: pki.pool, MinVersion: tls.VersionTLS13, ServerName: "127.0.0.1"})
+}
+
 func guestGet(stream net.Conn, pki endpointPKI) (string, error) {
-	guest := tls.Client(stream, &tls.Config{RootCAs: pki.pool, MinVersion: tls.VersionTLS13, ServerName: "127.0.0.1"})
+	guest := guestTLS(stream, pki)
 	req, _ := http.NewRequest(http.MethodGet, "https://127.0.0.1/bucket/key", nil)
 	if err := req.Write(guest); err != nil {
 		return "", err
@@ -198,7 +215,7 @@ func TestEndpointListener_RefusesAnUnknownContractVersion(t *testing.T) {
 	require.NoError(t, err)
 	// The version TLV is the first after the 28-byte IPv4 PROXY v2 prefix.
 	require.Equal(t, byte(endpointproxy.TypeVersion), header[28])
-	header[31] = 2
+	header[31] = 3
 
 	stream, err := dialEndpoint(t, addr, pki, &pki.node, header)
 	require.NoError(t, err)
@@ -253,7 +270,7 @@ func endpointRequest() *http.Request {
 	r := httptest.NewRequest(http.MethodGet, "/reports/q3.csv", nil)
 	h := testHeader()
 	r.RemoteAddr = h.Source.String()
-	return r.WithContext(context.WithValue(r.Context(), endpointCtxKey{}, h))
+	return r.WithContext(withEndpoint(r.Context(), h, nil))
 }
 
 // Through an endpoint the guest's private address is aws:VpcSourceIp, and
@@ -362,7 +379,7 @@ func endpointDecision(t *testing.T, viaEndpoint bool, statements ...iampolicy.St
 	if viaEndpoint {
 		h := testHeader()
 		req.RemoteAddr = h.Source.String()
-		req = req.WithContext(context.WithValue(req.Context(), endpointCtxKey{}, h))
+		req = req.WithContext(withEndpoint(req.Context(), h, nil))
 	} else {
 		req.RemoteAddr = "192.0.2.10:41288"
 	}
@@ -450,7 +467,7 @@ func TestEndpointPolicies_ReachThePerObjectAuthorizer(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/owner-bucket?delete=", bytes.NewReader(body))
 	h := testHeader()
 	req.RemoteAddr = h.Source.String()
-	req = req.WithContext(context.WithValue(req.Context(), endpointCtxKey{}, h))
+	req = req.WithContext(withEndpoint(req.Context(), h, nil))
 	signTestReq(t, req, body, keyOwner, secret, "ap-southeast-2", "s3")
 	rr := httptest.NewRecorder()
 	server.ServeHTTP(rr, req)

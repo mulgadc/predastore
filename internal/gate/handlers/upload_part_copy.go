@@ -27,7 +27,7 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 		uploadID := r.URL.Query().Get("uploadId")
 		partNumber, _ := strconv.Atoi(r.URL.Query().Get("partNumber"))
 
-		srcBucket, srcKey, versionID, err := parseCopySource(r.Header.Get("X-Amz-Copy-Source"))
+		srcBucket, srcKey, versionID, err := ParseCopySource(r.Header.Get("X-Amz-Copy-Source"))
 		if err != nil {
 			HandleError(w, r, err)
 			return
