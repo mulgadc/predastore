@@ -161,3 +161,43 @@ func TestFSM_ApplyBatch_FailedCommitStopsTheReplica(t *testing.T) {
 		func() { fsm.ApplyBatch(logs) })
 	assert.Zero(t, fsm.applied.Load(), "a failed batch is not applied")
 }
+
+// countCommits counts the transactions fsm commits, through its commit seam.
+func countCommits(fsm *FSM) *int {
+	n := new(int)
+	fsm.commitBatch = func(txn *badger.Txn) error {
+		*n++
+		return txn.Commit()
+	}
+	return n
+}
+
+// TestFSM_ApplyBatch_CommitsOncePerBatch pins what batching is for: a batch
+// that fits one transaction is one synced commit, and one too big for a
+// transaction splits into a few commits rather than one per entry.
+func TestFSM_ApplyBatch_CommitsOncePerBatch(t *testing.T) {
+	fsm := NewFSM(newTestDB(t))
+	commits := countCommits(fsm)
+	logs := make([]*raft.Log, 64)
+	for i := range logs {
+		logs[i] = commandLog(t, uint64(i+1), Command{Type: CommandPut, Key: []byte{'k', byte(i)}, Value: []byte("v")})
+	}
+	fsm.ApplyBatch(logs)
+	assert.Equal(t, 1, *commits, "64 small entries")
+
+	db, err := badger.Open(badger.DefaultOptions(t.TempDir()).
+		WithLoggingLevel(badger.WARNING).
+		WithMemTableSize(1 << 20).
+		WithValueThreshold(64 << 10))
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+	big := NewFSM(db)
+	commits = countCommits(big)
+	value := bytes.Repeat([]byte{0x5a}, 16<<10)
+	for i := range logs {
+		logs[i] = commandLog(t, uint64(i+1), Command{Type: CommandPut, Key: []byte{'b', byte(i)}, Value: value})
+	}
+	big.ApplyBatch(logs)
+	assert.Greater(t, *commits, 1, "a batch too big for one transaction splits")
+	assert.Less(t, *commits, len(logs)/4, "and splits into a few commits, not one per entry")
+}
