@@ -23,6 +23,11 @@ var ErrNotFound = errors.New("key not found")
 // election is still settling.
 var ErrNotLeader = errors.New("meta replica is not the leader")
 
+// ErrUndelivered marks an attempt that never reached a replica, so the command
+// it carried cannot have been applied and another attempt is safe. Every other
+// failure is ambiguous: a command whose response was lost is in the log.
+var ErrUndelivered = errors.New("meta request not delivered")
+
 // Item is one key-value pair returned by a scan.
 type Item struct {
 	Key   string
@@ -113,7 +118,8 @@ func (c *Client) call(ctx context.Context, target config.NodeID, op rpc.Opcode, 
 
 	stream, err := rpc.OpenStream(ctx, c.rpc, target, op, req)
 	if err != nil {
-		return nil, fmt.Errorf("open stream to replica %d: %w", target, err)
+		// Nothing left the client, so the command cannot have been applied.
+		return nil, fmt.Errorf("open stream to replica %d: %w: %w", target, ErrUndelivered, err)
 	}
 	if len(body) > 0 {
 		if _, err := stream.Write(body); err != nil {
@@ -483,6 +489,10 @@ func (c *Client) write(ctx context.Context, op rpc.Opcode, req *MetaRequest, bod
 
 // writeValue is write, plus whatever the replica answered with. Only a swap
 // populates that; every other write leaves it nil.
+//
+// Put, PutMax and Delete are idempotent, so an attempt whose outcome is
+// unknown is simply tried again. A swap is not: it retries only on an attempt
+// that never reached a replica, or a refusal that names a leader.
 func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest, body []byte) ([]byte, error) {
 	candidates := c.readOrder()
 	next := 0
@@ -495,6 +505,14 @@ func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest
 		switch {
 		case err != nil:
 			lastErr = err
+			// Re-applying a swap moves the record a second time and answers
+			// with a different displaced generation, so the writer releases a
+			// generation that is live. An attempt that never reached a replica
+			// is safe to repeat; anything past that is in the log or not, and
+			// the caller has to be told we cannot say which.
+			if op == OpMetaSwap && !errors.Is(err, ErrUndelivered) {
+				return nil, fmt.Errorf("swap %q: %w", req.Key, err)
+			}
 		case resp.Err == "":
 			c.cacheLeader(target)
 			return resp.Value, nil
@@ -512,6 +530,12 @@ func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest
 			telemetry.RecordMetaRedirect(ctx, telemetry.RedirectNoLeader)
 		default:
 			lastErr = fmt.Errorf("replica %d: %s", target, resp.Err)
+			// A replica that answered with anything but a redirect may have
+			// applied the command first: raft reports a lost leadership once
+			// the entry is in the log, and the next leader can commit it.
+			if op == OpMetaSwap {
+				return nil, fmt.Errorf("swap %q: %w", req.Key, lastErr)
+			}
 		}
 
 		// No redirect to follow — rotate to the next replica after a

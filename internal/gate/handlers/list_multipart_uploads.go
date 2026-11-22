@@ -33,6 +33,11 @@ func ListMultipartUploads(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
+		if err := requireExpectedBucketOwner(ctx, mc, cache, r, bucket); err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		// Uploads are keyed by upload id alone, so there is no per-bucket
 		// prefix to scan and the whole table is read and filtered. In-flight
 		// uploads are few and short-lived, which is what makes that affordable.

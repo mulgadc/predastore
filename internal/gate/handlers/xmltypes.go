@@ -209,6 +209,9 @@ type DeleteRequestObject struct {
 	// VersionId names one version to destroy. Without it a delete on a versioned
 	// bucket appends a delete marker instead, exactly as the single-key route does.
 	VersionId string `xml:"VersionId"`
+	// ETag is a per-object precondition, read only so that a request carrying
+	// one, even empty, is refused rather than deleted unconditionally.
+	ETag *string `xml:"ETag"`
 }
 
 // DeleteResult answers POST /{bucket}?delete. A key that could not be deleted

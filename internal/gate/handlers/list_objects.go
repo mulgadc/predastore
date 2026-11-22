@@ -57,6 +57,11 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
+		if err := requireExpectedBucketOwner(ctx, mc, cache, r, bucket); err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		listV2 := query.Get("list-type") == "2"
 
 		// encoding-type=url is how a client asks for keys it can carry through

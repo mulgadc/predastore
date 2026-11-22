@@ -431,12 +431,19 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 	case RoleBlob:
 		// The node owns its store: it creates the directory, opens the engine
 		// and closes it again, so no failure here can leak one.
+		slot, slots := compactionSlot(cfg, n.ID)
 		svc, berr := blob.New(blob.Config{
-			NodeID:     n.ID,
-			DataDir:    dir,
-			AEAD:       opts.MasterKey.AEAD,
-			Compaction: time.Duration(cfg.Compaction.IntervalSeconds) * time.Second,
-			Listeners:  lns,
+			NodeID:                   n.ID,
+			DataDir:                  dir,
+			AEAD:                     opts.MasterKey.AEAD,
+			Compaction:               time.Duration(cfg.Compaction.IntervalSeconds) * time.Second,
+			RetainedMaxAge:           time.Duration(cfg.Compaction.RetainedMaxAgeSeconds) * time.Second,
+			CompactionSlot:           slot,
+			CompactionSlots:          slots,
+			CompactionMaxBytesPerSec: cfg.Compaction.MaxBytesPerSec,
+			CompactionYieldLatency:   time.Duration(cfg.Compaction.YieldLatencyMs) * time.Millisecond,
+			CompactionMaxYield:       time.Duration(cfg.Compaction.MaxYieldSeconds) * time.Second,
+			Listeners:                lns,
 		})
 		if berr != nil {
 			cleanup()

@@ -175,6 +175,14 @@ func TestTheSweepReleasesRetainedGenerations(t *testing.T) {
 
 	epochs, _, _ := raceWriters(t, st, oh, writers)
 
+	// Each superseded generation is released by the publisher that displaced
+	// it. Without that the sweep has nothing to reclaim, however old the rows.
+	for _, epoch := range epochs[:writers-1] {
+		if err := st.ReleaseGeneration(oh, 0, epoch); err != nil {
+			t.Fatalf("release %016x: %v", epoch, err)
+		}
+	}
+
 	released, err := st.sweepRetained(-1)
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
@@ -220,7 +228,7 @@ func TestReleaseGenerationHandsBackASupersededGeneration(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 
-	released, err := st.sweepRetained(retainedMaxAge)
+	released, err := st.sweepRetained(-1)
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}

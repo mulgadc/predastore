@@ -343,3 +343,95 @@ func TestNewRejectsAServiceThatCouldNotSweep(t *testing.T) {
 		assert.Equal(t, defaultInterval, svc.interval)
 	})
 }
+
+// storeVersioned writes a tombstone under the layout a version delete uses and
+// holds the shards it names, so a pass reads the row production would leave.
+func (c *cluster) storeVersioned(t *testing.T, row tombstoneRow) string {
+	t.Helper()
+
+	info := handlers.DeletedObjectInfo{
+		Bucket: row.bucket, Key: row.key, ObjectHash: row.hash,
+		WriteEpoch: row.epoch, DataShardNodes: row.data, ParityNodes: row.m,
+	}
+	var buf bytes.Buffer
+	require.NoError(t, gob.NewEncoder(&buf).Encode(info))
+
+	stored := handlers.TableKey(model.TableObjects,
+		handlers.DeletedObjectKey(row.bucket, row.key, row.hash))
+	c.meta.put(stored, buf.Bytes())
+
+	for i, n := range row.data {
+		c.blob.hold(n, row.hash, uint32(i))
+	}
+	for i, n := range row.m {
+		c.blob.hold(n, row.hash, uint32(len(row.data)+i))
+	}
+	return stored
+}
+
+// Emptying a versioned bucket deletes every version of a key in succession.
+// Each failed fan-out owes its own shards, and one record per key would leave
+// the first version's shards unaccounted for while the bucket is allowed to
+// disappear.
+func TestBothVersionsOfOneKeyAreIndependentlyReclaimed(t *testing.T) {
+	t.Parallel()
+
+	c := newCluster(t)
+	first := tombstone("a.txt\x00V1", 5, nodes(1, 2), nodes(3))
+	second := tombstone("a.txt\x00V2", 6, nodes(2, 3), nodes(1))
+	first.key, second.key = "a.txt", "a.txt"
+	require.NotEqual(t, first.hash, second.hash, "two versions must not share a shard set")
+
+	firstRow := c.storeVersioned(t, first)
+	secondRow := c.storeVersioned(t, second)
+	require.NotEqual(t, firstRow, secondRow, "the two versions share one reclaim record")
+
+	svc := c.service(8)
+	require.NoError(t, svc.Pass(t.Context()))
+
+	for _, row := range []tombstoneRow{first, second} {
+		for i, n := range row.data {
+			assert.False(t, c.blob.has(n, row.hash, uint32(i)),
+				"data shard %d of %x was not reclaimed", i, row.hash)
+		}
+		for i, n := range row.m {
+			assert.False(t, c.blob.has(n, row.hash, uint32(len(row.data)+i)),
+				"parity shard of %x was not reclaimed", row.hash)
+		}
+	}
+	assert.False(t, c.meta.has(firstRow), "the first version's record survived its reclaim")
+	assert.False(t, c.meta.has(secondRow), "the second version's record survived its reclaim")
+
+	stats := svc.Stats()
+	assert.Equal(t, int64(2), stats.Scanned)
+	assert.Equal(t, int64(2), stats.Reclaimed)
+	assert.Zero(t, stats.Failed)
+}
+
+// A record written before the deploy is the one most likely to still owe
+// shards, so a pass has to reclaim both layouts. One scan reads them because
+// the prefix is unchanged.
+//
+// The worker is built after the rows are written and holds no state between
+// passes, so this is also what a restart reads: durable rows and a fresh
+// scan.
+func TestLegacyAndVersionedRecordsReclaimInOnePass(t *testing.T) {
+	t.Parallel()
+
+	c := newCluster(t)
+	legacy := tombstone("legacy.txt", 4, nodes(1, 2), nodes(3))
+	versioned := tombstone("current.txt\x00V1", 5, nodes(2, 3), nodes(1))
+	versioned.key = "current.txt"
+
+	legacyRow := c.store(t, legacy)
+	versionedRow := c.storeVersioned(t, versioned)
+
+	svc := c.service(8)
+	require.NoError(t, svc.Pass(t.Context()))
+
+	assert.False(t, c.blob.has(1, legacy.hash, 0), "the legacy record's shards were not reclaimed")
+	assert.False(t, c.blob.has(2, versioned.hash, 0), "the versioned record's shards were not reclaimed")
+	assert.False(t, c.meta.has(legacyRow))
+	assert.False(t, c.meta.has(versionedRow))
+	assert.Equal(t, int64(2), svc.Stats().Reclaimed)
+}

@@ -31,6 +31,11 @@ func ListObjectVersions(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
+		if err := requireExpectedBucketOwner(ctx, mc, cache, r, bucket); err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		maxKeys, ok := parseMaxKeys(query.Get("max-keys"))
 		if !ok {
 			WriteS3Error(w, r, http.StatusBadRequest, string(model.ErrInvalidArgument),

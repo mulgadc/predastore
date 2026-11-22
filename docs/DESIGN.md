@@ -413,9 +413,33 @@ The writer then owns a disjoint byte range. It assembles fragments into an in-me
 
 Tombstones are keyed by physical slot — `'d'` ‖ big-endian `segNum` ‖ big-endian `off`, 17 bytes — with the dead byte count as the value. Keying by slot rather than by object key is what lets one key die repeatedly: on delete, on overwrite, and on a relocation that lost its race. They only accelerate compaction's candidate selection and are never consulted for correctness.
 
+### Retained generations
+
+A `Commit` promotes the new generation and **demotes** the one it replaces to `'r'` ‖ key ‖ index ‖ big-endian epoch, rather than destroying it. Shards are published before the placement record, so a record can name a generation the nodes have already passed, and a demoted generation still answers `LookupAt` for exactly that reason.
+
+A demoted generation is reclaimable only once a publisher reports that its record displaced it. That report is `Release`, and it writes `'R'` ‖ key ‖ index ‖ epoch, a row whose presence is the whole eligibility test. `retainedMaxAge` (5 minutes) then applies to the release, not to the demotion: it is the grace window a reader that already resolved the old generation keeps answering in.
+
+A release row is found only through its retained row, so a shard delete that removes the retained row leaves the release behind. A background sweep on the same 15-second tick reads at most 10,000 release rows, resuming where the last sweep stopped, and drops any whose retained row is gone, checking again inside the deleting transaction so a retained row written back in between keeps its release.
+
+Age cannot decide on its own. A writer that commits and never publishes starts no clock anybody can see, the gate's PUT path carries no total deadline, and reclaiming such a generation destroys an object every client was acknowledged for. The sweep therefore reclaims released generations past their grace and nothing else, ever. A release that does not arrive costs disk until the generation is released again, which is the safe direction: failure retains.
+
+The retained row's stamp field is written `math.MaxInt64` and is never read here. It exists for an engine from before the release namespace, which reclaims on that field and will not find the value old enough, so a generation this engine demoted is stranded rather than destroyed by a downgrade.
+
+That is not a rollback guarantee, and there is none. A retained row written before the release namespace existed carries the real stamp its own commit wrote, this sweep holds it because nothing released it, and an older engine then reclaims it on age. Where a live placement record still names such a generation, going back destroys an object every client was acknowledged for, and no scan answers whether one does. A defect found on this engine is fixed forward.
+
 ### Compaction
 
 Compaction is always on. Without it, overwrite and delete churn frees nothing and the store fills. The interval comes from `[compaction] interval_seconds`, defaulting to 5 minutes, and a nearfull `Append` kicks an out-of-cycle pass.
+
+Routine passes are paced so reclaim does not take the foreground's latency, and never on every node at once:
+
+- **Staggered start.** Each blob node takes a slot, its position among the cluster's blob node IDs, sorted. A routine pass starts at the next wall-clock instant aligned to the interval plus `slot × interval / slots`, so three nodes on 5 minutes start 100 s apart and a restart keeps its node's phase. The timer re-arms after each pass, so a pass longer than the interval skips to the next slot.
+- **Byte-rate cap.** `[compaction] max_bytes_per_sec`, default 64 MiB/s, paid per 256 KiB copy buffer, so a large extent is paced inside itself. Every wait runs outside `store.mutex`.
+- **Foreground yield, off by default.** With `yield_latency_ms` set, the pass waits in 100 ms steps while the highest foreground segment read or sync latency of the last second is above it, for at most `max_yield_seconds` (default 60) per pass. Compaction's own reads and syncs are not counted.
+- **Urgent reclaim is unpaced.** A pass that starts below the nearfull watermark, or is kicked, runs without pacing or yields. A kick, or the store crossing nearfull, during a paced pass makes the rest of it unpaced and re-arms a fresh pass.
+- **The retained sweep keeps its 15 s cadence** through a long pass: it runs between copy buffers once 15 s have passed.
+- **Close** finishes the extent in flight unpaced and ends the pass, leaving the segment for a later pass even when that extent was its last.
+- **Bounded waits.** One rate wait lasts at most 1 s before the pass checks free space, the full band included, and the retained sweep again.
 
 One cycle:
 
@@ -425,9 +449,11 @@ One cycle:
 4. For each candidate, walk its `.idx`, back-check each row against the index, and relocate the rows that are still live.
 5. Fsync the index, drop the segment and its sidecar, and clear its tombstones.
 
-Relocation copies extent bytes **verbatim** — `fragNum` rides inside the copied bytes, so the nonce moves with them and is never reissued — then commits the repoint only if the key still points at the extent it copied from. Losing that race strands the copy for good, since only that swap could ever have referenced it, so the loser tombstones its own copy rather than let it pad the destination segment's live count. The copy itself runs without `store.mutex`, so compaction never stalls the write path.
+Relocation copies extent bytes **verbatim** — `fragNum` rides inside the copied bytes, so the nonce moves with them and is never reissued — then commits the repoint only if the row still holds the extent it copied from. Losing that race strands the copy for good, since only that swap could ever have referenced it, so the loser tombstones its own copy rather than let it pad the destination segment's live count. The copy itself runs without `store.mutex`, so compaction never stalls the write path.
 
-The index runs with badger's sync writes off, so relocations may still be in the page cache; the explicit index fsync before a drop is what stops a power loss from reverting the index to a segment that is already gone.
+A lost swap does not mean the slot is dead. The commit that won it can have moved the row into another namespace still naming the slot: an overwrite demotes the live row to a retained one, and a commit publishes a prepared row as live. So the slot is read again, in one snapshot across the live, prepared and retained namespaces, and relocated again under whichever row now names it, up to three times. If a row still names a slot after that, the segment is kept and the next cycle retries. A segment with a writer still open in it is deferred before its sidecar is read: the writer reserved its slot before the segment rolled and has not prepared its row yet, so enumerating it would miss that extent.
+
+The index runs with badger's sync writes off, so relocations may still be in the page cache. The index is fsynced before **every** drop, including one whose pass moved nothing because an earlier pass relocated everything and then failed: that is what stops a power loss from reverting the index to a segment that is already gone.
 
 ### Persistent state
 
@@ -461,7 +487,9 @@ The milliseconds are the object's `LastModified` on every surface that serves on
 
 The body is split into `K` data shard buffers in memory and each is streamed to its node in parallel. Parity is encoded into buffers of its own and written from those. It is deliberately not piped from a single encoder: one parity node refusing would close its pipe, fail the encode and take every other parity write down with it, losing all redundancy at once rather than one shard of it.
 
-**The write is two-phase.** Each shard put makes the bytes durable and invisible. The placement record landing in raft is the commit point — the moment the object's new generation exists — and the shards are published only afterwards. A reader that finds a prepared-but-unpublished shard at the record's epoch completes the commit itself, so an interrupted writer costs a round trip rather than the object.
+**The write is two-phase.** Each shard put makes the bytes durable and invisible. The shards are published first, then the placement record lands in raft, which is the commit point and the moment the object's new generation becomes visible. That order is what stops a record naming shards that have not landed; the reverse is possible — a record can name a generation the nodes have already passed — which is why a commit demotes rather than destroys. A reader that finds a prepared-but-unpublished shard at the record's epoch completes the commit itself, so an interrupted writer costs a round trip rather than the object.
+
+Swapping the record rather than writing it tells the writer which generation it displaced, and the writer then **releases** exactly that one on every node behind the old record, including the handoff holder. A generation nobody released is never reclaimed: see §7, *Retained generations*. A writer that does not reach the release leaves disk held, which is the direction to fail in.
 
 The write is acknowledged once `K` shards are durable, so one node down does not refuse writes; the response then carries `X-Spx-Degraded-Write: <n>`. Setting `rs.degraded_writes = false` restores a full-width floor. `K` is the floor and not `K+1`, because any `K` of the `K+M` reconstruct — at RS(2,1) one more buys no redundancy and would refuse three quarters of writes with a single node down.
 
@@ -642,6 +670,9 @@ parity = 1
 
 # [compaction]
 # interval_seconds = 300        # zero uses the engine default; compaction is never off
+# max_bytes_per_sec = 0         # routine-pass copy cap; zero defaults to 64 MiB/s
+# yield_latency_ms  = 0         # foreground latency a routine pass yields to; zero is off
+# max_yield_seconds = 0         # most one pass yields; zero defaults to 60
 
 # [meta]                        # raft log retention on the metadata plane
 # snapshot_interval_seconds = 0 # zero defaults to 120
@@ -818,6 +849,8 @@ A meta quorum loss stops all writes and leaves reads serving whatever the surviv
 | `fragNumReservation` | 1 048 576 | fragNums per durable reservation |
 | `defaultCompactionInterval` | 5 min | Overridden by `[compaction] interval_seconds` |
 | `compactionLiveThreshold` | 0.70 | Live-byte fraction below which a segment is a candidate |
+| `DefaultCompactionMaxBytesPerSec` | 64 MiB/s | Overridden by `[compaction] max_bytes_per_sec` |
+| `DefaultCompactionMaxYield` | 60 s | Overridden by `[compaction] max_yield_seconds` |
 | `defaultNearfullFreeFrac` | 0.15 | Kicks compaction, flags pressure |
 | `defaultFullFreeFrac` | 0.05 | Rejects writes with `ErrStoreFull` |
 | `statfsThrottleInterval` | 1s | Free-space check throttle |

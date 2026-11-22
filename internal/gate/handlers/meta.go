@@ -20,6 +20,9 @@ var errNoMetaClient = errors.New("gate has no meta client")
 // always holds a *meta.Client.
 type MetaClient interface {
 	Get(ctx context.Context, key string) ([]byte, error)
+	// LeaderGet is Get answered only by a leader that has applied everything
+	// committed, so a follower's stale row cannot satisfy a precondition.
+	LeaderGet(ctx context.Context, key string) ([]byte, error)
 	Put(ctx context.Context, key string, value []byte) error
 	Swap(ctx context.Context, key string, value []byte) ([]byte, error)
 	Delete(ctx context.Context, key string) error
@@ -70,6 +73,15 @@ func metaGet(ctx context.Context, mc MetaClient, table, key string) ([]byte, err
 		return nil, errNoMetaClient
 	}
 	return mc.Get(ctx, TableKey(table, key))
+}
+
+// metaLeaderGet reads one row of a table from a leader, for a caller that
+// cannot act on a stale answer.
+func metaLeaderGet(ctx context.Context, mc MetaClient, table, key string) ([]byte, error) {
+	if mc == nil {
+		return nil, errNoMetaClient
+	}
+	return mc.LeaderGet(ctx, TableKey(table, key))
 }
 
 // metaPut writes one row of a table.

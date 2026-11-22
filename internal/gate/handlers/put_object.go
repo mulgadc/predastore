@@ -29,6 +29,9 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 		bucket, key := resource.Bucket.Name, resource.Key
+		if refuseConditionalWrite(w, r) {
+			return
+		}
 
 		// PUT /{bucket}/{key}?acl — answering 200 here would discard the ACL the
 		// caller sent rather than say object ACLs are not supported.
@@ -135,7 +138,6 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		previous, err := metaSwap(ctx, mc, model.TableObjects, string(objectHash[:]), record)
 		if err != nil {
 			telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
-			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
@@ -143,7 +145,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// Nothing is superseded on a versioned write: the record this one
 		// replaced belongs to a different hash and is still a live version.
 		if !target.versioned {
-			releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch)
+			releaseSuperseded(ctx, bc, objectHash, previous, place.WriteEpoch, handoffNode(ring, cfg, objectHash))
 		}
 
 		// The index row before the listing key, so a version is enumerable by the

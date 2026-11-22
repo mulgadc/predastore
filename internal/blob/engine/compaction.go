@@ -40,6 +40,9 @@ type compactor struct {
 	kick chan struct{}
 
 	wg sync.WaitGroup
+
+	// When the retained sweep last ran, from the loop or from inside a pass.
+	lastRetained time.Time
 }
 
 func (store *Store) startCompactor() {
@@ -52,8 +55,15 @@ func (store *Store) startCompactor() {
 
 func (c *compactor) loop() {
 	defer c.wg.Done()
-	ticker := time.NewTicker(c.store.compactionInterval)
-	defer ticker.Stop()
+	store := c.store
+	// A timer re-armed after each pass at this node's next aligned start, so a
+	// long pass skips to the next slot rather than running back to back.
+	routine := time.NewTimer(time.Until(nextCompactionStart(store.clock.Now(), store.compactionInterval, store.compactionSlot, store.compactionSlots)))
+	defer routine.Stop()
+	rearm := func() {
+		rearmTimer(routine, time.Until(nextCompactionStart(store.clock.Now(), store.compactionInterval, store.compactionSlot, store.compactionSlots)))
+	}
+	c.lastRetained = store.clock.Now()
 
 	// Retained generations are swept on their own, much faster cycle. A full
 	// cycle relocates extents and rewrites segments; this is one scan of the
@@ -67,22 +77,73 @@ func (c *compactor) loop() {
 		case <-c.done:
 			return
 		case <-retained.C:
-			released, err := c.store.sweepRetained(retainedMaxAge)
-			if err != nil {
-				slog.Error("retained sweep failed", "error", err)
-			} else if released > 0 {
-				slog.Debug("released superseded generations", "count", released)
+			if store.clock.Now().Sub(c.lastRetained) >= retainedSweepInterval/2 {
+				c.lastRetained = store.clock.Now()
+				store.retainedTick()
 			}
-		case <-ticker.C:
-			if err := c.store.compactOnce(); err != nil {
-				slog.Error("compaction cycle failed", "error", err)
-			}
+		case <-routine.C:
+			c.runPass(false)
+			rearm()
 		case <-c.kick:
-			if err := c.store.compactOnce(); err != nil {
-				slog.Error("kicked compaction cycle failed", "error", err)
-			}
+			// A kicked pass can run over this node's slot; the routine pass
+			// then waits for the next one rather than starting at once.
+			c.runPass(true)
+			rearm()
 		}
 	}
+}
+
+// rearmTimer stops t, drains a fire it missed, and resets it to d.
+func rearmTimer(t *time.Timer, d time.Duration) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+	t.Reset(d)
+}
+
+// runPass runs one pass, unpaced if kicked or the store starts near full, and
+// asks for a fresh unpaced pass if this one turned urgent part way.
+func (c *compactor) runPass(kicked bool) {
+	p := c.store.newPacer(c, kicked || c.store.belowNearfull())
+	err := c.store.compactPass(p)
+	switch {
+	case errors.Is(err, errCompactionStopped), errors.Is(err, ErrClosedStore):
+		return
+	case err != nil:
+		slog.Error("compaction cycle failed", "kicked", kicked, "error", err)
+	}
+	if p.rekick {
+		c.store.kickCompaction()
+	}
+}
+
+// retainedTick runs the two sweeps of the retained cycle. Each logs its own
+// failure, so neither stops the other or the compaction cycle, and the orphan
+// sweep yields to a pending compaction kick.
+func (store *Store) retainedTick() {
+	released, err := store.sweepRetained(store.retainedMaxAge)
+	if err != nil {
+		slog.Error("retained sweep failed", "error", err)
+	} else if released > 0 {
+		slog.Debug("released superseded generations", "count", released)
+	}
+	// A pending kick means the disk is filling; reclamation goes first.
+	if store.kickPending() {
+		return
+	}
+	if orphans, err := store.sweepOrphanedReleases(); err != nil {
+		slog.Error("orphaned release sweep failed", "error", err)
+	} else if orphans > 0 {
+		slog.Debug("dropped orphaned release rows", "count", orphans)
+	}
+}
+
+// kickPending reports whether a compaction kick is waiting for the loop.
+func (store *Store) kickPending() bool {
+	return store.compactor != nil && len(store.compactor.kick) > 0
 }
 
 // kickCompaction signals the compactor goroutine to run an immediate pass,
@@ -105,9 +166,15 @@ func (c *compactor) stop() {
 	slog.Info("compactor stopped")
 }
 
-// compactOnce runs one full compaction cycle: select under-occupied segments,
-// relocate their live extents into the active append segment, and drop them.
+// compactOnce runs one full compaction cycle at the configured pacing:
+// select under-occupied segments, relocate their live extents into the active
+// append segment, and drop them.
 func (store *Store) compactOnce() error {
+	return store.compactPass(store.newPacer(store.compactor, store.belowNearfull()))
+}
+
+// compactPass is one cycle under pacer p.
+func (store *Store) compactPass(p *pacer) error {
 	store.mutex.Lock()
 	closed := store.closed
 	store.mutex.Unlock()
@@ -116,7 +183,9 @@ func (store *Store) compactOnce() error {
 	}
 
 	start := time.Now()
-	slog.Info("compaction started", "interval", store.compactionInterval, "liveThreshold", compactionLiveThreshold)
+	slog.Info("compaction started", "interval", store.compactionInterval, "liveThreshold", compactionLiveThreshold,
+		"slot", store.compactionSlot, "slots", store.compactionSlots, "paced", !p.urgent,
+		"maxBytesPerSec", store.compactionMaxBytesPerSec)
 
 	// Before selecting candidates: a prepared row keeps its extent alive, so a
 	// caller that died between prepare and commit would otherwise pin the space
@@ -132,7 +201,7 @@ func (store *Store) compactOnce() error {
 
 	// Likewise for superseded generations: a commit demotes rather than
 	// tombstones, so this is where that space comes back.
-	released, err := store.sweepRetained(retainedMaxAge)
+	released, err := store.sweepRetained(store.retainedMaxAge)
 	if err != nil {
 		return fmt.Errorf("sweep retained generations: %w", err)
 	}
@@ -140,7 +209,6 @@ func (store *Store) compactOnce() error {
 		slog.Info("released superseded generations",
 			"count", released, "older_than_ms", retainedMaxAge.Milliseconds())
 	}
-
 	candidates, failed, err := store.candidateSegments()
 	if err != nil {
 		return fmt.Errorf("select candidates: %w", err)
@@ -166,8 +234,10 @@ func (store *Store) compactOnce() error {
 	var dropped int64
 	for _, num := range candidates {
 		segStart := time.Now()
-		stats, err := store.compactSegment(num)
+		stats, err := store.compactSegment(num, p)
 		switch {
+		case errors.Is(err, errCompactionStopped):
+			return err
 		// A reader or writer still holds the segment. Its extents have already
 		// been relocated, so the next cycle finds nothing to move and only
 		// retries the drop.
@@ -207,6 +277,9 @@ func (store *Store) compactOnce() error {
 	store.mutex.Unlock()
 
 	slog.Info("compaction finished",
+		"paced", !p.urgent,
+		"paceWait", p.waitedTotal,
+		"yielded", p.yielded,
 		"segments", len(candidates),
 		"extents", totalExtents,
 		"bytes", totalBytes,
@@ -290,16 +363,185 @@ const retainedMaxAge = 5 * time.Minute
 // scan it runs is cheap next to a compaction pass.
 const retainedSweepInterval = 15 * time.Second
 
+// releaseStamp reports when a retained generation was released, or zero if no
+// publisher has released it.
+func (store *Store) releaseStamp(retained []byte) (int64, error) {
+	var at int64
+	err := store.index.View(func(txn *badger.Txn) error {
+		raw, err := readRaw(txn, releasedKeyFor(retained))
+		if errors.Is(err, badger.ErrKeyNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		at, err = decodeReleasedAt(raw)
+
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("read release: %w", err)
+	}
+
+	return at, nil
+}
+
+// orphanScanPerSweep bounds the release rows one sweep reads. Every commit
+// holds back new transactions until it is applied, so drops commit in small
+// batches that request paths can interleave with.
+const (
+	orphanReleaseBatch = 100
+	orphanScanPerSweep = 10000
+)
+
+// retainedKeyFor maps a release row's key back onto the retained row it marks.
+func retainedKeyFor(released []byte) []byte {
+	key := append([]byte(nil), released...)
+	key[0] = retainedPrefix
+
+	return key
+}
+
+// sweepOrphanedReleases drops release rows whose retained row is gone, which a
+// shard delete leaves behind. A release is written only while its retained row
+// exists, so a release row without one can never be read again.
+func (store *Store) sweepOrphanedReleases() (int, error) {
+	orphans, err := store.collectOrphanedReleases()
+	if err != nil {
+		return 0, err
+	}
+
+	return store.dropOrphanedReleases(orphans)
+}
+
+// collectOrphanedReleases reads up to orphanScanPerSweep release rows from
+// where the last sweep stopped, wrapping at the end of the namespace, and
+// returns those whose retained row is absent from one snapshot.
+func (store *Store) collectOrphanedReleases() ([][]byte, error) {
+	store.orphanMu.Lock()
+	defer store.orphanMu.Unlock()
+
+	start := store.orphanCursor
+	if start == nil {
+		start = []byte{releasedPrefix}
+	}
+	var orphans [][]byte
+	var next []byte
+	err := store.index.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = []byte{releasedPrefix}
+		opts.PrefetchValues = false
+		// Every version, deleted ones included, counts toward the cap, so the
+		// tombstones a drop leaves cannot make a sweep's scan unbounded.
+		opts.AllVersions = true
+		it := txn.NewIterator(opts)
+		defer it.Close()
+
+		scanned := 0
+		var key []byte
+		for it.Seek(start); it.Valid(); it.Next() {
+			item := it.Item()
+			scanned++
+			if key != nil && bytes.Equal(item.Key(), key) {
+				continue
+			}
+			// Stop only between keys, so a resumed sweep starts at a newest version.
+			if scanned > orphanScanPerSweep {
+				next = item.KeyCopy(nil)
+				break
+			}
+			key = item.KeyCopy(nil)
+			// A live row whose object hash starts with releasedPrefix sorts in
+			// here too; only a release row has this width.
+			if item.IsDeletedOrExpired() || len(key) != releasedKeySize {
+				continue
+			}
+			_, err := txn.Get(retainedKeyFor(key))
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				orphans = append(orphans, key)
+				continue
+			}
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scan release rows: %w", err)
+	}
+	store.orphanCursor = next
+
+	return orphans, nil
+}
+
+// dropOrphanedReleases deletes the given release rows in bounded transactions,
+// skipping any whose retained row exists again by then.
+func (store *Store) dropOrphanedReleases(orphans [][]byte) (int, error) {
+	dropped := 0
+	for start := 0; start < len(orphans); start += orphanReleaseBatch {
+		if store.kickPending() {
+			// Resume at the first undropped orphan once the kick is served.
+			store.orphanMu.Lock()
+			store.orphanCursor = orphans[start]
+			store.orphanMu.Unlock()
+
+			return dropped, nil
+		}
+		batch := orphans[start:min(start+orphanReleaseBatch, len(orphans))]
+		var n int
+		err := store.index.Update(func(txn *badger.Txn) error {
+			var err error
+			n, err = dropOrphanBatch(txn, batch)
+
+			return err
+		})
+		if errors.Is(err, badger.ErrConflict) {
+			// The next sweep finds whatever this batch left.
+			continue
+		}
+		if err != nil {
+			return dropped, fmt.Errorf("drop orphaned release rows: %w", err)
+		}
+		dropped += n
+	}
+
+	return dropped, nil
+}
+
+// dropOrphanBatch deletes the release rows in batch whose retained row txn
+// cannot see. The read joins txn's conflict set, so a commit that writes the
+// retained row back before txn commits fails txn rather than orphaning it.
+func dropOrphanBatch(txn *badger.Txn, batch [][]byte) (int, error) {
+	n := 0
+	for _, key := range batch {
+		_, err := txn.Get(retainedKeyFor(key))
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, badger.ErrKeyNotFound) {
+			return n, err
+		}
+		if err := txn.Delete(key); err != nil {
+			return n, err
+		}
+		n++
+	}
+
+	return n, nil
+}
+
 // sweepRetained reclaims generations that a commit superseded and nothing has
 // asked for since. It is the only thing that decides a generation is dead —
 // commit demotes, and never destroys.
 //
-// Age is the only bound, because age is the only thing that bounds who can
-// still name a generation. A count bound ranked them by epoch, which is write
-// *start* order, while the record that survives is the one whose write
-// finished last. Those are different writes whenever PUTs overlap, so the cap
-// evicted generations the metadata still pointed at, and the object read back
-// as a 500 having acknowledged every writer.
+// A release is what makes a generation reclaimable, and age only bounds how
+// long a reader that already resolved it keeps answering. Age alone cannot
+// decide: a writer that commits and dies before publishing starts no clock,
+// leaves the record naming the generation its commit demoted, and the write
+// path has no deadline that bounds when it could still publish. Reclaiming on
+// age destroyed objects every writer had been acknowledged for.
 func (store *Store) sweepRetained(maxAge time.Duration) (int, error) {
 	cutoff := time.Now().Add(-maxAge).UnixNano()
 
@@ -328,11 +570,15 @@ func (store *Store) sweepRetained(maxAge time.Duration) (int, error) {
 		if len(k) != retainedKeySize || len(v) != preparedValueSize {
 			return nil
 		}
-		at, err := decodePreparedAt(v)
-		if err != nil {
-			return fmt.Errorf("decode retained row: %w", err)
-		}
 		key := append([]byte(nil), k...)
+		at, err := store.releaseStamp(key)
+		if err != nil {
+			return err
+		}
+		if at == 0 {
+			// Not released: nothing has reported a record displacing it.
+			return nil
+		}
 		if len(group) > 0 && !bytes.Equal(group[0].key[:retainedKeySize-8], key[:retainedKeySize-8]) {
 			flush()
 		}
@@ -402,16 +648,22 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 
 	store.recordOccupancy(dead)
 
-	store.mutex.Lock()
-
 	var candidates, dropped []uint64
 	var failed int
+	// One short locked section per segment, so foreground requests never wait
+	// behind a scan that grows with the store.
 	for num, totals := range dead {
-		if num == store.segNum {
+		store.mutex.Lock()
+		active := num == store.segNum
+		var seg *segment
+		var err error
+		if !active {
+			seg, err = store.getSegment(num, false)
+		}
+		store.mutex.Unlock()
+		if active {
 			continue
 		}
-
-		seg, err := store.getSegment(num, false)
 		if err != nil {
 			// A segment file that is not there cannot hold live data, so every
 			// tombstone naming it is dead weight. Reclaim it below, outside the
@@ -439,7 +691,6 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 			candidates = append(candidates, num)
 		}
 	}
-	store.mutex.Unlock()
 
 	for _, num := range dropped {
 		totals := dead[num]
@@ -511,40 +762,57 @@ type segmentStats struct {
 
 // compactSegment relocates a segment's live extents into the active append
 // segment, then drops it and clears its tombstones.
-func (store *Store) compactSegment(num uint64) (segmentStats, error) {
+func (store *Store) compactSegment(num uint64, p *pacer) (segmentStats, error) {
 	var stats segmentStats
+
+	// A writer still open in this segment has not prepared its row yet, so the
+	// enumeration below would skip its extent and the drop would lose it.
+	store.mutex.Lock()
+	src, err := store.getSegment(num, false)
+	writing := err == nil && src.writers.Load() > 0
+	store.mutex.Unlock()
+	if writing {
+		return stats, fmt.Errorf("%w: segment %d has an open writer", errSegmentBusy, num)
+	}
 
 	entries, err := scanIdx(store.dir, num)
 	if err != nil {
 		return stats, fmt.Errorf("scan idx %d: %w", num, err)
 	}
 
+	unresolved := 0
 	for _, e := range entries {
-		badgerKey, raw, cur, err := store.rowAt(e.Key, num, e.Off)
+		if p.stopped() {
+			return stats, errCompactionStopped
+		}
+		moved, size, err := store.relocateSlot(e.Key, num, e.Off, p)
 		if err != nil {
 			return stats, err
 		}
-		// A .idx row is only live if some index key still points at this exact
-		// slot; anything deleted or superseded is already dead.
-		if badgerKey == nil {
-			continue
+		switch {
+		case moved:
+			stats.extents++
+			stats.bytes += size
+		case size > 0:
+			unresolved++
 		}
-		if err := store.relocateExtent(badgerKey, e.Key, raw, cur); err != nil {
-			return stats, fmt.Errorf("relocate extent: %w", err)
-		}
-		stats.extents++
-		stats.bytes += cur.PSize
+	}
+	// Closing: the extent in flight finished, but the segment is left for the
+	// next pass rather than dropped on the way out.
+	if p.stopped() {
+		return stats, errCompactionStopped
+	}
+	// A row still names a slot here after every attempt, so the segment holds
+	// data someone can read; keep it, and the next cycle tries again.
+	if unresolved > 0 {
+		return stats, fmt.Errorf("%w: segment %d, %d extents still named after relocation", errSegmentBusy, num, unresolved)
 	}
 
-	// The relocations above CAS-committed the repointed rows into badger, which
-	// runs with SyncWrites off, so they may still be only in the OS page cache.
-	// dropSegment durably unlinks the source, so without this fsync a power loss
-	// or kernel panic between the two could revert the index to a segment that is
-	// already gone. Skip it when nothing moved: an empty drop repoints nothing.
-	if stats.extents > 0 {
-		if err := store.index.Sync(); err != nil {
-			return stats, fmt.Errorf("sync index before drop %d: %w", num, err)
-		}
+	// The repoints above, and any made by an earlier pass that failed before its
+	// drop, may be only in the page cache: badger runs with SyncWrites off. The
+	// unlink is durable, so the index is synced first on every drop.
+	if err := store.syncIndex(); err != nil {
+		return stats, fmt.Errorf("sync index before drop %d: %w", num, err)
 	}
 
 	store.mutex.Lock()
@@ -565,6 +833,44 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 	return stats, store.deleteTombstones(num)
 }
 
+// relocateAttempts bounds how often one slot is re-read and re-relocated after
+// losing its swap to a concurrent commit, which moves the row it raced.
+const relocateAttempts = 3
+
+// relocateSlot relocates whichever row occupies segment num at off. A lost swap
+// means a commit moved that row, possibly into a namespace still naming this
+// slot, so the slot is read afresh and tried again. moved reports a relocation;
+// a zero size with moved false means no row names the slot any more.
+func (store *Store) relocateSlot(idxKey [36]byte, num uint64, off int64, p *pacer) (moved bool, size int64, err error) {
+	for range relocateAttempts {
+		badgerKey, raw, cur, err := store.rowAt(idxKey, num, off)
+		if err != nil {
+			return false, 0, err
+		}
+		// A .idx row is only live if some index key still points at this exact
+		// slot; anything deleted or superseded is already dead.
+		if badgerKey == nil {
+			return false, 0, nil
+		}
+		moved, err := store.relocateExtent(badgerKey, idxKey, raw, cur, p)
+		if err != nil {
+			return false, 0, fmt.Errorf("relocate extent: %w", err)
+		}
+		if moved {
+			return true, cur.PSize, nil
+		}
+		size = cur.PSize
+	}
+	badgerKey, _, _, err := store.rowAt(idxKey, num, off)
+	if err != nil {
+		return false, 0, err
+	}
+	if badgerKey == nil {
+		return false, 0, nil
+	}
+	return false, size, nil
+}
+
 // rowAt finds the index key, if any, whose extent occupies segment num at off.
 // It checks the live row, then the prepared and retained generations: a
 // prepared extent is data a commit is about to publish and a retained one is
@@ -574,57 +880,79 @@ func (store *Store) compactSegment(num uint64) (segmentStats, error) {
 // Prepared and retained rows are keyed by epoch, so there may be several of
 // each and none can be addressed directly — hence the scan.
 func (store *Store) rowAt(idxKey [36]byte, num uint64, off int64) (badgerKey, raw []byte, ext extent, err error) {
-	value, err := store.indexGet(idxKey[:])
-	switch {
-	case err == nil:
-		cur, _, decodeErr := decodeIndexValue(value)
-		if decodeErr != nil {
-			return nil, nil, extent{}, fmt.Errorf("decode extent: %w", decodeErr)
-		}
-		if cur.SegNum == num && cur.Off == off {
-			return idxKey[:], value, cur, nil
-		}
-	case !errors.Is(err, badger.ErrKeyNotFound):
-		return nil, nil, extent{}, fmt.Errorf("get extent: %w", err)
-	}
-
-	for _, prefix := range [][]byte{preparedScan(idxKey[:]), retainedScan(idxKey[:])} {
-		var (
-			found    []byte
-			foundRaw []byte
-			foundExt extent
-		)
-		scanErr := store.indexScan(prefix, func(k, v []byte) error {
-			if found != nil || len(k) != len(prefix)+8 {
-				return nil
-			}
-			cur, _, decodeErr := decodeIndexValue(v)
+	// One snapshot for all three namespaces, so a commit moving a row between
+	// them mid-lookup cannot hide it from every one.
+	err = store.index.View(func(txn *badger.Txn) error {
+		value, err := readRaw(txn, idxKey[:])
+		switch {
+		case err == nil:
+			cur, _, decodeErr := decodeIndexValue(value)
 			if decodeErr != nil {
 				return fmt.Errorf("decode extent: %w", decodeErr)
 			}
 			if cur.SegNum == num && cur.Off == off {
-				found = append([]byte(nil), k...)
-				foundRaw = append([]byte(nil), v...)
-				foundExt = cur
+				badgerKey, raw, ext = idxKey[:], value, cur
+				return nil
 			}
-			return nil
-		})
-		if scanErr != nil {
-			return nil, nil, extent{}, scanErr
+		case !errors.Is(err, badger.ErrKeyNotFound):
+			return fmt.Errorf("get extent: %w", err)
 		}
-		if found != nil {
-			return found, foundRaw, foundExt, nil
+
+		for _, prefix := range [][]byte{preparedScan(idxKey[:]), retainedScan(idxKey[:])} {
+			found, err := scanRowAt(txn, prefix, num, off)
+			if err != nil {
+				return err
+			}
+			if found != nil {
+				badgerKey, raw, ext = found.key, found.raw, found.ext
+				return nil
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, extent{}, err
+	}
+	return badgerKey, raw, ext, nil
+}
+
+type slotRow struct {
+	key, raw []byte
+	ext      extent
+}
+
+// scanRowAt returns the epoch-keyed row under prefix whose extent occupies
+// segment num at off, or nil.
+func scanRowAt(txn *badger.Txn, prefix []byte, num uint64, off int64) (*slotRow, error) {
+	opts := badger.DefaultIteratorOptions
+	opts.Prefix = prefix
+	it := txn.NewIterator(opts)
+	defer it.Close()
+	for it.Rewind(); it.Valid(); it.Next() {
+		item := it.Item()
+		if len(item.Key()) != len(prefix)+8 {
+			continue
+		}
+		v, err := item.ValueCopy(nil)
+		if err != nil {
+			return nil, err
+		}
+		cur, _, err := decodeIndexValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("decode extent: %w", err)
+		}
+		if cur.SegNum == num && cur.Off == off {
+			return &slotRow{key: item.KeyCopy(nil), raw: v, ext: cur}, nil
 		}
 	}
-
-	return nil, nil, extent{}, nil
+	return nil, nil
 }
 
 // relocateExtent moves an extent into the active append segment and repoints
 // the index at it, unless a concurrent overwrite or delete of the same key gets
-// there first. badgerKey is the row being repointed, which is the live row or
-// the prepared one; idxKey is always the 36-byte form the sidecar records.
-func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []byte, old extent) error {
+// there first, which moved reports as false. badgerKey is the live, prepared or
+// retained row; idxKey is always the 36-byte form the sidecar records.
+func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []byte, old extent, p *pacer) (moved bool, err error) {
 	fragCount := uint64(old.PSize / totalFragSize) //nolint:gosec // PSize is a non-negative multiple of totalFragSize.
 
 	store.mutex.Lock()
@@ -633,7 +961,7 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 	srcSeg, err := store.getSegment(old.SegNum, false)
 	if err != nil {
 		store.mutex.Unlock()
-		return fmt.Errorf("get source segment %d: %w", old.SegNum, err)
+		return false, fmt.Errorf("get source segment %d: %w", old.SegNum, err)
 	}
 	srcSeg.addRef()
 
@@ -641,7 +969,7 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 	if err != nil {
 		srcSeg.releaseRef()
 		store.mutex.Unlock()
-		return fmt.Errorf("reserve destination: %w", err)
+		return false, fmt.Errorf("reserve destination: %w", err)
 	}
 	dstSeg.addRef()
 
@@ -653,7 +981,7 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 		srcSeg.releaseRef()
 		dstSeg.releaseRef()
 		store.mutex.Unlock()
-		return fmt.Errorf("append destination idx: %w", err)
+		return false, fmt.Errorf("append destination idx: %w", err)
 	}
 	// Copy without the mutex so compaction never stalls the write path. This is
 	// the window a racing overwrite or delete lands in.
@@ -664,20 +992,24 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 
 	// Verbatim is load-bearing: fragNum rides inside the copied bytes, so the
 	// nonce moves with them and is never reissued.
-	if err := copyExtent(srcSeg, old.Off, dstSeg, dstOff, old.PSize); err != nil {
-		return fmt.Errorf("copy extent bytes: %w", err)
+	if err := copyExtent(srcSeg, old.Off, dstSeg, dstOff, old.PSize, p); err != nil {
+		return false, fmt.Errorf("copy extent bytes: %w", err)
 	}
 	if err := dstSeg.Sync(); err != nil {
-		return fmt.Errorf("sync destination segment: %w", err)
+		return false, fmt.Errorf("sync destination segment: %w", err)
 	}
 	if err := dstSeg.syncIdx(); err != nil {
-		return fmt.Errorf("sync destination idx: %w", err)
+		return false, fmt.Errorf("sync destination idx: %w", err)
+	}
+	if store.beforeRelocateSwap != nil {
+		store.beforeRelocateSwap()
 	}
 
 	// Swap onto the new slot only if the key still holds the one we copied from.
 	for {
+		var stale bool
 		err := store.index.Update(func(txn *badger.Txn) error {
-			var stale bool
+			stale = false
 			item, err := txn.Get(badgerKey)
 			switch {
 			case errors.Is(err, badger.ErrKeyNotFound):
@@ -709,15 +1041,16 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("commit relocation: %w", err)
+			return false, fmt.Errorf("commit relocation: %w", err)
 		}
-		return nil
+		return !stale, nil
 	}
 }
 
 // copyExtent streams size bytes from src@srcOff to dst@dstOff via disjoint
-// ReadAt/WriteAt, so it runs lock-free against concurrent reads and writes.
-func copyExtent(src *segment, srcOff int64, dst *segment, dstOff int64, size int64) error {
+// ReadAt/WriteAt, so it runs lock-free against concurrent reads and writes,
+// pacing after each buffer.
+func copyExtent(src *segment, srcOff int64, dst *segment, dstOff int64, size int64, p *pacer) error {
 	if size == 0 {
 		return nil
 	}
@@ -731,6 +1064,7 @@ func copyExtent(src *segment, srcOff int64, dst *segment, dstOff int64, size int
 			return err
 		}
 		pos += n
+		p.copied(n)
 	}
 	return nil
 }

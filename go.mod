@@ -14,7 +14,8 @@ require (
 	github.com/klauspost/reedsolomon v1.14.2
 	github.com/minio/crc64nvme v1.1.1
 	github.com/mulgadc/bluebottle v1.25.1-0.20261119052434-6261addd31b9
-	github.com/nats-io/nats.go v1.55.0
+	github.com/nats-io/nats-server/v2 v2.15.3
+	github.com/nats-io/nats.go v1.56.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/quic-go/quic-go v0.65.0
 	github.com/stretchr/testify v1.12.1
@@ -53,7 +54,6 @@ require (
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/minio/highwayhash v1.0.4 // indirect
 	github.com/nats-io/jwt/v2 v2.8.3 // indirect
-	github.com/nats-io/nats-server/v2 v2.15.3 // indirect
 	github.com/nats-io/nkeys v0.4.17 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	go.etcd.io/bbolt v1.4.3 // indirect

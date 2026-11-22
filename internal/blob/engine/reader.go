@@ -30,6 +30,9 @@ type reader struct {
 	// Sequential position for Read; ReadAt is stateless.
 	readPos int64
 
+	// Records the segment read's latency for compaction's yield; may be nil.
+	latency *latencyMeter
+
 	closed bool
 }
 
@@ -81,7 +84,10 @@ func (r *reader) ReadAt(p []byte, off int64) (int, error) {
 		batchFragCount := min(int(endFragIdx-startFragIdx+1), batchCap)
 		batchDiskOff := r.ext.Off + startFragIdx*totalFragSize
 
-		if _, err := r.seg.ReadAt(r.buf[:batchFragCount*totalFragSize], batchDiskOff); err != nil {
+		if err := r.latency.timed(latencyRead, func() error {
+			_, err := r.seg.ReadAt(r.buf[:batchFragCount*totalFragSize], batchDiskOff)
+			return err
+		}); err != nil {
 			return totalCopied, fmt.Errorf("read segment %d at offset %d: %w", r.ext.SegNum, batchDiskOff, err)
 		}
 

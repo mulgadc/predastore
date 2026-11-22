@@ -1000,13 +1000,20 @@ func deleteObject(ctx context.Context, bc BlobClient, bucket, key string, object
 }
 
 // releaseSuperseded tells the nodes behind a replaced placement record that its
-// generation is finished with, so the disk comes back on the next sweep rather
-// than at the end of the retention window.
+// generation is finished with, which is the only thing that makes the disk
+// reclaimable: the sweep never reclaims a generation nobody released.
 //
-// Best-effort by construction: the object is already durable and visible, the
-// sweep reclaims the same rows on age alone, and a node that cannot be reached
-// must not fail a write that has landed.
-func releaseSuperseded(ctx context.Context, bc BlobClient, objectHash [32]byte, previous []byte, mine uint64) {
+// handoff is the node one step off the stripe, which is never recorded in a
+// placement, so it is passed in and released at every index. A shard only
+// lands there when its owner refused, and nothing else would ever name it.
+//
+// Best-effort by construction: the object is already durable and visible, and
+// a node that cannot be reached must not fail a write that has landed. A
+// release that does not arrive costs disk until the generation is released
+// again or the store is compacted, not correctness.
+func releaseSuperseded(
+	ctx context.Context, bc BlobClient, objectHash [32]byte, previous []byte, mine uint64, handoff config.NodeID,
+) {
 	if len(previous) == 0 {
 		return
 	}
@@ -1015,19 +1022,27 @@ func releaseSuperseded(ctx context.Context, bc BlobClient, objectHash [32]byte, 
 		return
 	}
 
-	var wg sync.WaitGroup
-	for index, node := range prev.AllNodes() {
+	release := func(wg *sync.WaitGroup, node config.NodeID, index int) {
 		wg.Go(func() {
 			if err := bc.Release(ctx, node, blob.ReleaseRequest{
 				Key:   objectHash,
 				Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
 				Epoch: prev.WriteEpoch,
 			}); err != nil {
-				slog.DebugContext(ctx, "Could not release a superseded generation; the sweep will age it out",
+				slog.DebugContext(ctx, "Could not release a superseded generation; its disk is held until it is released again",
 					"node", node, "index", index,
 					"epoch", fmt.Sprintf("%016x", prev.WriteEpoch), "err", err)
 			}
 		})
+	}
+
+	var wg sync.WaitGroup
+	nodes := prev.AllNodes()
+	for index, node := range nodes {
+		release(&wg, node, index)
+		if handoff != 0 && handoff != node {
+			release(&wg, handoff, index)
+		}
 	}
 	wg.Wait()
 }

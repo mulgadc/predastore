@@ -52,6 +52,11 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config)
 			return
 		}
 
+		if err := requireExpectedBucketOwner(ctx, mc, cache, r, bucket); err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, deleteObjectsBodyLimit))
 		if err != nil {
 			// A rewritten body keeps its own error rather than being reported as bad XML.
@@ -75,6 +80,15 @@ func DeleteObjects(mc MetaClient, bc BlobClient, cache *BucketCache, cfg Config)
 			HandleError(w, r, model.NewS3Error(model.ErrMalformedXML,
 				fmt.Sprintf("A delete request must name between 1 and %d objects", maxDeleteObjects), 400))
 			return
+		}
+		// The whole batch is refused: deleting the other keys would act on a
+		// request whose conditions were never evaluated.
+		for _, object := range request.Objects {
+			if object.ETag != nil {
+				WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
+					"Conditional deletes are not implemented")
+				return
+			}
 		}
 
 		outcomes := deleteBatch(ctx, mc, bc, cache, cfg, bucket, request.Objects, objectAuthorizerFrom(ctx))

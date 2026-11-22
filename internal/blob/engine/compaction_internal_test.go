@@ -42,12 +42,13 @@ func openTestStore(t *testing.T, opts ...Option) (*Store, string) {
 // putValue writes and publishes a value. Every epoch here is distinct, which
 // is what a real overwrite does; a test that needs a specific one calls
 // prepareValue and Commit itself.
-func putValue(t *testing.T, st *Store, oh [32]byte, idx uint32, body []byte) {
+func putValue(t *testing.T, st *Store, oh [32]byte, idx uint32, body []byte) uint64 {
 	t.Helper()
 	epoch := prepareValue(t, st, oh, idx, body)
 	if _, err := st.Commit(oh, idx, epoch); err != nil {
 		t.Fatalf("commit (%x,%d): %v", oh[0], idx, err)
 	}
+	return epoch
 }
 
 // prepareValue writes a value without publishing it and returns its epoch.
@@ -125,6 +126,21 @@ func fragNumsAt(t *testing.T, dir string, ext extent) []uint64 {
 // Three ~12 KiB values under a 40 KiB cap pack two into segment 0 and roll the
 // third into segment 1; deleting one of segment 0's values drops its live
 // fraction below threshold, making it the sole compaction candidate.
+// liveEpochOf is the generation a shard position currently serves, which is
+// the one the next overwrite demotes.
+func liveEpochOf(t *testing.T, st *Store, oh [32]byte, idx uint32) uint64 {
+	t.Helper()
+	r, err := st.Lookup(oh, idx)
+	if err != nil {
+		t.Fatalf("lookup (%x,%d): %v", oh[0], idx, err)
+	}
+	epoch := r.Epoch()
+	if err := r.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	return epoch
+}
+
 func segment0LayoutStore(t *testing.T) (st *Store, dir string, oh [32]byte) {
 	st, dir = openTestStore(t, WithMaxSegSize(40*KiB))
 	oh = [32]byte{0x42}
@@ -282,7 +298,7 @@ func TestOverwriteRetainsThenReclaimsSupersededExtent(t *testing.T) {
 	st, _ := openTestStore(t, WithMaxSegSize(1*MiB))
 	oh := [32]byte{0x11}
 
-	putValue(t, st, oh, 0, bytes.Repeat([]byte{0xaa}, 12*KiB))
+	superseded := putValue(t, st, oh, 0, bytes.Repeat([]byte{0xaa}, 12*KiB))
 	old := extentOf(t, st, oh, 0)
 
 	putValue(t, st, oh, 0, bytes.Repeat([]byte{0xbb}, 12*KiB))
@@ -298,6 +314,11 @@ func TestOverwriteRetainsThenReclaimsSupersededExtent(t *testing.T) {
 		t.Fatalf("commit tombstoned superseded slot %v while it is still retained", slotOf(old))
 	}
 
+	// The publisher reporting its record displaced that generation is what
+	// makes it dead; the sweep reclaims it afterwards and never before.
+	if err := st.ReleaseGeneration(oh, 0, superseded); err != nil {
+		t.Fatalf("release: %v", err)
+	}
 	released, err := st.sweepRetained(-time.Second)
 	if err != nil {
 		t.Fatalf("sweep retained: %v", err)
@@ -338,7 +359,7 @@ func TestTombstoneLandsAtCommitNotAppend(t *testing.T) {
 	oh := [32]byte{0x33}
 	body := bytes.Repeat([]byte{0xdd}, 12*KiB)
 
-	putValue(t, st, oh, 0, body)
+	superseded := putValue(t, st, oh, 0, body)
 	old := extentOf(t, st, oh, 0)
 
 	// Prepare an overwrite. Closing the writer makes it durable but does not
@@ -363,6 +384,9 @@ func TestTombstoneLandsAtCommitNotAppend(t *testing.T) {
 	if _, ok := tombstones(t, st)[slotOf(old)]; ok {
 		t.Fatalf("commit tombstoned superseded slot %v instead of retaining it", slotOf(old))
 	}
+	if err := st.ReleaseGeneration(oh, 0, superseded); err != nil {
+		t.Fatalf("release: %v", err)
+	}
 	if _, err := st.sweepRetained(-time.Second); err != nil {
 		t.Fatalf("sweep retained: %v", err)
 	}
@@ -380,12 +404,18 @@ func TestOverwriteChurnDrainsSegment(t *testing.T) {
 
 	// Values 0 and 1 fill segment 0; rewriting both relocates them and leaves
 	// segment 0 entirely dead.
+	superseded := [2]uint64{liveEpochOf(t, st, oh, 0), liveEpochOf(t, st, oh, 1)}
 	putValue(t, st, oh, 0, body)
 	putValue(t, st, oh, 1, body)
 
 	// Overwriting retains the previous generation, so the space is not dead
-	// until it is released. Draining is a property of the reclaim path, not of
-	// how long the store holds a generation answerable.
+	// until a publisher releases it. Draining is a property of the reclaim
+	// path, not of how long the store holds a generation answerable.
+	for idx, epoch := range superseded {
+		if err := st.ReleaseGeneration(oh, uint32(idx), epoch); err != nil {
+			t.Fatalf("release (%d): %v", idx, err)
+		}
+	}
 	if _, err := st.sweepRetained(-time.Second); err != nil {
 		t.Fatalf("sweep retained: %v", err)
 	}

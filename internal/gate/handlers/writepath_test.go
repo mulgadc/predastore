@@ -76,6 +76,19 @@ func (m *fakeMeta) Get(_ context.Context, key string) ([]byte, error) {
 	return append([]byte(nil), v...), nil
 }
 
+// LeaderGet counts as its own round trip: a leader read is a confirmed read in
+// production, not a cheaper one, so a handler that adds one is paying for it.
+func (m *fakeMeta) LeaderGet(_ context.Context, key string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.count("leaderget")
+	v, ok := m.rows[key]
+	if !ok {
+		return nil, meta.ErrNotFound
+	}
+	return append([]byte(nil), v...), nil
+}
+
 func (m *fakeMeta) Put(_ context.Context, key string, value []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
