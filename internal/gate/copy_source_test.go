@@ -109,3 +109,50 @@ func TestCopySource_MalformedSourceIsLeftToTheHandler(t *testing.T) {
 	_, nextCalled, _ := runMiddleware(t, copyServer(t), copyReq(t, "/owner-bucket/b", "/no-key", false, keyOwner, nil))
 	assert.True(t, nextCalled)
 }
+
+// Each multipart operation AWS names on its own is decided by that action, at
+// the identity and endpoint checks, so a deny on it is not escaped through the
+// object action it once shared, and a deny on that object action no longer
+// reaches it.
+func TestMultipart_OperationsAuthorizeAsTheirOwnActions(t *testing.T) {
+	for _, op := range []struct{ method, path, action, shared string }{
+		{http.MethodGet, "/owner-bucket/k?uploadId=u", "s3:ListMultipartUploadParts", "s3:GetObject"},
+		{http.MethodDelete, "/owner-bucket/k?uploadId=u", "s3:AbortMultipartUpload", "s3:DeleteObject"},
+		{http.MethodGet, "/owner-bucket?uploads", "s3:ListBucketMultipartUploads", "s3:ListBucket"},
+	} {
+		for name, tc := range map[string]struct {
+			denied   string
+			endpoint bool
+			allowed  bool
+		}{
+			"identity deny on the action":        {op.action, false, false},
+			"endpoint deny on the action":        {op.action, true, false},
+			"identity deny on the object action": {op.shared, false, true},
+		} {
+			identity := iampolicy.PolicyDocument{Version: iampolicy.Version2012, Statement: []iampolicy.Statement{allowAllPolicy.Statement[0]}}
+			req := httptest.NewRequest(op.method, op.path, nil)
+			if tc.endpoint {
+				doc, err := iampolicy.ParseEndpointPolicy([]byte(`{"Version":"2012-10-17","Statement":[` +
+					`{"Effect":"Allow","Principal":"*","Action":"s3:*","Resource":"*"},` +
+					`{"Effect":"Deny","Principal":"*","Action":"` + tc.denied + `","Resource":"*"}]}`))
+				require.NoError(t, err)
+				h := testHeader()
+				req.RemoteAddr = h.Source.String()
+				req = req.WithContext(withEndpoint(req.Context(), h, &doc))
+			} else {
+				identity.Statement = append(identity.Statement, iampolicy.Statement{
+					Effect: "Deny", Action: iampolicy.StringOrArr{tc.denied}, Resource: iampolicy.StringOrArr{"*"}})
+			}
+			server := newTestGate(t, Config{
+				Region: "ap-southeast-2",
+				Meta:   newFakeMeta(t, model.BucketMetadata{Name: "owner-bucket", Region: "ap-southeast-2", AccountID: acctOwner}),
+				CredProv: &stubCredProvider{creds: map[string]*auth.CredentialResult{
+					keyOwner: {SecretAccessKey: secret, AccountID: acctOwner, PolicyDocuments: []iampolicy.PolicyDocument{identity}},
+				}},
+			})
+			signTestReq(t, req, nil, keyOwner, secret, "ap-southeast-2", "s3")
+			status, nextCalled, body := runMiddleware(t, server, req)
+			assert.Equal(t, tc.allowed, nextCalled, "%s %s, %s: %d %s", op.method, op.path, name, status, body)
+		}
+	}
+}

@@ -9,11 +9,32 @@ import (
 
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	"github.com/mulgadc/predastore/internal/gate/auth"
+	"github.com/mulgadc/predastore/s3api"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 // --- s3Action tests ---
+
+// A request naming two bucket sub-resources authorizes as the operation it is
+// dispatched to, so the action order follows the route table's.
+func TestBucketSubResourceActions_FollowDispatchOrder(t *testing.T) {
+	for method, subs := range bucketSubResourceActions {
+		served := map[string]bool{}
+		var ordered []string
+		for _, sub := range subs {
+			served[sub.query] = true
+			ordered = append(ordered, sub.query)
+		}
+		var dispatched []string
+		for _, route := range s3api.Routes() {
+			if route.Scope == s3api.ScopeBucket && route.Method == method && served[route.Query] {
+				dispatched = append(dispatched, route.Query)
+			}
+		}
+		assert.Equal(t, dispatched, ordered, method)
+	}
+}
 
 func TestS3Action(t *testing.T) {
 	tests := []struct {
