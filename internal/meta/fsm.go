@@ -59,6 +59,10 @@ type FSM struct {
 	serving atomic.Bool
 
 	onKeyChanged func(key, value []byte)
+
+	// commitBatch commits a batch's transaction. A test replaces it to fail a
+	// commit on demand; production always commits the transaction.
+	commitBatch func(*badger.Txn) error
 }
 
 // FSMOption configures an FSM at construction. The FSM stays a pure state
@@ -90,7 +94,7 @@ func OnKeyChanged(fn func(key, value []byte)) FSMOption {
 
 // NewFSM creates a new FSM with the given Badger database.
 func NewFSM(db *badger.DB, opts ...FSMOption) *FSM {
-	f := &FSM{db: db}
+	f := &FSM{db: db, commitBatch: (*badger.Txn).Commit}
 	for _, opt := range opts {
 		opt(f)
 	}
@@ -98,85 +102,100 @@ func NewFSM(db *badger.DB, opts ...FSMOption) *FSM {
 	return f
 }
 
-// Apply is called once a log entry is committed by Raft
-// It applies the command to the Badger database.
+// Apply applies one committed entry. It is the batch path with a batch of one,
+// so a replica applies an entry the same way whichever path raft takes.
 func (f *FSM) Apply(log *raft.Log) any {
-	f.applied.Store(log.Index)
+	return f.ApplyBatch([]*raft.Log{log})[0]
+}
 
-	var cmd Command
-	if err := json.Unmarshal(log.Data, &cmd); err != nil {
-		return fmt.Errorf("failed to unmarshal command: %w", err)
+// ApplyBatch applies committed entries in order inside as few badger
+// transactions as fit, so a batch costs one synced commit instead of one per
+// entry. Each entry still gets its own response, as Apply would have given it.
+//
+// A failed commit stops the process. Badger may have applied part of it, so no
+// retry or error response can say what the store holds; a restart restores the
+// snapshot and replays the log, which rebuilds the store exactly.
+func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
+	responses := make([]any, len(logs))
+	if len(logs) == 0 {
+		return responses
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	switch cmd.Type {
-	case CommandPut:
-		return f.applyPut(string(cmd.Key), cmd.Value)
-	case CommandDelete:
-		return f.applyDelete(string(cmd.Key))
-	case CommandPutMax:
-		return f.applyPutMax(string(cmd.Key), cmd.Value, cmd.Epoch)
-	case CommandSwap:
-		return f.applySwap(string(cmd.Key), cmd.Value)
-	default:
-		return fmt.Errorf("unknown command type: %d", cmd.Type)
+	txn := f.db.NewTransaction(true)
+	commit := func() {
+		if err := f.commitBatch(txn); err != nil {
+			//nolint:forbidigo // A part-applied commit cannot be answered; restart rebuilds the store from the log.
+			panic(fmt.Sprintf("meta: committing applied entries %d-%d failed; stopping so the log rebuilds the store: %v",
+				logs[0].Index, logs[len(logs)-1].Index, err))
+		}
 	}
+
+	for i, log := range logs {
+		if log.Type != raft.LogCommand {
+			continue
+		}
+		var cmd Command
+		if err := json.Unmarshal(log.Data, &cmd); err != nil {
+			responses[i] = fmt.Errorf("failed to unmarshal command: %w", err)
+			continue
+		}
+		resp, err := applyCommand(txn, cmd)
+		if errors.Is(err, badger.ErrTxnTooBig) {
+			commit()
+			txn = f.db.NewTransaction(true)
+			resp, err = applyCommand(txn, cmd)
+		}
+		if err != nil {
+			responses[i] = err
+			continue
+		}
+		responses[i] = resp
+	}
+	commit()
+	f.applied.Store(logs[len(logs)-1].Index)
+
+	return responses
 }
 
-// applyPutMax stores a placement record, and the epoch it carries orders
+// applyCommand stages one command in txn and returns its response: the
+// replaced value for CommandSwap, nil otherwise.
+//
+// CommandPutMax stores a placement record, and the epoch it carries orders
 // nothing. It exists so log entries written when this command did compare
-// epochs still replay, and new writers should use CommandPut.
+// epochs still replay, and new writers should use CommandPut. A client's PUT
+// is not acknowledged until its record reaches the log, so arrival order is
+// acknowledgement order, and last-to-arrive is the write S3 calls the winner.
 //
-// A client's PUT is not acknowledged until its record reaches the log, so
-// arrival order is acknowledgement order, and last-to-arrive is the write S3
-// calls the winner. Comparing epochs here picked the write that *started*
-// last instead, which is a different write whenever two PUTs overlap.
-func (f *FSM) applyPutMax(key string, value []byte, _ uint64) error {
-	return f.applyPut(key, value)
-}
-
-// applySwap stores a key-value pair and returns the value it replaced, or nil
-// if the key was absent. It reads before writing, so it is the more expensive
-// of the two and CommandPut stays the default.
-//
-// What the extra read buys is a writer knowing which generation it displaced.
-// Nothing else can tell it: the log settles who wins, and a caller that reads
-// the key itself beforehand races every other writer of that key.
-func (f *FSM) applySwap(key string, value []byte) any {
-	var previous []byte
-	err := f.db.Update(func(txn *badger.Txn) error {
-		switch item, err := txn.Get([]byte(key)); {
+// CommandSwap reads before writing, through the same transaction, so it sees
+// the writes earlier in its batch. What the read buys is a writer knowing
+// which generation it displaced: the log settles who wins, and a caller that
+// reads the key itself beforehand races every other writer of that key.
+func applyCommand(txn *badger.Txn, cmd Command) (any, error) {
+	switch cmd.Type {
+	case CommandPut, CommandPutMax:
+		return nil, txn.Set(cmd.Key, cmd.Value)
+	case CommandDelete:
+		return nil, txn.Delete(cmd.Key)
+	case CommandSwap:
+		var previous []byte
+		switch item, err := txn.Get(cmd.Key); {
 		case err == nil:
 			if previous, err = item.ValueCopy(nil); err != nil {
-				return err
+				return nil, err
 			}
 		case !errors.Is(err, badger.ErrKeyNotFound):
-			return err
+			return nil, err
 		}
-
-		return txn.Set([]byte(key), value)
-	})
-	if err != nil {
-		return err
+		if err := txn.Set(cmd.Key, cmd.Value); err != nil {
+			return nil, err
+		}
+		return previous, nil
+	default:
+		return nil, fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
-
-	return previous
-}
-
-// applyPut stores a key-value pair.
-func (f *FSM) applyPut(key string, value []byte) error {
-	return f.db.Update(func(txn *badger.Txn) error {
-		return txn.Set([]byte(key), value)
-	})
-}
-
-// applyDelete removes a key.
-func (f *FSM) applyDelete(key string) error {
-	return f.db.Update(func(txn *badger.Txn) error {
-		return txn.Delete([]byte(key))
-	})
 }
 
 // Snapshot captures a point-in-time view of the store and returns.

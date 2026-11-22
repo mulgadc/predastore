@@ -304,6 +304,12 @@ LeaderTimeout:      30 * time.Second   // how long the gate barrier waits
 
 `SnapshotInterval` is a *check* interval, not a snapshot frequency. `runSnapshots` wakes on a randomised 120–240s timer and only takes one when `lastIndex - lastSnapshotIndex >= SnapshotThreshold`. At the default threshold a cluster writing 100 objects a second snapshots about every five and a half hours.
 
+### The raft log store and the apply path
+
+The log is opened with bolt's freelist unsynced and kept as a map (`openLogStore`). A snapshot truncates up to `TrailingLogs` entries from the front of the log, which frees that many pages, and a synced freelist is rewritten in full on every commit: on prod that cost about 1 MB per one-entry commit, around 80 MB/s per node at 80 commits/s. Unsynced, bolt rebuilds the freelist by scanning the file on open, and the file format is unchanged, so an older build opens it and syncs its freelist again.
+
+The FSM takes committed entries in batches (`ApplyBatch`), and applies each batch in one badger transaction, so a batch costs one synced commit rather than one per entry. Entries still apply in order and a `Swap` sees the writes before it in its batch. A failed commit stops the process: badger may have applied part of it, and a restart restores the snapshot and replays the log, which rebuilds the store. That stop takes the gate and blob roles in the same process down with the replica.
+
 **`SnapshotThreshold` is the knob that decides cost, and it should be set to about the row count.** A snapshot writes the whole store, so at `N` rows of `r` bytes it costs `N × r` and is taken once per `T` entries: each write carries an amortised `N × r / T` on top of its own `r`, making write amplification `N / T`. A threshold well below the row count is amplification; one well above it is a longer replay after a restart, which is far cheaper. The default suits the few-million-object clusters this is built for. **A store an order of magnitude larger needs it raised** — at a billion rows, a threshold of two million is roughly 500× amplification against a store of a few hundred GB.
 
 The log peaks at `TrailingLogs + SnapshotThreshold` entries before compaction, so the defaults imply about 1.1 GB. The snapshot store retains two (`NewFileSnapshotStore(..., 2, ...)`), so a large store also costs twice its size on disk in snapshots.
