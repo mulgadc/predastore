@@ -64,9 +64,9 @@ func TestCompactionDefersSegmentWithLiveReader(t *testing.T) {
 	}
 }
 
-// dropSegment must decline rather than wait, so the decision is exact under
+// detachSegment must decline rather than wait, so the decision is exact under
 // the caller's lock and never turns into a blocking one.
-func TestDropSegmentReportsBusyWithoutWaiting(t *testing.T) {
+func TestDetachSegmentReportsBusyWithoutWaiting(t *testing.T) {
 	st, _, oh := segment0LayoutStore(t)
 
 	held, err := st.Lookup(oh, 1)
@@ -76,11 +76,11 @@ func TestDropSegmentReportsBusyWithoutWaiting(t *testing.T) {
 	defer held.Close()
 
 	st.mutex.Lock()
-	err = st.dropSegment(0)
+	err = st.detachSegment(0)
 	st.mutex.Unlock()
 
 	if err == nil {
-		t.Fatal("dropSegment dropped a segment with a live reader")
+		t.Fatal("detachSegment detached a segment with a live reader")
 	}
 	if _, ok := st.segCache[0]; !ok {
 		t.Error("a declined drop must leave the segment cached")

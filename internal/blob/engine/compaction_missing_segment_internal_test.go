@@ -116,7 +116,7 @@ func TestCompactOnceSkipsUnopenableSegment(t *testing.T) {
 // TestCompactOnceSkipsDroppedButStillTombstonedSegment covers the interaction
 // between the read/create split and per-segment error isolation: a segment
 // whose file is already gone but whose tombstones are still live in the index
-// (e.g. a crash between dropSegment and deleteTombstones leaves this exact
+// (e.g. a crash between the drop and deleteTombstones leaves this exact
 // state) must not stall the cycle, and its tombstones must be reclaimed.
 //
 // Before the read/create split, getSegment fabricated a header-only stand-in
@@ -151,7 +151,7 @@ func TestCompactOnceSkipsDroppedButStillTombstonedSegment(t *testing.T) {
 	}
 	t.Logf("clean candidate set: %v", cands)
 
-	// Simulate a crash between dropSegment and deleteTombstones: unlink the
+	// Simulate a crash between the drop and deleteTombstones: unlink the
 	// segment and its sidecar directly, leaving the tombstones that made it a
 	// candidate still in the index.
 	victim := cands[0]

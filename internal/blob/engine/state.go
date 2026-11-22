@@ -102,10 +102,5 @@ func (store *Store) saveState() (retErr error) {
 	}
 
 	// The rename itself is only durable once the parent directory is fsynced.
-	dir, err := os.Open(store.dir)
-	if err != nil {
-		return err
-	}
-	defer dir.Close()
-	return dir.Sync()
+	return store.syncDir()
 }

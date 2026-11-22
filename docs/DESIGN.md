@@ -461,6 +461,8 @@ A lost swap does not mean the slot is dead. The commit that won it can have move
 
 The index runs with badger's sync writes off, so relocations may still be in the page cache. The index is fsynced before **every** drop, including one whose pass moved nothing because an earlier pass relocated everything and then failed: that is what stops a power loss from reverting the index to a segment that is already gone.
 
+The drop holds `store.mutex` only to take the segment out of the cache and close it. The unlink runs after the lock is released: ext4 frees every extent of a file before `unlink` returns, about 1.6 s for a sealed 4 GiB segment, and every shard write and read on the node takes that lock. The `.seg` is unlinked before its `.idx` and the directory is fsynced, all before the tombstones are cleared, so a failed or interrupted drop leaves either both files, which the next cycle drops again, or the sidecar alone, which the next cycle removes with the tombstones. A segment whose `.seg` is present but whose sidecar is missing is reported, never treated as dropped.
+
 ### Persistent state
 
 `state.json` holds `segNum`, `valueNum`, `fragNum`, `fragNumHighWater` and `storeID`. It is written atomically and durably: write `state.json.tmp`, fsync it, rename, fsync the parent directory.
