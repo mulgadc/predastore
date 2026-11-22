@@ -147,7 +147,7 @@ jobs:
         uses: actions/checkout@v7.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@v7.1.0
         with:
           cache: true
           go-version-file: "go.mod"
@@ -296,7 +296,7 @@ jobs:
       # to upload it back. The toolchain itself is found locally in 0.1s.
       - name: Setup Go
         if: steps.gate.outputs.paused != 'true'
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@v7.1.0
         with:
           cache: false
           go-version-file: "go.mod"
