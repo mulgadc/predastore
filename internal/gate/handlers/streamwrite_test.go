@@ -157,7 +157,11 @@ func TestWriteAllocationDoesNotFollowObjectSize(t *testing.T) {
 		f := newWriteFixture(2, 1)
 		bc := &discardBlob{}
 
+		// Twice: one collection only moves pooled blocks to the victim cache,
+		// and a block a test before this one left there would be reused here
+		// and make the small write look cheaper than it is.
 		var before, after runtime.MemStats
+		runtime.GC()
 		runtime.GC()
 		runtime.ReadMemStats(&before)
 		_, err := writeSynthetic(t, f, bc, size)

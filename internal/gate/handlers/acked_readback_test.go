@@ -204,8 +204,10 @@ func newRealStoreGate(t testing.TB, p rsProfile) *realStoreGate {
 	t.Cleanup(func() { clientTr.Close() })
 	res, err := rpc.NewResolver(clusterCfg, clientNode, clientTr)
 	require.NoError(t, err)
+	pool := rpc.NewConnPool(clientNode, res)
+	t.Cleanup(func() { _ = pool.Close() })
 	client, err := blob.NewClient(blob.ClientConfig{
-		Client:          rpc.NewClient(rpc.NewConnPool(clientNode, res)),
+		Client:          rpc.NewClient(pool),
 		EnvelopeTimeout: 5 * time.Second,
 		IdleTimeout:     5 * time.Second,
 	})
