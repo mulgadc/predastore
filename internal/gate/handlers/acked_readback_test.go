@@ -51,6 +51,38 @@ type faultyBlob struct {
 	epochs *EpochMinter
 	mu     sync.Mutex
 	armed  shardFaults
+
+	// released and committed record what the gate asked of the nodes, by
+	// epoch, so a test can say which generation a write released.
+	released  []blob.ReleaseRequest
+	committed map[uint64]int
+}
+
+func (f *faultyBlob) Release(ctx context.Context, node config.NodeID, req blob.ReleaseRequest) error {
+	f.mu.Lock()
+	f.released = append(f.released, req)
+	f.mu.Unlock()
+	return f.BlobClient.Release(ctx, node, req)
+}
+
+// takeReleases returns and clears the releases recorded so far.
+func (f *faultyBlob) takeReleases() []blob.ReleaseRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.released
+	f.released = nil
+	return out
+}
+
+// lastCommitEpoch is the epoch of the most recent commit the gate sent.
+func (f *faultyBlob) lastCommitEpoch() uint64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var last uint64
+	for e := range f.committed {
+		last = max(last, e)
+	}
+	return last
 }
 
 func (f *faultyBlob) arm(s shardFaults) {
@@ -94,6 +126,12 @@ func (f *faultyBlob) Put(
 }
 
 func (f *faultyBlob) Commit(ctx context.Context, node config.NodeID, req blob.CommitRequest) (bool, error) {
+	f.mu.Lock()
+	if f.committed == nil {
+		f.committed = make(map[uint64]int)
+	}
+	f.committed[req.Epoch]++
+	f.mu.Unlock()
 	if slices.Contains(f.faults().dropCommit, req.Index) {
 		return false, errInjected
 	}
@@ -258,6 +296,32 @@ func succeeded(rr *httptest.ResponseRecorder) bool {
 	return rr.Code == http.StatusOK && !strings.Contains(rr.Body.String(), "<Error>")
 }
 
+// requireRefused holds a write below its floor to the promised failure: HTTP
+// 500 carrying an S3 InternalError, sent before any success header.
+func requireRefused(t *testing.T, rr *httptest.ResponseRecorder) {
+	t.Helper()
+	require.Equal(t, http.StatusInternalServerError, rr.Code, "a write below its floor must fail with 500: %s", rr.Body.String())
+	assert.Equal(t, "InternalError", s3ErrorCode(t, rr))
+	assert.Empty(t, rr.Header().Get("ETag"), "a refused write must not carry a success header")
+}
+
+// successBody checks that a success decodes as the operation's own result.
+type successBody func(t *testing.T, rr *httptest.ResponseRecorder)
+
+func copyResult(t *testing.T, rr *httptest.ResponseRecorder) {
+	t.Helper()
+	var out CopyObjectResult
+	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &out), rr.Body.String())
+	assert.NotEmpty(t, out.ETag)
+}
+
+func completeResult(t *testing.T, rr *httptest.ResponseRecorder) {
+	t.Helper()
+	var out CompleteMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &out), rr.Body.String())
+	assert.NotEmpty(t, out.ETag)
+}
+
 // faultCase is a fault and whether it leaves the write at or above its floor.
 type faultCase struct {
 	name     string
@@ -325,13 +389,19 @@ func eachFault(t *testing.T, fn func(t *testing.T, p rsProfile, c faultCase)) {
 // requireOutcome is the contract every write here is held to: a success reads
 // back as the new bytes, and a failure leaves the key as it was, or absent.
 // Below the floor the write must fail; at or above it, it must succeed.
-func requireOutcome(t *testing.T, g *realStoreGate, c faultCase, write *httptest.ResponseRecorder, key string, before, after []byte) {
+func requireOutcome(
+	t *testing.T, g *realStoreGate, c faultCase, write *httptest.ResponseRecorder, key string, before, after []byte,
+	body successBody,
+) {
 	t.Helper()
 	got := g.get(key)
 	if c.atFloor {
 		require.True(t, succeeded(write), "a write at its floor must succeed: %d %s", write.Code, write.Body.String())
+		if body != nil {
+			body(t, write)
+		}
 	} else {
-		require.False(t, succeeded(write), "a write below its floor was acknowledged")
+		requireRefused(t, write)
 	}
 	switch {
 	case succeeded(write):
@@ -355,7 +425,7 @@ func TestAnAcknowledgedNewKeyReadsBack(t *testing.T) {
 		put := g.put("fresh", body)
 		g.bc.arm(shardFaults{})
 
-		requireOutcome(t, g, c, put, "fresh", nil, body)
+		requireOutcome(t, g, c, put, "fresh", nil, body, nil)
 	})
 }
 
@@ -370,7 +440,7 @@ func TestAnAcknowledgedOverwriteReadsBack(t *testing.T) {
 		put := g.put("chunk", after)
 		g.bc.arm(shardFaults{})
 
-		requireOutcome(t, g, c, put, "chunk", before, after)
+		requireOutcome(t, g, c, put, "chunk", before, after, nil)
 	})
 }
 
@@ -403,7 +473,7 @@ func TestAnAcknowledgedCopyReadsBack(t *testing.T) {
 		cp := g.copy("src", "dst")
 		g.bc.arm(shardFaults{})
 
-		requireOutcome(t, g, c, cp, "dst", before, src)
+		requireOutcome(t, g, c, cp, "dst", before, src, copyResult)
 	})
 }
 
@@ -419,7 +489,7 @@ func TestAnAcknowledgedCompletionReadsBack(t *testing.T) {
 		done := g.complete(t, "mp", upload, MultipartUploadPart{PartNumber: 1, ETag: up.Header().Get("ETag")})
 		g.bc.arm(shardFaults{})
 
-		requireOutcome(t, g, c, done, "mp", nil, part)
+		requireOutcome(t, g, c, done, "mp", nil, part, completeResult)
 	})
 }
 
@@ -451,7 +521,7 @@ func TestAFailedPartReplacementKeepsTheOldPart(t *testing.T) {
 					rr = g.uploadPartCopy("mp", upload, 1, "src")
 				}
 				g.bc.arm(shardFaults{})
-				require.False(t, succeeded(rr), "a part write below its floor was acknowledged")
+				requireRefused(t, rr)
 
 				listed := g.listParts(t, "mp", upload)
 				require.Len(t, listed.Parts, 1)
@@ -495,10 +565,74 @@ func TestWithoutDegradedWritesEveryShardMustCommit(t *testing.T) {
 			put := g.put("k", bytes.Repeat([]byte("v2"), 1<<18))
 			g.bc.arm(shardFaults{})
 
-			require.False(t, succeeded(put), "a full-width write that lost a commit was acknowledged")
+			requireRefused(t, put)
 			got := g.get("k")
 			require.Equal(t, http.StatusOK, got.Code, got.Body.String())
 			assert.True(t, bytes.Equal(before, got.Body.Bytes()), "a failed write must leave the previous version")
 		})
 	}
 }
+
+// A failed overwrite must leave the generation it would have replaced
+// unreleased, which is what keeps it from the sweep (engine:
+// TestTheSweepKeepsAGenerationNobodyReleased), and the next successful write
+// must release exactly that generation on every holder, which is what lets
+// the sweep reclaim it (engine: TestAReleasedGenerationSurvivesTheReaderGraceWindow).
+func TestAFailedOverwriteReleasesNothingAndTheNextWriteReleasesTheSeed(t *testing.T) {
+	eachFault(t, func(t *testing.T, p rsProfile, c faultCase) {
+		if c.atFloor {
+			t.Skip("a write at its floor succeeds and releases the seed itself")
+		}
+		g := newRealStoreGate(t, p)
+		seed := bytes.Repeat([]byte("s"), 1<<18)
+		require.Equal(t, http.StatusOK, g.put("k", seed).Code)
+		seedEpoch := g.bc.lastCommitEpoch()
+		_ = g.bc.takeReleases()
+
+		g.bc.arm(c.faults)
+		failed := g.put("k", bytes.Repeat([]byte("f"), 1<<18))
+		g.bc.arm(shardFaults{})
+		requireRefused(t, failed)
+		assert.Empty(t, g.bc.takeReleases(), "a failed overwrite released a generation")
+
+		got := g.get("k")
+		require.Equal(t, http.StatusOK, got.Code, got.Body.String())
+		assert.True(t, bytes.Equal(seed, got.Body.Bytes()), "a failed overwrite must leave the seed")
+
+		final := bytes.Repeat([]byte("z"), 1<<18)
+		require.Equal(t, http.StatusOK, g.put("k", final).Code)
+		released := g.bc.takeReleases()
+		require.NotEmpty(t, released, "the write after a failed one released nothing")
+		positions := map[uint32]bool{}
+		for _, r := range released {
+			assert.Equal(t, seedEpoch, r.Epoch, "a write must release the generation its record displaced, not the failed one")
+			positions[r.Index] = true
+		}
+		assert.Len(t, positions, p.data+p.parity, "the seed must be released at every position")
+	})
+}
+
+// The degraded signal counts what committed, not what landed: a shard that
+// landed and lost its commit is as absent from the stripe as one never sent.
+func TestTheDegradedHeaderCountsUncommittedShards(t *testing.T) {
+	cases := []struct {
+		p      rsProfile
+		faults shardFaults
+		short  string
+	}{
+		{rsProfile{2, 1, 4}, shardFaults{dropCommit: []uint32{0}}, "1"},
+		{rsProfile{3, 2, 6}, shardFaults{dropCommit: []uint32{0}}, "1"},
+		{rsProfile{3, 2, 6}, shardFaults{failPut: []uint32{1}, dropCommit: []uint32{0}}, "2"},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("%s/short-%s", tc.p, tc.short), func(t *testing.T) {
+			g := newRealStoreGate(t, tc.p)
+			g.bc.arm(tc.faults)
+			put := g.put("k", bytes.Repeat([]byte("d"), 1<<18))
+			g.bc.arm(shardFaults{})
+			require.Equal(t, http.StatusOK, put.Code, put.Body.String())
+			assert.Equal(t, tc.short, put.Header().Get(degradedWriteHeader))
+		})
+	}
+}
+

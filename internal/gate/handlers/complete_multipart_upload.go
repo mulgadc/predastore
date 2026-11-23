@@ -164,7 +164,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		// Shards before the record, as PutObject does. The other order let a
 		// swap this writer could not account for abort the prepared shards the
 		// record may already name.
-		if _, err := commitShards(ctx, bc, objectHash, place, written, cfg.MinShards()); err != nil {
+		if _, err := commitShards(ctx, bc, objectHash, place, &written, cfg.MinShards()); err != nil {
 			failBelowCommitFloor(ctx, w, r, bc, objectHash, place, written, err)
 			return
 		}
@@ -205,7 +205,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		slog.DebugContext(ctx, "Multipart upload completed", "bucket", bucket, "key", key, "uploadID", uploadID, "parts", len(parts))
 
 		if written.degraded() {
-			w.Header().Set(degradedWriteHeader, strconv.Itoa(len(written.missing)))
+			w.Header().Set(degradedWriteHeader, strconv.Itoa(written.shortBy()))
 		}
 		if len(written.handoff) > 0 {
 			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))

@@ -125,7 +125,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// have already passed, and the blob store retains superseded
 		// generations for exactly that reason. Too few committed and the write
 		// fails here, before the swap, so the previous version stays current.
-		overtaken, err := commitShards(ctx, bc, objectHash, place, written, cfg.MinShards())
+		overtaken, err := commitShards(ctx, bc, objectHash, place, &written, cfg.MinShards())
 		if err != nil {
 			failBelowCommitFloor(ctx, w, r, bc, objectHash, place, written, err)
 			return
@@ -184,7 +184,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// until repair restores the shards that did not land. A caller writing
 		// something it cannot reproduce deserves to know that.
 		if written.degraded() {
-			w.Header().Set(degradedWriteHeader, strconv.Itoa(len(written.missing)))
+			w.Header().Set(degradedWriteHeader, strconv.Itoa(written.shortBy()))
 		}
 		if len(written.handoff) > 0 {
 			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))

@@ -128,7 +128,7 @@ func storePart(
 	// the commit comes before the parts row as well as the record. The other
 	// order also lets a re-upload release a generation its own commit has not
 	// retained yet, which leaves a row no sweep can reclaim.
-	if _, err := commitShards(ctx, bc, objectHash, place, written, cfg.MinShards()); err != nil {
+	if _, err := commitShards(ctx, bc, objectHash, place, &written, cfg.MinShards()); err != nil {
 		slog.ErrorContext(ctx, "Part refused: too few shards committed to read it back",
 			"uploadID", uploadID, "part", partNumber, "error", err)
 		telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonShardWrite)
@@ -183,7 +183,7 @@ func storePart(
 // is an error: the part is stored either way.
 func writePartHeaders(w http.ResponseWriter, written writeResult) {
 	if written.degraded() {
-		w.Header().Set(degradedWriteHeader, strconv.Itoa(len(written.missing)))
+		w.Header().Set(degradedWriteHeader, strconv.Itoa(written.shortBy()))
 	}
 	if len(written.handoff) > 0 {
 		w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))

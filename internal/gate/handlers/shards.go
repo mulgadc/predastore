@@ -98,6 +98,12 @@ type writeResult struct {
 	// toward neither the floor nor the degraded signal, and the commit that
 	// follows the record settles it either way.
 	ambiguous []int
+
+	// committed is how many positions commitShards found durable at the
+	// write's epoch, and zero until it has run. Once it has, it rather than
+	// the landings is what the degraded signal counts: a shard that landed
+	// and lost its commit is as absent as one that never landed.
+	committed int
 }
 
 func (r writeResult) landedCount() int {
@@ -117,7 +123,17 @@ func (r writeResult) landedCount() int {
 //
 // A shard that was handed off is not missing: the stripe is complete, just not
 // where the record says, and both the read path and repair look there.
-func (r writeResult) degraded() bool { return len(r.missing) > 0 }
+func (r writeResult) degraded() bool { return r.shortBy() > 0 }
+
+// shortBy is how many positions the write is short of full width: those not
+// committed once the commits have run, and those that never landed before.
+func (r writeResult) shortBy() int {
+	if r.committed > 0 {
+		return len(r.landed) - r.committed
+	}
+
+	return len(r.missing)
+}
 
 // fullWidth is the result of a write with no shards to place, which is an empty
 // object: nothing is missing because nothing was owed, and there is nothing on
@@ -643,10 +659,10 @@ var errCommitFloor = errors.New("too few shards committed")
 // still answers a record that names it, so it is counted, and reported so it
 // can be logged rather than acted on.
 func commitShards(
-	ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written writeResult, floor int,
+	ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written *writeResult, floor int,
 ) (superseded int, err error) {
 	var lost, durable atomic.Int64
-	forEachShard(written, func(index int, node config.NodeID) {
+	forEachShard(*written, func(index int, node config.NodeID) {
 		overtaken, err := bc.Commit(ctx, node, blob.CommitRequest{
 			Key:   objectHash,
 			Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
@@ -674,7 +690,8 @@ func commitShards(
 	if len(written.holders) == 0 {
 		return int(lost.Load()), nil
 	}
-	if n := int(durable.Load()); n < floor {
+	written.committed = int(durable.Load())
+	if n := written.committed; n < floor {
 		return int(lost.Load()), fmt.Errorf("%w: %d of %d needed at epoch %016x",
 			errCommitFloor, n, floor, place.WriteEpoch)
 	}

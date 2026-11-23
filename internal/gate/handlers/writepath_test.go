@@ -370,7 +370,7 @@ func (f writeFixture) write(ctx context.Context, objectHash [32]byte, body io.Re
 	if err != nil {
 		return place, written, err
 	}
-	_, err = commitShards(ctx, f.bc, objectHash, place, written, f.cfg.MinShards())
+	_, err = commitShards(ctx, f.bc, objectHash, place, &written, f.cfg.MinShards())
 
 	return place, written, err
 }
