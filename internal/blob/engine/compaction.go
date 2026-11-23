@@ -668,7 +668,7 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 			// A segment file that is not there cannot hold live data, so every
 			// tombstone naming it is dead weight. Reclaim it below, outside the
 			// mutex, rather than reporting it on every cycle forever.
-			if errors.Is(err, fs.ErrNotExist) {
+			if errors.Is(err, fs.ErrNotExist) && !store.segmentFileExists(num) {
 				dropped = append(dropped, num)
 				continue
 			}
@@ -704,6 +704,13 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 			"sampleOff", totals.sampOff,
 			"samplePSize", totals.sampLen)
 
+		// A drop interrupted between its two unlinks leaves the sidecar; it
+		// goes, durably, before the tombstones that would retry the drop.
+		if err := store.removeLeftoverSidecar(num); err != nil {
+			slog.Error("could not remove what a dropped segment left", "segNum", num, "error", err)
+			failed++
+			continue
+		}
 		if err := store.deleteTombstones(num); err != nil {
 			slog.Error("could not reclaim tombstones naming a dropped segment", "segNum", num, "error", err)
 			failed++
@@ -819,16 +826,29 @@ func (store *Store) compactSegment(num uint64, p *pacer) (segmentStats, error) {
 	// Measured before the unlink, since afterwards there is nothing to stat.
 	// A segment that cannot be measured is still dropped: the reclaim figure
 	// is reporting, and must not decide whether the drop happens.
+	var size int64
 	if seg, segErr := store.getSegment(num, false); segErr == nil {
 		if info, statErr := seg.Stat(); statErr == nil {
-			stats.reclaimed = info.Size()
+			size = info.Size()
 		}
 	}
-	err = store.dropSegment(num)
+	err = store.detachSegment(num)
 	store.mutex.Unlock()
 	if err != nil {
 		return stats, fmt.Errorf("drop segment %d: %w", num, err)
 	}
+
+	// The unlink frees every extent before it returns, seconds for a sealed
+	// segment, so it runs unlocked. No row names the segment any more; until
+	// the tombstones go, a failed or interrupted unlink is retried next cycle.
+	unlinkStart := time.Now()
+	segUnlink, err := store.unlinkSegment(num)
+	if err != nil {
+		return stats, fmt.Errorf("drop segment %d: %w", num, err)
+	}
+	stats.reclaimed = size
+	slog.Info("dropped segment", "segNum", num, "bytes", size,
+		"segUnlinkStart", unlinkStart.UTC().Format(time.RFC3339Nano), "segUnlink", segUnlink, "unlink", time.Since(unlinkStart))
 
 	return stats, store.deleteTombstones(num)
 }

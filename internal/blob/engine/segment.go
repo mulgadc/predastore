@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -160,6 +161,10 @@ var openFile = func(path string, create bool) (file, error) {
 	return os.OpenFile(path, flags, 0600)
 }
 
+// removeFile unlinks a dropped segment's files. On ext4 it frees every extent
+// before returning, seconds for a sealed segment; tests override it to hold it.
+var removeFile = os.Remove
+
 // segment is an open segment file handle with a reference count.
 type segment struct {
 	file // .seg
@@ -213,15 +218,16 @@ func (seg *segment) appendIdx(e idxEntry) error {
 
 func (seg *segment) syncIdx() error { return seg.idx.Sync() }
 
-// dropSegment unlinks a drained segment and its sidecar. Caller holds
-// store.mutex. Safe only once every live extent it held has been committed
-// elsewhere.
+// detachSegment takes a drained segment out of service so it can be unlinked
+// without the lock: it leaves the cache and its descriptors close, so the
+// unlink is what frees its extents. The live count drops at the unlink, which
+// a failed one leaves to the retry. Caller holds store.mutex.
 //
 // A segment with live references is left in place and reported busy. Waiting
 // for them here would hold store.mutex across a wait no reader bounds, so a
 // single wedged reader would stall every other read and write on the node.
 // Deferring costs nothing but the dead space until the next cycle.
-func (store *Store) dropSegment(num uint64) error {
+func (store *Store) detachSegment(num uint64) error {
 	seg, ok := store.segCache[num]
 	if !ok {
 		return nil
@@ -230,7 +236,6 @@ func (store *Store) dropSegment(num uint64) error {
 		return fmt.Errorf("%w: segment %d", errSegmentBusy, num)
 	}
 	delete(store.segCache, num)
-	store.stats.liveSegments--
 
 	var errs []error
 	if err := seg.Close(); err != nil {
@@ -239,14 +244,66 @@ func (store *Store) dropSegment(num uint64) error {
 	if err := seg.idx.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close idx %d: %w", num, err))
 	}
-	if err := os.Remove(filepath.Join(store.dir, fmt.Sprintf(segFilename, num))); err != nil {
-		errs = append(errs, fmt.Errorf("unlink segment %d: %w", num, err))
-	}
-	if err := os.Remove(filepath.Join(store.dir, fmt.Sprintf(idxSegFilename, num))); err != nil {
-		errs = append(errs, fmt.Errorf("unlink idx %d: %w", num, err))
-	}
 	return errors.Join(errs...)
 }
+
+// unlinkSegment removes a detached segment's files and makes the removal
+// durable, reporting how long the .seg unlink took. Called without
+// store.mutex. The .seg goes first: a sidecar left behind is reclaimed by the
+// next cycle, a segment left behind is not.
+func (store *Store) unlinkSegment(num uint64) (segUnlink time.Duration, err error) {
+	start := time.Now()
+	switch err := removeFile(filepath.Join(store.dir, fmt.Sprintf(segFilename, num))); {
+	case err == nil:
+		store.mutex.Lock()
+		store.stats.liveSegments--
+		store.mutex.Unlock()
+	case !errors.Is(err, fs.ErrNotExist):
+		return 0, fmt.Errorf("unlink segment %d: %w", num, err)
+	}
+	segUnlink = time.Since(start)
+	if err := removeFile(filepath.Join(store.dir, fmt.Sprintf(idxSegFilename, num))); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return segUnlink, fmt.Errorf("unlink idx %d: %w", num, err)
+	}
+	return segUnlink, store.syncDir()
+}
+
+// segmentFileExists reports whether segment num's .seg file is on disk, which
+// tells a dropped segment from one whose sidecar alone is missing.
+func (store *Store) segmentFileExists(num uint64) bool {
+	_, err := os.Stat(filepath.Join(store.dir, fmt.Sprintf(segFilename, num)))
+	return !errors.Is(err, fs.ErrNotExist)
+}
+
+// removeLeftoverSidecar removes the .idx a drop interrupted after its .seg
+// unlink left behind, and makes that durable. Only a number below the active
+// segment qualifies: appends create segments at or above it, never below.
+func (store *Store) removeLeftoverSidecar(num uint64) error {
+	store.mutex.Lock()
+	below := num < store.segNum
+	store.mutex.Unlock()
+	if !below {
+		return fmt.Errorf("segment %d is not below the active segment", num)
+	}
+	if err := removeFile(filepath.Join(store.dir, fmt.Sprintf(idxSegFilename, num))); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("unlink idx %d: %w", num, err)
+	}
+	return store.syncDir()
+}
+
+// syncDirectory fsyncs a directory after a drop's unlinks; tests override it
+// to fail.
+var syncDirectory = func(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+// syncDir makes a drop's unlinks in the store directory durable.
+func (store *Store) syncDir() error { return syncDirectory(store.dir) }
 
 // countSegments counts the .seg files in dir. Called once at Open to seed the
 // live-segment counter, never on a reporting path.
