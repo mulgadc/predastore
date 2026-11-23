@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,14 +118,15 @@ var rsProfiles = []rsProfile{{2, 1, 4}, {3, 2, 6}}
 
 func (p rsProfile) String() string { return fmt.Sprintf("rs-%d-%d", p.data, p.parity) }
 
-var pipeHosts sync.Map
+// pipeHostSeq keeps every gate on a pipe host of its own. A benchmark runs
+// its setup once per calibration round, so a name alone would repeat.
+var pipeHostSeq atomic.Uint64
 
-func newRealStoreGate(t *testing.T, p rsProfile) *realStoreGate {
+func newRealStoreGate(t testing.TB, p rsProfile) *realStoreGate {
 	t.Helper()
 
-	host := "acked-" + strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
-	_, dup := pipeHosts.LoadOrStore(host, true)
-	require.False(t, dup, "pipe host %s reused", host)
+	host := fmt.Sprintf("acked-%d-%s", pipeHostSeq.Add(1),
+		strings.NewReplacer("/", "-", " ", "-").Replace(t.Name()))
 
 	const clientNode, basePort = config.NodeID(99), 7400
 	ids := make([]config.NodeID, p.nodes)
@@ -213,7 +215,7 @@ func (g *realStoreGate) copy(src, dst string) *httptest.ResponseRecorder {
 		http.Header{"X-Amz-Copy-Source": {"/bkt/" + src}})
 }
 
-func (g *realStoreGate) createUpload(t *testing.T, key string) string {
+func (g *realStoreGate) createUpload(t testing.TB, key string) string {
 	t.Helper()
 	rr := g.serve(CreateMultipartUpload(g.mc, g.cache), http.MethodPost, "/bkt/"+key+"?uploads", key, nil, nil)
 	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
@@ -233,7 +235,7 @@ func (g *realStoreGate) uploadPartCopy(key, upload string, n int, src string) *h
 		http.Header{"X-Amz-Copy-Source": {"/bkt/" + src}})
 }
 
-func (g *realStoreGate) listParts(t *testing.T, key, upload string) ListPartsResult {
+func (g *realStoreGate) listParts(t testing.TB, key, upload string) ListPartsResult {
 	t.Helper()
 	rr := g.serve(ListParts(g.mc, g.cache), http.MethodGet,
 		fmt.Sprintf("/bkt/%s?uploadId=%s", key, url.QueryEscape(upload)), key, nil, nil)
@@ -243,7 +245,7 @@ func (g *realStoreGate) listParts(t *testing.T, key, upload string) ListPartsRes
 	return out
 }
 
-func (g *realStoreGate) complete(t *testing.T, key, upload string, parts ...MultipartUploadPart) *httptest.ResponseRecorder {
+func (g *realStoreGate) complete(t testing.TB, key, upload string, parts ...MultipartUploadPart) *httptest.ResponseRecorder {
 	t.Helper()
 	body, err := xml.Marshal(CompleteMultipartUploadRequest{Parts: parts})
 	require.NoError(t, err)

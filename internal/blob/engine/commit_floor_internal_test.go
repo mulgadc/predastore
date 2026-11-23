@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 )
@@ -62,4 +63,51 @@ func TestCommitOfAGenerationHeldBehindANewerOneIsOvertaken(t *testing.T) {
 			t.Fatalf("Commit(demoted) = (%v, %v), want (false, nil)", published, err)
 		}
 	})
+}
+
+// BenchmarkCommitOvertaken measures the one commit branch that gained a read:
+// a retry for a generation held behind a newer one, which now proves the
+// retained row before it answers overtaken.
+func BenchmarkCommitOvertaken(b *testing.B) {
+	st, err := Open(b.TempDir(), WithFreeSpaceWatermark(0, 0), WithAEAD(testAEAD(b)))
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	b.Cleanup(func() { _ = st.Close() })
+	oh := [32]byte{0x64}
+	older := prepareValue(b, st, oh, 0, []byte("older"))
+	newer := prepareValue(b, st, oh, 0, []byte("newer"))
+	if _, err := st.Commit(oh, 0, newer); err != nil {
+		b.Fatalf("commit newer: %v", err)
+	}
+	if _, err := st.Commit(oh, 0, older); err != nil {
+		b.Fatalf("commit older: %v", err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := st.Commit(oh, 0, older); err != nil {
+			b.Fatalf("commit: %v", err)
+		}
+	}
+}
+
+// BenchmarkCommitPublish is the healthy path, for comparison: prepare and
+// publish a fresh generation, which the change does not touch.
+func BenchmarkCommitPublish(b *testing.B) {
+	st, err := Open(b.TempDir(), WithFreeSpaceWatermark(0, 0), WithAEAD(testAEAD(b)))
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	b.Cleanup(func() { _ = st.Close() })
+	body := bytes.Repeat([]byte("x"), 4096)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		oh := [32]byte{byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24)}
+		epoch := prepareValue(b, st, oh, 0, body)
+		if _, err := st.Commit(oh, 0, epoch); err != nil {
+			b.Fatalf("commit: %v", err)
+		}
+	}
 }
