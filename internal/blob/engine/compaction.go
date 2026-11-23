@@ -706,7 +706,7 @@ func (store *Store) candidateSegments() ([]uint64, int, error) {
 
 		// A drop interrupted between its two unlinks leaves the sidecar; it
 		// goes, durably, before the tombstones that would retry the drop.
-		if _, err := store.unlinkSegment(num); err != nil {
+		if err := store.removeLeftoverSidecar(num); err != nil {
 			slog.Error("could not remove what a dropped segment left", "segNum", num, "error", err)
 			failed++
 			continue

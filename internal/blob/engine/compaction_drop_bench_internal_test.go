@@ -16,8 +16,8 @@ import (
 )
 
 // dropBenchSegBytes is the size of the sealed segment the pass drops, from
-// PREDASTORE_BENCH_DROP_BYTES, default 1 GiB. Point PREDASTORE_BENCH_DIR at a
-// real disk: tmpfs frees a file for nothing and hides the cost.
+// PREDASTORE_BENCH_DROP_BYTES, default 1 GiB. PREDASTORE_BENCH_DIR places the
+// store; on tmpfs a file is freed for nothing, which hides the cost.
 func dropBenchSegBytes() int64 {
 	if v, err := strconv.ParseInt(os.Getenv("PREDASTORE_BENCH_DROP_BYTES"), 10, 64); err == nil && v > 0 {
 		return v
@@ -123,6 +123,9 @@ func BenchmarkForegroundDuringSegmentDrop(b *testing.B) {
 			removeFile = prevRemove
 			if unlinkTo.Load() == 0 {
 				b.Fatal("the pass never unlinked a segment")
+			}
+			if st.segmentFileExists(0) {
+				b.Fatal("the pass left the dead segment on disk")
 			}
 			from, to := time.Unix(0, unlinkFrom.Load()), time.Unix(0, unlinkTo.Load())
 			unlinks = append(unlinks, to.Sub(from))

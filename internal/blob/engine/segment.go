@@ -220,7 +220,8 @@ func (seg *segment) syncIdx() error { return seg.idx.Sync() }
 
 // detachSegment takes a drained segment out of service so it can be unlinked
 // without the lock: it leaves the cache and its descriptors close, so the
-// unlink is what frees its extents. Caller holds store.mutex.
+// unlink is what frees its extents. The live count drops at the unlink, which
+// a failed one leaves to the retry. Caller holds store.mutex.
 //
 // A segment with live references is left in place and reported busy. Waiting
 // for them here would hold store.mutex across a wait no reader bounds, so a
@@ -235,7 +236,6 @@ func (store *Store) detachSegment(num uint64) error {
 		return fmt.Errorf("%w: segment %d", errSegmentBusy, num)
 	}
 	delete(store.segCache, num)
-	store.stats.liveSegments--
 
 	var errs []error
 	if err := seg.Close(); err != nil {
@@ -253,7 +253,12 @@ func (store *Store) detachSegment(num uint64) error {
 // next cycle, a segment left behind is not.
 func (store *Store) unlinkSegment(num uint64) (segUnlink time.Duration, err error) {
 	start := time.Now()
-	if err := removeFile(filepath.Join(store.dir, fmt.Sprintf(segFilename, num))); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	switch err := removeFile(filepath.Join(store.dir, fmt.Sprintf(segFilename, num))); {
+	case err == nil:
+		store.mutex.Lock()
+		store.stats.liveSegments--
+		store.mutex.Unlock()
+	case !errors.Is(err, fs.ErrNotExist):
 		return 0, fmt.Errorf("unlink segment %d: %w", num, err)
 	}
 	segUnlink = time.Since(start)
@@ -270,15 +275,35 @@ func (store *Store) segmentFileExists(num uint64) bool {
 	return !errors.Is(err, fs.ErrNotExist)
 }
 
-// syncDir makes renames and unlinks in the store directory durable.
-func (store *Store) syncDir() error {
-	dir, err := os.Open(store.dir)
+// removeLeftoverSidecar removes the .idx a drop interrupted after its .seg
+// unlink left behind, and makes that durable. Only a number below the active
+// segment qualifies: appends create segments at or above it, never below.
+func (store *Store) removeLeftoverSidecar(num uint64) error {
+	store.mutex.Lock()
+	below := num < store.segNum
+	store.mutex.Unlock()
+	if !below {
+		return fmt.Errorf("segment %d is not below the active segment", num)
+	}
+	if err := removeFile(filepath.Join(store.dir, fmt.Sprintf(idxSegFilename, num))); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("unlink idx %d: %w", num, err)
+	}
+	return store.syncDir()
+}
+
+// syncDirectory fsyncs a directory after a drop's unlinks; tests override it
+// to fail.
+var syncDirectory = func(path string) error {
+	dir, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer dir.Close()
 	return dir.Sync()
 }
+
+// syncDir makes a drop's unlinks in the store directory durable.
+func (store *Store) syncDir() error { return syncDirectory(store.dir) }
 
 // countSegments counts the .seg files in dir. Called once at Open to seed the
 // live-segment counter, never on a reporting path.

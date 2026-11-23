@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/dgraph-io/badger/v4"
 )
 
 // holdSegmentUnlink makes the next unlink of a .seg file block until release
@@ -48,7 +50,15 @@ func TestCompaction_DropDoesNotBlockAppend(t *testing.T) {
 
 	entered, release := holdSegmentUnlink(t)
 	compacted := make(chan error, 1)
-	go func() { compacted <- st.compactOnce() }()
+	served := make(chan error, 1)
+	var workers sync.WaitGroup
+	// Runs before holdSegmentUnlink's cleanup restores the seam, and before the
+	// store closes: release the drop, then wait for both goroutines to finish.
+	t.Cleanup(func() {
+		release()
+		workers.Wait()
+	})
+	workers.Go(func() { compacted <- st.compactOnce() })
 	select {
 	case <-entered:
 	case err := <-compacted:
@@ -58,8 +68,7 @@ func TestCompaction_DropDoesNotBlockAppend(t *testing.T) {
 	}
 
 	body := bytes.Repeat([]byte{0xab}, 4*KiB)
-	served := make(chan error, 1)
-	go func() {
+	workers.Go(func() {
 		w, err := st.Append([32]byte{0x77}, 0, int64(len(body)), nextTestEpoch())
 		if err == nil {
 			_, err = w.Write(body)
@@ -75,7 +84,7 @@ func TestCompaction_DropDoesNotBlockAppend(t *testing.T) {
 			}
 		}
 		served <- err
-	}()
+	})
 
 	select {
 	case err := <-served:
@@ -129,9 +138,19 @@ func TestCompaction_FailedUnlinkIsRetriedNextCycle(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 
+	live := st.Snapshot().LiveSegments
 	restore := failUnlink(t, ".seg")
 	if err := st.compactOnce(); err != nil {
 		t.Fatalf("compact: %v", err)
+	}
+	if got := st.Snapshot().LiveSegments; got != live {
+		t.Fatalf("a failed unlink moved the live count %d -> %d", live, got)
+	}
+	if err := st.compactOnce(); err != nil {
+		t.Fatalf("compact while still failing: %v", err)
+	}
+	if got := st.Snapshot().LiveSegments; got != live {
+		t.Fatalf("a second failed unlink moved the live count %d -> %d", live, got)
 	}
 	if seg, idx := segmentFiles(t, dir, 0); !seg || !idx {
 		t.Fatalf("failed unlink left seg=%v idx=%v, want both", seg, idx)
@@ -155,6 +174,9 @@ func TestCompaction_FailedUnlinkIsRetriedNextCycle(t *testing.T) {
 	}
 	if st.Snapshot().BytesReclaimed == 0 {
 		t.Fatal("the completed drop counted nothing reclaimed")
+	}
+	if got := st.Snapshot().LiveSegments; got != live-1 {
+		t.Fatalf("the completed drop left the live count at %d, want %d", got, live-1)
 	}
 	if got := readValue(t, st, oh, 1); len(got) != 12*KiB {
 		t.Fatalf("relocated value read back %d bytes", len(got))
@@ -272,5 +294,77 @@ func TestCompaction_InterruptedDropRecoversAfterReopen(t *testing.T) {
 				t.Fatalf("relocated value read back %d bytes after reopen", len(got))
 			}
 		})
+	}
+}
+
+// failDirSync makes directory fsyncs fail until the returned restore runs,
+// which it also does at cleanup.
+func failDirSync(t *testing.T) (restore func()) {
+	t.Helper()
+	prev := syncDirectory
+	syncDirectory = func(string) error { return errors.New("injected directory sync failure") }
+	var once sync.Once
+	restore = func() { once.Do(func() { syncDirectory = prev }) }
+	t.Cleanup(restore)
+	return restore
+}
+
+// The unlinks are durable only once the directory is synced. A failed sync
+// leaves both files gone but keeps the tombstones, and a later cycle with a
+// working sync finishes the drop.
+func TestCompaction_FailedDirectorySyncKeepsTheTombstones(t *testing.T) {
+	st, dir, oh := segment0LayoutStore(t)
+	if _, err := st.Delete(oh, 0); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	restore := failDirSync(t)
+	if err := st.compactOnce(); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+	if seg, idx := segmentFiles(t, dir, 0); seg || idx {
+		t.Fatalf("the unlinks ran, yet seg=%v idx=%v remain", seg, idx)
+	}
+	if n := tombstoneCount(t, st, 0); n == 0 {
+		t.Fatal("tombstones were cleared although the unlinks were not made durable")
+	}
+
+	restore()
+	if err := st.compactOnce(); err != nil {
+		t.Fatalf("compact again: %v", err)
+	}
+	if n := tombstoneCount(t, st, 0); n != 0 {
+		t.Fatalf("%d tombstones survived a cycle with a working directory sync", n)
+	}
+}
+
+// A tombstone naming a segment number at or above the active one must never
+// remove files there: that is where appends create segments. It is reported
+// and kept, never treated as a drop to finish.
+func TestCandidateSegments_LeavesFilesAtOrAboveTheActiveSegment(t *testing.T) {
+	st, dir, _ := segment0LayoutStore(t)
+
+	st.mutex.Lock()
+	future := st.segNum + 1
+	st.mutex.Unlock()
+	sidecar := filepath.Join(dir, fmt.Sprintf(idxSegFilename, future))
+	if err := os.WriteFile(sidecar, nil, 0o600); err != nil {
+		t.Fatalf("create sidecar: %v", err)
+	}
+	err := st.index.Update(func(txn *badger.Txn) error {
+		return txn.Set(tombstoneKey(future, int64(segHeaderSize)), tombstoneValue(4096))
+	})
+	if err != nil {
+		t.Fatalf("inject tombstone: %v", err)
+	}
+
+	if _, _, err := st.candidateSegments(); err != nil {
+		t.Fatalf("candidates: %v", err)
+	}
+	if _, err := os.Stat(sidecar); err != nil {
+		t.Fatalf("cleanup removed a sidecar at or above the active segment: %v", err)
+	}
+	if n := tombstoneCount(t, st, future); n == 0 {
+		t.Fatal("tombstones naming a segment at or above the active one were cleared")
 	}
 }
