@@ -90,4 +90,8 @@ type Response struct {
 	// so published nothing. It is not an error — the caller raced another
 	// writer of the same shard and lost — but it is worth counting.
 	Superseded bool `json:"superseded,omitempty"`
+	// Held accompanies Superseded from a node that answers overtaken only
+	// for a generation it still holds. A node that predates it can answer
+	// overtaken for one it never prepared, so its answer proves nothing.
+	Held bool `json:"held,omitempty"`
 }

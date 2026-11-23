@@ -33,7 +33,7 @@ func (s *Service) repairShard(ctx context.Context, t task) (repairRoute, error) 
 			"node", t.node, "index", t.index)
 
 		return routeCommit, nil
-	case err != nil && !errors.Is(err, blob.ErrNotPrepared):
+	case err != nil && !errors.Is(err, blob.ErrNotPrepared) && !errors.Is(err, blob.ErrOvertakenUnproven):
 		return 0, fmt.Errorf("publish prepared shard: %w", err)
 	}
 
