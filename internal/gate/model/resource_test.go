@@ -18,6 +18,10 @@ func TestObjectValidateKey(t *testing.T) {
 		{"truncated sequence", []byte{0xE2, 0x82}, "valid UTF-8"},
 		{"invalid continuation byte", []byte{0xE2, 0x28, 0xA1}, "valid UTF-8"},
 		{"mixed valid and invalid", []byte{'a', 0xFF, 'b'}, "valid UTF-8"},
+		{"NUL first", []byte("\x00a"), "Bad Request"},
+		{"NUL inside", []byte("a\x00X"), "Bad Request"},
+		{"NUL last", []byte("a\x00"), "Bad Request"},
+		{"other control characters", []byte("a\x01\x1f\x7fb"), ""},
 	}
 
 	for _, tt := range tests {
