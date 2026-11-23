@@ -635,4 +635,3 @@ func TestTheDegradedHeaderCountsUncommittedShards(t *testing.T) {
 		})
 	}
 }
-
