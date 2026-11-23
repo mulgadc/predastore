@@ -20,6 +20,7 @@ var (
 // the log in short transactions so appends interleave with a snapshot's trim.
 type logStore struct {
 	*raftboltdb.BoltStore
+
 	batch       uint64
 	deleteRange func(from, to uint64) error
 }
