@@ -30,21 +30,27 @@ func BenchmarkLogStoreAppendDuringTrim(b *testing.B) {
 		b.StartTimer()
 
 		var stop atomic.Bool
-		appended := make(chan []time.Duration, 1)
+		var w []time.Duration
+		started := make(chan struct{})
+		appendErr := make(chan error, 1)
 		go func() {
-			var w []time.Duration
+			close(started)
 			for next := entries + 1; !stop.Load(); next++ {
 				start := time.Now()
 				if err := store.StoreLogs([]*raft.Log{{Index: next, Term: 1, Type: raft.LogCommand, Data: []byte("v")}}); err != nil {
-					break
+					appendErr <- err
+					return
 				}
 				w = append(w, time.Since(start))
 			}
-			appended <- w
+			appendErr <- nil
 		}()
+		<-started
 		require.NoError(b, store.DeleteRange(1, entries-1))
 		stop.Store(true)
-		waits = append(waits, <-appended...)
+		require.NoError(b, <-appendErr)
+		require.NotEmpty(b, w, "no append overlapped the trim")
+		waits = append(waits, w...)
 
 		b.StopTimer()
 		require.NoError(b, store.Close())

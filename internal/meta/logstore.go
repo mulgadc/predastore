@@ -42,9 +42,9 @@ func openLogStore(path string) (*logStore, error) {
 	return &logStore{BoltStore: bolt, batch: trimBatch, deleteRange: bolt.DeleteRange}, nil
 }
 
-// DeleteRange splits only a strict prefix: one that starts at the first entry
-// and ends before the last. Raft also deletes a conflicting suffix or the whole
-// log; those stay one transaction. An interrupted prefix leaves a shorter log.
+// DeleteRange splits only a prefix: a range that covers the first entry and
+// ends before the last, which may start below the first if another trim got
+// there first. A suffix or the whole log stays one transaction.
 func (s *logStore) DeleteRange(from, to uint64) error {
 	first, err := s.FirstIndex()
 	if err != nil {
@@ -54,10 +54,10 @@ func (s *logStore) DeleteRange(from, to uint64) error {
 	if err != nil {
 		return err
 	}
-	if from != first || to >= last {
+	if from > first || to >= last {
 		return s.deleteRange(from, to)
 	}
-	for lo := from; lo <= to; lo += s.batch {
+	for lo := max(from, first); lo <= to; lo += s.batch {
 		if err := s.deleteRange(lo, lo+min(s.batch-1, to-lo)); err != nil {
 			return err
 		}

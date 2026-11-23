@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"bytes"
 	"errors"
 	"path/filepath"
 	"sync/atomic"
@@ -26,8 +27,11 @@ func TestLogStore_PrefixTrimDoesNotBlockAppends(t *testing.T) {
 
 	var stop atomic.Bool
 	var worst time.Duration
+	appends := 0
+	started := make(chan struct{})
 	appendErr := make(chan error, 1)
 	go func() {
+		close(started)
 		for next := uint64(entries + 1); !stop.Load(); next++ {
 			start := time.Now()
 			if err := store.StoreLogs([]*raft.Log{{Index: next, Term: 1, Type: raft.LogCommand, Data: []byte("v")}}); err != nil {
@@ -35,9 +39,11 @@ func TestLogStore_PrefixTrimDoesNotBlockAppends(t *testing.T) {
 				return
 			}
 			worst = max(worst, time.Since(start))
+			appends++
 		}
 		appendErr <- nil
 	}()
+	<-started
 	require.NoError(t, store.DeleteRange(1, entries-1))
 	stop.Store(true)
 	require.NoError(t, <-appendErr)
@@ -45,7 +51,8 @@ func TestLogStore_PrefixTrimDoesNotBlockAppends(t *testing.T) {
 	first, err := store.FirstIndex()
 	require.NoError(t, err)
 	require.Equal(t, uint64(entries), first)
-	t.Logf("worst append %v", worst)
+	t.Logf("worst of %d appends %v", appends, worst)
+	require.Positive(t, appends, "no append overlapped the trim")
 	require.Less(t, worst, 250*time.Millisecond)
 }
 
@@ -74,9 +81,11 @@ func TestLogStore_InterruptedPrefixTrimLeavesAShorterLog(t *testing.T) {
 	recordDeletes(store, 3)
 	require.Error(t, store.DeleteRange(1, 899))
 	assertLogRange(t, store, 201, 1_000)
-	var entry raft.Log
+	want := bytes.Repeat([]byte{0x6c}, 16)
 	for i := uint64(201); i <= 1_000; i++ {
+		var entry raft.Log
 		require.NoError(t, store.GetLog(i, &entry))
+		require.Equal(t, raft.Log{Index: i, Term: 1, Type: raft.LogCommand, Data: want}, raft.Log{Index: entry.Index, Term: entry.Term, Type: entry.Type, Data: entry.Data})
 	}
 
 	store.deleteRange = store.BoltStore.DeleteRange
@@ -84,7 +93,7 @@ func TestLogStore_InterruptedPrefixTrimLeavesAShorterLog(t *testing.T) {
 	assertLogRange(t, store, 900, 1_000)
 }
 
-func TestLogStore_OnlyAStrictPrefixIsSplit(t *testing.T) {
+func TestLogStore_OnlyAPrefixIsSplit(t *testing.T) {
 	cases := []struct {
 		name               string
 		from, to           uint64
@@ -115,4 +124,20 @@ func TestLogStore_OnlyAStrictPrefixIsSplit(t *testing.T) {
 			assertLogRange(t, store, tc.wantFirst, tc.wantEnd)
 		})
 	}
+}
+
+// A second compaction can read the first index before an earlier one moves
+// it, and then asks for a prefix that starts below the log. It is still split.
+func TestLogStore_StalePrefixIsSplit(t *testing.T) {
+	store, err := openLogStore(filepath.Join(t.TempDir(), "raft.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	store.batch = 100
+	fillLog(t, store, 1, 1_000, 16)
+	require.NoError(t, store.DeleteRange(1, 300))
+
+	calls := recordDeletes(store, 0)
+	require.NoError(t, store.DeleteRange(1, 450))
+	require.Equal(t, [][2]uint64{{301, 400}, {401, 450}}, *calls)
+	assertLogRange(t, store, 451, 1_000)
 }

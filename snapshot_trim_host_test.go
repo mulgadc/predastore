@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,38 +57,70 @@ func TestS3PutDoesNotStallBehindASnapshotLogTrim(t *testing.T) {
 	status, _ := c.send(http.MethodPut, "/trim", "", nil)
 	require.Equal(t, http.StatusOK, status)
 
+	snapshots := ""
+	require.NoError(t, filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() && d.Name() == "snapshots" {
+			snapshots = path
+			return filepath.SkipAll
+		}
+		return err
+	}))
+	require.NotEmpty(t, snapshots, "no meta snapshot directory under %s", dataDir)
+
+	// Raft renames a snapshot out of its .tmp directory and then trims the
+	// log, so the rename marks the trim's start. PUTs run until well after it.
+	var trimStart atomic.Pointer[time.Time]
+	go func() {
+		for trimStart.Load() == nil {
+			if dirs, _ := filepath.Glob(filepath.Join(snapshots, "*", "state.bin")); slices.ContainsFunc(dirs, func(d string) bool {
+				return !strings.HasSuffix(filepath.Dir(d), ".tmp")
+			}) {
+				now := time.Now()
+				trimStart.Store(&now)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	const afterTrim = 5 * time.Second
+	running := func() bool {
+		start := trimStart.Load()
+		return start == nil || time.Since(*start) < afterTrim
+	}
+
 	// A key near S3's 1,024-byte limit makes each placement entry about 2 KB.
 	pad := strings.Repeat("k", 960)
 	var next atomic.Int64
 	var mu sync.Mutex
 	var worst time.Duration
+	overlapping := 0
 	var wg sync.WaitGroup
 	for range 16 {
 		wg.Go(func() {
-			for i := next.Add(1); i <= puts; i = next.Add(1) {
+			for running() {
+				i := next.Add(1)
+				if i > 2*puts {
+					t.Errorf("no snapshot after %d PUTs", 2*puts)
+					return
+				}
 				start := time.Now()
 				status, body := c.send(http.MethodPut, fmt.Sprintf("/trim/%s%08d", pad, i), "", []byte("v"))
-				took := time.Since(start)
+				end := time.Now()
 				if status != http.StatusOK {
 					t.Errorf("PUT %d: %d %s", i, status, body)
 					return
 				}
-				mu.Lock()
-				worst = max(worst, took)
-				mu.Unlock()
+				if trim := trimStart.Load(); trim != nil && end.After(*trim) {
+					mu.Lock()
+					overlapping++
+					worst = max(worst, end.Sub(start))
+					mu.Unlock()
+				}
 			}
 		})
 	}
 	wg.Wait()
 
-	snapshots := 0
-	require.NoError(t, filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
-		if err == nil && d.Name() == "state.bin" && strings.Contains(path, "snapshots") {
-			snapshots++
-		}
-		return err
-	}))
-	t.Logf("worst PUT %v over %d, %d snapshots", worst, puts, snapshots)
-	require.Positive(t, snapshots, "no snapshot was taken, so no log was truncated")
+	t.Logf("worst of %d PUTs ending in the %v after the trim began: %v", overlapping, afterTrim, worst)
+	require.Positive(t, overlapping, "no PUT overlapped the trim")
 	require.Less(t, worst, 250*time.Millisecond, "a PUT waited %v", worst)
 }
