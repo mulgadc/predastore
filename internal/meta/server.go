@@ -14,11 +14,9 @@ import (
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/hashicorp/raft"
-	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/telemetry"
 	"github.com/mulgadc/predastore/internal/transport"
-	"go.etcd.io/bbolt"
 )
 
 const (
@@ -46,7 +44,7 @@ type Server struct {
 	raft      *raft.Raft
 	fsm       *FSM
 	badgerDB  *badger.DB
-	bolt      *raftboltdb.BoltStore
+	bolt      *logStore
 
 	// raftUp is set once raft exists. Callers outside Run reach the Server as
 	// soon as it is built, so they need a published answer rather than a read
@@ -280,19 +278,6 @@ func parseRaftStat(v string) int64 {
 		return 0
 	}
 	return n
-}
-
-// openLogStore opens the raft log without syncing bolt's freelist. Synced, the
-// freelist is rewritten on every commit and holds every page a snapshot's log
-// truncation freed, which made each one-entry commit cost megabytes.
-func openLogStore(path string) (*raftboltdb.BoltStore, error) {
-	return raftboltdb.New(raftboltdb.Options{
-		Path: path,
-		BoltOptions: &bbolt.Options{
-			NoFreelistSync: true,
-			FreelistType:   bbolt.FreelistMapType,
-		},
-	})
 }
 
 // raftConfig applies this replica's identity and tuning over raft's own
