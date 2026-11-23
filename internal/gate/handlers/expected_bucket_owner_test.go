@@ -366,45 +366,76 @@ func TestExpectedBucketOwnerReadsThroughTheLeader(t *testing.T) {
 	assert.Positive(t, stale.leaderReads, "the owner was not read through a leader")
 }
 
-// A copy holds its source bucket to x-amz-source-expected-bucket-owner before
-// its source conditions, so a condition that holds cannot carry a copy past a wrong
-// owner, and the real owner still copies.
+// placementReads records which object placements a handler reads.
+type placementReads struct {
+	*fakeMeta
+
+	keys []string
+}
+
+func (m *placementReads) Get(ctx context.Context, key string) ([]byte, error) {
+	m.keys = append(m.keys, key)
+	return m.fakeMeta.Get(ctx, key)
+}
+
+// A copy refuses an expected source owner that does not own the source bucket
+// before it reads the source or evaluates a condition, so neither a holding nor
+// a failing condition changes the 403, and the source's real owner copies.
 // Verifies: Q-68.
 func TestExpectedSourceOwnerGatesBothCopies(t *testing.T) {
 	t.Parallel()
 
+	const srcBucket, sourceAccount = "source-bucket", "222233334444"
 	f := newWriteFixture(4, 2)
 	cache := NewBucketCache(nil)
 	seedOwnedBucket(t, f.mc, ownedBucket, ownerAccount)
-	seedOwnedObject(t, f, ownedBucket, ownedTestFile, []byte("source bytes"))
+	seedOwnedBucket(t, f.mc, srcBucket, sourceAccount)
+	seedOwnedObject(t, f, srcBucket, ownedTestFile, []byte("source bytes"))
 	seedOwnedUpload(t, f, ownedBucket, "assembled", "u1")
+	reads := &placementReads{fakeMeta: f.mc}
+	sourceHash := model.ObjectHash(srcBucket, ownedTestFile)
 
 	copies := map[string]struct {
 		handler http.Handler
 		target  string
 		key     string
 	}{
-		"CopyObject":     {CopyObject(f.mc, f.bc, f.ring, cache, f.cfg), "/" + ownedBucket + "/dest", "dest"},
-		"UploadPartCopy": {UploadPartCopy(f.mc, f.bc, f.ring, cache, f.cfg), "/" + ownedBucket + "/assembled?partNumber=1&uploadId=u1", "assembled"},
+		"CopyObject":     {CopyObject(reads, f.bc, f.ring, cache, f.cfg), "/" + ownedBucket + "/dest", "dest"},
+		"UploadPartCopy": {UploadPartCopy(reads, f.bc, f.ring, cache, f.cfg), "/" + ownedBucket + "/assembled?partNumber=1&uploadId=u1", "assembled"},
+	}
+	cases := []struct {
+		name, owner, ifMatch string
+		want                 int
+	}{
+		{"another account", otherAccount, "", http.StatusForbidden},
+		{"the destination's owner", ownerAccount, "", http.StatusForbidden},
+		{"another account, holding condition", otherAccount, "*", http.StatusForbidden},
+		{"another account, failing condition", otherAccount, `"0000"`, http.StatusForbidden},
+		{"the source's owner", sourceAccount, "", http.StatusOK},
 	}
 	for name, c := range copies {
-		for _, owner := range []string{otherAccount, ownerAccount} {
+		for _, tc := range cases {
 			req := ownerObjectRequest(http.MethodPut, c.target, ownedBucket, c.key, "")
-			req.Header.Set("X-Amz-Copy-Source", ownedBucket+"/"+ownedTestFile)
-			req.Header.Set("X-Amz-Copy-Source-If-Match", "*")
-			req.Header.Set(ExpectedSourceBucketOwnerHeader, owner)
+			req.Header.Set("X-Amz-Copy-Source", srcBucket+"/"+ownedTestFile)
+			if tc.ifMatch != "" {
+				req.Header.Set("X-Amz-Copy-Source-If-Match", tc.ifMatch)
+			}
+			req.Header.Set(ExpectedSourceBucketOwnerHeader, tc.owner)
 			f.mc.resetOps()
+			reads.keys = nil
 
 			w := httptest.NewRecorder()
 			c.handler.ServeHTTP(w, req)
 
-			if owner == ownerAccount {
-				assert.Equal(t, http.StatusOK, w.Code, "%s, real owner: %s", name, w.Body.String())
+			require.Equal(t, tc.want, w.Code, "%s, %s: %s", name, tc.name, w.Body.String())
+			if tc.want == http.StatusOK {
 				continue
 			}
-			assert.Equal(t, http.StatusForbidden, w.Code, "%s, wrong owner: %s", name, w.Body.String())
-			assert.Contains(t, w.Body.String(), "<Code>AccessDenied</Code>", name)
-			assert.Zero(t, f.mc.ops["put"]+f.mc.ops["swap"], "%s: metadata writes by a refused copy", name)
+			assert.Contains(t, w.Body.String(), "<Code>AccessDenied</Code>", "%s, %s", name, tc.name)
+			assert.Zero(t, f.mc.ops["put"]+f.mc.ops["swap"], "%s, %s: metadata writes by a refused copy", name, tc.name)
+			for _, key := range reads.keys {
+				assert.NotContains(t, key, string(sourceHash[:]), "%s, %s: a refused copy read the source placement", name, tc.name)
+			}
 		}
 	}
 }
