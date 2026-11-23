@@ -158,7 +158,10 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 		// Shards before the record, as PutObject does. The other order let a
 		// swap this writer could not account for abort the prepared shards the
 		// record may already name.
-		commitShards(ctx, bc, destHash, place, written)
+		if _, err := commitShards(ctx, bc, destHash, place, &written, cfg.MinShards()); err != nil {
+			failBelowCommitFloor(ctx, w, r, bc, destHash, place, written, err)
+			return
+		}
 
 		previous, err := metaSwap(ctx, mc, model.TableObjects, string(destHash[:]), record)
 		if err != nil {
@@ -187,7 +190,7 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			w.Header().Set("X-Predastore-Pool-Pressure", "nearfull")
 		}
 		if written.degraded() {
-			w.Header().Set(degradedWriteHeader, strconv.Itoa(len(written.missing)))
+			w.Header().Set(degradedWriteHeader, strconv.Itoa(written.shortBy()))
 		}
 		if len(written.handoff) > 0 {
 			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))

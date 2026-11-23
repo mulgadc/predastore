@@ -22,8 +22,9 @@
 #                      "node-rejoin", "node-resync", "node-rebuild",
 #                      "multipart-upload", "last-modified", "large-object",
 #                      "concurrent-put", "torn-overwrite", "stale-shard",
-#                      "object-sizes", "freeze", or "partial-put" — a client
-#                      that stops sending mid-body. Unset runs all fourteen.
+#                      "object-sizes", "acked-readback", "freeze", or
+#                      "partial-put" — a client that stops sending mid-body.
+#                      Unset runs them all.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -40,6 +41,9 @@
 #                      with a cluster already on the defaults (default: 10000)
 #   STRESS_TORN_LINES  Records in the torn-overwrite state document, which sets
 #                      its size (default: 16384, about 1MiB)
+#   STRESS_ACK_CYCLES  Freezes acked-readback runs (default: 3)
+#   STRESS_ACK_FREEZE  Seconds each acked-readback freeze lasts (default: 50)
+#   STRESS_ACK_WRITERS Concurrent writers acked-readback runs (default: 8)
 #   STRESS_STALE_KEYS  Objects the stale-shard scenario overwrites with a host
 #                      frozen (default: 12)
 #   STRESS_REPAIR_KEYS Objects the repair scenario writes with a host down
@@ -97,7 +101,7 @@ STALE_KEYS="${STRESS_STALE_KEYS:-12}"
 SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
     all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff|large-object|multipart-upload) ;;
-    last-modified|concurrent-put|object-sizes|retained-reclaim) ;;
+    last-modified|concurrent-put|object-sizes|retained-reclaim|acked-readback) ;;
     node-rejoin|node-resync|node-rebuild) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
@@ -108,7 +112,7 @@ esac
 # the memory figure the scenario exists to measure.
 WORK_ROOT="${TMPDIR:-/tmp}"
 case "$SCENARIO" in
-    all|large-object|multipart-upload) WORK_ROOT="$HOME/.cache/predastore-e2e" ;;
+    all|large-object|multipart-upload|acked-readback) WORK_ROOT="$HOME/.cache/predastore-e2e" ;;
 esac
 WORK_ROOT="${STRESS_WORK_ROOT:-$WORK_ROOT}"
 mkdir -p "$WORK_ROOT"
@@ -2106,6 +2110,231 @@ if [ "$SCENARIO" = all ] || [ "$SCENARIO" = object-sizes ]; then
     fi
 fi
 
+# --- Scenario: acked-readback ---
+#
+# The user-visible claim: a write that answered success reads back, straight
+# away and later, while one host of the stripe freezes for 50s, the shape of
+# an NVMe completion stall that outlasts the kernel's 30s timeout. Eight
+# writers put fresh keys throughout and read each success straight back, as
+# viperblock does with a chunk. The freeze outlasts the 45s commit bound, so
+# writes the frozen host holds give up on it and commit short a shard; a
+# shorter freeze heals before any write path notices.
+#
+# This is a soak, not the reproduction. The incident needs a commit cut off on
+# a write whose stripe is already short, which one frozen host cannot produce
+# on its own. The deterministic reproduction is the gate suite on real
+# blob stores (internal/gate/handlers/acked_readback_test.go). What this run
+# holds is the invariant under a process-level fault: every success reads back.
+#
+# Only one host is ever stopped, so the four-replica meta group keeps quorum.
+# It runs its own cluster under the production settings: degraded writes and
+# hinted handoff on, repair off so nothing heals a defect before it is read.
+# A failed write is not asserted on either way. The fault has to be shown to
+# have been met: an acknowledgement whose response came back inside a freeze,
+# and a short-stripe write logged between that freeze and its thaw. A run without both proves nothing and is inconclusive.
+
+ACKED_CLUSTER="${CONFIG_NAME}-acked"
+ACKED_CONFIG="$PREDA_CONFIG_DIR/$ACKED_CLUSTER.toml"
+ACKED_PID_DIR="$PREDA_DIR/$ACKED_CLUSTER/pids"
+ACKED_BUCKET="stress-acked"
+ACKED_CYCLES="${STRESS_ACK_CYCLES:-3}"
+ACKED_WRITERS="${STRESS_ACK_WRITERS:-8}"
+ACKED_FREEZE="${STRESS_ACK_FREEZE:-50}"
+ACKED_FAILURES=0
+ACKED_CASES=0
+
+render_acked_profile() {
+    render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$ACKED_CONFIG" "$(( PORT_OFFSET + 900 ))"
+    pin_availability "$ACKED_CONFIG" true true
+    pin_repair_off "$ACKED_CONFIG"
+    cat >> "$ACKED_CONFIG" <<PROFILE
+
+[[bucket]]
+name = "$ACKED_BUCKET"
+region = "$REGION"
+account_id = "123456789012"
+PROFILE
+    grep -q '^degraded_writes = true$' "$ACKED_CONFIG" \
+        || fail "acked-readback: degraded_writes was not written into $ACKED_CONFIG"
+    cp "$ACKED_CONFIG" "$RUN_DIR/$ACKED_CLUSTER.toml"
+}
+
+acked_check() {
+    local ok="$1" message="$2"
+    ACKED_CASES=$(( ACKED_CASES + 1 ))
+    if [ "$ok" = true ]; then
+        log "acked-readback: pass, $message"
+    else
+        log "acked-readback: FAIL $message"
+        ACKED_FAILURES=$(( ACKED_FAILURES + 1 ))
+    fi
+}
+
+# acked_writer PUTs fresh keys through its gate until the stop file appears,
+# and reads each success straight back. Each line it records is
+# "returned_ms key put_rc readback body", stamped when the PUT answered.
+acked_writer() {
+    local id="$1" gate="$2" out="$3" stop="$4"
+    local body="$WORK_DIR/acked-body-$id.bin" got="$WORK_DIR/acked-got-$id.bin"
+    local n=0 key rc seen returned
+    openssl rand -out "$body" 1048576
+    while [ ! -e "$stop" ]; do
+        n=$(( n + 1 ))
+        key="$(printf 'w%02d-%06d.bin' "$id" "$n")"
+        rc=0
+        aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 60 \
+            s3api put-object --bucket "$ACKED_BUCKET" --key "$key" --body "$body" \
+            >/dev/null 2>&1 || rc=$?
+        returned="$(date +%s%3N)"
+        seen=-
+        if [ "$rc" -eq 0 ]; then
+            seen=bad
+            if aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 60 \
+                s3 cp "s3://$ACKED_BUCKET/$key" "$got" --only-show-errors >/dev/null 2>&1 \
+                && cmp -s "$body" "$got"; then
+                seen=ok
+            fi
+        fi
+        echo "$returned $key $rc $seen $body" >> "$out"
+    done
+}
+
+# acked_log_lines prints, per host, how many lines its log holds now, so the
+# lines a freeze wrote can be read back by offset without parsing timestamps.
+acked_log_lines() {
+    local f
+    for f in "$PREDA_DIR/$ACKED_CLUSTER"/logs/host-*.log; do
+        echo "$f $(wc -l < "$f")"
+    done
+}
+
+# acked_faults_between counts the short-stripe events logged between two
+# acked_log_lines snapshots: a shard write that failed, leaving its position
+# empty. A handoff is not one, since it keeps the stripe at full width. A log
+# that gained no lines is skipped, so the range never reads past the snapshot.
+acked_faults_between() {
+    local before="$1" after="$2" f a b total=0 n
+    while read -r f b; do
+        a="$(awk -v f="$f" '$1 == f { print $2 }' "$before")"
+        a="${a:-0}"
+        [ "$b" -gt "$a" ] || continue
+        n="$(sed -n "$(( a + 1 )),${b}p" "$f" \
+            | grep -c 'Shard write failed; the stripe is short one holder' || true)"
+        total=$(( total + n ))
+    done < "$after"
+    echo "$total"
+}
+
+run_acked_readback() {
+    local hosts frozen gate1 gate2 fpid stop records windows
+    local cycle w t0 t1 faults=0 n pids=()
+
+    render_acked_profile
+    log "acked-readback: starting $ACKED_CLUSTER with degraded writes and handoff on, repair off"
+    "$SCRIPTS_DIR/start.sh" -w "$ACKED_CLUSTER"
+
+    mapfile -t hosts < <(parse_hosts "$ACKED_CONFIG" | awk '{ print $1 }')
+    [ "${#hosts[@]}" -ge 4 ] || fail "acked-readback: needs four hosts, profile has ${#hosts[@]}"
+    frozen="${hosts[2]}"
+    gate1="$(gate_of "$ACKED_CONFIG" "${hosts[0]}")"
+    gate2="$(gate_of "$ACKED_CONFIG" "${hosts[1]}")"
+    if [ -z "$gate1" ] || [ -z "$gate2" ]; then
+        fail "acked-readback: hosts ${hosts[0]} and ${hosts[1]} must run gates"
+    fi
+
+    records="$WORK_DIR/acked-records.txt"
+    windows="$WORK_DIR/acked-windows.txt"
+    stop="$WORK_DIR/acked-stop"
+    : > "$windows"
+    for w in $(seq 1 "$ACKED_WRITERS"); do
+        : > "$records.$w"
+        if [ $(( w % 2 )) -eq 0 ]; then
+            acked_writer "$w" "$gate2" "$records.$w" "$stop" &
+        else
+            acked_writer "$w" "$gate1" "$records.$w" "$stop" &
+        fi
+        pids+=("$!")
+    done
+    log "acked-readback: $ACKED_WRITERS writers running through $gate1 and $gate2"
+    sleep 8
+
+    for cycle in $(seq 1 "$ACKED_CYCLES"); do
+        fpid="$(cat "$ACKED_PID_DIR/host-${frozen}.pid")"
+        acked_log_lines > "$WORK_DIR/acked-lines-before"
+        t0="$(date +%s%3N)"
+        kill -STOP "$fpid"
+        FROZEN_PID="$fpid"
+        log "acked-readback: cycle $cycle, SIGSTOP host $frozen for ${ACKED_FREEZE}s"
+        sleep "$ACKED_FREEZE"
+        kill -CONT "$fpid"
+        FROZEN_PID=""
+        t1="$(date +%s%3N)"
+        acked_log_lines > "$WORK_DIR/acked-lines-after"
+        echo "$t0 $t1" >> "$windows"
+        n="$(acked_faults_between "$WORK_DIR/acked-lines-before" "$WORK_DIR/acked-lines-after")"
+        faults=$(( faults + n ))
+        log "acked-readback: cycle $cycle, SIGCONT host $frozen, $n short-stripe faults logged during the freeze"
+        sleep 15
+    done
+
+    touch "$stop"
+    for w in "${pids[@]}"; do wait "$w" || true; done
+    cat "$records".* > "$records"
+    cp "$records" "$RUN_DIR/acked-readback-records.txt"
+    mkdir -p "$RUN_DIR/logs/$ACKED_CLUSTER"
+    cp "$PREDA_DIR/$ACKED_CLUSTER"/logs/*.log "$RUN_DIR/logs/$ACKED_CLUSTER/" 2>/dev/null || true
+
+    local total acked refused bad inside final_bad
+    total="$(wc -l < "$records")"
+    acked="$(awk '$3 == 0' "$records" | wc -l)"
+    refused="$(awk '$3 != 0' "$records" | wc -l)"
+    bad="$(awk '$4 == "bad"' "$records" | wc -l)"
+    inside="$(awk 'NR == FNR { lo[NR] = $1; hi[NR] = $2; n = NR; next }
+        $3 == 0 { for (i = 1; i <= n; i++) if ($1 >= lo[i] && $1 <= hi[i]) { c++; break } }
+        END { print c + 0 }' "$windows" "$records")"
+    log "acked-readback: $total writes, $acked acknowledged, $refused refused, $inside acknowledged inside a freeze, $faults short-stripe faults logged during freezes"
+
+    # The settled pass: the cluster is whole again and every success is read
+    # once more, through the gate the odd writers did not use.
+    final_bad=0
+    local key rc body got="$WORK_DIR/acked-final.bin"
+    while read -r _ key rc _ body; do
+        [ "$rc" -eq 0 ] || continue
+        if ! aws_s3 "$gate2" --cli-connect-timeout 10 --cli-read-timeout 60 \
+            s3 cp "s3://$ACKED_BUCKET/$key" "$got" --only-show-errors >/dev/null 2>&1 \
+            || ! cmp -s "$body" "$got"; then
+            final_bad=$(( final_bad + 1 ))
+            log "acked-readback: $key was acknowledged and does not read back once settled"
+        fi
+    done < "$records"
+
+    acked_check "$([ "$inside" -gt 0 ] && [ "$faults" -gt 0 ] && echo true || echo false)" \
+        "fault reached: $inside acknowledgements answered inside a freeze and $faults short-stripe faults logged during one"
+    acked_check "$([ "$bad" -eq 0 ] && echo true || echo false)" \
+        "$bad of $acked acknowledged writes failed their immediate read-back"
+    acked_check "$([ "$final_bad" -eq 0 ] && echo true || echo false)" \
+        "$final_bad of $acked acknowledged writes failed the settled read-back"
+
+    log "acked-readback: stopping $ACKED_CLUSTER"
+    stop_clusters
+    if [ "$ACKED_FAILURES" -eq 0 ]; then
+        log "acked-readback: passed $ACKED_CASES assertions"
+    else
+        log "acked-readback: FAILED $ACKED_FAILURES of $ACKED_CASES assertions"
+    fi
+}
+
+if [ "$SCENARIO" = all ] || [ "$SCENARIO" = acked-readback ]; then
+    run_acked_readback
+
+    if [ "$SCENARIO" = acked-readback ]; then
+        echo "Stress results: $RUN_DIR"
+        [ "$ACKED_FAILURES" -eq 0 ] \
+            || fail "acked-readback failed $ACKED_FAILURES of $ACKED_CASES assertions"
+        exit 0
+    fi
+fi
+
 # --- Start ---
 
 log "starting $CONFIG_NAME"
@@ -3503,6 +3732,13 @@ log "Warp completed with no errors"
     else
         echo "handoff=fail ($HANDOFF_FAILURES of $HANDOFF_CASES)"
     fi
+    if [ "$ACKED_CASES" -eq 0 ]; then
+        echo "acked_readback=skipped"
+    elif [ "$ACKED_FAILURES" -eq 0 ]; then
+        echo "acked_readback=pass"
+    else
+        echo "acked_readback=fail ($ACKED_FAILURES of $ACKED_CASES)"
+    fi
     if [ "$TORN_CASES" -eq 0 ]; then
         echo "torn_overwrite=skipped"
     elif [ "$TORN_FAILURES" -eq 0 ]; then
@@ -3590,6 +3826,8 @@ echo "Stress results: $RUN_DIR"
     || fail "torn-overwrite failed $TORN_FAILURES of $TORN_CASES assertions"
 [ "$STALE_FAILURES" -eq 0 ] \
     || fail "stale-shard failed $STALE_FAILURES of $STALE_CASES assertions"
+[ "$ACKED_FAILURES" -eq 0 ] \
+    || fail "acked-readback failed $ACKED_FAILURES of $ACKED_CASES assertions"
 [ "$REPAIR_FAILURES" -eq 0 ] \
     || fail "repair failed $REPAIR_FAILURES of $REPAIR_CASES assertions"
 [ "$HANDOFF_FAILURES" -eq 0 ] \

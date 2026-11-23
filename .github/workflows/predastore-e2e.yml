@@ -117,7 +117,7 @@ jobs:
           REQUESTED: ${{ inputs.stress_scenarios }}
         run: |
           set -euo pipefail
-          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put retained-reclaim torn-overwrite stale-shard object-sizes freeze multipart-upload partial-put"
+          default="repair handoff node-rejoin node-resync node-rebuild last-modified large-object concurrent-put retained-reclaim torn-overwrite stale-shard object-sizes acked-readback freeze multipart-upload partial-put"
           # shellcheck disable=SC2086
           printf '%s\n' ${REQUESTED:-$default} | jq -Rsc 'split("\n") | map(select(length > 0))' \
             | sed 's/^/scenarios=/' >> "$GITHUB_OUTPUT"

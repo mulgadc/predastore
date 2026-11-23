@@ -22,7 +22,7 @@ unrelated, and passing this gate does not put anything on a server.
 
 ## What a default run does
 
-Fifteen scenarios in order, then a Warp load test. A default run is about **43
+Sixteen scenarios in order, then a Warp load test. A default run is about **43
 minutes** and asserts about **470** things, more on a fast runner where extra
 reclaim sweeps fit in the dwell.
 
@@ -41,6 +41,7 @@ reclaim sweeps fit in the dwell.
 | `torn-overwrite` | 5 | Overwrites with the host holding one named shard stopped; asserts the failed write left the object exactly as it was |
 | `stale-shard` | 48 | Overwrites with a host frozen, asserts no read ever splices generations |
 | `freeze` | 6 | Warp GET load while a host is SIGSTOPped; survivors keep serving, frozen host rejoins raft and takes writes |
+| `acked-readback` | 3 | A soak, not the reproduction: eight writers PUT fresh 1 MiB keys and read each back while one host is frozen 50s, past the 45s commit bound, three times. Asserts every acknowledged write reads back byte-identical straight away and once settled, and that the fault was met: an acknowledgement answered inside a freeze, and a short-stripe write logged during one (a handoff keeps full width and does not count). Runs its own cluster with degraded writes and handoff on. The deterministic reproduction of an acknowledged-but-unreadable write is the gate suite on real blob stores, `internal/gate/handlers/acked_readback_test.go` |
 | `partial-put` | 18 | A client that stops sending mid-body, over HTTP/1.1 and h2, killed and stalled; asserts the gate abandons it on its idle bound and the object it overwrites is untouched |
 
 **SIGSTOP is the fault worth injecting** because it is the one a healthy

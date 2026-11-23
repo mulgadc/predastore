@@ -15,7 +15,7 @@ import (
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
 )
 
-func testAEAD(t *testing.T) cipher.AEAD {
+func testAEAD(t testing.TB) cipher.AEAD {
 	t.Helper()
 	aead, err := masterkey.NewAEAD(bytes.Repeat([]byte{0x42}, 32))
 	if err != nil {
@@ -52,7 +52,7 @@ func putValue(t *testing.T, st *Store, oh [32]byte, idx uint32, body []byte) uin
 }
 
 // prepareValue writes a value without publishing it and returns its epoch.
-func prepareValue(t *testing.T, st *Store, oh [32]byte, idx uint32, body []byte) uint64 {
+func prepareValue(t testing.TB, st *Store, oh [32]byte, idx uint32, body []byte) uint64 {
 	t.Helper()
 	epoch := nextTestEpoch()
 	w, err := st.Append(oh, idx, int64(len(body)), epoch)

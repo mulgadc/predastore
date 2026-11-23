@@ -262,3 +262,24 @@ func TestBlobAbortDiscardsThePreparedShard(t *testing.T) {
 	require.NoError(t, err, "abort must not touch the committed generation")
 	assert.Equal(t, first, got)
 }
+
+// An upgraded node says it holds an overtaken generation, so the commit of a
+// generation that lost its race on the node still counts as durable, and one
+// it never prepared is refused rather than counted.
+func TestAnUpgradedNodeProvesTheOvertakenGenerationItHolds(t *testing.T) {
+	c := startBlobNode(t)
+	put(t, c, 10, []byte("older"))
+	put(t, c, 20, []byte("newer"))
+	require.NoError(t, commit(t, c, 20))
+
+	superseded, err := c.Commit(context.Background(), epochServerNode, blob.CommitRequest{
+		Key: epochKey(), Index: epochTestShardIndex, Epoch: 10,
+	})
+	require.NoError(t, err, "a held, overtaken generation is durable")
+	assert.True(t, superseded)
+
+	_, err = c.Commit(context.Background(), epochServerNode, blob.CommitRequest{
+		Key: epochKey(), Index: epochTestShardIndex, Epoch: 15,
+	})
+	require.ErrorIs(t, err, blob.ErrNotPrepared, "an epoch the node never prepared is not durable")
+}

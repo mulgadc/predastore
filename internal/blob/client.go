@@ -36,6 +36,11 @@ var (
 	// ErrNotPrepared is returned by commits when the node has nothing prepared
 	// under that epoch. The answer is to rewrite the shard, not to retry.
 	ErrNotPrepared = errors.New("no prepared shard under that epoch")
+
+	// ErrOvertakenUnproven is a commit answered overtaken by a node that does
+	// not say it holds the generation, as a node from before Held does. The
+	// shard may never have existed there, so it is not durable.
+	ErrOvertakenUnproven = errors.New("overtaken without proof the node holds the generation")
 )
 
 // PutRequest identifies the value a put commits. The bytes travel separately,
@@ -401,6 +406,16 @@ func (c *Client) Commit(ctx context.Context, nodeID config.NodeID, req CommitReq
 	resp, err := c.finish(ctx, nodeID, OpCommit, "commit", req)
 	if err != nil {
 		return false, err
+	}
+	return commitOutcome(resp)
+}
+
+// commitOutcome reads a commit's answer. Overtaken counts only with Held: a
+// write's floor must not rest on a node's word that it lost a race for a shard
+// it may never have prepared.
+func commitOutcome(resp *Response) (superseded bool, err error) {
+	if resp.Superseded && !resp.Held {
+		return true, ErrOvertakenUnproven
 	}
 	return resp.Superseded, nil
 }

@@ -370,9 +370,9 @@ func (f writeFixture) write(ctx context.Context, objectHash [32]byte, body io.Re
 	if err != nil {
 		return place, written, err
 	}
-	commitShards(ctx, f.bc, objectHash, place, written)
+	_, err = commitShards(ctx, f.bc, objectHash, place, &written, f.cfg.MinShards())
 
-	return place, written, nil
+	return place, written, err
 }
 
 // writeFixture is a gate write path at one erasure width.

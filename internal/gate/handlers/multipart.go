@@ -123,6 +123,19 @@ func storePart(
 		}
 	}
 
+	// Shards before any metadata, as the object path does. A part that fails
+	// its floor must leave ListParts and completion on the part it replaces, so
+	// the commit comes before the parts row as well as the record. The other
+	// order also lets a re-upload release a generation its own commit has not
+	// retained yet, which leaves a row no sweep can reclaim.
+	if _, err := commitShards(ctx, bc, objectHash, place, &written, cfg.MinShards()); err != nil {
+		slog.ErrorContext(ctx, "Part refused: too few shards committed to read it back",
+			"uploadID", uploadID, "part", partNumber, "error", err)
+		telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonShardWrite)
+		abortShards(ctx, bc, objectHash, place, written)
+		return model.PartMetadata{}, written, model.NewS3Error(model.ErrInternalError, err.Error(), 500)
+	}
+
 	// The part is dated from its own epoch, so ListParts and the placement
 	// record cannot disagree about when it was written.
 	modified, _ := place.ModifiedAt()
@@ -149,11 +162,6 @@ func storePart(
 		abortShards(ctx, bc, objectHash, place, written)
 		return model.PartMetadata{}, written, model.NewS3Error(model.ErrInternalError, "Failed to encode shard metadata", 500)
 	}
-	// Shards before the record, as the object path does. The other order lets a
-	// re-upload of the same part number release a generation its own commit has
-	// not retained yet, which leaves a row no sweep can reclaim.
-	commitShards(ctx, bc, objectHash, place, written)
-
 	// Swapping rather than writing tells this writer which generation it
 	// displaced. Re-uploading a part is an overwrite like any other, and
 	// without that answer the generation it supersedes is never released.
@@ -175,7 +183,7 @@ func storePart(
 // is an error: the part is stored either way.
 func writePartHeaders(w http.ResponseWriter, written writeResult) {
 	if written.degraded() {
-		w.Header().Set(degradedWriteHeader, strconv.Itoa(len(written.missing)))
+		w.Header().Set(degradedWriteHeader, strconv.Itoa(written.shortBy()))
 	}
 	if len(written.handoff) > 0 {
 		w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))

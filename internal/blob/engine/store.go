@@ -726,7 +726,16 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 					published = true
 					return nil
 				case liveErr == nil && liveEpoch > epoch:
-					return nil
+					// Overtaken only if this node still holds the generation. One
+					// it never prepared is not durable, and must not be counted
+					// toward a write's floor as though it were.
+					_, retErr := readRaw(txn, retainedKey(idxKey, epoch))
+					if retErr == nil {
+						return nil
+					}
+					if !errors.Is(retErr, badger.ErrKeyNotFound) {
+						return retErr
+					}
 				}
 				return ErrNotPrepared
 			case err != nil:

@@ -312,7 +312,9 @@ func (s *Server) handleCommit(ctx context.Context, h Request, stream transport.S
 		}
 		return respond(stream, &Response{Err: fmt.Sprintf("commit: %v", err)})
 	}
-	return respond(stream, &Response{Epoch: h.Epoch, Superseded: !published})
+	// The store answers overtaken only for a generation it holds, which is
+	// what Held tells a gate counting this shard toward a write's floor.
+	return respond(stream, &Response{Epoch: h.Epoch, Superseded: !published, Held: !published})
 }
 
 // handleAbort discards a prepared shard. Aborting something never prepared is
