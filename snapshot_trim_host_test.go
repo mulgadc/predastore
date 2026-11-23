@@ -67,12 +67,12 @@ func TestS3PutDoesNotStallBehindASnapshotLogTrim(t *testing.T) {
 	}))
 	require.NotEmpty(t, snapshots, "no meta snapshot directory under %s", dataDir)
 
-	// Raft renames a snapshot out of its .tmp directory and then trims the
-	// log, so the rename marks the trim's start. PUTs run until well after it.
+	// Raft renames a snapshot out of its .tmp directory, under the store's own
+	// snapshots directory, and then trims the log: the rename marks the trim.
 	var trimStart atomic.Pointer[time.Time]
 	go func() {
 		for trimStart.Load() == nil {
-			if dirs, _ := filepath.Glob(filepath.Join(snapshots, "*", "state.bin")); slices.ContainsFunc(dirs, func(d string) bool {
+			if dirs, _ := filepath.Glob(filepath.Join(snapshots, "snapshots", "*", "state.bin")); slices.ContainsFunc(dirs, func(d string) bool {
 				return !strings.HasSuffix(filepath.Dir(d), ".tmp")
 			}) {
 				now := time.Now()
