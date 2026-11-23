@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -194,9 +195,7 @@ func (g *realStoreGate) serve(h http.Handler, method, target, key string, body [
 	}
 	req := httptest.NewRequest(method, target, rd).WithContext(objectCtx("bkt", key))
 	req.ContentLength = int64(len(body))
-	for k, v := range header {
-		req.Header[k] = v
-	}
+	maps.Copy(req.Header, header)
 	rr := httptest.NewRecorder()
 	h.ServeHTTP(rr, req)
 	return rr
