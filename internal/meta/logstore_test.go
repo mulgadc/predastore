@@ -32,7 +32,7 @@ func writtenBytes(t *testing.T) int64 {
 
 // fillLog appends entries [from, to] of size bytes in batches, the way a
 // replica's log grows under load.
-func fillLog(t *testing.T, store raft.LogStore, from, to uint64, size int) {
+func fillLog(t testing.TB, store raft.LogStore, from, to uint64, size int) {
 	t.Helper()
 	data := bytes.Repeat([]byte{0x6c}, size)
 	batch := make([]*raft.Log, 0, 1000)
@@ -104,7 +104,7 @@ func TestOpenLogStore_ReadsALogEitherBuildWrote(t *testing.T) {
 }
 
 // assertLogRange requires the store to hold exactly entries [first, last].
-func assertLogRange(t *testing.T, store *raftboltdb.BoltStore, first, last uint64) {
+func assertLogRange(t *testing.T, store raft.LogStore, first, last uint64) {
 	t.Helper()
 	gotFirst, err := store.FirstIndex()
 	require.NoError(t, err)

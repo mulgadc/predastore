@@ -1,6 +1,7 @@
 package meta
 
 import (
+	"errors"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -46,4 +47,72 @@ func TestLogStore_PrefixTrimDoesNotBlockAppends(t *testing.T) {
 	require.Equal(t, uint64(entries), first)
 	t.Logf("worst append %v", worst)
 	require.Less(t, worst, 250*time.Millisecond)
+}
+
+// recordDeletes makes store's deletes visible to the test, failing the one
+// numbered failAt (from 1) and every one after it; zero never fails.
+func recordDeletes(store *logStore, failAt int) *[][2]uint64 {
+	calls := &[][2]uint64{}
+	del := store.deleteRange
+	store.deleteRange = func(from, to uint64) error {
+		*calls = append(*calls, [2]uint64{from, to})
+		if failAt > 0 && len(*calls) >= failAt {
+			return errors.New("injected")
+		}
+		return del(from, to)
+	}
+	return calls
+}
+
+func TestLogStore_InterruptedPrefixTrimLeavesAShorterLog(t *testing.T) {
+	store, err := openLogStore(filepath.Join(t.TempDir(), "raft.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { store.Close() })
+	store.batch = 100
+	fillLog(t, store, 1, 1_000, 16)
+
+	recordDeletes(store, 3)
+	require.Error(t, store.DeleteRange(1, 899))
+	assertLogRange(t, store, 201, 1_000)
+	var entry raft.Log
+	for i := uint64(201); i <= 1_000; i++ {
+		require.NoError(t, store.GetLog(i, &entry))
+	}
+
+	store.deleteRange = store.BoltStore.DeleteRange
+	require.NoError(t, store.DeleteRange(201, 899))
+	assertLogRange(t, store, 900, 1_000)
+}
+
+func TestLogStore_OnlyAStrictPrefixIsSplit(t *testing.T) {
+	cases := []struct {
+		name               string
+		from, to           uint64
+		calls              [][2]uint64
+		wantFirst, wantEnd uint64
+	}{
+		{"prefix", 1, 250, [][2]uint64{{1, 100}, {101, 200}, {201, 250}}, 251, 1_000},
+		{"conflict at the first entry, or the whole log", 1, 1_000, [][2]uint64{{1, 1_000}}, 0, 0},
+		{"suffix", 500, 1_000, [][2]uint64{{500, 1_000}}, 1, 499},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := openLogStore(filepath.Join(t.TempDir(), "raft.db"))
+			require.NoError(t, err)
+			t.Cleanup(func() { store.Close() })
+			store.batch = 100
+			fillLog(t, store, 1, 1_000, 16)
+
+			calls := recordDeletes(store, 0)
+			require.NoError(t, store.DeleteRange(tc.from, tc.to))
+			require.Equal(t, tc.calls, *calls)
+			if tc.wantEnd == 0 {
+				last, err := store.LastIndex()
+				require.NoError(t, err)
+				require.Zero(t, last)
+				return
+			}
+			assertLogRange(t, store, tc.wantFirst, tc.wantEnd)
+		})
+	}
 }
