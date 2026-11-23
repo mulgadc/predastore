@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -628,50 +629,70 @@ func logShardWriteFailure(ctx context.Context, node config.NodeID, index int, er
 		"node", node, "index", index, "reason", reason, "err", err)
 }
 
+// errCommitFloor reports a write whose shards landed but too few of them
+// committed for the object to be read back. Nothing may publish it.
+var errCommitFloor = errors.New("too few shards committed")
+
 // commitShards publishes every prepared shard before the placement record
-// naming the epoch lands in global state. A superseded epoch is reported so
-// its writer cannot publish a record that no shard can satisfy.
+// naming the epoch lands, and fails unless at least floor of them are durable
+// at that epoch. A write with no shards, an empty object, has no floor.
 //
-// Non-supersession failures remain recoverable by a reader or repair, but an
-// epoch mismatch means another write has won the shard and this writer must
-// not publish its placement.
-// commitShards publishes every prepared shard and reports how many were
-// overtaken by a newer generation.
-//
-// Being overtaken is not a failure and does not fail the write. Concurrent
-// writers of one key have no defined winner, the epoch decides it, and the
-// loser is still owed an acknowledgement — the object it wrote existed and was
-// durable, and a newer one replaced it. That is last-write-wins, and the count
-// is returned so it can be logged rather than acted on.
-func commitShards(ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written writeResult) (superseded int) {
-	var lost atomic.Int64
+// A shard is durable when its commit answered without error: published, or
+// overtaken by a newer generation the node holds behind it. Being overtaken
+// is last-write-wins, not a failure: the loser's generation is retained and
+// still answers a record that names it, so it is counted, and reported so it
+// can be logged rather than acted on.
+func commitShards(
+	ctx context.Context, bc BlobClient, objectHash [32]byte, place ObjectToShardNodes, written writeResult, floor int,
+) (superseded int, err error) {
+	var lost, durable atomic.Int64
 	forEachShard(written, func(index int, node config.NodeID) {
 		overtaken, err := bc.Commit(ctx, node, blob.CommitRequest{
 			Key:   objectHash,
 			Index: uint32(index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
 			Epoch: place.WriteEpoch,
 		})
+		if err == nil {
+			durable.Add(1)
+		}
+		if overtaken {
+			lost.Add(1)
+		}
 		if slices.Contains(written.ambiguous, index) {
 			// This commit is the answer the put never gave. Say which way it
 			// went: a node whose writes all land but never report in time is
 			// invisible otherwise, and that is the whole defect.
 			logAmbiguousResolution(ctx, node, index, place.WriteEpoch, overtaken, err)
-			if overtaken {
-				lost.Add(1)
-			}
-
 			return
 		}
-		switch {
-		case err != nil:
+		if err != nil {
 			slog.WarnContext(ctx, "Shard commit failed",
 				"node", node, "index", index,
 				"epoch", fmt.Sprintf("%016x", place.WriteEpoch), "err", err)
-		case overtaken:
-			lost.Add(1)
 		}
 	})
-	return int(lost.Load())
+	if len(written.holders) == 0 {
+		return int(lost.Load()), nil
+	}
+	if n := int(durable.Load()); n < floor {
+		return int(lost.Load()), fmt.Errorf("%w: %d of %d needed at epoch %016x",
+			errCommitFloor, n, floor, place.WriteEpoch)
+	}
+	return int(lost.Load()), nil
+}
+
+// failBelowCommitFloor answers a write that committed too few shards, before
+// any metadata names it, and discards what is still prepared. A shard that did
+// commit stays live under an epoch no record names, which costs its disk and
+// nothing a reader can see.
+func failBelowCommitFloor(
+	ctx context.Context, w http.ResponseWriter, r *http.Request, bc BlobClient,
+	objectHash [32]byte, place ObjectToShardNodes, written writeResult, err error,
+) {
+	slog.ErrorContext(ctx, "Write refused: too few shards committed to read it back", "error", err)
+	telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonShardWrite)
+	abortShards(ctx, bc, objectHash, place, written)
+	HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 }
 
 // logAmbiguousResolution reports what became of a shard whose put was

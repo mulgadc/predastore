@@ -224,9 +224,9 @@ func (f handoffFixture) write(ctx context.Context, objectHash [32]byte, body []b
 	if err != nil {
 		return place, written, err
 	}
-	commitShards(ctx, f.bc, objectHash, place, written)
+	_, err = commitShards(ctx, f.bc, objectHash, place, written, f.cfg.MinShards())
 
-	return place, written, nil
+	return place, written, err
 }
 
 // The point of handoff: a node down costs the stripe nothing. The write is

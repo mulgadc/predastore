@@ -164,7 +164,10 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 		// Shards before the record, as PutObject does. The other order let a
 		// swap this writer could not account for abort the prepared shards the
 		// record may already name.
-		commitShards(ctx, bc, objectHash, place, written)
+		if _, err := commitShards(ctx, bc, objectHash, place, written, cfg.MinShards()); err != nil {
+			failBelowCommitFloor(ctx, w, r, bc, objectHash, place, written, err)
+			return
+		}
 
 		previous, err := metaSwap(ctx, mc, model.TableObjects, string(objectHash[:]), shardRecord)
 		if err != nil {

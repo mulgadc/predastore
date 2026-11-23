@@ -123,8 +123,14 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// Publish shards before the placement record, so the record can never
 		// name a generation the shards have not reached. It may name one they
 		// have already passed, and the blob store retains superseded
-		// generations for exactly that reason.
-		if overtaken := commitShards(ctx, bc, objectHash, place, written); overtaken > 0 {
+		// generations for exactly that reason. Too few committed and the write
+		// fails here, before the swap, so the previous version stays current.
+		overtaken, err := commitShards(ctx, bc, objectHash, place, written, cfg.MinShards())
+		if err != nil {
+			failBelowCommitFloor(ctx, w, r, bc, objectHash, place, written, err)
+			return
+		}
+		if overtaken > 0 {
 			slog.InfoContext(ctx, "A newer write overtook this one",
 				"shards_superseded", overtaken,
 				"epoch", fmt.Sprintf("%016x", place.WriteEpoch))
