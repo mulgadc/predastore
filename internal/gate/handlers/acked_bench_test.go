@@ -3,9 +3,21 @@ package handlers
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"testing"
 )
+
+// quietLogs discards logging for one benchmark. The blob stores log as they
+// open, and a line landing between a benchmark's name and its result is a
+// result benchstat cannot parse.
+func quietLogs(b *testing.B) {
+	b.Helper()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	b.Cleanup(func() { slog.SetDefault(prev) })
+}
 
 // benchSizes span a small object, the common viperblock chunk, and the largest
 // the in-process fixtures carry.
@@ -28,6 +40,7 @@ func BenchmarkPutObjectRealStore(b *testing.B) {
 	for _, p := range rsProfiles {
 		for _, sz := range benchSizes {
 			b.Run(p.String()+"/"+sz.name, func(b *testing.B) {
+				quietLogs(b)
 				g := newRealStoreGate(b, p)
 				body := bytes.Repeat([]byte("x"), sz.size)
 				b.SetBytes(int64(sz.size))
@@ -49,6 +62,7 @@ func BenchmarkPutObjectRealStoreDegraded(b *testing.B) {
 	for _, p := range rsProfiles {
 		for _, sz := range benchSizes[2:4] {
 			b.Run(p.String()+"/"+sz.name, func(b *testing.B) {
+				quietLogs(b)
 				g := newRealStoreGate(b, p)
 				g.bc.arm(shardFaults{failPut: []uint32{1}})
 				body := bytes.Repeat([]byte("x"), sz.size)
@@ -71,6 +85,7 @@ func BenchmarkCopyObjectRealStore(b *testing.B) {
 	for _, p := range rsProfiles {
 		for _, sz := range benchSizes[2:4] {
 			b.Run(p.String()+"/"+sz.name, func(b *testing.B) {
+				quietLogs(b)
 				g := newRealStoreGate(b, p)
 				if rr := g.put("src", bytes.Repeat([]byte("s"), sz.size)); rr.Code != http.StatusOK {
 					b.Fatalf("seed: %d %s", rr.Code, rr.Body.String())
@@ -94,6 +109,7 @@ func BenchmarkUploadPartRealStore(b *testing.B) {
 	for _, p := range rsProfiles {
 		for _, sz := range benchSizes[2:4] {
 			b.Run(p.String()+"/"+sz.name, func(b *testing.B) {
+				quietLogs(b)
 				g := newRealStoreGate(b, p)
 				upload := g.createUpload(b, "mp")
 				body := bytes.Repeat([]byte("p"), sz.size)

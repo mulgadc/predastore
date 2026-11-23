@@ -3,6 +3,8 @@ package engine
 import (
 	"bytes"
 	"errors"
+	"io"
+	"log/slog"
 	"testing"
 )
 
@@ -65,10 +67,20 @@ func TestCommitOfAGenerationHeldBehindANewerOneIsOvertaken(t *testing.T) {
 	})
 }
 
+// quietLogs discards logging for one benchmark, so the store's open lines do
+// not split a result from its name.
+func quietLogs(b *testing.B) {
+	b.Helper()
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	b.Cleanup(func() { slog.SetDefault(prev) })
+}
+
 // BenchmarkCommitOvertaken measures the one commit branch that gained a read:
 // a retry for a generation held behind a newer one, which now proves the
 // retained row before it answers overtaken.
 func BenchmarkCommitOvertaken(b *testing.B) {
+	quietLogs(b)
 	st, err := Open(b.TempDir(), WithFreeSpaceWatermark(0, 0), WithAEAD(testAEAD(b)))
 	if err != nil {
 		b.Fatalf("open: %v", err)
@@ -95,6 +107,7 @@ func BenchmarkCommitOvertaken(b *testing.B) {
 // BenchmarkCommitPublish is the healthy path, for comparison: prepare and
 // publish a fresh generation, which the change does not touch.
 func BenchmarkCommitPublish(b *testing.B) {
+	quietLogs(b)
 	st, err := Open(b.TempDir(), WithFreeSpaceWatermark(0, 0), WithAEAD(testAEAD(b)))
 	if err != nil {
 		b.Fatalf("open: %v", err)
