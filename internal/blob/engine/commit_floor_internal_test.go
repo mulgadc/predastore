@@ -3,7 +3,6 @@ package engine
 import (
 	"bytes"
 	"errors"
-	"io"
 	"log/slog"
 	"testing"
 )
@@ -72,7 +71,7 @@ func TestCommitOfAGenerationHeldBehindANewerOneIsOvertaken(t *testing.T) {
 func quietLogs(b *testing.B) {
 	b.Helper()
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	slog.SetDefault(slog.New(slog.DiscardHandler))
 	b.Cleanup(func() { slog.SetDefault(prev) })
 }
 

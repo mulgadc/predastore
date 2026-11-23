@@ -3,7 +3,6 @@ package handlers
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"testing"
@@ -15,7 +14,7 @@ import (
 func quietLogs(b *testing.B) {
 	b.Helper()
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	slog.SetDefault(slog.New(slog.DiscardHandler))
 	b.Cleanup(func() { slog.SetDefault(prev) })
 }
 
