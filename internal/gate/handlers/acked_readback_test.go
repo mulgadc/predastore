@@ -481,3 +481,25 @@ func TestEmptyWritesNeedNoShardFloor(t *testing.T) {
 		})
 	}
 }
+
+// With degraded writes off the floor is the whole stripe, so one commit lost
+// fails the write even though every shard landed.
+func TestWithoutDegradedWritesEveryShardMustCommit(t *testing.T) {
+	for _, p := range rsProfiles {
+		t.Run(p.String(), func(t *testing.T) {
+			g := newRealStoreGate(t, p)
+			g.cfg.DegradedWrites = false
+			before := bytes.Repeat([]byte("v1"), 1<<18)
+			require.Equal(t, http.StatusOK, g.put("k", before).Code)
+
+			g.bc.arm(shardFaults{dropCommit: []uint32{0}})
+			put := g.put("k", bytes.Repeat([]byte("v2"), 1<<18))
+			g.bc.arm(shardFaults{})
+
+			require.False(t, succeeded(put), "a full-width write that lost a commit was acknowledged")
+			got := g.get("k")
+			require.Equal(t, http.StatusOK, got.Code, got.Body.String())
+			assert.True(t, bytes.Equal(before, got.Body.Bytes()), "a failed write must leave the previous version")
+		})
+	}
+}
