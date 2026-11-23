@@ -596,7 +596,7 @@ FAIL|s3tests/functional/test_s3.py::test_multipart_copy_invalid_range
 PASS|s3tests/functional/test_s3.py::test_multipart_copy_multiple_sizes
 PASS|s3tests/functional/test_s3.py::test_multipart_copy_small
 PASS|s3tests/functional/test_s3.py::test_multipart_copy_special_names
-FAIL|s3tests/functional/test_s3.py::test_multipart_copy_versioned
+PASS|s3tests/functional/test_s3.py::test_multipart_copy_versioned
 PASS|s3tests/functional/test_s3.py::test_multipart_copy_without_range
 FAIL|s3tests/functional/test_s3.py::test_multipart_get_part
 FAIL|s3tests/functional/test_s3.py::test_multipart_put_current_object_if_match

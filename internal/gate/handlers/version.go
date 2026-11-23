@@ -71,6 +71,12 @@ func versionObjectHash(bucket, key, versionID string) [32]byte {
 	return model.VersionHash(bucket, key, versionID)
 }
 
+// wellFormedVersionID reports whether id has the form mintVersionID gives.
+func wellFormedVersionID(id string) bool {
+	raw, err := versionIDEncoding.DecodeString(id)
+	return err == nil && len(raw) == versionIDBytes
+}
+
 // mintVersionID returns a fresh, opaque version id.
 func mintVersionID() (string, error) {
 	buf := make([]byte, versionIDBytes)

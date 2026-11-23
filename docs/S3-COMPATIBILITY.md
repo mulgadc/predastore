@@ -15,8 +15,8 @@ make s3-tests
 
 | | count |
 | --- | --- |
-| pass | 222 |
-| fail | 169 |
+| pass | 223 |
+| fail | 168 |
 | skip | 495 |
 | error | 0 |
 
@@ -29,7 +29,7 @@ A passing case is never one of the 489, whatever family's marker or node id woul
 
 A skip is not a pass. It means predastore has not been measured against that case in this run, on purpose.
 
-The 169 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
+The 168 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
 
 ## The gaps that break real clients
 
@@ -60,7 +60,7 @@ Served sub-resources: bucket `tagging`, `versioning`, `versions`, `location`, `u
 
 ## By area
 
-Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 222/169 above. An area predastore has deliberately not implemented is not here; see the next table.
+Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 223/168 above. An area predastore has deliberately not implemented is not here; see the next table.
 
 | Area | Pass | Fail | Selector (test name) | Note |
 | --- | --- | --- | --- | --- |
@@ -68,7 +68,7 @@ Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is
 | Conditional requests | 12 | 35 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | `GetObject` and `HeadObject` evaluate `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`; `CopyObject` and `UploadPartCopy` evaluate the four `x-amz-copy-source-if-*` conditions and answer `412` when one fails. The passes are eight `GetObject` and four `CopyObject` cases; `HeadObject`, `UploadPartCopy` and irregular ETag lists are covered by the gate's own tests and by the `s3compat` probe in the mulga repository (`scripts/aws-compliance/s3compat`), whose cases live AWS S3 also passes. An ETag condition is matched as AWS matches it: split on quotes, commas, spaces and tabs, with any piece equal to the ETag or `*` a match. Conditional `PutObject`, `CopyObject` destination and `DeleteObjects` cases fail with the refusal. |
 | Checksums and object attributes | 0 | 16 | contains `checksum`, `cksum` or `object_attributes` | |
 | Object and bucket tagging | 1 | 11 | ends `_tags`, or contains `tagging` | The pass is bucket tagging. |
-| CopyObject / UploadPartCopy | 20 | 5 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Invalid ranges, versioned sources and cross-owner copies fail. |
+| CopyObject / UploadPartCopy | 21 | 4 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Invalid ranges and cross-owner copies fail. `UploadPartCopy` copies a named source version; a named delete marker answers `404 NoSuchVersion` where AWS answers `400 InvalidRequest`. |
 | DeleteObjects | 7 | 1 | contains `multi_object` | The fail is the concurrent versioned delete. |
 | Multipart upload | 11 | 10 | contains `multipart` | `GetObject` by `partNumber`, empty and single-small uploads, completing an upload twice. |
 | ListObjectsV2 | 37 | 5 | `test_bucket_listv2_*`, `test_bucketv2_*`, `test_basic_key_count` | |

@@ -218,3 +218,59 @@ func TestConditionalCopyObjectOfAHiddenSource(t *testing.T) {
 	assert.Equal(t, "true", rr.Header().Get("X-Amz-Delete-Marker"))
 	assert.Equal(t, mutations, f.g.blob.mutationCount(), "blob calls made by a refused copy")
 }
+
+// putVersion writes body to obj on a versioned bucket and answers its version ID
+// and ETag.
+func (f readFixture) putVersion(t *testing.T, body string) (versionID, etag string) {
+	t.Helper()
+	rr := f.g.do(http.MethodPut, sdkPath("obj"), []byte(body), nil)
+	require.Equal(t, http.StatusOK, rr.Code, "put: %s", rr.Body.String())
+	return rr.Header().Get("X-Amz-Version-Id"), rr.Header().Get("ETag")
+}
+
+// A part copy of a named version copies that version, evaluates its conditions
+// against it and reports it, as S3 does. A well-formed ID with no version behind
+// it answers 404 NoSuchVersion, a malformed one 400, and neither stores a part.
+// Verifies: Q-68.
+func TestConditionalUploadPartCopyOfANamedVersion(t *testing.T) {
+	f := newReadFixture(t)
+	f.g.enableVersioning()
+	older, olderETag := f.putVersion(t, "older")
+	f.putVersion(t, "newer")
+	named := func(id string) string { return strings.TrimPrefix(sdkPath("obj"), "/") + "?versionId=" + id }
+
+	u := newPartUpload(t, f.g)
+	requirePreconditionFailed(t, u.copyPart(http.Header{"X-Amz-Copy-Source": {named(older)}, "X-Amz-Copy-Source-If-Match": {f.etag}}))
+	assert.Empty(t, u.parts())
+	rr := u.copyPart(http.Header{"X-Amz-Copy-Source": {named(older)}, "X-Amz-Copy-Source-If-Match": {olderETag}})
+	require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
+	assert.Equal(t, older, rr.Header().Get("X-Amz-Copy-Source-Version-Id"))
+	assert.Equal(t, "older", u.complete(u.parts()[1]))
+
+	rr = f.g.do(http.MethodDelete, sdkPath("obj")+"?versionId="+older, nil, nil)
+	require.Equal(t, http.StatusNoContent, rr.Code, "delete version: %s", rr.Body.String())
+	rr = f.g.do(http.MethodDelete, sdkPath("obj"), nil, nil)
+	require.Equal(t, http.StatusNoContent, rr.Code, "delete: %s", rr.Body.String())
+	marker := rr.Header().Get("X-Amz-Version-Id")
+	require.NotEmpty(t, marker)
+
+	// S3 answers a named delete marker 400 InvalidRequest; a marker here has no
+	// record its ID can reach, so it answers as a version that is gone.
+	for name, want := range map[string]struct {
+		id     string
+		status int
+		code   string
+	}{
+		"deleted version": {older, http.StatusNotFound, "NoSuchVersion"},
+		"delete marker":   {marker, http.StatusNotFound, "NoSuchVersion"},
+		"malformed":       {"zzz", http.StatusBadRequest, "InvalidArgument"},
+	} {
+		u := newPartUpload(t, f.g)
+		mutations := f.g.blob.mutationCount()
+		rr := u.copyPart(http.Header{"X-Amz-Copy-Source": {named(want.id)}})
+		assert.Equal(t, want.status, rr.Code, "%s: %s", name, rr.Body.String())
+		assert.Contains(t, rr.Body.String(), "<Code>"+want.code+"</Code>", name)
+		assert.Equal(t, mutations, f.g.blob.mutationCount(), "%s: blob calls made by a refused part copy", name)
+		assert.Empty(t, u.parts(), name)
+	}
+}

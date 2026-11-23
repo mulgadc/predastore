@@ -275,9 +275,10 @@ func TestUploadPartCopyRefusesRequestsItCannotHonour(t *testing.T) {
 			status: http.StatusBadRequest, code: "InvalidPart",
 		},
 		{
-			name: "versioned source", uploadID: "u1", partNumber: 1,
+			// A named version is copied; one with no record is an unknown ID.
+			name: "unknown source version", uploadID: "u1", partNumber: 1,
 			source: "/" + copyTestBucket + "/src?versionId=v2",
-			status: http.StatusNotImplemented, code: "NotImplemented",
+			status: http.StatusBadRequest, code: "InvalidArgument",
 		},
 		{
 			// Source conditions are evaluated now, so a failing one is a 412.
@@ -359,6 +360,10 @@ func TestCopySourceTargetReadsABoundedPrefix(t *testing.T) {
 
 	_, err = copySourceTarget(ctx, m, cache, "b", "absent", "")
 	require.ErrorIs(t, err, meta.ErrNotFound)
+
+	got, err = copySourceTarget(ctx, m, cache, "b", "k", "v10")
+	require.NoError(t, err)
+	assert.Equal(t, model.VersionHash("b", "k", "v10"), got.hash)
 
 	assert.Equal(t, []int{1, 1}, m.limits, "scan limits: one index row for each hidden key")
 	assert.LessOrEqual(t, m.ops["get"], 6, "metadata gets")
