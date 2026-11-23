@@ -312,32 +312,54 @@ func TestUploadPartCopyRefusesRequestsItCannotHonour(t *testing.T) {
 	}
 }
 
-// A part copy names its source without scanning the key's version history,
-// so a request refused on its source conditions does no work that scales with
-// the number of versions.
+// scanLimits records the limit of every scan, so a test can tell a bounded
+// read of the version index from one that walks a key's whole history.
+type scanLimits struct {
+	*fakeMeta
+
+	limits []int
+}
+
+func (m *scanLimits) Scan(ctx context.Context, prefix string, limit int) ([]meta.Item, error) {
+	m.limits = append(m.limits, limit)
+	return m.fakeMeta.Scan(ctx, prefix, limit)
+}
+
+// A copy names its source with a bounded number of metadata reads however
+// many versions the key has, so a copy refused on its source conditions does
+// no work that grows with the key's history.
 // Verifies: Q-68.
-func TestCopySourceHashDoesNotScanVersions(t *testing.T) {
+func TestCopySourceTargetReadsABoundedPrefix(t *testing.T) {
 	ctx := context.Background()
-	m := newFakeMeta()
+	m := &scanLimits{fakeMeta: newFakeMeta()}
 	cache := emptyCache()
 	require.NoError(t, setBucketVersioning(ctx, m, cache, "b", "Enabled"))
-	current := model.VersionHash("b", "k", "v2")
-	require.NoError(t, metaPut(ctx, m, model.TableObjects, objectARN("b", "k"), current[:]))
-	for _, id := range []string{"v1", "v2"} {
-		require.NoError(t, metaPut(ctx, m, model.TableObjectVersions, versionKeyPrefix("b", "k")+id, []byte("x")))
+	for epoch := uint64(1); epoch <= 50; epoch++ {
+		for _, key := range []string{"k", "hidden"} {
+			id := fmt.Sprintf("v%02d", epoch)
+			rec := VersionRecord{VersionID: id, WriteEpoch: epoch, DeleteMarker: key == "hidden" && epoch == 50}
+			require.NoError(t, putVersionRecord(ctx, m, "b", key, rec))
+		}
 	}
+	current := model.VersionHash("b", "k", "v50")
+	require.NoError(t, metaPut(ctx, m, model.TableObjects, objectARN("b", "k"), current[:]))
 	m.resetOps()
 
-	got, err := copySourceHash(ctx, m, cache, "b", "k", "")
+	got, err := copySourceTarget(ctx, m, cache, "b", "k", "")
 	require.NoError(t, err)
-	assert.Equal(t, current, got)
+	assert.Equal(t, current, got.hash)
 
-	got, err = copySourceHash(ctx, m, cache, "b", "k", nullVersionID)
+	got, err = copySourceTarget(ctx, m, cache, "b", "k", nullVersionID)
 	require.NoError(t, err)
-	assert.Equal(t, model.ObjectHash("b", "k"), got)
+	assert.Equal(t, model.ObjectHash("b", "k"), got.hash)
 
-	_, err = copySourceHash(ctx, m, cache, "b", "hidden", "")
+	got, err = copySourceTarget(ctx, m, cache, "b", "hidden", "")
+	require.ErrorIs(t, err, errDeleteMarker)
+	assert.Equal(t, "v50", got.versionID)
+
+	_, err = copySourceTarget(ctx, m, cache, "b", "absent", "")
 	require.ErrorIs(t, err, meta.ErrNotFound)
 
-	assert.Zero(t, m.ops["scan"], "version-history scans")
+	assert.Equal(t, []int{1, 1}, m.limits, "scan limits: one index row for each hidden key")
+	assert.LessOrEqual(t, m.ops["get"], 6, "metadata gets")
 }

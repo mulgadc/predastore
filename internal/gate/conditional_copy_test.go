@@ -197,5 +197,24 @@ func TestConditionalUploadPartCopyUsesTheCurrentVersion(t *testing.T) {
 	u = newPartUpload(t, f.g)
 	rr = u.copyPart(http.Header{"X-Amz-Copy-Source-If-Match": {"*"}})
 	assert.Equal(t, http.StatusNotFound, rr.Code, "body: %s", rr.Body.String())
+	assert.Equal(t, "true", rr.Header().Get("X-Amz-Delete-Marker"))
 	assert.Empty(t, u.parts())
+}
+
+// A copy whose source a delete marker hides answers 404 and says so, as S3
+// does, and writes nothing.
+// Verifies: Q-68.
+func TestConditionalCopyObjectOfAHiddenSource(t *testing.T) {
+	f := newReadFixture(t)
+	f.g.enableVersioning()
+	rr := f.g.do(http.MethodDelete, sdkPath("obj"), nil, nil)
+	require.Equal(t, http.StatusNoContent, rr.Code, "delete: %s", rr.Body.String())
+	mutations := f.g.blob.mutationCount()
+
+	header := http.Header{"X-Amz-Copy-Source": {strings.TrimPrefix(sdkPath("obj"), "/")}, "X-Amz-Copy-Source-If-Match": {"*"}}
+	rr = f.g.do(http.MethodPut, sdkPath("dest"), nil, header)
+	assert.Equal(t, http.StatusNotFound, rr.Code, "body: %s", rr.Body.String())
+	assert.Contains(t, rr.Body.String(), "<Code>NoSuchKey</Code>")
+	assert.Equal(t, "true", rr.Header().Get("X-Amz-Delete-Marker"))
+	assert.Equal(t, mutations, f.g.blob.mutationCount(), "blob calls made by a refused copy")
 }

@@ -52,14 +52,13 @@ const (
 
 // evalPreconditions applies S3's precedence: If-Match decides over
 // If-Unmodified-Since, and If-None-Match over If-Modified-Since. A record with
-// no ETag matches only "*", one with no time skips the date conditions, and a
-// malformed ETag list fails rather than being read as a non-match.
+// no ETag matches only "*", and one with no time skips the date conditions.
 func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModified bool, p preconditions) preconditionResult {
 	// Last-Modified is served to the second, so it is compared to the second.
 	modified = modified.Truncate(time.Second)
 
 	if p.ifMatch != "" {
-		if matched, ok := etagListMatches(p.ifMatch, etag, hasETag); !ok || !matched {
+		if !etagListMatches(p.ifMatch, etag, hasETag) {
 			return preconditionFailed
 		}
 	} else if since, err := http.ParseTime(p.ifUnmodifiedSince); err == nil && hasModified && modified.After(since) {
@@ -67,11 +66,7 @@ func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModifie
 	}
 
 	if p.ifNoneMatch != "" {
-		matched, ok := etagListMatches(p.ifNoneMatch, etag, hasETag)
-		if !ok {
-			return preconditionFailed
-		}
-		if matched {
+		if etagListMatches(p.ifNoneMatch, etag, hasETag) {
 			return preconditionNotModified
 		}
 	} else if since, err := http.ParseTime(p.ifModifiedSince); err == nil && hasModified && !modified.After(since) {
@@ -81,45 +76,21 @@ func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModifie
 	return preconditionsHold
 }
 
-// etagListMatches reports whether any entity tag in a comma-separated list
-// names the record, quoted or not, and whether the list is well formed. "*"
-// names any record that exists; a comma inside a quoted tag is part of it.
-func etagListMatches(list, etag string, hasETag bool) (matched, ok bool) {
+// etagListMatches reports whether an ETag condition names the record. As S3
+// does, the value is split on quotes, commas, spaces and tabs, and any piece
+// equal to the ETag or "*" matches, so no value is rejected as malformed.
+func etagListMatches(list, etag string, hasETag bool) bool {
 	want := strings.Trim(etag, `"`)
-	for rest := list; rest != ""; {
-		tag, next, ok := nextEntityTag(rest)
-		if !ok {
-			return false, false
+	for _, tag := range strings.FieldsFunc(list, isETagSeparator) {
+		if tag == "*" || (hasETag && tag == want) {
+			return true
 		}
-		if tag == "*" || (hasETag && tag != "" && strings.Trim(tag, `"`) == want) {
-			matched = true
-		}
-		rest = next
 	}
-	return matched, true
+	return false
 }
 
-// nextEntityTag splits the first entity tag off a list. A quoted tag runs to
-// its closing quote and must be followed by a comma or the end; an unquoted
-// one, which S3 also accepts, runs to the next comma and holds no quote.
-func nextEntityTag(list string) (tag, rest string, ok bool) {
-	list = strings.TrimLeft(list, " \t,")
-	if !strings.HasPrefix(list, `"`) {
-		tag, rest = list, ""
-		if end := strings.IndexByte(list, ','); end >= 0 {
-			tag, rest = list[:end], list[end:]
-		}
-		return strings.TrimSpace(tag), rest, !strings.Contains(tag, `"`)
-	}
-	end := strings.IndexByte(list[1:], '"')
-	if end < 0 {
-		return "", "", false
-	}
-	tag, rest = list[:end+2], strings.TrimLeft(list[end+2:], " \t")
-	if rest != "" && rest[0] != ',' {
-		return "", "", false
-	}
-	return tag, rest, true
+func isETagSeparator(r rune) bool {
+	return r == '"' || r == ',' || r == ' ' || r == '\t'
 }
 
 // preconditionFailedMessage is S3's text for a 412.

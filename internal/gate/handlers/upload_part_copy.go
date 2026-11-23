@@ -1,9 +1,6 @@
 package handlers
 
 import (
-	"context"
-	"crypto/sha256"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -65,12 +62,12 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 			return
 		}
 
-		srcHash, err := copySourceHash(ctx, mc, cache, srcBucket, srcKey, versionID)
+		srcTarget, err := copySourceTarget(ctx, mc, cache, srcBucket, srcKey, versionID)
 		if err != nil {
-			HandleError(w, r, placementReadError(ctx, srcBucket, srcKey, err))
+			handleVersionedReadErr(w, r, srcKey, srcTarget, err)
 			return
 		}
-		srcPlace, srcSize, err := loadPlacementByHash(ctx, mc, ring, cfg, srcHash)
+		srcPlace, srcSize, err := loadPlacementByHash(ctx, mc, ring, cfg, srcTarget.hash)
 		if err != nil {
 			HandleError(w, r, placementReadError(ctx, srcBucket, srcKey, err))
 			return
@@ -91,7 +88,7 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 		}
 
 		stream, err := openCopyStream(ctx, bc, cfg,
-			srcHash, srcPlace, handoffNode(ring, cfg, srcHash),
+			srcTarget.hash, srcPlace, handoffNode(ring, cfg, srcTarget.hash),
 			srcSize, start, partSize)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
@@ -142,25 +139,4 @@ func copySourceRange(header string, size int64) (start, end int64, err error) {
 	}
 
 	return start, end, nil
-}
-
-// copySourceHash names the record a part copy reads with at most two metadata
-// lookups: the null version, or the key's current version. A key a delete
-// marker hides has no listing key, and answers not found as S3 does.
-func copySourceHash(ctx context.Context, mc MetaClient, cache *BucketCache, bucket, key, versionID string) ([32]byte, error) {
-	if versionID == nullVersionID {
-		return model.ObjectHash(bucket, key), nil
-	}
-	status, err := objectPathVersioning(ctx, mc, cache, bucket)
-	if err != nil || status == "" {
-		return model.ObjectHash(bucket, key), err
-	}
-	data, err := metaGet(ctx, mc, model.TableObjects, objectARN(bucket, key))
-	if err != nil {
-		return [32]byte{}, err
-	}
-	if len(data) != sha256.Size {
-		return [32]byte{}, fmt.Errorf("listing key for %s/%s holds %d bytes", bucket, key, len(data))
-	}
-	return [32]byte(data), nil
 }
