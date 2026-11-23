@@ -2,7 +2,7 @@
 
 Measured, not asserted. The numbers here come from `ceph/s3-tests` — the suite Ceph RGW, MinIO and Garage are all validated against — run against a single-node predastore and recorded in `scripts/s3-tests-baseline.txt`. The suite is pinned by `S3TESTS_REF` in `scripts/s3-tests.sh`.
 
-Reproduce it with:
+Maintainers reproduce it with:
 
 ```
 ./scripts/start.sh -w s3tests
@@ -65,7 +65,7 @@ Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is
 | Area | Pass | Fail | Selector (test name) | Note |
 | --- | --- | --- | --- | --- |
 | TLS transfer | 11 | 0 | `test_encrypted_transfer_*`, `test_sse_kms_*` | Held by the skip guard; plain transfers over TLS, not server-side encryption. |
-| Conditional requests | 12 | 35 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | `GetObject` and `HeadObject` evaluate `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`; `CopyObject` and `UploadPartCopy` evaluate the four `x-amz-copy-source-if-*` conditions and answer `412` when one fails. The passes are eight `GetObject` and four `CopyObject` cases; `HeadObject` is covered by the gate's own tests and the `s3compat` probe, and `UploadPartCopy` by the gate's own tests. Conditional `PutObject`, `CopyObject` destination and `DeleteObjects` cases fail with the refusal. |
+| Conditional requests | 12 | 35 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | `GetObject` and `HeadObject` evaluate `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`; `CopyObject` and `UploadPartCopy` evaluate the four `x-amz-copy-source-if-*` conditions and answer `412` when one fails. The passes are eight `GetObject` and four `CopyObject` cases; `HeadObject`, `UploadPartCopy` and irregular ETag lists are covered by the gate's own tests and by the `s3compat` probe in the mulga repository (`scripts/aws-compliance/s3compat`), whose cases live AWS S3 also passes. An ETag condition is matched as AWS matches it: split on quotes, commas, spaces and tabs, with any piece equal to the ETag or `*` a match. Conditional `PutObject`, `CopyObject` destination and `DeleteObjects` cases fail with the refusal. |
 | Checksums and object attributes | 0 | 16 | contains `checksum`, `cksum` or `object_attributes` | |
 | Object and bucket tagging | 1 | 11 | ends `_tags`, or contains `tagging` | The pass is bucket tagging. |
 | CopyObject / UploadPartCopy | 20 | 5 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Invalid ranges, versioned sources and cross-owner copies fail. |
