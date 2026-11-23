@@ -3,10 +3,14 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -14,7 +18,6 @@ import (
 
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
-	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/storetest"
@@ -27,56 +30,76 @@ import (
 // peer produces: the connection closes and the caller learns nothing more.
 var errInjected = errors.New("injected: connection closed")
 
-// faultyBlob forwards to real blob nodes, except where a test names a fault.
-// A failed put drains the body first, so the write path sees a shard that
-// failed after it was sent rather than one its owner refused, which is the
-// case hinted handoff does not cover. A dropped commit never reaches the node.
+// shardFaults names, by shard index, what goes wrong for the next write.
+type shardFaults struct {
+	// failPut drains the body then fails, so the write path sees a shard that
+	// failed after it was sent, which hinted handoff does not cover.
+	failPut []uint32
+	// dropCommit fails the commit without it reaching the node.
+	dropCommit []uint32
+	// phantom never prepares the shard: a concurrent writer publishes a newer
+	// generation on that node instead, and the put's outcome reads as unknown.
+	phantom []uint32
+}
+
+// faultyBlob forwards to real blob nodes, except where the armed faults say.
 type faultyBlob struct {
 	BlobClient
 
-	mu         sync.Mutex
-	failPut    map[config.NodeID]bool
-	dropCommit map[config.NodeID]bool
+	epochs *EpochMinter
+	mu     sync.Mutex
+	armed  shardFaults
 }
 
-func (f *faultyBlob) faults(put, commit config.NodeID) {
+func (f *faultyBlob) arm(s shardFaults) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.failPut = map[config.NodeID]bool{put: true}
-	f.dropCommit = map[config.NodeID]bool{commit: true}
+	f.armed = s
 }
 
-func (f *faultyBlob) clear() {
+func (f *faultyBlob) faults() shardFaults {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.failPut, f.dropCommit = nil, nil
+	return f.armed
 }
 
 func (f *faultyBlob) Put(
 	ctx context.Context, node config.NodeID, req blob.PutRequest, body io.Reader,
 ) (*blob.PutResponse, error) {
-	f.mu.Lock()
-	fail := f.failPut[node]
-	f.mu.Unlock()
-	if fail {
+	armed := f.faults()
+	switch {
+	case slices.Contains(armed.failPut, req.Index):
 		_, _ = io.Copy(io.Discard, body)
 		return nil, errInjected
+	case slices.Contains(armed.phantom, req.Index):
+		_, _ = io.Copy(io.Discard, body)
+		newer, err := f.epochs.Next()
+		if err != nil {
+			return nil, err
+		}
+		other := bytes.Repeat([]byte{0xEE}, int(req.Size))
+		rival := req
+		rival.Epoch = newer
+		if _, err := f.BlobClient.Put(ctx, node, rival, bytes.NewReader(other)); err != nil {
+			return nil, err
+		}
+		if _, err := f.BlobClient.Commit(ctx, node, blob.CommitRequest{Key: req.Key, Index: req.Index, Epoch: newer}); err != nil {
+			return nil, err
+		}
+		return nil, blob.ErrCommitUnknown
 	}
 	return f.BlobClient.Put(ctx, node, req, body)
 }
 
 func (f *faultyBlob) Commit(ctx context.Context, node config.NodeID, req blob.CommitRequest) (bool, error) {
-	f.mu.Lock()
-	drop := f.dropCommit[node]
-	f.mu.Unlock()
-	if drop {
+	if slices.Contains(f.faults().dropCommit, req.Index) {
 		return false, errInjected
 	}
 	return f.BlobClient.Commit(ctx, node, req)
 }
 
-// realStoreGate is the gate's object handlers over four real blob nodes, each
-// on its own engine store, reached through the real blob client over the pipe
+// realStoreGate is the gate's object handlers over real blob nodes, each on its
+// own engine store, reached through the real blob client over the pipe
 // transport. Only metadata is faked: meta quorum is not what these tests ask.
 type realStoreGate struct {
 	mc    *fakeMeta
@@ -86,22 +109,35 @@ type realStoreGate struct {
 	cache *BucketCache
 }
 
-func newRealStoreGate(t *testing.T) *realStoreGate {
+// rsProfile is an erasure code and the cluster it runs on. Each has one node
+// more than its stripe, as production does, so hinted handoff has a target.
+type rsProfile struct{ data, parity, nodes int }
+
+var rsProfiles = []rsProfile{{2, 1, 4}, {3, 2, 6}}
+
+func (p rsProfile) String() string { return fmt.Sprintf("rs-%d-%d", p.data, p.parity) }
+
+var pipeHosts sync.Map
+
+func newRealStoreGate(t *testing.T, p rsProfile) *realStoreGate {
 	t.Helper()
 
 	host := "acked-" + strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
-	const clientNode, basePort = config.NodeID(9), 7400
-	ids := []config.NodeID{1, 2, 3, 4}
+	_, dup := pipeHosts.LoadOrStore(host, true)
+	require.False(t, dup, "pipe host %s reused", host)
 
-	nodes := make([]config.Node, 0, len(ids)+1)
-	for _, id := range ids {
-		nodes = append(nodes, config.Node{ID: id, Role: config.RoleBlob, Port: basePort + int(id)})
+	const clientNode, basePort = config.NodeID(99), 7400
+	ids := make([]config.NodeID, p.nodes)
+	nodes := make([]config.Node, 0, p.nodes+1)
+	for i := range ids {
+		ids[i] = config.NodeID(i + 1)
+		nodes = append(nodes, config.Node{ID: ids[i], Role: config.RoleBlob, Port: basePort + i + 1})
 	}
 	nodes = append(nodes, config.Node{ID: clientNode, Role: config.RoleBlob, Port: basePort + int(clientNode)})
 	clusterCfg := &config.Config{Hosts: []config.Host{{ID: 1, Addr: host, Nodes: nodes}}}
 
-	for _, id := range ids {
-		tr := transport.NewPipeTransport(host, basePort+int(id))
+	for i, id := range ids {
+		tr := transport.NewPipeTransport(host, basePort+i+1)
 		t.Cleanup(func() { tr.Close() })
 		ln, err := tr.Listen()
 		require.NoError(t, err)
@@ -134,87 +170,312 @@ func newRealStoreGate(t *testing.T) *realStoreGate {
 	})
 	require.NoError(t, err)
 
-	// The production profile: RS(2,1) over four hosts, degraded writes and
-	// hinted handoff on.
+	epochs := mustEpochs(clientNode)
+	// The production profile: degraded writes and hinted handoff on.
 	return &realStoreGate{
 		mc:   newFakeMeta(),
-		bc:   &faultyBlob{BlobClient: client},
+		bc:   &faultyBlob{BlobClient: client, epochs: epochs},
 		ring: placement.NewRing(ids),
 		cfg: Config{
-			Region: "ap-southeast-2", DataShards: 2, ParityShards: 1,
+			Region: "ap-southeast-2", DataShards: p.data, ParityShards: p.parity,
 			DegradedWrites: true, HintedHandoff: true,
-			Epochs: mustEpochs(clientNode),
+			Epochs: epochs,
 		},
-		cache: NewBucketCache([]BucketConfig{{Name: "b"}}),
+		cache: NewBucketCache([]BucketConfig{{Name: "bkt"}}),
 	}
+}
+
+func (g *realStoreGate) serve(h http.Handler, method, target, key string, body []byte, header http.Header) *httptest.ResponseRecorder {
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req := httptest.NewRequest(method, target, rd).WithContext(objectCtx("bkt", key))
+	req.ContentLength = int64(len(body))
+	for k, v := range header {
+		req.Header[k] = v
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr
 }
 
 func (g *realStoreGate) put(key string, body []byte) *httptest.ResponseRecorder {
-	req, _ := http.NewRequestWithContext(objectCtx("b", key), http.MethodPut, "/b/"+key, bytes.NewReader(body))
-	req.ContentLength = int64(len(body))
-	rr := httptest.NewRecorder()
-	PutObject(g.mc, g.bc, g.ring, g.cache, g.cfg).ServeHTTP(rr, req)
-	return rr
+	return g.serve(PutObject(g.mc, g.bc, g.ring, g.cache, g.cfg), http.MethodPut, "/bkt/"+key, key, body, nil)
 }
 
 func (g *realStoreGate) get(key string) *httptest.ResponseRecorder {
-	req, _ := http.NewRequestWithContext(objectCtx("b", key), http.MethodGet, "/b/"+key, nil)
-	rr := httptest.NewRecorder()
-	GetObject(g.mc, g.bc, g.ring, g.cache, g.cfg).ServeHTTP(rr, req)
-	return rr
+	return g.serve(GetObject(g.mc, g.bc, g.ring, g.cache, g.cfg), http.MethodGet, "/bkt/"+key, key, nil, nil)
 }
 
-// holders names the stripe's three nodes for a key, in shard order.
-func (g *realStoreGate) holders(t *testing.T, key string) []config.NodeID {
+func (g *realStoreGate) copy(src, dst string) *httptest.ResponseRecorder {
+	return g.serve(CopyObject(g.mc, g.bc, g.ring, g.cache, g.cfg), http.MethodPut, "/bkt/"+dst, dst, nil,
+		http.Header{"X-Amz-Copy-Source": {"/bkt/" + src}})
+}
+
+func (g *realStoreGate) createUpload(t *testing.T, key string) string {
 	t.Helper()
-	nodes, err := g.ring.Nodes(model.ObjectHash("b", key), g.cfg.TotalShards())
+	rr := g.serve(CreateMultipartUpload(g.mc, g.cache), http.MethodPost, "/bkt/"+key+"?uploads", key, nil, nil)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var created InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &created))
+	return created.UploadId
+}
+
+func (g *realStoreGate) uploadPart(key, upload string, n int, body []byte) *httptest.ResponseRecorder {
+	return g.serve(UploadPart(g.mc, g.bc, g.ring, g.cache, g.cfg), http.MethodPut,
+		fmt.Sprintf("/bkt/%s?partNumber=%d&uploadId=%s", key, n, url.QueryEscape(upload)), key, body, nil)
+}
+
+func (g *realStoreGate) uploadPartCopy(key, upload string, n int, src string) *httptest.ResponseRecorder {
+	return g.serve(UploadPartCopy(g.mc, g.bc, g.ring, g.cache, g.cfg), http.MethodPut,
+		fmt.Sprintf("/bkt/%s?partNumber=%d&uploadId=%s", key, n, url.QueryEscape(upload)), key, nil,
+		http.Header{"X-Amz-Copy-Source": {"/bkt/" + src}})
+}
+
+func (g *realStoreGate) listParts(t *testing.T, key, upload string) ListPartsResult {
+	t.Helper()
+	rr := g.serve(ListParts(g.mc, g.cache), http.MethodGet,
+		fmt.Sprintf("/bkt/%s?uploadId=%s", key, url.QueryEscape(upload)), key, nil, nil)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	var out ListPartsResult
+	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &out))
+	return out
+}
+
+func (g *realStoreGate) complete(t *testing.T, key, upload string, parts ...MultipartUploadPart) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := xml.Marshal(CompleteMultipartUploadRequest{Parts: parts})
 	require.NoError(t, err)
-	return nodes
+	return g.serve(CompleteMultipartUpload(g.mc, g.bc, g.ring, g.cache, g.cfg), http.MethodPost,
+		fmt.Sprintf("/bkt/%s?uploadId=%s", key, url.QueryEscape(upload)), key, body, nil)
 }
 
-// The prod failure of 2026-11-23, on real stores: one shard fails after it was
-// sent, and one of the two that landed loses its commit. One committed shard is
-// fewer than any read needs, so the write must not be acknowledged, and the
-// previous version must still be the one that reads back.
-func TestAnAcknowledgedWriteReadsBack(t *testing.T) {
-	g := newRealStoreGate(t)
-	before := bytes.Repeat([]byte("v1"), 1<<19)
-	after := bytes.Repeat([]byte("v2"), 1<<19)
+// succeeded reports whether a write answered as a success, which for copy and
+// completion means the body too: AWS can answer 200 with an error document.
+func succeeded(rr *httptest.ResponseRecorder) bool {
+	return rr.Code == http.StatusOK && !strings.Contains(rr.Body.String(), "<Error>")
+}
 
-	require.Equal(t, http.StatusOK, g.put("chunk", before).Code)
+// faultCase is a fault and whether it leaves the write at or above its floor.
+type faultCase struct {
+	name     string
+	faults   shardFaults
+	atFloor  bool
+	profiles []rsProfile
+}
 
-	h := g.holders(t, "chunk")
-	g.bc.faults(h[1], h[0])
-	put := g.put("chunk", after)
-	g.bc.clear()
+// The cases cover each side of the floor at both codes. RS(2,1) needs two
+// committed shards and RS(3,2) needs three, so the same fault shape lands on
+// different sides of the floor for each.
+var faultCases = []faultCase{
+	{
+		name:     "one shard lost, the rest commit",
+		faults:   shardFaults{failPut: []uint32{1}},
+		atFloor:  true,
+		profiles: rsProfiles,
+	},
+	{
+		name:     "two shards lost, the rest commit",
+		faults:   shardFaults{failPut: []uint32{1, 3}},
+		atFloor:  true,
+		profiles: []rsProfile{{3, 2, 6}},
+	},
+	{
+		name:     "one shard lost and one commit dropped",
+		faults:   shardFaults{failPut: []uint32{1}, dropCommit: []uint32{0}},
+		atFloor:  false,
+		profiles: []rsProfile{{2, 1, 4}},
+	},
+	{
+		name:     "one shard lost and one commit dropped, above a floor of three",
+		faults:   shardFaults{failPut: []uint32{1}, dropCommit: []uint32{0}},
+		atFloor:  true,
+		profiles: []rsProfile{{3, 2, 6}},
+	},
+	{
+		name:     "one shard lost and two commits dropped",
+		faults:   shardFaults{failPut: []uint32{1}, dropCommit: []uint32{0, 2}},
+		atFloor:  false,
+		profiles: []rsProfile{{3, 2, 6}},
+	},
+	{
+		name:     "a position that never prepared, behind a newer generation",
+		faults:   shardFaults{phantom: []uint32{1}, dropCommit: []uint32{0}},
+		atFloor:  false,
+		profiles: []rsProfile{{2, 1, 4}},
+	},
+	{
+		name:     "a position that never prepared, behind a newer generation, at three",
+		faults:   shardFaults{phantom: []uint32{1}, dropCommit: []uint32{0, 2}},
+		atFloor:  false,
+		profiles: []rsProfile{{3, 2, 6}},
+	},
+}
 
-	got := g.get("chunk")
-	if put.Code == http.StatusOK {
-		require.Equal(t, http.StatusOK, got.Code, "a write answered 200 and did not read back: %s", got.Body.String())
-		assert.Equal(t, after, got.Body.Bytes())
-		return
+func eachFault(t *testing.T, fn func(t *testing.T, p rsProfile, c faultCase)) {
+	for _, c := range faultCases {
+		for _, p := range c.profiles {
+			t.Run(p.String()+"/"+c.name, func(t *testing.T) { fn(t, p, c) })
+		}
 	}
-	require.Equal(t, http.StatusOK, got.Code, "a failed write left the key unreadable: %s", got.Body.String())
-	assert.Equal(t, before, got.Body.Bytes(), "a failed write must leave the previous version")
 }
 
-// The incident's exact shape: the chunk was a new key, so there is no previous
-// version to fall back to, and a failed write must read as absent rather than
-// as a 200 the store cannot serve.
+// requireOutcome is the contract every write here is held to: a success reads
+// back as the new bytes, and a failure leaves the key as it was, or absent.
+// Below the floor the write must fail; at or above it, it must succeed.
+func requireOutcome(t *testing.T, g *realStoreGate, c faultCase, write *httptest.ResponseRecorder, key string, before, after []byte) {
+	t.Helper()
+	got := g.get(key)
+	if c.atFloor {
+		require.True(t, succeeded(write), "a write at its floor must succeed: %d %s", write.Code, write.Body.String())
+	} else {
+		require.False(t, succeeded(write), "a write below its floor was acknowledged")
+	}
+	switch {
+	case succeeded(write):
+		require.Equal(t, http.StatusOK, got.Code, "an acknowledged write did not read back: %s", got.Body.String())
+		assert.True(t, bytes.Equal(after, got.Body.Bytes()), "an acknowledged write read back other bytes")
+	case before == nil:
+		assert.Equal(t, http.StatusNotFound, got.Code, "a failed first write must leave the key absent: %s", got.Body.String())
+	default:
+		require.Equal(t, http.StatusOK, got.Code, "a failed write left the key unreadable: %s", got.Body.String())
+		assert.True(t, bytes.Equal(before, got.Body.Bytes()), "a failed write must leave the previous version")
+	}
+}
+
+// The prod failure of 2026-11-23 was a new key: a viperblock chunk.
 func TestAnAcknowledgedNewKeyReadsBack(t *testing.T) {
-	g := newRealStoreGate(t)
-	body := bytes.Repeat([]byte("c"), 1<<20)
+	eachFault(t, func(t *testing.T, p rsProfile, c faultCase) {
+		g := newRealStoreGate(t, p)
+		body := bytes.Repeat([]byte("c"), 1<<20)
 
-	h := g.holders(t, "fresh")
-	g.bc.faults(h[1], h[0])
-	put := g.put("fresh", body)
-	g.bc.clear()
+		g.bc.arm(c.faults)
+		put := g.put("fresh", body)
+		g.bc.arm(shardFaults{})
 
-	got := g.get("fresh")
-	if put.Code == http.StatusOK {
-		require.Equal(t, http.StatusOK, got.Code, "a write answered 200 and did not read back: %s", got.Body.String())
-		assert.Equal(t, body, got.Body.Bytes())
-		return
+		requireOutcome(t, g, c, put, "fresh", nil, body)
+	})
+}
+
+func TestAnAcknowledgedOverwriteReadsBack(t *testing.T) {
+	eachFault(t, func(t *testing.T, p rsProfile, c faultCase) {
+		g := newRealStoreGate(t, p)
+		before := bytes.Repeat([]byte("v1"), 1<<19)
+		after := bytes.Repeat([]byte("v2"), 1<<19)
+		require.Equal(t, http.StatusOK, g.put("chunk", before).Code)
+
+		g.bc.arm(c.faults)
+		put := g.put("chunk", after)
+		g.bc.arm(shardFaults{})
+
+		requireOutcome(t, g, c, put, "chunk", before, after)
+	})
+}
+
+// A failed write may leave a committed shard under an epoch no record names.
+// It must not disturb the writes that follow.
+func TestAWriteAfterAFailedOneReadsBack(t *testing.T) {
+	eachFault(t, func(t *testing.T, p rsProfile, c faultCase) {
+		g := newRealStoreGate(t, p)
+		g.bc.arm(c.faults)
+		_ = g.put("k", bytes.Repeat([]byte("a"), 1<<18))
+		g.bc.arm(shardFaults{})
+
+		final := bytes.Repeat([]byte("z"), 1<<18)
+		require.Equal(t, http.StatusOK, g.put("k", final).Code)
+		got := g.get("k")
+		require.Equal(t, http.StatusOK, got.Code, got.Body.String())
+		assert.True(t, bytes.Equal(final, got.Body.Bytes()))
+	})
+}
+
+func TestAnAcknowledgedCopyReadsBack(t *testing.T) {
+	eachFault(t, func(t *testing.T, p rsProfile, c faultCase) {
+		g := newRealStoreGate(t, p)
+		before := bytes.Repeat([]byte("d1"), 1<<18)
+		src := bytes.Repeat([]byte("s"), 1<<19)
+		require.Equal(t, http.StatusOK, g.put("src", src).Code)
+		require.Equal(t, http.StatusOK, g.put("dst", before).Code)
+
+		g.bc.arm(c.faults)
+		cp := g.copy("src", "dst")
+		g.bc.arm(shardFaults{})
+
+		requireOutcome(t, g, c, cp, "dst", before, src)
+	})
+}
+
+func TestAnAcknowledgedCompletionReadsBack(t *testing.T) {
+	eachFault(t, func(t *testing.T, p rsProfile, c faultCase) {
+		g := newRealStoreGate(t, p)
+		part := bytes.Repeat([]byte("p"), 1<<19)
+		upload := g.createUpload(t, "mp")
+		up := g.uploadPart("mp", upload, 1, part)
+		require.True(t, succeeded(up), up.Body.String())
+
+		g.bc.arm(c.faults)
+		done := g.complete(t, "mp", upload, MultipartUploadPart{PartNumber: 1, ETag: up.Header().Get("ETag")})
+		g.bc.arm(shardFaults{})
+
+		requireOutcome(t, g, c, done, "mp", nil, part)
+	})
+}
+
+// A part replaced under a fault below the floor must leave the upload on the
+// part it had: ListParts names the old ETag, and completing with it serves the
+// old bytes.
+func TestAFailedPartReplacementKeepsTheOldPart(t *testing.T) {
+	for _, via := range []string{"UploadPart", "UploadPartCopy"} {
+		eachFault(t, func(t *testing.T, p rsProfile, c faultCase) {
+			if c.atFloor {
+				t.Skip("a write at its floor replaces the part, which the success cases cover")
+			}
+			t.Run(via, func(t *testing.T) {
+				g := newRealStoreGate(t, p)
+				old := bytes.Repeat([]byte("o"), 1<<19)
+				replacement := bytes.Repeat([]byte("r"), 1<<19)
+				require.Equal(t, http.StatusOK, g.put("src", replacement).Code)
+
+				upload := g.createUpload(t, "mp")
+				up := g.uploadPart("mp", upload, 1, old)
+				require.True(t, succeeded(up), up.Body.String())
+				oldETag := up.Header().Get("ETag")
+
+				g.bc.arm(c.faults)
+				var rr *httptest.ResponseRecorder
+				if via == "UploadPart" {
+					rr = g.uploadPart("mp", upload, 1, replacement)
+				} else {
+					rr = g.uploadPartCopy("mp", upload, 1, "src")
+				}
+				g.bc.arm(shardFaults{})
+				require.False(t, succeeded(rr), "a part write below its floor was acknowledged")
+
+				listed := g.listParts(t, "mp", upload)
+				require.Len(t, listed.Parts, 1)
+				assert.Equal(t, oldETag, listed.Parts[0].ETag, "ListParts must still name the old part")
+
+				done := g.complete(t, "mp", upload, MultipartUploadPart{PartNumber: 1, ETag: oldETag})
+				require.True(t, succeeded(done), done.Body.String())
+				got := g.get("mp")
+				require.Equal(t, http.StatusOK, got.Code, got.Body.String())
+				assert.True(t, bytes.Equal(old, got.Body.Bytes()), "completing with the old ETag must serve the old part")
+			})
+		})
 	}
-	assert.Equal(t, http.StatusNotFound, got.Code, "a failed first write must leave the key absent: %s", got.Body.String())
+}
+
+// An empty object stores no shards, so the floor does not apply to it.
+func TestEmptyWritesNeedNoShardFloor(t *testing.T) {
+	for _, p := range rsProfiles {
+		t.Run(p.String(), func(t *testing.T) {
+			g := newRealStoreGate(t, p)
+			require.True(t, succeeded(g.put("empty", []byte{})))
+			require.True(t, succeeded(g.copy("empty", "empty-copy")))
+			got := g.get("empty-copy")
+			require.Equal(t, http.StatusOK, got.Code, got.Body.String())
+			assert.Empty(t, got.Body.Bytes())
+		})
+	}
 }
