@@ -101,6 +101,8 @@ func TestNULKeyIsRefusedOnEveryKeyPath(t *testing.T) {
 		{"CompleteMultipartUpload", http.MethodPost, nul + "?" + upload, complete, nil},
 		{"CopyObject destination", http.MethodPut, nul, nil, copySource},
 		{"UploadPartCopy destination", http.MethodPut, nul + "?partNumber=1&" + upload, nil, copySource},
+		{"ListParts", http.MethodGet, nul + "?" + upload, nil, nil},
+		{"AbortMultipartUpload", http.MethodDelete, nul + "?" + upload, nil, nil},
 	}
 	for _, c := range cases {
 		rows, mutations := maps.Clone(g.meta.rows), g.blob.mutationCount()
@@ -141,6 +143,9 @@ func TestNULCopySourceIsRefused(t *testing.T) {
 			rows, mutations := maps.Clone(g.meta.rows), g.blob.mutationCount()
 			rr := g.do(c.key, http.MethodPut, dest, nil, http.Header{"X-Amz-Copy-Source": {"owner-bucket/secret/a%00b"}})
 			assert.Equal(t, c.want, rr.Code, "%s, %s: %s", name, c.name, rr.Body.String())
+			if c.want == http.StatusBadRequest {
+				assert.Contains(t, rr.Body.String(), "<Code>BadRequest</Code>", "%s, %s", name, c.name)
+			}
 			assert.Equal(t, rows, g.meta.rows, "%s, %s: metadata changed", name, c.name)
 			assert.Equal(t, mutations, g.blob.mutationCount(), "%s, %s: blob calls", name, c.name)
 		}
