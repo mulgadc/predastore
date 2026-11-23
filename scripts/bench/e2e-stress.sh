@@ -2112,22 +2112,23 @@ fi
 # --- Scenario: acked-readback ---
 #
 # The user-visible claim: a write that answered success reads back, straight
-# away and later, with the cluster under the two faults prod meets together.
-# One host freezes for 12s, the shape of an NVMe completion stall. Every write
-# then waits out its stream to that host, about ten seconds, and commits short
-# one shard. Four seconds in, a second host is stopped, so the commits those
-# writes send it hang on open connections, and six seconds later it is killed
-# and restarted, which is what a rolling deploy does: each hanging commit ends
-# in connection closed. That pair is what acknowledged an unreadable chunk on
-# prod: one shard lost after sending, one landed shard's commit cut off, one
-# shard committed of the two a read needs.
+# away and later, while the cluster rides through the faults prod meets. One
+# host freezes for 12s, the shape of an NVMe completion stall; four seconds in
+# a second host is stopped, then killed and restarted, which is what a rolling
+# deploy does to the connections in flight.
+#
+# This is a soak, not the reproduction. The incident needs a commit cut off on
+# a write whose stripe is already short, and a put to a frozen host waits out
+# the 45s commit timeout, so a freeze this short heals itself before the two
+# faults can meet. The deterministic reproduction is the gate suite on real
+# blob stores (internal/gate/handlers/acked_readback_test.go). What this run
+# holds is the invariant under process-level faults: every success reads back.
 #
 # It runs its own cluster under the production settings: degraded writes and
 # hinted handoff on, repair off so nothing heals a defect before it is read.
-# A failed write is not asserted on either way. What is asserted is that every
-# success reads back byte-identical, and that the faults were really reached:
-# a run with no acknowledgement inside the fault window, or no shard fault
-# logged, proves nothing and is reported as inconclusive rather than passed.
+# A failed write is not asserted on either way. A run with no acknowledgement
+# inside a fault window, or no shard fault logged, proves nothing and is
+# reported as inconclusive rather than passed.
 
 ACKED_CLUSTER="${CONFIG_NAME}-acked"
 ACKED_CONFIG="$PREDA_CONFIG_DIR/$ACKED_CLUSTER.toml"
@@ -2275,7 +2276,7 @@ run_acked_readback() {
     cat "$records".* > "$records"
     cp "$records" "$RUN_DIR/acked-readback-records.txt"
 
-    local total acked refused bad inside final_bad cut short
+    local total acked refused bad inside final_bad cut short handed
     total="$(wc -l < "$records")"
     acked="$(awk '$3 == 0' "$records" | wc -l)"
     refused="$(awk '$3 != 0' "$records" | wc -l)"
@@ -2288,7 +2289,8 @@ run_acked_readback() {
     cut="$(cat "$PREDA_DIR/$ACKED_CLUSTER"/logs/*.log 2>/dev/null | grep -c 'Shard commit failed' || true)"
     short="$(cat "$PREDA_DIR/$ACKED_CLUSTER"/logs/*.log 2>/dev/null \
         | grep -c 'Shard write failed; the stripe is short one holder' || true)"
-    log "acked-readback: $total writes, $acked acknowledged, $refused refused, $inside acknowledged inside a fault window, $cut commits cut off, $short short stripes logged"
+    handed="$(cat "$PREDA_DIR/$ACKED_CLUSTER"/logs/*.log 2>/dev/null | grep -c 'Shard handed off' || true)"
+    log "acked-readback: $total writes, $acked acknowledged, $refused refused, $inside acknowledged inside a fault window, $cut commits cut off, $short short stripes, $handed handoffs logged"
 
     # The settled pass: the cluster is whole again and every success is read
     # once more, through the gate the odd writers did not use.
@@ -2304,8 +2306,8 @@ run_acked_readback() {
         fi
     done < "$records"
 
-    if [ "$inside" -eq 0 ] || [ "$cut" -eq 0 ]; then
-        acked_check false "inconclusive: $inside acknowledgements inside a fault window and $cut commits cut off; the faults were not reached"
+    if [ "$inside" -eq 0 ] || [ $(( cut + short + handed )) -eq 0 ]; then
+        acked_check false "inconclusive: $inside acknowledgements inside a fault window and $(( cut + short + handed )) shard faults logged; the faults were not reached"
     fi
     acked_check "$([ "$bad" -eq 0 ] && echo true || echo false)" \
         "$bad of $acked acknowledged writes failed their immediate read-back"
