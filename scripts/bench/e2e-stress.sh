@@ -2131,7 +2131,7 @@ fi
 # hinted handoff on, repair off so nothing heals a defect before it is read.
 # A failed write is not asserted on either way. The fault has to be shown to
 # have been met: an acknowledgement whose response came back inside a freeze,
-# and a short stripe or failed commit logged between that freeze and its thaw. A run without both proves nothing and is inconclusive.
+# and a short-stripe write logged between that freeze and its thaw. A run without both proves nothing and is inconclusive.
 
 ACKED_CLUSTER="${CONFIG_NAME}-acked"
 ACKED_CONFIG="$PREDA_CONFIG_DIR/$ACKED_CLUSTER.toml"
@@ -2208,9 +2208,9 @@ acked_log_lines() {
     done
 }
 
-# acked_faults_between counts the events that prove a stripe went short, logged
-# between two acked_log_lines snapshots: a shard write that failed, or a commit
-# that did. A handoff is not one, since it keeps the stripe at full width. A log
+# acked_faults_between counts the short-stripe events logged between two
+# acked_log_lines snapshots: a shard write that failed, leaving its position
+# empty. A handoff is not one, since it keeps the stripe at full width. A log
 # that gained no lines is skipped, so the range never reads past the snapshot.
 acked_faults_between() {
     local before="$1" after="$2" f a b total=0 n
@@ -2219,7 +2219,7 @@ acked_faults_between() {
         a="${a:-0}"
         [ "$b" -gt "$a" ] || continue
         n="$(sed -n "$(( a + 1 )),${b}p" "$f" \
-            | grep -cE 'Shard commit failed|Shard write failed; the stripe is short one holder' || true)"
+            | grep -c 'Shard write failed; the stripe is short one holder' || true)"
         total=$(( total + n ))
     done < "$after"
     echo "$total"
