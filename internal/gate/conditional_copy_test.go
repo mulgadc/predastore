@@ -1,7 +1,9 @@
 package gate
 
 import (
+	"bytes"
 	"encoding/xml"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -9,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 
 	"github.com/stretchr/testify/assert"
@@ -273,4 +276,53 @@ func TestConditionalUploadPartCopyOfANamedVersion(t *testing.T) {
 		assert.Equal(t, mutations, f.g.blob.mutationCount(), "%s: blob calls made by a refused part copy", name)
 		assert.Empty(t, u.parts(), name)
 	}
+}
+
+// A part copy of a named version is authorized as s3:GetObjectVersion on the
+// source through the whole signed gate: a caller who may write the upload and
+// read the current source, but not its history, is refused and stores nothing.
+// Verifies: Q-68.
+func TestNamedPartCopyNeedsGetObjectVersion(t *testing.T) {
+	blob := newMemBlob()
+	cfg := copyServer(t).cfg
+	cfg.Blob, cfg.RS, cfg.BlobNodeIDs = blob, RS{Data: 2, Parity: 1}, []config.NodeID{1, 2, 3}
+	server := newTestGate(t, cfg)
+	do := func(accessKey, method, target string, body []byte, header http.Header) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, target, bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+		maps.Copy(req.Header, header)
+		signTestReq(t, req, body, accessKey, secret, "ap-southeast-2", "s3")
+		rr := httptest.NewRecorder()
+		server.ServeHTTP(rr, req)
+		return rr
+	}
+
+	rr := do(keyOwner, http.MethodPut, "/owner-bucket?versioning", []byte(
+		"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"), nil)
+	require.Equal(t, http.StatusOK, rr.Code, "enable versioning: %s", rr.Body.String())
+	rr = do(keyOwner, http.MethodPut, "/owner-bucket/src", []byte("older"), nil)
+	require.Equal(t, http.StatusOK, rr.Code, "put: %s", rr.Body.String())
+	older := rr.Header().Get("X-Amz-Version-Id")
+	require.Equal(t, http.StatusOK, do(keyOwner, http.MethodPut, "/owner-bucket/src", []byte("newer"), nil).Code)
+	rr = do(keyOwner, http.MethodPost, "/owner-bucket/assembled?uploads", nil, nil)
+	require.Equal(t, http.StatusOK, rr.Code, "initiate: %s", rr.Body.String())
+	var initiated handlers.InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &initiated))
+	upload := "/owner-bucket/assembled?uploadId=" + url.QueryEscape(initiated.UploadId)
+	mutations := blob.mutationCount()
+
+	rr = do(keyNoVersions, http.MethodPut, upload+"&partNumber=1", nil,
+		http.Header{"X-Amz-Copy-Source": {"owner-bucket/src?versionId=" + older}})
+	assert.Equal(t, http.StatusForbidden, rr.Code, "body: %s", rr.Body.String())
+	assert.Contains(t, rr.Body.String(), "<Code>AccessDenied</Code>")
+	assert.Equal(t, mutations, blob.mutationCount(), "blob calls made by a refused part copy")
+
+	parts := do(keyOwner, http.MethodGet, upload, nil, nil)
+	require.Equal(t, http.StatusOK, parts.Code, "list parts: %s", parts.Body.String())
+	assert.NotContains(t, parts.Body.String(), "<PartNumber>")
+
+	rr = do(keyNoVersions, http.MethodPut, upload+"&partNumber=1", nil,
+		http.Header{"X-Amz-Copy-Source": {"owner-bucket/src"}})
+	assert.Equal(t, http.StatusOK, rr.Code, "the current version needs s3:GetObject only: %s", rr.Body.String())
 }

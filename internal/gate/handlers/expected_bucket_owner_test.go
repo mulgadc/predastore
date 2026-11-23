@@ -365,3 +365,46 @@ func TestExpectedBucketOwnerReadsThroughTheLeader(t *testing.T) {
 	assert.Equal(t, string(model.ErrAccessDenied), decodeS3Error(t, w).Code)
 	assert.Positive(t, stale.leaderReads, "the owner was not read through a leader")
 }
+
+// A copy holds its source bucket to x-amz-source-expected-bucket-owner before
+// its source conditions, so a condition that holds cannot carry a copy past a wrong
+// owner, and the real owner still copies.
+// Verifies: Q-68.
+func TestExpectedSourceOwnerGatesBothCopies(t *testing.T) {
+	t.Parallel()
+
+	f := newWriteFixture(4, 2)
+	cache := NewBucketCache(nil)
+	seedOwnedBucket(t, f.mc, ownedBucket, ownerAccount)
+	seedOwnedObject(t, f, ownedBucket, ownedTestFile, []byte("source bytes"))
+	seedOwnedUpload(t, f, ownedBucket, "assembled", "u1")
+
+	copies := map[string]struct {
+		handler http.Handler
+		target  string
+		key     string
+	}{
+		"CopyObject":     {CopyObject(f.mc, f.bc, f.ring, cache, f.cfg), "/" + ownedBucket + "/dest", "dest"},
+		"UploadPartCopy": {UploadPartCopy(f.mc, f.bc, f.ring, cache, f.cfg), "/" + ownedBucket + "/assembled?partNumber=1&uploadId=u1", "assembled"},
+	}
+	for name, c := range copies {
+		for _, owner := range []string{otherAccount, ownerAccount} {
+			req := ownerObjectRequest(http.MethodPut, c.target, ownedBucket, c.key, "")
+			req.Header.Set("X-Amz-Copy-Source", ownedBucket+"/"+ownedTestFile)
+			req.Header.Set("X-Amz-Copy-Source-If-Match", "*")
+			req.Header.Set(ExpectedSourceBucketOwnerHeader, owner)
+			f.mc.resetOps()
+
+			w := httptest.NewRecorder()
+			c.handler.ServeHTTP(w, req)
+
+			if owner == ownerAccount {
+				assert.Equal(t, http.StatusOK, w.Code, "%s, real owner: %s", name, w.Body.String())
+				continue
+			}
+			assert.Equal(t, http.StatusForbidden, w.Code, "%s, wrong owner: %s", name, w.Body.String())
+			assert.Contains(t, w.Body.String(), "<Code>AccessDenied</Code>", name)
+			assert.Zero(t, f.mc.ops["put"]+f.mc.ops["swap"], "%s: metadata writes by a refused copy", name)
+		}
+	}
+}

@@ -195,6 +195,9 @@ func bucketExists(ctx context.Context, mc MetaClient, cache *BucketCache, bucket
 // https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObject.html
 const ExpectedBucketOwnerHeader = "X-Amz-Expected-Bucket-Owner"
 
+// ExpectedSourceBucketOwnerHeader is the same assertion about a copy's source.
+const ExpectedSourceBucketOwnerHeader = "X-Amz-Source-Expected-Bucket-Owner"
+
 // requireExpectedBucketOwner refuses a request whose expected owner is not the
 // bucket's account. An absent header asserts nothing, so every caller that
 // does not send one is unaffected.
@@ -205,7 +208,16 @@ const ExpectedBucketOwnerHeader = "X-Amz-Expected-Bucket-Owner"
 // refuses the request, because an unproven precondition on a destructive call
 // is not a satisfied one.
 func requireExpectedBucketOwner(ctx context.Context, mc MetaClient, cache *BucketCache, r *http.Request, bucket string) error {
-	want := r.Header.Get(ExpectedBucketOwnerHeader)
+	return requireBucketOwnedBy(ctx, mc, cache, r.Header.Get(ExpectedBucketOwnerHeader), bucket)
+}
+
+// requireExpectedSourceOwner holds a copy's source bucket to
+// x-amz-source-expected-bucket-owner, as the destination is held to its own.
+func requireExpectedSourceOwner(ctx context.Context, mc MetaClient, cache *BucketCache, r *http.Request, bucket string) error {
+	return requireBucketOwnedBy(ctx, mc, cache, r.Header.Get(ExpectedSourceBucketOwnerHeader), bucket)
+}
+
+func requireBucketOwnedBy(ctx context.Context, mc MetaClient, cache *BucketCache, want, bucket string) error {
 	if want == "" {
 		return nil
 	}
@@ -232,7 +244,7 @@ func requireExpectedBucketOwner(ctx context.Context, mc MetaClient, cache *Bucke
 	}
 
 	var metadata model.BucketMetadata
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&metadata); err != nil {
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&metadata); err != nil { //nolint:gosec // G709: the input is state this gate wrote, not client data.
 		return model.NewS3Error(model.ErrInternalError, "failed to decode bucket metadata: "+err.Error(), 500)
 	}
 

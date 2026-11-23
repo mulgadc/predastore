@@ -81,16 +81,21 @@ func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModifie
 // equal to the ETag or "*" matches, so no value is rejected as malformed.
 func etagListMatches(list, etag string, hasETag bool) bool {
 	want := strings.Trim(etag, `"`)
-	for _, tag := range strings.FieldsFunc(list, isETagSeparator) {
-		if tag == "*" || (hasETag && tag == want) {
+	for start := 0; start < len(list); {
+		end := start
+		for end < len(list) && !isETagSeparator(list[end]) {
+			end++
+		}
+		if tag := list[start:end]; tag == "*" || (hasETag && tag != "" && tag == want) {
 			return true
 		}
+		start = end + 1
 	}
 	return false
 }
 
-func isETagSeparator(r rune) bool {
-	return r == '"' || r == ',' || r == ' ' || r == '\t'
+func isETagSeparator(c byte) bool {
+	return c == '"' || c == ',' || c == ' ' || c == '\t'
 }
 
 // preconditionFailedMessage is S3's text for a 412.

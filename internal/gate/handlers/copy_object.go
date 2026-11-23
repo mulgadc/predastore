@@ -70,6 +70,10 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, err)
 			return
 		}
+		if err := requireExpectedSourceOwner(ctx, mc, cache, r, srcBucket); err != nil {
+			HandleError(w, r, err)
+			return
+		}
 		if err := requireBucket(ctx, mc, cache, destBucket); err != nil {
 			HandleError(w, r, err)
 			return
