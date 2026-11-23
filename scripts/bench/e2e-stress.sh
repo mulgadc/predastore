@@ -2131,8 +2131,7 @@ fi
 # hinted handoff on, repair off so nothing heals a defect before it is read.
 # A failed write is not asserted on either way. The fault has to be shown to
 # have been met: an acknowledgement whose response came back inside a freeze,
-# and a short stripe, handoff or failed commit logged between that freeze and
-# its thaw. A run without both proves nothing and is inconclusive.
+# and a short stripe or failed commit logged between that freeze and its thaw. A run without both proves nothing and is inconclusive.
 
 ACKED_CLUSTER="${CONFIG_NAME}-acked"
 ACKED_CONFIG="$PREDA_CONFIG_DIR/$ACKED_CLUSTER.toml"
@@ -2209,14 +2208,18 @@ acked_log_lines() {
     done
 }
 
-# acked_faults_between counts the shard faults the gates logged between two
-# acked_log_lines snapshots.
+# acked_faults_between counts the events that prove a stripe went short, logged
+# between two acked_log_lines snapshots: a shard write that failed, or a commit
+# that did. A handoff is not one, since it keeps the stripe at full width. A log
+# that gained no lines is skipped, so the range never reads past the snapshot.
 acked_faults_between() {
     local before="$1" after="$2" f a b total=0 n
     while read -r f b; do
         a="$(awk -v f="$f" '$1 == f { print $2 }' "$before")"
-        n="$(sed -n "$(( ${a:-0} + 1 )),${b}p" "$f" \
-            | grep -cE 'Shard commit failed|Shard write failed; the stripe is short one holder|Shard handed off' || true)"
+        a="${a:-0}"
+        [ "$b" -gt "$a" ] || continue
+        n="$(sed -n "$(( a + 1 )),${b}p" "$f" \
+            | grep -cE 'Shard commit failed|Shard write failed; the stripe is short one holder' || true)"
         total=$(( total + n ))
     done < "$after"
     echo "$total"
@@ -2270,7 +2273,7 @@ run_acked_readback() {
         echo "$t0 $t1" >> "$windows"
         n="$(acked_faults_between "$WORK_DIR/acked-lines-before" "$WORK_DIR/acked-lines-after")"
         faults=$(( faults + n ))
-        log "acked-readback: cycle $cycle, SIGCONT host $frozen, $n shard faults logged during the freeze"
+        log "acked-readback: cycle $cycle, SIGCONT host $frozen, $n short-stripe faults logged during the freeze"
         sleep 15
     done
 
@@ -2289,7 +2292,7 @@ run_acked_readback() {
     inside="$(awk 'NR == FNR { lo[NR] = $1; hi[NR] = $2; n = NR; next }
         $3 == 0 { for (i = 1; i <= n; i++) if ($1 >= lo[i] && $1 <= hi[i]) { c++; break } }
         END { print c + 0 }' "$windows" "$records")"
-    log "acked-readback: $total writes, $acked acknowledged, $refused refused, $inside acknowledged inside a freeze, $faults shard faults logged during freezes"
+    log "acked-readback: $total writes, $acked acknowledged, $refused refused, $inside acknowledged inside a freeze, $faults short-stripe faults logged during freezes"
 
     # The settled pass: the cluster is whole again and every success is read
     # once more, through the gate the odd writers did not use.
@@ -2306,7 +2309,7 @@ run_acked_readback() {
     done < "$records"
 
     acked_check "$([ "$inside" -gt 0 ] && [ "$faults" -gt 0 ] && echo true || echo false)" \
-        "fault reached: $inside acknowledgements answered inside a freeze and $faults shard faults logged during one"
+        "fault reached: $inside acknowledgements answered inside a freeze and $faults short-stripe faults logged during one"
     acked_check "$([ "$bad" -eq 0 ] && echo true || echo false)" \
         "$bad of $acked acknowledged writes failed their immediate read-back"
     acked_check "$([ "$final_bad" -eq 0 ] && echo true || echo false)" \
