@@ -86,16 +86,18 @@ func (o Object) Validate() error {
 		return reject("object key must be a valid UTF-8 string")
 	case strings.HasSuffix(o.Key, "/"):
 		return reject("object key must not end in a slash")
-	case strings.IndexByte(o.Key, 0) >= 0:
-		// S3 refuses NUL, and storage names use it to separate a key from a
-		// version id, so a key holding one could name another key's version.
-		return NewS3Error(ErrBadRequest, "Bad Request", 400).WithResource(o.Key)
 	}
 
 	for segment := range strings.SplitSeq(o.Key, "/") {
 		if segment == "." || segment == ".." {
 			return reject("object key must not contain a . or .. segment")
 		}
+	}
+
+	// S3 refuses NUL, and storage names use it to separate a key from a
+	// version id, so a key holding one could name another key's version.
+	if strings.IndexByte(o.Key, 0) >= 0 {
+		return NewS3Error(ErrBadRequest, "Bad Request", 400).WithResource(o.Key)
 	}
 
 	return nil

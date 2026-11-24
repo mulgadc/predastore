@@ -47,6 +47,19 @@ func TestObjectValidateRefusesNUL(t *testing.T) {
 	}
 }
 
+// A key that breaks another key rule as well as holding NUL keeps that rule's
+// InvalidKey, so the NUL refusal changes the outcome of no other key.
+// Verifies: Q-68.
+func TestObjectValidateKeepsInvalidKeyBeforeNUL(t *testing.T) {
+	for _, key := range []string{"a/../b\x00", "./a\x00", "a\x00/", "a\x00\xff"} {
+		err := Object{Bucket: Bucket{Name: "valid-bucket"}, Key: key}.Validate()
+		var s3err *S3Error
+		if assert.ErrorAs(t, err, &s3err, "key %q", key) {
+			assert.Equal(t, ErrInvalidKey, s3err.Code, "key %q", key)
+		}
+	}
+}
+
 func TestBucketValidate(t *testing.T) {
 	tests := []struct {
 		name    string
