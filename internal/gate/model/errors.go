@@ -197,7 +197,6 @@ var (
 	}
 )
 
-// NewS3Error creates a new S3Error with the given code.
 // ContentSHA256Mismatch returns ErrContentSHA256MismatchError with the digests err carries.
 // A bare sigv4.ErrContentSHA256Mismatch carries none, so the response has none.
 func ContentSHA256Mismatch(err error) *S3Error {
@@ -210,6 +209,7 @@ func ContentSHA256Mismatch(err error) *S3Error {
 	return &e
 }
 
+// NewS3Error creates a new S3Error with the given code.
 func NewS3Error(code S3ErrorCode, message string, statusCode int) *S3Error {
 	return &S3Error{
 		Code:       code,

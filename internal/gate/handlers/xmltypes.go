@@ -188,16 +188,14 @@ type CopyPartResult struct {
 
 // S3Error is the error document every failed request returns.
 type S3Error struct {
-	XMLName    xml.Name `xml:"Error"`
-	Code       string   `xml:"Code"`
-	Message    string   `xml:"Message"`
-
-	ClientComputedContentSHA256 string `xml:"ClientComputedContentSHA256,omitempty"`
-	S3ComputedContentSHA256     string `xml:"S3ComputedContentSHA256,omitempty"`
-
-	BucketName string `xml:"BucketName"`
-	RequestId  string   `xml:"RequestId"`
-	HostId     string   `xml:"HostId"`
+	XMLName                     xml.Name `xml:"Error"`
+	Code                        string   `xml:"Code"`
+	Message                     string   `xml:"Message"`
+	ClientComputedContentSHA256 string   `xml:"ClientComputedContentSHA256,omitempty"`
+	S3ComputedContentSHA256     string   `xml:"S3ComputedContentSHA256,omitempty"`
+	BucketName                  string   `xml:"BucketName"`
+	RequestId                   string   `xml:"RequestId"`
+	HostId                      string   `xml:"HostId"`
 }
 
 // DeleteRequest is the body of POST /{bucket}?delete. Quiet asks for the
