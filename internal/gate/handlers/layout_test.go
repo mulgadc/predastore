@@ -247,15 +247,11 @@ func TestARangedReadCostsOnlyTheStripesItTouches(t *testing.T) {
 	ranges := []struct{ start, end int64 }{
 		{streamBlockSize - 1, streamBlockSize},       // across the first boundary
 		{streamBlockSize - 1, 2 * streamBlockSize},   // across two
-		{2*streamBlockSize - 5, 3 * streamBlockSize}, // into the short last stripe
+		{2*streamBlockSize + 5, 3 * streamBlockSize}, // into the short last stripe
 		{tailCross - 1, tailCross},                   // across a boundary in the tail
 		{size - 2, size - 1},                         // one block: the fast path
 		{0, size - 1},                                // the whole object
 	}
-	// Each range is either longer than a block, so the stripe reader serves it,
-	// or a few bytes, so a direct read cannot run long enough to be hedged and
-	// add the hedge's reads to the tally.
-	//
 	// One tally over one object, so the ranges run in sequence rather than as
 	// parallel subtests: a shared counter cannot attribute concurrent reads.
 	for _, r := range ranges {

@@ -52,6 +52,28 @@ func BenchmarkGetObjectRange(b *testing.B) {
 		})
 	}
 
+	// A whole block's length across a block boundary of a striped object, past
+	// the direct limit, so the stripe reader serves it as it did before.
+	b.Run("crossing/4MiB-striped", func(b *testing.B) {
+		const striped = 3*streamBlockSize + 7919
+		g := newWriteFixture(2, 1)
+		publishedObject(b, g, striped)
+		h := GetObject(g.mc, g.bc, g.ring, testCache(), g.cfg)
+		start := int64(streamBlockSize / 2)
+		end := start + streamBlockSize - 1
+		b.SetBytes(end - start + 1)
+		b.ReportAllocs()
+		for range b.N {
+			req := objectRequest(http.MethodGet, "k", "")
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != http.StatusPartialContent || int64(w.Body.Len()) != end-start+1 {
+				b.Fatalf("range %d-%d: status %d, %d bytes", start, end, w.Code, w.Body.Len())
+			}
+		}
+	})
+
 	// Concurrent readers of the crossing block, the load under which each one
 	// that reads the whole object costs the most.
 	b.Run("crossing/4KiB/parallel", func(b *testing.B) {

@@ -3,7 +3,6 @@ package handlers
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"sync"
@@ -124,10 +123,12 @@ type rangeResult struct {
 // reconstruction from the other shards if the owner has not answered within the
 // hedge delay. Both arms run to completion or cancellation and the first usable
 // answer wins, so a stalled node costs the hedge delay rather than the blob
-// client's ten-second envelope. rebuilt reports that the answer used parity.
+// client's ten-second envelope. An owner that fails is asked for via its
+// handoff holder before the read counts it lost, and an answer of the wrong
+// length is a failure, not a win. rebuilt reports that the answer used parity.
 func readRangeHedged(
 	ctx context.Context, bc BlobClient, cfg Config, objectHash [32]byte,
-	place ObjectToShardNodes, shardIdx int, at, length int64,
+	place ObjectToShardNodes, shardIdx int, at, length int64, handoff config.NodeID,
 ) (data []byte, rebuilt bool, err error) {
 	if shardIdx >= len(place.DataShardNodes) {
 		return nil, false, fmt.Errorf("shard index %d out of range", shardIdx)
@@ -145,6 +146,13 @@ func readRangeHedged(
 
 	go func() {
 		data, err := readRangeFromSingleShard(ctx, bc, objectHash, place, shardIdx, at, length)
+		if err != nil && handoff != 0 && handoff != owner {
+			if held, hErr := readShardRange(ctx, bc, objectHash, handoff, shardIdx, at, length, place.WriteEpoch); hErr == nil {
+				slog.InfoContext(ctx, "Range served from its handoff holder",
+					"owner", owner, "holder", handoff, "index", shardIdx)
+				data, err = held, nil
+			}
+		}
 		results <- rangeResult{data: data, err: err}
 	}()
 
@@ -173,6 +181,9 @@ func readRangeHedged(
 
 		case res := <-results:
 			running--
+			if res.err == nil && int64(len(res.data)) != length {
+				res.err = fmt.Errorf("shard %d range at %d returned %d bytes, want %d", shardIdx, at, len(res.data), length)
+			}
 			if res.err == nil {
 				if res.hedged {
 					telemetry.RecordObjectRead(ctx, telemetry.ReadPathReconstructed)
@@ -292,7 +303,7 @@ func readShardRange(
 	}
 	defer reader.Close() // CRITICAL: Close to release the stream back to the pool
 
-	data, err = io.ReadAll(reader)
+	data, err = readExactly(reader, length)
 	if err != nil {
 		return nil, fmt.Errorf("read range data: %w", err)
 	}

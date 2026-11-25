@@ -108,7 +108,7 @@ func TestReadRangeHedged_FastOwnerIsNotHedged(t *testing.T) {
 	shardLatency = &nodeLatency{}
 	bc, cfg, place := rs21(t, 4096)
 
-	got, _, err := readRangeHedged(t.Context(), bc, cfg, [32]byte{}, place, 0, 0, 128)
+	got, _, err := readRangeHedged(t.Context(), bc, cfg, [32]byte{}, place, 0, 0, 128, 0)
 	require.NoError(t, err)
 	assert.Equal(t, bc.shards[0][:128], got)
 	assert.Equal(t, int64(1), bc.gets.Load(), "a prompt owner must be served by exactly one read")
@@ -122,7 +122,7 @@ func TestReadRangeHedged_StalledOwnerIsAnsweredByReconstruction(t *testing.T) {
 	bc.stall[4] = 10 * time.Second
 
 	began := time.Now()
-	got, _, err := readRangeHedged(t.Context(), bc, cfg, [32]byte{}, place, 0, 0, 128)
+	got, _, err := readRangeHedged(t.Context(), bc, cfg, [32]byte{}, place, 0, 0, 128, 0)
 	took := time.Since(began)
 
 	require.NoError(t, err)
@@ -140,7 +140,7 @@ func TestReadRangeHedged_FailedOwnerHedgesImmediately(t *testing.T) {
 	bc.fail[4] = errors.New("transport")
 
 	began := time.Now()
-	got, _, err := readRangeHedged(t.Context(), bc, cfg, [32]byte{}, place, 0, 0, 128)
+	got, _, err := readRangeHedged(t.Context(), bc, cfg, [32]byte{}, place, 0, 0, 128, 0)
 
 	require.NoError(t, err)
 	assert.Equal(t, bc.shards[0][:128], got)
@@ -155,7 +155,7 @@ func TestReadRangeHedged_BothArmsFailingIsAnError(t *testing.T) {
 	bc.fail[4] = errors.New("transport")
 	bc.fail[6] = errors.New("transport")
 
-	_, _, err := readRangeHedged(t.Context(), bc, cfg, [32]byte{}, place, 0, 0, 128)
+	_, _, err := readRangeHedged(t.Context(), bc, cfg, [32]byte{}, place, 0, 0, 128, 0)
 	require.Error(t, err)
 }
 
