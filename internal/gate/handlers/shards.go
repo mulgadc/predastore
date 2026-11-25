@@ -1007,7 +1007,7 @@ func fanOutDelete(
 	errCh := make(chan error, len(nodes))
 
 	for i, node := range nodes {
-		index := uint32(i) //nolint:gosec // G115: bounded by DataShards + ParityShards (small uint).
+		index := uint32(i)
 		wg.Go(func() {
 			start := time.Now()
 			resp, err := send(node, index)

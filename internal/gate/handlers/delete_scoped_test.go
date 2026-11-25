@@ -85,7 +85,7 @@ func toPreEpoch(t *testing.T, f deleteFixture, key string) ObjectToShardNodes {
 	place := storedPlacement(t, f, key)
 	f.write.bc.mu.Lock()
 	for i := range place.AllNodes() {
-		id := shardID{key: objectHash, index: uint32(i)} //nolint:gosec // G115: a six-shard stripe.
+		id := shardID{key: objectHash, index: uint32(i)}
 		shard := f.write.bc.shards[id]
 		shard.epoch = 0
 		f.write.bc.shards[id] = shard
@@ -112,7 +112,7 @@ func TestADeleteOfAPreEpochObjectReclaimsItsShards(t *testing.T) {
 	f.write.bc.mu.Lock()
 	defer f.write.bc.mu.Unlock()
 	for i := range place.AllNodes() {
-		_, held := f.write.bc.shards[shardID{key: objectHash, index: uint32(i)}] //nolint:gosec // G115: a six-shard stripe.
+		_, held := f.write.bc.shards[shardID{key: objectHash, index: uint32(i)}]
 		assert.False(t, held, "index %d of a pre-epoch object survived its delete", i)
 	}
 	assert.False(t, tombstoneExists(f.write.mc, deleteTestBucket, "a.txt"))

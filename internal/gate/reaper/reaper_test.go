@@ -452,7 +452,7 @@ func TestS7_AReclaimRacedByARecreateKeepsTheNewGeneration(t *testing.T) {
 	const recreated = 9
 	c.blob.beforeDelete = func() {
 		for i, n := range append(row.data, row.m...) {
-			c.blob.hold(n, row.hash, uint32(i), recreated) //nolint:gosec // G115: a three-shard stripe.
+			c.blob.hold(n, row.hash, uint32(i), recreated)
 		}
 		c.recordLivePlacement(t, row.hash, recreated, row.data, row.m)
 	}
@@ -460,7 +460,7 @@ func TestS7_AReclaimRacedByARecreateKeepsTheNewGeneration(t *testing.T) {
 	require.NoError(t, c.service(8).Pass(t.Context()))
 
 	for i, n := range append(row.data, row.m...) {
-		epoch, ok := c.blob.epochAt(n, row.hash, uint32(i)) //nolint:gosec // G115: a three-shard stripe.
+		epoch, ok := c.blob.epochAt(n, row.hash, uint32(i))
 		require.True(t, ok, "ADR-0003:S7: node %d lost the recreated shard at index %d to a stale reclaim", n, i)
 		assert.Equal(t, uint64(recreated), epoch)
 	}
@@ -488,7 +488,7 @@ func TestAScopedEpochZeroTombstoneIsReclaimedOnceTheNodeReturns(t *testing.T) {
 	c.blob.resume(2)
 	require.NoError(t, svc.Pass(t.Context()))
 	for i, n := range append(row.data, row.m...) {
-		assert.False(t, c.blob.has(n, row.hash, uint32(i)), "node %d still holds index %d", n, i) //nolint:gosec // G115: a three-shard stripe.
+		assert.False(t, c.blob.has(n, row.hash, uint32(i)), "node %d still holds index %d", n, i)
 	}
 	assert.False(t, c.meta.has(stored))
 	for _, epoch := range c.blob.epochs {
