@@ -68,8 +68,7 @@ func RespondSigV4Error(w http.ResponseWriter, r *http.Request, claimedKey string
 			"contentLength", r.Header.Get("Content-Length"),
 			"remoteAddr", ClientAddr(r),
 		)
-		WriteS3Error(w, r, http.StatusBadRequest, string(model.ErrContentSHA256Mismatch),
-			"The provided 'x-amz-content-sha256' header does not match what was computed")
+		HandleError(w, r, model.ContentSHA256Mismatch(err))
 	case errors.Is(err, sigv4.ErrRequestTimeTooSkewed):
 		slog.DebugContext(r.Context(), "Request timestamp outside allowed skew", "timestamp", r.Header.Get("X-Amz-Date"))
 		WriteS3Error(w, r, http.StatusForbidden, "RequestTimeTooSkewed",
@@ -144,25 +143,27 @@ func HandleError(w http.ResponseWriter, r *http.Request, err error) {
 	statusCode := http.StatusInternalServerError
 	var s3error S3Error
 
+	// The SigV4 payload check rides on the read a handler makes of the request body, so
+	// this arrives here rather than from the middleware door. It is the client's error.
+	if _, ok := model.IsS3Error(err); !ok && errors.Is(err, sigv4.ErrContentSHA256Mismatch) {
+		slog.WarnContext(r.Context(), "Request body does not match the signed payload hash",
+			"accessKeyID", auth.AccessKeyID(r.Context()),
+			"method", r.Method,
+			"path", r.URL.Path,
+			"payloadHashHeader", r.Header.Get("X-Amz-Content-Sha256"),
+			"remoteAddr", ClientAddr(r),
+		)
+		err = model.ContentSHA256Mismatch(err)
+	}
+
 	if opErr, ok := model.IsS3Error(err); ok {
 		statusCode = opErr.StatusCode
 		s3error.Code = string(opErr.Code)
 		s3error.Message = opErr.Message
+		s3error.ClientComputedContentSHA256 = opErr.ClientComputedContentSHA256
+		s3error.S3ComputedContentSHA256 = opErr.S3ComputedContentSHA256
 	} else {
 		switch {
-		// The SigV4 payload check rides on the read a handler makes of the request body, so
-		// this arrives here rather than from the middleware door. It is the client's error.
-		case errors.Is(err, sigv4.ErrContentSHA256Mismatch):
-			slog.WarnContext(r.Context(), "Request body does not match the signed payload hash",
-				"accessKeyID", auth.AccessKeyID(r.Context()),
-				"method", r.Method,
-				"path", r.URL.Path,
-				"payloadHashHeader", r.Header.Get("X-Amz-Content-Sha256"),
-				"remoteAddr", ClientAddr(r),
-			)
-			statusCode = model.ErrContentSHA256MismatchError.StatusCode
-			s3error.Code = string(model.ErrContentSHA256MismatchError.Code)
-			s3error.Message = model.ErrContentSHA256MismatchError.Message
 		case strings.Contains(err.Error(), "NoSuchBucket") || strings.Contains(err.Error(), "Bucket not found"):
 			statusCode = http.StatusNotFound
 			s3error.Code = "NoSuchBucket"

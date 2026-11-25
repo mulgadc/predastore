@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+
+	"github.com/mulgadc/bluebottle/pkg/sigv4"
 )
 
 // S3ErrorCode represents standardized S3 error codes.
@@ -46,6 +48,10 @@ type S3Error struct {
 	Message    string
 	StatusCode int
 	Resource   string
+
+	// The two digests of a payload-hash mismatch, empty on every other error.
+	ClientComputedContentSHA256 string
+	S3ComputedContentSHA256     string
 }
 
 // Error implements the error interface.
@@ -190,6 +196,18 @@ var (
 		StatusCode: http.StatusBadRequest,
 	}
 )
+
+// ContentSHA256Mismatch returns ErrContentSHA256MismatchError with the digests err carries.
+// A bare sigv4.ErrContentSHA256Mismatch carries none, so the response has none.
+func ContentSHA256Mismatch(err error) *S3Error {
+	e := *ErrContentSHA256MismatchError
+	if mismatch, ok := errors.AsType[*sigv4.ContentSHA256MismatchError](err); ok {
+		e.ClientComputedContentSHA256 = mismatch.Client
+		e.S3ComputedContentSHA256 = mismatch.Computed
+	}
+
+	return &e
+}
 
 // NewS3Error creates a new S3Error with the given code.
 func NewS3Error(code S3ErrorCode, message string, statusCode int) *S3Error {
