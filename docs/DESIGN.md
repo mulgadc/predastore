@@ -349,6 +349,7 @@ A node that predates `Hold` sends no `Registered`, so the client stops waiting a
 The final envelope carries `Holding`, which confirms that the prepared row is held.
 The age sweep drops an unheld prepared row that is older than 30 minutes, and it never drops a held one: only `Commit`, `Abort` or `DeleteEpoch` removes it.
 An `Abort` that arrives while the held writer is still open answers `Open` and cuts off the body, and the writer then ends with no prepared row.
+An `Abort` that arrives while the writer is closing waits for the close, drops the row, and answers without `Open`.
 A held writer that ends without its whole body prepares no row, so a crash at any point leaves nothing for the sweep to keep.
 A held body that stops arriving for `BodyIdleTimeout` ends the write.
 A second `Abort` then answers without `Open`, which tells the caller that no row is left.

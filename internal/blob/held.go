@@ -9,17 +9,26 @@ type heldKey struct {
 	epoch uint64
 }
 
-// heldWriters tracks the held writes that have not prepared their row yet.
-// An abort that reaches one marks it and cuts off its body, since there is no
-// row to drop, and the writer then prepares nothing.
+// heldWriter is one open held write. Before it closes, an abort marks it and
+// cuts off its body, so it prepares nothing. Once it is closing, an abort
+// waits for done and drops the row itself.
+type heldWriter struct {
+	cut     func()
+	aborted bool
+	closing bool
+	done    chan struct{}
+}
+
+// heldWriters tracks the held writes that have not finished. The abort
+// decision and the prepare never overlap: a writer either sees the abort
+// before it closes, or the abort sees it closing and waits.
 type heldWriters struct {
-	mu      sync.Mutex
-	open    map[heldKey]func()
-	aborted map[heldKey]bool
+	mu   sync.Mutex
+	open map[heldKey]*heldWriter
 }
 
 func newHeldWriters() *heldWriters {
-	return &heldWriters{open: map[heldKey]func(){}, aborted: map[heldKey]bool{}}
+	return &heldWriters{open: map[heldKey]*heldWriter{}}
 }
 
 // register records a held writer as open, with the action that ends its body
@@ -30,41 +39,49 @@ func (h *heldWriters) register(k heldKey, cut func()) bool {
 	if _, ok := h.open[k]; ok {
 		return false
 	}
-	h.open[k] = cut
+	h.open[k] = &heldWriter{cut: cut, done: make(chan struct{})}
 	return true
 }
 
-// finish removes an open writer and reports whether an abort marked it.
-// The caller drops the writer's prepared row when it was marked.
-func (h *heldWriters) finish(k heldKey) (aborted bool) {
+// beginClose reports whether an abort has marked the writer. If not, the
+// writer is closing from here on, and a later abort waits for finish.
+func (h *heldWriters) beginClose(k heldKey) (aborted bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	aborted = h.aborted[k]
-	delete(h.open, k)
-	delete(h.aborted, k)
-	return aborted
+	w := h.open[k]
+	if w.aborted {
+		return true
+	}
+	w.closing = true
+	return false
 }
 
-// isAborted reports whether an abort has marked the open writer.
-func (h *heldWriters) isAborted(k heldKey) bool {
+// finish removes the writer and releases any abort waiting on its close.
+func (h *heldWriters) finish(k heldKey) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return h.aborted[k]
+	if w, ok := h.open[k]; ok {
+		delete(h.open, k)
+		close(w.done)
+	}
 }
 
-// markAborted marks an open writer, cuts off its body, and reports whether
-// one was open. When it reports false, no held writer for the epoch can
-// still prepare a row.
-func (h *heldWriters) markAborted(k heldKey) bool {
+// markAborted handles an abort for an open writer. A writer not yet closing
+// is marked and cut off, and open is true. A closing writer returns its done
+// channel, and the caller drops the row once it is closed.
+func (h *heldWriters) markAborted(k heldKey) (open bool, closing <-chan struct{}) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	cut, ok := h.open[k]
+	w, ok := h.open[k]
 	if !ok {
-		return false
+		return false, nil
 	}
-	if !h.aborted[k] {
-		h.aborted[k] = true
-		cut()
+	if w.closing {
+		return true, w.done
 	}
-	return true
+	if !w.aborted {
+		w.aborted = true
+		w.cut()
+	}
+	return true, nil
 }

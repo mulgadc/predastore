@@ -195,6 +195,70 @@ func TestGetServesARetainedEpochWithNoLiveRow(t *testing.T) {
 	assert.Equal(t, first, got)
 }
 
+// closingStore holds a held writer inside Close until released, as a slow
+// fsync does, and reports when the close has begun.
+type closingStore struct {
+	*engine.Store
+
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *closingStore) AppendHeld(key [32]byte, index uint32, size int64, epoch uint64) (engine.Writer, error) {
+	w, err := s.Store.AppendHeld(key, index, size, epoch)
+	if err != nil {
+		return nil, err
+	}
+	return &closingWriter{Writer: w, store: s}, nil
+}
+
+type closingWriter struct {
+	engine.Writer
+
+	store *closingStore
+}
+
+func (w *closingWriter) Close() error {
+	close(w.store.entered)
+	<-w.store.release
+	return w.Writer.Close()
+}
+
+// An abort that reaches a held writer while it is closing waits for the row
+// to exist and drops it, rather than answering Open before the row is durable.
+func TestAbortDuringAHeldCloseDropsTheRow(t *testing.T) {
+	es, err := engine.Open(t.TempDir(), engine.WithAEAD(storetest.TestAEAD()), engine.WithFreeSpaceWatermark(0, 0))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = es.Close() })
+	store := &closingStore{Store: es, entered: make(chan struct{}), release: make(chan struct{})}
+	c := startStoreNode(t, store)
+	ctx := context.Background()
+	body := []byte("closing when the abort lands")
+
+	p, err := c.OpenHeld(ctx, 1, heldReq(1, body))
+	require.NoError(t, err)
+	go func() { _, _ = p.Send(ctx, bytes.NewReader(body)) }()
+	<-store.entered
+
+	aborted := make(chan error, 1)
+	go func() { aborted <- c.Abort(ctx, 1, shardAt(1)) }()
+	select {
+	case err := <-aborted:
+		t.Fatalf("abort answered while the writer was closing: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(store.release)
+	select {
+	case err := <-aborted:
+		require.NoError(t, err, "an abort that waited out the close must confirm the row is gone")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the abort never answered")
+	}
+	_, err = c.Commit(ctx, 1, shardAt(1))
+	require.ErrorIs(t, err, blob.ErrNotPrepared)
+}
+
 // A get for an epoch at a position with no live row is a record whose writer
 // has not committed, so the node commits the held row and serves it.
 func TestGetOfANewKeyCommitsTheNamedHeldEpoch(t *testing.T) {

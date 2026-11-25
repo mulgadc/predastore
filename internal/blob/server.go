@@ -264,13 +264,10 @@ func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stre
 	}
 
 	if _, err := writer.ReadFrom(io.LimitReader(stream, h.Size)); err != nil {
-		// Close is what releases the segment reference Append took, so a failed
-		// body must still close or that reference is held for the life of the
-		// process. What it prepares is never published and is reaped in turn.
-		if closeErr := writer.Close(); closeErr != nil {
-			slog.Warn("close writer after failed body", "node", s.cfg.NodeID, "error", closeErr)
-		} else if abortErr := st.Abort(h.Key, h.Index, h.Epoch); abortErr != nil {
-			slog.Warn("abort partial write", "node", s.cfg.NodeID, "error", abortErr)
+		// Discard releases the segment reference Append took and prepares
+		// nothing, so a get cannot commit the short body before it is undone.
+		if discardErr := writer.Discard(); discardErr != nil {
+			slog.Warn("discard writer after failed body", "node", s.cfg.NodeID, "error", discardErr)
 		}
 		return respond(stream, &Response{Err: fmt.Sprintf("write: %v", err)})
 	}
@@ -329,20 +326,14 @@ func (s *Server) putHeld(h Request, k heldKey, writer engine.Writer, stream tran
 		s.discard(writer)
 		return respond(stream, &Response{Err: fmt.Sprintf("write: %v", err)})
 	}
-	if s.held.isAborted(k) {
+	if s.held.beginClose(k) {
 		s.held.finish(k)
 		s.discard(writer)
 		return respond(stream, &Response{Err: "held write aborted"})
 	}
+	// An abort from here on waits for this close and drops the row itself.
 	closeErr := writer.Close()
-	// Finished only after the row is prepared, so an abort that misses the
-	// open writer finds the row instead.
-	if s.held.finish(k) {
-		if err := s.store.Abort(h.Key, h.Index, h.Epoch); err != nil {
-			return respond(stream, &Response{Err: fmt.Sprintf("abort held write: %v", err)})
-		}
-		return respond(stream, &Response{Err: "held write aborted"})
-	}
+	s.held.finish(k)
 	if closeErr != nil {
 		return respond(stream, &Response{Err: fmt.Sprintf("prepare: %v", closeErr)})
 	}
@@ -400,9 +391,16 @@ func (s *Server) handleAbort(ctx context.Context, h Request, stream transport.St
 	if h.Epoch == 0 {
 		return respond(stream, &Response{Err: "no write epoch specified"})
 	}
-	// A held writer still receiving its body has no row to drop yet. It is
-	// marked, discards its extent when it closes, and the caller hears Open.
-	if s.held.markAborted(heldKey{key: h.Key, index: h.Index, epoch: h.Epoch}) {
+	// A held writer still receiving its body is cut off and prepares nothing,
+	// and the caller hears Open. One already closing is waited for.
+	open, closing := s.held.markAborted(heldKey{key: h.Key, index: h.Index, epoch: h.Epoch})
+	if closing != nil {
+		select {
+		case <-closing:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	} else if open {
 		return respond(stream, &Response{Epoch: h.Epoch, Open: true})
 	}
 	if err := s.store.Abort(h.Key, h.Index, h.Epoch); err != nil {
