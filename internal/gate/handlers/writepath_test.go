@@ -176,6 +176,7 @@ type fakeBlob struct {
 
 	declaring    func(size int64) error
 	failPutOn    func(index uint32) bool
+	failGetOn    func(index uint32) bool
 	failCommitOn func(index uint32) bool
 
 	// abandonPutOn models a node on a stalling drive: it takes the whole body
@@ -290,6 +291,10 @@ func (b *fakeBlob) Abort(_ context.Context, _ config.NodeID, req blob.CommitRequ
 func (b *fakeBlob) Get(_ context.Context, _ config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	if b.failGetOn != nil && b.failGetOn(req.Index) {
+		return nil, fmt.Errorf("node holding shard %d is not answering", req.Index)
+	}
 
 	id := shardID{key: req.Key, index: req.Index}
 	shard, ok := b.shards[id]
