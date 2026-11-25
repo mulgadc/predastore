@@ -75,6 +75,42 @@ func (l layout) stripeStart(offset int64) (objectAt, shardAt int64) {
 	return head, full * l.blockSize
 }
 
+// blockEnd reports the object offset just past the block that holds offset,
+// which is where a read starting there has to move to the next shard. It
+// splits the object exactly as locate does, short last stripe included.
+func (l layout) blockEnd(offset int64) int64 {
+	full := l.shardSize / l.blockSize
+	head := full * int64(l.dataShards) * l.blockSize
+	if offset < head {
+		return (offset/l.blockSize + 1) * l.blockSize
+	}
+	tail := l.shardSize % l.blockSize
+
+	return head + ((offset-head)/tail+1)*tail
+}
+
+// piece is one run of an object range that lies inside one block, so one
+// ranged read of one data shard serves it.
+type piece struct {
+	shard  int
+	at     int64
+	length int64
+}
+
+// pieces splits an object range at block boundaries into the runs that
+// single-shard reads serve, in object order.
+func (l layout) pieces(start, end int64) []piece {
+	var out []piece
+	for from := start; from <= end; {
+		to := min(end, l.blockEnd(from)-1)
+		shard, at := l.locate(from)
+		out = append(out, piece{shard: shard, at: at, length: to - from + 1})
+		from = to + 1
+	}
+
+	return out
+}
+
 // contiguous reports whether an object range is one unbroken run inside a
 // single shard, which is the only case a single ranged shard read can serve.
 func (l layout) contiguous(start, end int64) bool {

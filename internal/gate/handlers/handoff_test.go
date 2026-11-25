@@ -35,6 +35,7 @@ type nodeBlob struct {
 	committed map[nodeAddr]fakeShard
 	prepared  map[nodeAddr]fakeShard
 	down      map[config.NodeID]bool
+	stalled   map[config.NodeID]bool
 	retained  map[nodeAddr][]uint64
 	released  map[nodeAddr][]uint64
 
@@ -46,6 +47,7 @@ func newNodeBlob(down ...config.NodeID) *nodeBlob {
 		committed: make(map[nodeAddr]fakeShard),
 		prepared:  make(map[nodeAddr]fakeShard),
 		down:      make(map[config.NodeID]bool),
+		stalled:   make(map[config.NodeID]bool),
 		retained:  make(map[nodeAddr][]uint64),
 		released:  make(map[nodeAddr][]uint64),
 	}
@@ -130,7 +132,16 @@ func (b *nodeBlob) releasedEpochs(node config.NodeID, key [32]byte, index uint32
 	return append([]uint64(nil), b.released[nodeAddr{node, key, index}]...)
 }
 
-func (b *nodeBlob) Get(_ context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
+func (b *nodeBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
+	b.mu.Lock()
+	stalled := b.stalled[node]
+	b.mu.Unlock()
+	if stalled {
+		// A node that takes the request and never answers.
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.down[node] {

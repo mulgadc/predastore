@@ -271,7 +271,7 @@ func objectPut(key string, body []byte) *http.Request {
 
 // publish records the placement under the object hash, the way a write does,
 // so a read can find the object and the epoch it names.
-func (f writeFixture) publish(t *testing.T, objectHash [32]byte, place ObjectToShardNodes) {
+func (f writeFixture) publish(t testing.TB, objectHash [32]byte, place ObjectToShardNodes) {
 	t.Helper()
 	record, err := EncodePlacement(place)
 	require.NoError(t, err)

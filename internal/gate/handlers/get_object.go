@@ -127,18 +127,39 @@ func serveObject(
 	}
 
 	// A range inside one block is one ranged read of one shard, which is what
-	// makes a small read of a large object cost a small read.
+	// makes a small read of a large object cost a small read. A short range
+	// across blocks is one such read per block: the data shards hold the
+	// object's own bytes, so parity is needed only if one of them fails.
 	lay := newLayout(cfg.DataShards, size, place.BlockSize)
-	if status == http.StatusPartialContent && lay.contiguous(start, end) {
-		shardIdx, at := lay.locate(start)
-		if data, rErr := readRangeHedged(ctx, bc, cfg, objectHash, place, shardIdx, at, end-start+1); rErr == nil {
-			header(int64(len(data)), 0)
-			if _, wErr := w.Write(data); wErr != nil {
-				slog.DebugContext(ctx, "failed to write response body", "error", wErr)
+	if status == http.StatusPartialContent {
+		var (
+			parts [][]byte
+			rErr  error
+			tried = true
+		)
+		switch {
+		case lay.contiguous(start, end):
+			shardIdx, at := lay.locate(start)
+			var data []byte
+			data, rErr = readRangeHedged(ctx, bc, cfg, objectHash, place, shardIdx, at, end-start+1, handoff)
+			parts = [][]byte{data}
+		case end-start+1 <= min(lay.blockSize, directRangeLimit):
+			parts, rErr = readPieces(ctx, bc, cfg, objectHash, place, lay.pieces(start, end), handoff)
+		default:
+			tried = false
+		}
+		if tried && rErr == nil {
+			header(end-start+1, 0)
+			for _, part := range parts {
+				if _, wErr := w.Write(part); wErr != nil {
+					slog.DebugContext(ctx, "failed to write response body", "error", wErr)
+					return
+				}
 			}
 			return
-		} else {
-			slog.WarnContext(ctx, "Single shard range read failed, falling back to reconstruction", "err", rErr)
+		}
+		if tried {
+			slog.WarnContext(ctx, "Direct shard range read failed, falling back to reconstruction", "err", rErr)
 		}
 	}
 
@@ -176,6 +197,46 @@ func serveObject(
 		return
 	}
 	reportDegradedRead(ctx, bucket, key, reader.failures, reader.reconstructed, time.Since(began))
+}
+
+// readPieces reads the pieces of a range from their data shards one after
+// another, each with the hedge, and returns them in order. The first failure
+// ends it, and the caller falls back to the stripes. Measured on a loopback
+// cluster, reading the pieces in parallel was no faster.
+func readPieces(
+	ctx context.Context, bc BlobClient, cfg Config, objectHash [32]byte,
+	place ObjectToShardNodes, pieces []piece, handoff config.NodeID,
+) ([][]byte, error) {
+	parts := make([][]byte, len(pieces))
+	for i, p := range pieces {
+		data, err := readRangeHedged(ctx, bc, cfg, objectHash, place, p.shard, p.at, p.length, handoff)
+		if err != nil {
+			return nil, err
+		}
+		parts[i] = data
+	}
+	return parts, nil
+}
+
+// directRangeLimit is the longest range across blocks served from the data
+// shards directly. Beyond it the stripe reader, which streams every shard at
+// once from pooled blocks, was measured faster and lighter.
+const directRangeLimit = 2 << 20
+
+// readExactly reads a ranged shard answer into one buffer of the length asked
+// for. A range's size is known, so growing a buffer to fit would only copy it;
+// an answer shorter or longer than asked is an error.
+func readExactly(r io.Reader, length int64) ([]byte, error) {
+	data := make([]byte, length)
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, fmt.Errorf("want %d bytes: %w", length, err)
+	}
+	var extra [1]byte
+	if n, _ := r.Read(extra[:]); n > 0 {
+		return nil, fmt.Errorf("answer is longer than the %d bytes asked for", length)
+	}
+
+	return data, nil
 }
 
 // resolveRange clamps a requested range to the object, reporting whether what
@@ -265,7 +326,7 @@ func readRangeFromSingleShard(ctx context.Context, bc BlobClient, objectHash [32
 	}
 	defer reader.Close() // CRITICAL: Close to release the stream back to the pool
 
-	data, err = io.ReadAll(reader)
+	data, err = readExactly(reader, length)
 	if err != nil {
 		return nil, fmt.Errorf("read range data: %w", err)
 	}
