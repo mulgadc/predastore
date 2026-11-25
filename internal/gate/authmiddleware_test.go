@@ -2,6 +2,9 @@ package gate
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/xml"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +16,7 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/auth"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestSigV4AuthMiddleware(t *testing.T) {
@@ -315,4 +319,43 @@ func TestSigV4AuthMiddleware_RequireSignedHeaders(t *testing.T) {
 			assert.Contains(t, rr.Body.String(), "AuthorizationHeaderMalformed")
 		})
 	}
+}
+
+// TestSigV4AuthMiddleware_MismatchReportsBothDigests asserts that a rewritten body is
+// refused with the header digest and the digest of the received bytes, as S3 reports them.
+func TestSigV4AuthMiddleware_MismatchReportsBothDigests(t *testing.T) {
+	s3Config := Config{
+		Region:  "ap-southeast-2",
+		Buckets: []handlers.BucketConfig{{Name: "test-bucket01", Region: "ap-southeast-2"}},
+		Auth: []auth.Entry{{
+			AccessKeyID:     "TESTACCESSKEY",
+			SecretAccessKey: "TESTSECRETKEY",
+			Policy:          []auth.PolicyRule{{Bucket: "test-bucket01", Actions: []string{"s3:PutObject"}}},
+		}},
+	}
+	server := newTestGate(t, s3Config)
+
+	signed := []byte("the body the client signed")
+	sent := []byte("the body an attacker swapped")[:len(signed)]
+
+	req := httptest.NewRequest(http.MethodPut, "/test-bucket01/object.txt", bytes.NewReader(signed))
+	signTestReq(t, req, signed, "TESTACCESSKEY", "TESTSECRETKEY", "ap-southeast-2", "s3")
+	req.Body = io.NopCloser(bytes.NewReader(sent))
+
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	rr := httptest.NewRecorder()
+	resolveRouter(next, server.sigV4AuthMiddleware).ServeHTTP(rr, req)
+
+	var body struct {
+		Code     string `xml:"Code"`
+		Client   string `xml:"ClientComputedContentSHA256"`
+		Computed string `xml:"S3ComputedContentSHA256"`
+	}
+	require.Equal(t, http.StatusBadRequest, rr.Code)
+	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &body))
+
+	signedSum, sentSum := sha256.Sum256(signed), sha256.Sum256(sent)
+	assert.Equal(t, "XAmzContentSHA256Mismatch", body.Code)
+	assert.Equal(t, hex.EncodeToString(signedSum[:]), body.Client)
+	assert.Equal(t, hex.EncodeToString(sentSum[:]), body.Computed)
 }
