@@ -92,8 +92,8 @@ github.com/minio/crc64nvme v1.1.1 h1:8dwx/Pz49suywbO+auHCBpCtlW1OfpcLN7wYgVR6wAI
 github.com/minio/crc64nvme v1.1.1/go.mod h1:eVfm2fAzLlxMdUGc0EEBGSMmPwmXD5XiNRpnu9J3bvg=
 github.com/minio/highwayhash v1.0.4 h1:asJizugGgchQod2ja9NJlGOWq4s7KsAWr5XUc9Clgl4=
 github.com/minio/highwayhash v1.0.4/go.mod h1:GGYsuwP/fPD6Y9hMiXuapVvlIUEhFhMTh0rxU3ik1LQ=
-github.com/mulgadc/bluebottle v1.26.1-0.20261125044616-727428c54cc3 h1:ZuFTx0WKZs+5lpP1sBHG1G0UEy6bDPF0cO2M9Ez/U0U=
-github.com/mulgadc/bluebottle v1.26.1-0.20261125044616-727428c54cc3/go.mod h1:ypZ0fnq0DYg1eLMeDzJyHFj9ca/oquAJwLZ56lUbHoM=
+github.com/mulgadc/bluebottle v1.26.1-0.20261125044928-fca9b34556dd h1:a/YWgiZb/POeRPIZfr/NFC5VClqgX3egs1hzrjOHk6I=
+github.com/mulgadc/bluebottle v1.26.1-0.20261125044928-fca9b34556dd/go.mod h1:ypZ0fnq0DYg1eLMeDzJyHFj9ca/oquAJwLZ56lUbHoM=
 github.com/nats-io/jwt/v2 v2.8.3 h1:pqImTmlqH2zPHKNdRXO0YRyWif2diGRlrtLFJ2RxM2I=
 github.com/nats-io/jwt/v2 v2.8.3/go.mod h1:OOY2rP/UU8tcfoqhbHmBKcNdpFMKvmxIkmFFa16M4wI=
 github.com/nats-io/nats-server/v2 v2.15.3 h1:IgHIKL4DYN9mEfwtPcdM39muvXG8v9FBADQn0f4Whs0=
