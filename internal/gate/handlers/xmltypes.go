@@ -191,7 +191,11 @@ type S3Error struct {
 	XMLName    xml.Name `xml:"Error"`
 	Code       string   `xml:"Code"`
 	Message    string   `xml:"Message"`
-	BucketName string   `xml:"BucketName"`
+
+	ClientComputedContentSHA256 string `xml:"ClientComputedContentSHA256,omitempty"`
+	S3ComputedContentSHA256     string `xml:"S3ComputedContentSHA256,omitempty"`
+
+	BucketName string `xml:"BucketName"`
 	RequestId  string   `xml:"RequestId"`
 	HostId     string   `xml:"HostId"`
 }

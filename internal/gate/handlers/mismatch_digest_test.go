@@ -7,6 +7,7 @@ import (
 	"encoding/xml"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/mulgadc/bluebottle/pkg/sigv4"
@@ -49,6 +50,34 @@ func TestPutObjectStreamedMismatchReportsBothDigests(t *testing.T) {
 	PutObject(f.mc, f.bc, f.ring, f.cache, f.cfg).ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusBadRequest, rr.Code)
+	body := decodeMismatch(t, rr)
+	assert.Equal(t, "XAmzContentSHA256Mismatch", body.Code)
+	assert.Equal(t, hexSum(signed), body.Client)
+	assert.Equal(t, hexSum(sent), body.Computed)
+}
+
+// TestUploadPartStreamedMismatchReportsBothDigests covers the multipart path, which shares the
+// write path's error mapping with PutObject.
+func TestUploadPartStreamedMismatchReportsBothDigests(t *testing.T) {
+	f := newHandlerFixture("bucket")
+
+	createRR := httptest.NewRecorder()
+	CreateMultipartUpload(f.mc, f.cache).ServeHTTP(createRR,
+		httptest.NewRequest(http.MethodPost, "/bucket/object.txt", nil).WithContext(objectCtx("bucket", "object.txt")))
+	require.Equal(t, http.StatusOK, createRR.Code, createRR.Body.String())
+	var created InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(createRR.Body.Bytes(), &created))
+
+	signed := bytes.Repeat([]byte("a"), sigv4.MaxPayloadLen+1)
+	sent := bytes.Repeat([]byte("b"), len(signed))
+
+	// The body is verified before the query is set, so the signature does not need to cover it.
+	req := verifiedPut(t, signed, sent).WithContext(objectCtx("bucket", "object.txt"))
+	req.URL.RawQuery = "partNumber=1&uploadId=" + url.QueryEscape(created.UploadId)
+	rr := httptest.NewRecorder()
+	UploadPart(f.mc, f.bc, f.ring, f.cache, f.cfg).ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
 	body := decodeMismatch(t, rr)
 	assert.Equal(t, "XAmzContentSHA256Mismatch", body.Code)
 	assert.Equal(t, hexSum(signed), body.Client)

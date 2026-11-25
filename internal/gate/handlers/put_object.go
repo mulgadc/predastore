@@ -263,7 +263,7 @@ func mapChecksumErr(err error) error {
 func mapChunkedErr(err error) error {
 	switch {
 	case errors.Is(err, sigv4.ErrContentSHA256Mismatch):
-		return model.ErrContentSHA256MismatchError
+		return model.ContentSHA256Mismatch(err)
 	case errors.Is(err, chunked.ErrChunkSignature):
 		return model.ErrSignatureDoesNotMatchError
 	case errors.Is(err, chunked.ErrMalformedFraming):
