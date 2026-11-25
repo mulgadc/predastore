@@ -71,6 +71,12 @@ func versionObjectHash(bucket, key, versionID string) [32]byte {
 	return model.VersionHash(bucket, key, versionID)
 }
 
+// wellFormedVersionID reports whether id has the form mintVersionID gives.
+func wellFormedVersionID(id string) bool {
+	raw, err := versionIDEncoding.DecodeString(id)
+	return err == nil && len(raw) == versionIDBytes
+}
+
 // mintVersionID returns a fresh, opaque version id.
 func mintVersionID() (string, error) {
 	buf := make([]byte, versionIDBytes)
@@ -255,7 +261,7 @@ func nullVersion(ctx context.Context, mc MetaClient, bucket, key string) (Versio
 // decodeVersionRecord reads one stored index row.
 func decodeVersionRecord(data []byte) (VersionRecord, error) {
 	var rec VersionRecord
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&rec); err != nil {
+	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&rec); err != nil { //nolint:gosec // G709: the input is state this gate wrote, not client data.
 		return VersionRecord{}, err
 	}
 	return rec, nil
@@ -398,6 +404,63 @@ func currentVersion(ctx context.Context, mc MetaClient, bucket, key string) (rea
 		return readTarget{versionID: versions[0].VersionID}, errDeleteMarker
 	}
 	return readTarget{}, meta.ErrNotFound
+}
+
+// copySourceTarget resolves a copy source with a bounded number of metadata
+// reads. A copy reports no source version ID, so the current version is named
+// by its listing key alone; a hidden key costs one index row and the null one.
+func copySourceTarget(ctx context.Context, mc MetaClient, cache *BucketCache, bucket, key, versionID string) (readTarget, error) {
+	if versionID != "" {
+		return resolveReadTarget(ctx, mc, cache, bucket, key, versionID)
+	}
+	status, err := objectPathVersioning(ctx, mc, cache, bucket)
+	if err != nil {
+		return readTarget{}, err
+	}
+	if status == "" {
+		return readTarget{hash: model.ObjectHash(bucket, key)}, nil
+	}
+
+	data, err := metaGet(ctx, mc, model.TableObjects, objectARN(bucket, key))
+	if err == nil && len(data) == sha256.Size {
+		return readTarget{hash: [32]byte(data)}, nil
+	}
+	if err != nil && !errors.Is(err, meta.ErrNotFound) {
+		return readTarget{}, err
+	}
+	newest, ok, err := newestVersion(ctx, mc, bucket, key)
+	if err != nil {
+		return readTarget{}, err
+	}
+	if ok && newest.DeleteMarker {
+		return readTarget{versionID: newest.VersionID}, errDeleteMarker
+	}
+	return readTarget{}, meta.ErrNotFound
+}
+
+// newestVersion is the first record keyVersions would answer, read without the
+// rest: the newest index row, or the null version when it was written later.
+func newestVersion(ctx context.Context, mc MetaClient, bucket, key string) (VersionRecord, bool, error) {
+	var newest VersionRecord
+	found := false
+	items, err := metaScan(ctx, mc, model.TableObjectVersions, versionKeyPrefix(bucket, key), 1)
+	if err != nil {
+		return VersionRecord{}, false, err
+	}
+	if len(items) > 0 {
+		if newest, err = decodeVersionRecord(items[0].Value); err != nil {
+			return VersionRecord{}, false, err
+		}
+		found = true
+	}
+	null, ok, err := nullVersion(ctx, mc, bucket, key)
+	if err != nil {
+		return VersionRecord{}, false, err
+	}
+	if ok && (!found || null.WriteEpoch > newest.WriteEpoch) {
+		return null, true, nil
+	}
+	return newest, found, nil
 }
 
 // versionIDOfHash names the version a hash belongs to, for the headers a read

@@ -416,10 +416,10 @@ SKIP|s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDA
 SKIP|s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-1048576]
 SKIP|s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-1]
 SKIP|s3tests/functional/test_s3.py::test_copy_enc[unencrypted-unencrypted-STANDARD-STANDARD-8388608]
-FAIL|s3tests/functional/test_s3.py::test_copy_object_ifmatch_failed
-FAIL|s3tests/functional/test_s3.py::test_copy_object_ifmatch_good
-FAIL|s3tests/functional/test_s3.py::test_copy_object_ifnonematch_failed
-FAIL|s3tests/functional/test_s3.py::test_copy_object_ifnonematch_good
+PASS|s3tests/functional/test_s3.py::test_copy_object_ifmatch_failed
+PASS|s3tests/functional/test_s3.py::test_copy_object_ifmatch_good
+PASS|s3tests/functional/test_s3.py::test_copy_object_ifnonematch_failed
+PASS|s3tests/functional/test_s3.py::test_copy_object_ifnonematch_good
 SKIP|s3tests/functional/test_s3.py::test_copy_part_enc[sse-c-sse-c-STANDARD-STANDARD-8388608]
 SKIP|s3tests/functional/test_s3.py::test_copy_part_enc[sse-c-sse-kms-STANDARD-STANDARD-8388608]
 SKIP|s3tests/functional/test_s3.py::test_copy_part_enc[sse-c-sse-s3-STANDARD-STANDARD-8388608]
@@ -596,7 +596,7 @@ FAIL|s3tests/functional/test_s3.py::test_multipart_copy_invalid_range
 PASS|s3tests/functional/test_s3.py::test_multipart_copy_multiple_sizes
 PASS|s3tests/functional/test_s3.py::test_multipart_copy_small
 PASS|s3tests/functional/test_s3.py::test_multipart_copy_special_names
-FAIL|s3tests/functional/test_s3.py::test_multipart_copy_versioned
+PASS|s3tests/functional/test_s3.py::test_multipart_copy_versioned
 PASS|s3tests/functional/test_s3.py::test_multipart_copy_without_range
 FAIL|s3tests/functional/test_s3.py::test_multipart_get_part
 FAIL|s3tests/functional/test_s3.py::test_multipart_put_current_object_if_match

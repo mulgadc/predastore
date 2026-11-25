@@ -12,6 +12,7 @@ type S3ErrorCode string
 const (
 	ErrNoSuchBucket            S3ErrorCode = "NoSuchBucket"
 	ErrNoSuchKey               S3ErrorCode = "NoSuchKey"
+	ErrNoSuchVersion           S3ErrorCode = "NoSuchVersion"
 	ErrNoSuchUpload            S3ErrorCode = "NoSuchUpload"
 	ErrInvalidKey              S3ErrorCode = "InvalidKey"
 	ErrInvalidPart             S3ErrorCode = "InvalidPart"

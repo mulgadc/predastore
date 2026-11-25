@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -8,6 +10,7 @@ import (
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
+	"github.com/mulgadc/predastore/internal/meta"
 )
 
 // UploadPartCopy serves PUT /{bucket}/{key}?partNumber=N&uploadId=X carrying
@@ -37,22 +40,6 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 			return
 		}
 
-		// Same two refusals CopyObject makes, for the same reason: honouring
-		// neither silently would answer 200 to a request whose terms were
-		// ignored.
-		if versionID != "" && versionID != "null" {
-			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
-				"Copying a specific object version is not implemented")
-			return
-		}
-		for _, h := range copySourceConditionHeaders {
-			if r.Header.Get(h) != "" {
-				WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
-					"Conditional copy requests are not implemented")
-				return
-			}
-		}
-
 		if err := model.ValidatePartNumber(partNumber); err != nil {
 			HandleError(w, r, err)
 			return
@@ -65,14 +52,26 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 			HandleError(w, r, err)
 			return
 		}
+		if err := requireExpectedSourceOwner(ctx, mc, cache, r, srcBucket); err != nil {
+			HandleError(w, r, err)
+			return
+		}
 		if err := requireUpload(ctx, mc, bucket, key, uploadID); err != nil {
 			HandleError(w, r, err)
 			return
 		}
 
-		srcPlace, srcSize, err := loadPlacement(ctx, mc, ring, cfg, srcBucket, srcKey)
+		srcTarget, err := copySourceTarget(ctx, mc, cache, srcBucket, srcKey, versionID)
 		if err != nil {
-			HandleError(w, r, placementReadError(ctx, srcBucket, srcKey, err))
+			handleVersionedReadErr(w, r, srcKey, srcTarget, err)
+			return
+		}
+		srcPlace, srcSize, err := loadPlacementByHash(ctx, mc, ring, cfg, srcTarget.hash)
+		if err != nil {
+			HandleError(w, r, partCopySourceError(ctx, srcBucket, srcKey, versionID, err))
+			return
+		}
+		if refuseCopySource(w, r, srcPlace) {
 			return
 		}
 
@@ -88,8 +87,7 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 		}
 
 		stream, err := openCopyStream(ctx, bc, cfg,
-			model.ObjectHash(srcBucket, srcKey), srcPlace,
-			handoffNode(ring, cfg, model.ObjectHash(srcBucket, srcKey)),
+			srcTarget.hash, srcPlace, handoffNode(ring, cfg, srcTarget.hash),
 			srcSize, start, partSize)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
@@ -107,6 +105,9 @@ func UploadPartCopy(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *B
 		}
 
 		writePartHeaders(w, written)
+		if versionID != "" {
+			w.Header().Set("X-Amz-Copy-Source-Version-Id", versionID)
+		}
 		w.Header().Set("X-Amz-Server-Side-Encryption", "AES256")
 		if err := writeXML(w, http.StatusOK,
 			CopyPartResult{ETag: partMeta.ETag, LastModified: partMeta.LastModified}); err != nil {
@@ -140,4 +141,17 @@ func copySourceRange(header string, size int64) (start, end int64, err error) {
 	}
 
 	return start, end, nil
+}
+
+// partCopySourceError answers a source with no placement record. As on S3, an
+// ID this gate could not have minted is invalid and a well-formed one names no
+// version; a delete marker has only an index row, so it reads as the latter.
+func partCopySourceError(ctx context.Context, bucket, key, versionID string, err error) error {
+	if versionID == "" || versionID == nullVersionID || !errors.Is(err, meta.ErrNotFound) {
+		return placementReadError(ctx, bucket, key, err)
+	}
+	if !wellFormedVersionID(versionID) {
+		return model.NewS3Error(model.ErrInvalidArgument, "Invalid version id specified", http.StatusBadRequest)
+	}
+	return model.NewS3Error(model.ErrNoSuchVersion, "The specified version does not exist.", http.StatusNotFound).WithResource(key)
 }

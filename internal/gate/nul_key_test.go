@@ -69,6 +69,19 @@ func TestNULKeyCannotReplaceAnotherKeysVersion(t *testing.T) {
 	require.Equal(t, http.StatusOK, rr.Code, "copy version X: %s", rr.Body.String())
 	copied := do(http.MethodGet, "/owner-bucket/copy", nil, nil)
 	assert.Equal(t, "version X", copied.Body.String(), "CopyObject of version X")
+
+	// A copied part's ETag is the MD5 of the bytes it read from the source.
+	rr = do(http.MethodPost, "/owner-bucket/assembled?uploads", nil, nil)
+	require.Equal(t, http.StatusOK, rr.Code, "initiate: %s", rr.Body.String())
+	var initiated handlers.InitiateMultipartUploadResult
+	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &initiated))
+	rr = do(http.MethodPut, "/owner-bucket/assembled?partNumber=1&uploadId="+url.QueryEscape(initiated.UploadId), nil, http.Header{
+		"X-Amz-Copy-Source": {"owner-bucket/a?versionId=" + url.QueryEscape(version)},
+	})
+	require.Equal(t, http.StatusOK, rr.Code, "part copy of version X: %s", rr.Body.String())
+	var part handlers.CopyPartResult
+	require.NoError(t, xml.Unmarshal(rr.Body.Bytes(), &part))
+	assert.Equal(t, versionETag, part.ETag, "UploadPartCopy of version X")
 }
 
 // Every request that names a key holding NUL is refused with S3's 400 before

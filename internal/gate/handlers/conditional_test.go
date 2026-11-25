@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"math/rand/v2"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,17 +41,22 @@ func TestPreconditionsOnALegacyRecord(t *testing.T) {
 	}
 }
 
-// A comma inside one quoted entity tag is part of that tag, so a tag that
-// merely contains the record's digest between commas does not name it.
+// An ETag condition is matched as S3 matches it: the value is split on quotes,
+// commas, spaces and tabs, and any piece equal to the ETag or "*" matches.
 // Verifies: Q-68.
-func TestPreconditionQuotedTagsAreCompared(t *testing.T) {
+func TestPreconditionETagListsMatchAsS3Does(t *testing.T) {
 	etag := `"abc"`
-	for _, list := range []string{`"other,abc,tag"`, `"abc,"`, `",abc"`} {
+	matching := []string{`abc`, `"abc"`, ` "abc" `, `"x", "abc"`, `, ,"abc"`, `W/"abc"`,
+		`"abc", "x`, `"x""abc"`, `"abc" "x"`, `"abc"x`, `x"abc"y`, `junk "abc"`, `"abc`,
+		`"other,abc,tag"`, `"abc,"`, `"x,y" ,abc`, "\tabc", `*, "x"`, `"x", *`}
+	for _, list := range matching {
+		assert.Equal(t, preconditionsHold, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifMatch: list}), list)
+		assert.Equal(t, preconditionNotModified, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifNoneMatch: list}), list)
+	}
+	missing := []string{`other"unterminated`, `xabc`, `abcx`, `"xabc"`, `"ab"`, `abc;x`, `"x", "y"`}
+	for _, list := range missing {
 		assert.Equal(t, preconditionFailed, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifMatch: list}), list)
 		assert.Equal(t, preconditionsHold, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifNoneMatch: list}), list)
-	}
-	for _, list := range []string{`"x", "abc"`, `"x,y" ,abc`, `abc`, ` "abc" `} {
-		assert.Equal(t, preconditionsHold, evalPreconditions(etag, true, time.Time{}, false, preconditions{ifMatch: list}), list)
 	}
 }
 
@@ -80,4 +87,35 @@ func TestPreconditionHeaderForms(t *testing.T) {
 	h.Add("If-Match", `"other"`)
 	h.Add("If-Match", `"e"`)
 	assert.Equal(t, preconditionsHold, evalPreconditions(`"e"`, true, modified, true, readPreconditions(h)))
+}
+
+// The substring search answers as splitting the list on separators would, for
+// lists built from separators, "*", tag bytes and the ETag in any order.
+// Verifies: Q-68.
+func TestETagListSearchMatchesSplitting(t *testing.T) {
+	split := func(list, etag string, hasETag bool) bool {
+		want := strings.Trim(etag, `"`)
+		for _, tag := range strings.FieldsFunc(list, func(r rune) bool { return strings.ContainsRune(etagSeparators, r) }) {
+			if tag == "*" || (hasETag && tag == want) {
+				return true
+			}
+		}
+		return false
+	}
+	parts := []string{`"`, ",", " ", "\t", "*", "a", "b", "ab", "aab", "abab", "**", "x*"}
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 200_000 {
+		var list strings.Builder
+		for range rng.IntN(8) {
+			list.WriteString(parts[rng.IntN(len(parts))])
+		}
+		for _, etag := range []string{`"ab"`, "ab", `"a"`, "a b", ""} {
+			for _, has := range []bool{true, false} {
+				want := split(list.String(), etag, has)
+				if got := etagListMatches(list.String(), etag, has); got != want {
+					t.Fatalf("list %q, etag %q, hasETag %v: search %v, splitting %v", list.String(), etag, has, got, want)
+				}
+			}
+		}
+	}
 }
