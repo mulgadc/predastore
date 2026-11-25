@@ -254,6 +254,10 @@ func TestARangedReadCostsOnlyTheStripesItTouches(t *testing.T) {
 	}
 	// One tally over one object, so the ranges run in sequence rather than as
 	// parallel subtests: a shared counter cannot attribute concurrent reads.
+	// A direct read's losing hedge arm can still deliver its bytes after the
+	// response, so the tally may carry the previous range's bytes once more
+	// from each shard.
+	var previous int64
 	for _, r := range ranges {
 		req := objectRequest(http.MethodGet, "k", "")
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", r.start, r.end))
@@ -264,8 +268,9 @@ func TestARangedReadCostsOnlyTheStripesItTouches(t *testing.T) {
 
 		require.Equal(t, http.StatusPartialContent, w.Code, "range %d-%d", r.start, r.end)
 		require.Equal(t, body[r.start:r.end+1], w.Body.Bytes(), "range %d-%d", r.start, r.end)
-		assert.LessOrEqualf(t, f.bc.getBytes.Load(), touched(r.start, r.end),
+		assert.LessOrEqualf(t, f.bc.getBytes.Load(), touched(r.start, r.end)+previous*int64(f.cfg.TotalShards()),
 			"range %d-%d of %d bytes read %d from the nodes, more than the %d its stripes hold",
 			r.start, r.end, r.end-r.start+1, f.bc.getBytes.Load(), touched(r.start, r.end))
+		previous = r.end - r.start + 1
 	}
 }

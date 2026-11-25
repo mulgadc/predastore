@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -134,28 +133,23 @@ func serveObject(
 	lay := newLayout(cfg.DataShards, size, place.BlockSize)
 	if status == http.StatusPartialContent {
 		var (
-			parts   [][]byte
-			rebuilt int
-			rErr    error
-			tried   = true
+			parts [][]byte
+			rErr  error
+			tried = true
 		)
 		switch {
 		case lay.contiguous(start, end):
 			shardIdx, at := lay.locate(start)
 			var data []byte
-			var hedged bool
-			data, hedged, rErr = readRangeHedged(ctx, bc, cfg, objectHash, place, shardIdx, at, end-start+1, handoff)
+			data, rErr = readRangeHedged(ctx, bc, cfg, objectHash, place, shardIdx, at, end-start+1, handoff)
 			parts = [][]byte{data}
-			if hedged {
-				rebuilt = 1
-			}
 		case end-start+1 <= min(lay.blockSize, directRangeLimit):
-			parts, rebuilt, rErr = readPieces(ctx, bc, cfg, objectHash, place, lay.pieces(start, end), handoff)
+			parts, rErr = readPieces(ctx, bc, cfg, objectHash, place, lay.pieces(start, end), handoff)
 		default:
 			tried = false
 		}
 		if tried && rErr == nil {
-			header(end-start+1, rebuilt)
+			header(end-start+1, 0)
 			for _, part := range parts {
 				if _, wErr := w.Write(part); wErr != nil {
 					slog.DebugContext(ctx, "failed to write response body", "error", wErr)
@@ -206,27 +200,22 @@ func serveObject(
 }
 
 // readPieces reads the pieces of a range from their data shards one after
-// another, each with the hedge, and returns them in order with the number of
-// distinct shards rebuilt from parity, the count the stripe reader reports.
-// The first failure ends it, and the caller falls back to the stripes.
-// Measured on a loopback cluster, reading the pieces in parallel was no faster.
+// another, each with the hedge, and returns them in order. The first failure
+// ends it, and the caller falls back to the stripes. Measured on a loopback
+// cluster, reading the pieces in parallel was no faster.
 func readPieces(
 	ctx context.Context, bc BlobClient, cfg Config, objectHash [32]byte,
 	place ObjectToShardNodes, pieces []piece, handoff config.NodeID,
-) ([][]byte, int, error) {
+) ([][]byte, error) {
 	parts := make([][]byte, len(pieces))
-	var rebuilt []int
 	for i, p := range pieces {
-		data, hedged, err := readRangeHedged(ctx, bc, cfg, objectHash, place, p.shard, p.at, p.length, handoff)
+		data, err := readRangeHedged(ctx, bc, cfg, objectHash, place, p.shard, p.at, p.length, handoff)
 		if err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		parts[i] = data
-		if hedged && !slices.Contains(rebuilt, p.shard) {
-			rebuilt = append(rebuilt, p.shard)
-		}
 	}
-	return parts, len(rebuilt), nil
+	return parts, nil
 }
 
 // directRangeLimit is the longest range across blocks served from the data

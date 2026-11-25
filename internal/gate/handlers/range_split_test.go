@@ -176,31 +176,6 @@ func TestAShortPieceFallsBackToTheStripes(t *testing.T) {
 	assert.Greater(t, read, int64(2*4096), "only the stripe reader reads more than the range, so it did not run")
 }
 
-// A piece answered from parity is a degraded read and says so, as the stripe
-// reader does for the shards it rebuilds.
-func TestARebuiltPieceIsReportedDegraded(t *testing.T) {
-	t.Parallel()
-
-	const size = 10 + 1024*4096
-	for _, lost := range []uint32{0, 1} {
-		t.Run(fmt.Sprintf("data shard %d lost", lost), func(t *testing.T) {
-			t.Parallel()
-			f := newWriteFixture(2, 1)
-			body := publishedObject(t, f, size)
-			f.bc.failGetOn = func(index uint32) bool { return index == lost }
-
-			start := int64(10 + 511*4096)
-			end := start + 4095
-			w, read := getRange(t, f, start, end)
-
-			require.Equal(t, http.StatusPartialContent, w.Code)
-			assert.Equal(t, body[start:end+1], w.Body.Bytes())
-			assert.Equal(t, "1", w.Header().Get(degradedHeader))
-			assert.LessOrEqual(t, read, hedgedBound(f, 4096), "the direct path answered, not the stripe reader")
-		})
-	}
-}
-
 // An owner that answers short must lose to a reconstruction that answers in
 // full, or a healthy cluster pays a stripe read for one shard's bad reply.
 func TestAShortOwnerLosesToItsReconstruction(t *testing.T) {
@@ -219,36 +194,7 @@ func TestAShortOwnerLosesToItsReconstruction(t *testing.T) {
 
 	require.Equal(t, http.StatusPartialContent, w.Code)
 	assert.Equal(t, body[start:end+1], w.Body.Bytes())
-	assert.Equal(t, "1", w.Header().Get(degradedHeader))
 	assert.LessOrEqual(t, read, hedgedBound(f, 4096), "the hedge answered, not the stripe reader")
-}
-
-// A range that spans the head and the short last stripe can rebuild two
-// pieces of the same lost shard. The header counts shards, as the stripe
-// reader does, not pieces.
-func TestDegradedCountsShardsNotPieces(t *testing.T) {
-	t.Parallel()
-
-	const size = 3*streamBlockSize + 7919
-	f := newWriteFixture(2, 1)
-	body := publishedObject(t, f, size)
-	lay := newLayout(2, size, streamBlockSize)
-	head := int64(lay.dataShards) * lay.blockSize * (lay.shardSize / lay.blockSize)
-	tail := lay.shardSize % lay.blockSize
-
-	// From the end of the head's shard 1 block, through the tail's shard 0
-	// block, into its shard 1 block: shard 1 is read twice.
-	start, end := head-100, head+tail+100
-	pieces := lay.pieces(start, end)
-	require.Len(t, pieces, 3)
-	require.Equal(t, pieces[0].shard, pieces[2].shard)
-	f.bc.failGetOn = func(index uint32) bool { return int(index) == pieces[0].shard }
-
-	w, _ := getRange(t, f, start, end)
-
-	require.Equal(t, http.StatusPartialContent, w.Code)
-	assert.Equal(t, body[start:end+1], w.Body.Bytes())
-	assert.Equal(t, "1", w.Header().Get(degradedHeader))
 }
 
 // A crossing range whose owner lacks the shard, with parity stalled, must be
@@ -294,5 +240,4 @@ func TestARangeAcrossABlockReadsTheHandoffHolder(t *testing.T) {
 	require.NoError(t, ctx.Err(), "the read waited on the stalled parity node")
 	require.Equal(t, http.StatusPartialContent, w.Code)
 	assert.Equal(t, body[start:end+1], w.Body.Bytes())
-	assert.Empty(t, w.Header().Get(degradedHeader), "the holder answered, so nothing was rebuilt")
 }
