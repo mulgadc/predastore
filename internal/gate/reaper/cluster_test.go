@@ -29,21 +29,28 @@ type shardAddr struct {
 // how a test models one that is unreachable when a delete needs it.
 type fakeBlob struct {
 	mu     sync.Mutex
-	shards map[shardAddr]bool
+	shards map[shardAddr]uint64
 	down   map[config.NodeID]bool
 
 	deletes []shardAddr
+	epochs  []uint64
+
+	// beforeDelete runs once, ahead of every delete, which is where a test
+	// lands a write the sweep did not see. Set it before the pass starts.
+	beforeDelete func()
+	landOnce     sync.Once
 }
 
 func newFakeBlob() *fakeBlob {
-	return &fakeBlob{shards: make(map[shardAddr]bool), down: make(map[config.NodeID]bool)}
+	return &fakeBlob{shards: make(map[shardAddr]uint64), down: make(map[config.NodeID]bool)}
 }
 
-// hold marks a shard as present on a node, as a completed write left it.
-func (f *fakeBlob) hold(node config.NodeID, key [32]byte, index uint32) {
+// hold marks a shard as present on a node at the generation that wrote it, as
+// a completed write left it.
+func (f *fakeBlob) hold(node config.NodeID, key [32]byte, index uint32, epoch uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.shards[shardAddr{node, key, index}] = true
+	f.shards[shardAddr{node, key, index}] = epoch
 }
 
 func (f *fakeBlob) stop(nodes ...config.NodeID) {
@@ -65,12 +72,27 @@ func (f *fakeBlob) resume(nodes ...config.NodeID) {
 func (f *fakeBlob) has(node config.NodeID, key [32]byte, index uint32) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.shards[shardAddr{node, key, index}]
+	_, ok := f.shards[shardAddr{node, key, index}]
+	return ok
+}
+
+// epochAt reports the generation a node holds at a position.
+func (f *fakeBlob) epochAt(node config.NodeID, key [32]byte, index uint32) (uint64, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	epoch, ok := f.shards[shardAddr{node, key, index}]
+	return epoch, ok
 }
 
 var errNodeDown = errors.New("node unreachable")
 
-func (f *fakeBlob) Delete(_ context.Context, node config.NodeID, req blob.DeleteRequest) (*blob.DeleteResponse, error) {
+// DeleteEpoch removes a shard only when the node holds it at the named
+// generation, as the blob engine does.
+func (f *fakeBlob) DeleteEpoch(_ context.Context, node config.NodeID, req blob.CommitRequest) (*blob.DeleteResponse, error) {
+	if f.beforeDelete != nil {
+		f.landOnce.Do(f.beforeDelete)
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -80,10 +102,14 @@ func (f *fakeBlob) Delete(_ context.Context, node config.NodeID, req blob.Delete
 
 	addr := shardAddr{node, req.Key, req.Index}
 	f.deletes = append(f.deletes, addr)
-	held := f.shards[addr]
+	f.epochs = append(f.epochs, req.Epoch)
+	epoch, held := f.shards[addr]
+	if !held || epoch != req.Epoch {
+		return &blob.DeleteResponse{}, nil
+	}
 	delete(f.shards, addr)
 
-	return &blob.DeleteResponse{Deleted: held}, nil
+	return &blob.DeleteResponse{Deleted: true}, nil
 }
 
 var _ BlobClient = (*fakeBlob)(nil)

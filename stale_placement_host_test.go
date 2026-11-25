@@ -117,10 +117,9 @@ func (c *s3Client) sendTyped(method, path, contentType string, body []byte) (int
 	return resp.StatusCode, got, resp.Header
 }
 
-// commitOrphanGeneration writes and commits a newer generation of every shard
-// of one object on every blob node, and never publishes a placement record.
-// That is what a writer that dies in the window between the two leaves behind.
-func commitOrphanGeneration(t *testing.T, cfg *config.Config, hash [32]byte, shards int) {
+// withHostBlob runs fn with a blob client that reaches every blob node of a
+// single-host cluster.
+func withHostBlob(t *testing.T, cfg *config.Config, fn func(bc *blob.Client, blobIDs []config.NodeID)) {
 	t.Helper()
 
 	// A single-host cluster starts no QUIC listener, so its nodes are reachable
@@ -144,18 +143,29 @@ func commitOrphanGeneration(t *testing.T, cfg *config.Config, hash [32]byte, sha
 	bc, err := blob.NewClient(blob.ClientConfig{Client: rpc.NewClient(connPool)})
 	require.NoError(t, err)
 
-	body := []byte("a generation no placement record will ever name")
-	for _, id := range blobIDs {
-		for idx := range shards {
-			req := blob.PutRequest{Key: hash, Index: uint32(idx), Size: int64(len(body)), Epoch: orphanEpoch}
-			_, err := bc.Put(t.Context(), id, req, bytes.NewReader(body))
-			require.NoError(t, err, "prepare orphan shard %d on node %d", idx, id)
+	fn(bc, blobIDs)
+}
 
-			_, err = bc.Commit(t.Context(), id,
-				blob.CommitRequest{Key: hash, Index: uint32(idx), Epoch: orphanEpoch})
-			require.NoError(t, err, "commit orphan shard %d on node %d", idx, id)
+// commitOrphanGeneration writes and commits a newer generation of every shard
+// of one object on every blob node, and never publishes a placement record.
+// That is what a writer that dies in the window between the two leaves behind.
+func commitOrphanGeneration(t *testing.T, cfg *config.Config, hash [32]byte, shards int) {
+	t.Helper()
+
+	withHostBlob(t, cfg, func(bc *blob.Client, blobIDs []config.NodeID) {
+		body := []byte("a generation no placement record will ever name")
+		for _, id := range blobIDs {
+			for idx := range shards {
+				req := blob.PutRequest{Key: hash, Index: uint32(idx), Size: int64(len(body)), Epoch: orphanEpoch}
+				_, err := bc.Put(t.Context(), id, req, bytes.NewReader(body))
+				require.NoError(t, err, "prepare orphan shard %d on node %d", idx, id)
+
+				_, err = bc.Commit(t.Context(), id,
+					blob.CommitRequest{Key: hash, Index: uint32(idx), Epoch: orphanEpoch})
+				require.NoError(t, err, "commit orphan shard %d on node %d", idx, id)
+			}
 		}
-	}
+	})
 }
 
 // An acknowledged object must stay readable when a later writer commits its
@@ -238,4 +248,40 @@ func TestAPublishedOverwriteReplacesTheGenerationItDisplaced(t *testing.T) {
 
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// A delete that read a placement naming the orphaned generation removes that
+// generation's shards, then stops before its placement removal. The record
+// still names the acknowledged generation, which now exists only as retained
+// rows, and a read must still serve it.
+//
+// Verifies: ADR-0003:S7.
+func TestS7_AScopedDeleteThatStopsLeavesARetainedAcknowledgedObjectReadable(t *testing.T) {
+	c, cfg := startStaleHost(t)
+
+	status, body := c.send(http.MethodPut, "/"+staleBucket, "", nil)
+	require.Equal(t, http.StatusOK, status, "CreateBucket: %s", body)
+
+	want := []byte("$ORIGIN spx3.net.\n@ IN SOA ns1 hostmaster 1 7200 3600 1209600 3600\n")
+	status, body, putHeaders := c.sendTyped(http.MethodPut, "/"+staleBucket+"/"+staleObject, staleType, want)
+	require.Equal(t, http.StatusOK, status, "PutObject: %s", body)
+
+	hash := model.ObjectHash(staleBucket, staleObject)
+	shards := cfg.RS.Data + cfg.RS.Parity
+	commitOrphanGeneration(t, cfg, hash, shards)
+	withHostBlob(t, cfg, func(bc *blob.Client, blobIDs []config.NodeID) {
+		for _, id := range blobIDs {
+			for idx := range shards {
+				_, err := bc.DeleteEpoch(t.Context(), id,
+					blob.CommitRequest{Key: hash, Index: uint32(idx), Epoch: orphanEpoch})
+				require.NoError(t, err, "scoped delete of orphan shard %d on node %d", idx, id)
+			}
+		}
+	})
+
+	status, got, after := c.sendTyped(http.MethodGet, "/"+staleBucket+"/"+staleObject, "", nil)
+	require.Equal(t, http.StatusOK, status,
+		"ADR-0003:S7: an acknowledged object held only as retained rows stopped reading back: %s", got)
+	require.Equal(t, want, got, "the object read back as another generation's body")
+	require.Equal(t, putHeaders.Get("ETag"), after.Get("ETag"))
 }

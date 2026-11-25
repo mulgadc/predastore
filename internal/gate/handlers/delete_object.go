@@ -48,6 +48,9 @@ type DeletedObjectInfo struct {
 	WriteEpoch     uint64          `json:"write_epoch"`      // The placement's write epoch, so the reaper can tell a recreate from its own delete still in flight
 	DataShardNodes []config.NodeID `json:"data_shard_nodes"` // Which nodes had data shards
 	ParityNodes    []config.NodeID `json:"parity_nodes"`     // Which nodes had parity shards
+	// Scoped marks a tombstone written by a failed scoped delete. Its shards
+	// are still owed at WriteEpoch, including epoch zero for a pre-epoch object.
+	Scoped bool `json:"scoped"`
 }
 
 // DeleteObject serves DELETE /{bucket}/{key} with no uploadId.
@@ -146,6 +149,7 @@ func deleteStoredVersion(ctx context.Context, mc MetaClient, bc BlobClient, buck
 			WriteEpoch:     place.WriteEpoch,
 			DataShardNodes: place.DataShardNodes,
 			ParityNodes:    place.ParityShardNodes,
+			Scoped:         true,
 		}
 		var deletedBuf bytes.Buffer
 		if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err != nil {

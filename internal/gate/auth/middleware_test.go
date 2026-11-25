@@ -74,6 +74,10 @@ func (noBlob) Delete(context.Context, config.NodeID, blob.DeleteRequest) (*blob.
 	return nil, errNoCluster
 }
 
+func (noBlob) DeleteEpoch(context.Context, config.NodeID, blob.CommitRequest) (*blob.DeleteResponse, error) {
+	return nil, errNoCluster
+}
+
 func (noBlob) Stat(context.Context, config.NodeID, blob.StatRequest) (*blob.StatResponse, error) {
 	return nil, errNoCluster
 }

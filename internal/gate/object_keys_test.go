@@ -114,6 +114,23 @@ func (b *memBlob) Delete(_ context.Context, node config.NodeID, req blob.DeleteR
 	return &blob.DeleteResponse{Deleted: ok}, nil
 }
 
+func (b *memBlob) DeleteEpoch(_ context.Context, node config.NodeID, req blob.CommitRequest) (*blob.DeleteResponse, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.mutations++
+	id := memShardID{node, req.Key, req.Index}
+	deleted := false
+	if s, ok := b.live[id]; ok && s.epoch == req.Epoch {
+		delete(b.live, id)
+		deleted = true
+	}
+	if s, ok := b.prepared[id]; ok && s.epoch == req.Epoch {
+		delete(b.prepared, id)
+		deleted = true
+	}
+	return &blob.DeleteResponse{Deleted: deleted}, nil
+}
+
 func (b *memBlob) Stat(_ context.Context, node config.NodeID, req blob.StatRequest) (*blob.StatResponse, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

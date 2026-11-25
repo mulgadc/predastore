@@ -22,6 +22,7 @@ type BlobClient interface {
 	Abort(ctx context.Context, nodeID config.NodeID, req blob.CommitRequest) error
 	Get(ctx context.Context, nodeID config.NodeID, req blob.GetRequest) (io.ReadCloser, error)
 	Delete(ctx context.Context, nodeID config.NodeID, req blob.DeleteRequest) (*blob.DeleteResponse, error)
+	DeleteEpoch(ctx context.Context, nodeID config.NodeID, req blob.CommitRequest) (*blob.DeleteResponse, error)
 	Release(ctx context.Context, nodeID config.NodeID, req blob.ReleaseRequest) error
 }
 

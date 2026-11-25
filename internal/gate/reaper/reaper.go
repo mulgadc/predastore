@@ -25,16 +25,15 @@
 // indices — and the tombstone is dropped without touching a shard, since
 // deleting there would delete the recreated object's data.
 //
-// It deliberately does not close the window between that check and the
-// delete landing: a concurrent recreate in that narrow gap could still lose a
-// race against the sweep. Closing it needs the shard delete itself to carry
-// the placement's write epoch and the blob engine to honour it, which is a
-// protocol change out of scope here. It is no worse than the window the
-// inline delete already left against a concurrent PUT.
+// A recreate that lands between that check and the delete keeps its shards:
+// each shard delete names the tombstone's write epoch, and the blob node
+// removes only rows at exactly that epoch, so a later generation is untouched.
 //
-// A tombstone with WriteEpoch == 0 predates this field. Those deletes fanned
-// their shards out inline before the tombstone was even durable, so there is
-// nothing left to reclaim, and it is dropped without a placement check.
+// A tombstone with WriteEpoch == 0 and no Scoped mark predates this field.
+// Those deletes fanned their shards out inline before the tombstone was even
+// durable, so there is nothing left to reclaim, and it is dropped without a
+// placement check. A Scoped one is a failed delete of a pre-epoch object, and
+// its shards are reclaimed at epoch zero like any other.
 //
 // There is no election. Every gate that runs repair also runs this sweep, and
 // two gates racing the same tombstone issue the same idempotent shard deletes
@@ -73,9 +72,9 @@ type MetaClient interface {
 var _ MetaClient = (*meta.Client)(nil)
 
 // BlobClient is what the sweep needs of a blob node: the ability to remove
-// one shard.
+// one shard at one generation.
 type BlobClient interface {
-	Delete(ctx context.Context, node config.NodeID, req blob.DeleteRequest) (*blob.DeleteResponse, error)
+	DeleteEpoch(ctx context.Context, node config.NodeID, req blob.CommitRequest) (*blob.DeleteResponse, error)
 }
 
 var _ BlobClient = (*blob.Client)(nil)
@@ -298,7 +297,7 @@ func (s *Service) scan(ctx context.Context, emit func(task) error) error {
 // the caller must not count it against Failed. A false result with a non-nil
 // error explains why the reclaim could not complete.
 func (s *Service) reclaim(ctx context.Context, t task) (bool, error) {
-	if t.info.WriteEpoch == 0 {
+	if t.info.WriteEpoch == 0 && !t.info.Scoped {
 		// Legacy tombstone: its delete already fanned the shards out inline,
 		// before this field existed to name the generation. Nothing remains
 		// to reclaim.
@@ -387,9 +386,10 @@ func (s *Service) deleteShards(ctx context.Context, info handlers.DeletedObjectI
 	for _, target := range targets {
 		wg.Go(func() {
 			start := time.Now()
-			resp, err := s.cfg.Blob.Delete(ctx, target.node, blob.DeleteRequest{
+			resp, err := s.cfg.Blob.DeleteEpoch(ctx, target.node, blob.CommitRequest{
 				Key:   info.ObjectHash,
 				Index: uint32(target.index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
+				Epoch: info.WriteEpoch,
 			})
 			recordShardDelete(ctx, target.node, start, err)
 			if err != nil {

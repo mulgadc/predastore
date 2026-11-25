@@ -21,6 +21,7 @@ type tombstoneRow struct {
 	hash        [32]byte
 	epoch       uint64
 	data, m     []config.NodeID
+	scoped      bool
 }
 
 // tombstone builds a tombstone naming the given data and parity nodes, keyed
@@ -43,10 +44,10 @@ func (c *cluster) store(t *testing.T, row tombstoneRow) string {
 	stored := c.storeTombstoneOnly(t, row)
 
 	for i, n := range row.data {
-		c.blob.hold(n, row.hash, uint32(i))
+		c.blob.hold(n, row.hash, uint32(i), row.epoch)
 	}
 	for i, n := range row.m {
-		c.blob.hold(n, row.hash, uint32(len(row.data)+i))
+		c.blob.hold(n, row.hash, uint32(len(row.data)+i), row.epoch)
 	}
 
 	return stored
@@ -60,6 +61,7 @@ func (c *cluster) storeTombstoneOnly(t *testing.T, row tombstoneRow) string {
 	info := handlers.DeletedObjectInfo{
 		Bucket: row.bucket, Key: row.key, ObjectHash: row.hash,
 		WriteEpoch: row.epoch, DataShardNodes: row.data, ParityNodes: row.m,
+		Scoped: row.scoped,
 	}
 	var buf bytes.Buffer
 	require.NoError(t, gob.NewEncoder(&buf).Encode(info))
@@ -361,10 +363,10 @@ func (c *cluster) storeVersioned(t *testing.T, row tombstoneRow) string {
 	c.meta.put(stored, buf.Bytes())
 
 	for i, n := range row.data {
-		c.blob.hold(n, row.hash, uint32(i))
+		c.blob.hold(n, row.hash, uint32(i), row.epoch)
 	}
 	for i, n := range row.m {
-		c.blob.hold(n, row.hash, uint32(len(row.data)+i))
+		c.blob.hold(n, row.hash, uint32(len(row.data)+i), row.epoch)
 	}
 	return stored
 }
@@ -434,4 +436,62 @@ func TestLegacyAndVersionedRecordsReclaimInOnePass(t *testing.T) {
 	assert.False(t, c.meta.has(legacyRow))
 	assert.False(t, c.meta.has(versionedRow))
 	assert.Equal(t, int64(2), svc.Stats().Reclaimed)
+}
+
+// A reclaim that found no placement record, then lost the race to a write that
+// recreated the key at the same positions, must leave the write's shards: the
+// delete names the tombstone's generation, and the write made a later one.
+//
+// Verifies: ADR-0003:S7.
+func TestS7_AReclaimRacedByARecreateKeepsTheNewGeneration(t *testing.T) {
+	t.Parallel()
+
+	c := newCluster(t)
+	row := tombstone("raced", 4, nodes(1, 2), nodes(3))
+	stored := c.store(t, row)
+	const recreated = 9
+	c.blob.beforeDelete = func() {
+		for i, n := range append(row.data, row.m...) {
+			c.blob.hold(n, row.hash, uint32(i), recreated) //nolint:gosec // G115: a three-shard stripe.
+		}
+		c.recordLivePlacement(t, row.hash, recreated, row.data, row.m)
+	}
+
+	require.NoError(t, c.service(8).Pass(t.Context()))
+
+	for i, n := range append(row.data, row.m...) {
+		epoch, ok := c.blob.epochAt(n, row.hash, uint32(i)) //nolint:gosec // G115: a three-shard stripe.
+		require.True(t, ok, "ADR-0003:S7: node %d lost the recreated shard at index %d to a stale reclaim", n, i)
+		assert.Equal(t, uint64(recreated), epoch)
+	}
+	assert.ElementsMatch(t, []uint64{4, 4, 4}, c.blob.epochs, "every shard delete must name the tombstone's generation")
+	assert.False(t, c.meta.has(stored))
+}
+
+// A failed delete of an object written before epochs leaves a scoped tombstone
+// at epoch zero. It is owed like any other: kept while a node is down, and
+// reclaimed at epoch zero once the node returns.
+func TestAScopedEpochZeroTombstoneIsReclaimedOnceTheNodeReturns(t *testing.T) {
+	t.Parallel()
+
+	c := newCluster(t)
+	row := tombstone("pre-epoch", 0, nodes(1, 2), nodes(3))
+	row.scoped = true
+	stored := c.store(t, row)
+	c.blob.stop(2)
+
+	svc := c.service(8)
+	require.NoError(t, svc.Pass(t.Context()))
+	assert.True(t, c.meta.has(stored), "a scoped tombstone with a shard still owed must stay")
+	assert.True(t, c.blob.has(2, row.hash, 1))
+
+	c.blob.resume(2)
+	require.NoError(t, svc.Pass(t.Context()))
+	for i, n := range append(row.data, row.m...) {
+		assert.False(t, c.blob.has(n, row.hash, uint32(i)), "node %d still holds index %d", n, i) //nolint:gosec // G115: a three-shard stripe.
+	}
+	assert.False(t, c.meta.has(stored))
+	for _, epoch := range c.blob.epochs {
+		assert.Zero(t, epoch, "every delete must name epoch zero")
+	}
 }

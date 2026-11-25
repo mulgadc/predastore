@@ -38,13 +38,13 @@ func (m *putFailingMeta) Swap(ctx context.Context, key string, value []byte) ([]
 
 var _ MetaClient = (*putFailingMeta)(nil)
 
-// failingBlob fails every shard Delete, standing in for a fan-out that could
-// not reach any node.
+// failingBlob fails every scoped shard delete, standing in for a fan-out that
+// could not reach any node.
 type failingBlob struct {
 	*fakeBlob
 }
 
-func (b *failingBlob) Delete(_ context.Context, _ config.NodeID, _ blob.DeleteRequest) (*blob.DeleteResponse, error) {
+func (b *failingBlob) DeleteEpoch(_ context.Context, _ config.NodeID, _ blob.CommitRequest) (*blob.DeleteResponse, error) {
 	return nil, errors.New("simulated node unreachable")
 }
 
