@@ -7,6 +7,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -31,9 +32,11 @@ func getRange(t *testing.T, f writeFixture, start, end int64) (*httptest.Respons
 	return w, f.bc.getBytes.Load()
 }
 
-func publishedObject(t *testing.T, f writeFixture, size int64) []byte {
+func publishedObject(t testing.TB, f writeFixture, size int64) []byte {
 	t.Helper()
-	body := randomBytes(t, int(size))
+	body := make([]byte, size)
+	_, err := rand.Read(body)
+	require.NoError(t, err)
 	objectHash := model.ObjectHash("b", "k")
 	place, _, err := f.write(context.Background(), objectHash, bytes.NewReader(body), size)
 	require.NoError(t, err)
