@@ -24,6 +24,9 @@ const (
 	// and only ever removes a retained row, so it cannot take the generation a
 	// node is currently serving.
 	OpRelease rpc.Opcode = 0x2007
+	// OpDeleteEpoch removes the live, prepared and retained rows of one epoch
+	// of a shard, and no other generation.
+	OpDeleteEpoch rpc.Opcode = 0x2008
 )
 
 // Response error codes with protocol meaning; anything else in Err is an
@@ -64,6 +67,10 @@ type Request struct {
 	// put, commit and abort; on get it is the generation the caller will
 	// accept, and a node holding any other one answers epoch-mismatch.
 	Epoch uint64 `json:"epoch,omitempty"`
+	// Hold asks a put to prepare a row the age sweep never drops, and to
+	// answer Registered before it reads the body. A node that predates it
+	// ignores the field and answers neither.
+	Hold bool `json:"hold,omitempty"`
 }
 
 func (h *Request) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
@@ -94,4 +101,14 @@ type Response struct {
 	// for a generation it still holds. A node that predates it can answer
 	// overtaken for one it never prepared, so its answer proves nothing.
 	Held bool `json:"held,omitempty"`
+	// Registered is the first envelope of a held put: the writer is open and
+	// an abort will find it. Its final envelope follows the body.
+	Registered bool `json:"registered,omitempty"`
+	// Holding confirms on a put's final envelope that the row it prepared is
+	// held. Only a shard answered with it counts toward a held write's floor.
+	Holding bool `json:"holding,omitempty"`
+	// Open reports that an abort found a held writer still receiving its
+	// body. The writer discards its extent when it closes; abort again to
+	// learn that it has.
+	Open bool `json:"open,omitempty"`
 }

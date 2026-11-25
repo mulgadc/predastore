@@ -42,6 +42,9 @@ type writer struct {
 	dataLen int64
 
 	closed bool
+
+	// hold stamps the prepared row so the age sweep never drops it.
+	hold bool
 }
 
 // Write copies p into the value via ReadFrom over a bytes.Reader, sharing the
@@ -143,7 +146,7 @@ func (w *writer) Close() (err error) {
 		return fmt.Errorf("sync idx %d: %w", w.ext.SegNum, err)
 	}
 
-	return w.store.prepareExtent(w.key, w.index, w.ext, w.epoch)
+	return w.store.prepareExtent(w.key, w.index, w.ext, w.epoch, w.hold)
 }
 
 // flush seals each buffered fragment in place under aead, then writes the

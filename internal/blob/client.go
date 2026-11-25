@@ -41,6 +41,14 @@ var (
 	// not say it holds the generation, as a node from before Held does. The
 	// shard may never have existed there, so it is not durable.
 	ErrOvertakenUnproven = errors.New("overtaken without proof the node holds the generation")
+
+	// ErrHoldUnsupported is a held put the node did not register, which is
+	// what a node that predates held writes answers. No body was sent.
+	ErrHoldUnsupported = errors.New("node did not register a held write")
+
+	// ErrWriterOpen is an abort that found a held writer still receiving its
+	// body. The writer discards its extent on close; abort again to confirm.
+	ErrWriterOpen = errors.New("held writer still open")
 )
 
 // PutRequest identifies the value a put commits. The bytes travel separately,
@@ -63,6 +71,8 @@ type PutResponse struct {
 	PoolNearFull bool
 	// Epoch echoes the generation the shard was prepared under.
 	Epoch uint64
+	// Holding confirms a held put prepared a row the age sweep never drops.
+	Holding bool
 }
 
 // GetRequest identifies the value a get reads.
@@ -275,23 +285,93 @@ func (c *Client) awaitEnvelopeWithin(
 
 // Put streams a value to the node and returns the commit result.
 func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, body io.Reader) (*PutResponse, error) {
-	stream, err := c.openBounded(ctx, nodeID, OpPut, &Request{
+	stream, err := c.openBounded(ctx, nodeID, OpPut, putHeader(req, false))
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.sendBody(ctx, nodeID, stream, bufio.NewReader(stream), req.Size, body)
+	if err != nil {
+		return nil, err
+	}
+	return &PutResponse{Size: resp.Size, PoolNearFull: resp.PoolNearFull, Epoch: resp.Epoch}, nil
+}
+
+func putHeader(req PutRequest, hold bool) *Request {
+	return &Request{
 		Key:        req.Key,
 		Index:      req.Index,
 		Size:       req.Size,
 		Epoch:      req.Epoch,
 		RangeStart: -1,
 		RangeEnd:   -1,
-	})
+		Hold:       hold,
+	}
+}
+
+// HeldPut is a held shard write whose writer the node has registered and
+// whose body has not been sent. Send or Abandon it exactly once.
+type HeldPut struct {
+	c      *Client
+	nodeID config.NodeID
+	req    PutRequest
+	stream transport.Stream
+	br     *bufio.Reader
+}
+
+// OpenHeld opens a held put and returns once the node reports its writer
+// registered. A node that does not answer Registered within the envelope
+// bound gets no body, and OpenHeld fails with ErrHoldUnsupported.
+func (c *Client) OpenHeld(ctx context.Context, nodeID config.NodeID, req PutRequest) (*HeldPut, error) {
+	stream, err := c.openBounded(ctx, nodeID, OpPut, putHeader(req, true))
 	if err != nil {
 		return nil, err
 	}
+	br := bufio.NewReader(stream)
+	resp, err := c.awaitEnvelope(ctx, stream, br)
+	if err != nil {
+		abortStream(stream)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("held put to node %d: %w: %w", nodeID, ErrHoldUnsupported, err)
+		}
+		return nil, fmt.Errorf("held put to node %d: %w", nodeID, err)
+	}
+	if resp.Err != "" {
+		abortStream(stream)
+		if resp.Err == ErrCodeStoreFull {
+			return nil, fmt.Errorf("held put to node %d: %w", nodeID, engine.ErrStoreFull)
+		}
+		return nil, fmt.Errorf("held put to node %d: %s", nodeID, resp.Err)
+	}
+	if !resp.Registered {
+		abortStream(stream)
+		return nil, fmt.Errorf("held put to node %d: %w", nodeID, ErrHoldUnsupported)
+	}
+	return &HeldPut{c: c, nodeID: nodeID, req: req, stream: stream, br: br}, nil
+}
 
+// Send streams the body and returns the prepare result. Holding is set only
+// when the node confirms the row it prepared is held.
+func (p *HeldPut) Send(ctx context.Context, body io.Reader) (*PutResponse, error) {
+	resp, err := p.c.sendBody(ctx, p.nodeID, p.stream, p.br, p.req.Size, body)
+	if err != nil {
+		return nil, err
+	}
+	return &PutResponse{Size: resp.Size, PoolNearFull: resp.PoolNearFull, Epoch: resp.Epoch, Holding: resp.Holding}, nil
+}
+
+// Abandon resets the stream with no body sent, so the node's writer closes
+// with nothing prepared.
+func (p *HeldPut) Abandon() { abortStream(p.stream) }
+
+// sendBody streams a put's body, half-closes, and reads the final envelope.
+func (c *Client) sendBody(
+	ctx context.Context, nodeID config.NodeID, stream transport.Stream, br *bufio.Reader, size int64, body io.Reader,
+) (*Response, error) {
 	// The body is bounded by progress, not duration: a large value moving
 	// steadily must not be cut off. The caller's cancellation still applies.
 	stopCaller := context.AfterFunc(ctx, func() { abortStream(stream) })
-	guard := transport.NewWriteGuard(io.LimitReader(body, req.Size), stream, c.idleTimeout)
-	_, err = stream.ReadFrom(guard)
+	guard := transport.NewWriteGuard(io.LimitReader(body, size), stream, c.idleTimeout)
+	_, err := stream.ReadFrom(guard)
 	guard.Stop()
 	if err != nil {
 		stopCaller()
@@ -310,7 +390,7 @@ func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, 
 
 	// The node does not answer until the shard is durable, so this waits on
 	// the disk and is bounded as such.
-	resp, err := c.awaitEnvelopeWithin(ctx, stream, bufio.NewReader(stream), c.commitTimeout)
+	resp, err := c.awaitEnvelopeWithin(ctx, stream, br, c.commitTimeout)
 	if err != nil {
 		stream.CancelRead(0)
 		// The body is already delivered and half-closed, so a node that has
@@ -330,7 +410,7 @@ func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, 
 	default:
 		return nil, fmt.Errorf("put to node %d: %s", nodeID, resp.Err)
 	}
-	return &PutResponse{Size: resp.Size, PoolNearFull: resp.PoolNearFull, Epoch: resp.Epoch}, nil
+	return resp, nil
 }
 
 // Delete marks a value deleted on the node.
@@ -423,8 +503,25 @@ func commitOutcome(resp *Response) (superseded bool, err error) {
 // Abort discards a shard prepared under the same epoch, releasing its space
 // without waiting for the node to age it out. Aborting nothing is success.
 func (c *Client) Abort(ctx context.Context, nodeID config.NodeID, req CommitRequest) error {
-	_, err := c.finish(ctx, nodeID, OpAbort, "abort", req)
-	return err
+	resp, err := c.finish(ctx, nodeID, OpAbort, "abort", req)
+	if err != nil {
+		return err
+	}
+	// A held writer still receiving its body has prepared nothing yet.
+	if resp.Open {
+		return fmt.Errorf("abort on node %d: %w", nodeID, ErrWriterOpen)
+	}
+	return nil
+}
+
+// DeleteEpoch removes one epoch of a shard and no other generation. A node
+// that predates it closes the stream unanswered, which is an error here.
+func (c *Client) DeleteEpoch(ctx context.Context, nodeID config.NodeID, req CommitRequest) (*DeleteResponse, error) {
+	resp, err := c.finish(ctx, nodeID, OpDeleteEpoch, "delete epoch", req)
+	if err != nil {
+		return nil, err
+	}
+	return &DeleteResponse{Deleted: resp.Deleted}, nil
 }
 
 // Release drops a superseded generation the caller has finished with, so the

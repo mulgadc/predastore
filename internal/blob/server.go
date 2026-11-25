@@ -26,11 +26,13 @@ import (
 // implementation; Config.Store is the seam a test substitutes through.
 type Store interface {
 	Append(key [32]byte, index uint32, size int64, epoch uint64) (engine.Writer, error)
+	AppendHeld(key [32]byte, index uint32, size int64, epoch uint64) (engine.Writer, error)
 	Lookup(key [32]byte, index uint32) (engine.Reader, error)
 	LookupAt(key [32]byte, index uint32, epoch uint64) (engine.Reader, error)
 	Commit(key [32]byte, index uint32, epoch uint64) (published bool, err error)
 	Abort(key [32]byte, index uint32, epoch uint64) error
 	Delete(key [32]byte, index uint32) (bool, error)
+	DeleteEpoch(key [32]byte, index uint32, epoch uint64) (bool, error)
 	ReleaseGeneration(key [32]byte, index uint32, epoch uint64) error
 	NearFull() bool
 	Close() error
@@ -97,6 +99,7 @@ const DefaultBodyIdleTimeout = 60 * time.Second
 type Server struct {
 	cfg   Config
 	store Store
+	held  *heldWriters
 }
 
 // New validates cfg and applies its defaults. It creates no directory, opens
@@ -120,7 +123,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.BodyIdleTimeout <= 0 {
 		cfg.BodyIdleTimeout = DefaultBodyIdleTimeout
 	}
-	return &Server{cfg: cfg}, nil
+	return &Server{cfg: cfg, held: newHeldWriters()}, nil
 }
 
 // Run opens the store, answers rpc on the configured listeners until ctx is
@@ -165,6 +168,7 @@ func (s *Server) Run(ctx context.Context) error {
 	rpc.RegisterHandler(mux, OpCommit, s.handleCommit)
 	rpc.RegisterHandler(mux, OpAbort, s.handleAbort)
 	rpc.RegisterHandler(mux, OpStat, s.handleStat)
+	rpc.RegisterHandler(mux, OpDeleteEpoch, s.handleDeleteEpoch)
 	srv, err := rpc.NewServer(mux, s.cfg.Listeners, nil)
 	if err != nil {
 		return errors.Join(err, s.store.Close())
@@ -236,24 +240,44 @@ func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stre
 	}
 	// Zero is reserved as "invalid", so a caller that forgot the epoch is
 	// refused rather than storing a shard nothing can ever match.
+	// A held put sends no body before Registered, so its refusals answer
+	// at once; draining would wait for bytes that never come.
 	if h.Epoch == 0 {
-		if derr := drainBody(stream, h.Size); derr != nil {
-			return derr
+		if !h.Hold {
+			if derr := drainBody(stream, h.Size); derr != nil {
+				return derr
+			}
 		}
 		return respond(stream, &Response{Err: "no write epoch specified"})
 	}
 
-	writer, err := st.Append(h.Key, h.Index, h.Size, h.Epoch)
+	// A held writer registers before it exists, so a second put of the same
+	// shard is refused without a writer that could prepare over the first.
+	k := heldKey{key: h.Key, index: h.Index, epoch: h.Epoch}
+	appendValue := st.Append
+	if h.Hold {
+		if !s.held.register(k) {
+			return respond(stream, &Response{Err: "a held write of this shard is already open"})
+		}
+		appendValue = st.AppendHeld
+	}
+	writer, err := appendValue(h.Key, h.Index, h.Size, h.Epoch)
 	if err != nil {
-		// Drain the client's in-flight body so the reply is carried
-		// instead of racing a stream reset.
-		if derr := drainBody(stream, h.Size); derr != nil {
+		if h.Hold {
+			s.held.finish(k)
+		} else if derr := drainBody(stream, h.Size); derr != nil {
+			// Drain the client's in-flight body so the reply is carried
+			// instead of racing a stream reset.
 			return derr
 		}
 		if errors.Is(err, engine.ErrStoreFull) {
 			return respond(stream, &Response{Err: ErrCodeStoreFull})
 		}
 		return respond(stream, &Response{Err: fmt.Sprintf("append: %v", err)})
+	}
+
+	if h.Hold {
+		return s.putHeld(h, k, writer, stream)
 	}
 
 	if _, err := writer.ReadFrom(io.LimitReader(stream, h.Size)); err != nil {
@@ -278,6 +302,48 @@ func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stre
 	// Surface nearfull pressure on success too, so callers can back off
 	// before a write is ever outright rejected.
 	return respond(stream, &Response{Size: h.Size, PoolNearFull: st.NearFull(), Epoch: h.Epoch})
+}
+
+// putHeld runs a registered held put once its writer exists. The caller is
+// told before any body byte is read, so an abort that arrives at any later
+// point finds either the open writer or its row.
+func (s *Server) putHeld(h Request, k heldKey, writer engine.Writer, stream transport.Stream) error {
+	if err := respond(stream, &Response{Registered: true, Epoch: h.Epoch}); err != nil {
+		s.held.finish(k)
+		s.discard(h, writer)
+		return fmt.Errorf("write registered envelope: %w", err)
+	}
+
+	if _, err := writer.ReadFrom(io.LimitReader(stream, h.Size)); err != nil {
+		s.held.finish(k)
+		s.discard(h, writer)
+		return respond(stream, &Response{Err: fmt.Sprintf("write: %v", err)})
+	}
+	closeErr := writer.Close()
+	// Finished only after the row is prepared, so an abort that misses the
+	// open writer finds the row instead.
+	if s.held.finish(k) {
+		if err := s.store.Abort(h.Key, h.Index, h.Epoch); err != nil {
+			return respond(stream, &Response{Err: fmt.Sprintf("abort held write: %v", err)})
+		}
+		return respond(stream, &Response{Err: "held write aborted"})
+	}
+	if closeErr != nil {
+		return respond(stream, &Response{Err: fmt.Sprintf("prepare: %v", closeErr)})
+	}
+	return respond(stream, &Response{Size: h.Size, PoolNearFull: s.store.NearFull(), Epoch: h.Epoch, Holding: true})
+}
+
+// discard closes a writer whose body will not be used and drops anything
+// its close prepared.
+func (s *Server) discard(h Request, writer engine.Writer) {
+	if err := writer.Close(); err != nil {
+		slog.Warn("close discarded writer", "node", s.cfg.NodeID, "error", err)
+		return
+	}
+	if err := s.store.Abort(h.Key, h.Index, h.Epoch); err != nil {
+		slog.Warn("abort discarded write", "node", s.cfg.NodeID, "error", err)
+	}
 }
 
 // drainBody consumes a rejected put's in-flight body so the reply is carried
@@ -323,6 +389,11 @@ func (s *Server) handleAbort(ctx context.Context, h Request, stream transport.St
 	if h.Epoch == 0 {
 		return respond(stream, &Response{Err: "no write epoch specified"})
 	}
+	// A held writer still receiving its body has no row to drop yet. It is
+	// marked, discards its extent when it closes, and the caller hears Open.
+	if s.held.markAborted(heldKey{key: h.Key, index: h.Index, epoch: h.Epoch}) {
+		return respond(stream, &Response{Epoch: h.Epoch, Open: true})
+	}
 	if err := s.store.Abort(h.Key, h.Index, h.Epoch); err != nil {
 		return respond(stream, &Response{Err: fmt.Sprintf("abort: %v", err)})
 	}
@@ -355,6 +426,9 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 	st := s.store
 
 	reader, err := st.Lookup(h.Key, h.Index)
+	if errors.Is(err, engine.ErrKeyNotFound) && h.Epoch != 0 {
+		reader, err = s.completeFirst(h)
+	}
 	if err != nil {
 		return respond(stream, &Response{Err: ErrCodeNotFound})
 	}
@@ -449,6 +523,22 @@ func (s *Server) resolveEpoch(h Request, stale engine.Reader) (engine.Reader, er
 	return reader, nil
 }
 
+// completeFirst answers a get for a named epoch at a position with no live
+// row: a record names it, so its writer has not committed yet or died first.
+// Committing it is what the writer would do; nothing else is committed.
+func (s *Server) completeFirst(h Request) (engine.Reader, error) {
+	if _, err := s.store.Commit(h.Key, h.Index, h.Epoch); err != nil {
+		return nil, err
+	}
+	reader, err := s.store.LookupAt(h.Key, h.Index, h.Epoch)
+	if err != nil {
+		return nil, err
+	}
+	slog.Info("completed the first commit of a shard abandoned by its writer",
+		"node", s.cfg.NodeID, "index", h.Index, "epoch", fmt.Sprintf("%016x", h.Epoch))
+	return reader, nil
+}
+
 // handleRelease drops a superseded generation a writer has finished with. It
 // is best-effort housekeeping, so a miss is success: the generation being gone
 // already is the outcome the caller wanted.
@@ -458,6 +548,19 @@ func (s *Server) handleRelease(ctx context.Context, h Request, stream transport.
 	}
 
 	return respond(stream, &Response{})
+}
+
+// handleDeleteEpoch removes one epoch of a shard. It refuses epoch zero,
+// which would otherwise match the zero a legacy row carries.
+func (s *Server) handleDeleteEpoch(ctx context.Context, h Request, stream transport.Stream) error {
+	if h.Epoch == 0 {
+		return respond(stream, &Response{Err: "no write epoch specified"})
+	}
+	deleted, err := s.store.DeleteEpoch(h.Key, h.Index, h.Epoch)
+	if err != nil {
+		return respond(stream, &Response{Err: err.Error()})
+	}
+	return respond(stream, &Response{Deleted: deleted})
 }
 
 func (s *Server) handleDelete(ctx context.Context, h Request, stream transport.Stream) error {

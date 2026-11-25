@@ -541,6 +541,16 @@ func (store *Store) lookup(rowKey []byte, key [32]byte, index uint32) (Reader, e
 // epoch is opaque here: the engine stores it, returns it on Lookup and matches
 // it on Commit, and never orders or interprets it.
 func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64) (Writer, error) {
+	return store.appendValue(key, index, size, epoch, false)
+}
+
+// AppendHeld is Append for a write whose fate a caller decides later. Its
+// prepared row is never swept by age; only Commit or Abort removes it.
+func (store *Store) AppendHeld(key [32]byte, index uint32, size int64, epoch uint64) (Writer, error) {
+	return store.appendValue(key, index, size, epoch, true)
+}
+
+func (store *Store) appendValue(key [32]byte, index uint32, size int64, epoch uint64, hold bool) (Writer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("negative size %d", size)
 	}
@@ -614,6 +624,7 @@ func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64)
 		fragNum:  store.fragNum,
 		buf:      wbuf,
 		held:     wheld,
+		hold:     hold,
 	}
 
 	store.valueNum += 1
@@ -683,8 +694,13 @@ func (store *Store) reserveExtent(fragCount uint64) (*segment, int64, error) {
 // at it, so an extent held only in memory between prepare and commit would be
 // dropped out from under the commit. A prepared row makes it live enough to be
 // relocated instead.
-func (store *Store) prepareExtent(key [32]byte, index uint32, ext extent, epoch uint64) error {
-	value := encodePreparedValue(ext, epoch, time.Now().UnixNano())
+func (store *Store) prepareExtent(key [32]byte, index uint32, ext extent, epoch uint64, hold bool) error {
+	stamp := time.Now().UnixNano()
+	// No sweep cutoff ever passes this stamp, so a held row waits for its verdict.
+	if hold {
+		stamp = retainedHoldStamp
+	}
+	value := encodePreparedValue(ext, epoch, stamp)
 	if err := store.index.Update(func(txn *badger.Txn) error {
 		return txn.Set(preparedKey(MakeKey(key, index), epoch), value)
 	}); err != nil {
@@ -1010,6 +1026,70 @@ func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
 		return false, err
 	}
 	return deleted, nil
+}
+
+// DeleteEpoch removes the live, prepared and retained rows of exactly one
+// epoch, so a stale delete cannot take a generation a later write made in
+// either order. It reports whether any row was removed.
+func (store *Store) DeleteEpoch(key [32]byte, index uint32, epoch uint64) (bool, error) {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+
+	if store.closed {
+		return false, ErrClosedStore
+	}
+
+	idxKey := MakeKey(key, index)
+	deleted := false
+	err := store.index.Update(func(txn *badger.Txn) error {
+		deleted = false
+		for _, rowKey := range [][]byte{preparedKey(idxKey, epoch), retainedKey(idxKey, epoch)} {
+			removed, err := dropRowAt(txn, rowKey, epoch)
+			if err != nil {
+				return fmt.Errorf("delete epoch: %w", err)
+			}
+			deleted = deleted || removed
+		}
+
+		ext, live, err := readIndexValue(txn, idxKey)
+		if errors.Is(err, badger.ErrKeyNotFound) || (err == nil && live != epoch) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("delete epoch: read extent: %w", err)
+		}
+		if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
+			return fmt.Errorf("delete epoch: put tombstone: %w", err)
+		}
+		deleted = true
+		return txn.Delete(idxKey)
+	})
+	if err != nil {
+		return false, err
+	}
+	return deleted, nil
+}
+
+// dropRowAt tombstones and removes one prepared or retained row, and its
+// release row, inside the caller's transaction, when the row holds epoch.
+func dropRowAt(txn *badger.Txn, rowKey []byte, epoch uint64) (bool, error) {
+	ext, held, err := readIndexValue(txn, rowKey)
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if held != epoch {
+		return false, nil
+	}
+	if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
+		return false, fmt.Errorf("put tombstone: %w", err)
+	}
+	if err := txn.Delete(releasedKeyFor(rowKey)); err != nil {
+		return false, fmt.Errorf("delete release: %w", err)
+	}
+	return true, txn.Delete(rowKey)
 }
 
 // Close blocks until all outstanding segment references drain, then closes
