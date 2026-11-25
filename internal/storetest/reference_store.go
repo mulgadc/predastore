@@ -207,6 +207,16 @@ func (w *refWriter) Close() error {
 	return nil
 }
 
+// Discard ends the writer without preparing anything.
+func (w *refWriter) Discard() error {
+	if w.closed {
+		return engine.ErrClosedWriter
+	}
+	w.closed = true
+
+	return nil
+}
+
 // NextEpoch hands out distinct non-zero write epochs for tests. Zero is
 // reserved as invalid, so a counter starting at one is enough.
 func NextEpoch() uint64 { return testEpochs.Add(1) }

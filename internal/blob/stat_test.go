@@ -35,6 +35,12 @@ func (s failingLookupStore) Lookup([32]byte, uint32) (engine.Reader, error) { re
 // addressed to it.
 func startStoreNode(t *testing.T, store blob.Store) *blob.Client {
 	t.Helper()
+	return startStoreNodeWithin(t, store, 5*time.Second)
+}
+
+// startStoreNodeWithin is startStoreNode with the client's envelope bound set.
+func startStoreNodeWithin(t *testing.T, store blob.Store, envelopeTimeout time.Duration) *blob.Client {
+	t.Helper()
 
 	clusterCfg := &config.Config{
 		Hosts: []config.Host{{
@@ -75,7 +81,7 @@ func startStoreNode(t *testing.T, store blob.Store) *blob.Client {
 
 	client, err := blob.NewClient(blob.ClientConfig{
 		Client:          rpc.NewClient(rpc.NewConnPool(2, clientRes)),
-		EnvelopeTimeout: 5 * time.Second,
+		EnvelopeTimeout: envelopeTimeout,
 		IdleTimeout:     5 * time.Second,
 	})
 	require.NoError(t, err)

@@ -104,11 +104,13 @@ func TestHandleGetAbortsAStalledBody(t *testing.T) {
 
 // failingWriter models a put whose body never arrives.
 type failingWriter struct {
-	closed atomic.Bool
+	closed    atomic.Bool
+	discarded atomic.Bool
 }
 
 func (w *failingWriter) Write(p []byte) (int, error) { return len(p), nil }
 func (w *failingWriter) Close() error                { w.closed.Store(true); return nil }
+func (w *failingWriter) Discard() error              { w.discarded.Store(true); return nil }
 
 func (w *failingWriter) ReadFrom(io.Reader) (int64, error) {
 	return 0, errors.New("connection reset")
@@ -130,10 +132,10 @@ func (s *putStore) Abort(_ [32]byte, _ uint32, _ uint64) error {
 	return nil
 }
 
-// Close is the only thing that releases the segment reference Append took, so
-// a put whose body fails must still close its writer. Skipping it pins the
-// segment for the life of the process, which is what compaction then waits on.
-func TestHandlePutClosesWriterOnFailedBody(t *testing.T) {
+// A put whose body fails must release its writer, or the segment stays pinned,
+// and must prepare nothing, or a get naming the epoch could commit the short
+// body before an abort undoes it. Discard does both.
+func TestHandlePutDiscardsWriterOnFailedBody(t *testing.T) {
 	store := &putStore{writer: &failingWriter{}}
 	srv := &Server{cfg: Config{NodeID: 1}, store: store}
 	stream := &stallStream{cancelled: make(chan struct{})}
@@ -141,10 +143,10 @@ func TestHandlePutClosesWriterOnFailedBody(t *testing.T) {
 	if err := srv.handlePut(context.Background(), Request{Size: 16, Epoch: 7}, stream); err != nil {
 		t.Fatalf("handlePut: %v", err)
 	}
-	if !store.writer.closed.Load() {
-		t.Error("a failed body must still close the writer, or its segment stays pinned")
+	if !store.writer.discarded.Load() {
+		t.Error("a failed body must discard the writer, or its segment stays pinned")
 	}
-	if !store.aborted.Load() {
-		t.Error("the prepared extent of a failed put should be aborted")
+	if store.writer.closed.Load() {
+		t.Error("a failed body must not close the writer, which prepares the short body")
 	}
 }

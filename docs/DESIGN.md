@@ -343,6 +343,21 @@ A put also reports `PoolNearFull` on success, so callers can back off before a w
 
 **A write is two operations.** `Put` makes the value durable but invisible; `Commit` publishes it and `Abort` discards it. A get names the epoch it wants, and a node holding another generation answers `epoch-mismatch` rather than bytes — see §8. `Stat` answers what generation a node holds without its body, which is what repair asks of every position it owns.
 
+**A held put** sets `Hold` in its header.
+The node registers the writer in memory and sends a `Registered` envelope before it reads any body byte, and the client sends the body only after that envelope.
+A node that predates `Hold` sends no `Registered`, so the client stops waiting after the envelope bound, resets the stream with no body sent, and reports `ErrHoldUnsupported`.
+The final envelope carries `Holding`, which confirms that the prepared row is held.
+The age sweep drops an unheld prepared row that is older than 30 minutes, and it never drops a held one: only `Commit`, `Abort` or `DeleteEpoch` removes it.
+An `Abort` that arrives while the held writer is still open answers `Open` and cuts off the body, and the writer then ends with no prepared row.
+An `Abort` that arrives while the writer is closing waits for the close, drops the row, and answers without `Open`.
+A held writer that ends without its whole body prepares no row, so a crash at any point leaves nothing for the sweep to keep.
+A held body that stops arriving for `BodyIdleTimeout` ends the write.
+A second `Abort` then answers without `Open`, which tells the caller that no row is left.
+
+`DeleteEpoch` removes the live, prepared and retained rows of one epoch and no other generation.
+Epoch zero is valid and names a row written before epochs, since no write path makes another row at zero.
+A node that predates it closes the stream with no envelope, which the client reports as an error.
+
 ## The engine
 
 <p align="center">
@@ -415,7 +430,7 @@ The writer then owns a disjoint byte range. It assembles fragments into an in-me
 
 ### Delete and tombstones
 
-`Delete` removes the index row and writes a tombstone in one transaction, so the dead-space hint can neither precede nor outlive the deletion. A missing key is not an error, which keeps deletes idempotent. An overwrite tombstones the extent it supersedes inside the same commit transaction.
+`Delete` removes the index row and writes a tombstone in one transaction, so the dead-space hint can neither precede nor outlive the deletion. A missing key is not an error, which keeps deletes idempotent. `Delete` removes every generation at the position. `DeleteEpoch` removes only the rows of the epoch it names, so a stale delete cannot remove a generation that a later write made. An overwrite tombstones the extent it supersedes inside the same commit transaction.
 
 Tombstones are keyed by physical slot — `'d'` ‖ big-endian `segNum` ‖ big-endian `off`, 17 bytes — with the dead byte count as the value. Keying by slot rather than by object key is what lets one key die repeatedly: on delete, on overwrite, and on a relocation that lost its race. They only accelerate compaction's candidate selection and are never consulted for correctness.
 
@@ -495,11 +510,11 @@ The milliseconds are the object's `LastModified` on every surface that serves on
 
 The body is split into `K` data shard buffers in memory and each is streamed to its node in parallel. Parity is encoded into buffers of its own and written from those. It is deliberately not piped from a single encoder: one parity node refusing would close its pipe, fail the encode and take every other parity write down with it, losing all redundancy at once rather than one shard of it.
 
-**The write is two-phase.** Each shard put makes the bytes durable and invisible. The shards are published first, then the placement record lands in raft, which is the commit point and the moment the object's new generation becomes visible. That order is what stops a record naming shards that have not landed; the reverse is possible — a record can name a generation the nodes have already passed — which is why a commit demotes rather than destroys. A reader that finds a prepared-but-unpublished shard at the record's epoch, behind an older live generation, completes the commit itself, so an interrupted overwrite costs a round trip rather than the object. A key with no live generation at all answers not-found without looking, which is one reason the floor below counts commits rather than landings.
+**The write is two-phase.** Each shard put makes the bytes durable and invisible. The shards are published first, then the placement record lands in raft, which is the commit point and the moment the object's new generation becomes visible. That order is what stops a record naming shards that have not landed; the reverse is possible — a record can name a generation the nodes have already passed — which is why a commit demotes rather than destroys. A reader that finds a prepared-but-unpublished shard at the record's epoch, behind an older live generation, completes the commit itself, so an interrupted overwrite costs a round trip rather than the object. A get that names an epoch at a key with no live generation does the same, so a record that lands before its first shard commit is readable while the prepared row exists.
 
 Swapping the record rather than writing it tells the writer which generation it displaced, and the writer then **releases** exactly that one on every node behind the old record, including the handoff holder. A generation nobody released is never reclaimed: see §7, *Retained generations*. A writer that does not reach the release leaves disk held, which is the direction to fail in.
 
-**A write is acknowledged only once `K` shards are committed at its own epoch.** Landing is not enough: a shard that landed and then lost its commit is invisible to every read of a new key, and on production a chunk was acknowledged with one of its two landed shards committed and failed its read-back seconds later. `commitShards` counts a shard as durable when its commit published, or answered overtaken by a newer generation the node holds behind it — the engine proves that with the retained row, and answers not-prepared for an epoch it never held. Below the floor the write fails with `InternalError` before any record, parts row or listing key names it, and its still-prepared shards are aborted. A shard that did commit stays live under an epoch nothing names; it costs disk and never a read. PutObject, CopyObject, CompleteMultipartUpload, UploadPart and UploadPartCopy all hold to it, and an empty object, which stores no shards, has no floor.
+**A write is acknowledged only once `K` shards are committed at its own epoch.** Landing is not enough: a shard that landed and then lost its commit is readable only until the age sweep drops its prepared row, and on production a chunk was acknowledged with one of its two landed shards committed and failed its read-back seconds later. `commitShards` counts a shard as durable when its commit published, or answered overtaken by a newer generation the node holds behind it — the engine proves that with the retained row, and answers not-prepared for an epoch it never held. Below the floor the write fails with `InternalError` before any record, parts row or listing key names it, and its still-prepared shards are aborted. A shard that did commit stays live under an epoch nothing names; it costs disk and never a read. PutObject, CopyObject, CompleteMultipartUpload, UploadPart and UploadPartCopy all hold to it, and an empty object, which stores no shards, has no floor.
 
 The floor is `K` with degraded writes, so one node down does not refuse writes; the response then carries `X-Spx-Degraded-Write: <n>`. Setting `rs.degraded_writes = false` restores a full-width floor. `K` is the floor and not `K+1`, because any `K` of the `K+M` reconstruct — at RS(2,1) one more buys no redundancy and would refuse three quarters of writes with a single node down.
 

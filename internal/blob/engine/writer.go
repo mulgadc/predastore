@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/dgraph-io/badger/v4"
 )
 
 var ErrClosedWriter = errors.New("closed writer")
@@ -42,6 +44,9 @@ type writer struct {
 	dataLen int64
 
 	closed bool
+
+	// hold stamps the prepared row so the age sweep never drops it.
+	hold bool
 }
 
 // Write copies p into the value via ReadFrom over a bytes.Reader, sharing the
@@ -143,7 +148,28 @@ func (w *writer) Close() (err error) {
 		return fmt.Errorf("sync idx %d: %w", w.ext.SegNum, err)
 	}
 
-	return w.store.prepareExtent(w.key, w.index, w.ext, w.epoch)
+	return w.store.prepareExtent(w.key, w.index, w.ext, w.epoch, w.hold)
+}
+
+// Discard releases the writer with no prepared row, so a body that will not
+// be used never exists in the index, even across a crash. The reserved space
+// is tombstoned for compaction to find.
+func (w *writer) Discard() error {
+	if w.closed {
+		return ErrClosedWriter
+	}
+
+	w.closed = true
+	defer w.seg.releaseRef()
+	defer w.seg.writers.Add(-1)
+	defer func() { dropFragWindow(w.held); w.held, w.buf = nil, nil }()
+
+	if err := w.store.index.Update(func(txn *badger.Txn) error {
+		return txn.Set(tombstoneKey(w.ext.SegNum, w.ext.Off), tombstoneValue(w.ext.PSize))
+	}); err != nil {
+		return fmt.Errorf("tombstone discarded extent: %w", err)
+	}
+	return nil
 }
 
 // flush seals each buffered fragment in place under aead, then writes the
