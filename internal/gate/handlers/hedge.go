@@ -124,13 +124,13 @@ type rangeResult struct {
 // reconstruction from the other shards if the owner has not answered within the
 // hedge delay. Both arms run to completion or cancellation and the first usable
 // answer wins, so a stalled node costs the hedge delay rather than the blob
-// client's ten-second envelope.
+// client's ten-second envelope. rebuilt reports that the answer used parity.
 func readRangeHedged(
 	ctx context.Context, bc BlobClient, cfg Config, objectHash [32]byte,
 	place ObjectToShardNodes, shardIdx int, at, length int64,
-) ([]byte, error) {
+) (data []byte, rebuilt bool, err error) {
 	if shardIdx >= len(place.DataShardNodes) {
-		return nil, fmt.Errorf("shard index %d out of range", shardIdx)
+		return nil, false, fmt.Errorf("shard index %d out of range", shardIdx)
 	}
 	owner := place.DataShardNodes[shardIdx]
 
@@ -180,7 +180,7 @@ func readRangeHedged(
 						"owner", owner, "index", shardIdx)
 				}
 
-				return res.data, nil
+				return res.data, res.hedged, nil
 			}
 			if firstErr == nil {
 				firstErr = res.err
@@ -194,11 +194,11 @@ func readRangeHedged(
 			}
 
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		}
 	}
 
-	return nil, fmt.Errorf("range read failed on the owner and on reconstruction: %w", firstErr)
+	return nil, false, fmt.Errorf("range read failed on the owner and on reconstruction: %w", firstErr)
 }
 
 // reconstructRange rebuilds a range of one data shard from the others. Blocks

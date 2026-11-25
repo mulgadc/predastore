@@ -177,6 +177,7 @@ type fakeBlob struct {
 	declaring    func(size int64) error
 	failPutOn    func(index uint32) bool
 	failGetOn    func(index uint32) bool
+	shortGetOn   func(req blob.GetRequest) bool
 	failCommitOn func(index uint32) bool
 
 	// abandonPutOn models a node on a stalling drive: it takes the whole body
@@ -313,6 +314,9 @@ func (b *fakeBlob) Get(_ context.Context, _ config.NodeID, req blob.GetRequest) 
 	data := shard.data
 	if req.RangeStart >= 0 && req.RangeEnd >= 0 {
 		data = data[req.RangeStart : req.RangeEnd+1]
+	}
+	if b.shortGetOn != nil && b.shortGetOn(req) && len(data) > 0 {
+		data = data[:len(data)-1]
 	}
 	return io.NopCloser(&tallyingReader{r: bytes.NewReader(data), n: &b.getBytes}), nil
 }

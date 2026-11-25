@@ -544,7 +544,7 @@ Every shard read names the record's epoch, and a node holding another generation
 
 A shard its owner cannot serve is looked for on the handoff node before it is counted as failed, since a write that could not reach the owner will have put it there. That is one fetch against `K` fetches and a decode, so it is worth asking even though the usual answer is no — and without it a handed-off stripe would be complete only on paper, the bytes existing where the gate never looks.
 
-A `Range` request takes a fast path when the whole range lands inside one data shard, since Reed–Solomon splits data sequentially: that is a single ranged shard read. Anything wider falls back to reconstructing the object and slicing it.
+A `Range` request is served straight from the data shards when it is short: the data shards hold the object's own bytes, so a range inside one block is a single ranged shard read, and a range no longer than one block that crosses block boundaries is one ranged read per block it touches. Each read is hedged: if its owner is slow or fails, the same range is rebuilt from the other shards, and the response reports it in `X-Spx-Degraded`. A read that still fails, or a longer range, goes to the stripe reader, which reads the stripes the range touches and drops the lead-in.
 
 ## DELETE
 
