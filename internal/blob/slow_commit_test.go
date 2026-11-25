@@ -170,6 +170,8 @@ func (w *slowCommitWriter) Close() error {
 	return nil
 }
 
+func (w *slowCommitWriter) Discard() error { return nil }
+
 const (
 	slowServerPort = 6311
 	slowClientPort = 6312

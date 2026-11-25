@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"errors"
+	"io"
 	"testing"
 	"time"
 )
@@ -157,5 +158,34 @@ func TestDeleteEpochDropsAHeldPreparedRow(t *testing.T) {
 	}
 	if _, err := st.Commit(oh, 0, epoch); !errors.Is(err, ErrNotPrepared) {
 		t.Fatalf("Commit after DeleteEpoch = %v, want ErrNotPrepared", err)
+	}
+}
+
+// Discard ends a writer with no prepared row, so a held body that will not be
+// used never reaches the index, and its space is tombstoned.
+func TestDiscardPreparesNothing(t *testing.T) {
+	st, _ := openTestStore(t)
+	oh := [32]byte{0x36}
+	epoch := nextTestEpoch()
+
+	w, err := st.AppendHeld(oh, 0, 4*KiB, epoch)
+	if err != nil {
+		t.Fatalf("append held: %v", err)
+	}
+	// A short body is what a cut-off held put leaves the writer with.
+	if _, err := w.Write(bytes.Repeat([]byte{0xe1}, KiB)); !errors.Is(err, io.EOF) {
+		t.Fatalf("short write = %v, want io.EOF", err)
+	}
+	if err := w.Discard(); err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+	if _, err := st.Commit(oh, 0, epoch); !errors.Is(err, ErrNotPrepared) {
+		t.Fatalf("Commit after Discard = %v, want ErrNotPrepared", err)
+	}
+	if got := len(tombstones(t, st)); got != 1 {
+		t.Fatalf("Discard left %d tombstones, want 1", got)
+	}
+	if err := w.Close(); !errors.Is(err, ErrClosedWriter) {
+		t.Fatalf("Close after Discard = %v, want ErrClosedWriter", err)
 	}
 }

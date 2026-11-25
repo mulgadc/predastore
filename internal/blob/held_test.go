@@ -3,6 +3,7 @@ package blob_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -41,7 +42,7 @@ func TestHeldPutRegistersThenHolds(t *testing.T) {
 }
 
 // An abort that reaches a held writer before its row exists hears Open, and
-// the writer drops what it prepares. A second abort then confirms nothing is
+// the body sent after it prepares nothing. A later abort confirms nothing is
 // left, so the caller learns when undo is complete.
 func TestAbortDuringAnOpenHeldWriterLeavesNoRow(t *testing.T) {
 	c := startBlobNode(t)
@@ -57,8 +58,11 @@ func TestAbortDuringAnOpenHeldWriterLeavesNoRow(t *testing.T) {
 	_, err = p.Send(ctx, bytes.NewReader(body))
 	require.Error(t, err, "a held write aborted while open must not report a prepare")
 
-	require.NoError(t, c.Abort(ctx, epochServerNode, shardAt(1)),
-		"once the writer has closed, abort must answer that nothing is open")
+	// The client can see its stream cut before the node has ended the writer,
+	// so the confirming abort may still find it open for a moment.
+	require.Eventually(t, func() bool {
+		return c.Abort(ctx, epochServerNode, shardAt(1)) == nil
+	}, 5*time.Second, 10*time.Millisecond, "once the writer has ended, abort must answer that nothing is open")
 	require.ErrorIs(t, commit(t, c, 1), blob.ErrNotPrepared)
 }
 
@@ -85,33 +89,55 @@ func TestADuplicateHeldPutLeavesTheFirstIntact(t *testing.T) {
 }
 
 // gatedStore holds a held writer's creation until released, as a node slow to
-// register does, and reports each abort the server sends its store.
+// register does. Its Abort always fails, as a node that crashes before any
+// abort lands, so only a writer that prepares nothing leaves no row.
 type gatedStore struct {
 	*engine.Store
 
-	gate    chan struct{}
-	aborted chan uint64
+	gate  chan struct{}
+	ended chan string
 }
 
 func (s *gatedStore) AppendHeld(key [32]byte, index uint32, size int64, epoch uint64) (engine.Writer, error) {
 	<-s.gate
-	return s.Store.AppendHeld(key, index, size, epoch)
+	w, err := s.Store.AppendHeld(key, index, size, epoch)
+	if err != nil {
+		return nil, err
+	}
+	return &endingWriter{Writer: w, ended: s.ended}, nil
 }
 
-func (s *gatedStore) Abort(key [32]byte, index uint32, epoch uint64) error {
-	err := s.Store.Abort(key, index, epoch)
-	s.aborted <- epoch
+func (s *gatedStore) Abort([32]byte, uint32, uint64) error {
+	return errors.New("node crashed before the abort")
+}
+
+// endingWriter reports how the server ended a writer.
+type endingWriter struct {
+	engine.Writer
+
+	ended chan string
+}
+
+func (w *endingWriter) Close() error {
+	err := w.Writer.Close()
+	w.ended <- "close"
 	return err
 }
 
-// A node that registers after the gate stops waiting gets no body, so the
-// writer it opens late prepares nothing that could outlive the write. The same
-// wait is what a node that predates held writes meets.
+func (w *endingWriter) Discard() error {
+	err := w.Writer.Discard()
+	w.ended <- "discard"
+	return err
+}
+
+// A node that registers after the gate stops waiting gets no body, and its
+// writer prepares no row at all, so nothing is left even if no abort ever
+// lands. The same wait is what a node that predates held writes meets.
 func TestLateRegistrationGetsNoBody(t *testing.T) {
 	es, err := engine.Open(t.TempDir(), engine.WithAEAD(storetest.TestAEAD()), engine.WithFreeSpaceWatermark(0, 0))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = es.Close() })
-	store := &gatedStore{Store: es, gate: make(chan struct{}), aborted: make(chan uint64, 4)}
+	store := &gatedStore{Store: es, gate: make(chan struct{}), ended: make(chan string, 4)}
 	c := startStoreNodeWithin(t, store, 200*time.Millisecond)
 	ctx := context.Background()
 	body := []byte("registered too late")
@@ -121,13 +147,52 @@ func TestLateRegistrationGetsNoBody(t *testing.T) {
 
 	close(store.gate)
 	select {
-	case epoch := <-store.aborted:
-		assert.Equal(t, uint64(1), epoch)
+	case how := <-store.ended:
+		assert.Equal(t, "discard", how, "a writer with no body must be discarded, not prepared")
 	case <-time.After(5 * time.Second):
-		t.Fatal("the late writer never discarded its extent")
+		t.Fatal("the late writer never ended")
 	}
 	_, err = c.Commit(ctx, 1, blob.CommitRequest{Key: epochKey(), Index: epochTestShardIndex, Epoch: 1})
 	require.ErrorIs(t, err, blob.ErrNotPrepared, "a late writer must leave no prepared row")
+}
+
+// An abort cuts off a held writer whose body has stalled, so the writer ends
+// at once and a later abort confirms nothing is left.
+func TestAbortCutsOffAStalledHeldWriter(t *testing.T) {
+	c := startBlobNode(t)
+	ctx := context.Background()
+	body := []byte("a body that never arrives")
+
+	p, err := c.OpenHeld(ctx, epochServerNode, heldReq(1, body))
+	require.NoError(t, err)
+	t.Cleanup(p.Abandon)
+
+	require.ErrorIs(t, c.Abort(ctx, epochServerNode, shardAt(1)), blob.ErrWriterOpen)
+	require.Eventually(t, func() bool {
+		return c.Abort(ctx, epochServerNode, shardAt(1)) == nil
+	}, 5*time.Second, 10*time.Millisecond, "the stalled writer must end once aborted")
+	require.ErrorIs(t, commit(t, c, 1), blob.ErrNotPrepared)
+}
+
+// A get that names a retained generation at a position whose live row is gone
+// serves that generation, rather than trying to commit it.
+func TestGetServesARetainedEpochWithNoLiveRow(t *testing.T) {
+	c := startBlobNode(t)
+	ctx := context.Background()
+	first := []byte("generation one")
+
+	put(t, c, 1, first)
+	require.NoError(t, commit(t, c, 1))
+	put(t, c, 2, []byte("generation two"))
+	require.NoError(t, commit(t, c, 2))
+
+	resp, err := c.DeleteEpoch(ctx, epochServerNode, shardAt(2))
+	require.NoError(t, err)
+	require.True(t, resp.Deleted)
+
+	got, err := get(t, c, 1)
+	require.NoError(t, err)
+	assert.Equal(t, first, got)
 }
 
 // A get for an epoch at a position with no live row is a record whose writer

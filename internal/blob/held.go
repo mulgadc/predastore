@@ -10,27 +10,27 @@ type heldKey struct {
 }
 
 // heldWriters tracks the held writes that have not prepared their row yet.
-// An abort that reaches one marks it, since there is no row to drop, and the
-// writer discards its extent when it closes.
+// An abort that reaches one marks it and cuts off its body, since there is no
+// row to drop, and the writer then prepares nothing.
 type heldWriters struct {
 	mu      sync.Mutex
-	open    map[heldKey]bool
+	open    map[heldKey]func()
 	aborted map[heldKey]bool
 }
 
 func newHeldWriters() *heldWriters {
-	return &heldWriters{open: map[heldKey]bool{}, aborted: map[heldKey]bool{}}
+	return &heldWriters{open: map[heldKey]func(){}, aborted: map[heldKey]bool{}}
 }
 
-// register records a held writer as open. It reports false when one is
-// already open for the same epoch, which is a second put of the same shard.
-func (h *heldWriters) register(k heldKey) bool {
+// register records a held writer as open, with the action that ends its body
+// read. It reports false when one is already open for the same epoch.
+func (h *heldWriters) register(k heldKey, cut func()) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.open[k] {
+	if _, ok := h.open[k]; ok {
 		return false
 	}
-	h.open[k] = true
+	h.open[k] = cut
 	return true
 }
 
@@ -45,14 +45,26 @@ func (h *heldWriters) finish(k heldKey) (aborted bool) {
 	return aborted
 }
 
-// markAborted marks an open writer and reports whether one was open. When it
-// reports false, no held writer for the epoch can still prepare a row.
+// isAborted reports whether an abort has marked the open writer.
+func (h *heldWriters) isAborted(k heldKey) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.aborted[k]
+}
+
+// markAborted marks an open writer, cuts off its body, and reports whether
+// one was open. When it reports false, no held writer for the epoch can
+// still prepare a row.
 func (h *heldWriters) markAborted(k heldKey) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if !h.open[k] {
+	cut, ok := h.open[k]
+	if !ok {
 		return false
 	}
-	h.aborted[k] = true
+	if !h.aborted[k] {
+		h.aborted[k] = true
+		cut()
+	}
 	return true
 }

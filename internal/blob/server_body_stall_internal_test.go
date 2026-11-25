@@ -109,6 +109,7 @@ type failingWriter struct {
 
 func (w *failingWriter) Write(p []byte) (int, error) { return len(p), nil }
 func (w *failingWriter) Close() error                { w.closed.Store(true); return nil }
+func (w *failingWriter) Discard() error              { w.closed.Store(true); return nil }
 
 func (w *failingWriter) ReadFrom(io.Reader) (int64, error) {
 	return 0, errors.New("connection reset")

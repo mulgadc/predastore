@@ -158,6 +158,9 @@ type Reader interface {
 type Writer interface {
 	io.WriteCloser
 	io.ReaderFrom
+	// Discard ends the writer without preparing its extent, so nothing it
+	// wrote ever becomes reachable. Use it in place of Close, not after.
+	Discard() error
 }
 
 var (

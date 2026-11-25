@@ -348,7 +348,9 @@ The node registers the writer in memory and sends a `Registered` envelope before
 A node that predates `Hold` sends no `Registered`, so the client stops waiting after the envelope bound, resets the stream with no body sent, and reports `ErrHoldUnsupported`.
 The final envelope carries `Holding`, which confirms that the prepared row is held.
 The age sweep drops an unheld prepared row that is older than 30 minutes, and it never drops a held one: only `Commit`, `Abort` or `DeleteEpoch` removes it.
-An `Abort` that arrives while the held writer is still open answers `Open`, and the writer drops its row when it closes.
+An `Abort` that arrives while the held writer is still open answers `Open` and cuts off the body, and the writer then ends with no prepared row.
+A held writer that ends without its whole body prepares no row, so a crash at any point leaves nothing for the sweep to keep.
+A held body that stops arriving for `BodyIdleTimeout` ends the write.
 A second `Abort` then answers without `Open`, which tells the caller that no row is left.
 
 `DeleteEpoch` removes the live, prepared and retained rows of one epoch and no other generation.
