@@ -26,12 +26,23 @@ func (b errBody) Close() error             { return nil }
 func TestCreateBucketRejectsUnreadableConfiguration(t *testing.T) {
 	t.Parallel()
 
+	digests := &sigv4.ContentSHA256MismatchError{Client: hexSum([]byte("signed")), Computed: hexSum([]byte("sent"))}
+
 	tests := []struct {
-		name string
-		err  error
-		code string
+		name         string
+		err          error
+		code         string
+		wantClient   string
+		wantComputed string
 	}{
 		{name: "payload digest mismatch", err: sigv4.ErrContentSHA256Mismatch, code: "XAmzContentSHA256Mismatch"},
+		{
+			name:         "payload digest mismatch with digests",
+			err:          digests,
+			code:         "XAmzContentSHA256Mismatch",
+			wantClient:   digests.Client,
+			wantComputed: digests.Computed,
+		},
 		{name: "read failure", err: errors.New("connection reset by peer"), code: "MalformedXML"},
 	}
 
@@ -53,6 +64,8 @@ func TestCreateBucketRejectsUnreadableConfiguration(t *testing.T) {
 			var s3err S3Error
 			require.NoError(t, xml.NewDecoder(w.Body).Decode(&s3err))
 			assert.Equal(t, tc.code, s3err.Code)
+			assert.Equal(t, tc.wantClient, s3err.ClientComputedContentSHA256)
+			assert.Equal(t, tc.wantComputed, s3err.S3ComputedContentSHA256)
 		})
 	}
 }
