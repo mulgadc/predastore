@@ -563,12 +563,9 @@ func (s *Server) handleRelease(ctx context.Context, h Request, stream transport.
 	return respond(stream, &Response{})
 }
 
-// handleDeleteEpoch removes one epoch of a shard. It refuses epoch zero,
-// which would otherwise match the zero a legacy row carries.
+// handleDeleteEpoch removes one epoch of a shard. Epoch zero is valid here:
+// it names a row written before epochs, and no write path makes another.
 func (s *Server) handleDeleteEpoch(ctx context.Context, h Request, stream transport.Stream) error {
-	if h.Epoch == 0 {
-		return respond(stream, &Response{Err: "no write epoch specified"})
-	}
 	deleted, err := s.store.DeleteEpoch(h.Key, h.Index, h.Epoch)
 	if err != nil {
 		return respond(stream, &Response{Err: err.Error()})

@@ -195,6 +195,39 @@ func TestGetServesARetainedEpochWithNoLiveRow(t *testing.T) {
 	assert.Equal(t, first, got)
 }
 
+// A row written before epochs carries epoch zero, and DeleteEpoch at zero is
+// how a delete reclaims it. It leaves a later generation at another position.
+func TestDeleteEpochZeroReclaimsAPreEpochRow(t *testing.T) {
+	es, err := engine.Open(t.TempDir(), engine.WithAEAD(storetest.TestAEAD()), engine.WithFreeSpaceWatermark(0, 0))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = es.Close() })
+	key := epochKey()
+	for index, epoch := range map[uint32]uint64{0: 0, 1: 7} {
+		w, err := es.Append(key, index, 4, epoch)
+		require.NoError(t, err)
+		_, err = w.Write([]byte("body"))
+		require.NoError(t, err)
+		require.NoError(t, w.Close())
+		_, err = es.Commit(key, index, epoch)
+		require.NoError(t, err)
+	}
+	c := startStoreNode(t, es)
+	ctx := context.Background()
+
+	resp, err := c.DeleteEpoch(ctx, 1, blob.CommitRequest{Key: key, Index: 0, Epoch: 0})
+	require.NoError(t, err)
+	assert.True(t, resp.Deleted, "epoch zero must reclaim the row written before epochs")
+	_, err = c.Stat(ctx, 1, blob.StatRequest{Key: key, Index: 0})
+	require.ErrorIs(t, err, blob.ErrNotFound)
+
+	resp, err = c.DeleteEpoch(ctx, 1, blob.CommitRequest{Key: key, Index: 1, Epoch: 0})
+	require.NoError(t, err)
+	assert.False(t, resp.Deleted, "epoch zero must not match a later generation")
+	stat, err := c.Stat(ctx, 1, blob.StatRequest{Key: key, Index: 1})
+	require.NoError(t, err)
+	assert.Equal(t, uint64(7), stat.Epoch)
+}
+
 // closingStore holds a held writer inside Close until released, as a slow
 // fsync does, and reports when the close has begun.
 type closingStore struct {
@@ -300,8 +333,7 @@ func TestGetOfANewKeyAtAnUnpreparedEpochCommitsNothing(t *testing.T) {
 	require.NoError(t, commit(t, c, 5), "the other epoch must stay prepared for its writer")
 }
 
-// DeleteEpoch over the wire removes the named generation and refuses epoch
-// zero, which would match a legacy row.
+// DeleteEpoch over the wire removes the named generation and nothing else.
 func TestDeleteEpochRemovesOnlyTheNamedEpochOverTheWire(t *testing.T) {
 	c := startBlobNode(t)
 	ctx := context.Background()
@@ -322,6 +354,7 @@ func TestDeleteEpochRemovesOnlyTheNamedEpochOverTheWire(t *testing.T) {
 	_, err = get(t, c, 0)
 	require.ErrorIs(t, err, blob.ErrNotFound)
 
-	_, err = c.DeleteEpoch(ctx, epochServerNode, shardAt(0))
-	require.Error(t, err, "epoch zero must be refused")
+	resp, err = c.DeleteEpoch(ctx, epochServerNode, shardAt(0))
+	require.NoError(t, err)
+	assert.False(t, resp.Deleted, "epoch zero must match only a row written before epochs")
 }

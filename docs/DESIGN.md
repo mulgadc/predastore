@@ -355,6 +355,7 @@ A held body that stops arriving for `BodyIdleTimeout` ends the write.
 A second `Abort` then answers without `Open`, which tells the caller that no row is left.
 
 `DeleteEpoch` removes the live, prepared and retained rows of one epoch and no other generation.
+Epoch zero is valid and names a row written before epochs, since no write path makes another row at zero.
 A node that predates it closes the stream with no envelope, which the client reports as an error.
 
 ## The engine
