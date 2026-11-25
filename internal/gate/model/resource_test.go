@@ -18,6 +18,7 @@ func TestObjectValidateKey(t *testing.T) {
 		{"truncated sequence", []byte{0xE2, 0x82}, "valid UTF-8"},
 		{"invalid continuation byte", []byte{0xE2, 0x28, 0xA1}, "valid UTF-8"},
 		{"mixed valid and invalid", []byte{'a', 0xFF, 'b'}, "valid UTF-8"},
+		{"other control characters", []byte("a\x01\x1f\x7fb"), ""},
 	}
 
 	for _, tt := range tests {
@@ -30,6 +31,32 @@ func TestObjectValidateKey(t *testing.T) {
 				assert.Contains(t, err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+// S3 answers a key holding NUL with 400 BadRequest wherever the NUL falls.
+// Verifies: Q-68.
+func TestObjectValidateRefusesNUL(t *testing.T) {
+	for _, key := range []string{"\x00a", "a\x00X", "a\x00"} {
+		err := Object{Bucket: Bucket{Name: "valid-bucket"}, Key: key}.Validate()
+		var s3err *S3Error
+		if assert.ErrorAs(t, err, &s3err, "key %q", key) {
+			assert.Equal(t, ErrBadRequest, s3err.Code, "key %q", key)
+			assert.Equal(t, 400, s3err.StatusCode, "key %q", key)
+		}
+	}
+}
+
+// A key that breaks another key rule as well as holding NUL keeps that rule's
+// InvalidKey, so the NUL refusal changes the outcome of no other key.
+// Verifies: Q-68.
+func TestObjectValidateKeepsInvalidKeyBeforeNUL(t *testing.T) {
+	for _, key := range []string{"a/../b\x00", "./a\x00", "a\x00/", "a\x00\xff"} {
+		err := Object{Bucket: Bucket{Name: "valid-bucket"}, Key: key}.Validate()
+		var s3err *S3Error
+		if assert.ErrorAs(t, err, &s3err, "key %q", key) {
+			assert.Equal(t, ErrInvalidKey, s3err.Code, "key %q", key)
+		}
 	}
 }
 

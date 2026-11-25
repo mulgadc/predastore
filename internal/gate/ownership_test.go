@@ -84,8 +84,9 @@ func (p *stubCredProvider) Close() {}
 // set every read fails with it, which is how the infra-error branch of
 // resolveBucketMetadata is exercised.
 type fakeMeta struct {
-	rows map[string][]byte
-	err  error
+	rows   map[string][]byte
+	err    error
+	writes int // Put and Delete calls, counted even when no row changes
 }
 
 func (f *fakeMeta) Get(_ context.Context, key string) ([]byte, error) {
@@ -100,6 +101,7 @@ func (f *fakeMeta) Get(_ context.Context, key string) ([]byte, error) {
 }
 
 func (f *fakeMeta) Put(_ context.Context, key string, value []byte) error {
+	f.writes++
 	if f.err != nil {
 		return f.err
 	}
@@ -116,6 +118,7 @@ func (f *fakeMeta) Swap(ctx context.Context, key string, value []byte) ([]byte, 
 }
 
 func (f *fakeMeta) Delete(_ context.Context, key string) error {
+	f.writes++
 	if f.err != nil {
 		return f.err
 	}

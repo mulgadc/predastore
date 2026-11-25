@@ -94,5 +94,11 @@ func (o Object) Validate() error {
 		}
 	}
 
+	// S3 refuses NUL, and storage names use it to separate a key from a
+	// version id, so a key holding one could name another key's version.
+	if strings.IndexByte(o.Key, 0) >= 0 {
+		return NewS3Error(ErrBadRequest, "Bad Request", 400).WithResource(o.Key)
+	}
+
 	return nil
 }

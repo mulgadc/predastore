@@ -36,6 +36,7 @@ const (
 	ErrInvalidRequest          S3ErrorCode = "InvalidRequest"
 	ErrMalformedXML            S3ErrorCode = "MalformedXML"
 	ErrMetadataTooLarge        S3ErrorCode = "MetadataTooLarge"
+	ErrBadRequest              S3ErrorCode = "BadRequest"
 )
 
 // S3Error represents a typed S3 error with code and message.
