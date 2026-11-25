@@ -80,18 +80,34 @@ func evalPreconditions(etag string, hasETag bool, modified time.Time, hasModifie
 // does, the value is split on quotes, commas, spaces and tabs, and any piece
 // equal to the ETag or "*" matches, so no value is rejected as malformed.
 func etagListMatches(list, etag string, hasETag bool) bool {
+	if hasPiece(list, "*") {
+		return true
+	}
 	want := strings.Trim(etag, `"`)
-	for start := 0; start < len(list); {
-		end := start
-		for end < len(list) && !isETagSeparator(list[end]) {
-			end++
+	return hasETag && want != "" && !strings.ContainsAny(want, etagSeparators) && hasPiece(list, want)
+}
+
+const etagSeparators = "\", \t"
+
+// hasPiece reports whether piece occurs in list bounded by separators or the
+// ends, which is splitting on them without walking every byte. A hit without a
+// leading separator resumes after the next separator, so the search stays linear.
+func hasPiece(list, piece string) bool {
+	for off := 0; ; {
+		i := strings.Index(list[off:], piece)
+		if i < 0 {
+			return false
 		}
-		if tag := list[start:end]; tag == "*" || (hasETag && tag != "" && tag == want) {
+		start, end := off+i, off+i+len(piece)
+		if (start == 0 || isETagSeparator(list[start-1])) && (end == len(list) || isETagSeparator(list[end])) {
 			return true
 		}
-		start = end + 1
+		next := strings.IndexAny(list[start:], etagSeparators)
+		if next < 0 {
+			return false
+		}
+		off = start + next + 1
 	}
-	return false
 }
 
 func isETagSeparator(c byte) bool {

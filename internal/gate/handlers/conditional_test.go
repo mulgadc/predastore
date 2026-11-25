@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"math/rand/v2"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -85,4 +87,35 @@ func TestPreconditionHeaderForms(t *testing.T) {
 	h.Add("If-Match", `"other"`)
 	h.Add("If-Match", `"e"`)
 	assert.Equal(t, preconditionsHold, evalPreconditions(`"e"`, true, modified, true, readPreconditions(h)))
+}
+
+// The substring search answers as splitting the list on separators would, for
+// lists built from separators, "*", tag bytes and the ETag in any order.
+// Verifies: Q-68.
+func TestETagListSearchMatchesSplitting(t *testing.T) {
+	split := func(list, etag string, hasETag bool) bool {
+		want := strings.Trim(etag, `"`)
+		for _, tag := range strings.FieldsFunc(list, func(r rune) bool { return strings.ContainsRune(etagSeparators, r) }) {
+			if tag == "*" || (hasETag && tag == want) {
+				return true
+			}
+		}
+		return false
+	}
+	parts := []string{`"`, ",", " ", "\t", "*", "a", "b", "ab", "aab", "abab", "**", "x*"}
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 200_000 {
+		var list strings.Builder
+		for range rng.IntN(8) {
+			list.WriteString(parts[rng.IntN(len(parts))])
+		}
+		for _, etag := range []string{`"ab"`, "ab", `"a"`, "a b", ""} {
+			for _, has := range []bool{true, false} {
+				want := split(list.String(), etag, has)
+				if got := etagListMatches(list.String(), etag, has); got != want {
+					t.Fatalf("list %q, etag %q, hasETag %v: search %v, splitting %v", list.String(), etag, has, got, want)
+				}
+			}
+		}
+	}
 }
