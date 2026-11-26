@@ -96,6 +96,8 @@ type MetaRequest struct {
 	// Leader asks for a read only the leader may answer, and only once it has
 	// applied everything committed. A follower refuses with not-leader.
 	Leader bool `json:"leader,omitempty"`
+	// Last requests the greatest key under the prefix on a leader scan.
+	Last bool `json:"last,omitempty"`
 }
 
 func (h *MetaRequest) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
@@ -113,6 +115,8 @@ type MetaResponse struct {
 	Value []byte `json:"value,omitempty"`
 	// Items is the payload for scan responses.
 	Items []ScanItem `json:"items,omitempty"`
+	// Last confirms that the requested reverse lookup ran on the leader.
+	Last bool `json:"last,omitempty"`
 }
 
 // ScanItem is one key-value pair in a scan response. Key is bytes for the same

@@ -547,6 +547,42 @@ func (f *FSM) ScanFrom(prefix, after string, fn func(key string, value []byte) e
 	})
 }
 
+// LastKey returns the greatest key under prefix with one indexed reverse seek.
+func (f *FSM) LastKey(prefix string) (string, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	var key string
+	err := f.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Reverse = true
+		opts.PrefetchValues = false
+		iter := txn.NewIterator(opts)
+		defer iter.Close()
+
+		upper := prefixUpperBound(prefix)
+		iter.Seek(upper)
+		if upper != nil && iter.Valid() && bytes.Equal(iter.Item().Key(), upper) {
+			iter.Next()
+		}
+		if iter.ValidForPrefix([]byte(prefix)) {
+			key = string(iter.Item().Key())
+		}
+		return nil
+	})
+	return key, err
+}
+
+func prefixUpperBound(prefix string) []byte {
+	upper := []byte(prefix)
+	for i := len(upper) - 1; i >= 0; i-- {
+		if upper[i] != 0xff {
+			upper[i]++
+			return upper[:i+1]
+		}
+	}
+	return nil
+}
+
 // snapshotMagic marks a stream whose frames are in key order. Restoring by
 // merge is only correct against a sorted stream, and two unsorted formats are
 // already in the wild: the legacy JSON map, and the frame stream this file

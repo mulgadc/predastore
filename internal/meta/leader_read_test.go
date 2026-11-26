@@ -33,6 +33,13 @@ func TestLeaderReadIsServedByTheLeader(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, items, 1)
 	assert.Equal(t, "objects/b", items[0].Key)
+
+	last, err := cli.LeaderLastKey(ctx, "objects/")
+	require.NoError(t, err)
+	assert.Equal(t, "objects/b", last)
+	last, err = cli.LeaderLastKey(ctx, "empty/")
+	require.NoError(t, err)
+	assert.Empty(t, last)
 }
 
 // A replica that is not the leader must refuse rather than answer from a local
@@ -46,6 +53,8 @@ func TestLeaderReadIsRefusedWithoutALeader(t *testing.T) {
 	assert.NotErrorIs(t, err, meta.ErrNotFound, "a follower's not-found must not be trusted")
 
 	_, err = cli.LeaderScanFrom(ctx, "objects/", "", 10)
+	require.ErrorIs(t, err, meta.ErrNoLeaderRead)
+	_, err = cli.LeaderLastKey(ctx, "objects/")
 	require.ErrorIs(t, err, meta.ErrNoLeaderRead)
 
 	// The ordinary read is unchanged: it still answers from the local store.

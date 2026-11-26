@@ -115,6 +115,20 @@ func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport
 	if refused, err := s.refuseLeaderRead(h, stream); refused {
 		return err
 	}
+	if h.Last {
+		if !h.Leader || len(h.Key) == 0 || len(h.After) != 0 || h.Limit != 1 {
+			return respond(stream, &MetaResponse{Err: "invalid last-key scan"})
+		}
+		key, err := s.fsm.LastKey(string(h.Key))
+		if err != nil {
+			return respond(stream, &MetaResponse{Err: err.Error()})
+		}
+		response := MetaResponse{Last: true}
+		if key != "" {
+			response.Items = []ScanItem{{Key: []byte(key)}}
+		}
+		return respond(stream, &response)
+	}
 	// errScanLimit stops iteration once the limit is reached without
 	// surfacing an error to the client.
 	errScanLimit := errors.New("scan limit reached")
