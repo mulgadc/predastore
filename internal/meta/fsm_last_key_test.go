@@ -152,6 +152,18 @@ func TestRestoreRejectsAnEarlierLocalSnapshotCapture(t *testing.T) {
 		Type: CommandPut, Key: []byte(key), Value: []byte("acknowledged"),
 	})))
 
+	store, err := raft.NewFileSnapshotStore(t.TempDir(), 1, io.Discard)
+	require.NoError(t, err)
+	prior, err := fsm.Snapshot()
+	require.NoError(t, err)
+	defer prior.Release()
+	goodSink, err := store.Create(1, 1, 1, raft.Configuration{}, 0, nil)
+	require.NoError(t, err)
+	require.NoError(t, prior.Persist(goodSink))
+
+	require.Nil(t, fsm.Apply(commandLog(t, 2, Command{
+		Type: CommandPut, Key: []byte(key), Value: []byte("acknowledged later"),
+	})))
 	captured, err := fsm.Snapshot()
 	require.NoError(t, err)
 	defer captured.Release()
@@ -159,9 +171,15 @@ func TestRestoreRejectsAnEarlierLocalSnapshotCapture(t *testing.T) {
 	_, err = fsm.Get(key)
 	require.ErrorIs(t, err, badger.ErrKeyNotFound, "failed legacy restore must have changed the store")
 
-	sink := &mockSnapshotSink{}
-	require.Error(t, captured.Persist(sink), "a capture invalidated by restore must never be published")
-	require.Empty(t, sink.buf, "validation must precede writing any snapshot bytes")
+	staleSink, err := store.Create(1, 2, 1, raft.Configuration{}, 0, nil)
+	require.NoError(t, err)
+	persistErr := captured.Persist(staleSink)
+	snapshots, err := store.List()
+	require.NoError(t, err)
+	require.Len(t, snapshots, 1)
+	require.Equal(t, goodSink.ID(), snapshots[0].ID,
+		"a stale capture must not publish and reap the previous recovery point")
+	require.Error(t, persistErr)
 }
 
 type blockingMetaSnapshotSink struct {
