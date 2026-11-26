@@ -40,6 +40,8 @@ const (
 	ErrMalformedXML            S3ErrorCode = "MalformedXML"
 	ErrMetadataTooLarge        S3ErrorCode = "MetadataTooLarge"
 	ErrBadRequest              S3ErrorCode = "BadRequest"
+	ErrBadDigest               S3ErrorCode = "BadDigest"
+	ErrInvalidDigest           S3ErrorCode = "InvalidDigest"
 )
 
 // S3Error represents a typed S3 error with code and message.
@@ -185,6 +187,14 @@ var (
 	ErrMetadataTooLargeError = &S3Error{
 		Code:       ErrMetadataTooLarge,
 		Message:    "Your metadata headers exceed the maximum allowed metadata size.",
+		StatusCode: http.StatusBadRequest,
+	}
+
+	// ErrBadDigestCRC64NVMEError is returned when a body does not match the
+	// x-amz-checksum-crc64nvme header it was sent with, worded as S3 words it.
+	ErrBadDigestCRC64NVMEError = &S3Error{
+		Code:       ErrBadDigest,
+		Message:    "The CRC64NVME you specified did not match the calculated checksum.",
 		StatusCode: http.StatusBadRequest,
 	}
 
