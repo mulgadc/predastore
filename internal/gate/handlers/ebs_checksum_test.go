@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net/http"
 	"testing"
 
@@ -60,6 +61,7 @@ func TestEBSChunkPutWithAWrongCRC64NVMEIsRefusedAndStoresNothing(t *testing.T) {
 		"X-Amz-Checksum-Crc64nvme": {crc64Header([]byte("other bytes"))},
 	})
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Contains(t, readAll(t, resp), "<Code>BadDigest</Code>")
 
 	got := g.get("c1")
 	require.Equal(t, http.StatusOK, got.Code)
@@ -83,4 +85,44 @@ func TestOnlyBothHeadersTogetherReplaceTheMD5ETag(t *testing.T) {
 			assert.Equal(t, md5ETag(body), resp.Header.Get("ETag"))
 		})
 	}
+
+	t.Run("an aws-chunked body with both headers keeps the trailer path", func(t *testing.T) {
+		g := newRealStoreGate(t, rsProfiles[0])
+		payload := string(body)
+		resp := ebsPut(g, "o", []byte(framedBodyChecksum(payload, crc64Trailer(payload))), http.Header{
+			"Content-Encoding":             {"aws-chunked"},
+			"X-Amz-Decoded-Content-Length": {fmt.Sprint(len(payload))},
+			"X-Amz-Trailer":                {"x-amz-checksum-crc64nvme"},
+			"X-Spinifex-Ebs":               {"true"},
+			"X-Amz-Checksum-Crc64nvme":     {crc64Header(body)},
+		})
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, md5ETag(body), resp.Header.Get("ETag"))
+	})
+}
+
+func TestEBSChunkPutWithAMalformedCRC64NVMEIsRefusedBeforeAnyShard(t *testing.T) {
+	for name, value := range map[string]string{
+		"not base64":  "%%%",
+		"not 8 bytes": base64.StdEncoding.EncodeToString([]byte{1, 2, 3, 4}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := newRealStoreGate(t, rsProfiles[0])
+			g.bc.arm(shardFaults{failPut: []uint32{0, 1, 2}})
+			resp := ebsPut(g, "c1", []byte("chunk"), http.Header{
+				"X-Spinifex-Ebs":           {"true"},
+				"X-Amz-Checksum-Crc64nvme": {value},
+			})
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Contains(t, readAll(t, resp), "<Code>InvalidDigest</Code>",
+				"refused before placement, so the failing shards are never reached")
+		})
+	}
+}
+
+func readAll(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	b, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return string(b)
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -77,7 +78,15 @@ func BenchmarkPartETagHasher(b *testing.B) {
 // process CPU each PUT costs. The ebs mode sends the chunk as viperblock does,
 // with its CRC64NVME and the EBS opt-in header.
 func BenchmarkPutObjectETagHash(b *testing.B) {
-	body := bytes.Repeat([]byte("x"), 4<<20+10)
+	for _, sz := range []struct {
+		name string
+		size int
+	}{{"4MiB", 4<<20 + 10}, {"32MiB", 32 << 20}} {
+		benchPutObjectETagHash(b, sz.name, bytes.Repeat([]byte("x"), sz.size))
+	}
+}
+
+func benchPutObjectETagHash(b *testing.B, size string, body []byte) {
 	sum := make([]byte, 8)
 	binary.BigEndian.PutUint64(sum, crc64nvme.Checksum(body))
 	modes := []struct {
@@ -92,7 +101,7 @@ func BenchmarkPutObjectETagHash(b *testing.B) {
 	}
 	for _, mode := range modes {
 		for _, streams := range []int{1, 16} {
-			b.Run(fmt.Sprintf("RS(2,1)/4MiB/%s/streams=%d", mode.name, streams), func(b *testing.B) {
+			b.Run(fmt.Sprintf("RS(2,1)/%s/%s/streams=%d", size, mode.name, streams), func(b *testing.B) {
 				quietLogs(b)
 				g := newRealStoreGate(b, rsProfiles[0])
 				h := PutObject(g.mc, g.bc, g.ring, g.cache, g.cfg)
@@ -104,6 +113,37 @@ func BenchmarkPutObjectETagHash(b *testing.B) {
 						b.Errorf("put: %d %s", rr.Code, rr.Body.String())
 					}
 				})
+			})
+		}
+	}
+}
+
+// BenchmarkPutHash is the one thing the ebs mode changes, the hash the PUT tee
+// feeds, up to the 5 GiB PutObject maximum: one 32 KiB buffer streamed through
+// MD5 and through CRC64NVME, so no body that size is allocated.
+func BenchmarkPutHash(b *testing.B) {
+	piece := bytes.Repeat([]byte("x"), 32<<10)
+	hashes := []struct {
+		name string
+		new  func() hash.Hash
+	}{
+		{"md5", func() hash.Hash { return model.NewPartETagHasher() }},
+		{"crc64nvme", func() hash.Hash { return crc64nvme.New() }},
+	}
+	for _, sz := range []struct {
+		name string
+		size int64
+	}{{"4MiB", 4 << 20}, {"32MiB", 32 << 20}, {"5GiB", model.MaxPutObjectSize}} {
+		for _, h := range hashes {
+			b.Run(sz.name+"/"+h.name, func(b *testing.B) {
+				b.SetBytes(sz.size)
+				for range b.N {
+					d := h.new()
+					for n := int64(0); n < sz.size; n += int64(len(piece)) {
+						_, _ = d.Write(piece[:min(int64(len(piece)), sz.size-n)])
+					}
+					_ = d.Sum(nil)
+				}
 			})
 		}
 	}
