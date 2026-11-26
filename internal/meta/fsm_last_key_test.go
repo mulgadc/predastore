@@ -142,3 +142,22 @@ func TestFailedRestoreCannotBecomeANewSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	recovered.Release()
 }
+
+func TestRestoreRejectsAnEarlierLocalSnapshotCapture(t *testing.T) {
+	key := testHeadPrefix + "1"
+	fsm := NewFSM(newTestDB(t))
+	require.Nil(t, fsm.Apply(commandLog(t, 1, Command{
+		Type: CommandPut, Key: []byte(key), Value: []byte("acknowledged"),
+	})))
+
+	captured, err := fsm.Snapshot()
+	require.NoError(t, err)
+	defer captured.Release()
+	require.Error(t, fsm.Restore(io.NopCloser(bytes.NewReader([]byte("{")))))
+	_, err = fsm.Get(key)
+	require.ErrorIs(t, err, badger.ErrKeyNotFound, "failed legacy restore must have changed the store")
+
+	sink := &mockSnapshotSink{}
+	require.Error(t, captured.Persist(sink), "a capture invalidated by restore must never be published")
+	require.Empty(t, sink.buf, "validation must precede writing any snapshot bytes")
+}
