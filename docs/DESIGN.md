@@ -528,6 +528,8 @@ The holder is **derived and never recorded**: it is `ring.Nodes(hash, K+M+1)[K+M
 
 Only the shards that actually prepared are committed or aborted. Committing a shard that never prepared is refused, and aborting one would ask a node to discard the generation it is still serving.
 
+**The ETag is the MD5 of the body**, teed off the read that feeds the shards. A plain body sent with both `X-Spinifex-Ebs: true` and `x-amz-checksum-crc64nvme` is checked with CRC64NVME instead and hashed with nothing else: viperblock sends its chunks that way and never reads an ETag, and MD5 is the slowest step of the write at about 400 MB/s a core. The object's ETag is then the CRC64NVME and the length in hex, not an MD5; a mismatch fails the write with `BadDigest` before the commit, and a malformed value with `InvalidDigest` before any shard is placed. Either header alone, or an `aws-chunked` body, keeps the MD5 ETag, because the AWS CLI sends CRC64NVME by default.
+
 If any node reported nearfull pressure, the response also carries `X-Predastore-Pool-Pressure: nearfull`; a node that rejected outright surfaces as 507 `InsufficientStorage`.
 
 **Ordering matters.** Shards are durable before metadata. A crash between the two leaves shards nothing points at (reclaimed by compaction only once something tombstones them — see §15); a crash the other way round would leave metadata pointing at data that was never written.

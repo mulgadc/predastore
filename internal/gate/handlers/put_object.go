@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/minio/crc64nvme"
 	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/gate/chunked"
 	"github.com/mulgadc/predastore/internal/gate/model"
@@ -77,6 +79,12 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 
+		wantCRC, ebs, err := ebsChecksum(r, dec != nil)
+		if err != nil {
+			HandleError(w, r, err)
+			return
+		}
+
 		// Placement, and the write epoch every shard is stamped with, are fixed
 		// before the first byte moves: the record the read path will dial has to
 		// be the same list the shards were written to.
@@ -88,7 +96,15 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		// The ETag is MD5 over the body, teed off the read the write path
 		// already performs rather than a second pass over a buffered copy.
-		digest := model.NewPartETagHasher()
+		// An EBS chunk is checked with CRC64NVME instead and pays for no MD5.
+		var digest hash.Hash
+		var crc hash.Hash64
+		if ebs {
+			crc = crc64nvme.New()
+			digest = crc
+		} else {
+			digest = model.NewPartETagHasher()
+		}
 
 		written, err := writeObject(ctx, bc, cfg, ring, io.TeeReader(body, digest), size, objectHash, place)
 		recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseShardFanout, phase)
@@ -110,7 +126,16 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		// The record must already carry the digest here: after the commit
 		// point below, it is what every read will demand.
-		place.Digest = digest.Sum(nil)
+		if ebs {
+			if crc.Sum64() != wantCRC {
+				abortShards(ctx, bc, objectHash, place, written)
+				HandleError(w, r, model.ErrBadDigestCRC64NVMEError)
+				return
+			}
+			place.Digest = ebsDigest(wantCRC, size)
+		} else {
+			place.Digest = digest.Sum(nil)
+		}
 		place.Attributes = attrs
 
 		record, err := EncodePlacement(place)
@@ -191,6 +216,10 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 		if etag, ok := place.ETag(); ok {
 			w.Header().Set("ETag", etag)
+		}
+		if ebs {
+			w.Header().Set(crc64nvmeHeader, r.Header.Get(crc64nvmeHeader))
+			w.Header().Set("X-Amz-Checksum-Type", "FULL_OBJECT")
 		}
 		setVersionIDHeader(w.Header(), target.versionID)
 		w.WriteHeader(http.StatusOK)
