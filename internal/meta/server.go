@@ -164,6 +164,7 @@ func (s *Server) open() (*rpc.Server, error) {
 	rpc.RegisterHandler(mux, OpMetaPutMax, s.handlePutMax)
 	rpc.RegisterHandler(mux, OpMetaDelete, s.handleDelete)
 	rpc.RegisterHandler(mux, OpMetaScan, s.handleScan)
+	rpc.RegisterHandler(mux, OpMetaLastKey, s.handleLastKey)
 	rpc.RegisterHandler(mux, OpMetaStatus, s.handleStatus)
 	srv, err := rpc.NewServer(mux, s.cfg.Listeners, s.pool)
 	if err != nil {

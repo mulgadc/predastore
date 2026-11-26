@@ -243,7 +243,8 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		publicBucketAccess := s.cfg.validatePublicBucketPermission(method, bucket)
 
-		authorityRequested := r.Header.Get(handlers.MapHeadReadModeHeader) != ""
+		action := s3Action(r, bucket, key)
+		authorityRequested := action == "s3:ListBucket" && r.Header.Get(handlers.MapHeadReadModeHeader) != ""
 		restoreTransferEncoding(r)
 		// Parse recognizes both header-authed and presigned requests; only a request with
 		// neither returns ErrMissingAuthentication.
@@ -263,7 +264,6 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 					// An endpoint policy holds an anonymous caller too, who carries
 					// no principal keys, so one naming a principal grants it nothing.
 					endpoint, _ := endpointFrom(r.Context())
-					action := s3Action(r, bucket, key)
 					if !endpoint.permits(r.Context(), action, s3Resource(bucket, key), conditionKeys(r, action, &auth.CredentialResult{})) {
 						handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 						return
@@ -308,7 +308,6 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		action := s3Action(r, bucket, key)
 		resource := s3Resource(bucket, key)
 		// The endpoint policy is a second gate on every request through an endpoint,
 		// a service account's included, as AWS applies it to every principal. The

@@ -2,11 +2,11 @@ package meta
 
 import (
 	"bytes"
-	"container/heap"
 	"errors"
 	"strings"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/tidwall/btree"
 )
 
 const (
@@ -20,29 +20,8 @@ var errMapHeadIndexUnavailable = errors.New("map-head index unavailable")
 type mapHeadIndex map[string]*mapHeadSet
 
 type mapHeadSet struct {
-	keys      []string
-	positions map[string]int
-}
-
-func (s *mapHeadSet) Len() int           { return len(s.keys) }
-func (s *mapHeadSet) Less(i, j int) bool { return s.keys[i] > s.keys[j] }
-func (s *mapHeadSet) Swap(i, j int) {
-	s.keys[i], s.keys[j] = s.keys[j], s.keys[i]
-	s.positions[s.keys[i]] = i
-	s.positions[s.keys[j]] = j
-}
-func (s *mapHeadSet) Push(value any) {
-	key := value.(string) //nolint:errcheck // Only the heap insertion below supplies a value.
-	s.positions[key] = len(s.keys)
-	s.keys = append(s.keys, key)
-}
-func (s *mapHeadSet) Pop() any {
-	last := len(s.keys) - 1
-	key := s.keys[last]
-	s.keys[last] = ""
-	s.keys = s.keys[:last]
-	delete(s.positions, key)
-	return key
+	keys *btree.BTreeG[string]
+	last string
 }
 
 func isMapHeadObject(key []byte) bool {
@@ -64,22 +43,26 @@ func (heads mapHeadIndex) update(key string, remove bool) {
 			if set == nil {
 				continue
 			}
-			if pos, ok := set.positions[key]; ok {
-				heap.Remove(set, pos)
-			}
-			if set.Len() == 0 {
+			set.keys.Delete(key)
+			if set.keys.Len() == 0 {
 				delete(heads, prefix)
+				continue
+			}
+			if set.last == key {
+				set.last, _ = set.keys.Max()
 			}
 			continue
 		}
 
 		if set == nil {
-			set = &mapHeadSet{positions: make(map[string]int)}
+			set = &mapHeadSet{keys: btree.NewBTreeGOptions(
+				func(a, b string) bool { return a < b },
+				btree.Options{NoLocks: true},
+			)}
 			heads[prefix] = set
 		}
-		if _, exists := set.positions[key]; !exists {
-			heap.Push(set, key)
-		}
+		set.keys.Set(key)
+		set.last = max(set.last, key)
 	}
 }
 
@@ -127,18 +110,28 @@ func (f *FSM) applyMapHeadChanges(changes []Command) {
 	}
 }
 
+func (f *FSM) mapHeadIndexReady() bool {
+	if !f.mapHeadsMu.TryRLock() {
+		return false
+	}
+	defer f.mapHeadsMu.RUnlock()
+	return f.mapHeads != nil
+}
+
 // LastKey returns the greatest object-table map-head key under an exact prefix.
 func (f *FSM) LastKey(prefix string) (string, error) {
 	if !strings.HasPrefix(prefix, mapHeadObjectTable) || !strings.HasSuffix(prefix, mapHeadKeyMarker) {
 		return "", errMapHeadIndexUnavailable
 	}
-	f.mapHeadsMu.RLock()
+	if !f.mapHeadsMu.TryRLock() {
+		return "", errMapHeadIndexUnavailable
+	}
 	defer f.mapHeadsMu.RUnlock()
 	if f.mapHeads == nil {
 		return "", errMapHeadIndexUnavailable
 	}
 	if set := f.mapHeads[prefix]; set != nil {
-		return set.keys[0], nil
+		return set.last, nil
 	}
 	return "", nil
 }

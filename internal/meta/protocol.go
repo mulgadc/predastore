@@ -27,6 +27,9 @@ const (
 	// OpMetaSwap writes a value and answers with the one it replaced.
 	OpMetaSwap rpc.Opcode = 0x1007
 
+	// OpMetaLastKey confirms a map head without an ordinary scan.
+	OpMetaLastKey rpc.Opcode = 0x1008
+
 	// OpMetaStatus asks a replica to report its own raft state, rather than
 	// any data it holds.
 	OpMetaStatus rpc.Opcode = 0x1005

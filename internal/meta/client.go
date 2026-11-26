@@ -388,7 +388,7 @@ func (c *Client) LeaderLastKey(ctx context.Context, prefix string) (key string, 
 
 	req := request(prefix, 1)
 	req.Last = true
-	resp, err := c.leaderRead(ctx, OpMetaScan, req)
+	resp, err := c.leaderRead(ctx, OpMetaLastKey, req)
 	if err != nil {
 		return "", err
 	}

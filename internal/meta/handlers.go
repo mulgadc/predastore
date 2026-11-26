@@ -111,23 +111,36 @@ func (s *Server) handleStatus(ctx context.Context, h MetaStatusRequest, stream t
 	return json.NewEncoder(stream).Encode(&status)
 }
 
-func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport.Stream) error {
+func (s *Server) handleLastKey(_ context.Context, h MetaRequest, stream transport.Stream) error {
+	if !h.Leader || len(h.Key) == 0 || len(h.After) != 0 || h.Limit != 1 {
+		return respond(stream, &MetaResponse{Err: "invalid last-key lookup"})
+	}
+	if !s.fsm.mapHeadIndexReady() {
+		return respond(stream, &MetaResponse{Err: ErrCodeBehind})
+	}
 	if refused, err := s.refuseLeaderRead(h, stream); refused {
 		return err
 	}
+	key, err := s.fsm.LastKey(string(h.Key))
+	if errors.Is(err, errMapHeadIndexUnavailable) {
+		return respond(stream, &MetaResponse{Err: ErrCodeBehind})
+	}
+	if err != nil {
+		return respond(stream, &MetaResponse{Err: err.Error()})
+	}
+	response := MetaResponse{Last: true}
+	if key != "" {
+		response.Items = []ScanItem{{Key: []byte(key)}}
+	}
+	return respond(stream, &response)
+}
+
+func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport.Stream) error {
 	if h.Last {
-		if !h.Leader || len(h.Key) == 0 || len(h.After) != 0 || h.Limit != 1 {
-			return respond(stream, &MetaResponse{Err: "invalid last-key scan"})
-		}
-		key, err := s.fsm.LastKey(string(h.Key))
-		if err != nil {
-			return respond(stream, &MetaResponse{Err: err.Error()})
-		}
-		response := MetaResponse{Last: true}
-		if key != "" {
-			response.Items = []ScanItem{{Key: []byte(key)}}
-		}
-		return respond(stream, &response)
+		return respond(stream, &MetaResponse{Err: "last-key lookup requires a dedicated operation"})
+	}
+	if refused, err := s.refuseLeaderRead(h, stream); refused {
+		return err
 	}
 	// errScanLimit stops iteration once the limit is reached without
 	// surfacing an error to the client.

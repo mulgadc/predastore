@@ -95,7 +95,7 @@ func TestMapHeadListRejectsPreExtensionMetadataReplies(t *testing.T) {
 
 	var response atomic.Pointer[meta.MetaResponse]
 	mux := rpc.NewMux()
-	rpc.RegisterHandler(mux, meta.OpMetaScan, func(_ context.Context, _ meta.MetaRequest, stream transport.Stream) error {
+	rpc.RegisterHandler(mux, meta.OpMetaLastKey, func(_ context.Context, _ meta.MetaRequest, stream transport.Stream) error {
 		return json.NewEncoder(stream).Encode(response.Load())
 	})
 	svc, err := rpc.NewServer(mux, []transport.Listener{listener}, nil)

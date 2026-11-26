@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/mulgadc/predastore/internal/config"
+	"github.com/mulgadc/predastore/internal/rpc"
+	"github.com/mulgadc/predastore/internal/transport"
 	"github.com/stretchr/testify/require"
 )
 
@@ -160,6 +163,112 @@ func BenchmarkMapHeadIndexRebuild(b *testing.B) {
 				if err := index.rebuildMapHeads(); err != nil {
 					b.Fatal(err)
 				}
+			}
+		})
+	}
+}
+
+func BenchmarkMapHeadMetadataRPC(b *testing.B) {
+	const prefix = "objects/arn:aws:s3:::predastore/vol/map/head."
+	for _, count := range []int{16, 16_384} {
+		b.Run(fmt.Sprintf("heads=%d", count), func(b *testing.B) {
+			svc := benchReplica(b)
+			batch := svc.fsm.db.NewWriteBatch()
+			defer batch.Cancel()
+			for id := range count {
+				key := fmt.Appendf(nil, "%s%020d.%020d", prefix, 1, id)
+				require.NoError(b, batch.Set(key, []byte("object")))
+			}
+			require.NoError(b, batch.Flush())
+			if index, ok := any(svc.fsm).(interface{ rebuildMapHeads() error }); ok {
+				require.NoError(b, index.rebuildMapHeads())
+			}
+			cfg := &config.Config{Hosts: []config.Host{{
+				ID: 1, Addr: "bench-host", Nodes: []config.Node{
+					{ID: 1, Role: config.RoleMeta, Port: 6301},
+					{ID: 2, Role: config.RoleGate, Port: 6302},
+				},
+			}}}
+			tr := transport.NewPipeTransport("map-head-rpc-bench-client", 0)
+			b.Cleanup(func() { tr.Close() })
+			resolver, err := rpc.NewResolver(cfg, 2, tr)
+			require.NoError(b, err)
+			pool := rpc.NewConnPool(2, resolver)
+			b.Cleanup(func() { pool.Close() })
+			client, err := NewClient(ClientConfig{Client: rpc.NewClient(pool), Replicas: []config.NodeID{1}})
+			require.NoError(b, err)
+			b.Run("ordinary-page", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					if _, err := client.Scan(b.Context(), prefix, 1); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.Run("authority", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					if key, err := client.LeaderLastKey(b.Context(), prefix); err != nil || key == "" {
+						b.Fatalf("head %q: %v", key, err)
+					}
+				}
+			})
+			b.Run("insert-delete", func(b *testing.B) {
+				ctx := b.Context()
+				key := prefix + "99999999999999999999.00000000000000000000"
+				b.ReportAllocs()
+				for b.Loop() {
+					if err := client.Put(ctx, key, []byte("head")); err != nil {
+						b.Fatal(err)
+					}
+					if err := client.Delete(ctx, key); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkThreeVoterMapHeadWritePressure(b *testing.B) {
+	const prefix = "objects/arn:aws:s3:::predastore/vol/map/head."
+	for _, count := range []int{16, 16_384} {
+		b.Run(fmt.Sprintf("heads=%d", count), func(b *testing.B) {
+			cluster := startMapHeadTestCluster(b)
+			client := cluster.client(cluster.voters...)
+			leader := cluster.leader(b, client)
+			for _, replica := range cluster.replicas {
+				batch := replica.fsm.db.NewWriteBatch()
+				for id := range count {
+					key := fmt.Appendf(nil, "%s%020d.%020d", prefix, 1, id)
+					require.NoError(b, batch.Set(key, []byte("object")))
+				}
+				require.NoError(b, batch.Flush())
+				if index, ok := any(replica.fsm).(interface{ rebuildMapHeads() error }); ok {
+					require.NoError(b, index.rebuildMapHeads())
+				}
+			}
+			ordinary := func() error {
+				_, err := client.Scan(b.Context(), prefix, 1)
+				return err
+			}
+			authority := func() error {
+				_, err := client.LeaderLastKey(b.Context(), prefix)
+				return err
+			}
+			for _, sample := range []struct {
+				name     string
+				read     func() error
+				interval time.Duration
+			}{
+				{"ordinary/pace", ordinary, 4 * time.Millisecond},
+				{"authority/pace", authority, 4 * time.Millisecond},
+				{"ordinary/saturated", ordinary, 0},
+				{"authority/saturated", authority, 0},
+			} {
+				b.Run(sample.name, func(b *testing.B) {
+					benchmarkWritesWithMapHeadReads(b, cluster.replicas[leader], ordinary, sample.read, sample.interval)
+				})
 			}
 		})
 	}

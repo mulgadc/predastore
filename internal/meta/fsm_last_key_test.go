@@ -65,7 +65,6 @@ func TestLastKeyTracksCommittedBatch(t *testing.T) {
 		{Type: CommandPut, Key: []byte(testHeadPrefix + "2"), Value: []byte("second")},
 		{Type: CommandSwap, Key: []byte(testHeadPrefix + "3"), Value: []byte("third")},
 		{Type: CommandSwap, Key: []byte(testHeadPrefix + "3"), Value: []byte("third updated")},
-		{Type: CommandDelete, Key: []byte(testHeadPrefix + "3")},
 	}
 	batch := make([]*raft.Log, 0, len(commands))
 	for i, cmd := range commands {
@@ -76,6 +75,10 @@ func TestLastKeyTracksCommittedBatch(t *testing.T) {
 	require.Nil(t, got[1])
 	require.Equal(t, []byte("third"), got[3])
 	key, err := fsm.LastKey(testHeadPrefix)
+	require.NoError(t, err)
+	require.Equal(t, testHeadPrefix+"3", key)
+	require.Nil(t, fsm.Apply(commandLog(t, 5, Command{Type: CommandDelete, Key: []byte(key)})))
+	key, err = fsm.LastKey(testHeadPrefix)
 	require.NoError(t, err)
 	require.Equal(t, testHeadPrefix+"2", key)
 	require.Nil(t, fsm.Apply(commandLog(t, 6, Command{Type: CommandDelete, Key: []byte(key)})))
