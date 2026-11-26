@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"net/http"
 	"sync"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/minio/crc64nvme"
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
@@ -71,20 +74,37 @@ func BenchmarkPartETagHasher(b *testing.B) {
 
 // BenchmarkPutObjectETagHash is the whole PutObject handler over real blob
 // stores for a viperblock chunk, one at a time and sixteen at once, with the
-// process CPU each PUT costs.
+// process CPU each PUT costs. The ebs mode sends the chunk as viperblock does,
+// with its CRC64NVME and the EBS opt-in header.
 func BenchmarkPutObjectETagHash(b *testing.B) {
 	body := bytes.Repeat([]byte("x"), 4<<20+10)
-	for _, streams := range []int{1, 16} {
-		b.Run(fmt.Sprintf("RS(2,1)/4MiB/streams=%d", streams), func(b *testing.B) {
-			quietLogs(b)
-			g := newRealStoreGate(b, rsProfiles[0])
-			b.SetBytes(int64(len(body)))
-			b.ReportAllocs()
-			runStreams(b, streams, func(i int) {
-				if rr := g.put(fmt.Sprintf("k%09d", i), body); rr.Code != http.StatusOK {
-					b.Errorf("put: %d %s", rr.Code, rr.Body.String())
-				}
+	sum := make([]byte, 8)
+	binary.BigEndian.PutUint64(sum, crc64nvme.Checksum(body))
+	modes := []struct {
+		name   string
+		header http.Header
+	}{
+		{"plain", nil},
+		{"ebs", http.Header{
+			"X-Spinifex-Ebs":           {"true"},
+			"X-Amz-Checksum-Crc64nvme": {base64.StdEncoding.EncodeToString(sum)},
+		}},
+	}
+	for _, mode := range modes {
+		for _, streams := range []int{1, 16} {
+			b.Run(fmt.Sprintf("RS(2,1)/4MiB/%s/streams=%d", mode.name, streams), func(b *testing.B) {
+				quietLogs(b)
+				g := newRealStoreGate(b, rsProfiles[0])
+				h := PutObject(g.mc, g.bc, g.ring, g.cache, g.cfg)
+				b.SetBytes(int64(len(body)))
+				b.ReportAllocs()
+				runStreams(b, streams, func(i int) {
+					key := fmt.Sprintf("k%09d", i)
+					if rr := g.serve(h, http.MethodPut, "/bkt/"+key, key, body, mode.header); rr.Code != http.StatusOK {
+						b.Errorf("put: %d %s", rr.Code, rr.Body.String())
+					}
+				})
 			})
-		})
+		}
 	}
 }
