@@ -19,12 +19,12 @@ const (
 // headers are needed because AWS SDKs send CRC64NVME by default, and only a
 // plain body qualifies; anything else keeps its MD5 ETag.
 func ebsChecksum(r *http.Request, framed bool) (want uint64, ok bool, err error) {
-	value := r.Header.Get(crc64nvmeHeader)
-	if framed || value == "" || r.Header.Get(ebsOptInHeader) != "true" {
+	values := r.Header.Values(crc64nvmeHeader)
+	if framed || len(values) == 0 || r.Header.Get(ebsOptInHeader) != "true" {
 		return 0, false, nil
 	}
-	raw, err := base64.StdEncoding.DecodeString(value)
-	if err != nil || len(raw) != 8 {
+	raw, err := base64.StdEncoding.DecodeString(values[0])
+	if err != nil || len(raw) != 8 || len(values) > 1 {
 		return 0, false, model.NewS3Error(model.ErrInvalidDigest,
 			"Value for x-amz-checksum-crc64nvme header is invalid.", http.StatusBadRequest)
 	}

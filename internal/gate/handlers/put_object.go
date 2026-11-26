@@ -97,11 +97,13 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// The ETag is MD5 over the body, teed off the read the write path
 		// already performs rather than a second pass over a buffered copy.
 		// An EBS chunk is checked with CRC64NVME instead and pays for no MD5.
-		digest := model.NewPartETagHasher()
+		var digest hash.Hash
 		var crc hash.Hash64
 		if ebs {
 			crc = crc64nvme.New()
 			digest = crc
+		} else {
+			digest = model.NewPartETagHasher()
 		}
 
 		written, err := writeObject(ctx, bc, cfg, ring, io.TeeReader(body, digest), size, objectHash, place)
@@ -217,6 +219,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		}
 		if ebs {
 			w.Header().Set(crc64nvmeHeader, r.Header.Get(crc64nvmeHeader))
+			w.Header().Set("X-Amz-Checksum-Type", "FULL_OBJECT")
 		}
 		setVersionIDHeader(w.Header(), target.versionID)
 		w.WriteHeader(http.StatusOK)

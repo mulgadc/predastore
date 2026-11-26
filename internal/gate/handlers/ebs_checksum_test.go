@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 
@@ -44,6 +45,7 @@ func TestEBSChunkPutIsVerifiedWithCRC64NVMEAndCarriesNoMD5(t *testing.T) {
 	want := fmt.Sprintf("\"%016x%016x\"", crc, len(body))
 	assert.Equal(t, want, resp.Header.Get("ETag"), "the ETag is the CRC64NVME and length, not MD5")
 	assert.Equal(t, crc64Header(body), resp.Header.Get("X-Amz-Checksum-Crc64nvme"))
+	assert.Equal(t, "FULL_OBJECT", resp.Header.Get("X-Amz-Checksum-Type"))
 
 	got := g.get("c1")
 	require.Equal(t, http.StatusOK, got.Code)
@@ -106,6 +108,7 @@ func TestEBSChunkPutWithAMalformedCRC64NVMEIsRefusedBeforeAnyShard(t *testing.T)
 	for name, value := range map[string]string{
 		"not base64":  "%%%",
 		"not 8 bytes": base64.StdEncoding.EncodeToString([]byte{1, 2, 3, 4}),
+		"empty":       "",
 	} {
 		t.Run(name, func(t *testing.T) {
 			g := newRealStoreGate(t, rsProfiles[0])
@@ -126,4 +129,22 @@ func readAll(t *testing.T, resp *http.Response) string {
 	b, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	return string(b)
+}
+
+func TestEBSChunkPutWithAWrongCRC64NVMEAbortsItsPreparedShards(t *testing.T) {
+	f := newWriteFixture(2, 1)
+	body := randomBytes(t, 4096)
+	req := objectPut("k", body)
+	req.Header.Set("X-Spinifex-Ebs", "true")
+	req.Header.Set("X-Amz-Checksum-Crc64nvme", crc64Header([]byte("other bytes")))
+
+	w := httptest.NewRecorder()
+	PutObject(f.mc, f.bc, f.ring, testCache(), f.cfg).ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	f.bc.mu.Lock()
+	defer f.bc.mu.Unlock()
+	assert.Empty(t, f.bc.prepared, "a refused chunk left shards prepared on the nodes")
+	assert.Empty(t, f.bc.shards, "a refused chunk published a shard")
+	assert.Equal(t, int64(3), f.bc.abortCalls.Load(), "every prepared shard is aborted")
 }
