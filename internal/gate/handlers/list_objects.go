@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/base64"
+	"encoding/xml"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -90,7 +91,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			return
 		}
 
-		if mode := r.Header.Get(mapHeadReadModeHeader); mode != "" {
+		if mode := r.Header.Get(MapHeadReadModeHeader); mode != "" {
 			if mode != latestMapHeadMode || !listV2 || maxKeys != 1 ||
 				!strings.HasSuffix(prefix, "/map/head.") || strings.TrimSuffix(prefix, "/map/head.") == "" ||
 				delimiter != "" || query.Get("continuation-token") != "" || query.Get("start-after") != "" {
@@ -232,10 +233,10 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 	})
 }
 
-const (
-	mapHeadReadModeHeader = "X-Predastore-Read-Mode"
-	latestMapHeadMode     = "latest-map-head"
-)
+// MapHeadReadModeHeader selects the leader-backed map-head lookup.
+const MapHeadReadModeHeader = "X-Predastore-Read-Mode"
+
+const latestMapHeadMode = "latest-map-head"
 
 type mapHeadLeader interface {
 	LeaderLastKey(ctx context.Context, prefix string) (string, error)
@@ -253,15 +254,26 @@ func writeLatestMapHead(w http.ResponseWriter, r *http.Request, mc MetaClient, b
 		WriteS3Error(w, r, http.StatusServiceUnavailable, "ServiceUnavailable", "Map-head authority unavailable")
 		return
 	}
-	var contents []ListObjectsV2_Contents
+	// Authority confirms membership only. Object attributes come from placement,
+	// so omit them instead of inventing values or making a second metadata read.
+	type mapHeadEntry struct {
+		Key string `xml:"Key"`
+	}
+	result := struct {
+		XMLName      xml.Name       `xml:"ListBucketResult"`
+		Name         string         `xml:"Name"`
+		Prefix       string         `xml:"Prefix"`
+		EncodingType string         `xml:"EncodingType,omitempty"`
+		KeyCount     int            `xml:"KeyCount"`
+		MaxKeys      int            `xml:"MaxKeys"`
+		IsTruncated  bool           `xml:"IsTruncated"`
+		Contents     []mapHeadEntry `xml:"Contents"`
+	}{Name: bucket, Prefix: encode(prefix), EncodingType: encodingType, MaxKeys: 1}
 	if key != "" {
-		contents = append(contents, ListObjectsV2_Contents{Key: encode(strings.TrimPrefix(key, bucketPrefix))})
+		result.Contents = []mapHeadEntry{{Key: encode(strings.TrimPrefix(key, bucketPrefix))}}
+		result.KeyCount = 1
 	}
-	w.Header().Set(mapHeadReadModeHeader, latestMapHeadMode)
-	result := ListObjectsV2{
-		Name: bucket, Prefix: encode(prefix), EncodingType: encodingType,
-		KeyCount: len(contents), MaxKeys: 1, Contents: &contents,
-	}
+	w.Header().Set(MapHeadReadModeHeader, latestMapHeadMode)
 	if err := writeXML(w, http.StatusOK, result); err != nil {
 		slog.DebugContext(r.Context(), "failed to write map-head response", "error", err)
 	}

@@ -243,6 +243,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 
 		publicBucketAccess := s.cfg.validatePublicBucketPermission(method, bucket)
 
+		authorityRequested := r.Header.Get(handlers.MapHeadReadModeHeader) != ""
 		restoreTransferEncoding(r)
 		// Parse recognizes both header-authed and presigned requests; only a request with
 		// neither returns ErrMissingAuthentication.
@@ -250,6 +251,10 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		if err != nil {
 			// Unsigned: fall back to public-bucket access rather than a parse error.
 			if errors.Is(err, sigv4.ErrMissingAuthentication) {
+				if authorityRequested {
+					handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Map-head lookup requires a signed request")
+					return
+				}
 				if publicBucketAccess == nil {
 					// A public grant must not keep a closed account's data reachable.
 					if !s.publicOwnerActive(w, r, bucket) {
@@ -294,6 +299,13 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		if err != nil {
 			handlers.RespondSigV4Error(w, r, accessKey, err, nil)
 			return
+		}
+
+		if authorityRequested {
+			if _, signed := verified.Canonical.SignedHeaders[strings.ToLower(handlers.MapHeadReadModeHeader)]; !signed {
+				handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Map-head mode header must be signed")
+				return
+			}
 		}
 
 		action := s3Action(r, bucket, key)

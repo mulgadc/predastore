@@ -46,6 +46,9 @@ func TestMapHeadListRequiresLeaderResult(t *testing.T) {
 		ListObjects(client, cache).ServeHTTP(recorder, req)
 		require.Equal(t, http.StatusOK, recorder.Code)
 		require.Equal(t, mode, recorder.Header().Get(header))
+		require.NotContains(t, recorder.Body.String(), "<Size>")
+		require.NotContains(t, recorder.Body.String(), "<LastModified>")
+		require.NotContains(t, recorder.Body.String(), "<StorageClass>")
 		var result ListObjectsV2
 		require.NoError(t, xml.NewDecoder(recorder.Body).Decode(&result))
 		require.Len(t, contentsOf(result), 1)
