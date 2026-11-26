@@ -178,19 +178,7 @@ func (s *blockingMetaSnapshotSink) Write(data []byte) (int, error) {
 	return s.mockSnapshotSink.Write(data)
 }
 
-type observedRestoreInput struct {
-	io.Reader
-
-	read chan struct{}
-	once sync.Once
-}
-
-func (r *observedRestoreInput) Read(data []byte) (int, error) {
-	r.once.Do(func() { close(r.read) })
-	return r.Reader.Read(data)
-}
-
-func TestRestoreWaitsForAnActiveSnapshotWithoutBlockingWrites(t *testing.T) {
+func TestLegacyRestoreRefusesWhileSnapshotPersists(t *testing.T) {
 	fsm := NewFSM(newTestDB(t))
 	key := testHeadPrefix + "1"
 	require.Nil(t, fsm.Apply(commandLog(t, 1, Command{
@@ -221,16 +209,30 @@ func TestRestoreWaitsForAnActiveSnapshotWithoutBlockingWrites(t *testing.T) {
 		t.Fatal("snapshot persistence blocked an ordinary metadata apply")
 	}
 
-	input := &observedRestoreInput{Reader: bytes.NewReader([]byte("{")), read: make(chan struct{})}
+	input := []byte("{")
 	restored := make(chan error, 1)
-	go func() { restored <- fsm.Restore(io.NopCloser(input)) }()
+	go func() { restored <- fsm.Restore(io.NopCloser(bytes.NewReader(input))) }()
+
+	var restoreErr error
+	refusedBeforeRelease := false
 	select {
-	case <-input.read:
-		t.Fatal("restore entered the store while snapshot persistence was held")
-	case <-time.After(100 * time.Millisecond):
+	case restoreErr = <-restored:
+		refusedBeforeRelease = true
+	case <-time.After(2 * time.Second):
 	}
+	value, getErr := fsm.Get(key)
 	release()
 	require.NoError(t, <-persisted)
-	require.Error(t, <-restored)
+	if !refusedBeforeRelease {
+		<-restored
+	}
+	require.True(t, refusedBeforeRelease, "legacy restore must return before the sink is released")
+	require.Error(t, restoreErr)
+	require.NoError(t, getErr, "legacy restore must leave Badger untouched while persistence is active")
+	require.Equal(t, []byte("after"), value)
 	require.True(t, sink.closed)
+
+	require.Error(t, fsm.Restore(io.NopCloser(bytes.NewReader(input))))
+	_, err = fsm.Get(key)
+	require.ErrorIs(t, err, badger.ErrKeyNotFound, "retry must reach legacy replacement after persistence")
 }
