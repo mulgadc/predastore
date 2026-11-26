@@ -114,3 +114,31 @@ func TestLastKeyRebuildAfterSnapshotRestore(t *testing.T) {
 		})
 	}
 }
+
+func TestFailedRestoreCannotBecomeANewSnapshot(t *testing.T) {
+	key := testHeadPrefix + "1"
+	fsm := NewFSM(newTestDB(t))
+	require.NoError(t, fsm.rebuildMapHeads())
+	require.Nil(t, fsm.Apply(commandLog(t, 1, Command{
+		Type: CommandPut, Key: []byte(key), Value: []byte("acknowledged"),
+	})))
+	prior := snapshotStream(t, fsm)
+	require.Error(t, fsm.Restore(io.NopCloser(bytes.NewReader([]byte("{")))))
+
+	snapshot, err := fsm.Snapshot()
+	if snapshot != nil {
+		defer snapshot.Release()
+	}
+	require.Error(t, err, "failed restore must not replace the previous recovery point")
+	require.Nil(t, snapshot)
+	_, err = fsm.LastKey(testHeadPrefix)
+	require.ErrorIs(t, err, errMapHeadIndexUnavailable)
+
+	require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(prior))))
+	got, err := fsm.LastKey(testHeadPrefix)
+	require.NoError(t, err)
+	require.Equal(t, key, got)
+	recovered, err := fsm.Snapshot()
+	require.NoError(t, err)
+	recovered.Release()
+}

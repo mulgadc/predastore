@@ -1,6 +1,10 @@
 package meta
 
 import (
+	"bytes"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -81,4 +85,46 @@ func TestLastKeyLeaderConfirmationWithLagAndFailover(t *testing.T) {
 	key, err = client(current).LeaderLastKey(ctx, testHeadPrefix)
 	require.NoError(t, err)
 	require.Equal(t, latest, key)
+}
+
+func TestRaftCannotCompactToFailedMetadataRestore(t *testing.T) {
+	cluster := startMapHeadTestCluster(t)
+	client := cluster.client(cluster.voters...)
+	leader := cluster.leader(t, client)
+	replica := cluster.replicas[leader]
+	ctx := t.Context()
+
+	oldKey := testHeadPrefix + "1"
+	require.NoError(t, client.Put(ctx, oldKey, []byte("earlier snapshot")))
+	require.NoError(t, replica.raft.Snapshot().Error())
+	oldSnapshot, err := os.ReadDir(filepath.Join(replica.cfg.DataDir, "snapshots", "snapshots"))
+	require.NoError(t, err)
+	require.Len(t, oldSnapshot, 1)
+
+	acknowledged := testHeadPrefix + "2"
+	want := []byte("acknowledged after snapshot")
+	require.NoError(t, client.Put(ctx, acknowledged, want))
+	firstLog, err := replica.bolt.FirstIndex()
+	require.NoError(t, err)
+
+	require.Error(t, replica.fsm.Restore(io.NopCloser(bytes.NewReader([]byte("{")))))
+	require.Error(t, replica.raft.Snapshot().Error())
+	_, err = cluster.client(leader).LeaderLastKey(ctx, testHeadPrefix)
+	require.ErrorIs(t, err, ErrNoLeaderRead)
+
+	after, err := os.ReadDir(filepath.Join(replica.cfg.DataDir, "snapshots", "snapshots"))
+	require.NoError(t, err)
+	require.Len(t, after, 1)
+	require.Equal(t, oldSnapshot[0].Name(), after[0].Name())
+	logAfter, err := replica.bolt.FirstIndex()
+	require.NoError(t, err)
+	require.Equal(t, firstLog, logAfter)
+
+	cluster.stops[leader]()
+	cluster.start(leader, false)
+	restarted := cluster.client(leader)
+	require.Eventually(t, func() bool {
+		data, err := restarted.Get(ctx, acknowledged)
+		return err == nil && bytes.Equal(data, want)
+	}, 5*time.Second, 20*time.Millisecond, "the restarted replica must replay the acknowledged head from retained logs")
 }
