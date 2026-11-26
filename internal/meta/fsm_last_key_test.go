@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/hashicorp/raft"
@@ -160,4 +162,75 @@ func TestRestoreRejectsAnEarlierLocalSnapshotCapture(t *testing.T) {
 	sink := &mockSnapshotSink{}
 	require.Error(t, captured.Persist(sink), "a capture invalidated by restore must never be published")
 	require.Empty(t, sink.buf, "validation must precede writing any snapshot bytes")
+}
+
+type blockingMetaSnapshotSink struct {
+	mockSnapshotSink
+
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingMetaSnapshotSink) Write(data []byte) (int, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return s.mockSnapshotSink.Write(data)
+}
+
+type observedRestoreInput struct {
+	io.Reader
+
+	read chan struct{}
+	once sync.Once
+}
+
+func (r *observedRestoreInput) Read(data []byte) (int, error) {
+	r.once.Do(func() { close(r.read) })
+	return r.Reader.Read(data)
+}
+
+func TestRestoreWaitsForAnActiveSnapshotWithoutBlockingWrites(t *testing.T) {
+	fsm := NewFSM(newTestDB(t))
+	key := testHeadPrefix + "1"
+	require.Nil(t, fsm.Apply(commandLog(t, 1, Command{
+		Type: CommandPut, Key: []byte(key), Value: []byte("before"),
+	})))
+	captured, err := fsm.Snapshot()
+	require.NoError(t, err)
+	defer captured.Release()
+
+	sink := &blockingMetaSnapshotSink{started: make(chan struct{}), release: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(sink.release) })
+	defer release()
+	persisted := make(chan error, 1)
+	go func() { persisted <- captured.Persist(sink) }()
+	select {
+	case <-sink.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("snapshot did not begin persistence")
+	}
+
+	write := commandLog(t, 2, Command{Type: CommandPut, Key: []byte(key), Value: []byte("after")})
+	applied := make(chan any, 1)
+	go func() { applied <- fsm.Apply(write) }()
+	select {
+	case result := <-applied:
+		require.Nil(t, result)
+	case <-time.After(2 * time.Second):
+		t.Fatal("snapshot persistence blocked an ordinary metadata apply")
+	}
+
+	input := &observedRestoreInput{Reader: bytes.NewReader([]byte("{")), read: make(chan struct{})}
+	restored := make(chan error, 1)
+	go func() { restored <- fsm.Restore(io.NopCloser(input)) }()
+	select {
+	case <-input.read:
+		t.Fatal("restore entered the store while snapshot persistence was held")
+	case <-time.After(100 * time.Millisecond):
+	}
+	release()
+	require.NoError(t, <-persisted)
+	require.Error(t, <-restored)
+	require.True(t, sink.closed)
 }
