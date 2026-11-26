@@ -44,8 +44,9 @@ type FSM struct {
 	mapHeadsMu sync.RWMutex
 	mapHeads   mapHeadIndex
 
-	mu sync.RWMutex
-	db *badger.DB
+	mu            sync.RWMutex
+	db            *badger.DB
+	restoreUnsafe bool
 
 	// node labels the snapshot lifecycle logs, which are otherwise
 	// indistinguishable between the replicas colocated in one process.
@@ -222,6 +223,12 @@ func applyCommand(txn *badger.Txn, cmd Command) (any, error) {
 // and Milliseconds would truncate every one to zero.
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	started := time.Now()
+
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.restoreUnsafe {
+		return nil, errors.New("meta: snapshot capture refused after failed restore")
+	}
 	index := f.applied.Load()
 
 	snap := &FSMSnapshot{node: f.node, index: index, txn: f.db.NewTransaction(false)}
@@ -256,6 +263,7 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.restoreUnsafe = true
 	f.setMapHeads(nil)
 	r := bufio.NewReader(rc)
 	sorted, err := snapshotIsSorted(r)
@@ -270,7 +278,11 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	if err != nil {
 		return err
 	}
-	return f.rebuildMapHeads()
+	if err := f.rebuildMapHeads(); err != nil {
+		return err
+	}
+	f.restoreUnsafe = false
+	return nil
 }
 
 // snapshotIsSorted reports whether the stream carries the marker promising key

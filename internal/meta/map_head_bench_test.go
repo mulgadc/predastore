@@ -273,3 +273,29 @@ func BenchmarkThreeVoterMapHeadWritePressure(b *testing.B) {
 		})
 	}
 }
+
+func BenchmarkMetadataSnapshotCapture(b *testing.B) {
+	for _, count := range []int{16, 16_384} {
+		b.Run(fmt.Sprintf("heads=%d", count), func(b *testing.B) {
+			db, err := badger.Open(badger.DefaultOptions(b.TempDir()).WithLoggingLevel(badger.WARNING))
+			require.NoError(b, err)
+			b.Cleanup(func() { require.NoError(b, db.Close()) })
+			batch := db.NewWriteBatch()
+			defer batch.Cancel()
+			for id := range count {
+				key := fmt.Appendf(nil, "%s%020d", testHeadPrefix, id)
+				require.NoError(b, batch.Set(key, []byte("head")))
+			}
+			require.NoError(b, batch.Flush())
+			fsm := NewFSM(db)
+			b.ReportAllocs()
+			for b.Loop() {
+				snapshot, err := fsm.Snapshot()
+				if err != nil {
+					b.Fatal(err)
+				}
+				snapshot.Release()
+			}
+		})
+	}
+}
