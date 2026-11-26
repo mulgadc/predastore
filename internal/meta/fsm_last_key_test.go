@@ -145,41 +145,93 @@ func TestFailedRestoreCannotBecomeANewSnapshot(t *testing.T) {
 	recovered.Release()
 }
 
+// On the second user snapshot, pause Raft between capturing the FSM and
+// opening its real file sink. A restore at that point can invalidate the capture.
+type snapshotStoreCaptureGate struct {
+	*raft.FileSnapshotStore
+	armed   bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *snapshotStoreCaptureGate) Create(version raft.SnapshotVersion, index, term uint64,
+	configuration raft.Configuration, configurationIndex uint64, transport raft.Transport,
+) (raft.SnapshotSink, error) {
+	if s.armed {
+		close(s.entered)
+		<-s.release
+	}
+	return s.FileSnapshotStore.Create(version, index, term, configuration, configurationIndex, transport)
+}
+
 func TestRestoreRejectsAnEarlierLocalSnapshotCapture(t *testing.T) {
 	key := testHeadPrefix + "1"
 	fsm := NewFSM(newTestDB(t))
-	require.Nil(t, fsm.Apply(commandLog(t, 1, Command{
-		Type: CommandPut, Key: []byte(key), Value: []byte("acknowledged"),
-	})))
+	files, err := raft.NewFileSnapshotStore(t.TempDir(), 1, io.Discard)
+	require.NoError(t, err)
+	store := &snapshotStoreCaptureGate{
+		FileSnapshotStore: files, entered: make(chan struct{}), release: make(chan struct{}),
+	}
+	logs := raft.NewInmemStore()
+	addr, transport := raft.NewInmemTransport("")
+	t.Cleanup(func() { require.NoError(t, transport.Close()) })
+	cfg := raft.DefaultConfig()
+	cfg.LocalID = "local"
+	cfg.HeartbeatTimeout = 50 * time.Millisecond
+	cfg.ElectionTimeout = 50 * time.Millisecond
+	cfg.LeaderLeaseTimeout = 50 * time.Millisecond
+	cfg.SnapshotInterval = time.Hour
+	cfg.TrailingLogs = 0
+	cfg.LogOutput = io.Discard
+	members := raft.Configuration{Servers: []raft.Server{{ID: cfg.LocalID, Address: addr}}}
+	require.NoError(t, raft.BootstrapCluster(cfg, logs, logs, store, transport, members))
+	node, err := raft.NewRaft(cfg, fsm, logs, logs, store, transport)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, node.Shutdown().Error()) })
+	require.Eventually(t, func() bool { return node.State() == raft.Leader }, 3*time.Second, 5*time.Millisecond)
 
-	store, err := raft.NewFileSnapshotStore(t.TempDir(), 1, io.Discard)
+	put := func(value string) {
+		t.Helper()
+		cmd := commandLog(t, 0, Command{Type: CommandPut, Key: []byte(key), Value: []byte(value)})
+		applied := node.Apply(cmd.Data, time.Second)
+		require.NoError(t, applied.Error())
+		require.Nil(t, applied.Response())
+	}
+	put("acknowledged")
+	require.NoError(t, node.Snapshot().Error())
+	prior, err := store.List()
 	require.NoError(t, err)
-	prior, err := fsm.Snapshot()
-	require.NoError(t, err)
-	defer prior.Release()
-	goodSink, err := store.Create(1, 1, 1, raft.Configuration{}, 0, nil)
-	require.NoError(t, err)
-	require.NoError(t, prior.Persist(goodSink))
+	require.Len(t, prior, 1)
 
-	require.Nil(t, fsm.Apply(commandLog(t, 2, Command{
-		Type: CommandPut, Key: []byte(key), Value: []byte("acknowledged later"),
-	})))
-	captured, err := fsm.Snapshot()
+	put("acknowledged later")
+	first, err := logs.FirstIndex()
 	require.NoError(t, err)
-	defer captured.Release()
+	require.Greater(t, first, prior[0].Index, "initial snapshot should already have compacted old logs")
+
+	release := sync.OnceFunc(func() { close(store.release) })
+	defer release()
+	store.armed = true
+	future := node.Snapshot()
+	select {
+	case <-store.entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Raft did not reach persistence after capturing the snapshot")
+	}
 	require.Error(t, fsm.Restore(io.NopCloser(bytes.NewReader([]byte("{")))))
 	_, err = fsm.Get(key)
 	require.ErrorIs(t, err, badger.ErrKeyNotFound, "failed legacy restore must have changed the store")
+	release()
+	snapshotErr := future.Error()
 
-	staleSink, err := store.Create(1, 2, 1, raft.Configuration{}, 0, nil)
-	require.NoError(t, err)
-	persistErr := captured.Persist(staleSink)
 	snapshots, err := store.List()
 	require.NoError(t, err)
 	require.Len(t, snapshots, 1)
-	require.Equal(t, goodSink.ID(), snapshots[0].ID,
+	require.Equal(t, prior[0].ID, snapshots[0].ID,
 		"a stale capture must not publish and reap the previous recovery point")
-	require.Error(t, persistErr)
+	require.Error(t, snapshotErr)
+	firstAfter, err := logs.FirstIndex()
+	require.NoError(t, err)
+	require.Equal(t, first, firstAfter, "a stale snapshot cannot compact acknowledged log entries")
 }
 
 type blockingMetaSnapshotSink struct {
