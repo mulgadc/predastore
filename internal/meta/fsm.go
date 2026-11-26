@@ -41,6 +41,9 @@ type Command struct {
 
 // FSM implements raft.FSM interface backed by Badger.
 type FSM struct {
+	mapHeadsMu sync.RWMutex
+	mapHeads   mapHeadIndex
+
 	mu sync.RWMutex
 	db *badger.DB
 
@@ -124,6 +127,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	var mapHeadChanges []Command
 	txn := f.db.NewTransaction(true)
 	commit := func() {
 		if err := f.commitBatch(txn); err != nil {
@@ -153,8 +157,12 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 			continue
 		}
 		responses[i] = resp
+		if isMapHeadObject(cmd.Key) {
+			mapHeadChanges = append(mapHeadChanges, cmd)
+		}
 	}
 	commit()
+	f.applyMapHeadChanges(mapHeadChanges)
 	f.applied.Store(logs[len(logs)-1].Index)
 
 	return responses
@@ -248,16 +256,21 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.setMapHeads(nil)
 	r := bufio.NewReader(rc)
 	sorted, err := snapshotIsSorted(r)
 	if err != nil {
 		return err
 	}
 	if sorted {
-		return f.restoreByMerge(r, started)
+		err = f.restoreByMerge(r, started)
+	} else {
+		err = f.restoreByReplace(r, started)
 	}
-
-	return f.restoreByReplace(r, started)
+	if err != nil {
+		return err
+	}
+	return f.rebuildMapHeads()
 }
 
 // snapshotIsSorted reports whether the stream carries the marker promising key
@@ -545,42 +558,6 @@ func (f *FSM) ScanFrom(prefix, after string, fn func(key string, value []byte) e
 		}
 		return nil
 	})
-}
-
-// LastKey returns the greatest key under prefix with one indexed reverse seek.
-func (f *FSM) LastKey(prefix string) (string, error) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	var key string
-	err := f.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.Reverse = true
-		opts.PrefetchValues = false
-		iter := txn.NewIterator(opts)
-		defer iter.Close()
-
-		upper := prefixUpperBound(prefix)
-		iter.Seek(upper)
-		if upper != nil && iter.Valid() && bytes.Equal(iter.Item().Key(), upper) {
-			iter.Next()
-		}
-		if iter.ValidForPrefix([]byte(prefix)) {
-			key = string(iter.Item().Key())
-		}
-		return nil
-	})
-	return key, err
-}
-
-func prefixUpperBound(prefix string) []byte {
-	upper := []byte(prefix)
-	for i := len(upper) - 1; i >= 0; i-- {
-		if upper[i] != 0xff {
-			upper[i]++
-			return upper[:i+1]
-		}
-	}
-	return nil
 }
 
 // snapshotMagic marks a stream whose frames are in key order. Restoring by

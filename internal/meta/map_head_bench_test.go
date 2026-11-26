@@ -28,7 +28,7 @@ func BenchmarkMapHeadLookup(b *testing.B) {
 
 func benchmarkMapHeadLookup(b *testing.B, count int, authority bool) {
 	svc := benchReplica(b)
-	const prefix = "objects/arn:aws:s3:::vol/map/head."
+	const prefix = "objects/arn:aws:s3:::predastore/vol/map/head."
 	err := svc.fsm.db.Update(func(txn *badger.Txn) error {
 		for id := range count {
 			key := fmt.Appendf(nil, "%s%020d.%020d", prefix, 1, id)
@@ -39,6 +39,9 @@ func benchmarkMapHeadLookup(b *testing.B, count int, authority bool) {
 		return nil
 	})
 	require.NoError(b, err)
+	if index, ok := any(svc.fsm).(interface{ rebuildMapHeads() error }); ok {
+		require.NoError(b, index.rebuildMapHeads())
+	}
 	ordinary := func() error {
 		return svc.fsm.ScanFrom(prefix, "", func(string, []byte) error { return nil })
 	}
@@ -130,5 +133,34 @@ func benchmarkWritesWithMapHeadReads(b *testing.B, svc *Server, ordinary, lookup
 		b.ReportMetric(float64(writeLatency[(len(writeLatency)-1)*99/100]), "write-p99-ns")
 		b.ReportMetric(float64(len(writeLatency))/b.Elapsed().Seconds(), "writes/s")
 		b.ReportMetric(float64(reads.Load())/b.Elapsed().Seconds(), "lookups/s")
+	}
+}
+
+func BenchmarkMapHeadIndexRebuild(b *testing.B) {
+	for _, n := range []int{16, 16_384} {
+		b.Run(fmt.Sprintf("heads=%d", n), func(b *testing.B) {
+			db, err := badger.Open(badger.DefaultOptions(b.TempDir()).WithLoggingLevel(badger.WARNING))
+			require.NoError(b, err)
+			b.Cleanup(func() { require.NoError(b, db.Close()) })
+			batch := db.NewWriteBatch()
+			defer batch.Cancel()
+			for i := range n {
+				key := fmt.Appendf(nil, "%s%020d.%020d", "objects/arn:aws:s3:::predastore/vol/map/head.", 1, i)
+				require.NoError(b, batch.Set(key, []byte("head")))
+			}
+			require.NoError(b, batch.Flush())
+
+			fsm := NewFSM(db)
+			index, ok := any(fsm).(interface{ rebuildMapHeads() error })
+			if !ok {
+				b.Skip("baseline has no materialized map-head view")
+			}
+			b.ReportAllocs()
+			for b.Loop() {
+				if err := index.rebuildMapHeads(); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }

@@ -188,6 +188,9 @@ func (s *Server) open() (*rpc.Server, error) {
 		opts = append(opts, OnKeyChanged(s.cfg.OnKeyChanged))
 	}
 	s.fsm = NewFSM(s.badgerDB, opts...)
+	if err := s.fsm.rebuildMapHeads(); err != nil {
+		return nil, fmt.Errorf("build map-head index: %w", err)
+	}
 
 	s.bolt, err = openLogStore(filepath.Join(s.cfg.DataDir, "raft.db"))
 	if err != nil {

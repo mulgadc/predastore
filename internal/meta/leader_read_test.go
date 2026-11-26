@@ -34,10 +34,13 @@ func TestLeaderReadIsServedByTheLeader(t *testing.T) {
 	require.Len(t, items, 1)
 	assert.Equal(t, "objects/b", items[0].Key)
 
-	last, err := cli.LeaderLastKey(ctx, "objects/")
+	const headPrefix = "objects/arn:aws:s3:::predastore/vol/map/head."
+	require.NoError(t, cli.Put(ctx, headPrefix+"a", []byte("one")))
+	require.NoError(t, cli.Put(ctx, headPrefix+"b", []byte("two")))
+	last, err := cli.LeaderLastKey(ctx, headPrefix)
 	require.NoError(t, err)
-	assert.Equal(t, "objects/b", last)
-	last, err = cli.LeaderLastKey(ctx, "empty/")
+	assert.Equal(t, headPrefix+"b", last)
+	last, err = cli.LeaderLastKey(ctx, "objects/arn:aws:s3:::predastore/empty/map/head.")
 	require.NoError(t, err)
 	assert.Empty(t, last)
 }
