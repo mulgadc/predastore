@@ -97,9 +97,11 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// The ETag is MD5 over the body, teed off the read the write path
 		// already performs rather than a second pass over a buffered copy.
 		// An EBS chunk is checked with CRC64NVME instead and pays for no MD5.
-		var digest hash.Hash = model.NewPartETagHasher()
+		digest := model.NewPartETagHasher()
+		var crc hash.Hash64
 		if ebs {
-			digest = crc64nvme.New()
+			crc = crc64nvme.New()
+			digest = crc
 		}
 
 		written, err := writeObject(ctx, bc, cfg, ring, io.TeeReader(body, digest), size, objectHash, place)
@@ -123,13 +125,12 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// The record must already carry the digest here: after the commit
 		// point below, it is what every read will demand.
 		if ebs {
-			crc := digest.(hash.Hash64).Sum64()
-			if crc != wantCRC {
+			if crc.Sum64() != wantCRC {
 				abortShards(ctx, bc, objectHash, place, written)
 				HandleError(w, r, model.ErrBadDigestCRC64NVMEError)
 				return
 			}
-			place.Digest = ebsDigest(crc, size)
+			place.Digest = ebsDigest(wantCRC, size)
 		} else {
 			place.Digest = digest.Sum(nil)
 		}

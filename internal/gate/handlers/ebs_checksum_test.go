@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"testing"
 
 	"github.com/minio/crc64nvme"
@@ -91,7 +92,7 @@ func TestOnlyBothHeadersTogetherReplaceTheMD5ETag(t *testing.T) {
 		payload := string(body)
 		resp := ebsPut(g, "o", []byte(framedBodyChecksum(payload, crc64Trailer(payload))), http.Header{
 			"Content-Encoding":             {"aws-chunked"},
-			"X-Amz-Decoded-Content-Length": {fmt.Sprint(len(payload))},
+			"X-Amz-Decoded-Content-Length": {strconv.Itoa(len(payload))},
 			"X-Amz-Trailer":                {"x-amz-checksum-crc64nvme"},
 			"X-Spinifex-Ebs":               {"true"},
 			"X-Amz-Checksum-Crc64nvme":     {crc64Header(body)},

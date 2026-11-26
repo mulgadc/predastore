@@ -36,6 +36,6 @@ func ebsChecksum(r *http.Request, framed bool) (want uint64, ok bool, err error)
 func ebsDigest(crc uint64, size int64) []byte {
 	d := make([]byte, 16)
 	binary.BigEndian.PutUint64(d[:8], crc)
-	binary.BigEndian.PutUint64(d[8:], uint64(size))
+	binary.BigEndian.PutUint64(d[8:], uint64(size)) //nolint:gosec // G115: PutObject refuses a negative size first.
 	return d
 }
