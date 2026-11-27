@@ -626,6 +626,8 @@ func (rs *restoreState) takeApplied(key, value []byte) (bool, error) {
 // snapshot's applied row, or removes the local one when the snapshot has
 // none, then moves the in-memory index to match, backwards included.
 func (f *FSM) restoreApplied(rs *restoreState) error {
+	// A failed commit can still have landed and named the newer index.
+	rs.wrote = true
 	err := f.db.Update(func(txn *badger.Txn) error {
 		if rs.applied == nil {
 			return txn.Delete(appliedKey)

@@ -199,17 +199,16 @@ func TestStartup_ABadRowInTheNewestSnapshotFallsBackToAnOlderOne(t *testing.T) {
 	assert.Equal(t, map[string]string{"objects/k": "gen-2", string(appliedKey): string(encodeApplied(2))}, contents(t, db))
 }
 
-// A snapshot whose data the store already holds sends no write. A restore
-// that then fails leaves the store as it was, so it is an error that raft
-// can fall back from, not a stop.
-func TestFSM_Restore_AFailureWithNoWriteSentIsAnError(t *testing.T) {
+// A snapshot whose data the store already holds sends no data write. A failed
+// commit of the applied row can still have landed and named the newer index,
+// so it stops the replica rather than let raft fall back to an older snapshot.
+func TestFSM_Restore_AFailedAppliedRowCommitStopsTheReplica(t *testing.T) {
 	dir := t.TempDir()
 	opts := badger.DefaultOptions(dir).WithLoggingLevel(badger.WARNING)
 	db := openStore(t, opts)
 	fsm := NewFSM(db)
 	fsm.Apply(swapLog(t, 5, "objects/k", "gen-1"))
 	stream := snapshotStream(t, fsm)
-	before := dumpStore(t, db)
 	require.NoError(t, db.Close())
 
 	// A read-only store refuses the applied row, the only write this
@@ -217,12 +216,13 @@ func TestFSM_Restore_AFailureWithNoWriteSentIsAnError(t *testing.T) {
 	db = openStore(t, opts.WithReadOnly(true))
 	fsm = NewFSM(db)
 
-	var err error
-	require.NotPanics(t, func() { err = fsm.Restore(io.NopCloser(bytes.NewReader(stream))) })
-	require.Error(t, err)
-	assert.ErrorContains(t, err, "write the applied index")
-	assert.Equal(t, before, dumpStore(t, db))
-	assert.Equal(t, uint64(5), fsm.persisted)
+	var stop any
+	func() {
+		defer func() { stop = recover() }()
+		_ = fsm.Restore(io.NopCloser(bytes.NewReader(stream)))
+	}()
+	require.NotNil(t, stop, "the restore went on after a failed applied-row commit")
+	assert.Contains(t, fmt.Sprint(stop), "write the applied index")
 }
 
 // A bad applied row that the stream reaches after a write may have reached
