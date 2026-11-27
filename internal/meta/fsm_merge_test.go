@@ -165,6 +165,20 @@ func TestATruncatedSnapshotIsRefused(t *testing.T) {
 	assert.Contains(t, err.Error(), "read value")
 }
 
+// A stream that ends after a key length but before the key is truncated, not
+// finished, so restore must refuse it rather than drop the rows past the cut.
+func TestASnapshotCutAfterAKeyLengthIsRefused(t *testing.T) {
+	stream := snapshotOf(t, map[string][]byte{"a": []byte("kept")})
+	stream = append(stream, 0, 0, 0, 5)
+
+	db := newTestDB(t)
+	dbSet(t, db, []byte("z"), []byte("must survive"))
+	err := NewFSM(db).Restore(io.NopCloser(bytes.NewReader(stream)))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read key")
+	assert.Equal(t, map[string]string{"z": "must survive"}, contents(t, db))
+}
+
 // The claim C4 makes, stated as a property rather than as a duration: capturing
 // a snapshot allocates the same amount whether the store holds sixteen keys or
 // four thousand. It used to allocate the whole keyspace into a map, on the
