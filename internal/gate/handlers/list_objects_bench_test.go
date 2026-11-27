@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/meta"
 )
 
@@ -85,11 +86,15 @@ func BenchmarkMetaApplyDuringListing(b *testing.B) {
 	h, mc, _ := listBenchBucket(b, n)
 	b.Run(fmt.Sprintf("keys=%d", n), func(b *testing.B) {
 		var stop atomic.Bool
+		var listed, failed atomic.Int64
 		var wg sync.WaitGroup
 		for range 4 {
 			wg.Go(func() {
 				for !stop.Load() {
-					listPage(h, url.Values{"list-type": {"2"}, "max-keys": {"1000"}})
+					if listPage(h, url.Values{"list-type": {"2"}, "max-keys": {"1000"}}).Code != http.StatusOK {
+						failed.Add(1)
+					}
+					listed.Add(1)
 				}
 			})
 		}
@@ -100,5 +105,27 @@ func BenchmarkMetaApplyDuringListing(b *testing.B) {
 		}
 		stop.Store(true)
 		wg.Wait()
+		if failed.Load() > 0 || listed.Load() == 0 {
+			b.Fatalf("listings: %d sent, %d failed", listed.Load(), failed.Load())
+		}
+	})
+}
+
+// BenchmarkListObjectsAfterDeletes lists the first page of a bucket whose
+// first keys were just deleted, so the scan passes over their tombstones.
+func BenchmarkListObjectsAfterDeletes(b *testing.B) {
+	const n, deleted = 100_000, 99_000
+	h, mc, keys := listBenchBucket(b, n)
+	cmds := make([]meta.Command, 0, 1000)
+	for _, key := range keys[:deleted] {
+		cmds = append(cmds, meta.Command{Type: meta.CommandDelete, Key: []byte(TableKey(model.TableObjects, objectARN("bkt", key)))})
+		if len(cmds) == cap(cmds) {
+			mc.apply(cmds...)
+			cmds = cmds[:0]
+		}
+	}
+	mc.apply(cmds...)
+	b.Run(fmt.Sprintf("keys=%d/deleted=%d/max-keys=1000", n, deleted), func(b *testing.B) {
+		benchListPage(b, h, url.Values{"list-type": {"2"}, "max-keys": {"1000"}})
 	})
 }
