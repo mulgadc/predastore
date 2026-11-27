@@ -300,6 +300,18 @@ It is not the entry's answer, because another replica can read and apply the sam
 The restart applies the entry again.
 A failed check, a malformed transaction and a refused write are the same on every replica, so they stay answers.
 
+A committed entry that this release cannot read also stops the process: an entry that does not decode, one with no `type` or a `null` type, or one whose type this release does not know.
+A replica that can read the entry applies it, so answering it and moving on would leave the stores different.
+The batch is discarded, so the applied row stays below the entry, and every start gives the entry to the FSM again.
+The panic names the index and the type, and never the key.
+Recovery depends on the cause:
+
+- An entry that a later release reads: upgrade the replica. It applies the entry from its own log, so it needs no snapshot and no healthy quorum. If a quorum stops, the meta plane is down until enough voters run the later release.
+- An entry that only this replica cannot read, because its copy of the log is damaged: rebuild the replica from an empty data directory, as the `node-rebuild` stress scenario does. The leader sends it the log or a snapshot. This needs a healthy quorum.
+- An entry that no release can read: every replica that reaches it stops, the leader included. No procedure passes the entry yet, so the meta plane stays down. No write at or after the entry was acknowledged.
+
+A replica stop does not make a new command type safe to propose. A new type is proposed only after every voter runs a release that reads it, or under a recorded hard-cutover exception. New semantics take a new command type, never a new field on an old one, because an older replica ignores a field it does not know.
+
 No command writes a key under `\x00raft/`. The FSM, the replica's handlers and the client refuse a put, delete, swap or transaction that names one, and a transaction cannot check one. `Get`, `LeaderGet` and every scan, the empty prefix included, never return the row.
 
 A snapshot holds the row at the index that it captured. A restore writes and flushes every data row first, then writes the snapshot's row in its own transaction, or removes the local row when the snapshot has none, and then sets the in-memory index from it. So the index moves back when raft restores an older snapshot. A restore that fails after a write can have reached the store stops the process, as a failed commit does, and the next start restores the snapshot again before it skips any entry. A failed commit of the applied row, or of its removal, also stops the process, because the row can be on disk and name the newer index. A restore that fails before it sends a write returns an error, so raft can restore an older snapshot.
