@@ -621,6 +621,14 @@ func (c *Client) txnAnswer(target config.NodeID, resp *MetaResponse) (TxnOutcome
 	}
 }
 
+// RetirePlacement makes epoch ineligible if the observed placement is current.
+// Use an empty observed value when the placement was absent.
+func (c *Client) RetirePlacement(ctx context.Context, key string, epoch uint64, observed []byte) error {
+	req := request(key, 0)
+	req.Epoch = epoch
+	return c.write(ctx, OpMetaRetirePlacement, req, observed)
+}
+
 // Delete removes a key through the leader.
 func (c *Client) Delete(ctx context.Context, key string) (err error) {
 	defer observeOp(ctx, telemetry.MetaOpDelete, time.Now(), &err)
@@ -690,6 +698,9 @@ func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest
 			// the entry is in the log, and the next leader can commit it.
 			if op == OpMetaSwap {
 				return nil, fmt.Errorf("swap %q: %w", req.Key, lastErr)
+			}
+			if op == OpMetaRetirePlacement {
+				return nil, fmt.Errorf("retire placement %q: %w", req.Key, lastErr)
 			}
 		}
 

@@ -97,9 +97,9 @@ func TestPlacementRetirementSurvivesRaftLeaderChange(t *testing.T) {
 	old, abandoned, replacement := encodedTestPlacement(1), encodedTestPlacement(2), encodedTestPlacement(3)
 	ctx := t.Context()
 	require.NoError(t, client.Put(ctx, string(key), old))
-	require.NoError(t, cluster.replicas[leader].apply(Command{
-		Type: CommandRetirePlacement, Key: key, Value: old, Epoch: 2,
-	}))
+	require.Eventually(t, func() bool {
+		return client.RetirePlacement(ctx, string(key), 2, old) == nil
+	}, 4*time.Second, 50*time.Millisecond)
 
 	cluster.stops[leader]()
 	var newLeader config.NodeID
@@ -129,4 +129,11 @@ func TestPlacementRetirementSurvivesRaftLeaderChange(t *testing.T) {
 	stored, err = client.AuthorityGet(ctx, string(key))
 	require.NoError(t, err)
 	require.Equal(t, replacement, stored)
+
+	err = client.RetirePlacement(ctx, string(key), 4, replacement)
+	require.ErrorContains(t, err, errRetirementUnavailable.Error())
+	fourth := encodedTestPlacement(4)
+	displaced, err = client.Swap(ctx, string(key), fourth)
+	require.NoError(t, err, "a voter outage must not leave a retirement marker")
+	require.Equal(t, replacement, displaced)
 }
