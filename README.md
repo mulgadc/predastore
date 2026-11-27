@@ -386,12 +386,14 @@ See [DESIGN.md](docs/DESIGN.md) §6 for the on-disk format: the segment layout, 
 
 ## Upgrade and rollback
 
-Upgrade a cluster by stopping every node, installing the new release on every node, and starting every node again.
+From the release that writes `deleted-epoch:` tombstones, predastore supports only a stop-all upgrade and no rollback.
+Install that release only on a cluster whose operator accepts both conditions.
+
+A stop-all upgrade stops every node, installs the new release on every node, and then starts every node.
 Do not run nodes of two releases at the same time.
 
-A rollback is not supported below the release that writes `deleted-epoch:` tombstones.
-An earlier release never reads those tombstones, so the shards that they owe stay on disk and are never reclaimed.
-From the release that adds conditional `PutObject`, a rollback is not possible: an earlier meta replica cannot apply the conditional transactions in the log.
+A rollback below the release that writes `deleted-epoch:` tombstones strands the shards that those tombstones owe, because an earlier release never reads them.
+A rollback below the release that adds conditional `PutObject` is not possible, because an earlier meta replica cannot apply the conditional transactions in the log.
 
 ## Spinifex Integration
 
