@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mulgadc/predastore/internal/config"
+	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
 // The placement record's on-disk encoding.
@@ -53,7 +54,7 @@ import (
 // every object that does not need it -- which during a rolling upgrade is the
 // difference between some objects and all of them.
 const (
-	placementMagic       = 0x00
+	placementMagic       = model.PlacementMagic
 	placementVersionV1   = 0x01
 	placementVersionV2   = 0x02
 	placementVersionV3   = 0x03
@@ -97,7 +98,7 @@ func EncodePlacement(p ObjectToShardNodes) ([]byte, error) {
 	buf[1] = placementVersionV3
 	buf[2] = byte(k)
 	binary.BigEndian.PutUint64(buf[3:11], uint64(p.Size))
-	binary.BigEndian.PutUint64(buf[11:19], p.WriteEpoch)
+	binary.BigEndian.PutUint64(buf[model.PlacementEpochOffset:model.PlacementEpochEnd], p.WriteEpoch)
 	binary.BigEndian.PutUint64(buf[19:27], uint64(p.BlockSize))
 
 	// The marker is 0 for "no digest" so a v1/v2-style absent case round-trips
@@ -159,7 +160,7 @@ func DecodePlacement(b []byte) (ObjectToShardNodes, error) {
 	k := int(b[2])
 	p := ObjectToShardNodes{
 		Size:       int64(binary.BigEndian.Uint64(b[3:11])), //nolint:gosec // round-trips bit-for-bit from encode.
-		WriteEpoch: binary.BigEndian.Uint64(b[11:19]),
+		WriteEpoch: binary.BigEndian.Uint64(b[model.PlacementEpochOffset:model.PlacementEpochEnd]),
 
 		// A version 1 epoch is eight random bytes, so reading it as a time
 		// gives a date hundreds of millions of years out. Version 2 and later
