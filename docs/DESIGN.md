@@ -283,7 +283,19 @@ Capturing a snapshot takes a badger read transaction and returns, so it costs mi
 
 Two older formats still restore, by clearing the store and rewriting it — the legacy JSON map, and an unsorted frame stream from before the marker existed — so a node upgraded on top of an old store still starts and a follower can take a snapshot from a leader on the previous version. That path clears with badger's own bulk clear and rewrites through a `WriteBatch`, because a single transaction is capped and a metadata set that outgrew that cap used to make every snapshot permanently unrestorable, on every replica at once.
 
-Commands are JSON: a type (put or delete), a key and a value, all binary-safe.
+Commands are JSON: a type (put, delete, swap or transaction), a key and a value, all binary-safe.
+
+### The applied index
+
+The replica keeps one row of its own in badger, `\x00raft/applied`. Its value is the four bytes `PDAI`, a version byte and the big-endian raft index of the last entry whose writes the store holds. Every badger commit that the FSM makes writes this row in the same transaction as the entries it publishes: the shared transaction of a batch, and the transaction of each conditional `CommandTxn`. A batch that publishes no write does not commit, so the row then stays as it was.
+
+On start, the FSM reads the row. When raft replays the log against the store, an entry at or below the row is already in the store, so `ApplyBatch` skips it and answers nil, because no caller waits for a replayed entry. An entry is therefore applied once, and a conditional entry or a `Swap` is never evaluated again against a state that already includes it. A store from a release before the row has no row, and the FSM applies every entry against it, then writes the row on its first commit. A row that does not decode stops the start with an error, and the replica skips nothing.
+
+The shared transaction keeps room for the row. Before it stages an entry, it counts the entry and the row against badger's transaction limits, and it commits first when both would not fit. So an entry that did not fit goes into the next commit, which names it, and replay does not skip it.
+
+No command writes a key under `\x00raft/`. The FSM, the replica's handlers and the client refuse a put, delete, swap or transaction that names one, and a transaction cannot check one. `Get`, `LeaderGet` and every scan, the empty prefix included, never return the row.
+
+A snapshot holds the row at the index that it captured. A restore writes and flushes every data row first, then writes the snapshot's row in its own transaction, or removes the local row when the snapshot has none, and then sets the in-memory index from it. So the index moves back when raft restores an older snapshot. A restore that fails after a write can have reached the store stops the process, as a failed commit does, and the next start restores the snapshot again before it skips any entry.
 
 ## Client behaviour
 
@@ -318,7 +330,7 @@ LeaderTimeout:      30 * time.Second   // how long the gate barrier waits
 
 The log is opened with bolt's freelist unsynced and kept as a map (`openLogStore`). A snapshot truncates up to `TrailingLogs` entries from the front of the log, which frees that many pages, and a synced freelist is rewritten in full on every commit: on prod that cost about 1 MB per one-entry commit, around 80 MB/s per node at 80 commits/s. Unsynced, bolt rebuilds the freelist by scanning the file on open, and the file format is unchanged, so an older build opens it and syncs its freelist again.
 
-The FSM takes committed entries in batches (`ApplyBatch`), and applies each batch in one badger transaction, so a batch costs one synced commit rather than one per entry. Entries still apply in order and a `Swap` sees the writes before it in its batch. A failed commit stops the process: badger may have applied part of it, and a restart restores the snapshot and replays the log, which rebuilds the store. That stop takes the gate and blob roles in the same process down with the replica.
+The FSM takes committed entries in batches (`ApplyBatch`), and applies each batch in one badger transaction, so a batch costs one synced commit rather than one per entry. Entries still apply in order and a `Swap` sees the writes before it in its batch. A failed commit stops the process: badger may have applied part of it. A restart restores the snapshot, if there is one, and replays the log after it, and the replay applies only the entries after the applied index (see *The applied index*). That stop takes the gate and blob roles in the same process down with the replica.
 
 **`SnapshotThreshold` is the knob that decides cost, and it should be set to about the row count.** A snapshot writes the whole store, so at `N` rows of `r` bytes it costs `N × r` and is taken once per `T` entries: each write carries an amortised `N × r / T` on top of its own `r`, making write amplification `N / T`. A threshold well below the row count is amplification; one well above it is a longer replay after a restart, which is far cheaper. The default suits the few-million-object clusters this is built for. **A store an order of magnitude larger needs it raised** — at a billion rows, a threshold of two million is roughly 500× amplification against a store of a few hundred GB.
 
@@ -617,7 +629,7 @@ Rebuild concurrency derives from the CPU count but is capped at 8. Half of a 256
 
 **It carries no correctness weight.** A read compares each shard's epoch against the record it has already loaded and discards a stale one whether or not repair has ever run. What repair restores is redundancy — the number of further losses an object survives — and never the object.
 
-**It is a sweep, not a subscription.** Every pass pages through the placement records from the beginning, keeps the ring positions belonging to the nodes it repairs for, asks each holder which generation it has, and rebuilds the ones that disagree. Nothing is derived from a log window: the meta FSM applies commands into Badger without retaining the index that carried them, so there is no index-to-command history to walk and no cheaper question to ask than the records themselves.
+**It is a sweep, not a subscription.** Every pass pages through the placement records from the beginning, keeps the ring positions belonging to the nodes it repairs for, asks each holder which generation it has, and rebuilds the ones that disagree. Nothing is derived from a log window: the meta FSM keeps only the index of the last entry it applied, not the commands before it, so there is no index-to-command history to walk and no cheaper question to ask than the records themselves.
 
 | Property | Choice |
 |---|---|
