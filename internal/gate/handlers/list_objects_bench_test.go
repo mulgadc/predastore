@@ -96,7 +96,7 @@ func BenchmarkMetaApplyDuringListing(b *testing.B) {
 func writeDuringListing(b *testing.B, h http.Handler, mc MetaClient) {
 	b.Helper()
 	var stop atomic.Bool
-	var listed, failed atomic.Int64
+	var listed, failed, inflight atomic.Int64
 	var started sync.WaitGroup
 	var wg sync.WaitGroup
 	for range 4 {
@@ -104,33 +104,37 @@ func writeDuringListing(b *testing.B, h http.Handler, mc MetaClient) {
 		wg.Go(func() {
 			once := sync.OnceFunc(started.Done)
 			for !stop.Load() {
+				inflight.Add(1)
 				once()
 				if listPage(h, url.Values{"list-type": {"2"}, "max-keys": {"1000"}}).Code != http.StatusOK {
 					failed.Add(1)
 				}
+				inflight.Add(-1)
 				listed.Add(1)
 			}
 		})
 	}
 	// Every lister is inside its first listing before the first timed write.
 	started.Wait()
-	before := listed.Load()
 	var lat []time.Duration
-	i := 0
+	overlapped, i := 0, 0
 	for b.Loop() {
 		i++
+		if inflight.Load() > 0 {
+			overlapped++
+		}
 		start := time.Now()
 		if err := mc.Put(context.Background(), "bench/apply/"+strconv.Itoa(i), []byte("v")); err != nil {
 			b.Fatal(err)
 		}
 		lat = append(lat, time.Since(start))
 	}
-	during := listed.Load() - before
 	stop.Store(true)
 	wg.Wait()
-	if failed.Load() > 0 || during == 0 {
-		b.Fatalf("listings: %d during the writes, %d failed", during, failed.Load())
+	if failed.Load() > 0 || overlapped == 0 {
+		b.Fatalf("%d of %d writes started while a listing ran, %d listings failed", overlapped, i, failed.Load())
 	}
+	b.ReportMetric(float64(overlapped)/float64(i), "overlap-frac")
 	slices.Sort(lat)
 	b.ReportMetric(float64(lat[len(lat)/2].Nanoseconds()), "p50-ns")
 	b.ReportMetric(float64(lat[min(len(lat)-1, len(lat)*99/100)].Nanoseconds()), "p99-ns")
