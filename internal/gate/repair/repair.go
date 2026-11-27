@@ -408,6 +408,9 @@ type task struct {
 	index int
 	node  config.NodeID
 	place handlers.ObjectToShardNodes
+	// replace marks a shard the node holds at the right generation whose
+	// bytes failed authentication there, so only a rebuild repairs it.
+	replace bool
 }
 
 // scan pages through the placement records and reports every owned position
@@ -477,8 +480,13 @@ func (s *Service) inspect(
 			Key: hash, Index: uint32(index),
 		})
 		switch {
-		case err == nil && held.Epoch == place.WriteEpoch:
+		case err == nil && held.Epoch == place.WriteEpoch && !held.Suspect:
 			continue // the node has the generation the record names
+		case err == nil && held.Epoch == place.WriteEpoch:
+			if err := emit(task{hash: hash, index: index, node: node, place: place, replace: true}); err != nil {
+				return err
+			}
+			continue
 		case err != nil && !errors.Is(err, blob.ErrNotFound):
 			// A node that cannot be reached is not a node that owes a shard,
 			// and rebuilding into it would fail anyway. The next pass asks

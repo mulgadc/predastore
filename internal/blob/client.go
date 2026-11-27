@@ -119,6 +119,9 @@ type StatRequest struct {
 type StatResponse struct {
 	Epoch uint64
 	Size  int64
+	// Suspect reports that a read of this generation failed authentication
+	// on the node, so its bytes are owed a rebuild from peers.
+	Suspect bool
 }
 
 // DeleteResponse reports whether the node held the value.
@@ -468,7 +471,7 @@ func (c *Client) Stat(ctx context.Context, nodeID config.NodeID, req StatRequest
 	}
 	switch resp.Err {
 	case "":
-		return &StatResponse{Epoch: resp.Epoch, Size: resp.Size}, nil
+		return &StatResponse{Epoch: resp.Epoch, Size: resp.Size, Suspect: resp.Suspect}, nil
 	case ErrCodeNotFound:
 		return nil, fmt.Errorf("stat on node %d: %w", nodeID, ErrNotFound)
 	default:

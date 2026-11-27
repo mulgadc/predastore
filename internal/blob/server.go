@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/cipher"
 	"encoding/json"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -97,9 +98,10 @@ const DefaultBodyIdleTimeout = 60 * time.Second
 // nodes builds one Server per node, each with its own rpc server, so the
 // storage service never learns that it has siblings.
 type Server struct {
-	cfg   Config
-	store Store
-	held  *heldWriters
+	cfg      Config
+	store    Store
+	held     *heldWriters
+	suspects *suspectSet
 }
 
 // New validates cfg and applies its defaults. It creates no directory, opens
@@ -123,7 +125,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.BodyIdleTimeout <= 0 {
 		cfg.BodyIdleTimeout = DefaultBodyIdleTimeout
 	}
-	return &Server{cfg: cfg, held: newHeldWriters()}, nil
+	return &Server{cfg: cfg, held: newHeldWriters(), suspects: newSuspectSet()}, nil
 }
 
 // Run opens the store, answers rpc on the configured listeners until ctx is
@@ -414,16 +416,18 @@ func (s *Server) handleAbort(ctx context.Context, h Request, stream transport.St
 // the caller is asking what is there, and publishing something as a side effect
 // of being asked would make the answer a thing the question caused.
 func (s *Server) handleStat(ctx context.Context, h Request, stream transport.Stream) error {
+	pos := shardPosition{key: h.Key, index: h.Index}
 	reader, err := s.store.Lookup(h.Key, h.Index)
 	switch {
 	case errors.Is(err, engine.ErrKeyNotFound):
+		s.suspects.clear(pos, 0)
 		return respond(stream, &Response{Err: ErrCodeNotFound})
 	case err != nil:
 		// A store that could not answer has not shown the shard missing, and
 		// reporting it as missing would send repair to rebuild over it.
 		return respond(stream, &Response{Err: fmt.Sprintf("stat: %v", err)})
 	}
-	resp := Response{Epoch: reader.Epoch(), Size: reader.Size()}
+	resp := Response{Epoch: reader.Epoch(), Size: reader.Size(), Suspect: s.suspects.suspect(pos, reader.Epoch())}
 	if closeErr := reader.Close(); closeErr != nil {
 		return respond(stream, &Response{Err: fmt.Sprintf("stat: %v", closeErr)})
 	}
@@ -478,13 +482,36 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 		io.NewSectionReader(reader, rangeStart, responseSize), stream, s.cfg.BodyIdleTimeout)
 	defer guard.Stop()
 
+	pos := shardPosition{key: h.Key, index: h.Index}
 	if _, err := stream.ReadFrom(guard); err != nil {
 		if guard.Expired() {
 			return fmt.Errorf("stream body: %w", transport.ErrIdleTimeout)
 		}
+		if errors.Is(err, engine.ErrIntegrity) {
+			s.markSuspect(pos, reader.Epoch())
+		}
 		return fmt.Errorf("stream body: %w", err)
 	}
+	// Only a read of the whole value proves every fragment authenticates.
+	if rangeStart == 0 && rangeEnd == totalSize-1 {
+		s.suspects.clear(pos, reader.Epoch())
+	}
 	return nil
+}
+
+// markSuspect records a shard whose read failed authentication, so the next
+// stat sends repair to rebuild it. Only a store whose key is verified marks
+// one: under another key every shard fails, and none may be rewritten.
+func (s *Server) markSuspect(pos shardPosition, epoch uint64) {
+	kv, ok := s.store.(KeyVerifier)
+	if !ok || !kv.KeyVerified() {
+		return
+	}
+	if s.suspects.add(pos, epoch) {
+		slog.Warn("shard failed authentication on read; marked for repair",
+			"node", s.cfg.NodeID, "index", pos.index, "key", hex.EncodeToString(pos.key[:8]),
+			"epoch", fmt.Sprintf("%016x", epoch), "suspects", s.suspects.len(), "evicted", s.suspects.evicted.Load())
+	}
 }
 
 // resolveEpoch answers a get whose live shard is the wrong generation. Two
@@ -570,6 +597,7 @@ func (s *Server) handleDeleteEpoch(ctx context.Context, h Request, stream transp
 	if err != nil {
 		return respond(stream, &Response{Err: err.Error()})
 	}
+	s.suspects.clear(shardPosition{key: h.Key, index: h.Index}, h.Epoch)
 	return respond(stream, &Response{Deleted: deleted})
 }
 
@@ -579,5 +607,6 @@ func (s *Server) handleDelete(ctx context.Context, h Request, stream transport.S
 	if err != nil {
 		return respond(stream, &Response{Err: err.Error()})
 	}
+	s.suspects.clear(shardPosition{key: h.Key, index: h.Index}, 0)
 	return respond(stream, &Response{Deleted: deleted})
 }

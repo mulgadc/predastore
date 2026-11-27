@@ -375,7 +375,7 @@ A blob node knows nothing about S3. Its vocabulary is a **key** (32 opaque bytes
 
 A put also reports `PoolNearFull` on success, so callers can back off before a write is ever outright rejected.
 
-**A write is two operations.** `Put` makes the value durable but invisible; `Commit` publishes it and `Abort` discards it. A get names the epoch it wants, and a node holding another generation answers `epoch-mismatch` rather than bytes — see §8. `Stat` answers what generation a node holds without its body, which is what repair asks of every position it owns.
+**A write is two operations.** `Put` makes the value durable but invisible; `Commit` publishes it and `Abort` discards it. A get names the epoch it wants, and a node holding another generation answers `epoch-mismatch` rather than bytes — see §8. `Stat` answers what generation a node holds without its body, which is what repair asks of every position it owns. Its `suspect` flag reports that a read of that generation failed authentication on the node, so repair rebuilds it (see *Repair*).
 
 **A held put** sets `Hold` in its header.
 The node registers the writer in memory and sends a `Registered` envelope before it reads any body byte, and the client sends the body only after that envelope.
@@ -403,6 +403,7 @@ A node that predates it closes the stream with no envelope, which the client rep
 ```
 <data dir>/
 ├── state.json                 # monotonic counters + the data dir's crypto identity
+├── keycheck                   # evidence that the master key is the key that sealed this store
 ├── db/                        # badger: key‖index → extent, plus tombstones
 ├── 0000000000000000.seg       # append-only fragments
 ├── 0000000000000000.idx       # reverse sidecar: what was ever allocated in that segment
@@ -469,6 +470,8 @@ The writer then owns a disjoint byte range. It assembles fragments into an in-me
 Tombstones are keyed by physical slot — `'d'` ‖ big-endian `segNum` ‖ big-endian `off`, 17 bytes — with the dead byte count as the value. Keying by slot rather than by object key is what lets one key die repeatedly: on delete, on overwrite, and on a relocation that lost its race. They only accelerate compaction's candidate selection and are never consulted for correctness.
 
 ### Retained generations
+
+A `Commit` that publishes a prepared row over a live row **at the same epoch** does not demote anything. The live row keeps serving that epoch, so no record can name the bytes it displaces, and the same transaction writes a tombstone for them. A reader that already holds them keeps its segment reference, and compaction does not detach a segment with references. This is the case of a retried write and of a repaired shard.
 
 A `Commit` promotes the new generation and **demotes** the one it replaces to `'r'` ‖ key ‖ index ‖ big-endian epoch, rather than destroying it. Shards are published before the placement record, so a record can name a generation the nodes have already passed, and a demoted generation still answers `LookupAt` for exactly that reason.
 
@@ -670,6 +673,8 @@ A holder that cannot run `DeleteEpoch` keeps its copy, and the return still coun
 
 Before publishing, the record is re-read and the rebuilt shard discarded if the epoch has moved, so a write that lands mid-repair is not demoted to the generation before it. That window is narrowed rather than closed; what survives it is a shard the next read discards and the next pass rebuilds, which is a wasted repair and not a wrong object.
 
+**A shard that fails authentication on a read is rebuilt at its own generation.** When a get's body fails its GCM tag, the node records the position and the generation in a bounded in-memory set of 4096 entries, and a later `Stat` reports that generation `suspect`. A full set evicts its oldest entry, and an evicted shard that is still bad enters again at its next failed read. A whole read that authenticates, a delete, or a `Stat` that finds the position absent or at another generation clears the entry; a ranged read does not, because it can miss the bad fragment. Repair sends a suspect position straight to the rebuild route, because publishing or a handoff copy changes nothing at a generation the node already holds, and then reads the shard back in full, which clears the entry. The node marks nothing while its store's key is unverified (see *Encryption at rest*), because under another key every shard fails and none may be rewritten. A restart forgets the set; the next failed read finds the shard again.
+
 If fewer than `K` peers hold the record's generation, the rebuild fails and says so. Inventing a shard from a mixture of generations would replace a detectable loss with an undetectable one, which is the defect this whole design exists to remove.
 
 ---
@@ -692,6 +697,7 @@ What this buys:
 
 - **Confidentiality.** Disk-level access yields ciphertext and tags. Plaintext is never written.
 - **Authenticated integrity.** GCM is the sole integrity authority; there is no separate checksum. Disk corruption, tampering and a wrong master key all surface as one `ErrIntegrity`.
+- **Key check.** The `keycheck` file is the evidence that the node's master key is the key that sealed the store, which is what lets a failed read count as corruption. A new store seals it at open. A store that held data before the file existed gets a pending form at its first start, holding the append position at that start, and is sealed by the first read that authenticates a fragment below that position, which only an earlier release can have written. A key that does not open the sealed file leaves the store unverified for the life of the process: reads and writes run as before, and no shard is marked for repair. The limit: a store that ran under a wrong key before the file existed holds fragments below the position sealed under that key, and one of them can verify it.
 - **Position binding.** The AAD binds each fragment to its `(key, index, valueNum, fragNum)` slot, so swapping fragments between values — or rewriting the header to claim a different slot — fails the tag.
 - **Cross-data-dir defence.** `storeID` enters the nonce, not the AAD, so splicing a fragment from one data dir into another yields a different nonce at read time and the tag fails.
 - **Mandatory.** `engine.Open` errors without `WithAEAD`, `blob.New` errors without an AEAD, and `s3d` refuses to start without `-encryption-key`. There is no unencrypted code path.
@@ -860,7 +866,7 @@ Version mismatch, missing region, an erasure code that is absent or invalid, `pa
 | Failure | Detected as | Response |
 |---|---|---|
 | No index row for the shard | `not-found` from the blob node | The join fails; the gate refetches with parity and reconstructs |
-| Fragment fails its GCM tag | `ErrIntegrity` | Same. Covers corruption, tampering, fragment swaps and a wrong master key indistinguishably |
+| Fragment fails its GCM tag | `ErrIntegrity` | Same, and the node marks the shard for repair when its key is verified. Covers corruption, tampering, fragment swaps and a wrong master key indistinguishably |
 | Node unreachable or slow | Stream error or deadline | Same |
 | Fewer than `K` valid shards | Reconstruction fails | 500 to the client |
 | Object metadata missing | Meta read fails | 404 `NoSuchKey` |

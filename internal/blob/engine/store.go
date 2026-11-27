@@ -59,6 +59,9 @@ type Store struct {
 	// The durably-reserved ceiling on fragNum; Append fsyncs only to raise it.
 	fragNumHighWater uint64
 
+	// keyCheck is the evidence that aead is the key that sealed this store.
+	keyCheck *keyCheck
+
 	maxSegSize uint64
 
 	compactionEnabled  bool
@@ -346,6 +349,16 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("count segments: %w", err)
 	}
 
+	// Before the append position can move: the key check's high-water is
+	// where this start found it.
+	hasData, segSize, err := storeHasData(dir, store.segNum)
+	if err != nil {
+		return nil, fmt.Errorf("read segments: %w", err)
+	}
+	if store.keyCheck, err = openKeyCheck(dir, store.aead, hasData, store.segNum, segSize); err != nil {
+		return nil, err
+	}
+
 	if _, err := store.nextAvailableSegment(); err != nil {
 		return nil, err
 	}
@@ -531,9 +544,10 @@ func (store *Store) lookup(rowKey []byte, key [32]byte, index uint32) (Reader, e
 		aead:    store.aead,
 		seg:     seg,
 		ext:     ext,
-		buf:     buf,
-		held:    held,
-		latency: store.latency,
+		buf:      buf,
+		held:     held,
+		latency:  store.latency,
+		keyCheck: store.pendingKeyCheck(),
 	}, nil
 }
 
@@ -783,6 +797,14 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 					return fmt.Errorf("retain superseded generation: %w", err)
 				}
 				return txn.Delete(prepKey)
+
+			// The same generation written again: the live row keeps serving the
+			// epoch, so no record can name the bytes it displaces. They are dead
+			// now; an open reader keeps its segment reference until it closes.
+			case liveErr == nil && liveEpoch == epoch:
+				if err := txn.Set(tombstoneKey(old.SegNum, old.Off), tombstoneValue(old.PSize)); err != nil {
+					return fmt.Errorf("tombstone displaced extent: %w", err)
+				}
 
 			// Demoted, not destroyed: a record naming this generation is still
 			// answerable until the sweep decides otherwise. Riding the same txn
@@ -1286,4 +1308,13 @@ func MakeKey(key [32]byte, index uint32) []byte {
 	binary.BigEndian.PutUint32(idxKey[32:], index)
 
 	return idxKey
+}
+
+// pendingKeyCheck is the key check a reader reports to, or nil once the key
+// is verified, so a verified store's reads skip it.
+func (store *Store) pendingKeyCheck() *keyCheck {
+	if store.keyCheck == nil || !store.keyCheck.pending || store.keyCheck.verified.Load() {
+		return nil
+	}
+	return store.keyCheck
 }
