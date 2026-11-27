@@ -241,7 +241,7 @@ The meta replicas are a plain key-value store. The table taxonomy is the gate's 
 | Key | Value | Purpose |
 |---|---|---|
 | `objects/<32-byte object hash>` | gob `ObjectToShardNodes` | Placement and object size, for retrieval |
-| `objects/arn:aws:s3:::<bucket>/<key>` | the 32-byte object hash | Listing, as one prefix scan per bucket |
+| `objects/arn:aws:s3:::<bucket>/<key>` | the 32-byte object hash | Listing. A page without a delimiter scans from its cursor for at most `max-keys` + 1 rows; a page with a delimiter still scans every row under the prefix |
 | `objects/deleted-epoch:<hex object hash>/<16-hex-digit epoch>/<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record of a failed scoped shard delete, one row for each generation. N writes these rows and reads them. N-1 does not read them |
 | `objects/deleted:<bucket>/<key>`, `objects/deleted:#<hex object hash>/<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record of a failed shard delete from N-1. N-1 writes and reads only these rows. N reads them and does not write them |
 | `objects/part:<uploadID>:<part>` | gob `ObjectToShardNodes` | Placement of an in-flight multipart part |
@@ -986,7 +986,7 @@ Things the design implies but the code does not do. Longer-horizon items live in
 
 **No ETag backfill for pre-v3 objects.** `PutObject` and `CompleteMultipartUpload` store the body's MD5 in placement record v3 — a plain hex digest for a single part, `"<md5>-<N>"` for a multipart object assembled from N parts — and `GetObject`, `HeadObject` and `ListObjectsV2` return it as the ETag. A record written under an older placement version has no digest, so these surfaces omit its ETag instead of serving a stale value, and nothing rewrites it to add one.
 
-**Listings are not paginated.** `ListObjects` scans and returns everything under the prefix, always reporting `IsTruncated: false` and a max-keys of 1000 it does not enforce.
+**A delimiter listing reads the whole prefix.** A `ListObjects` page with a delimiter scans every row under the prefix and collapses them before it cuts the page, so its cost grows with the prefix. A page without a delimiter reads at most `max-keys` + 1 live rows, though the scan still passes over keys deleted since the store last compacted.
 
 **No multi-object delete.** `POST /{bucket}?delete=` has no route and returns 405.
 
