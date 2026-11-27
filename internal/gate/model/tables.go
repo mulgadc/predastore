@@ -20,4 +20,7 @@ const (
 	TableObjectVersions = "objectversions" // Object versions (bucket/key -> version records)
 	TableMultipart      = "multipart"      // Multipart upload metadata (uploadID -> metadata)
 	TableParts          = "parts"          // Part metadata (uploadID:partNumber -> part info)
+	// TableIntents holds one row per conditional write in flight, keyed by
+	// object hash and write epoch, naming every node that can hold its shards.
+	TableIntents = "intents" // Write intents (hash+epoch -> intent)
 )
