@@ -136,6 +136,24 @@ func (m *fakeMeta) Scan(_ context.Context, prefix string, limit int) ([]meta.Ite
 	return items, nil
 }
 
+// ScanFrom is Scan over the keys that sort strictly after after.
+func (m *fakeMeta) ScanFrom(_ context.Context, prefix, after string, limit int) ([]meta.Item, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.count("scan")
+	var items []meta.Item
+	for k, v := range m.rows {
+		if strings.HasPrefix(k, prefix) && k > after {
+			items = append(items, meta.Item{Key: k, Value: append([]byte(nil), v...)})
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Key < items[j].Key })
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
+}
+
 // shardID identifies one shard of one object, which is what a blob node keys by.
 type shardID struct {
 	key   [32]byte

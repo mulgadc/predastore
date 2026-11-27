@@ -124,7 +124,7 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			cursor = marker
 		}
 
-		items, err := metaScan(ctx, mc, model.TableObjects, objectARN(bucket, prefix), 0)
+		items, err := listRows(ctx, mc, bucket, prefix, delimiter, cursor, maxKeys)
 		if err != nil {
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
@@ -344,4 +344,22 @@ func urlEncodeKey(key string) string {
 		}
 	}
 	return b.String()
+}
+
+// listRows reads the listing rows a page is cut from. Without a delimiter
+// every row is one entry, so one scan from the cursor of at most maxKeys+1
+// rows holds the page and says whether it is truncated.
+func listRows(ctx context.Context, mc MetaClient, bucket, prefix, delimiter, cursor string, maxKeys int) ([]meta.Item, error) {
+	if delimiter != "" {
+		return metaScan(ctx, mc, model.TableObjects, objectARN(bucket, prefix), 0)
+	}
+	// A cursor below the prefix would seek outside it and find nothing. One
+	// equal to the prefix stays, because the scan skips the cursor itself.
+	after := ""
+	if cursor != "" && objectARN(bucket, cursor) >= objectARN(bucket, prefix) {
+		after = objectARN(bucket, cursor)
+	}
+	// max-keys=0 still reads one row, so a store that cannot be read is an
+	// error and not an empty page.
+	return metaScanFrom(ctx, mc, model.TableObjects, objectARN(bucket, prefix), after, max(maxKeys, 0)+1)
 }

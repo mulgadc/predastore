@@ -221,6 +221,10 @@ func (m *s3Meta) Scan(ctx context.Context, prefix string, limit int) ([]meta.Ite
 	return m.LeaderScanFrom(ctx, prefix, "", limit)
 }
 
+func (m *s3Meta) ScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error) {
+	return m.LeaderScanFrom(ctx, prefix, after, limit)
+}
+
 func (m *s3Meta) LeaderScanFrom(_ context.Context, prefix, after string, limit int) ([]meta.Item, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
