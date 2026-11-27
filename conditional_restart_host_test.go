@@ -281,6 +281,7 @@ func createRestartBucket(t *testing.T, c *s3Client) {
 // A replica with no snapshot replays its whole log on restart. The
 // conditional create keeps its result, its intent stays committed, and an
 // aged reaper pass settles the intent and leaves the object readable.
+// Verifies: ADR-0003:S7, ADR-0003:S11.
 func TestS7_AConditionalCreateReadsBackAfterARestartThatReplaysTheLog(t *testing.T) {
 	h := newRestartHost(t)
 	c := h.start()
@@ -304,6 +305,7 @@ func TestS7_AConditionalCreateReadsBackAfterARestartThatReplaysTheLog(t *testing
 // A replica restores a snapshot that holds one conditional create, then
 // replays the log after it, which holds a second. Both keep their result
 // through the restore and the replay, and through an aged reaper pass.
+// Verifies: ADR-0003:S7, ADR-0003:S11.
 func TestS7_AConditionalCreateReadsBackAfterARestartThatRestoresASnapshot(t *testing.T) {
 	h := newRestartHost(t)
 	h.cfg.Meta = config.Meta{SnapshotIntervalSeconds: 1, SnapshotThreshold: 1}

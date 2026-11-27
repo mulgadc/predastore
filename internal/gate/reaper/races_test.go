@@ -122,6 +122,7 @@ func (g *intentGate) deleteObject(mc handlers.MetaClient, bc handlers.BlobClient
 
 // A tombstone reclaim that read no placement, then paused while a conditional
 // create answered 200, must leave the new body readable when it resumes.
+// Verifies: ADR-0003:S7.
 func TestS7_AReclaimPausedAcrossAConditionalCreateLeavesTheNewBodyReadable(t *testing.T) {
 	g := newIntentGate(t)
 	g.mustPut("lock", body1)
@@ -158,6 +159,7 @@ func TestS7_AReclaimPausedAcrossAConditionalCreateLeavesTheNewBodyReadable(t *te
 // An inline delete that read its placement, paused while a conditional write
 // committed, then stopped before its placement delete, leaves the write
 // readable.
+// Verifies: ADR-0003:S7.
 func TestS7_AnInlineDeletePausedAcrossAConditionalWriteThatStopsLeavesTheWriteReadable(t *testing.T) {
 	g := newIntentGate(t)
 	etag := g.mustPut("lock", body1)
@@ -184,6 +186,7 @@ func TestS7_AnInlineDeletePausedAcrossAConditionalWriteThatStopsLeavesTheWriteRe
 // A writer paused after it opened its held streams and before its intent,
 // then resumed after an aged intent pass, finds nothing fenced: the write
 // settles, with no intent and no held shard left.
+// Verifies: ADR-0003:S7, ADR-0003:S11.
 func TestS7_AWriterPausedBeforeItsIntentAcrossAPassSettles(t *testing.T) {
 	g := newIntentGate(t)
 	etag := g.mustPut("lock", body1)
