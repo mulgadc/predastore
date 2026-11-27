@@ -307,12 +307,12 @@ func (s *Server) handlePutHeld(h Request, stream transport.Stream) error {
 }
 
 // putHeld runs a registered held put once its writer exists. The caller is
-// told before any body byte is read, so an abort that arrives at any later
-// point finds either the open writer or its row.
+// told before any body byte is read, and an unused writer is discarded before
+// its registration goes, so an abort confirms only once the segment is free.
 func (s *Server) putHeld(h Request, k heldKey, writer engine.Writer, stream transport.Stream) error {
 	if err := respond(stream, &Response{Registered: true, Epoch: h.Epoch}); err != nil {
-		s.held.finish(k)
 		s.discard(writer)
+		s.held.finish(k)
 		return fmt.Errorf("write registered envelope: %w", err)
 	}
 
@@ -322,13 +322,13 @@ func (s *Server) putHeld(h Request, k heldKey, writer engine.Writer, stream tran
 	_, err := writer.ReadFrom(guard)
 	guard.Stop()
 	if err != nil {
-		s.held.finish(k)
 		s.discard(writer)
+		s.held.finish(k)
 		return respond(stream, &Response{Err: fmt.Sprintf("write: %v", err)})
 	}
 	if s.held.beginClose(k) {
-		s.held.finish(k)
 		s.discard(writer)
+		s.held.finish(k)
 		return respond(stream, &Response{Err: "held write aborted"})
 	}
 	// An abort from here on waits for this close and drops the row itself.

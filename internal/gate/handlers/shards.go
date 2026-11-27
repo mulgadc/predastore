@@ -980,49 +980,50 @@ const hedgeDelay = 250 * time.Millisecond
 // and far too slow a one.
 const shardConvictionWindow = 5 * time.Second
 
-// deleteObject sends DELETE requests to all shard nodes.
+// deleteObject removes an object's shards at the generation its placement
+// names, so a write that lands at the same positions meanwhile keeps its own.
 func deleteObject(ctx context.Context, bc BlobClient, bucket, key string, objectHash [32]byte, place ObjectToShardNodes) error {
-	// Build (node, shardIndex) pairs so each delete carries the correct shard index.
-	type nodeShard struct {
-		node       config.NodeID
-		shardIndex int
-	}
-	targets := make([]nodeShard, 0, len(place.DataShardNodes)+len(place.ParityShardNodes))
-	for i, n := range place.DataShardNodes {
-		targets = append(targets, nodeShard{node: n, shardIndex: i})
-	}
-	for i, n := range place.ParityShardNodes {
-		targets = append(targets, nodeShard{node: n, shardIndex: len(place.DataShardNodes) + i})
-	}
+	return fanOutDelete(ctx, bucket, key, place, func(node config.NodeID, index uint32) (*blob.DeleteResponse, error) {
+		return bc.DeleteEpoch(ctx, node, blob.CommitRequest{Key: objectHash, Index: index, Epoch: place.WriteEpoch})
+	})
+}
 
+// deletePartShards removes every generation of a multipart part's shards. An
+// object at the part's hidden key shares the hash, so it loses its shards too.
+func deletePartShards(ctx context.Context, bc BlobClient, bucket, key string, partHash [32]byte, place ObjectToShardNodes) error {
+	return fanOutDelete(ctx, bucket, key, place, func(node config.NodeID, index uint32) (*blob.DeleteResponse, error) {
+		return bc.Delete(ctx, node, blob.DeleteRequest{Key: partHash, Index: index})
+	})
+}
+
+// fanOutDelete sends one shard delete to every position a placement names
+// and returns the first failure.
+func fanOutDelete(
+	ctx context.Context, bucket, key string, place ObjectToShardNodes,
+	send func(node config.NodeID, index uint32) (*blob.DeleteResponse, error),
+) error {
+	nodes := place.AllNodes()
 	var wg sync.WaitGroup
-	errCh := make(chan error, len(targets))
+	errCh := make(chan error, len(nodes))
 
-	for _, t := range targets {
-		wg.Add(1)
-		go func(ns nodeShard) {
-			defer wg.Done()
-
-			delReq := blob.DeleteRequest{
-				Key:   objectHash,
-				Index: uint32(ns.shardIndex), //nolint:gosec // G115: shardIndex bounded by DataShards + ParityShards (small uint).
-			}
-
+	for i, node := range nodes {
+		index := uint32(i)
+		wg.Go(func() {
 			start := time.Now()
-			resp, err := bc.Delete(ctx, ns.node, delReq)
-			recordShardOutcome(ctx, telemetry.ShardOpDelete, ns.node, start, err)
+			resp, err := send(node, index)
+			recordShardOutcome(ctx, telemetry.ShardOpDelete, node, start, err)
 			if err != nil {
-				slog.Error("deleteObject: delete failed", "node", ns.node, "error", err)
+				slog.Error("deleteObject: delete failed", "node", node, "error", err)
 				errCh <- err
 				return
 			}
 
 			if !resp.Deleted {
-				slog.Warn("deleteObject: shard not found on node", "node", ns.node, "shardIndex", ns.shardIndex)
+				slog.Warn("deleteObject: shard not found on node", "node", node, "shardIndex", index)
 			} else {
-				slog.Debug("deleteObject: deleted shard", "node", ns.node, "shardIndex", ns.shardIndex, "bucket", bucket, "key", key)
+				slog.Debug("deleteObject: deleted shard", "node", node, "shardIndex", index, "bucket", bucket, "key", key)
 			}
-		}(t)
+		})
 	}
 
 	wg.Wait()

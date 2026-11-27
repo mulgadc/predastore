@@ -46,9 +46,13 @@ type fakeBlob struct {
 	prepared  map[shardAddr]shardState
 	down      map[config.NodeID]bool
 
-	// onPut runs after a put lands, so a test can move the world underneath a
-	// repair that is already in flight.
-	onPut func()
+	// onPut runs after a put lands, and onCommit after a commit, so a test can
+	// move the world underneath a repair that is already in flight.
+	onPut    func()
+	onCommit func()
+
+	// deleted is the epoch each scoped delete named, in order.
+	deleted []uint64
 
 	stats, gets, puts, commits, aborts, deletes atomic.Int64
 }
@@ -185,6 +189,13 @@ func (f *fakeBlob) Commit(_ context.Context, node config.NodeID, req blob.Commit
 	}
 	delete(f.prepared, addr)
 	f.committed[addr] = s
+	if f.onCommit != nil {
+		onCommit := f.onCommit
+		f.onCommit = nil
+		f.mu.Unlock()
+		onCommit()
+		f.mu.Lock()
+	}
 
 	return false, nil
 }
@@ -201,21 +212,30 @@ func (f *fakeBlob) Abort(_ context.Context, node config.NodeID, req blob.CommitR
 	return nil
 }
 
-func (f *fakeBlob) Delete(
-	_ context.Context, node config.NodeID, req blob.DeleteRequest,
+// DeleteEpoch removes the rows at a position only at the named generation,
+// as the blob engine does, so a later write there is untouched.
+func (f *fakeBlob) DeleteEpoch(
+	_ context.Context, node config.NodeID, req blob.CommitRequest,
 ) (*blob.DeleteResponse, error) {
 	f.deletes.Add(1)
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.deleted = append(f.deleted, req.Epoch)
 	if f.down[node] {
 		return nil, errNodeDown
 	}
 	addr := shardAddr{node, req.Key, req.Index}
-	_, held := f.committed[addr]
-	delete(f.committed, addr)
-	delete(f.prepared, addr)
+	deleted := false
+	if s, ok := f.committed[addr]; ok && s.epoch == req.Epoch {
+		delete(f.committed, addr)
+		deleted = true
+	}
+	if s, ok := f.prepared[addr]; ok && s.epoch == req.Epoch {
+		delete(f.prepared, addr)
+		deleted = true
+	}
 
-	return &blob.DeleteResponse{Deleted: held}, nil
+	return &blob.DeleteResponse{Deleted: deleted}, nil
 }
 
 type fakeMeta struct {

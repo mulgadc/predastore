@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -357,4 +358,71 @@ func TestDeleteEpochRemovesOnlyTheNamedEpochOverTheWire(t *testing.T) {
 	resp, err = c.DeleteEpoch(ctx, epochServerNode, shardAt(0))
 	require.NoError(t, err)
 	assert.False(t, resp.Deleted, "epoch zero must match only a row written before epochs")
+}
+
+// discardingStore holds a held writer inside Discard, before it lets go of
+// its segment, until released.
+type discardingStore struct {
+	*engine.Store
+
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *discardingStore) AppendHeld(key [32]byte, index uint32, size int64, epoch uint64) (engine.Writer, error) {
+	w, err := s.Store.AppendHeld(key, index, size, epoch)
+	if err != nil {
+		return nil, err
+	}
+	return &discardingWriter{Writer: w, store: s}, nil
+}
+
+type discardingWriter struct {
+	engine.Writer
+
+	store *discardingStore
+}
+
+func (w *discardingWriter) Discard() error {
+	close(w.store.entered)
+	<-w.store.release
+	return w.Writer.Discard()
+}
+
+// An abort confirms a cut-off held writer only once its discard has released
+// the segment, so a caller told nothing is left can rely on the space too.
+func TestAbortConfirmsOnlyAfterTheDiscardReleases(t *testing.T) {
+	es, err := engine.Open(t.TempDir(), engine.WithAEAD(storetest.TestAEAD()), engine.WithFreeSpaceWatermark(0, 0))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = es.Close() })
+	store := &discardingStore{Store: es, entered: make(chan struct{}), release: make(chan struct{})}
+	var released sync.Once
+	free := func() { released.Do(func() { close(store.release) }) }
+	c := startStoreNode(t, store)
+	// After the node's own cleanup is registered, so it runs first and a
+	// failed assertion cannot leave the node waiting on the paused discard.
+	t.Cleanup(free)
+	ctx := context.Background()
+
+	p, err := c.OpenHeld(ctx, 1, heldReq(1, []byte("cut off before its body")))
+	require.NoError(t, err)
+	t.Cleanup(p.Abandon)
+	require.ErrorIs(t, c.Abort(ctx, 1, shardAt(1)), blob.ErrWriterOpen)
+
+	select {
+	case <-store.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cut-off writer never began its discard")
+	}
+	for range 3 {
+		require.ErrorIs(t, c.Abort(ctx, 1, shardAt(1)), blob.ErrWriterOpen,
+			"an abort must not confirm while the discard still holds the segment")
+	}
+
+	free()
+	require.Eventually(t, func() bool {
+		return c.Abort(ctx, 1, shardAt(1)) == nil
+	}, 5*time.Second, 10*time.Millisecond, "the abort must confirm once the discard has released")
+	_, err = c.Commit(ctx, 1, shardAt(1))
+	require.ErrorIs(t, err, blob.ErrNotPrepared)
 }

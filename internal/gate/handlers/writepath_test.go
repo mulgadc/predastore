@@ -346,6 +346,22 @@ func (b *fakeBlob) Delete(_ context.Context, _ config.NodeID, req blob.DeleteReq
 	return &blob.DeleteResponse{Deleted: ok}, nil
 }
 
+func (b *fakeBlob) DeleteEpoch(_ context.Context, _ config.NodeID, req blob.CommitRequest) (*blob.DeleteResponse, error) {
+	id := shardID{key: req.Key, index: req.Index}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	deleted := false
+	if s, ok := b.shards[id]; ok && s.epoch == req.Epoch {
+		delete(b.shards, id)
+		deleted = true
+	}
+	if s, ok := b.prepared[id]; ok && s.epoch == req.Epoch {
+		delete(b.prepared, id)
+		deleted = true
+	}
+	return &blob.DeleteResponse{Deleted: deleted}, nil
+}
+
 // observingReader records the largest chunk handed to the node.
 type observingReader struct {
 	r    io.Reader

@@ -48,14 +48,15 @@ type MetaClient interface {
 var _ MetaClient = (*meta.Client)(nil)
 
 // BlobClient is what repair needs of a blob node: what it holds, the bytes to
-// rebuild from, and the two halves of a write.
+// rebuild from, the two halves of a write, and the scoped delete that
+// releases a handed-off copy.
 type BlobClient interface {
 	Stat(ctx context.Context, node config.NodeID, req blob.StatRequest) (*blob.StatResponse, error)
 	Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error)
 	Put(ctx context.Context, node config.NodeID, req blob.PutRequest, body io.Reader) (*blob.PutResponse, error)
 	Commit(ctx context.Context, node config.NodeID, req blob.CommitRequest) (superseded bool, err error)
 	Abort(ctx context.Context, node config.NodeID, req blob.CommitRequest) error
-	Delete(ctx context.Context, node config.NodeID, req blob.DeleteRequest) (*blob.DeleteResponse, error)
+	DeleteEpoch(ctx context.Context, node config.NodeID, req blob.CommitRequest) (*blob.DeleteResponse, error)
 }
 
 // Config is everything a repair service runs on.

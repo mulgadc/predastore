@@ -242,7 +242,8 @@ The meta replicas are a plain key-value store. The table taxonomy is the gate's 
 |---|---|---|
 | `objects/<32-byte object hash>` | gob `ObjectToShardNodes` | Placement and object size, for retrieval |
 | `objects/arn:aws:s3:::<bucket>/<key>` | the 32-byte object hash | Listing, as one prefix scan per bucket |
-| `objects/deleted:<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record for a future compaction coordinator |
+| `objects/deleted-epoch:<hex object hash>/<16-hex-digit epoch>/<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record of a failed scoped shard delete, one row for each generation. N writes these rows and reads them. N-1 does not read them |
+| `objects/deleted:<bucket>/<key>`, `objects/deleted:#<hex object hash>/<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record of a failed shard delete from N-1. N-1 writes and reads only these rows. N reads them and does not write them |
 | `objects/part:<uploadID>:<part>` | gob `ObjectToShardNodes` | Placement of an in-flight multipart part |
 | `buckets/<name>` | gob `BucketMetadata` | Ownership, region, public flag |
 | `multipart/<uploadID>` | gob `UploadMetadata` | The upload itself |
@@ -528,6 +529,8 @@ The holder is **derived and never recorded**: it is `ring.Nodes(hash, K+M+1)[K+M
 
 Only the shards that actually prepared are committed or aborted. Committing a shard that never prepared is refused, and aborting one would ask a node to discard the generation it is still serving.
 
+**The ETag is the MD5 of the body**, teed off the read that feeds the shards. A plain body sent with both `X-Spinifex-Ebs: true` and `x-amz-checksum-crc64nvme` is checked with CRC64NVME instead and hashed with nothing else: viperblock sends its chunks that way and never reads an ETag, and MD5 is the slowest step of the write at about 400 MB/s a core. The object's ETag is then the CRC64NVME and the length in hex, not an MD5; a mismatch fails the write with `BadDigest` before the commit, and a malformed value with `InvalidDigest` before any shard is placed. Either header alone, or an `aws-chunked` body, keeps the MD5 ETag, because the AWS CLI sends CRC64NVME by default.
+
 If any node reported nearfull pressure, the response also carries `X-Predastore-Pool-Pressure: nearfull`; a node that rejected outright surfaces as 507 `InsufficientStorage`.
 
 **Ordering matters.** Shards are durable before metadata. A crash between the two leaves shards nothing points at (reclaimed by compaction only once something tombstones them — see §15); a crash the other way round would leave metadata pointing at data that was never written.
@@ -548,7 +551,27 @@ A `Range` request is served straight from the data shards when it is short: the 
 
 ## DELETE
 
-The gate loads the placement, fires shard deletes at every node in parallel, writes a `deleted:` record, then removes both metadata keys. A node that refuses its shard delete leaves garbage for the compactor; the object must still disappear from global state, so shard-delete failure is logged rather than propagated.
+The gate loads the placement and sends `DeleteEpoch` at the placement's `WriteEpoch` to every shard position in parallel, then removes the placement record and the listing row.
+Each shard delete removes only the rows of that epoch, so a write that lands at the same positions after the placement read keeps its shards.
+If a shard delete fails, the gate writes a `deleted-epoch:` record before it removes the placement record, and the object still leaves global state.
+The record key contains the object hash, the `WriteEpoch`, the bucket and the key, so each failed delete of a distinct generation has its own record.
+The record names the nodes and the epoch.
+The prefix does not start with `deleted:`, so a reaper from before this prefix never reads the record.
+An object written before epochs has `WriteEpoch` zero, and its shards are deleted at epoch zero, which matches only rows from before epochs.
+
+The tombstone reaper sweeps the `deleted-epoch:` records and the `deleted:` records.
+The release before the `deleted-epoch:` prefix writes a `deleted:` record only after a failed shard fan-out, so a `deleted:` record still owes its shards.
+For each record, the reaper reads the live placement at the record's hash with `LeaderGet`.
+When the leader cannot answer, the reaper keeps the record for a later pass, because a lagging follower can name an older epoch.
+A live placement at the record's own epoch is the delete still in flight, and the reaper keeps the record for a later pass.
+In the other cases, the reaper sends `DeleteEpoch` at the record's epoch to every node the record names.
+A live placement at another epoch is a recreate, and the reaper still deletes the record's epoch, because that delete cannot remove the shards of the recreate.
+A record at epoch zero, with either prefix, is a failed delete of an object from before epochs.
+The reaper deletes its shards at epoch zero, so a recreate at a positive epoch keeps its shards.
+The reaper removes the record only when every shard delete succeeds, so a node that was down is reclaimed on a later pass.
+A node from before `DeleteEpoch` closes the stream unanswered, and the record stays until that node is upgraded.
+Multipart part cleanup keeps the unscoped `Delete`.
+An object at the hidden part key of an upload has the same hash as the part, and the cleanup also removes the shards of that object.
 
 ## Multipart
 
@@ -607,7 +630,10 @@ Rebuild concurrency derives from the CPU count but is capped at 8. Half of a 256
 
 Repairing only the nodes sharing its process settles ownership deterministically: every blob node has exactly one coordinator and nothing has to elect one. Keeping no durable state is affordable because every rebuild is idempotent against the record's epoch — a crash repeats a page rather than losing work, and a durable cursor would need its own consistency argument against a table being written underneath it.
 
-A shard that was handed off is returned rather than recomputed. Repair derives the holder the same way the write path did, asks it for the shard at the record's epoch, streams it to its owner and publishes it there — and only then releases the holder's copy. Emptying the holder first would turn a failed return into exactly the loss handoff existed to prevent. A holder that has nothing, or has another generation, refuses, and the rebuild proceeds as it would have.
+A shard that was handed off is returned rather than recomputed. Repair derives the holder the same way the write path did, asks it for the shard at the record's epoch, streams it to its owner and publishes it there — and only then releases the holder's copy. Emptying the holder first would turn a failed return into exactly the loss handoff existed to prevent.
+The release is `DeleteEpoch` at the record's epoch, so a later write that landed on the holder meanwhile keeps its shard.
+When the publish discards the owner's copy because the record moved, the holder keeps its copy, because a read of the old record can still need it.
+A holder that cannot run `DeleteEpoch` keeps its copy, and the return still counts, because the owner holds the shard. A holder that has nothing, or has another generation, refuses, and the rebuild proceeds as it would have.
 
 Before publishing, the record is re-read and the rebuilt shard discarded if the epoch has moved, so a write that lands mid-repair is not demoted to the generation before it. That window is narrowed rather than closed; what survives it is a shard the next read discards and the next pass rebuilds, which is a wasted repair and not a wrong object.
 

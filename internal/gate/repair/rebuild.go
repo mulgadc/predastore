@@ -79,14 +79,19 @@ func (s *Service) pullFromHandoff(ctx context.Context, t task) error {
 	}, body); err != nil {
 		return fmt.Errorf("return handed-off shard to its owner: %w", err)
 	}
-	if err := s.publish(ctx, t); err != nil {
+	committed, err := s.publish(ctx, t)
+	if err != nil {
 		return err
 	}
+	if !committed {
+		// The owner's copy was discarded, so the holder may have the only one.
+		return nil
+	}
 
-	// Only once the owner holds it. A holder emptied before that would turn a
-	// failed return into the loss the handoff existed to prevent.
-	if _, err := s.cfg.Blob.Delete(ctx, holder, blob.DeleteRequest{
-		Key: t.hash, Index: uint32(t.index), //nolint:gosec // G115: bounded by the shard count.
+	// Only once the owner holds it, and only the generation returned, so a
+	// later write that landed on the holder meanwhile keeps its shard.
+	if _, err := s.cfg.Blob.DeleteEpoch(ctx, holder, blob.CommitRequest{
+		Key: t.hash, Index: uint32(t.index), Epoch: t.place.WriteEpoch, //nolint:gosec // G115: bounded by the shard count.
 	}); err != nil {
 		slog.WarnContext(ctx, "Handed-off shard returned but not released on its holder",
 			"holder", holder, "owner", t.node, "index", t.index, "err", err)
@@ -160,7 +165,8 @@ func (s *Service) rebuildShard(ctx context.Context, t task) error {
 		return fmt.Errorf("write rebuilt shard: %w", putErr)
 	}
 
-	return s.publish(ctx, t)
+	_, err = s.publish(ctx, t)
+	return err
 }
 
 // publish commits the rebuilt shard, but only after confirming the record still
@@ -172,10 +178,12 @@ func (s *Service) rebuildShard(ctx context.Context, t task) error {
 // record can move between this read and the commit — but the residual case is
 // a shard the next read discards on epoch mismatch and the next pass rebuilds,
 // which is a wasted repair rather than a wrong object.
-func (s *Service) publish(ctx context.Context, t task) error {
+//
+// It reports whether it committed, so a caller can tell a discard from it.
+func (s *Service) publish(ctx context.Context, t task) (committed bool, err error) {
 	current, err := s.currentEpoch(ctx, t.hash)
 	if err != nil {
-		return errors.Join(fmt.Errorf("re-read placement record: %w", err), s.discard(ctx, t))
+		return false, errors.Join(fmt.Errorf("re-read placement record: %w", err), s.discard(ctx, t))
 	}
 	if current != t.place.WriteEpoch {
 		slog.InfoContext(ctx, "Object was rewritten during its repair; discarding the rebuilt shard",
@@ -183,7 +191,7 @@ func (s *Service) publish(ctx context.Context, t task) error {
 			"built_for", fmt.Sprintf("%016x", t.place.WriteEpoch),
 			"record_now", fmt.Sprintf("%016x", current))
 
-		return s.discard(ctx, t)
+		return false, s.discard(ctx, t)
 	}
 
 	// A rebuild overtaken by a live write is not a failure: the newer generation
@@ -192,14 +200,14 @@ func (s *Service) publish(ctx context.Context, t task) error {
 		Key: t.hash, Index: uint32(t.index), Epoch: t.place.WriteEpoch, //nolint:gosec // G115: bounded by the shard count.
 	})
 	if err != nil {
-		return fmt.Errorf("commit rebuilt shard: %w", err)
+		return false, fmt.Errorf("commit rebuilt shard: %w", err)
 	}
 	if superseded {
-		return fmt.Errorf("%w: node=%d index=%d built_for=%016x",
+		return false, fmt.Errorf("%w: node=%d index=%d built_for=%016x",
 			errSuperseded, t.node, t.index, t.place.WriteEpoch)
 	}
 
-	return nil
+	return true, nil
 }
 
 // errSuperseded reports that a rebuilt shard was refused because its node has

@@ -171,3 +171,31 @@ func BenchmarkBlobGetConcurrent(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkBlobDelete times one shard delete of a committed 1 KiB shard, with
+// the unscoped and the epoch-scoped opcode. The put that sets up each delete
+// runs with the timer stopped.
+func BenchmarkBlobDelete(b *testing.B) {
+	body := bytes.Repeat([]byte{0x6d}, 1<<10)
+	ctx := context.Background()
+	b.Run("Unscoped", func(b *testing.B) {
+		c := startBenchNode(b)
+		for b.Loop() {
+			b.StopTimer()
+			putCommitted(b, c, 0, body)
+			b.StartTimer()
+			_, err := c.Delete(ctx, benchNode, blob.DeleteRequest{Key: benchKey(), Index: 0})
+			require.NoError(b, err)
+		}
+	})
+	b.Run("Epoch", func(b *testing.B) {
+		c := startBenchNode(b)
+		for b.Loop() {
+			b.StopTimer()
+			epoch := putCommitted(b, c, 0, body)
+			b.StartTimer()
+			_, err := c.DeleteEpoch(ctx, benchNode, blob.CommitRequest{Key: benchKey(), Index: 0, Epoch: epoch})
+			require.NoError(b, err)
+		}
+	})
+}

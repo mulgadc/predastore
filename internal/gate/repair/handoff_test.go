@@ -169,3 +169,95 @@ func TestAStaleShardOnTheHolderIsNotPulled(t *testing.T) {
 	assert.Equal(t, obj.shards[1], held.body)
 	assert.Equal(t, obj.place.WriteEpoch, held.epoch)
 }
+
+// A write that lands on the holder after the owner's copy is published, and
+// before the holder's copy is released, makes a later generation there. The
+// release names the returned generation, so the later shard stays.
+//
+// Verifies: ADR-0003:S7.
+func TestS7_AHandoffReleaseLeavesALaterGenerationOnTheHolder(t *testing.T) {
+	t.Parallel()
+
+	c := newCluster(t, 2, 1, 4)
+	obj := c.store("handed-off", 64<<10)
+	owner, holder := c.handOff(obj, 1)
+	later := obj.place.WriteEpoch + 1
+	c.blob.onCommit = func() {
+		c.blob.hold(holder, obj.hash, 1, later, []byte("a later generation"))
+	}
+
+	require.NoError(t, c.service(owner).Pass(context.Background()))
+
+	held, ok := c.blob.held(holder, obj.hash, 1)
+	require.True(t, ok, "ADR-0003:S7: the handoff release removed a later generation from the holder")
+	assert.Equal(t, later, held.epoch)
+	assert.Equal(t, []uint64{obj.place.WriteEpoch}, c.blob.deleted, "the release must name the generation it returned")
+	owned, ok := c.blob.held(owner, obj.hash, 1)
+	require.True(t, ok)
+	assert.Equal(t, obj.place.WriteEpoch, owned.epoch)
+}
+
+// A record that moves while the shard is being returned makes publish discard
+// the owner's copy. The holder may then have the only copy a reader of the old
+// record can use, so it is not released.
+func TestADiscardedReturnLeavesTheHolderHoldingIt(t *testing.T) {
+	t.Parallel()
+
+	c := newCluster(t, 2, 1, 4)
+	obj := c.store("handed-off", 64<<10)
+	owner, holder := c.handOff(obj, 1)
+	moved := obj.place
+	moved.WriteEpoch++
+	c.blob.onPut = func() { c.record(obj.hash, moved) }
+
+	require.NoError(t, c.service(owner).Pass(context.Background()))
+
+	held, ok := c.blob.held(holder, obj.hash, 1)
+	require.True(t, ok, "a return whose publish was discarded must not release the holder")
+	assert.Equal(t, obj.place.WriteEpoch, held.epoch)
+	assert.Equal(t, obj.shards[1], held.body)
+	assert.Zero(t, c.blob.deletes.Load())
+}
+
+// refusingDeletes is a cluster whose named node cannot run the scoped delete,
+// as a node from before it closes the stream unanswered.
+type refusingDeletes struct {
+	BlobClient
+
+	node config.NodeID
+}
+
+func (r refusingDeletes) DeleteEpoch(
+	ctx context.Context, node config.NodeID, req blob.CommitRequest,
+) (*blob.DeleteResponse, error) {
+	if node == r.node {
+		return nil, errors.New("read response: stream closed")
+	}
+
+	return r.BlobClient.DeleteEpoch(ctx, node, req)
+}
+
+// A holder that cannot run the scoped delete keeps its copy, and the return
+// still counts, because the owner holds the shard.
+func TestAHolderThatRefusesTheScopedReleaseKeepsItsCopy(t *testing.T) {
+	t.Parallel()
+
+	c := newCluster(t, 2, 1, 4)
+	obj := c.store("handed-off", 64<<10)
+	owner, holder := c.handOff(obj, 1)
+
+	svc, err := New(Config{
+		Nodes: []config.NodeID{owner}, Ring: c.ring, Meta: c.meta,
+		Blob:       refusingDeletes{BlobClient: c.blob, node: holder},
+		DataShards: c.k, ParityShards: c.m, Workers: 4, PageSize: 8,
+	})
+	require.NoError(t, err)
+	require.NoError(t, svc.Pass(context.Background()))
+
+	owned, ok := c.blob.held(owner, obj.hash, 1)
+	require.True(t, ok)
+	assert.Equal(t, obj.place.WriteEpoch, owned.epoch)
+	_, still := c.blob.held(holder, obj.hash, 1)
+	assert.True(t, still, "the refused release leaves the holder's copy")
+	assert.Zero(t, svc.Stats().Failed, "the shard is home, so the return is not a failure")
+}

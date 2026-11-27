@@ -1,40 +1,39 @@
-// Package reaper reclaims the shards a delete leaves behind.
+// Package reaper reclaims the shards a failed delete leaves behind.
 //
-// A delete no longer talks to shard nodes: it writes a tombstone naming the
-// shards, removes the index entries that make the object visible, and
-// returns. This is the coordinator that reads the tombstone back and does the
-// deferred work.
+// The inline delete sends each shard delete itself. When one fails, it writes
+// a tombstone naming the shards and their generation, removes the placement
+// record, and returns. This is the coordinator that reads the tombstone back
+// and does the deferred work.
 //
 // It is a sweep, not a subscription, modelled closely on internal/gate/repair:
 // Config/New/Run/Pass/Stats, a worker pool over a channel, and ScanFrom paging
-// with a cursor. It differs in what it pages — only the tombstone rows, so a
-// cluster that is not deleting pays nothing for it — and in what it does with
-// what it finds: reclaim a tombstone's shards and drop it, once every one of
-// them is confirmed gone.
+// with a cursor. It pages only the tombstone rows, so a cluster that is not
+// deleting pays nothing for it, and it drops a tombstone only once every
+// shard it names is confirmed gone.
 //
-// Before deleting anything it re-reads the placement record at the
-// tombstone's hash and compares its WriteEpoch against the tombstone's own.
-// A plain existence check is not enough: deleteStoredObject writes the
-// tombstone before it removes the placement record, so a pass landing in
-// that window would see the very object being deleted, conclude it had been
-// recreated, and drop the tombstone without reclaiming its shards — leaking
-// them permanently, on every delete, on a window two raft writes wide. The
-// epoch tells the two cases apart: a match is the same delete still in
-// flight, left alone for a later pass; a mismatch is a genuine recreate —
-// object hashes are deterministic, so it lands on the same nodes and
-// indices — and the tombstone is dropped without touching a shard, since
-// deleting there would delete the recreated object's data.
+// It scans two prefixes. A failed delete writes its row under
+// DeletedEpochPrefix, keyed by object hash and epoch, so each failed delete of
+// a distinct generation has its own row. Rows under DeletedObjectPrefix were
+// written by an older release, and are still read.
 //
-// It deliberately does not close the window between that check and the
-// delete landing: a concurrent recreate in that narrow gap could still lose a
-// race against the sweep. Closing it needs the shard delete itself to carry
-// the placement's write epoch and the blob engine to honour it, which is a
-// protocol change out of scope here. It is no worse than the window the
-// inline delete already left against a concurrent PUT.
+// Every shard delete names the tombstone's WriteEpoch, and the blob node
+// removes only rows at exactly that epoch. A later generation at the same
+// position is untouched, whatever the order of the sweep and a write.
 //
-// A tombstone with WriteEpoch == 0 predates this field. Those deletes fanned
-// their shards out inline before the tombstone was even durable, so there is
-// nothing left to reclaim, and it is dropped without a placement check.
+// Before deleting anything it reads the placement record at the tombstone's
+// hash from the meta leader, and keeps the tombstone when the leader cannot
+// answer: a lagging follower can name an older generation while the
+// tombstoned one is still current. A placement at the tombstone's own epoch
+// is the delete still in flight, because the delete writes its tombstone
+// before it removes the placement, so the tombstone is left for a later pass.
+// A placement at another epoch is a recreate: the sweep still deletes the
+// tombstone's epoch, which cannot touch the recreate's shards, and keeps the
+// tombstone until every shard delete succeeds.
+//
+// A row at epoch zero, under either prefix, is a failed delete of an object
+// written before epochs. Its shards are still owed, and it is reclaimed like
+// any other row: the shard deletes name epoch zero, which matches only the
+// pre-epoch generation, so a recreate at a positive epoch is untouched.
 //
 // There is no election. Every gate that runs repair also runs this sweep, and
 // two gates racing the same tombstone issue the same idempotent shard deletes
@@ -62,10 +61,10 @@ import (
 )
 
 // MetaClient is the slice of the meta client a sweep needs: ScanFrom pages the
-// tombstones, Get checks whether a hash has since been recreated, and Delete
-// drops a tombstone once it is resolved either way.
+// tombstones, LeaderGet reads the current placement at a hash, and Delete
+// drops a tombstone once its shards are gone.
 type MetaClient interface {
-	Get(ctx context.Context, key string) ([]byte, error)
+	LeaderGet(ctx context.Context, key string) ([]byte, error)
 	Delete(ctx context.Context, key string) error
 	ScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error)
 }
@@ -73,9 +72,9 @@ type MetaClient interface {
 var _ MetaClient = (*meta.Client)(nil)
 
 // BlobClient is what the sweep needs of a blob node: the ability to remove
-// one shard.
+// one shard at one generation.
 type BlobClient interface {
-	Delete(ctx context.Context, node config.NodeID, req blob.DeleteRequest) (*blob.DeleteResponse, error)
+	DeleteEpoch(ctx context.Context, node config.NodeID, req blob.CommitRequest) (*blob.DeleteResponse, error)
 }
 
 var _ BlobClient = (*blob.Client)(nil)
@@ -111,8 +110,8 @@ const (
 )
 
 // Stats is what a pass did. Scanned counts tombstones read, Reclaimed the ones
-// removed — whether their shards were deleted or the key had been recreated —
-// and Pending is what the last completed pass left owing.
+// removed once their shards were deleted, and Pending is what the last
+// completed pass left owing.
 type Stats struct {
 	Passes    int64
 	Scanned   int64
@@ -251,11 +250,22 @@ type task struct {
 	info handlers.DeletedObjectInfo
 }
 
-// scan pages through the tombstone rows and emits each one it can decode. A
-// row it cannot decode is logged and skipped rather than failing the pass: a
-// tombstone from a future format must not stall reclaim for every other one.
+// scan pages through both tombstone prefixes and emits each row it can decode.
 func (s *Service) scan(ctx context.Context, emit func(task) error) error {
-	prefix := handlers.TableKey(model.TableObjects, handlers.DeletedObjectPrefix)
+	for _, prefix := range []string{handlers.DeletedEpochPrefix, handlers.DeletedObjectPrefix} {
+		if err := s.scanPrefix(ctx, prefix, emit); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// scanPrefix pages through one tombstone prefix. A row it cannot decode is
+// logged and skipped rather than failing the pass: a tombstone from a future
+// format must not stall reclaim for every other one.
+func (s *Service) scanPrefix(ctx context.Context, rowPrefix string, emit func(task) error) error {
+	prefix := handlers.TableKey(model.TableObjects, rowPrefix)
 	cursor := ""
 	for {
 		items, err := s.cfg.Meta.ScanFrom(ctx, prefix, cursor, s.pageSize)
@@ -298,19 +308,8 @@ func (s *Service) scan(ctx context.Context, emit func(task) error) error {
 // the caller must not count it against Failed. A false result with a non-nil
 // error explains why the reclaim could not complete.
 func (s *Service) reclaim(ctx context.Context, t task) (bool, error) {
-	if t.info.WriteEpoch == 0 {
-		// Legacy tombstone: its delete already fanned the shards out inline,
-		// before this field existed to name the generation. Nothing remains
-		// to reclaim.
-		if err := s.cfg.Meta.Delete(ctx, t.key); err != nil {
-			return false, fmt.Errorf("drop legacy tombstone: %w", err)
-		}
-
-		return true, nil
-	}
-
 	liveKey := handlers.TableKey(model.TableObjects, string(t.info.ObjectHash[:]))
-	data, err := s.cfg.Meta.Get(ctx, liveKey)
+	data, err := s.cfg.Meta.LeaderGet(ctx, liveKey)
 	switch {
 	case err == nil:
 		place, decErr := handlers.DecodePlacement(data)
@@ -319,25 +318,16 @@ func (s *Service) reclaim(ctx context.Context, t task) (bool, error) {
 		}
 
 		if place.WriteEpoch == t.info.WriteEpoch {
-			// Same generation at the same hash is the delete that wrote this
-			// tombstone, caught before its placement removal, not a recreate.
-			// The next pass finds the placement gone and reclaims normally.
+			// The delete that wrote this tombstone, caught before its
+			// placement removal. A later pass finds the placement gone.
 			return false, nil
 		}
-
-		// A different epoch at the same hash is a genuine recreate. Object
-		// hashes are deterministic, so the new write already superseded these
-		// shards in place, and reclaiming superseded extents is the compactor's.
-		if delErr := s.cfg.Meta.Delete(ctx, t.key); delErr != nil {
-			return false, fmt.Errorf("drop tombstone superseded by a recreated key: %w", delErr)
-		}
-
-		return true, nil
+		// A recreate at another epoch. The shard deletes below name the
+		// tombstone's epoch, so the recreate's shards stay.
 	case errors.Is(err, meta.ErrNotFound):
-		// No live record: the key has not been recreated, so it is safe to
-		// reclaim the shards below.
+		// No live record at the hash.
 	default:
-		return false, fmt.Errorf("check for a recreated object: %w", err)
+		return false, fmt.Errorf("read the live placement from the leader: %w", err)
 	}
 
 	if err := s.deleteShards(ctx, t.info); err != nil {
@@ -387,9 +377,10 @@ func (s *Service) deleteShards(ctx context.Context, info handlers.DeletedObjectI
 	for _, target := range targets {
 		wg.Go(func() {
 			start := time.Now()
-			resp, err := s.cfg.Blob.Delete(ctx, target.node, blob.DeleteRequest{
+			resp, err := s.cfg.Blob.DeleteEpoch(ctx, target.node, blob.CommitRequest{
 				Key:   info.ObjectHash,
 				Index: uint32(target.index), //nolint:gosec // G115: index bounded by DataShards + ParityShards (small uint).
+				Epoch: info.WriteEpoch,
 			})
 			recordShardDelete(ctx, target.node, start, err)
 			if err != nil {

@@ -70,6 +70,10 @@ func (c *hedgeBlobClient) Delete(context.Context, config.NodeID, blob.DeleteRequ
 	return nil, errors.New("not implemented")
 }
 
+func (c *hedgeBlobClient) DeleteEpoch(context.Context, config.NodeID, blob.CommitRequest) (*blob.DeleteResponse, error) {
+	return nil, errors.New("not implemented")
+}
+
 // rs21 builds an RS(2,1) stripe of shardLen bytes per shard, and the placement
 // naming nodes 4, 5 for data and 6 for parity -- the dev-prod topology.
 func rs21(t *testing.T, shardLen int) (*hedgeBlobClient, Config, ObjectToShardNodes) {
