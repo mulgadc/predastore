@@ -72,6 +72,7 @@ func (d *raftDisk) start(t *testing.T, fsm raft.FSM) (*raft.Raft, error) {
 // that stops part way through a restore does.
 type failingRestore struct {
 	*FSM
+
 	limit int64
 }
 
@@ -89,6 +90,7 @@ func (failReader) Read([]byte) (int, error) { return 0, errors.New("injected sto
 // recordingFSM keeps the answer to every command entry the FSM was given.
 type recordingFSM struct {
 	*FSM
+
 	mu   sync.Mutex
 	seen map[uint64]any
 }

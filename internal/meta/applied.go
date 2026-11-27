@@ -138,6 +138,7 @@ func (l *txnLimits) cost(key []byte, valueLen int) int64 {
 // limits, keeping room for the applied row.
 type txnBudget struct {
 	txnLimits
+
 	count, size int64
 }
 
