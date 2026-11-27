@@ -105,6 +105,15 @@ func staleHostConfig(t *testing.T) (*s3Client, *config.Config) {
 }
 
 func TestHostReplaysRaftNamedPlacementBeforeServingShards(t *testing.T) {
+	testHostReplaysRaftNamedPlacement(t, false)
+}
+
+func TestHostReplaysPlacementPublishedAfterRestart(t *testing.T) {
+	testHostReplaysRaftNamedPlacement(t, true)
+}
+
+func testHostReplaysRaftNamedPlacement(t *testing.T, latePlacement bool) {
+	t.Helper()
 	client, cfg := staleHostConfig(t)
 	require.NoError(t, cfg.Validate())
 	key := newMasterKey(t)
@@ -136,11 +145,17 @@ func TestHostReplaysRaftNamedPlacementBeforeServingShards(t *testing.T) {
 
 	hash := model.ObjectHash(staleBucket, staleObject)
 	var placement handlers.ObjectToShardNodes
+	placementKey := handlers.TableKey(model.TableObjects, string(hash[:]))
+	var placementValue []byte
 	withHostClients(t, cfg, func(mc *meta.Client, _ *blob.Client, _ []config.NodeID) {
-		raw, err := mc.AuthorityGet(t.Context(), handlers.TableKey(model.TableObjects, string(hash[:])))
+		raw, err := mc.AuthorityGet(t.Context(), placementKey)
 		require.NoError(t, err)
+		placementValue = raw
 		placement, err = handlers.DecodePlacement(raw)
 		require.NoError(t, err)
+		if latePlacement {
+			require.NoError(t, mc.Delete(t.Context(), placementKey))
+		}
 	})
 	stop()
 	client.http.CloseIdleConnections()
@@ -167,6 +182,11 @@ func TestHostReplaysRaftNamedPlacementBeforeServingShards(t *testing.T) {
 	}
 
 	start()
+	if latePlacement {
+		withHostClients(t, cfg, func(mc *meta.Client, _ *blob.Client, _ []config.NodeID) {
+			require.NoError(t, mc.Put(t.Context(), placementKey, placementValue))
+		})
+	}
 	status, body = client.send(http.MethodGet, objectPath, "", nil)
 	require.Equal(t, http.StatusOK, status, "%s", body)
 	require.Equal(t, want, body)

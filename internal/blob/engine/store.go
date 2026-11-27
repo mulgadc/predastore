@@ -69,7 +69,8 @@ type Store struct {
 	retainedMaxAge          time.Duration
 	compactor               *compactor
 	startupRecovery         func(*Store) error
-	deferredPrepareSegments map[uint64]struct{}
+	deferredPrepares        map[prepareRecoveryKey]extent
+	deferredPrepareSegments map[uint64]int
 
 	// This node's slot among the cluster's blob nodes, which offsets its
 	// routine passes, and the pacing a routine pass runs under.
@@ -1085,9 +1086,17 @@ func (store *Store) DeleteEpoch(key [32]byte, index uint32, epoch uint64) (bool,
 	}
 
 	idxKey := MakeKey(key, index)
+	recovery := prepareRecoveryKey{key: key, index: index, epoch: epoch}
+	deferred, pending := store.deferredPrepares[recovery]
 	deleted := false
 	err := store.index.Update(func(txn *badger.Txn) error {
 		deleted = false
+		if pending {
+			if err := txn.Set(tombstoneKey(deferred.SegNum, deferred.Off), tombstoneValue(deferred.PSize)); err != nil {
+				return fmt.Errorf("delete deferred prepare: %w", err)
+			}
+			deleted = true
+		}
 		for _, rowKey := range [][]byte{preparedKey(idxKey, epoch), retainedKey(idxKey, epoch)} {
 			removed, err := dropRowAt(txn, rowKey, epoch)
 			if err != nil {
@@ -1112,6 +1121,7 @@ func (store *Store) DeleteEpoch(key [32]byte, index uint32, epoch uint64) (bool,
 	if err != nil {
 		return false, err
 	}
+	store.removeDeferredPrepareLocked(recovery)
 	return deleted, nil
 }
 

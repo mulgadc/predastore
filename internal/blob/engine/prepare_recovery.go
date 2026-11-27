@@ -14,6 +14,12 @@ import (
 	"github.com/dgraph-io/badger/v4"
 )
 
+type prepareRecoveryKey struct {
+	key   [32]byte
+	index uint32
+	epoch uint64
+}
+
 // WithStartupPrepareRecovery verifies and replays named extents before serving.
 func WithStartupPrepareRecovery(
 	ctx context.Context,
@@ -44,7 +50,8 @@ func (store *Store) replayRecoveredPrepares(
 		store.mutex.Unlock()
 		return errors.New("cannot rebuild recovery holds while compaction is running")
 	}
-	store.deferredPrepareSegments = make(map[uint64]struct{})
+	store.deferredPrepares = make(map[prepareRecoveryKey]extent)
+	store.deferredPrepareSegments = make(map[uint64]int)
 	store.mutex.Unlock()
 
 	sidecars, err := filepath.Glob(filepath.Join(store.dir, "*.idx"))
@@ -127,11 +134,7 @@ func (store *Store) replayPrepareIfNamed(
 		return err
 	}
 	if !named {
-		// An outstanding placement publication can still name this extent.
-		store.mutex.Lock()
-		store.deferredPrepareSegments[ext.SegNum] = struct{}{}
-		store.mutex.Unlock()
-		return nil
+		return store.deferPrepare(ctx, prepareRecoveryKey{key: key, index: index, epoch: epoch}, ext)
 	}
 	if err := store.stageRecoveredPrepare(key, index, epoch, ext); err != nil {
 		if errors.Is(err, ErrIntegrity) || errors.Is(err, os.ErrNotExist) {
@@ -142,6 +145,80 @@ func (store *Store) replayPrepareIfNamed(
 	}
 	_, err = store.Commit(key, index, epoch)
 	return err
+}
+
+func (store *Store) deferPrepare(ctx context.Context, recovery prepareRecoveryKey, ext extent) error {
+	if err := store.verifyPrepareExtent(recovery.key, recovery.index, ext); err != nil {
+		if errors.Is(err, ErrIntegrity) || errors.Is(err, os.ErrNotExist) {
+			slog.WarnContext(ctx, "cannot defer prepared shard", "segment", ext.SegNum, "offset", ext.Off, "error", err)
+			return nil
+		}
+		return err
+	}
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if _, held := store.deferredPrepares[recovery]; !held {
+		store.deferredPrepares[recovery] = ext
+		store.deferredPrepareSegments[ext.SegNum]++
+	}
+	return nil
+}
+
+// LookupRecoveredAt checks current placement before publishing a deferred shard.
+func (store *Store) LookupRecoveredAt(
+	ctx context.Context, key [32]byte, index uint32, epoch uint64,
+	authorize func(context.Context, [32]byte, uint32, uint64) (bool, error),
+) (Reader, error) {
+	recovery := prepareRecoveryKey{key: key, index: index, epoch: epoch}
+	store.mutex.Lock()
+	_, pending := store.deferredPrepares[recovery]
+	store.mutex.Unlock()
+	if !pending || authorize == nil {
+		return nil, ErrKeyNotFound
+	}
+	named, err := authorize(ctx, key, index, epoch)
+	if err != nil {
+		return nil, err
+	}
+	if !named {
+		return nil, ErrKeyNotFound
+	}
+	if err := store.publishDeferredPrepare(recovery); err != nil {
+		return nil, err
+	}
+	return store.LookupAt(key, index, epoch)
+}
+
+func (store *Store) publishDeferredPrepare(recovery prepareRecoveryKey) error {
+	store.mutex.Lock()
+	defer store.mutex.Unlock()
+	if store.closed {
+		return ErrClosedStore
+	}
+	ext, pending := store.deferredPrepares[recovery]
+	if !pending {
+		return nil
+	}
+	if err := store.stageVerifiedPrepareLocked(recovery.key, recovery.index, recovery.epoch, ext); err != nil {
+		return err
+	}
+	if _, err := store.Commit(recovery.key, recovery.index, recovery.epoch); err != nil {
+		return err
+	}
+	store.removeDeferredPrepareLocked(recovery)
+	return nil
+}
+
+func (store *Store) removeDeferredPrepareLocked(recovery prepareRecoveryKey) {
+	ext, pending := store.deferredPrepares[recovery]
+	if !pending {
+		return
+	}
+	delete(store.deferredPrepares, recovery)
+	store.deferredPrepareSegments[ext.SegNum]--
+	if store.deferredPrepareSegments[ext.SegNum] == 0 {
+		delete(store.deferredPrepareSegments, ext.SegNum)
+	}
 }
 
 func (store *Store) needsPrepareReplay(idxKey []byte, epoch uint64, ext extent) (bool, error) {
@@ -182,6 +259,10 @@ func (store *Store) stageRecoveredPrepare(key [32]byte, index uint32, epoch uint
 	if store.compactor != nil {
 		return errors.New("cannot stage recovery while compaction is running")
 	}
+	return store.stageVerifiedPrepareLocked(key, index, epoch, ext)
+}
+
+func (store *Store) stageVerifiedPrepareLocked(key [32]byte, index uint32, epoch uint64, ext extent) error {
 	row := preparedKey(MakeKey(key, index), epoch)
 	for {
 		err := store.index.Update(func(txn *badger.Txn) error {

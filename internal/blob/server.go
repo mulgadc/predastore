@@ -48,6 +48,12 @@ type SnapshotStore interface {
 
 var _ SnapshotStore = (*engine.Store)(nil)
 
+type recoveredPrepareStore interface {
+	LookupRecoveredAt(context.Context, [32]byte, uint32, uint64, func(context.Context, [32]byte, uint32, uint64) (bool, error)) (engine.Reader, error)
+}
+
+var _ recoveredPrepareStore = (*engine.Store)(nil)
+
 var _ Store = (*engine.Store)(nil)
 
 // Config is everything one blob node runs on. The listeners arrive already
@@ -441,6 +447,9 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 	reader, err := st.Lookup(h.Key, h.Index)
 	if errors.Is(err, engine.ErrKeyNotFound) && h.Epoch != 0 {
 		reader, err = s.completeFirst(h)
+		if err != nil {
+			reader, err = s.lookupRecovered(ctx, h, err)
+		}
 	}
 	if err != nil {
 		return respond(stream, &Response{Err: ErrCodeNotFound})
@@ -448,6 +457,9 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 	if h.Epoch != 0 && reader.Epoch() != h.Epoch {
 		held := reader.Epoch()
 		reader, err = s.resolveEpoch(h, reader)
+		if err != nil {
+			reader, err = s.lookupRecovered(ctx, h, err)
+		}
 		if err != nil {
 			return respond(stream, &Response{Err: ErrCodeEpochMismatch, Epoch: held})
 		}
@@ -489,6 +501,17 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 		return fmt.Errorf("stream body: %w", err)
 	}
 	return nil
+}
+
+func (s *Server) lookupRecovered(ctx context.Context, h Request, cause error) (engine.Reader, error) {
+	if !errors.Is(cause, engine.ErrNotPrepared) && !errors.Is(cause, engine.ErrKeyNotFound) {
+		return nil, cause
+	}
+	store, ok := s.store.(recoveredPrepareStore)
+	if !ok || s.cfg.AuthorizeRecoveredPrepare == nil {
+		return nil, cause
+	}
+	return store.LookupRecoveredAt(ctx, h.Key, h.Index, h.Epoch, s.cfg.AuthorizeRecoveredPrepare)
 }
 
 // resolveEpoch answers a get whose live shard is the wrong generation. Two
