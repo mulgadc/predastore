@@ -633,6 +633,99 @@ func TestS7_ALostReplyAfterTheTransactionAppliedAnswersTheWrite(t *testing.T) {
 	assert.Empty(t, h.intents())
 }
 
+// A zero-byte write has no intent to fence. When its transaction applied and
+// the reply was lost, the record it placed proves the write: it answers 200
+// through the normal success path, with its ETag and version, and reads back.
+// Verifies: ADR-0003:S7.
+func TestS7_AZeroByteWriteWhoseReplyIsLostAfterItAppliedAnswersTheWrite(t *testing.T) {
+	for _, versioned := range []bool{false, true} {
+		t.Run(fmt.Sprintf("versioned=%t", versioned), func(t *testing.T) {
+			h := newCondHarness(t, rsProfiles[0])
+			if versioned {
+				h.enableVersioning()
+			}
+			etag := h.mustPut("lock", body1)
+			h.hm.setHook(func(n int, next txnFunc) (meta.TxnOutcome, []meta.TxnValue, error) {
+				outcome, _, _ := next()
+				require.Equal(t, meta.TxnApplied, outcome)
+				return meta.TxnUnknown, nil, meta.ErrTxnUnknown
+			})
+
+			rr := h.condPut("lock", []byte{}, ifMatch(etag))
+
+			require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
+			assert.Equal(t, md5ETag(nil), rr.Header().Get("ETag"))
+			got := h.get("lock")
+			require.Equal(t, http.StatusOK, got.Code)
+			assert.Empty(t, got.Body.Bytes())
+			if versioned {
+				assert.True(t, wellFormedVersionID(rr.Header().Get("X-Amz-Version-Id")))
+				assert.Equal(t, rr.Header().Get("X-Amz-Version-Id"), got.Header().Get("X-Amz-Version-Id"))
+			}
+			assert.Equal(t, 1, h.hm.txnCount())
+		})
+	}
+}
+
+// A zero-byte write whose reply is lost before its transaction applied finds
+// no record of its own: it answers 500 and the previous object stays.
+// Verifies: ADR-0003:S7.
+func TestS7_AZeroByteWriteWhoseReplyIsLostBeforeItAppliedKeepsThePreviousObject(t *testing.T) {
+	h := newCondHarness(t, rsProfiles[0])
+	etag := h.mustPut("lock", body1)
+	h.hm.setHook(func(int, txnFunc) (meta.TxnOutcome, []meta.TxnValue, error) {
+		return meta.TxnUnknown, nil, meta.ErrTxnUnknown
+	})
+
+	rr := h.condPut("lock", []byte{}, ifMatch(etag))
+
+	require.Equal(t, http.StatusInternalServerError, rr.Code, "body: %s", rr.Body.String())
+	h.requireBody("lock", body1)
+	assert.Equal(t, 1, h.hm.txnCount())
+}
+
+// A write whose transaction applied and whose reply was lost, and whose
+// committed intent the reaper settled and deleted before the writer's fence,
+// answers 200 through the normal success path and reads back.
+// Verifies: ADR-0003:S7.
+func TestS7_ALostReplyAfterTheReaperSettledTheIntentAnswersTheWrite(t *testing.T) {
+	for _, versioned := range []bool{false, true} {
+		t.Run(fmt.Sprintf("versioned=%t", versioned), func(t *testing.T) {
+			h := newCondHarness(t, rsProfiles[0])
+			if versioned {
+				h.enableVersioning()
+			}
+			etag := h.mustPut("lock", body1)
+			h.hm.setHook(func(n int, next txnFunc) (meta.TxnOutcome, []meta.TxnValue, error) {
+				if n != 1 {
+					return next()
+				}
+				outcome, _, _ := next()
+				require.Equal(t, meta.TxnApplied, outcome)
+				id, in := h.onlyIntent()
+				require.Equal(t, IntentCommitted, in.State)
+				require.True(t, CommitIntent(context.Background(), h.bc.BlobClient.(*blob.Client), id, in).Complete)
+				require.NoError(t, h.mc.Delete(context.Background(), id.Key()))
+				return meta.TxnUnknown, nil, meta.ErrTxnUnknown
+			})
+
+			rr := h.condPut("lock", body2, ifMatch(etag))
+
+			require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
+			assert.Equal(t, md5ETag(body2), rr.Header().Get("ETag"))
+			got := h.get("lock")
+			require.Equal(t, http.StatusOK, got.Code)
+			assert.Equal(t, body2, got.Body.Bytes())
+			if versioned {
+				assert.True(t, wellFormedVersionID(rr.Header().Get("X-Amz-Version-Id")))
+				assert.Equal(t, rr.Header().Get("X-Amz-Version-Id"), got.Header().Get("X-Amz-Version-Id"))
+			}
+			assert.Equal(t, 2, h.hm.txnCount(), "the write was resent instead of fenced")
+			assert.Empty(t, h.intents())
+		})
+	}
+}
+
 // ifNoneMatchAllExceptCurrent is If-Match on the current object.
 func ifNoneMatchAllExceptCurrent(h *condHarness) http.Header {
 	rr := h.get("lock")

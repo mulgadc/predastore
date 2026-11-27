@@ -280,7 +280,7 @@ func conditionalWrite(w http.ResponseWriter, r *http.Request, p *conditionalPut)
 
 		default:
 			slog.WarnContext(ctx, "Conditional write outcome unknown; fencing its intent", "error", err)
-			resolveUnknown(ctx, w, r, p, id, intent, pendingRow, written, place)
+			resolveUnknown(ctx, w, r, p, id, intent, committed, pendingRow, record, written, place)
 			return
 		}
 	}
@@ -314,18 +314,27 @@ func answerReadError(w http.ResponseWriter, r *http.Request, err error) {
 
 // resolveUnknown settles a transaction whose outcome is unknown through the
 // log: the fence either aborts the intent, or finds that the write committed.
+// With no intent left to fence, only the record this write placed proves it.
 func resolveUnknown(
 	ctx context.Context, w http.ResponseWriter, r *http.Request, p *conditionalPut,
-	id IntentID, intent Intent, pendingRow []byte, written writeResult, place ObjectToShardNodes,
+	id IntentID, intent, committed Intent, pendingRow, record []byte, written writeResult, place ObjectToShardNodes,
 ) {
 	if p.size == 0 {
+		if placedRecord(ctx, p, record) {
+			finishCommitted(ctx, w, r, p, id, committed, written, place)
+			return
+		}
 		telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
 		HandleError(w, r, model.NewS3Error(model.ErrInternalError, "metadata outcome unknown", 500))
 		return
 	}
 	result, decided, err := FenceIntent(ctx, p.mc, id, pendingRow)
-	if result == FenceCommitted {
+	switch {
+	case result == FenceCommitted:
 		finishCommitted(ctx, w, r, p, id, decided, written, place)
+		return
+	case result == FenceGone && placedRecord(ctx, p, record):
+		finishCommitted(ctx, w, r, p, id, committed, written, place)
 		return
 	}
 	telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeFailed, telemetry.WriteReasonMeta)
@@ -337,6 +346,20 @@ func resolveUnknown(
 		slog.ErrorContext(ctx, "Conditional write left undecided for the reaper", "result", result, "error", err)
 		HandleError(w, r, model.NewS3Error(model.ErrInternalError, "metadata outcome unknown", 500))
 	}
+}
+
+// placedRecord reports whether the leader holds exactly this write's record at
+// its target. The record carries the write's own epoch, so no other write can
+// have placed those bytes.
+func placedRecord(ctx context.Context, p *conditionalPut, record []byte) bool {
+	row, err := p.mc.LeaderGet(ctx, TableKey(model.TableObjects, string(p.target.hash[:])))
+	if err != nil {
+		if !errors.Is(err, meta.ErrNotFound) {
+			slog.WarnContext(ctx, "Conditional write record not read after an unknown outcome", "error", err)
+		}
+		return false
+	}
+	return bytes.Equal(row, record)
 }
 
 // finishCommitted commits the shards of a write whose metadata is published,
