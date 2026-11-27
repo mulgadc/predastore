@@ -252,7 +252,9 @@ func (h *restartHost) snapshotIndex() uint64 {
 		if err != nil {
 			return err
 		}
-		var m struct{ Index uint64 }
+		var m struct {
+			Index uint64 `json:"Index"`
+		}
 		if err := json.Unmarshal(raw, &m); err != nil {
 			return err
 		}
@@ -316,7 +318,7 @@ func TestS7_AConditionalCreateReadsBackAfterARestartThatRestoresASnapshot(t *tes
 
 	// Default snapshot tuning: no snapshot is taken again during the test.
 	h.cfg.Meta = config.Meta{}
-	c = h.restart()
+	h.restart()
 	afterSnapshot := []byte("conditional create replayed after the snapshot\n")
 	etagLog := h.conditionalCreate("after-snapshot", afterSnapshot)
 	require.Less(t, h.snapshotIndex(), h.appliedIndex(), "setup: the second create must be after the snapshot")
