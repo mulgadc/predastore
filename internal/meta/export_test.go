@@ -22,3 +22,10 @@ func (c *Client) SendTxnBody(ctx context.Context, target config.NodeID, body []b
 func (c *Client) SendWrite(ctx context.Context, target config.NodeID, op rpc.Opcode, key string, value []byte) (*MetaResponse, error) {
 	return c.call(ctx, target, op, request(key, 0), value)
 }
+
+// encodeApplied returns the applied row value for index.
+func encodeApplied(index uint64) []byte {
+	v := make([]byte, appliedValueLen)
+	putApplied(v, index)
+	return v
+}

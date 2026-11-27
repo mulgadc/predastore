@@ -155,6 +155,10 @@ type FSM struct {
 	// commitBatch commits a batch's transaction. A test replaces it to fail a
 	// commit on demand; production always commits the transaction.
 	commitBatch func(*badger.Txn) error
+
+	// row and cmd are scratch space that ApplyBatch reuses, guarded by mu.
+	row appliedRow
+	cmd Command
 }
 
 // FSMOption configures an FSM at construction. The FSM stays a pure state
@@ -242,8 +246,13 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 		if (f.persisted != 0 && log.Index <= f.persisted) || log.Type != raft.LogCommand {
 			continue
 		}
-		var cmd Command
-		if err := json.Unmarshal(log.Data, &cmd); err != nil {
+		// Decoding into f.cmd keeps the command off the heap. It is cleared
+		// after the copy, so it holds no value beyond this entry.
+		f.cmd = Command{}
+		err := json.Unmarshal(log.Data, &f.cmd)
+		cmd := f.cmd
+		f.cmd = Command{}
+		if err != nil {
 			responses[i] = fmt.Errorf("failed to unmarshal command: %w", err)
 			continue
 		}
@@ -321,7 +330,7 @@ func (b *batch) stage(cmd Command, index uint64) any {
 
 // commitOrStop writes the applied row for index into txn and commits it.
 func (b *batch) commitOrStop(txn *badger.Txn, index uint64) {
-	if err := txn.Set(appliedKey, encodeApplied(index)); err != nil {
+	if err := b.f.row.set(txn, index); err != nil {
 		txn.Discard()
 		b.stop(err)
 	}
@@ -353,7 +362,7 @@ func (f *FSM) applyTxn(cmd Command, index uint64, b *batch) any {
 	txn := f.db.NewTransaction(true)
 	result, err := stageTxn(txn, cmd)
 	if err == nil && result.Applied {
-		err = txn.Set(appliedKey, encodeApplied(index))
+		err = f.row.set(txn, index)
 	}
 	if err != nil || !result.Applied {
 		txn.Discard()

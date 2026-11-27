@@ -36,12 +36,27 @@ func IsReservedKey(key []byte) bool {
 	return bytes.HasPrefix(key, reservedPrefix)
 }
 
-func encodeApplied(index uint64) []byte {
-	v := make([]byte, appliedValueLen)
+// putApplied writes the row value for index into v, which holds
+// appliedValueLen bytes.
+func putApplied(v []byte, index uint64) {
 	copy(v, appliedMagic[:])
 	v[len(appliedMagic)] = appliedVersion
 	binary.BigEndian.PutUint64(v[len(appliedMagic)+1:], index)
-	return v
+}
+
+// appliedRow is the entry and value the FSM reuses for the applied row. With
+// no badger subscriber, Commit is done with both when it returns, and the FSM
+// commits under its lock, so only one transaction at a time uses them.
+type appliedRow struct {
+	entry badger.Entry
+	value [appliedValueLen]byte
+}
+
+// set stages the applied row for index in txn.
+func (r *appliedRow) set(txn *badger.Txn, index uint64) error {
+	putApplied(r.value[:], index)
+	r.entry = badger.Entry{Key: appliedKey, Value: r.value[:]}
+	return txn.SetEntry(&r.entry)
 }
 
 func decodeApplied(v []byte) (uint64, error) {
