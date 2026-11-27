@@ -775,6 +775,10 @@ func (store *Store) compactSegment(num uint64, p *pacer) (segmentStats, error) {
 	// A writer still open in this segment has not prepared its row yet, so the
 	// enumeration below would skip its extent and the drop would lose it.
 	store.mutex.Lock()
+	if _, held := store.deferredPrepareSegments[num]; held {
+		store.mutex.Unlock()
+		return stats, fmt.Errorf("%w: segment %d has unresolved prepare records", errSegmentBusy, num)
+	}
 	src, err := store.getSegment(num, false)
 	writing := err == nil && src.writers.Load() > 0
 	store.mutex.Unlock()

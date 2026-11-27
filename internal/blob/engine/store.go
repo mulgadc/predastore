@@ -64,11 +64,12 @@ type Store struct {
 
 	maxSegSize uint64
 
-	compactionEnabled  bool
-	compactionInterval time.Duration
-	retainedMaxAge     time.Duration
-	compactor          *compactor
-	startupRecovery    func(*Store) error
+	compactionEnabled       bool
+	compactionInterval      time.Duration
+	retainedMaxAge          time.Duration
+	compactor               *compactor
+	startupRecovery         func(*Store) error
+	deferredPrepareSegments map[uint64]struct{}
 
 	// This node's slot among the cluster's blob nodes, which offsets its
 	// routine passes, and the pacing a routine pass runs under.

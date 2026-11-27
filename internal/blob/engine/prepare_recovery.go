@@ -35,6 +35,18 @@ func (store *Store) replayRecoveredPrepares(
 	ctx context.Context,
 	authorize func(context.Context, [32]byte, uint32, uint64) (bool, error),
 ) error {
+	store.mutex.Lock()
+	if store.closed {
+		store.mutex.Unlock()
+		return ErrClosedStore
+	}
+	if store.compactor != nil {
+		store.mutex.Unlock()
+		return errors.New("cannot rebuild recovery holds while compaction is running")
+	}
+	store.deferredPrepareSegments = make(map[uint64]struct{})
+	store.mutex.Unlock()
+
 	sidecars, err := filepath.Glob(filepath.Join(store.dir, "*.idx"))
 	if err != nil {
 		return err
@@ -111,8 +123,15 @@ func (store *Store) replayPrepareIfNamed(
 	key := [32]byte(idxKey[:32])
 	index := binary.BigEndian.Uint32(idxKey[32:])
 	named, err := authorize(ctx, key, index, epoch)
-	if err != nil || !named {
+	if err != nil {
 		return err
+	}
+	if !named {
+		// An outstanding placement publication can still name this extent.
+		store.mutex.Lock()
+		store.deferredPrepareSegments[ext.SegNum] = struct{}{}
+		store.mutex.Unlock()
+		return nil
 	}
 	if err := store.stageRecoveredPrepare(key, index, epoch, ext); err != nil {
 		if errors.Is(err, ErrIntegrity) || errors.Is(err, os.ErrNotExist) {
