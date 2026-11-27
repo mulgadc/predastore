@@ -20,13 +20,14 @@ type prepareRecoveryKey struct {
 	epoch uint64
 }
 
-type prepareRecoveryShard struct {
-	key   [32]byte
-	index uint32
+const deferredPrefix = 'q'
+
+func deferredScan(idxKey []byte) []byte {
+	return append(append(make([]byte, 0, preparedKeySize), deferredPrefix), idxKey...)
 }
 
-func (k prepareRecoveryKey) shard() prepareRecoveryShard {
-	return prepareRecoveryShard{key: k.key, index: k.index}
+func deferredKey(idxKey []byte, epoch uint64) []byte {
+	return binary.BigEndian.AppendUint64(deferredScan(idxKey), epoch)
 }
 
 // WithStartupPrepareRecovery verifies and replays named extents before serving.
@@ -59,8 +60,6 @@ func (store *Store) replayRecoveredPrepares(
 		store.mutex.Unlock()
 		return errors.New("cannot rebuild recovery holds while compaction is running")
 	}
-	store.deferredPrepares = make(map[prepareRecoveryShard]map[uint64]extent)
-	store.deferredPrepareSegments = make(map[uint64]int)
 	store.mutex.Unlock()
 
 	sidecars, err := filepath.Glob(filepath.Join(store.dir, "*.idx"))
@@ -164,19 +163,24 @@ func (store *Store) deferPrepare(ctx context.Context, recovery prepareRecoveryKe
 		}
 		return err
 	}
-	store.mutex.Lock()
-	defer store.mutex.Unlock()
-	shard := recovery.shard()
-	epochs := store.deferredPrepares[shard]
-	if epochs == nil {
-		epochs = make(map[uint64]extent)
-		store.deferredPrepares[shard] = epochs
-	}
-	if _, held := epochs[recovery.epoch]; !held {
-		epochs[recovery.epoch] = ext
-		store.deferredPrepareSegments[ext.SegNum]++
-	}
-	return nil
+	idxKey := MakeKey(recovery.key, recovery.index)
+	row := deferredKey(idxKey, recovery.epoch)
+	return store.index.Update(func(txn *badger.Txn) error {
+		current, _, err := readIndexValue(txn, row)
+		if err == nil {
+			if ext.PSize > 0 && (current.SegNum != ext.SegNum || current.Off != ext.Off) {
+				return txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize))
+			}
+			return nil
+		}
+		if !errors.Is(err, badger.ErrKeyNotFound) {
+			return err
+		}
+		if err := txn.Delete(preparedKey(idxKey, recovery.epoch)); err != nil {
+			return err
+		}
+		return txn.Set(row, encodePreparedValue(ext, recovery.epoch, retainedHoldStamp))
+	})
 }
 
 // LookupRecoveredAt checks current placement before publishing a deferred shard.
@@ -184,12 +188,22 @@ func (store *Store) LookupRecoveredAt(
 	ctx context.Context, key [32]byte, index uint32, epoch uint64,
 	authorize func(context.Context, [32]byte, uint32, uint64) (bool, error),
 ) (Reader, error) {
-	recovery := prepareRecoveryKey{key: key, index: index, epoch: epoch}
-	store.mutex.Lock()
-	_, pending := store.deferredPrepares[recovery.shard()][epoch]
-	store.mutex.Unlock()
-	if !pending || authorize == nil {
+	if authorize == nil {
 		return nil, ErrKeyNotFound
+	}
+	idxKey := MakeKey(key, index)
+	row := deferredKey(idxKey, epoch)
+	var candidate extent
+	err := store.index.View(func(txn *badger.Txn) error {
+		var err error
+		candidate, _, err = readIndexValue(txn, row)
+		return err
+	})
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return nil, ErrKeyNotFound
+	}
+	if err != nil {
+		return nil, err
 	}
 	named, err := authorize(ctx, key, index, epoch)
 	if err != nil {
@@ -198,68 +212,87 @@ func (store *Store) LookupRecoveredAt(
 	if !named {
 		return nil, ErrKeyNotFound
 	}
-	if err := store.publishDeferredPrepare(recovery); err != nil {
+	// A durable hold can survive a reopen even when the payload does not.
+	if err := store.verifyPrepareExtent(key, index, candidate); err != nil {
+		return nil, err
+	}
+	if err := store.publishDeferredPrepare(key, index, epoch, row, preparedKey(idxKey, epoch)); err != nil {
 		return nil, err
 	}
 	return store.LookupAt(key, index, epoch)
 }
 
-func (store *Store) publishDeferredPrepare(recovery prepareRecoveryKey) error {
+func (store *Store) publishDeferredPrepare(key [32]byte, index uint32, epoch uint64, row, prepared []byte) error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 	if store.closed {
 		return ErrClosedStore
 	}
-	ext, pending := store.deferredPrepares[recovery.shard()][recovery.epoch]
-	if !pending {
+	if err := store.promoteDeferred(row, prepared); err != nil {
+		return err
+	}
+	_, err := store.Commit(key, index, epoch)
+	if errors.Is(err, ErrNotPrepared) {
+		// A concurrent release can already have moved the epoch to retained.
 		return nil
 	}
-	if err := store.stageVerifiedPrepareLocked(recovery.key, recovery.index, recovery.epoch, ext); err != nil {
-		return err
-	}
-	if _, err := store.Commit(recovery.key, recovery.index, recovery.epoch); err != nil {
-		return err
-	}
-	store.removeDeferredPrepareLocked(recovery)
-	return nil
+	return err
 }
 
-func (store *Store) removeDeferredPrepareLocked(recovery prepareRecoveryKey) {
-	shard := recovery.shard()
-	epochs := store.deferredPrepares[shard]
-	ext, pending := epochs[recovery.epoch]
-	if !pending {
-		return
-	}
-	delete(epochs, recovery.epoch)
-	if len(epochs) == 0 {
-		delete(store.deferredPrepares, shard)
-	}
-	store.deferredPrepareSegments[ext.SegNum]--
-	if store.deferredPrepareSegments[ext.SegNum] == 0 {
-		delete(store.deferredPrepareSegments, ext.SegNum)
+func (store *Store) promoteDeferred(row, prepared []byte) error {
+	for {
+		err := store.index.Update(func(txn *badger.Txn) error {
+			raw, err := readRaw(txn, row)
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := txn.Set(prepared, raw); err != nil {
+				return err
+			}
+			return txn.Delete(row)
+		})
+		if !errors.Is(err, badger.ErrConflict) {
+			return err
+		}
 	}
 }
 
 func (store *Store) needsPrepareReplay(idxKey []byte, epoch uint64, ext extent) (bool, error) {
-	needed := true
+	needed, duplicate := true, false
+	tombstone := tombstoneKey(ext.SegNum, ext.Off)
 	err := store.index.View(func(txn *badger.Txn) error {
-		for _, row := range [][]byte{tombstoneKey(ext.SegNum, ext.Off), retainedKey(idxKey, epoch)} {
-			if _, err := txn.Get(row); err == nil {
-				needed = false
-				return nil
-			} else if !errors.Is(err, badger.ErrKeyNotFound) {
-				return err
-			}
-		}
-		_, current, err := readIndexValue(txn, idxKey)
-		if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+		if _, err := txn.Get(tombstone); err == nil {
+			needed = false
+			return nil
+		} else if !errors.Is(err, badger.ErrKeyNotFound) {
 			return err
 		}
-		needed = current != epoch
+		for _, row := range [][]byte{retainedKey(idxKey, epoch), idxKey} {
+			current, held, err := readIndexValue(txn, row)
+			if errors.Is(err, badger.ErrKeyNotFound) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if held == epoch {
+				needed = false
+				duplicate = current.SegNum != ext.SegNum || current.Off != ext.Off
+				return nil
+			}
+		}
 		return nil
 	})
-	return needed, err
+	if err != nil || !duplicate || ext.PSize == 0 {
+		return needed, err
+	}
+	// A prior compaction can leave a second synced copy behind.
+	return false, store.index.Update(func(txn *badger.Txn) error {
+		return txn.Set(tombstone, tombstoneValue(ext.PSize))
+	})
 }
 
 // stageRecoveredPrepare stages an exact extent before the compactor starts.
@@ -283,7 +316,8 @@ func (store *Store) stageRecoveredPrepare(key [32]byte, index uint32, epoch uint
 }
 
 func (store *Store) stageVerifiedPrepareLocked(key [32]byte, index uint32, epoch uint64, ext extent) error {
-	row := preparedKey(MakeKey(key, index), epoch)
+	idxKey := MakeKey(key, index)
+	row := preparedKey(idxKey, epoch)
 	for {
 		err := store.index.Update(func(txn *badger.Txn) error {
 			if _, err := txn.Get(tombstoneKey(ext.SegNum, ext.Off)); err == nil {
@@ -292,11 +326,14 @@ func (store *Store) stageVerifiedPrepareLocked(key [32]byte, index uint32, epoch
 				return err
 			}
 			if _, err := txn.Get(row); err == nil {
-				return nil
+				return txn.Delete(deferredKey(idxKey, epoch))
 			} else if !errors.Is(err, badger.ErrKeyNotFound) {
 				return err
 			}
-			return txn.Set(row, encodePreparedValue(ext, epoch, retainedHoldStamp))
+			if err := txn.Set(row, encodePreparedValue(ext, epoch, retainedHoldStamp)); err != nil {
+				return err
+			}
+			return txn.Delete(deferredKey(idxKey, epoch))
 		})
 		if !errors.Is(err, badger.ErrConflict) {
 			return err

@@ -64,13 +64,11 @@ type Store struct {
 
 	maxSegSize uint64
 
-	compactionEnabled       bool
-	compactionInterval      time.Duration
-	retainedMaxAge          time.Duration
-	compactor               *compactor
-	startupRecovery         func(*Store) error
-	deferredPrepares        map[prepareRecoveryShard]map[uint64]extent
-	deferredPrepareSegments map[uint64]int
+	compactionEnabled  bool
+	compactionInterval time.Duration
+	retainedMaxAge     time.Duration
+	compactor          *compactor
+	startupRecovery    func(*Store) error
 
 	// This node's slot among the cluster's blob nodes, which offsets its
 	// routine passes, and the pacing a routine pass runs under.
@@ -932,7 +930,7 @@ func readRaw(txn *badger.Txn, key []byte) ([]byte, error) {
 // The prefix covers a whole shard position, and a live row for an object hash
 // that happens to start with the namespace byte would be a different width, so
 // the width check is what keeps the scan from deleting an unrelated object.
-func dropRowsUnder(txn *badger.Txn, prefix []byte) error {
+func dropRowsUnder(txn *badger.Txn, prefix []byte) (bool, error) {
 	opts := badger.DefaultIteratorOptions
 	opts.Prefix = prefix
 	it := txn.NewIterator(opts)
@@ -946,14 +944,14 @@ func dropRowsUnder(txn *badger.Txn, prefix []byte) error {
 		}
 		raw, err := item.ValueCopy(nil)
 		if err != nil {
-			return fmt.Errorf("copy value: %w", err)
+			return false, fmt.Errorf("copy value: %w", err)
 		}
 		ext, _, err := decodeIndexValue(raw)
 		if err != nil {
-			return fmt.Errorf("decode row: %w", err)
+			return false, fmt.Errorf("decode row: %w", err)
 		}
 		if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
-			return fmt.Errorf("put tombstone: %w", err)
+			return false, fmt.Errorf("put tombstone: %w", err)
 		}
 		keys = append(keys, item.KeyCopy(nil))
 	}
@@ -961,10 +959,10 @@ func dropRowsUnder(txn *badger.Txn, prefix []byte) error {
 	// Deleting inside the iteration would invalidate it.
 	for _, k := range keys {
 		if err := txn.Delete(k); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return len(keys) > 0, nil
 }
 
 // readIndexValue decodes the extent and epoch a key currently points at.
@@ -987,48 +985,42 @@ func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
 // routine failed read. The delay is what keeps that reader whole; the release
 // is what makes the generation reclaimable at all.
 func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) error {
-	recovery := prepareRecoveryKey{key: key, index: index, epoch: epoch}
 	store.mutex.Lock()
+	defer store.mutex.Unlock()
 	if store.closed {
-		store.mutex.Unlock()
 		return ErrClosedStore
-	}
-	ext, deferred := store.deferredPrepares[recovery.shard()][epoch]
-	if deferred {
-		defer store.mutex.Unlock()
-	} else {
-		store.mutex.Unlock()
 	}
 
 	idxKey := MakeKey(key, index)
 	rowKey := retainedKey(idxKey, epoch)
 	for {
 		err := store.index.Update(func(txn *badger.Txn) error {
-			raw, err := readRaw(txn, rowKey)
+			_, held, err := readIndexValue(txn, rowKey)
 			if errors.Is(err, badger.ErrKeyNotFound) {
-				if !deferred {
+				row := deferredKey(idxKey, epoch)
+				raw, err := readRaw(txn, row)
+				if errors.Is(err, badger.ErrKeyNotFound) {
 					return nil
 				}
-				retained, err := retainReleasedPrepare(txn, idxKey, rowKey, epoch, ext)
-				if err != nil || !retained {
-					return err
-				}
-			} else {
 				if err != nil {
 					return err
 				}
-				_, held, err := decodeIndexValue(raw)
-				if err != nil {
-					return fmt.Errorf("decode retained row: %w", err)
-				}
-				if held != epoch {
-					if deferred {
-						return fmt.Errorf("%w: retained row has a different epoch", ErrIntegrity)
-					}
+				_, live, err := readIndexValue(txn, idxKey)
+				if err == nil && live == epoch {
 					return nil
 				}
+				if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+					return err
+				}
+				if err := txn.Set(rowKey, raw); err != nil {
+					return err
+				}
+				if err := txn.Delete(row); err != nil {
+					return err
+				}
+			} else if err != nil || held != epoch {
+				return err
 			}
-
 			return txn.Set(releasedKeyFor(rowKey), encodeReleasedValue(time.Now().UnixNano()))
 		})
 		if errors.Is(err, badger.ErrConflict) {
@@ -1037,39 +1029,8 @@ func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) 
 		if err != nil {
 			return fmt.Errorf("release generation: %w", err)
 		}
-		if deferred {
-			store.removeDeferredPrepareLocked(recovery)
-		}
 		return nil
 	}
-}
-
-// retainReleasedPrepare installs the deferred extent in the ordinary grace
-// window. The prepared row and retained row must never name the same extent.
-func retainReleasedPrepare(txn *badger.Txn, idxKey, rowKey []byte, epoch uint64, ext extent) (bool, error) {
-	_, live, err := readIndexValue(txn, idxKey)
-	if err == nil && live == epoch {
-		return false, nil
-	}
-	if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
-		return false, err
-	}
-	if _, err := txn.Get(tombstoneKey(ext.SegNum, ext.Off)); !errors.Is(err, badger.ErrKeyNotFound) {
-		return false, err
-	}
-	prepKey := preparedKey(idxKey, epoch)
-	prepared, _, err := readIndexValue(txn, prepKey)
-	if err == nil {
-		if prepared != ext {
-			return false, ErrNotPrepared
-		}
-		if err := txn.Delete(prepKey); err != nil {
-			return false, err
-		}
-	} else if !errors.Is(err, badger.ErrKeyNotFound) {
-		return false, err
-	}
-	return true, txn.Set(rowKey, encodePreparedValue(ext, epoch, retainedHoldStamp))
 }
 
 // Delete removes a key's index entry and tombstones its extent, in one
@@ -1085,21 +1046,16 @@ func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
 	}
 
 	idxKey := MakeKey(key, index)
-	shard := prepareRecoveryShard{key: key, index: index}
-	deferred := store.deferredPrepares[shard]
 	deleted := false
 	err := store.index.Update(func(txn *badger.Txn) error {
-		for _, ext := range deferred {
-			if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
-				return fmt.Errorf("delete deferred shard: %w", err)
-			}
-			deleted = true
+		scan := deferredScan(idxKey)
+		found, err := dropRowsUnder(txn, scan)
+		if err != nil {
+			return fmt.Errorf("delete deferred shard: %w", err)
 		}
-		// Every generation goes, not just the live one: a prepared row would
-		// resurrect the value on a later commit, and a retained row would keep
-		// answering a record that names it.
+		deleted = found
 		for _, scan := range [][]byte{preparedScan(idxKey), retainedScan(idxKey)} {
-			if err := dropRowsUnder(txn, scan); err != nil {
+			if _, err := dropRowsUnder(txn, scan); err != nil {
 				return fmt.Errorf("delete: %w", err)
 			}
 		}
@@ -1124,9 +1080,6 @@ func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	for epoch := range deferred {
-		store.removeDeferredPrepareLocked(prepareRecoveryKey{key: key, index: index, epoch: epoch})
-	}
 	return deleted, nil
 }
 
@@ -1142,18 +1095,10 @@ func (store *Store) DeleteEpoch(key [32]byte, index uint32, epoch uint64) (bool,
 	}
 
 	idxKey := MakeKey(key, index)
-	recovery := prepareRecoveryKey{key: key, index: index, epoch: epoch}
-	deferred, pending := store.deferredPrepares[recovery.shard()][epoch]
 	deleted := false
 	err := store.index.Update(func(txn *badger.Txn) error {
 		deleted = false
-		if pending {
-			if err := txn.Set(tombstoneKey(deferred.SegNum, deferred.Off), tombstoneValue(deferred.PSize)); err != nil {
-				return fmt.Errorf("delete deferred prepare: %w", err)
-			}
-			deleted = true
-		}
-		for _, rowKey := range [][]byte{preparedKey(idxKey, epoch), retainedKey(idxKey, epoch)} {
+		for _, rowKey := range [][]byte{preparedKey(idxKey, epoch), retainedKey(idxKey, epoch), deferredKey(idxKey, epoch)} {
 			removed, err := dropRowAt(txn, rowKey, epoch)
 			if err != nil {
 				return fmt.Errorf("delete epoch: %w", err)
@@ -1177,7 +1122,6 @@ func (store *Store) DeleteEpoch(key [32]byte, index uint32, epoch uint64) (bool,
 	if err != nil {
 		return false, err
 	}
-	store.removeDeferredPrepareLocked(recovery)
 	return deleted, nil
 }
 

@@ -335,19 +335,6 @@ func (store *Store) sweepPrepared(maxAge time.Duration) (int, error) {
 
 	dropped := 0
 	for _, k := range stale {
-		if len(k) == preparedKeySize {
-			shard := prepareRecoveryShard{
-				key:   [32]byte(k[1:33]),
-				index: binary.BigEndian.Uint32(k[33:37]),
-			}
-			epoch := binary.BigEndian.Uint64(k[37:])
-			store.mutex.Lock()
-			_, deferred := store.deferredPrepares[shard][epoch]
-			store.mutex.Unlock()
-			if deferred {
-				continue
-			}
-		}
 		// The row is re-read inside the drop's own transaction, so a commit
 		// that published it between the scan and here simply finds nothing
 		// left to drop rather than losing its extent underneath it.
@@ -788,10 +775,6 @@ func (store *Store) compactSegment(num uint64, p *pacer) (segmentStats, error) {
 	// A writer still open in this segment has not prepared its row yet, so the
 	// enumeration below would skip its extent and the drop would lose it.
 	store.mutex.Lock()
-	if _, held := store.deferredPrepareSegments[num]; held {
-		store.mutex.Unlock()
-		return stats, fmt.Errorf("%w: segment %d has unresolved prepare records", errSegmentBusy, num)
-	}
 	src, err := store.getSegment(num, false)
 	writing := err == nil && src.writers.Load() > 0
 	store.mutex.Unlock()
@@ -909,7 +892,7 @@ func (store *Store) relocateSlot(idxKey [36]byte, num uint64, off int64, p *pace
 }
 
 // rowAt finds the index key, if any, whose extent occupies segment num at off.
-// It checks the live row, then the prepared and retained generations: a
+// It checks the live row, then the prepared, retained and deferred rows: a
 // prepared extent is data a commit is about to publish and a retained one is
 // data a placement record may still name, so dropping either's segment would
 // lose a write that has already been acknowledged as durable.
@@ -935,7 +918,7 @@ func (store *Store) rowAt(idxKey [36]byte, num uint64, off int64) (badgerKey, ra
 			return fmt.Errorf("get extent: %w", err)
 		}
 
-		for _, prefix := range [][]byte{preparedScan(idxKey[:]), retainedScan(idxKey[:])} {
+		for _, prefix := range [][]byte{preparedScan(idxKey[:]), retainedScan(idxKey[:]), deferredScan(idxKey[:])} {
 			found, err := scanRowAt(txn, prefix, num, off)
 			if err != nil {
 				return err
@@ -1018,11 +1001,10 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 	// the destination the extent actually landed in is the one that must be
 	// recorded, not whatever store.segNum happens to be afterward.
 	newExt := extent{SegNum: dstSeg.num, Off: dstOff, PSize: old.PSize, LSize: old.LSize}
-	if err := dstSeg.appendPrepareAllocation(idxEntry{Off: dstOff, Key: idxKey, PSize: old.PSize}, epoch, old.LSize); err != nil {
-		srcSeg.releaseRef()
-		dstSeg.releaseRef()
-		store.mutex.Unlock()
-		return false, fmt.Errorf("append destination idx: %w", err)
+	allocation := idxEntry{Off: dstOff, Key: idxKey, PSize: old.PSize}
+	deferred := old.PSize > 0 && len(badgerKey) == preparedKeySize && badgerKey[0] == deferredPrefix
+	if !deferred {
+		err = dstSeg.appendPrepareAllocation(allocation, epoch, old.LSize)
 	}
 	// Copy without the mutex so compaction never stalls the write path. This is
 	// the window a racing overwrite or delete lands in.
@@ -1030,6 +1012,29 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 
 	defer srcSeg.releaseRef()
 	defer dstSeg.releaseRef()
+	if err != nil {
+		return false, fmt.Errorf("append destination idx: %w", err)
+	}
+
+	destination := tombstoneKey(newExt.SegNum, newExt.Off)
+	if deferred {
+		// A restart may find the sidecar before this swap. Keep the copy
+		// ineligible for recovery until the index names it.
+		if err := store.index.Update(func(txn *badger.Txn) error {
+			return txn.Set(destination, tombstoneValue(newExt.PSize))
+		}); err != nil {
+			return false, fmt.Errorf("stage deferred relocation: %w", err)
+		}
+		if err := store.syncIndex(); err != nil {
+			return false, fmt.Errorf("sync deferred relocation guard: %w", err)
+		}
+		store.mutex.Lock()
+		err = dstSeg.appendPrepareAllocation(allocation, epoch, old.LSize)
+		store.mutex.Unlock()
+		if err != nil {
+			return false, fmt.Errorf("append deferred destination idx: %w", err)
+		}
+	}
 
 	// Verbatim is load-bearing: fragNum rides inside the copied bytes, so the
 	// nonce moves with them and is never reissued.
@@ -1069,11 +1074,20 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 			// referenced it, and slots are never reissued — so tombstone it here
 			// rather than let it pad its segment's live count.
 			if stale {
-				return txn.Set(tombstoneKey(newExt.SegNum, newExt.Off), tombstoneValue(newExt.PSize))
+				return txn.Set(destination, tombstoneValue(newExt.PSize))
 			}
 			// Rewrite the extent and keep the tail, so the epoch — and, on a
 			// prepared row, its stamp — survives the move untouched.
-			return txn.Set(badgerKey, repointValue(oldRaw, newExt))
+			if err := txn.Set(badgerKey, repointValue(oldRaw, newExt)); err != nil {
+				return err
+			}
+			if deferred {
+				if err := txn.Delete(destination); err != nil {
+					return err
+				}
+				return txn.Set(tombstoneKey(old.SegNum, old.Off), tombstoneValue(old.PSize))
+			}
+			return nil
 		})
 
 		// The read above puts this txn under badger's conflict detection, which a
