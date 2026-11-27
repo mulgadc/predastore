@@ -877,8 +877,13 @@ func streamSnapshot(r *bufio.Reader, fn func(key, value []byte) error) error {
 			return nil, err
 		}
 		buf := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
-		_, err := io.ReadFull(r, buf)
-		return buf, err
+		if _, err := io.ReadFull(r, buf); err != nil {
+			if errors.Is(err, io.EOF) {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+		return buf, nil
 	}
 
 	for {

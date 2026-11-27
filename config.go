@@ -234,6 +234,8 @@ func gateConfig(
 			Workers:  c.Reaper.Workers,
 			PageSize: c.Reaper.PageSize,
 			Interval: time.Duration(c.Reaper.IntervalSeconds) * time.Second,
+
+			IntentMaxAge: time.Duration(c.Reaper.IntentMaxAgeSeconds) * time.Second,
 		},
 
 		Addr:         config.NodeBindAddr(host, n),

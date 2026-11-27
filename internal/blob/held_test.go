@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
@@ -425,4 +426,55 @@ func TestAbortConfirmsOnlyAfterTheDiscardReleases(t *testing.T) {
 	}, 5*time.Second, 10*time.Millisecond, "the abort must confirm once the discard has released")
 	_, err = c.Commit(ctx, 1, shardAt(1))
 	require.ErrorIs(t, err, blob.ErrNotPrepared)
+}
+
+// A record can name a held generation that a newer write overtook before it
+// committed. A get naming it commits it into the retained namespace and serves
+// it; a get naming an epoch nothing holds fails and commits nothing.
+func TestGetCommitsAHeldGenerationANewerWriteOvertook(t *testing.T) {
+	es, err := engine.Open(t.TempDir(), engine.WithAEAD(storetest.TestAEAD()), engine.WithFreeSpaceWatermark(0, 0))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = es.Close() })
+	key, index := epochKey(), uint32(epochTestShardIndex)
+	held, live := []byte("held generation"), []byte("newer generation")
+	prepare := func(epoch uint64, body []byte, hold bool) {
+		t.Helper()
+		appendFn := es.Append
+		if hold {
+			appendFn = es.AppendHeld
+		}
+		w, err := appendFn(key, index, int64(len(body)), epoch)
+		require.NoError(t, err)
+		_, err = w.Write(body)
+		require.NoError(t, err)
+		require.NoError(t, w.Close())
+	}
+	prepare(4, live, false)
+	_, err = es.Commit(key, index, 4)
+	require.NoError(t, err)
+	prepare(3, held, true)
+
+	c := startStoreNode(t, es)
+	ctx := context.Background()
+	getAt := func(epoch uint64) ([]byte, error) {
+		r, err := c.Get(ctx, 1, blob.GetRequest{Key: key, Index: index, RangeStart: -1, RangeEnd: -1, Epoch: epoch})
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		return io.ReadAll(r)
+	}
+
+	_, err = getAt(2)
+	require.ErrorIs(t, err, blob.ErrEpochMismatch, "an epoch with no row must still fail")
+	_, err = es.LookupAt(key, index, 3)
+	require.ErrorIs(t, err, engine.ErrKeyNotFound, "a get naming another epoch must not commit the held row")
+
+	got, err := getAt(3)
+	require.NoError(t, err)
+	assert.Equal(t, held, got)
+
+	stat, err := c.Stat(ctx, 1, blob.StatRequest{Key: key, Index: index})
+	require.NoError(t, err)
+	assert.Equal(t, uint64(4), stat.Epoch, "the newer generation must stay live")
 }

@@ -31,7 +31,10 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			return
 		}
 		bucket, key := resource.Bucket.Name, resource.Key
-		if refuseConditionalWrite(w, r) {
+		cond, conditional, unsupported := parseWriteCondition(r.Header)
+		if unsupported {
+			WriteS3Error(w, r, http.StatusNotImplemented, "NotImplemented",
+				"This conditional write is not implemented")
 			return
 		}
 
@@ -106,6 +109,19 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 			digest = model.NewPartETagHasher()
 		}
 
+		if conditional {
+			conditionalWrite(w, r, &conditionalPut{
+				mc: mc, bc: bc, ring: ring, cfg: cfg,
+				bucket: bucket, key: key, cond: cond, target: target, place: place,
+				body: io.TeeReader(body, digest), size: size,
+				seal: func(place *ObjectToShardNodes) error {
+					return sealRecord(r, dec, place, attrs, digest, crc, wantCRC, ebs)
+				},
+				ebs: ebs, phase: phase,
+			})
+			return
+		}
+
 		written, err := writeObject(ctx, bc, cfg, ring, io.TeeReader(body, digest), size, objectHash, place)
 		recordPhase(ctx, telemetry.GateOpPut, telemetry.PhaseShardFanout, phase)
 		if err != nil {
@@ -118,25 +134,11 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		// Shards are prepared but invisible until the placement lands below, so a
 		// body that fails its payload check leaves the previous object intact.
-		if err := finishPayload(r, dec); err != nil {
+		if err := sealRecord(r, dec, &place, attrs, digest, crc, wantCRC, ebs); err != nil {
 			abortShards(ctx, bc, objectHash, place, written)
 			HandleError(w, r, err)
 			return
 		}
-
-		// The record must already carry the digest here: after the commit
-		// point below, it is what every read will demand.
-		if ebs {
-			if crc.Sum64() != wantCRC {
-				abortShards(ctx, bc, objectHash, place, written)
-				HandleError(w, r, model.ErrBadDigestCRC64NVMEError)
-				return
-			}
-			place.Digest = ebsDigest(wantCRC, size)
-		} else {
-			place.Digest = digest.Sum(nil)
-		}
-		place.Attributes = attrs
 
 		record, err := EncodePlacement(place)
 		if err != nil {
@@ -199,31 +201,57 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 		// Counted only once both keys have landed: until then the shards exist
 		// but nothing references them, which is not an object.
 		telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeSuccess, "")
-
-		// Nearfull writes still succeed; the header lets clients back off before
-		// hitting the hard 507 rejection.
-		if written.poolNearFull {
-			w.Header().Set("X-Predastore-Pool-Pressure", "nearfull")
-		}
-		// The write is durable and correct; what it is short of is redundancy,
-		// until repair restores the shards that did not land. A caller writing
-		// something it cannot reproduce deserves to know that.
-		if written.degraded() {
-			w.Header().Set(degradedWriteHeader, strconv.Itoa(written.shortBy()))
-		}
-		if len(written.handoff) > 0 {
-			w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))
-		}
-		if etag, ok := place.ETag(); ok {
-			w.Header().Set("ETag", etag)
-		}
-		if ebs {
-			w.Header().Set(crc64nvmeHeader, r.Header.Get(crc64nvmeHeader))
-			w.Header().Set("X-Amz-Checksum-Type", "FULL_OBJECT")
-		}
-		setVersionIDHeader(w.Header(), target.versionID)
-		w.WriteHeader(http.StatusOK)
+		answerPut(w, r, written, place, ebs, target.versionID)
 	})
+}
+
+// sealRecord finishes the body and stamps the record with its digest and
+// attributes. The record must carry the digest before any metadata names it:
+// from then on it is what every read will demand.
+func sealRecord(
+	r *http.Request, dec *chunked.Decoder, place *ObjectToShardNodes, attrs ObjectAttributes,
+	digest hash.Hash, crc hash.Hash64, wantCRC uint64, ebs bool,
+) error {
+	if err := finishPayload(r, dec); err != nil {
+		return err
+	}
+	if ebs {
+		if crc.Sum64() != wantCRC {
+			return model.ErrBadDigestCRC64NVMEError
+		}
+		place.Digest = ebsDigest(wantCRC, place.Size)
+	} else {
+		place.Digest = digest.Sum(nil)
+	}
+	place.Attributes = attrs
+	return nil
+}
+
+// answerPut writes a successful PutObject's response.
+func answerPut(w http.ResponseWriter, r *http.Request, written writeResult, place ObjectToShardNodes, ebs bool, versionID string) {
+	// Nearfull writes still succeed; the header lets clients back off before
+	// hitting the hard 507 rejection.
+	if written.poolNearFull {
+		w.Header().Set("X-Predastore-Pool-Pressure", "nearfull")
+	}
+	// The write is durable and correct; what it is short of is redundancy,
+	// until repair restores the shards that did not land. A caller writing
+	// something it cannot reproduce deserves to know that.
+	if written.degraded() {
+		w.Header().Set(degradedWriteHeader, strconv.Itoa(written.shortBy()))
+	}
+	if len(written.handoff) > 0 {
+		w.Header().Set(handoffHeader, strconv.Itoa(len(written.handoff)))
+	}
+	if etag, ok := place.ETag(); ok {
+		w.Header().Set("ETag", etag)
+	}
+	if ebs {
+		w.Header().Set(crc64nvmeHeader, r.Header.Get(crc64nvmeHeader))
+		w.Header().Set("X-Amz-Checksum-Type", "FULL_OBJECT")
+	}
+	setVersionIDHeader(w.Header(), versionID)
+	w.WriteHeader(http.StatusOK)
 }
 
 // recordPhase records the time since start as one phase of an object request

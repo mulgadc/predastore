@@ -17,6 +17,8 @@
 #   PREDA_DIR          Root for cluster data, certs and the master key
 #   PREDA_CONFIG_DIR   Where profiles are read from (default: repo config/)
 #   LOG_LEVEL          Passed through as -log-level (debug|info|warn|error)
+#   PREDA_S3D_BINARY   Run this s3d instead of the repo build, as an upgrade
+#                      test does to start a cluster on an earlier release
 #
 # Examples:
 #   ./scripts/start.sh 1host          # one process, pipe only
@@ -30,7 +32,7 @@ REPO_DIR="$SCRIPT_DIR/.."
 # PREDA_CONFIG_DIR lets a harness run generated profiles — on shifted ports, so
 # a benchmark does not collide with a cluster already using the defaults.
 CONFIG_DIR="${PREDA_CONFIG_DIR:-$REPO_DIR/config}"
-S3D_BINARY="$REPO_DIR/bin/s3d"
+S3D_BINARY="${PREDA_S3D_BINARY:-$REPO_DIR/bin/s3d}"
 
 # shellcheck source=scripts/lib.sh
 source "$SCRIPT_DIR/lib.sh"
@@ -193,8 +195,10 @@ fi
 # --- Build s3d if needed ---
 
 # Rebuild when the binary is missing or older than any source file: a stale
-# binary silently benchmarks the wrong revision.
-if [ ! -f "$S3D_BINARY" ] || [ -n "$(find "$REPO_DIR" -name '*.go' -newer "$S3D_BINARY" -print -quit 2>/dev/null)" ]; then
+# binary silently benchmarks the wrong revision. A named binary is never rebuilt.
+if [ -n "${PREDA_S3D_BINARY:-}" ]; then
+    [ -x "$S3D_BINARY" ] || { log_error "PREDA_S3D_BINARY is not executable: $S3D_BINARY"; exit 1; }
+elif [ ! -f "$S3D_BINARY" ] || [ -n "$(find "$REPO_DIR" -name '*.go' -newer "$S3D_BINARY" -print -quit 2>/dev/null)" ]; then
     log_warn "s3d binary missing or stale, building..."
     make -C "$REPO_DIR" build
 fi

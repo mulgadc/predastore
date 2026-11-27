@@ -500,6 +500,7 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 // shards and its own record has not landed yet, or never will. That generation
 // was demoted rather than destroyed, so it is served from the retained
 // namespace. Refusing it would fail a read of the version the cluster agreed on.
+// If its writer has not committed it yet, the get commits it into that namespace.
 //
 // It takes ownership of the reader it is given: on every path that reader is
 // closed and the caller keeps only what comes back.
@@ -511,6 +512,9 @@ func (s *Server) resolveEpoch(h Request, stale engine.Reader) (engine.Reader, er
 
 	if h.Epoch < held {
 		reader, err := s.store.LookupAt(h.Key, h.Index, h.Epoch)
+		if errors.Is(err, engine.ErrKeyNotFound) {
+			reader, err = s.commitOvertaken(h, err)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -528,6 +532,25 @@ func (s *Server) resolveEpoch(h Request, stale engine.Reader) (engine.Reader, er
 		return nil, err
 	}
 	slog.Info("completed a shard commit abandoned by its writer",
+		"node", s.cfg.NodeID, "index", h.Index, "epoch", fmt.Sprintf("%016x", h.Epoch))
+	return reader, nil
+}
+
+// commitOvertaken completes a record's generation still prepared under a newer
+// live row: the record is authoritative, so the commit retains it. With nothing
+// prepared at that epoch, notFound is returned and nothing is committed.
+func (s *Server) commitOvertaken(h Request, notFound error) (engine.Reader, error) {
+	if _, err := s.store.Commit(h.Key, h.Index, h.Epoch); err != nil {
+		if errors.Is(err, engine.ErrNotPrepared) {
+			return nil, notFound
+		}
+		return nil, err
+	}
+	reader, err := s.store.LookupAt(h.Key, h.Index, h.Epoch)
+	if err != nil {
+		return nil, err
+	}
+	slog.Info("completed the commit of a shard a newer write overtook",
 		"node", s.cfg.NodeID, "index", h.Index, "epoch", fmt.Sprintf("%016x", h.Epoch))
 	return reader, nil
 }

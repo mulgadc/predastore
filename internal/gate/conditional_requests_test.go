@@ -84,11 +84,21 @@ func conditionalHeaders(etag string) map[string]http.Header {
 	}
 }
 
-// Conditional writes are not supported yet, so a PUT carrying a precondition
-// over an existing versioned key must be refused before it stores anything.
+// refusedPutHeaders are the PutObject preconditions S3 does not evaluate: an
+// If-None-Match other than "*", and either header sent empty.
+func refusedPutHeaders(etag string) map[string]http.Header {
+	return map[string]http.Header{
+		"If-None-Match etag":  {"If-None-Match": {etag}},
+		"empty If-Match":      {"If-Match": {""}},
+		"empty If-None-Match": {"If-None-Match": {""}},
+	}
+}
+
+// A PUT carrying a precondition S3 does not evaluate must be refused before it
+// stores anything over an existing versioned key.
 // Verifies: Q-68.
-func TestConditionalPutObjectIsRefusedAndKeepsTheObject(t *testing.T) {
-	for name, header := range conditionalHeaders(`"abc"`) {
+func TestUnsupportedConditionalPutObjectIsRefusedAndKeepsTheObject(t *testing.T) {
+	for name, header := range refusedPutHeaders(`"abc"`) {
 		t.Run(name, func(t *testing.T) {
 			g := newKeyGate(t)
 			g.enableVersioning()
@@ -106,8 +116,8 @@ func TestConditionalPutObjectIsRefusedAndKeepsTheObject(t *testing.T) {
 
 // A refused PUT to a new key must leave it absent and touch no shard.
 // Verifies: Q-68.
-func TestConditionalPutIsRefusedBeforeAnyShardIsWritten(t *testing.T) {
-	for name, header := range conditionalHeaders(`"abc"`) {
+func TestUnsupportedConditionalPutIsRefusedBeforeAnyShardIsWritten(t *testing.T) {
+	for name, header := range refusedPutHeaders(`"abc"`) {
 		t.Run(name, func(t *testing.T) {
 			g := newKeyGate(t)
 
@@ -117,6 +127,49 @@ func TestConditionalPutIsRefusedBeforeAnyShardIsWritten(t *testing.T) {
 			assert.Equal(t, http.StatusNotFound, g.do(http.MethodHead, sdkPath("fresh"), nil, nil).Code)
 		})
 	}
+}
+
+// If-None-Match: * over an absent key creates it.
+// Verifies: Q-68.
+func TestPutIfNoneMatchCreatesAnAbsentKey(t *testing.T) {
+	g := newKeyGate(t)
+
+	rr := g.do(http.MethodPut, sdkPath("lock"), []byte("first"), http.Header{"If-None-Match": {"*"}})
+
+	require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
+	assert.NotEmpty(t, rr.Header().Get("ETag"))
+	g.requireBody("lock", "first")
+}
+
+// If-None-Match: * over an existing key answers 412 and leaves the original
+// body, its listing and its versions as they were.
+// Verifies: Q-68.
+func TestPutIfNoneMatchOverAnExistingKeyFails(t *testing.T) {
+	g := newKeyGate(t)
+	g.putETag("lock", []byte("original"))
+	before := g.state("lock")
+
+	rr := g.do(http.MethodPut, sdkPath("lock"), []byte("second"), http.Header{"If-None-Match": {"*"}})
+
+	requirePreconditionFailed(t, rr)
+	assert.Equal(t, before, g.state("lock"))
+	g.requireBody("lock", "original")
+}
+
+// If-Match with an ETag the object no longer has answers 412 and keeps the
+// current body.
+// Verifies: Q-68.
+func TestPutIfMatchWithAStaleETagFails(t *testing.T) {
+	g := newKeyGate(t)
+	stale := g.putETag("lock", []byte("v1"))
+	g.putETag("lock", []byte("v2"))
+	before := g.state("lock")
+
+	rr := g.do(http.MethodPut, sdkPath("lock"), []byte("v3"), http.Header{"If-Match": {stale}})
+
+	requirePreconditionFailed(t, rr)
+	assert.Equal(t, before, g.state("lock"))
+	g.requireBody("lock", "v2")
 }
 
 // A refused completion must leave the destination and the upload in place, so

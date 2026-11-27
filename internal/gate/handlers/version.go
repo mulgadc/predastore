@@ -170,12 +170,21 @@ func setBucketVersioning(ctx context.Context, mc MetaClient, cache *BucketCache,
 
 // putVersionRecord appends one version to the index.
 func putVersionRecord(ctx context.Context, mc MetaClient, bucket, key string, rec VersionRecord) error {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(&rec); err != nil {
+	row, err := encodeVersionRecord(rec)
+	if err != nil {
 		return err
 	}
 	return metaPut(ctx, mc, model.TableObjectVersions,
-		versionIndexKey(bucket, key, rec.WriteEpoch, rec.VersionID), buf.Bytes())
+		versionIndexKey(bucket, key, rec.WriteEpoch, rec.VersionID), row)
+}
+
+// encodeVersionRecord renders one index row.
+func encodeVersionRecord(rec VersionRecord) ([]byte, error) {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(&rec); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // deleteVersionRecord drops one version from the index. A row that is not there
@@ -320,6 +329,11 @@ func indexWrite(ctx context.Context, mc MetaClient, bucket, key string, target w
 		return nil
 	}
 
+	return putVersionRecord(ctx, mc, bucket, key, versionRecordOf(target, place))
+}
+
+// versionRecordOf is the index row a versioned write records.
+func versionRecordOf(target writeTarget, place ObjectToShardNodes) VersionRecord {
 	rec := VersionRecord{VersionID: target.versionID, WriteEpoch: place.WriteEpoch, Size: place.Size}
 	if etag, ok := place.ETag(); ok {
 		rec.ETag = etag
@@ -329,7 +343,7 @@ func indexWrite(ctx context.Context, mc MetaClient, bucket, key string, target w
 	} else {
 		rec.LastModified = time.Now().UTC()
 	}
-	return putVersionRecord(ctx, mc, bucket, key, rec)
+	return rec
 }
 
 // versionIDHeader is the header S3 returns naming the version a request wrote

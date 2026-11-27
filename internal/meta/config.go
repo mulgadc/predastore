@@ -41,8 +41,4 @@ type Config struct {
 	SnapshotThreshold  uint64
 	TrailingLogs       uint64
 	LeaderLeaseTimeout time.Duration
-
-	// serveTxn registers the OpMetaTxn handler. Only tests set it, so a
-	// production replica answers that opcode as unknown and appends no CommandTxn.
-	serveTxn bool
 }

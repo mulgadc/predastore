@@ -87,6 +87,10 @@ type ReaperConfig struct {
 	Workers  int
 	PageSize int
 	Interval time.Duration
+
+	// IntentMaxAge is how old a pending write intent must be before the
+	// sweep fences it. Zero takes the reaper package's default.
+	IntentMaxAge time.Duration
 }
 
 // Config is everything one S3 gate runs on: its slice of the product

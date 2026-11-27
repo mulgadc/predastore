@@ -275,6 +275,12 @@ parity = 1    # parity shards; data + parity must not exceed the blob node count
 # enabled          = false
 # interval_seconds = 0      # zero defaults to 300
 
+# [reaper]                  # reclaim failed deletes and settle conditional writes
+# enabled                = true  # on wherever the host runs a blob node
+# interval_seconds       = 0     # zero defaults to 300
+# intent_max_age_seconds = 0     # age before a pending write intent is fenced;
+                                 # zero defaults to 3600
+
 # One host = one s3d process, launched with `-host <id>`.
 [[host]]
 id   = 1

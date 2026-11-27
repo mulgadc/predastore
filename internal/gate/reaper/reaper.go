@@ -38,6 +38,9 @@
 // There is no election. Every gate that runs repair also runs this sweep, and
 // two gates racing the same tombstone issue the same idempotent shard deletes
 // and the same idempotent tombstone removal — redundant RPCs, nothing else.
+//
+// Each pass also settles the write intents a conditional write left behind:
+// see intent.go.
 package reaper
 
 import (
@@ -61,9 +64,10 @@ import (
 )
 
 // MetaClient is the slice of the meta client a sweep needs: ScanFrom pages the
-// tombstones, LeaderGet reads the current placement at a hash, and Delete
-// drops a tombstone once its shards are gone.
+// tombstones and intents, LeaderGet reads the current placement at a hash,
+// Delete drops a settled row, and Txn fences a pending intent.
 type MetaClient interface {
+	handlers.IntentTxn
 	LeaderGet(ctx context.Context, key string) ([]byte, error)
 	Delete(ctx context.Context, key string) error
 	ScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error)
@@ -72,8 +76,9 @@ type MetaClient interface {
 var _ MetaClient = (*meta.Client)(nil)
 
 // BlobClient is what the sweep needs of a blob node: the ability to remove
-// one shard at one generation.
+// one shard at one generation, and to settle the shards of an intent.
 type BlobClient interface {
+	handlers.IntentBlob
 	DeleteEpoch(ctx context.Context, node config.NodeID, req blob.CommitRequest) (*blob.DeleteResponse, error)
 }
 
@@ -95,6 +100,13 @@ type Config struct {
 	// Interval is the gap between the end of one pass and the start of the
 	// next. Zero defaults.
 	Interval time.Duration
+
+	// IntentMaxAge is how old a pending intent must be before a pass fences
+	// it, so a live writer is left to finish. Zero defaults to one hour.
+	IntentMaxAge time.Duration
+
+	// Now is the clock intent ages are measured by. Nil is time.Now.
+	Now func() time.Time
 }
 
 // DefaultWorkers is the reclaim concurrency. Half the host, capped, the same
@@ -107,6 +119,7 @@ const (
 	maxDefaultWorkers = 8
 	defaultPageSize   = 512
 	defaultInterval   = 5 * time.Minute
+	defaultIntentAge  = time.Hour
 )
 
 // Stats is what a pass did. Scanned counts tombstones read, Reclaimed the ones
@@ -118,16 +131,27 @@ type Stats struct {
 	Reclaimed int64
 	Failed    int64
 	Pending   int64
+
+	// The same counts for write intents. IntentsOwed is what the last pass
+	// left, young pending intents included.
+	IntentsScanned int64
+	IntentsSettled int64
+	IntentsFailed  int64
+	IntentsOwed    int64
 }
 
 // Service sweeps for tombstones and reclaims what they name.
 type Service struct {
-	cfg      Config
-	workers  int
-	pageSize int
-	interval time.Duration
+	cfg       Config
+	workers   int
+	pageSize  int
+	interval  time.Duration
+	intentAge time.Duration
+	now       func() time.Time
 
 	passes, scanned, reclaimed, failed, pending atomic.Int64
+
+	intentsScanned, intentsSettled, intentsFailed, intentsOwed atomic.Int64
 }
 
 // New validates cfg and applies its defaults. It starts nothing.
@@ -144,6 +168,14 @@ func New(cfg Config) (*Service, error) {
 	}
 	if s.interval <= 0 {
 		s.interval = defaultInterval
+	}
+	s.intentAge = cfg.IntentMaxAge
+	if s.intentAge <= 0 {
+		s.intentAge = defaultIntentAge
+	}
+	s.now = cfg.Now
+	if s.now == nil {
+		s.now = time.Now
 	}
 
 	return s, nil
@@ -165,6 +197,11 @@ func (s *Service) Stats() Stats {
 		Reclaimed: s.reclaimed.Load(),
 		Failed:    s.failed.Load(),
 		Pending:   s.pending.Load(),
+
+		IntentsScanned: s.intentsScanned.Load(),
+		IntentsSettled: s.intentsSettled.Load(),
+		IntentsFailed:  s.intentsFailed.Load(),
+		IntentsOwed:    s.intentsOwed.Load(),
 	}
 }
 
@@ -188,13 +225,23 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 }
 
-// Pass runs one sweep to completion.
+// Pass runs one sweep to completion: the tombstones, then the intents. A
+// failed scan of one does not stop the other.
 //
 // It is not resumable: a restart part-way through starts the enumeration
 // again from the beginning. Only the position is lost, never work — every
 // reclaim is idempotent, both the shard deletes and the tombstone removal, so
 // repeating a page costs redundant RPCs and nothing else.
 func (s *Service) Pass(ctx context.Context) error {
+	tombErr := s.reapTombstones(ctx)
+	intentErr := s.reapIntents(ctx)
+	s.passes.Add(1)
+
+	return errors.Join(tombErr, intentErr)
+}
+
+// reapTombstones reclaims every tombstone a scan finds.
+func (s *Service) reapTombstones(ctx context.Context) error {
 	work := make(chan task)
 	var wg sync.WaitGroup
 	var owed atomic.Int64
@@ -236,12 +283,8 @@ func (s *Service) Pass(ctx context.Context) error {
 	// will find it again. Settling the gauge here rather than decrementing per
 	// item keeps it from drifting when a pass is cut short.
 	s.pending.Store(max(owed.Load(), 0))
-	s.passes.Add(1)
-	if err != nil {
-		return err
-	}
 
-	return nil
+	return err
 }
 
 // task is one tombstone row, decoded.
