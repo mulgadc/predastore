@@ -537,8 +537,8 @@ func (s *Server) get(key string) ([]byte, error) {
 }
 
 // scan iterates over every key with the given prefix.
-func (s *Server) scan(prefix, after string, fn func(key string, value []byte) error) error {
-	return s.fsm.ScanFrom(prefix, after, fn)
+func (s *Server) scan(prefix, after string, limit int, fn func(key string, value []byte) error) error {
+	return s.fsm.ScanFromLimit(prefix, after, limit, fn)
 }
 
 // leaderAddr returns the advertise address of the current leader, empty while

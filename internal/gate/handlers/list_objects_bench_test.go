@@ -97,10 +97,14 @@ func writeDuringListing(b *testing.B, h http.Handler, mc MetaClient) {
 	b.Helper()
 	var stop atomic.Bool
 	var listed, failed atomic.Int64
+	var started sync.WaitGroup
 	var wg sync.WaitGroup
 	for range 4 {
+		started.Add(1)
 		wg.Go(func() {
+			once := sync.OnceFunc(started.Done)
 			for !stop.Load() {
+				once()
 				if listPage(h, url.Values{"list-type": {"2"}, "max-keys": {"1000"}}).Code != http.StatusOK {
 					failed.Add(1)
 				}
@@ -108,6 +112,9 @@ func writeDuringListing(b *testing.B, h http.Handler, mc MetaClient) {
 			}
 		})
 	}
+	// Every lister is inside its first listing before the first timed write.
+	started.Wait()
+	before := listed.Load()
 	var lat []time.Duration
 	i := 0
 	for b.Loop() {
@@ -118,10 +125,11 @@ func writeDuringListing(b *testing.B, h http.Handler, mc MetaClient) {
 		}
 		lat = append(lat, time.Since(start))
 	}
+	during := listed.Load() - before
 	stop.Store(true)
 	wg.Wait()
-	if failed.Load() > 0 || listed.Load() == 0 {
-		b.Fatalf("listings: %d sent, %d failed", listed.Load(), failed.Load())
+	if failed.Load() > 0 || during == 0 {
+		b.Fatalf("listings: %d during the writes, %d failed", during, failed.Load())
 	}
 	slices.Sort(lat)
 	b.ReportMetric(float64(lat[len(lat)/2].Nanoseconds()), "p50-ns")
@@ -144,5 +152,25 @@ func BenchmarkListObjectsAfterDeletes(b *testing.B) {
 	mc.apply(cmds...)
 	b.Run(fmt.Sprintf("keys=%d/deleted=%d/max-keys=1000", n, deleted), func(b *testing.B) {
 		benchListPage(b, h, url.Values{"list-type": {"2"}, "max-keys": {"1000"}})
+	})
+}
+
+// BenchmarkListObjectsDeletesAfterThePage lists the first page of a bucket
+// whose keys just after that page were deleted, so a scan that read past the
+// row it needs would pass over their tombstones.
+func BenchmarkListObjectsDeletesAfterThePage(b *testing.B) {
+	const n, page = 100_000, 1000
+	h, mc, keys := listBenchBucket(b, n)
+	cmds := make([]meta.Command, 0, 1000)
+	for _, key := range keys[page+1 : n-1000] {
+		cmds = append(cmds, meta.Command{Type: meta.CommandDelete, Key: []byte(TableKey(model.TableObjects, objectARN("bkt", key)))})
+		if len(cmds) == cap(cmds) {
+			mc.apply(cmds...)
+			cmds = cmds[:0]
+		}
+	}
+	mc.apply(cmds...)
+	b.Run(fmt.Sprintf("keys=%d/deleted-after=%d/max-keys=%d", n, page+1, page), func(b *testing.B) {
+		benchListPage(b, h, url.Values{"list-type": {"2"}, "max-keys": {strconv.Itoa(page)}})
 	})
 }

@@ -67,7 +67,9 @@ func (m *fsmMeta) Get(_ context.Context, key string) ([]byte, error) {
 func (m *fsmMeta) LeaderGet(ctx context.Context, key string) ([]byte, error) { return m.Get(ctx, key) }
 
 func (m *fsmMeta) Put(_ context.Context, key string, value []byte) error {
-	_ = m.apply(meta.Command{Type: meta.CommandPut, Key: []byte(key), Value: value})
+	if err, ok := m.apply(meta.Command{Type: meta.CommandPut, Key: []byte(key), Value: value})[0].(error); ok {
+		return err
+	}
 	return nil
 }
 
@@ -87,16 +89,12 @@ func (m *fsmMeta) Scan(ctx context.Context, prefix string, limit int) ([]meta.It
 
 // ScanFrom stops at limit as the replica's scan handler does.
 func (m *fsmMeta) ScanFrom(_ context.Context, prefix, after string, limit int) ([]meta.Item, error) {
-	errLimit := errors.New("limit")
 	var items []meta.Item
-	err := m.fsm.ScanFrom(prefix, after, func(key string, value []byte) error {
-		if limit > 0 && len(items) >= limit {
-			return errLimit
-		}
+	err := m.fsm.ScanFromLimit(prefix, after, limit, func(key string, value []byte) error {
 		items = append(items, meta.Item{Key: key, Value: value})
 		return nil
 	})
-	if err != nil && !errors.Is(err, errLimit) {
+	if err != nil {
 		return nil, err
 	}
 	return items, nil

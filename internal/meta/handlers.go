@@ -171,18 +171,14 @@ func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport
 	if refused, err := s.refuseLeaderRead(h, stream); refused {
 		return err
 	}
-	// errScanLimit stops iteration once the limit is reached without
-	// surfacing an error to the client.
-	errScanLimit := errors.New("scan limit reached")
+	// The scan stops on the row that reaches the limit, so it never reads the
+	// row after it.
 	var items []ScanItem
-	err := s.scan(string(h.Key), string(h.After), func(key string, value []byte) error {
-		if h.Limit > 0 && len(items) >= h.Limit {
-			return errScanLimit
-		}
+	err := s.scan(string(h.Key), string(h.After), h.Limit, func(key string, value []byte) error {
 		items = append(items, ScanItem{Key: []byte(key), Value: value})
 		return nil
 	})
-	if err != nil && !errors.Is(err, errScanLimit) {
+	if err != nil {
 		return respond(stream, &MetaResponse{Err: err.Error()})
 	}
 	return respond(stream, &MetaResponse{Items: items})

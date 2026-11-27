@@ -17,10 +17,18 @@ import (
 const largeListKeys = 1_000_000
 
 var (
-	largeOnce sync.Once
-	largeMC   *countingMeta
-	largeKeys []string
+	largeOnce  sync.Once
+	largeMC    *countingMeta
+	largeKeys  []string
+	largeClose func()
 )
+
+// closeLargeBucket closes and removes the large bucket, if a benchmark built it.
+func closeLargeBucket() {
+	if largeClose != nil {
+		largeClose()
+	}
+}
 
 // largeBucket builds one bucket of a million objects under vol/, with their
 // placement rows, once per test binary: building it costs more than any run.
@@ -31,9 +39,14 @@ func largeBucket(b *testing.B) (*countingMeta, []string) {
 		if err != nil {
 			b.Fatal(err)
 		}
+		largeClose = func() { _ = os.RemoveAll(dir) }
 		db, err := badger.Open(badger.DefaultOptions(dir).WithLoggingLevel(badger.WARNING))
 		if err != nil {
 			b.Fatal(err)
+		}
+		largeClose = func() {
+			_ = db.Close()
+			_ = os.RemoveAll(dir)
 		}
 		fsm, err := meta.OpenFSM(db)
 		if err != nil {
