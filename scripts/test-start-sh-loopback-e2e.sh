@@ -67,7 +67,7 @@ fi
 # hosts whose peers they cannot verify never report meta_leader ok. Record
 # the verdict but do not stop: the S3 leg below runs either way, so a broken
 # build is reported through every surface it breaks, not just the first.
-READYZ_OK=1
+READYZ_OK=0
 for _ in $(seq 1 45); do
     OK=3
     for ip in 127.0.0.1 127.0.0.2 127.0.0.3; do
@@ -81,7 +81,6 @@ for _ in $(seq 1 45); do
     sleep 2
 done
 if [ $READYZ_OK -ne 1 ]; then
-    READYZ_OK=0
     echo "FAIL: cluster did not reach readyz on all three hosts within 90s"
     for ip in 127.0.0.1 127.0.0.2 127.0.0.3; do
         echo "  readyz $ip: $(curl -s --max-time 2 "http://$ip:9099/readyz" || echo unreachable)"
