@@ -16,3 +16,4 @@ PASS|stale-shard
 PASS|object-sizes
 PASS|acked-readback
 PASS|freeze
+FAIL|upgrade

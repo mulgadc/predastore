@@ -24,7 +24,8 @@
 #                      "concurrent-put", "torn-overwrite", "stale-shard",
 #                      "object-sizes", "acked-readback", "freeze", or
 #                      "partial-put" — a client that stops sending mid-body.
-#                      Unset runs them all.
+#                      Unset runs them all except "upgrade", which runs only
+#                      when named.
 #   STRESS_CONFIG      Profile to run (default: 4host)
 #   STRESS_HOST        "follower" (default), "leader", or an explicit host id.
 #                      The role is resolved against the running cluster, since
@@ -65,6 +66,15 @@
 #   STRESS_SIZE_KEYS   Keys written per size (default: 16). Placement follows
 #                      the object hash, so this is how many placements each
 #                      size is exercised over rather than repetition.
+#   STRESS_UPGRADE_FROM
+#                      Tag the upgrade scenario starts the cluster on
+#                      (default: v1.26.0). It must be in the local clone.
+#   STRESS_UPGRADE_DEADLINE
+#                      Seconds allowed for the reaper to reclaim the legacy
+#                      tombstone after the upgrade (default: 120)
+#   STRESS_UPGRADE_KEYS, STRESS_UPGRADE_VERSIONS
+#                      Objects on the unversioned bucket and versions of one
+#                      key on the versioned bucket (defaults: 4 and 3)
 #   STRESS_WORK_ROOT   Where the cluster work directory is created. Defaults to
 #                      TMPDIR, except when large-object is in the run: TMPDIR is
 #                      often tmpfs, which is RAM-backed, so it would both cap
@@ -102,7 +112,7 @@ SCENARIO="${STRESS_SCENARIO:-all}"
 case "$SCENARIO" in
     all|freeze|partial-put|torn-overwrite|stale-shard|repair|handoff|large-object|multipart-upload) ;;
     last-modified|concurrent-put|object-sizes|retained-reclaim|acked-readback) ;;
-    node-rejoin|node-resync|node-rebuild) ;;
+    node-rejoin|node-resync|node-rebuild|upgrade) ;;
     *) echo "unknown STRESS_SCENARIO: $SCENARIO" >&2; exit 1 ;;
 esac
 
@@ -1208,6 +1218,390 @@ for node_scenario in node-rejoin node-resync node-rebuild; do
         fi
     fi
 done
+
+# --- Scenario: upgrade ---
+#
+# Stop every node on an earlier release, start them all on this build, and
+# check the old data and a legacy delete tombstone survive it. Not in "all":
+# it builds the earlier release from its tag, which a shallow clone lacks.
+
+UPGRADE_FROM="${STRESS_UPGRADE_FROM:-v1.26.0}"
+UPGRADE_DEADLINE="${STRESS_UPGRADE_DEADLINE:-120}"
+UPGRADE_VERSIONS="${STRESS_UPGRADE_VERSIONS:-3}"
+UPGRADE_KEYS="${STRESS_UPGRADE_KEYS:-4}"
+UPGRADE_CLUSTER="${CONFIG_NAME}-upgrade"
+UPGRADE_CONFIG="$PREDA_CONFIG_DIR/$UPGRADE_CLUSTER.toml"
+UPGRADE_PLAIN="stress-upgrade-plain"
+UPGRADE_VERSIONED="stress-upgrade-versioned"
+UPGRADE_ACKED="$WORK_DIR/upgrade-acked.txt"
+UPGRADE_FAILURES=0
+UPGRADE_CASES=0
+COND_FAILURES=0
+COND_CASES=0
+
+upgrade_check() {
+    local ok="$1" message="$2"
+    UPGRADE_CASES=$(( UPGRADE_CASES + 1 ))
+    if [ "$ok" = true ]; then
+        log "upgrade: pass, $message"
+    else
+        log "upgrade: FAIL $message"
+        UPGRADE_FAILURES=$(( UPGRADE_FAILURES + 1 ))
+    fi
+}
+
+# cond_check counts the conditional-write phase apart from the rest, so the
+# verdict says which half failed.
+cond_check() {
+    local ok="$1" message="$2"
+    COND_CASES=$(( COND_CASES + 1 ))
+    if [ "$ok" = true ]; then
+        log "upgrade[conditional-write]: pass, $message"
+    else
+        log "upgrade[conditional-write]: FAIL $message"
+        COND_FAILURES=$(( COND_FAILURES + 1 ))
+    fi
+}
+
+# upgrade_build_from builds the earlier release from its tag into the work
+# directory, with that release's own Makefile and go.mod.
+upgrade_build_from() {
+    local src="$WORK_DIR/upgrade-from"
+    git -C "$REPO_DIR" rev-parse --verify --quiet "refs/tags/$UPGRADE_FROM^{commit}" >/dev/null \
+        || fail "upgrade: tag $UPGRADE_FROM is not in this clone (git fetch origin tag $UPGRADE_FROM)"
+    mkdir -p "$src"
+    git -C "$REPO_DIR" archive "$UPGRADE_FROM" | tar -x -C "$src"
+
+    # A release that already writes scoped tombstones would leave no legacy
+    # row, and the reclaim check below would test nothing.
+    if grep -q 'deleted-epoch:' "$src/internal/gate/handlers/delete_object.go"; then
+        fail "upgrade: $UPGRADE_FROM already writes scoped tombstones, so it cannot leave a legacy one"
+    fi
+
+    log "upgrade: building $UPGRADE_FROM from its tag"
+    GOWORK=off make -C "$src" go_build >"$RUN_DIR/upgrade-build.log" 2>&1 \
+        || fail "upgrade: building $UPGRADE_FROM failed; see $RUN_DIR/upgrade-build.log"
+    UPGRADE_FROM_BIN="$src/bin/s3d"
+}
+
+render_upgrade_profile() {
+    render_profile "$CONFIG_DIR/$CONFIG_NAME.toml" "$UPGRADE_CONFIG" "$(( PORT_OFFSET + 1000 ))"
+    cat >> "$UPGRADE_CONFIG" <<'PROFILE'
+
+[reaper]
+interval_seconds = 2
+PROFILE
+    cp "$UPGRADE_CONFIG" "$RUN_DIR/$UPGRADE_CLUSTER.toml"
+}
+
+# upgrade_wait_ready polls every host's readiness gate, which answers only once
+# the host sees a meta leader and its blob nodes are open.
+upgrade_wait_ready() {
+    local label="$1" admin addr deadline
+    admin="$(awk -F= '/^[[:space:]]*admin_port[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); print $2; exit }' "$UPGRADE_CONFIG")"
+    [ -n "$admin" ] || fail "upgrade: $UPGRADE_CONFIG names no admin_port"
+    deadline=$(( $(date +%s) + 90 ))
+    for addr in $(parse_hosts "$UPGRADE_CONFIG" | awk '{ print $2 }'); do
+        until curl -fsS --max-time 5 "http://$addr:$admin/readyz" >/dev/null 2>&1; do
+            [ "$(date +%s)" -lt "$deadline" ] \
+                || fail "upgrade: $addr did not report ready within 90s $label"
+            sleep 2
+        done
+    done
+    log "upgrade: every host reports ready $label"
+}
+
+# upgrade_running_binary reports whether every host process runs the named
+# binary, which is the version check: one build, so one version.
+upgrade_running_binary() {
+    local want pidfile pid got
+    want="$(readlink -f "$1")"
+    for pidfile in "$PREDA_DIR/$UPGRADE_CLUSTER"/pids/*.pid; do
+        [ -e "$pidfile" ] || return 1
+        pid="$(cat "$pidfile")"
+        got="$(readlink -f "/proc/$pid/exe" 2>/dev/null)" || return 1
+        [ "$got" = "$want" ] || { log "upgrade: pid $pid runs $got, not $want"; return 1; }
+    done
+}
+
+# upgrade_save_logs copies the node logs before a restart, because start.sh
+# truncates each log when it launches the host again.
+upgrade_save_logs() {
+    mkdir -p "$RUN_DIR/logs-upgrade/$1"
+    cp -R "$PREDA_DIR/$UPGRADE_CLUSTER/logs/." "$RUN_DIR/logs-upgrade/$1/" 2>/dev/null || true
+}
+
+# upgrade_put writes one object and records "bucket key version etag body". It
+# prints nothing and fails when the write is not acknowledged.
+upgrade_put() {
+    local gate="$1" bucket="$2" key="$3" body="$4" out etag version
+    out="$(aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+        s3api put-object --bucket "$bucket" --key "$key" --body "$body" \
+        --query '[ETag, VersionId]' --output text 2>>"$RUN_DIR/upgrade-errors.txt")" || return 1
+    read -r etag version <<< "$out"
+    [ -n "$etag" ] || return 1
+    case "$version" in ""|None|null) version=- ;; esac
+    echo "$bucket $key $version $etag $body" >> "$UPGRADE_ACKED"
+}
+
+# upgrade_get reads one object, or one version of it, and prints its ETag.
+upgrade_get() {
+    local gate="$1" bucket="$2" key="$3" version="$4" out="$5"
+    local args=(--bucket "$bucket" --key "$key")
+    [ "$version" = - ] || args+=(--version-id "$version")
+    aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+        s3api get-object "${args[@]}" "$out" --query ETag --output text 2>>"$RUN_DIR/upgrade-errors.txt"
+}
+
+# upgrade_readback reads every acknowledged record through one gate and checks
+# its body and ETag, logging each one that differs.
+upgrade_readback() {
+    local gate="$1" label="$2" got="$WORK_DIR/upgrade-got.bin"
+    local bucket key version etag body seen ok=0 total=0
+    while read -r bucket key version etag body <&3; do
+        total=$(( total + 1 ))
+        seen="$(upgrade_get "$gate" "$bucket" "$key" "$version" "$got" || true)"
+        if [ "$seen" = "$etag" ] && cmp -s "$body" "$got"; then
+            ok=$(( ok + 1 ))
+        else
+            log "upgrade: $bucket/$key version $version read ETag '${seen:-none}' want $etag through $gate"
+        fi
+    done 3< "$UPGRADE_ACKED"
+    upgrade_check "$([ "$total" -gt 0 ] && [ "$ok" -eq "$total" ] && echo true || echo false)" \
+        "$ok of $total acknowledged objects and versions read back with body and ETag through $gate $label"
+}
+
+# upgrade_tombstone_on_disk counts the meta stores that hold the legacy
+# tombstone of bucket/key. The cluster must be stopped: Badger locks its store.
+upgrade_tombstone_on_disk() {
+    local bucket="$1" key="$2" host node dir held=0
+    while read -r host node <&3; do
+        dir="$PREDA_DIR/$UPGRADE_CLUSTER/host-$host/node-$node/badger"
+        [ -d "$dir" ] || continue
+        if "$BADGER_PROBE" -mode meta "$dir" 2>>"$RUN_DIR/upgrade-errors.txt" \
+            | grep -F 'objects/deleted:' | grep -qF "/$bucket/$key  "; then
+            held=$(( held + 1 ))
+        fi
+    done 3< <(meta_nodes "$UPGRADE_CONFIG")
+    echo "$held"
+}
+
+# cond_put sends PutObject with If-None-Match: * and prints "200 <etag>",
+# "412", or the error code the gate answered instead.
+cond_put() {
+    local gate="$1" bucket="$2" key="$3" body="$4" err="$WORK_DIR/upgrade-cond.err" out
+    if out="$(aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+        s3api put-object --bucket "$bucket" --key "$key" --body "$body" --if-none-match '*' \
+        --query ETag --output text 2>"$err")"; then
+        echo "200 $out"
+        return
+    fi
+    cat "$err" >> "$RUN_DIR/upgrade-errors.txt"
+    if grep -q '(PreconditionFailed)' "$err"; then
+        echo 412
+    else
+        echo "error $(grep -o '([A-Za-z]*)' "$err" | head -1)"
+    fi
+}
+
+run_upgrade() {
+    local src_dir="$WORK_DIR/upgrade-bodies" got="$WORK_DIR/upgrade-got.bin"
+    local victim gate gates=() i key body doomed="" held new_bin
+
+    BADGER_PROBE="$WORK_DIR/badgerdump"
+    go build -o "$BADGER_PROBE" "$REPO_DIR/scripts/bench/badgerdump"
+    TOMB_PROBE="$WORK_DIR/tombstones"
+    go build -o "$TOMB_PROBE" "$REPO_DIR/scripts/bench/tombstones"
+    new_bin="$REPO_DIR/bin/s3d"
+    [ -x "$new_bin" ] || fail "upgrade: $new_bin is missing (run make build)"
+
+    upgrade_build_from
+    render_upgrade_profile
+    mkdir -p "$src_dir"
+    : > "$UPGRADE_ACKED"
+
+    # --- Phase: the earlier release writes the data ---
+    log "upgrade: starting $UPGRADE_CLUSTER on $UPGRADE_FROM"
+    PREDA_S3D_BINARY="$UPGRADE_FROM_BIN" "$SCRIPTS_DIR/start.sh" -w "$UPGRADE_CLUSTER"
+    upgrade_wait_ready "on $UPGRADE_FROM"
+    upgrade_running_binary "$UPGRADE_FROM_BIN" \
+        || fail "upgrade: not every host runs the $UPGRADE_FROM build"
+
+    # The host that is down for the delete is the last, and the meta group
+    # keeps quorum without it, so the delete measures a failed shard fan-out
+    # rather than a lost quorum.
+    victim="$(parse_hosts "$UPGRADE_CONFIG" | awk 'END { print $1 }')"
+    gate="$(survivor_gate "$UPGRADE_CONFIG" "$victim")"
+    [ -n "$gate" ] || fail "upgrade: no gate survives losing host $victim"
+    mapfile -t gates < <(gate_endpoints "$UPGRADE_CONFIG" | sed 's#^#https://#')
+
+    aws_s3 "$gate" s3 mb "s3://$UPGRADE_PLAIN" >/dev/null
+    aws_s3 "$gate" s3 mb "s3://$UPGRADE_VERSIONED" >/dev/null
+    aws_s3 "$gate" s3api put-bucket-versioning --bucket "$UPGRADE_VERSIONED" \
+        --versioning-configuration Status=Enabled
+
+    local written=0 want=0
+    for i in $(seq 1 "$UPGRADE_KEYS"); do
+        key="$(printf 'plain-%03d.bin' "$i")"
+        body="$src_dir/$key"
+        openssl rand -out "$body" $(( 65536 * i ))
+        want=$(( want + 1 ))
+        upgrade_put "$gate" "$UPGRADE_PLAIN" "$key" "$body" && written=$(( written + 1 ))
+    done
+    for i in $(seq 1 "$UPGRADE_VERSIONS"); do
+        body="$src_dir/doc-v$i.bin"
+        openssl rand -out "$body" $(( 131072 + i ))
+        want=$(( want + 1 ))
+        upgrade_put "$gate" "$UPGRADE_VERSIONED" doc.bin "$body" && written=$(( written + 1 ))
+    done
+    body="$src_dir/single.bin"
+    openssl rand -out "$body" 1048576
+    want=$(( want + 1 ))
+    upgrade_put "$gate" "$UPGRADE_VERSIONED" single.bin "$body" && written=$(( written + 1 ))
+    [ "$written" -eq "$want" ] \
+        || fail "upgrade: $written of $want writes on $UPGRADE_FROM were acknowledged, so nothing below is attributable"
+    log "upgrade: $written objects and versions acknowledged on $UPGRADE_FROM"
+
+    # The delete target must keep a shard on the host that goes down, or its
+    # fan-out succeeds and no tombstone is written.
+    for i in $(seq 1 64); do
+        key="$(printf 'doomed-%03d.bin' "$i")"
+        if "$SHARD_PROBE" -config "$UPGRADE_CONFIG" -bucket "$UPGRADE_PLAIN" -key "$key" \
+            | awk -v h="host=$victim" '$2 != "role=handoff" && $4 == h { f = 1 } END { exit !f }'; then
+            doomed="$key"
+            break
+        fi
+    done
+    [ -n "$doomed" ] || fail "upgrade: no candidate key places a shard on host $victim"
+    openssl rand -out "$src_dir/$doomed" 262144
+    aws_s3 "$gate" s3api put-object --bucket "$UPGRADE_PLAIN" --key "$doomed" \
+        --body "$src_dir/$doomed" >/dev/null \
+        || fail "upgrade: writing $doomed on $UPGRADE_FROM failed"
+
+    upgrade_readback "$gate" "on $UPGRADE_FROM, before the outage"
+
+    NODE_MODE=upgrade
+    stop_host "$UPGRADE_CLUSTER" "$victim"
+    log "upgrade: deleting $doomed with shard host $victim down"
+    aws_s3 "$gate" --cli-connect-timeout 10 --cli-read-timeout 120 \
+        s3api delete-object --bucket "$UPGRADE_PLAIN" --key "$doomed" >/dev/null \
+        2>>"$RUN_DIR/upgrade-errors.txt" \
+        || fail "upgrade: the delete of $doomed with host $victim down was not acknowledged"
+
+    # --- Phase: stop every node and install the new release on all of them ---
+    upgrade_save_logs "1-$UPGRADE_FROM"
+    log "upgrade: stopping every node, with host $victim still down"
+    stop_clusters
+
+    held="$(upgrade_tombstone_on_disk "$UPGRADE_PLAIN" "$doomed")"
+    upgrade_check "$([ "$held" -gt 0 ] && echo true || echo false)" \
+        "the stopped cluster holds the legacy tombstone of $doomed in $held meta store(s)"
+    [ "$held" -gt 0 ] \
+        || fail "upgrade: no legacy tombstone survived to the upgrade, so the reclaim check would test nothing"
+
+    log "upgrade: starting every node on $(git -C "$REPO_DIR" rev-parse --short HEAD)"
+    "$SCRIPTS_DIR/start.sh" -w "$UPGRADE_CLUSTER"
+    upgrade_wait_ready "after the upgrade"
+    if upgrade_running_binary "$new_bin"; then
+        upgrade_check true "every host runs the new build"
+    else
+        upgrade_check false "not every host runs the new build"
+    fi
+
+    # --- Phase: the new release reads the old data ---
+    warm_gate "${gates[0]}" "$UPGRADE_PLAIN" plain-001.bin upgrade \
+        || fail "upgrade: no gate served after the upgrade"
+    for gate in "${gates[@]}"; do
+        upgrade_readback "$gate" "after the upgrade"
+    done
+
+    local versions
+    versions="$(aws_s3 "${gates[0]}" s3api list-object-versions --bucket "$UPGRADE_VERSIONED" \
+        --prefix doc.bin --query 'length(Versions)' --output text 2>>"$RUN_DIR/upgrade-errors.txt" || true)"
+    upgrade_check "$([ "$versions" = "$UPGRADE_VERSIONS" ] && echo true || echo false)" \
+        "doc.bin lists $versions of $UPGRADE_VERSIONS versions after the upgrade"
+
+    local head_err="$WORK_DIR/upgrade-head.err"
+    if aws_s3 "${gates[0]}" s3api head-object --bucket "$UPGRADE_PLAIN" --key "$doomed" >/dev/null 2>"$head_err"; then
+        upgrade_check false "$doomed, deleted on $UPGRADE_FROM, is readable again after the upgrade"
+    else
+        upgrade_check "$(grep -q '(404)' "$head_err" && echo true || echo false)" \
+            "$doomed, deleted on $UPGRADE_FROM, answers 404 after the upgrade"
+    fi
+
+    local deadline reclaimed=false listing started
+    started="$(date +%s)"
+    deadline=$(( started + UPGRADE_DEADLINE ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        if listing="$("$TOMB_PROBE" -config "$UPGRADE_CONFIG" -ca "$CA_FILE" 2>>"$RUN_DIR/upgrade-errors.txt")" \
+            && ! grep -qF "bucket=$UPGRADE_PLAIN key=$doomed epoch=" <<< "$listing"; then
+            reclaimed=true
+            break
+        fi
+        sleep 2
+    done
+    printf '%s\n' "${listing:-}" > "$RUN_DIR/upgrade-tombstones.txt"
+    upgrade_check "$reclaimed" \
+        "the reaper reclaimed the legacy tombstone of $doomed $(( $(date +%s) - started ))s after the first probe"
+
+    # --- Phase: conditional-write ---
+    # Fails until conditional PutObject lands. Counted on its own, so it does
+    # not hide the result of the upgrade itself.
+    local cond_key="conditional.bin" first second answer cond_etag=""
+    first="$src_dir/conditional-1.bin"
+    second="$src_dir/conditional-2.bin"
+    openssl rand -out "$first" 65536
+    openssl rand -out "$second" 65536
+
+    answer="$(cond_put "${gates[0]}" "$UPGRADE_PLAIN" "$cond_key" "$first")"
+    cond_check "$([ "${answer%% *}" = 200 ] && echo true || echo false)" \
+        "If-None-Match: * on new key $cond_key answered ${answer}, want 200"
+    [ "${answer%% *}" = 200 ] && cond_etag="${answer#* }"
+
+    answer="$(cond_put "${gates[1]}" "$UPGRADE_PLAIN" "$cond_key" "$second")"
+    cond_check "$([ "$answer" = 412 ] && echo true || echo false)" \
+        "a second If-None-Match: * on $cond_key answered ${answer}, want 412"
+
+    # --- Phase: restart every node and read the conditional object back ---
+    upgrade_save_logs 2-upgraded
+    log "upgrade: restarting every node"
+    stop_clusters
+    "$SCRIPTS_DIR/start.sh" -w "$UPGRADE_CLUSTER"
+    upgrade_wait_ready "after the restart"
+    warm_gate "${gates[0]}" "$UPGRADE_PLAIN" plain-001.bin upgrade \
+        || fail "upgrade: no gate served after the restart"
+
+    local seen
+    for gate in "${gates[@]}"; do
+        upgrade_readback "$gate" "after the restart"
+        seen="$(upgrade_get "$gate" "$UPGRADE_PLAIN" "$cond_key" - "$got" || true)"
+        cond_check "$([ -n "$cond_etag" ] && [ "$seen" = "$cond_etag" ] && cmp -s "$first" "$got" && echo true || echo false)" \
+            "$cond_key reads back the first body with ETag ${cond_etag:-none} through $gate after the restart"
+    done
+
+    upgrade_save_logs 3-restarted
+    log "upgrade: stopping $UPGRADE_CLUSTER"
+    stop_clusters
+
+    if [ "$UPGRADE_FAILURES" -eq 0 ]; then
+        log "upgrade: passed $UPGRADE_CASES assertions"
+    else
+        log "upgrade: FAILED $UPGRADE_FAILURES of $UPGRADE_CASES assertions"
+    fi
+    if [ "$COND_FAILURES" -eq 0 ]; then
+        log "upgrade[conditional-write]: passed $COND_CASES assertions"
+    else
+        log "upgrade[conditional-write]: FAILED $COND_FAILURES of $COND_CASES assertions"
+    fi
+}
+
+if [ "$SCENARIO" = upgrade ]; then
+    run_upgrade
+    echo "Stress results: $RUN_DIR"
+    [ $(( UPGRADE_FAILURES + COND_FAILURES )) -eq 0 ] \
+        || fail "upgrade failed $UPGRADE_FAILURES of $UPGRADE_CASES upgrade assertions and $COND_FAILURES of $COND_CASES conditional-write assertions"
+    exit 0
+fi
 
 # --- Scenario: large-object ---
 #
