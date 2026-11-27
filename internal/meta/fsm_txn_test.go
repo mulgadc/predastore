@@ -105,6 +105,7 @@ func TestFSM_Txn_AMalformedTransactionIsRejectedWithoutEffect(t *testing.T) {
 		"delete with a value": txnCommand(nil, put("a", "1"), TxnWrite{Key: []byte("b"), Value: []byte("x"), Delete: true}),
 		"too many checks":     txnCommand(absentChecks(MaxTxnChecks+1), put("a", "1")),
 		"too many writes":     txnCommand(nil, puts(MaxTxnWrites+1)...),
+		"a key checked twice": txnCommand([]TxnCheck{absent("b"), holds("c", "1"), holds("b", "x")}, put("a", "1")),
 	}
 	for name, cmd := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -280,4 +281,29 @@ func TestFSM_Txn_ReplicasApplyingTheSameLogAgree(t *testing.T) {
 		one.kinds)
 	assert.Equal(t, []string{fmt.Sprintf("%q=%q", appliedKey, encodeApplied(9)), `"objects/a"="gen-3"`, `"objects/b"="gen-3"`},
 		one.store, "the applied row names the last entry that wrote, however the log was batched")
+}
+
+// A check value arrives inside a body of at most MaxTxnBodyBytes, so a larger
+// row cannot hold it. Such a row is a mismatch, reported with no value and
+// never read, so neither the work nor the reply grows with it.
+func TestFSM_Txn_ARowLargerThanTheBodyLimitIsAMismatchWithNoValue(t *testing.T) {
+	db := newTestDB(t)
+	dbSet(t, db, []byte("big"), bytes.Repeat([]byte{'v'}, MaxTxnBodyBytes+1))
+	dbSet(t, db, []byte("small"), []byte("1"))
+	fsm := NewFSM(db)
+	var read []string
+	fsm.copyValue = func(item *badger.Item) ([]byte, error) {
+		read = append(read, string(item.Key()))
+		return item.ValueCopy(nil)
+	}
+
+	got := fsm.Apply(commandLog(t, 1, txnCommand(
+		[]TxnCheck{holds("small", "1"), holds("big", "v")}, put("small", "2"))))
+
+	assert.Equal(t, TxnResult{Current: []TxnValue{
+		{Key: []byte("small"), Value: []byte("1"), Exists: true},
+		{Key: []byte("big"), Exists: true, Oversized: true},
+	}}, got)
+	assert.Equal(t, []string{"small"}, read, "the large row is not read")
+	assertStored(t, db, map[string]*string{"small": str("1")})
 }

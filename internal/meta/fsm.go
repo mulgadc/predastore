@@ -64,11 +64,14 @@ type TxnWrite struct {
 }
 
 // TxnValue is what a checked key held when a transaction was evaluated.
-// Exists is false for an absent key, which then has no Value.
+// Exists is false for an absent key, which then has no Value. Oversized marks
+// a value larger than MaxTxnBodyBytes, which no check can name and no reply
+// carries, so it has no Value either.
 type TxnValue struct {
-	Key    []byte `json:"key"`
-	Value  []byte `json:"value,omitempty"`
-	Exists bool   `json:"exists,omitempty"`
+	Key       []byte `json:"key"`
+	Value     []byte `json:"value,omitempty"`
+	Exists    bool   `json:"exists,omitempty"`
+	Oversized bool   `json:"oversized,omitempty"`
 }
 
 // TxnResult is the FSM's answer to a CommandTxn it evaluated. On a mismatch,
@@ -111,6 +114,11 @@ func ValidateTxn(checks []TxnCheck, writes []TxnWrite) error {
 		}
 		if IsReservedKey(c.Key) {
 			return fmt.Errorf("%w: check %d: %w", ErrInvalidTxn, i, ErrReservedKey)
+		}
+		for j := range i {
+			if bytes.Equal(checks[j].Key, c.Key) {
+				return fmt.Errorf("%w: checks %d and %d name the same key", ErrInvalidTxn, j, i)
+			}
 		}
 	}
 	for i, w := range writes {
@@ -427,6 +435,9 @@ func (f *FSM) applyTxn(cmd Command, index uint64, b *batch) any {
 // stageTxn reads every checked key, then stages the writes only if all the
 // checks hold. The result depends on the store and the command alone, and a
 // failure to read the store is a storeError.
+//
+// A check value arrives inside a body of at most MaxTxnBodyBytes, so a row
+// larger than that holds no checked value. It is a mismatch and is not read.
 func (f *FSM) stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
 	current := make([]TxnValue, len(cmd.Checks))
 	holds := true
@@ -441,6 +452,10 @@ func (f *FSM) stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
 			return TxnResult{}, &storeError{err}
 		}
 		current[i].Exists = true
+		if item.ValueSize() > MaxTxnBodyBytes {
+			current[i].Oversized, holds = true, false
+			continue
+		}
 		value, err := f.copyValue(item)
 		if err != nil {
 			return TxnResult{}, &storeError{err}

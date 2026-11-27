@@ -190,3 +190,20 @@ func TestClientTxn_AnOversizedTransactionIsRefusedBeforeSending(t *testing.T) {
 	require.ErrorIs(t, err, meta.ErrTxnRefused)
 	require.ErrorIs(t, err, meta.ErrInvalidTxn)
 }
+
+// A mismatch reply carries no value larger than the body limit, so a check
+// that names a large row cannot make the replica send it.
+func TestTxnMismatchOnALargeRowCarriesNoValue(t *testing.T) {
+	cli := startTxnLeader(t)
+	ctx := t.Context()
+	require.NoError(t, cli.Put(ctx, "objects/big", bytes.Repeat([]byte{'v'}, meta.MaxTxnBodyBytes+1)))
+
+	resp, err := cli.SendTxnBody(ctx, 1, txnBody(t,
+		[]meta.TxnCheck{{Key: []byte("objects/big"), Value: []byte("v")}},
+		[]meta.TxnWrite{{Key: []byte("objects/k"), Value: []byte("gen-1")}}))
+
+	require.NoError(t, err)
+	assert.Empty(t, resp.Err)
+	assert.True(t, resp.Mismatch)
+	assert.Equal(t, []meta.TxnValue{{Key: []byte("objects/big"), Exists: true, Oversized: true}}, resp.Current)
+}
