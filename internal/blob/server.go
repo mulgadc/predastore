@@ -91,6 +91,7 @@ type Config struct {
 
 	// AuthorizeRecoveredPrepare checks authoritative placement at startup.
 	AuthorizeRecoveredPrepare func(context.Context, [32]byte, uint32, uint64) (bool, error)
+	AuthorizeRecoveredPart    func(context.Context, string, [32]byte, uint32, uint64) (bool, error)
 
 	// Store stands in for the engine that would be opened at DataDir. Test
 	// seam: production leaves it nil.
@@ -510,6 +511,12 @@ func (s *Server) lookupRecovered(ctx context.Context, h Request, cause error) (e
 	store, ok := s.store.(recoveredPrepareStore)
 	if !ok || s.cfg.AuthorizeRecoveredPrepare == nil {
 		return nil, cause
+	}
+	if h.PartPlacement != "" && s.cfg.AuthorizeRecoveredPart != nil {
+		return store.LookupRecoveredAt(ctx, h.Key, h.Index, h.Epoch,
+			func(ctx context.Context, key [32]byte, index uint32, epoch uint64) (bool, error) {
+				return s.cfg.AuthorizeRecoveredPart(ctx, h.PartPlacement, key, index, epoch)
+			})
 	}
 	return store.LookupRecoveredAt(ctx, h.Key, h.Index, h.Epoch, s.cfg.AuthorizeRecoveredPrepare)
 }

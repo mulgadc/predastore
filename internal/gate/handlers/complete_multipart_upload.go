@@ -304,6 +304,7 @@ func locatePart(
 		return locatedPart{err: err}
 	}
 
+	place.partPlacement = partShardKey(uploadID, partNumber)
 	return locatedPart{key: partObjectKey(key, uploadID, partNumber), place: place}
 }
 

@@ -69,7 +69,7 @@ type Store struct {
 	retainedMaxAge          time.Duration
 	compactor               *compactor
 	startupRecovery         func(*Store) error
-	deferredPrepares        map[prepareRecoveryKey]extent
+	deferredPrepares        map[prepareRecoveryShard]map[uint64]extent
 	deferredPrepareSegments map[uint64]int
 
 	// This node's slot among the cluster's blob nodes, which offsets its
@@ -1040,8 +1040,16 @@ func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
 	}
 
 	idxKey := MakeKey(key, index)
+	shard := prepareRecoveryShard{key: key, index: index}
+	deferred := store.deferredPrepares[shard]
 	deleted := false
 	err := store.index.Update(func(txn *badger.Txn) error {
+		for _, ext := range deferred {
+			if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
+				return fmt.Errorf("delete deferred shard: %w", err)
+			}
+			deleted = true
+		}
 		// Every generation goes, not just the live one: a prepared row would
 		// resurrect the value on a later commit, and a retained row would keep
 		// answering a record that names it.
@@ -1071,6 +1079,9 @@ func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	for epoch := range deferred {
+		store.removeDeferredPrepareLocked(prepareRecoveryKey{key: key, index: index, epoch: epoch})
+	}
 	return deleted, nil
 }
 
@@ -1087,7 +1098,7 @@ func (store *Store) DeleteEpoch(key [32]byte, index uint32, epoch uint64) (bool,
 
 	idxKey := MakeKey(key, index)
 	recovery := prepareRecoveryKey{key: key, index: index, epoch: epoch}
-	deferred, pending := store.deferredPrepares[recovery]
+	deferred, pending := store.deferredPrepares[recovery.shard()][epoch]
 	deleted := false
 	err := store.index.Update(func(txn *badger.Txn) error {
 		deleted = false

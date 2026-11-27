@@ -54,6 +54,7 @@ type ObjectToShardNodes struct {
 
 	DataShardNodes   []config.NodeID
 	ParityShardNodes []config.NodeID
+	partPlacement    string
 }
 
 // AllNodes returns the shard nodes in shard order: data first, then parity, so

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
@@ -41,6 +42,25 @@ func partShardKey(uploadID string, partNumber int) string {
 // in a hidden prefix so an in-flight upload never shows up in a listing.
 func partObjectKey(key, uploadID string, partNumber int) string {
 	return fmt.Sprintf(".multipart/%s/%s/%05d", uploadID, key, partNumber)
+}
+
+// PartPlacementHash checks that a placement key names a part of this upload.
+func PartPlacementHash(ctx context.Context, get func(context.Context, string) ([]byte, error), placement string) ([32]byte, error) {
+	part, ok := strings.CutPrefix(placement, partKeyPrefix)
+	uploadID, number, split := strings.Cut(part, ":")
+	n, err := strconv.Atoi(number)
+	if !ok || !split || uploadID == "" || err != nil || n < 1 || n > 10000 || partShardKey(uploadID, n) != placement {
+		return [32]byte{}, errors.New("invalid multipart placement key")
+	}
+	raw, err := get(ctx, TableKey(model.TableMultipart, uploadID))
+	if err != nil {
+		return [32]byte{}, err
+	}
+	var upload model.UploadMetadata
+	if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(&upload); err != nil {
+		return [32]byte{}, fmt.Errorf("decode upload metadata: %w", err)
+	}
+	return model.ObjectHash(upload.Bucket, partObjectKey(upload.Key, uploadID, n)), nil
 }
 
 // getUploadMetadata retrieves and validates upload metadata.

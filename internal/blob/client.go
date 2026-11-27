@@ -86,7 +86,8 @@ type GetRequest struct {
 	RangeEnd   int64
 	// Epoch is the generation the caller will accept. Zero reads whatever the
 	// node holds, which only a caller with no placement record should do.
-	Epoch uint64
+	Epoch         uint64
+	PartPlacement string
 }
 
 // DeleteRequest identifies the value a delete removes.
@@ -586,11 +587,12 @@ func (c *Client) finish(ctx context.Context, nodeID config.NodeID, op rpc.Opcode
 // stream.
 func (c *Client) Get(ctx context.Context, nodeID config.NodeID, req GetRequest) (io.ReadCloser, error) {
 	stream, err := c.openBounded(ctx, nodeID, OpGet, &Request{
-		Key:        req.Key,
-		Index:      req.Index,
-		Epoch:      req.Epoch,
-		RangeStart: req.RangeStart,
-		RangeEnd:   req.RangeEnd,
+		Key:           req.Key,
+		Index:         req.Index,
+		Epoch:         req.Epoch,
+		RangeStart:    req.RangeStart,
+		RangeEnd:      req.RangeEnd,
+		PartPlacement: req.PartPlacement,
 	})
 	if err != nil {
 		return nil, err

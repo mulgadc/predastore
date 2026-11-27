@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -115,26 +117,7 @@ func TestHostReplaysPlacementPublishedAfterRestart(t *testing.T) {
 func testHostReplaysRaftNamedPlacement(t *testing.T, latePlacement bool) {
 	t.Helper()
 	client, cfg := staleHostConfig(t)
-	require.NoError(t, cfg.Validate())
-	key := newMasterKey(t)
-	start := func() func() {
-		ctx, cancel := context.WithCancel(t.Context())
-		done := make(chan error, 1)
-		go func() {
-			done <- predastore.Run(ctx, predastore.Options{Config: cfg, HostID: 1, MasterKey: key})
-		}()
-		stop := sync.OnceFunc(func() {
-			cancel()
-			select {
-			case <-done:
-			case <-time.After(15 * time.Second):
-				t.Error("host did not stop")
-			}
-		})
-		t.Cleanup(stop)
-		awaitProbe(t, "http://127.0.0.1:"+strconv.Itoa(cfg.Hosts[0].AdminPort)+"/readyz", http.StatusOK)
-		return stop
-	}
+	start := recoveryHostStarter(t, cfg)
 	stop := start()
 	status, body := client.send(http.MethodPut, "/"+staleBucket, "", nil)
 	require.Equal(t, http.StatusOK, status, "%s", body)
@@ -160,6 +143,45 @@ func testHostReplaysRaftNamedPlacement(t *testing.T, latePlacement bool) {
 	stop()
 	client.http.CloseIdleConnections()
 
+	dropRecoveryHostShardRows(t, cfg, hash, placement)
+
+	start()
+	if latePlacement {
+		withHostClients(t, cfg, func(mc *meta.Client, _ *blob.Client, _ []config.NodeID) {
+			require.NoError(t, mc.Put(t.Context(), placementKey, placementValue))
+		})
+	}
+	status, body = client.send(http.MethodGet, objectPath, "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	require.Equal(t, want, body)
+}
+
+func recoveryHostStarter(t *testing.T, cfg *config.Config) func() func() {
+	t.Helper()
+	require.NoError(t, cfg.Validate())
+	key := newMasterKey(t)
+	return func() func() {
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() {
+			done <- predastore.Run(ctx, predastore.Options{Config: cfg, HostID: 1, MasterKey: key})
+		}()
+		stop := sync.OnceFunc(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				t.Error("host did not stop")
+			}
+		})
+		t.Cleanup(stop)
+		awaitProbe(t, "http://127.0.0.1:"+strconv.Itoa(cfg.Hosts[0].AdminPort)+"/readyz", http.StatusOK)
+		return stop
+	}
+}
+
+func dropRecoveryHostShardRows(t *testing.T, cfg *config.Config, hash [32]byte, placement handlers.ObjectToShardNodes) {
+	t.Helper()
 	host := cfg.Hosts[0]
 	holders := placement.AllNodes()
 	require.Len(t, holders, 3)
@@ -181,13 +203,52 @@ func testHostReplaysRaftNamedPlacement(t *testing.T, latePlacement bool) {
 		}
 	}
 
-	start()
-	if latePlacement {
-		withHostClients(t, cfg, func(mc *meta.Client, _ *blob.Client, _ []config.NodeID) {
-			require.NoError(t, mc.Put(t.Context(), placementKey, placementValue))
-		})
+}
+
+func TestHostRecoversMultipartPartAfterRestart(t *testing.T) {
+	client, cfg := staleHostConfig(t)
+	start := recoveryHostStarter(t, cfg)
+	stop := start()
+
+	status, body := client.send(http.MethodPut, "/"+staleBucket, "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	object := "/" + staleBucket + "/" + staleObject
+	status, body = client.send(http.MethodPost, object+"?uploads", "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	var upload struct {
+		ID string `xml:"UploadId"`
 	}
-	status, body = client.send(http.MethodGet, objectPath, "", nil)
+	require.NoError(t, xml.Unmarshal(body, &upload))
+	require.NotEmpty(t, upload.ID)
+
+	want := bytes.Repeat([]byte("acknowledged multipart bytes"), 400)
+	status, body, headers := client.sendTyped(http.MethodPut, object+"?uploadId="+upload.ID+"&partNumber=1", "", want)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	etag := headers.Get("ETag")
+	require.NotEmpty(t, etag)
+	var placement handlers.ObjectToShardNodes
+	withHostClients(t, cfg, func(mc *meta.Client, _ *blob.Client, _ []config.NodeID) {
+		row := handlers.TableKey(model.TableObjects, "part:"+upload.ID+":00001")
+		raw, err := mc.AuthorityGet(t.Context(), row)
+		require.NoError(t, err)
+		placement, err = handlers.DecodePlacement(raw)
+		require.NoError(t, err)
+	})
+	stop()
+	client.http.CloseIdleConnections()
+	hash := model.ObjectHash(staleBucket, ".multipart/"+upload.ID+"/"+staleObject+"/00001")
+	dropRecoveryHostShardRows(t, cfg, hash, placement)
+
+	start()
+	complete := fmt.Sprintf("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>", etag)
+	status, body = client.send(http.MethodPost, object+"?uploadId="+upload.ID, "", []byte(complete))
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	var completed struct {
+		ETag string `xml:"ETag"`
+	}
+	require.NoError(t, xml.Unmarshal(body, &completed))
+	require.NotEmpty(t, completed.ETag)
+	status, body = client.send(http.MethodGet, object, "", nil)
 	require.Equal(t, http.StatusOK, status, "%s", body)
 	require.Equal(t, want, body)
 }

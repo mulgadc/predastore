@@ -20,6 +20,15 @@ type prepareRecoveryKey struct {
 	epoch uint64
 }
 
+type prepareRecoveryShard struct {
+	key   [32]byte
+	index uint32
+}
+
+func (k prepareRecoveryKey) shard() prepareRecoveryShard {
+	return prepareRecoveryShard{key: k.key, index: k.index}
+}
+
 // WithStartupPrepareRecovery verifies and replays named extents before serving.
 func WithStartupPrepareRecovery(
 	ctx context.Context,
@@ -50,7 +59,7 @@ func (store *Store) replayRecoveredPrepares(
 		store.mutex.Unlock()
 		return errors.New("cannot rebuild recovery holds while compaction is running")
 	}
-	store.deferredPrepares = make(map[prepareRecoveryKey]extent)
+	store.deferredPrepares = make(map[prepareRecoveryShard]map[uint64]extent)
 	store.deferredPrepareSegments = make(map[uint64]int)
 	store.mutex.Unlock()
 
@@ -157,8 +166,14 @@ func (store *Store) deferPrepare(ctx context.Context, recovery prepareRecoveryKe
 	}
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
-	if _, held := store.deferredPrepares[recovery]; !held {
-		store.deferredPrepares[recovery] = ext
+	shard := recovery.shard()
+	epochs := store.deferredPrepares[shard]
+	if epochs == nil {
+		epochs = make(map[uint64]extent)
+		store.deferredPrepares[shard] = epochs
+	}
+	if _, held := epochs[recovery.epoch]; !held {
+		epochs[recovery.epoch] = ext
 		store.deferredPrepareSegments[ext.SegNum]++
 	}
 	return nil
@@ -171,7 +186,7 @@ func (store *Store) LookupRecoveredAt(
 ) (Reader, error) {
 	recovery := prepareRecoveryKey{key: key, index: index, epoch: epoch}
 	store.mutex.Lock()
-	_, pending := store.deferredPrepares[recovery]
+	_, pending := store.deferredPrepares[recovery.shard()][epoch]
 	store.mutex.Unlock()
 	if !pending || authorize == nil {
 		return nil, ErrKeyNotFound
@@ -195,7 +210,7 @@ func (store *Store) publishDeferredPrepare(recovery prepareRecoveryKey) error {
 	if store.closed {
 		return ErrClosedStore
 	}
-	ext, pending := store.deferredPrepares[recovery]
+	ext, pending := store.deferredPrepares[recovery.shard()][recovery.epoch]
 	if !pending {
 		return nil
 	}
@@ -210,11 +225,16 @@ func (store *Store) publishDeferredPrepare(recovery prepareRecoveryKey) error {
 }
 
 func (store *Store) removeDeferredPrepareLocked(recovery prepareRecoveryKey) {
-	ext, pending := store.deferredPrepares[recovery]
+	shard := recovery.shard()
+	epochs := store.deferredPrepares[shard]
+	ext, pending := epochs[recovery.epoch]
 	if !pending {
 		return
 	}
-	delete(store.deferredPrepares, recovery)
+	delete(epochs, recovery.epoch)
+	if len(epochs) == 0 {
+		delete(store.deferredPrepares, shard)
+	}
 	store.deferredPrepareSegments[ext.SegNum]--
 	if store.deferredPrepareSegments[ext.SegNum] == 0 {
 		delete(store.deferredPrepareSegments, ext.SegNum)

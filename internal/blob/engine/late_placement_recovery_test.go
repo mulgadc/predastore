@@ -40,7 +40,13 @@ func TestPrepareReplayPreservesExtentUntilLatePlacement(t *testing.T) {
 	require.Equal(t, payload, readValue(t, store, key, 0))
 }
 
-func TestDeleteEpochReleasesDeferredPrepare(t *testing.T) {
+func TestDeleteReleasesDeferredPrepare(t *testing.T) {
+	t.Run("exact epoch", func(t *testing.T) { testDeleteReleasesDeferredPrepare(t, true) })
+	t.Run("all epochs", func(t *testing.T) { testDeleteReleasesDeferredPrepare(t, false) })
+}
+
+func testDeleteReleasesDeferredPrepare(t *testing.T, exact bool) {
+	t.Helper()
 	store, _ := openTestStore(t, WithMaxSegSize(20*KiB))
 	key := [32]byte{1}
 	epoch := prepareValue(t, store, key, 0, []byte("deleted deferred payload"))
@@ -58,7 +64,12 @@ func TestDeleteEpochReleasesDeferredPrepare(t *testing.T) {
 
 	_, err = store.compactSegment(source, nil)
 	require.ErrorIs(t, err, errSegmentBusy)
-	deleted, err := store.DeleteEpoch(key, 0, epoch)
+	var deleted bool
+	if exact {
+		deleted, err = store.DeleteEpoch(key, 0, epoch)
+	} else {
+		deleted, err = store.Delete(key, 0)
+	}
 	require.NoError(t, err)
 	require.True(t, deleted)
 	_, err = store.compactSegment(source, nil)

@@ -142,7 +142,22 @@ func Run(ctx context.Context, opts Options) error {
 }
 
 func authorizeShardRecovery(ctx context.Context, client *meta.Client, holder config.NodeID, key [32]byte, index uint32, epoch uint64) (bool, error) {
-	rowKey := handlers.TableKey(model.TableObjects, string(key[:]))
+	return authorizePlacementRow(ctx, client, holder, string(key[:]), index, epoch)
+}
+
+func authorizePartRecovery(ctx context.Context, client *meta.Client, holder config.NodeID, placement string, key [32]byte, index uint32, epoch uint64) (bool, error) {
+	partHash, err := handlers.PartPlacementHash(ctx, client.AuthorityGet, placement)
+	if errors.Is(err, meta.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil || partHash != key {
+		return false, err
+	}
+	return authorizePlacementRow(ctx, client, holder, placement, index, epoch)
+}
+
+func authorizePlacementRow(ctx context.Context, client *meta.Client, holder config.NodeID, placement string, index uint32, epoch uint64) (bool, error) {
+	rowKey := handlers.TableKey(model.TableObjects, placement)
 	for {
 		raw, err := client.AuthorityGet(ctx, rowKey)
 		switch {
@@ -482,6 +497,9 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 			Listeners:                lns,
 			AuthorizeRecoveredPrepare: func(ctx context.Context, key [32]byte, index uint32, epoch uint64) (bool, error) {
 				return authorizeShardRecovery(ctx, metaClient, n.ID, key, index, epoch)
+			},
+			AuthorizeRecoveredPart: func(ctx context.Context, placement string, key [32]byte, index uint32, epoch uint64) (bool, error) {
+				return authorizePartRecovery(ctx, metaClient, n.ID, placement, key, index, epoch)
 			},
 		})
 		if berr != nil {
