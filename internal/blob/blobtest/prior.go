@@ -148,6 +148,7 @@ func (p *PriorNode) Holds(t testing.TB, key [32]byte, index uint32) (uint64, boo
 // opcode before the server reads them.
 type priorListener struct {
 	transport.Listener
+
 	node *PriorNode
 }
 
@@ -163,6 +164,7 @@ var _ transport.Listener = (*priorListener)(nil)
 
 type priorConn struct {
 	transport.Conn
+
 	node *PriorNode
 }
 
@@ -180,6 +182,7 @@ var _ transport.Conn = (*priorConn)(nil)
 // it lets through is replayed to the server unchanged.
 type priorStream struct {
 	transport.Stream
+
 	node    *PriorNode
 	peeked  bool
 	pending []byte
