@@ -303,6 +303,8 @@ A failed check, a malformed transaction and a refused write are the same on ever
 No command writes a key under `\x00raft/`. The FSM, the replica's handlers and the client refuse a put, delete, swap or transaction that names one, and a transaction cannot check one. `Get`, `LeaderGet` and every scan, the empty prefix included, never return the row.
 
 A snapshot holds the row at the index that it captured. A restore writes and flushes every data row first, then writes the snapshot's row in its own transaction, or removes the local row when the snapshot has none, and then sets the in-memory index from it. So the index moves back when raft restores an older snapshot. A restore that fails after a write can have reached the store stops the process, as a failed commit does, and the next start restores the snapshot again before it skips any entry.
+The restore decodes the snapshot's row when the stream reaches it, which in a sorted stream is before any data row except the rare key below `\x00raft/`.
+A restore that fails before a write can have reached the store returns an error and changes nothing, so raft tries the next older snapshot on start.
 
 ## Client behaviour
 

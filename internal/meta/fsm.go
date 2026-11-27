@@ -576,7 +576,7 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 		err = f.restoreByReplace(r, started, rs)
 	}
 	if err == nil {
-		err = f.restoreApplied(rs.applied)
+		err = f.restoreApplied(rs)
 	}
 	if err != nil && rs.wrote {
 		// The store is part old, part snapshot, and raft would go on without
@@ -590,11 +590,13 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 }
 
 // restoreState is what a restore learns on its way: whether it may have
-// changed the store, and the applied row the snapshot holds, nil for none.
+// changed the store, whether it sent any write, and the applied row the
+// snapshot holds, nil for none, with the index it names.
 type restoreState struct {
-	wrote   bool
-	applied []byte
-	budget  txnBudget
+	wrote, sent bool
+	applied     []byte
+	index       uint64
+	budget      txnBudget
 }
 
 // write counts one write sent to a WriteBatch. The batch commits a chunk only
@@ -606,39 +608,38 @@ func (rs *restoreState) write(key, value []byte) {
 		rs.wrote = true
 	}
 	rs.budget.add(cost)
+	rs.sent = true
 }
 
 // takeApplied keeps the snapshot's applied row aside and reports whether key
-// was that row, which the data pass then leaves out.
-func (rs *restoreState) takeApplied(key, value []byte) bool {
+// was that row, which the data pass then leaves out. The row is decoded here,
+// so a snapshot with a bad row fails before the flush.
+func (rs *restoreState) takeApplied(key, value []byte) (bool, error) {
 	if !bytes.Equal(key, appliedKey) {
-		return false
+		return false, nil
 	}
-	rs.applied = bytes.Clone(value)
-	return true
+	index, err := decodeApplied(value)
+	if err != nil {
+		return true, fmt.Errorf("restore: %w", err)
+	}
+	rs.applied, rs.index = bytes.Clone(value), index
+	return true, nil
 }
 
 // restoreApplied runs after every data row is flushed. It writes the
 // snapshot's applied row, or removes the local one when the snapshot has
 // none, then moves the in-memory index to match, backwards included.
-func (f *FSM) restoreApplied(row []byte) error {
-	var index uint64
-	if row != nil {
-		var err error
-		if index, err = decodeApplied(row); err != nil {
-			return fmt.Errorf("restore: %w", err)
-		}
-	}
+func (f *FSM) restoreApplied(rs *restoreState) error {
 	err := f.db.Update(func(txn *badger.Txn) error {
-		if row == nil {
+		if rs.applied == nil {
 			return txn.Delete(appliedKey)
 		}
-		return txn.Set(appliedKey, row)
+		return txn.Set(appliedKey, rs.applied)
 	})
 	if err != nil {
 		return fmt.Errorf("restore: write the applied index: %w", err)
 	}
-	f.persisted = index
+	f.persisted = rs.index
 
 	return nil
 }
@@ -712,8 +713,8 @@ func (f *FSM) restoreByMerge(r *bufio.Reader, started time.Time, rs *restoreStat
 	}
 
 	err := streamSnapshot(r, func(key, value []byte) error {
-		if rs.takeApplied(key, value) {
-			return nil
+		if taken, err := rs.takeApplied(key, value); taken || err != nil {
+			return err
 		}
 		if err := dropBefore(key); err != nil {
 			return err
@@ -749,7 +750,8 @@ func (f *FSM) restoreByMerge(r *bufio.Reader, started time.Time, rs *restoreStat
 		}
 	}
 
-	rs.wrote = true
+	// A flush with no write sent commits nothing, so it cannot change the store.
+	rs.wrote = rs.wrote || rs.sent
 	if err := wb.Flush(); err != nil {
 		return fmt.Errorf("restore: flush merge: %w", err)
 	}
@@ -800,8 +802,8 @@ func (f *FSM) restoreByReplace(r *bufio.Reader, started time.Time, rs *restoreSt
 
 	var entries int
 	err := streamSnapshot(r, func(key, value []byte) error {
-		if rs.takeApplied(key, value) {
-			return nil
+		if taken, err := rs.takeApplied(key, value); taken || err != nil {
+			return err
 		}
 		entries++
 		return wb.Set(key, value)

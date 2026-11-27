@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/badger/v4"
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -115,6 +116,21 @@ var (
 	_ raft.FSM         = (*failingRestore)(nil)
 )
 
+// rawSnapshot persists data as a snapshot without an FSM, so the stream can
+// hold an applied row that no FSM would accept.
+func rawSnapshot(t *testing.T, opts badger.Options, data map[string][]byte) []byte {
+	t.Helper()
+	src := openStore(t, opts)
+	for k, v := range data {
+		dbSet(t, src, []byte(k), v)
+	}
+	snap := &FSMSnapshot{txn: src.NewTransaction(false)}
+	defer snap.Release()
+	sink := &mockSnapshotSink{}
+	require.NoError(t, snap.Persist(sink))
+	return sink.buf
+}
+
 // A replica that stops part way through restoring its snapshot at startup
 // recovers on its next start: raft restores the whole snapshot, and the log
 // after it applies each entry once.
@@ -158,4 +174,69 @@ func TestStartup_AnInterruptedSnapshotRestoreRecoversOnTheNextStart(t *testing.T
 		"objects/01": str(big(1)), fmt.Sprintf("objects/%02d", n): str("gen-2"), "objects/zz": str("gen-1"),
 	})
 	assert.Equal(t, uint64(n+2), storedApplied(t, db))
+}
+
+// The newest snapshot holds an applied row that does not decode. Its restore
+// fails before it writes, so startup falls back to the older snapshot.
+func TestStartup_ABadRowInTheNewestSnapshotFallsBackToAnOlderOne(t *testing.T) {
+	opts := badger.DefaultOptions("").WithInMemory(true).WithLoggingLevel(badger.WARNING)
+	disk := newRaftDisk(t)
+	disk.putSnapshot(t, 2, rawSnapshot(t, opts, map[string][]byte{
+		"objects/k": []byte("gen-2"), string(appliedKey): encodeApplied(2),
+	}))
+	disk.putSnapshot(t, 4, rawSnapshot(t, opts, map[string][]byte{
+		"objects/k": []byte("gen-4"), "objects/j": []byte("gen-4"), string(appliedKey): []byte("garbage"),
+	}))
+
+	db := newTestDB(t)
+	fsm := NewFSM(db)
+	_, err := disk.start(t, fsm)
+
+	require.NoError(t, err)
+	assert.Equal(t, uint64(2), fsm.persisted)
+	assert.Equal(t, map[string]string{"objects/k": "gen-2", string(appliedKey): string(encodeApplied(2))}, contents(t, db))
+}
+
+// A snapshot whose data the store already holds sends no write. A restore
+// that then fails leaves the store as it was, so it is an error that raft
+// can fall back from, not a stop.
+func TestFSM_Restore_AFailureWithNoWriteSentIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	opts := badger.DefaultOptions(dir).WithLoggingLevel(badger.WARNING)
+	db := openStore(t, opts)
+	fsm := NewFSM(db)
+	fsm.Apply(swapLog(t, 5, "objects/k", "gen-1"))
+	stream := snapshotStream(t, fsm)
+	before := dumpStore(t, db)
+	require.NoError(t, db.Close())
+
+	// A read-only store refuses the applied row, the only write this
+	// restore makes.
+	db = openStore(t, opts.WithReadOnly(true))
+	fsm = NewFSM(db)
+
+	var err error
+	require.NotPanics(t, func() { err = fsm.Restore(io.NopCloser(bytes.NewReader(stream))) })
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "write the applied index")
+	assert.Equal(t, before, dumpStore(t, db))
+	assert.Equal(t, uint64(5), fsm.persisted)
+}
+
+// A bad applied row that the stream reaches after a write may have reached
+// the store still stops the replica.
+func TestFSM_Restore_ABadRowAfterAWriteStopsTheReplica(t *testing.T) {
+	opts := smallTxnOptions(t.TempDir())
+	data := map[string][]byte{string(appliedKey): []byte("garbage")}
+	// These keys sort before the row, so their writes come first, and
+	// together they fill more than one badger transaction.
+	for i := range 40 {
+		data[fmt.Sprintf("\x00a%02d", i)] = bytes.Repeat([]byte{byte(i)}, 8<<10)
+	}
+	stream := rawSnapshot(t, smallTxnOptions(t.TempDir()), data)
+
+	fsm := NewFSM(openStore(t, opts))
+	fsm.Apply(swapLog(t, 1, "objects/k", "local"))
+
+	assert.Panics(t, func() { _ = fsm.Restore(io.NopCloser(bytes.NewReader(stream))) })
 }
