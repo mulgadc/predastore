@@ -428,10 +428,9 @@ func TestFSM_ApplyBatch_AStoreReadFailureStopsBeforeTheRowPassesTheEntry(t *test
 	}
 }
 
-// Badger keeps a value at or above its value threshold in the value log and
-// charges the transaction for a pointer only, so it takes a value larger than
-// a whole transaction. The release before the row took it too, and replay
-// after restoring an older snapshot must apply it again.
+// Badger charges a value in its value log as a pointer, so it takes a value
+// larger than a whole transaction, as the release before the row did. Replay
+// after restoring an older snapshot must apply that value again.
 func TestFSM_ApplyBatch_AValueInTheValueLogAppliesAndReplays(t *testing.T) {
 	opts := smallTxnOptions(t.TempDir())
 	db := openStore(t, opts)

@@ -63,10 +63,9 @@ type TxnWrite struct {
 	Delete bool   `json:"delete,omitempty"`
 }
 
-// TxnValue is what a checked key held when a transaction was evaluated.
-// Exists is false for an absent key, which then has no Value. Oversized marks
-// a value larger than MaxTxnBodyBytes, which no check can name and no reply
-// carries, so it has no Value either.
+// TxnValue is what a checked key held when a transaction was evaluated. An
+// absent key has Exists false, and a value over MaxTxnBodyBytes is Oversized,
+// which no check can match. Neither carries a Value.
 type TxnValue struct {
 	Key       []byte `json:"key"`
 	Value     []byte `json:"value,omitempty"`
@@ -433,11 +432,8 @@ func (f *FSM) applyTxn(cmd Command, index uint64, b *batch) any {
 }
 
 // stageTxn reads every checked key, then stages the writes only if all the
-// checks hold. The result depends on the store and the command alone, and a
-// failure to read the store is a storeError.
-//
-// A check value arrives inside a body of at most MaxTxnBodyBytes, so a row
-// larger than that holds no checked value. It is a mismatch and is not read.
+// checks hold. A row over MaxTxnBodyBytes is a mismatch and is not read, as no
+// check value can be that large. A failed read is a storeError.
 func (f *FSM) stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
 	current := make([]TxnValue, len(cmd.Checks))
 	holds := true
