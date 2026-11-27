@@ -15,8 +15,8 @@ make s3-tests
 
 | | count |
 | --- | --- |
-| pass | 223 |
-| fail | 168 |
+| pass | 231 |
+| fail | 160 |
 | skip | 495 |
 | error | 0 |
 
@@ -29,13 +29,13 @@ A passing case is never one of the 489, whatever family's marker or node id woul
 
 A skip is not a pass. It means predastore has not been measured against that case in this run, on purpose.
 
-The 168 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
+The 160 fails are operations predastore attempts and gets wrong, or refuses: conditional request headers, checksums and `GetObjectAttributes`, object tagging, multipart edge cases, bucket ownership controls, and 36 request-validation cases in `test_headers.py`, 21 of which use Signature V2. The gaps that hurt an ordinary client are a much shorter list, and they are in the first table below.
 
 ## The gaps that break real clients
 
 | Operation | State | What happens |
 | --- | --- | --- |
-| Conditional writes and deletes | **Refused** | `PutObject`, `CompleteMultipartUpload` and the `CopyObject` destination answer `NotImplemented` to `If-Match` or `If-None-Match`, before the body is read and without writing anything. `DeleteObject` does the same for `If-Match`, and `DeleteObjects` refuses the whole batch when any object carries an `ETag`. A Terraform S3 backend with `use_lockfile = true` therefore fails at `terraform init` instead of running unlocked. `mulga-7oevb` covers conditional writes and `mulga-7oevb.3` conditional deletes. |
+| Conditional writes and deletes | **Partly served** | `PutObject` evaluates `If-Match` and `If-None-Match: *`. It answers `412 PreconditionFailed` when the condition fails, and `404 NoSuchKey` for `If-Match` on an absent key. `PutObject` answers `501 NotImplemented`, before it reads the body, to `If-None-Match` with a value other than `*`, to an empty `If-Match`, and to both headers on one request. `CompleteMultipartUpload` and the `CopyObject` destination answer `NotImplemented` to `If-Match` or `If-None-Match`, before the body is read and without writing anything. `DeleteObject` does the same for `If-Match`, and `DeleteObjects` refuses the whole batch when any object carries an `ETag`. `mulga-7oevb.6` covers `CompleteMultipartUpload` and `mulga-7oevb.3` conditional deletes. |
 | Object tagging | **Refused** | `PutObjectTagging`, `GetObjectTagging` and `DeleteObjectTagging` answer `NotImplemented`, and `x-amz-tagging` on `PutObject` is not applied. Bucket tagging is served. |
 | Object ACLs | **Refused** | `GetObjectAcl` and `PutObjectAcl` answer `NotImplemented`. |
 | `POST` object | **Missing** | Browser-form uploads. All 36 cases are a deliberate skip below rather than a FAIL. |
@@ -60,12 +60,12 @@ Served sub-resources: bucket `tagging`, `versioning`, `versions`, `location`, `u
 
 ## By area
 
-Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 223/168 above. An area predastore has deliberately not implemented is not here; see the next table.
+Counts from the committed baseline, `pass`/`fail` only. Each non-skipped case is counted in the first row whose selector matches its name, top to bottom, so the rows sum to the 231/160 above. An area predastore has deliberately not implemented is not here; see the next table.
 
 | Area | Pass | Fail | Selector (test name) | Note |
 | --- | --- | --- | --- | --- |
 | TLS transfer | 11 | 0 | `test_encrypted_transfer_*`, `test_sse_kms_*` | Held by the skip guard; plain transfers over TLS, not server-side encryption. |
-| Conditional requests | 12 | 35 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | `GetObject` and `HeadObject` evaluate `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`; `CopyObject` and `UploadPartCopy` evaluate the four `x-amz-copy-source-if-*` conditions and answer `412` when one fails. The passes are eight `GetObject` and four `CopyObject` cases; `HeadObject`, `UploadPartCopy` and irregular ETag lists are covered by the gate's own tests and by the `s3compat` probe in the mulga repository (`scripts/aws-compliance/s3compat`). The probe sends each condition and both precedence pairs to `GetObject`, `CopyObject` and `UploadPartCopy`, five irregular ETag list forms to `GetObject`, `HeadObject`, `CopyObject` and `UploadPartCopy`, and named source versions to `UploadPartCopy`. Live AWS S3 passes all 95 probe cases, measured on 2026-11-25 in `us-east-1`. Predastore passes 93; the two failures are the suffix range and the repeated delete of an absent key, and the named delete marker passes against its own expectation, `404 NoSuchVersion`. An ETag condition is matched as AWS matches it: split on quotes, commas, spaces and tabs, with any piece equal to the ETag or `*` a match. Conditional `PutObject`, `CopyObject` destination and `DeleteObjects` cases fail with the refusal. |
+| Conditional requests | 20 | 27 | contains `if_match`, `if_none_match`, `ifmatch`, `ifnonematch`, `ifnonmatch`, `ifmodifiedsince`, `ifunmodifiedsince` or `conditional_write` | `GetObject` and `HeadObject` evaluate `If-Match`, `If-None-Match`, `If-Modified-Since` and `If-Unmodified-Since`; `CopyObject` and `UploadPartCopy` evaluate the four `x-amz-copy-source-if-*` conditions and answer `412` when one fails. `PutObject` evaluates `If-Match` and `If-None-Match: *`. The passes are eight `GetObject`, four `CopyObject` and eight `PutObject` cases; `HeadObject`, `UploadPartCopy` and irregular ETag lists are covered by the gate's own tests and by the `s3compat` probe in the mulga repository (`scripts/aws-compliance/s3compat`). The probe sends each condition and both precedence pairs to `GetObject`, `CopyObject` and `UploadPartCopy`, five irregular ETag list forms to `GetObject`, `HeadObject`, `CopyObject` and `UploadPartCopy`, and named source versions to `UploadPartCopy`. Live AWS S3 passes all 95 probe cases, measured on 2026-11-25 in `us-east-1`. Predastore passes 93; the two failures are the suffix range and the repeated delete of an absent key, and the named delete marker passes against its own expectation, `404 NoSuchVersion`. An ETag condition is matched as AWS matches it: split on quotes, commas, spaces and tabs, with any piece equal to the ETag or `*` a match. Of the 27 fails, 18 are conditional `DeleteObject` and `DeleteObjects` cases and 3 are conditional `CompleteMultipartUpload` cases, which fail with the refusal. The other 6 are `PutObject` cases that send `If-None-Match` with an ETag, which predastore answers `501`. The AWS answer to that form is not measured against live AWS here. |
 | Checksums and object attributes | 0 | 16 | contains `checksum`, `cksum` or `object_attributes` | |
 | Object and bucket tagging | 1 | 11 | ends `_tags`, or contains `tagging` | The pass is bucket tagging. |
 | CopyObject / UploadPartCopy | 21 | 4 | `test_object_copy_*`, `test_multipart_copy_*`, `test_upload_part_copy_*` | Invalid ranges and cross-owner copies fail. Both copies answer `403 AccessDenied` when `x-amz-source-expected-bucket-owner` names an account that does not own the source bucket, before any source condition. `UploadPartCopy` copies a named source version; a named delete marker answers `404 NoSuchVersion` where AWS answers `400 InvalidRequest`. A part copy that names no version omits `x-amz-copy-source-version-id`, which AWS returns when the source bucket has versioning enabled. |

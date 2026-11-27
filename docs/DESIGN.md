@@ -221,7 +221,7 @@ The contract is retired by removing the version from both sides after the featur
 |---|---|
 | Service | `ListBuckets` |
 | Buckets | `CreateBucket`, `DeleteBucket`, `HeadBucket`, `ListObjects` / `ListObjectsV2` |
-| Objects | `PutObject`, `GetObject` (incl. `Range`), `HeadObject`, `DeleteObject` |
+| Objects | `PutObject` (incl. `If-Match` and `If-None-Match: *`), `GetObject` (incl. `Range`), `HeadObject`, `DeleteObject` |
 | Multipart | `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListMultipartUploads` |
 
 S3 overloads one method and path across several operations and distinguishes them by query string, which chi cannot match on, so the split is explicit in `routes.go`: `?partNumber` selects `UploadPart` over `PutObject`, `?uploadId` selects the multipart completion and abort handlers, and `?uploads` on a bare bucket selects `ListMultipartUploads` over `ListObjects`.
@@ -245,6 +245,7 @@ The meta replicas are a plain key-value store. The table taxonomy is the gate's 
 | `objects/deleted-epoch:<hex object hash>/<16-hex-digit epoch>/<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record of a failed scoped shard delete, one row for each generation. N writes these rows and reads them. N-1 does not read them |
 | `objects/deleted:<bucket>/<key>`, `objects/deleted:#<hex object hash>/<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record of a failed shard delete from N-1. N-1 writes and reads only these rows. N reads them and does not write them |
 | `objects/part:<uploadID>:<part>` | gob `ObjectToShardNodes` | Placement of an in-flight multipart part |
+| `intents/<32-byte object hash><8-byte big-endian epoch>` | JSON `Intent` | The obligation of one conditional write, until every node that can hold its shards has answered. See §8, *The write intent* |
 | `buckets/<name>` | gob `BucketMetadata` | Ownership, region, public flag |
 | `multipart/<uploadID>` | gob `UploadMetadata` | The upload itself |
 | `parts/<uploadID>:<part>` | gob `PartMetadata` | One uploaded part, zero-padded to 5 digits so scans sort |
@@ -556,6 +557,111 @@ If any node reported nearfull pressure, the response also carries `X-Predastore-
 
 **Ordering matters.** Shards are durable before metadata. A crash between the two leaves shards nothing points at (reclaimed by compaction only once something tombstones them — see §15); a crash the other way round would leave metadata pointing at data that was never written.
 
+### Conditional writes
+
+A `PutObject` with `If-Match` or `If-None-Match` goes to `conditionalWrite` (`internal/gate/handlers/conditional_write.go`) after the handler's own validation.
+The gate evaluates `If-Match` with an ETag list, `*` included, and `If-None-Match: *`.
+It answers `501 NotImplemented` before it reads the body when `If-None-Match` has a value other than `*`, when `If-Match` is empty, and when one request has both headers.
+
+The unconditional order above publishes the shards before the record, so a write that a condition refuses would already have replaced the live generation.
+A conditional write uses a different order:
+
+1. **Early check.** The gate reads the rows that define the current object with `LeaderGet` and evaluates the condition.
+   A failed condition answers `412 PreconditionFailed`, or `404 NoSuchKey` for `If-Match` on an absent key, and writes nothing.
+   This check only prevents a wasted upload, and the transaction in step 4 decides the result.
+2. **Open the streams.** The gate opens a held put to every owner and waits for each `Registered` envelope before it sends a body byte.
+   A node that sends no `Registered` gets no body.
+   When fewer than `K` owners register, the gate answers before it writes an intent, with `501` when nodes without held writes cause the shortfall and the usual write error otherwise.
+3. **Intent and held prepare.** The gate writes a `pending` intent with an ordinary `Put`, then streams the body.
+   Only a shard that answers `Holding` counts toward the floor of `K`.
+   Below the floor, the gate aborts every candidate and answers as in step 2.
+4. **Transaction.** The gate sends one `CommandTxn` (`OpMetaTxn`) to the leader.
+   It checks the rows the gate evaluated and that the intent is still `pending`, and it writes the placement record, the listing key, the version index row on an Enabled bucket, and the intent as `committed`.
+5. **Commit.** After the transaction applies, the gate commits the shards on every candidate and releases the generation that the write displaced.
+   The response is `200` only when `K` shards are committed at the write's epoch.
+
+The transaction checks the bytes of every row that defines the current object, so it applies only to the state that the condition was evaluated against.
+
+| Bucket | Checks | Writes |
+| --- | --- | --- |
+| Never versioned | the placement row at the object hash | the placement row at the object hash; the listing key; the intent |
+| Suspended | the listing key; the placement row it names; the placement row at the object hash | the placement row at the object hash; the listing key; the intent |
+| Enabled | the listing key; the placement row it names; no placement row at the new version hash | the placement row at the version hash; the version index row; the listing key; the intent |
+
+On a versioned bucket, an absent listing key means that no current object exists, whether a delete marker hides the key or the key was never written.
+An Enabled write releases no generation, because the version that it follows is a different shard set and stays live.
+A zero-byte object stores no shards, so it writes no intent and the transaction checks only the object rows.
+
+The meta answer decides what the gate does next:
+
+- **Applied:** commit and release as in step 5.
+  When the transaction applied but fewer than `K` shard commits succeed, the answer is `500`.
+  The object stays readable, because a read commits the held shards that its record names, and the reaper commits the rest.
+- **Mismatch on the object rows:** the gate reads the current object again and evaluates the condition again.
+  A failed condition aborts the write and answers `412` or `404`.
+  A condition that still holds means that another write left the same ETag, and the gate sends a new transaction against the new rows.
+  After three mismatches it aborts and answers `409 ConditionalRequestConflict`.
+- **Mismatch on the intent:** the reaper fenced the write, so the write can never publish.
+  The gate aborts the shards and answers `500`.
+- **Refused:** the leader refused the request before a proposal.
+  The gate aborts and answers `503 SlowDown`.
+- **Unknown:** the gate never sends the write again.
+  It sends a fence transaction that checks `pending` and writes `aborted`.
+  When the fence applies, the gate aborts the shards and answers `500`.
+  When the fence finds the intent `committed`, the write applied, and the gate continues as for an applied write.
+  When the fence outcome is also unknown, the gate answers `500` and the reaper settles the intent.
+
+`If-None-Match: *` never sends a second transaction.
+After a mismatch, an object that now exists answers `412`.
+No object means that a create and a delete ran during the write, and the answer is `409 ConditionalRequestConflict`.
+A key that is absent at the early check and at the commit answers `200`, even when a create and a delete ran between the two.
+
+### The write intent
+
+The intent is the durable obligation of one conditional write.
+Its row is in the `intents` table, keyed by the object hash and the write epoch, so two writers of one key never share a row.
+The value is JSON with a format number, and it holds:
+
+- the state, `pending`, `committed` or `aborted`;
+- the bucket, the key and the version ID;
+- the owner node of each shard index, and the handoff node;
+- the epoch and nodes of the generation to release after the commit, or nothing;
+- the creation time.
+
+The gate writes the intent before the first body byte moves.
+So a crash at any later point leaves a row that names every node that can hold a shard of the write.
+Only a `CommandTxn` that checks `pending` changes the state, and raft orders the write's own transaction and a fence, so exactly one of `committed` and `aborted` applies.
+
+The gate or the reaper deletes the row only when every candidate position has answered.
+A commit answers by publishing the shard, by reporting that a newer generation overtook it, or by reporting that nothing was prepared at that epoch.
+An abort answers when it succeeds and reports that no held writer for the epoch is still open.
+A release answers when it succeeds.
+An unreachable node or a writer that is still open keeps the row for the reaper.
+
+### The intent pass
+
+The reaper runs an intent pass after its tombstone pass, on every gate that has a local blob node.
+It pages the `intents` table with `ScanFrom` and measures each row against one clock reading that it takes at the start of the pass.
+
+| State | Action |
+| --- | --- |
+| `pending`, younger than `intent_max_age_seconds` | none, because a live writer can still own it |
+| `pending`, older | send the fence transaction, then continue in the state that the fence reports |
+| `committed` | commit the shards on every candidate, then release the displaced generation |
+| `aborted` | abort the shards on every candidate |
+
+The reaper never aborts the shards of a `committed` intent and never commits the shards of an `aborted` one, because only the fence's answer decides a `pending` row.
+A fenced writer that is slow but still alive fails its transaction on the `pending` check, so the result is a failed request and the previous object stays current.
+A row that does not decode stays, so the reaper never settles a row from a later format by a guess.
+The pass deletes a row by the cleanup rule above.
+
+### New-key read roll-forward
+
+A get that names an epoch, at a position with no live row, tries `Commit` at that epoch and then reads it.
+A reader names only an epoch that a placement record names, so it commits only what the writer of that record would commit.
+A refused write's epoch is in no record, so a read never commits it.
+So a conditional object is readable at the floor as soon as its record is visible, before the writer commits its shards and after the writer stops.
+
 ## GET
 
 <p align="center">
@@ -747,6 +853,13 @@ parity = 1
 # max_bytes_per_sec = 0         # routine-pass copy cap; zero defaults to 64 MiB/s
 # yield_latency_ms  = 0         # foreground latency a routine pass yields to; zero is off
 # max_yield_seconds = 0         # most one pass yields; zero defaults to 60
+
+# [reaper]                      # settle failed deletes and conditional writes; see §8
+# enabled          = true       # on wherever the host runs a blob node
+# workers          = 0          # concurrent reclaims; zero derives one from the CPU count, capped at 8
+# page_size        = 0          # rows per scan request; zero defaults to 512
+# interval_seconds = 0          # gap between passes; zero defaults to 300
+# intent_max_age_seconds = 0    # age before a pending write intent is fenced; zero defaults to 3600
 
 # [meta]                        # raft log retention on the metadata plane
 # snapshot_interval_seconds = 0 # zero defaults to 120

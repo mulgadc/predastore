@@ -197,9 +197,9 @@ type Repair struct {
 // no local blob node still runs none, because there is nothing for it to own.
 func (r Repair) IsEnabled() bool { return r.Enabled == nil || *r.Enabled }
 
-// Reaper tunes the background sweep that reclaims the shards a delete leaves
-// tombstoned. It is on by default: a delete no longer removes its shards
-// inline, so without this sweep running they are never reclaimed at all.
+// Reaper tunes the background sweep that reclaims the shards a failed delete
+// leaves and settles the write intents a conditional PutObject leaves. It is
+// on by default: without it neither is ever reclaimed.
 type Reaper struct {
 	Enabled *bool `toml:"enabled"`
 
