@@ -272,9 +272,13 @@ func TestS7_AScopedDeleteThatStopsLeavesARetainedAcknowledgedObjectReadable(t *t
 	withHostBlob(t, cfg, func(bc *blob.Client, blobIDs []config.NodeID) {
 		for _, id := range blobIDs {
 			for idx := range shards {
-				_, err := bc.DeleteEpoch(t.Context(), id,
+				resp, err := bc.DeleteEpoch(t.Context(), id,
 					blob.CommitRequest{Key: hash, Index: uint32(idx), Epoch: orphanEpoch})
 				require.NoError(t, err, "scoped delete of orphan shard %d on node %d", idx, id)
+				require.True(t, resp.Deleted, "the orphan shard %d on node %d was not removed", idx, id)
+
+				_, err = bc.Stat(t.Context(), id, blob.StatRequest{Key: hash, Index: uint32(idx)})
+				require.ErrorIs(t, err, blob.ErrNotFound, "position %d on node %d still has a live row", idx, id)
 			}
 		}
 	})
