@@ -8,8 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,6 +23,8 @@ import (
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
+	"github.com/mulgadc/predastore/internal/gate/model"
+	"github.com/mulgadc/predastore/internal/meta"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/storetest"
 	"github.com/mulgadc/predastore/internal/transport"
@@ -171,7 +176,92 @@ func corruptOnlyShard(t *testing.T, dir string) {
 	require.NoError(t, f.Sync())
 }
 
-// A GET that meets a shard whose bytes fail authentication on its node is
+// s3Meta is a map that serves both the S3 handlers and repair, so one store
+// holds what a PUT wrote and what a repair pass scans.
+type s3Meta struct {
+	mu   sync.Mutex
+	rows map[string][]byte
+}
+
+func (m *s3Meta) Get(_ context.Context, key string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.rows[key]
+	if !ok {
+		return nil, meta.ErrNotFound
+	}
+	return append([]byte(nil), v...), nil
+}
+
+func (m *s3Meta) LeaderGet(ctx context.Context, key string) ([]byte, error) { return m.Get(ctx, key) }
+
+func (m *s3Meta) Put(_ context.Context, key string, value []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rows[key] = append([]byte(nil), value...)
+	return nil
+}
+
+func (m *s3Meta) Swap(_ context.Context, key string, value []byte) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	prev := m.rows[key]
+	m.rows[key] = append([]byte(nil), value...)
+	return prev, nil
+}
+
+func (m *s3Meta) Delete(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.rows, key)
+	return nil
+}
+
+func (m *s3Meta) Scan(ctx context.Context, prefix string, limit int) ([]meta.Item, error) {
+	return m.LeaderScanFrom(ctx, prefix, "", limit)
+}
+
+func (m *s3Meta) LeaderScanFrom(_ context.Context, prefix, after string, limit int) ([]meta.Item, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keys := make([]string, 0, len(m.rows))
+	for k := range m.rows {
+		if strings.HasPrefix(k, prefix) && k > after {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	if limit > 0 && len(keys) > limit {
+		keys = keys[:limit]
+	}
+	items := make([]meta.Item, len(keys))
+	for i, k := range keys {
+		items[i] = meta.Item{Key: k, Value: append([]byte(nil), m.rows[k]...)}
+	}
+	return items, nil
+}
+
+var (
+	_ handlers.MetaClient = (*s3Meta)(nil)
+	_ MetaClient          = (*s3Meta)(nil)
+)
+
+// serveS3 sends one object request through an S3 handler.
+func serveS3(h http.Handler, method, key string, body []byte) *httptest.ResponseRecorder {
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	ctx := handlers.WithBucket(context.Background(), model.Bucket{Name: "bkt"})
+	ctx = handlers.WithObject(ctx, model.Object{Bucket: model.Bucket{Name: "bkt"}, Key: key})
+	req := httptest.NewRequest(method, "/bkt/"+key, rd).WithContext(ctx)
+	req.ContentLength = int64(len(body))
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	return rr
+}
+
+// An S3 GET that meets a shard whose bytes fail authentication on its node is
 // answered from the other shards. The node's repair pass must then rewrite
 // that shard from its peers, so the node serves it again.
 func TestARepairPassReplacesAShardThatFailedAuthenticationOnGet(t *testing.T) {
@@ -179,16 +269,41 @@ func TestARepairPassReplacesAShardThatFailedAuthenticationOnGet(t *testing.T) {
 	c := newCluster(t, k, m, 4)
 	nodes := startRealNodes(t, c.nodes)
 	ctx := context.Background()
+	mc := &s3Meta{rows: map[string][]byte{}}
+	epochs, err := handlers.NewEpochMinter(99)
+	require.NoError(t, err)
+	cfg := handlers.Config{
+		Region: "ap-southeast-2", DataShards: k, ParityShards: m,
+		DegradedWrites: true, HintedHandoff: true, Epochs: epochs,
+	}
+	cache := handlers.NewBucketCache([]handlers.BucketConfig{{Name: "bkt"}})
 
-	hash, place, shards := nodes.store(c, "corrupt-on-get")
+	body := bytes.Repeat([]byte("integrity "), 6<<10)
+	rr := serveS3(handlers.PutObject(mc, nodes.client, c.ring, cache, cfg), http.MethodPut, "k", body)
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+
+	hash := model.ObjectHash("bkt", "k")
+	raw, err := mc.Get(ctx, handlers.TableKey(model.TableObjects, string(hash[:])))
+	require.NoError(t, err)
+	place, err := handlers.DecodePlacement(raw)
+	require.NoError(t, err)
+	shards := make([][]byte, k+m)
+	for index, node := range place.AllNodes() {
+		shards[index], err = nodes.readShard(node, hash, index, place.WriteEpoch)
+		require.NoError(t, err)
+	}
 
 	target := place.DataShardNodes[0]
 	corruptOnlyShard(t, nodes.dirs[target])
-	_, err := nodes.readShard(target, hash, 0, place.WriteEpoch)
+	_, err = nodes.readShard(target, hash, 0, place.WriteEpoch)
 	require.Error(t, err, "the flipped byte must fail authentication on the node")
 
+	rr = serveS3(handlers.GetObject(mc, nodes.client, c.ring, cache, cfg), http.MethodGet, "k", nil)
+	require.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, body, rr.Body.Bytes(), "the GET answers the stored bytes, rebuilt from the other shards")
+
 	svc, err := New(Config{
-		Nodes: []config.NodeID{target}, Ring: c.ring, Meta: c.meta, Blob: nodes.client,
+		Nodes: []config.NodeID{target}, Ring: c.ring, Meta: mc, Blob: nodes.client,
 		DataShards: k, ParityShards: m, Workers: 1,
 	})
 	require.NoError(t, err)
