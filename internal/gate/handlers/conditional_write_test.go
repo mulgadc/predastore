@@ -40,6 +40,15 @@ type hookMeta struct {
 
 	// onPut, when set, sees the key of every row the writer puts.
 	onPut func(key string)
+	// beforeLeaderGet, when set, runs before each leader read the writer makes.
+	beforeLeaderGet func(key string)
+}
+
+func (m *hookMeta) LeaderGet(ctx context.Context, key string) ([]byte, error) {
+	if m.beforeLeaderGet != nil {
+		m.beforeLeaderGet(key)
+	}
+	return m.fakeMeta.LeaderGet(ctx, key)
 }
 
 func (m *hookMeta) setHook(hook func(n int, next txnFunc) (meta.TxnOutcome, []meta.TxnValue, error)) {
@@ -207,6 +216,29 @@ func (h *condHarness) del(key string) {
 	h.t.Helper()
 	rr := h.serve(DeleteObject(h.mc, h.bc, h.cache, h.cfg), http.MethodDelete, "/bkt/"+key, key, nil, nil)
 	require.Equal(h.t, http.StatusNoContent, rr.Code, "delete: %s", rr.Body.String())
+}
+
+func (h *condHarness) delVersion(key, versionID string) {
+	h.t.Helper()
+	rr := h.serve(DeleteObject(h.mc, h.bc, h.cache, h.cfg), http.MethodDelete,
+		"/bkt/"+key+"?versionId="+versionID, key, nil, nil)
+	require.Equal(h.t, http.StatusNoContent, rr.Code, "delete version: %s", rr.Body.String())
+}
+
+// mustPutVersion writes key and answers its ETag and version id.
+func (h *condHarness) mustPutVersion(key string, body []byte) (etag, versionID string) {
+	h.t.Helper()
+	rr := h.put(key, body)
+	require.Equal(h.t, http.StatusOK, rr.Code, "put: %s", rr.Body.String())
+	return rr.Header().Get("ETag"), rr.Header().Get("X-Amz-Version-Id")
+}
+
+// namedPlacementKey is the stored key of the placement the listing names.
+func (h *condHarness) namedPlacementKey(key string) string {
+	h.t.Helper()
+	listing, err := h.mc.Get(context.Background(), TableKey(model.TableObjects, objectARN("bkt", key)))
+	require.NoError(h.t, err)
+	return TableKey(model.TableObjects, string(listing))
 }
 
 func (h *condHarness) mustPut(key string, body []byte) string {
@@ -460,6 +492,70 @@ func TestIfMatchRetriesAfterOneSameETagChange(t *testing.T) {
 	assert.Equal(t, 2, h.hm.txnCount())
 	h.requireBody("lock", body2)
 	assert.Empty(t, h.intents())
+}
+
+// An If-Match write whose read of the current object straddles a new version
+// of the same ETag and the deletion of the version it replaced reads again
+// and is written, in an Enabled and in a Suspended bucket.
+// Verifies: Q-68.
+func TestIfMatchAcrossAReplacedAndDeletedVersionIsWritten(t *testing.T) {
+	for _, status := range []string{VersioningEnabled, VersioningSuspended} {
+		t.Run(status, func(t *testing.T) {
+			h := newCondHarness(t, rsProfiles[0])
+			h.enableVersioning()
+			etag, former := h.mustPutVersion("lock", body1)
+			require.NoError(t, setBucketVersioning(context.Background(), h.mc, h.cache, "bkt", status))
+			formerKey := h.namedPlacementKey("lock")
+			var once sync.Once
+			h.hm.beforeLeaderGet = func(key string) {
+				if key != formerKey {
+					return
+				}
+				once.Do(func() {
+					again, _ := h.mustPutVersion("lock", body1)
+					require.Equal(t, etag, again)
+					h.delVersion("lock", former)
+				})
+			}
+
+			rr := h.condPut("lock", body2, ifMatch(etag))
+
+			require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
+			h.requireBody("lock", body2)
+			assert.Equal(t, 1, h.hm.txnCount())
+			assert.Empty(t, h.intents())
+		})
+	}
+}
+
+// An If-Match write whose every read of the current object meets a new
+// version and the deletion of the one it named answers 409 before any
+// transaction. The last version written stays current.
+// Verifies: Q-68.
+func TestIfMatchWhoseCurrentObjectNeverHoldsStillConflicts(t *testing.T) {
+	h := newCondHarness(t, rsProfiles[0])
+	h.enableVersioning()
+	etag, current := h.mustPutVersion("lock", body1)
+	listingKey := TableKey(model.TableObjects, objectARN("bkt", "lock"))
+	replaced := 0
+	h.hm.beforeLeaderGet = func(key string) {
+		if key == listingKey || strings.HasPrefix(key, IntentPrefix) {
+			return
+		}
+		named := current
+		_, current = h.mustPutVersion("lock", body1)
+		h.delVersion("lock", named)
+		replaced++
+	}
+
+	rr := h.condPut("lock", body2, ifMatch(etag))
+
+	require.Equal(t, http.StatusConflict, rr.Code, "body: %s", rr.Body.String())
+	assert.Contains(t, rr.Body.String(), "<Code>ConditionalRequestConflict</Code>")
+	assert.Equal(t, maxCurrentReads, replaced)
+	assert.Zero(t, h.hm.txnCount())
+	assert.NotContains(t, h.log.all(), "intent")
+	h.requireBody("lock", body1)
 }
 
 // An If-None-Match: * write whose transaction meets a create, and whose

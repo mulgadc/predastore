@@ -165,7 +165,7 @@ func conditionalWrite(w http.ResponseWriter, r *http.Request, p *conditionalPut)
 	ctx := r.Context()
 	cur, err := readCurrentObject(ctx, p.mc, p.bucket, p.key, p.target)
 	if err != nil {
-		HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+		answerReadError(w, r, err)
 		return
 	}
 	if answerCondition(w, r, p.key, p.cond.eval(cur.place)) {
@@ -260,7 +260,7 @@ func conditionalWrite(w http.ResponseWriter, r *http.Request, p *conditionalPut)
 			mismatches++
 			if cur, err = readCurrentObject(ctx, p.mc, p.bucket, p.key, p.target); err != nil {
 				abandonIntentIf(ctx, p, id, intent)
-				HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+				answerReadError(w, r, err)
 				return
 			}
 			verdict := p.cond.eval(cur.place)
@@ -269,8 +269,7 @@ func conditionalWrite(w http.ResponseWriter, r *http.Request, p *conditionalPut)
 			// gives up after three.
 			if verdict == conditionHolds && (p.cond.ifNoneMatch || mismatches >= maxConditionalMismatches) {
 				abandonIntentIf(ctx, p, id, intent)
-				WriteS3Error(w, r, http.StatusConflict, "ConditionalRequestConflict",
-					"A conflicting operation occurred. If using PutObject you can retry the request.")
+				answerConflict(w, r)
 				return
 			}
 			if verdict != conditionHolds {
@@ -290,6 +289,28 @@ func conditionalWrite(w http.ResponseWriter, r *http.Request, p *conditionalPut)
 // maxConditionalMismatches is how many mismatches an If-Match write that
 // still holds meets before it answers 409.
 const maxConditionalMismatches = 3
+
+// maxCurrentReads is how many reads of the current object may each find the
+// listing changed under them before the write answers 409.
+const maxCurrentReads = 3
+
+// errCurrentUnsettled is a current object that changed during every read.
+var errCurrentUnsettled = errors.New("the current object changed during every read")
+
+func answerConflict(w http.ResponseWriter, r *http.Request) {
+	WriteS3Error(w, r, http.StatusConflict, "ConditionalRequestConflict",
+		"A conflicting operation occurred. If using PutObject you can retry the request.")
+}
+
+// answerReadError answers a failed read of the current object: 409 when it
+// never held still, and 500 otherwise.
+func answerReadError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, errCurrentUnsettled) {
+		answerConflict(w, r)
+		return
+	}
+	HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
+}
 
 // resolveUnknown settles a transaction whose outcome is unknown through the
 // log: the fence either aborts the intent, or finds that the write committed.
@@ -411,6 +432,19 @@ func releaseOf(displaced []byte, mine uint64, target writeTarget) *IntentRelease
 // object of a key, and the checks that pin them. The write target says which
 // bucket state the write was placed for, so the two cannot disagree.
 func readCurrentObject(ctx context.Context, mc MetaClient, bucket, key string, target writeTarget) (currentObject, error) {
+	for range maxCurrentReads {
+		cur, settled, err := readCurrentOnce(ctx, mc, bucket, key, target)
+		if err != nil || settled {
+			return cur, err
+		}
+	}
+	return currentObject{}, errCurrentUnsettled
+}
+
+// readCurrentOnce is one read of the current object. It reports unsettled
+// when the version the listing named is gone and the listing has since moved,
+// so the listing and the placement it read do not agree.
+func readCurrentOnce(ctx context.Context, mc MetaClient, bucket, key string, target writeTarget) (currentObject, bool, error) {
 	var cur currentObject
 	nullHash := model.ObjectHash(bucket, key)
 	nullKey := TableKey(model.TableObjects, string(nullHash[:]))
@@ -419,27 +453,37 @@ func readCurrentObject(ctx context.Context, mc MetaClient, bucket, key string, t
 	if target.versionID == "" {
 		row, err := cur.pin(ctx, mc, nullKey)
 		if err != nil {
-			return currentObject{}, err
+			return currentObject{}, false, err
 		}
 		cur.displaced = row
-		return cur, cur.setPlace(row)
+		return cur, true, cur.setPlace(row)
 	}
 
 	// Versioned: the listing key names the current version, and its absence
 	// is no current object, whether a delete marker hides the key or not.
-	listing, err := cur.pin(ctx, mc, TableKey(model.TableObjects, objectARN(bucket, key)))
+	listingKey := TableKey(model.TableObjects, objectARN(bucket, key))
+	listing, err := cur.pin(ctx, mc, listingKey)
 	if err != nil {
-		return currentObject{}, err
+		return currentObject{}, false, err
 	}
 	var namedKey string
 	if len(listing) == sha256.Size {
 		namedKey = TableKey(model.TableObjects, string(listing))
 		row, err := cur.pin(ctx, mc, namedKey)
 		if err != nil {
-			return currentObject{}, err
+			return currentObject{}, false, err
+		}
+		if row == nil {
+			again, err := mc.LeaderGet(ctx, listingKey)
+			if err != nil && !errors.Is(err, meta.ErrNotFound) {
+				return currentObject{}, false, err
+			}
+			if !bytes.Equal(again, listing) {
+				return currentObject{}, false, nil
+			}
 		}
 		if err := cur.setPlace(row); err != nil {
-			return currentObject{}, err
+			return currentObject{}, false, err
 		}
 		if namedKey == nullKey {
 			cur.displaced = row
@@ -449,17 +493,17 @@ func readCurrentObject(ctx context.Context, mc MetaClient, bucket, key string, t
 	if target.versioned {
 		newKey := TableKey(model.TableObjects, string(target.hash[:]))
 		cur.checks = append(cur.checks, meta.TxnCheck{Key: []byte(newKey), Absent: true})
-		return cur, nil
+		return cur, true, nil
 	}
 	// Suspended: the write replaces the null version, whatever is current.
 	if namedKey != nullKey {
 		row, err := cur.pin(ctx, mc, nullKey)
 		if err != nil {
-			return currentObject{}, err
+			return currentObject{}, false, err
 		}
 		cur.displaced = row
 	}
-	return cur, nil
+	return cur, true, nil
 }
 
 // pin reads one row from the leader and adds a check that it is unchanged.
