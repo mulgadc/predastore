@@ -556,7 +556,7 @@ func (g *intentGate) requireNothingPrepared(id handlers.IntentID, in handlers.In
 	g.t.Helper()
 	for _, c := range candidates(in) {
 		_, err := g.bc.Commit(context.Background(), config.NodeID(c[0]), blob.CommitRequest{
-			Key: id.Hash, Index: uint32(c[1]), Epoch: id.Epoch, //nolint:gosec // G115: a small shard index.
+			Key: id.Hash, Index: uint32(c[1]), Epoch: id.Epoch,
 		})
 		require.ErrorIs(g.t, err, blob.ErrNotPrepared, "node %d index %d still holds epoch %016x", c[0], c[1], id.Epoch)
 	}
@@ -572,7 +572,7 @@ func (g *intentGate) requireLiveAt(id handlers.IntentID, in handlers.Intent) {
 			if node == 0 {
 				continue
 			}
-			st, err := g.bc.Stat(context.Background(), node, blob.StatRequest{Key: id.Hash, Index: uint32(i)}) //nolint:gosec // G115: a small shard index.
+			st, err := g.bc.Stat(context.Background(), node, blob.StatRequest{Key: id.Hash, Index: uint32(i)})
 			if err == nil && st.Epoch == id.Epoch {
 				live = true
 			}
