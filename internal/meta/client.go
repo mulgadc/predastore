@@ -578,6 +578,9 @@ func (c *Client) write(ctx context.Context, op rpc.Opcode, req *MetaRequest, bod
 // unknown is simply tried again. A swap is not: it retries only on an attempt
 // that never reached a replica, or a refusal that names a leader.
 func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest, body []byte) ([]byte, error) {
+	if IsReservedKey(req.Key) {
+		return nil, fmt.Errorf("write %q: %w", req.Key, ErrReservedKey)
+	}
 	candidates := c.readOrder()
 	next := 0
 	target := candidates[next]
@@ -600,6 +603,10 @@ func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest
 		case resp.Err == "":
 			c.cacheLeader(target)
 			return resp.Value, nil
+		case resp.Err == ErrCodeInvalid:
+			// The replica refused the request before proposing it, and every
+			// replica would refuse it the same way.
+			return nil, fmt.Errorf("write %q: replica %d: %s", req.Key, target, resp.Err)
 		case resp.Err == ErrCodeNotLeader:
 			lastErr = ErrNotLeader
 			if id, perr := ParseRaftAddress(resp.Leader); perr == nil {

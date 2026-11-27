@@ -124,6 +124,8 @@ func (s *Server) writeResult(err error) *MetaResponse {
 	switch {
 	case errors.Is(err, ErrNotLeader):
 		return &MetaResponse{Err: ErrCodeNotLeader, Leader: s.leaderAddr()}
+	case errors.Is(err, ErrReservedKey):
+		return &MetaResponse{Err: ErrCodeInvalid}
 	case err != nil:
 		return &MetaResponse{Err: err.Error()}
 	}

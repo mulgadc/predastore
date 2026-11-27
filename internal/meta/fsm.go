@@ -109,6 +109,9 @@ func ValidateTxn(checks []TxnCheck, writes []TxnWrite) error {
 		if c.Absent && len(c.Value) > 0 {
 			return fmt.Errorf("%w: check %d requires both absence and a value", ErrInvalidTxn, i)
 		}
+		if IsReservedKey(c.Key) {
+			return fmt.Errorf("%w: check %d: %w", ErrInvalidTxn, i, ErrReservedKey)
+		}
 	}
 	for i, w := range writes {
 		if len(w.Key) == 0 {
@@ -116,6 +119,9 @@ func ValidateTxn(checks []TxnCheck, writes []TxnWrite) error {
 		}
 		if w.Delete && len(w.Value) > 0 {
 			return fmt.Errorf("%w: write %d is both a delete and a put", ErrInvalidTxn, i)
+		}
+		if IsReservedKey(w.Key) {
+			return fmt.Errorf("%w: write %d: %w", ErrInvalidTxn, i, ErrReservedKey)
 		}
 	}
 	return nil
@@ -134,6 +140,10 @@ type FSM struct {
 	// index it is capturing, so a snapshot log line can only name one if the
 	// FSM tracks it.
 	applied atomic.Uint64
+
+	// persisted is the index the applied row names: the store already holds
+	// every entry at or below it, so ApplyBatch skips them. Guarded by mu.
+	persisted uint64
 
 	// serving separates the restore raft performs while it is being
 	// constructed from one a leader sends afterwards. Only the second is a
@@ -174,11 +184,28 @@ func OnKeyChanged(fn func(key, value []byte)) FSMOption {
 	return func(f *FSM) { f.onKeyChanged = fn }
 }
 
-// NewFSM creates a new FSM with the given Badger database.
-func NewFSM(db *badger.DB, opts ...FSMOption) *FSM {
-	f := &FSM{db: db, commitBatch: (*badger.Txn).Commit}
+// OpenFSM creates an FSM over db and reads the applied index the store holds.
+// A row that does not decode is an error: skipping entries against it could
+// skip one the store does not hold.
+func OpenFSM(db *badger.DB, opts ...FSMOption) (*FSM, error) {
+	persisted, err := readApplied(db)
+	if err != nil {
+		return nil, err
+	}
+	f := &FSM{db: db, commitBatch: (*badger.Txn).Commit, persisted: persisted}
 	for _, opt := range opts {
 		opt(f)
+	}
+
+	return f, nil
+}
+
+// NewFSM is OpenFSM for a store whose applied row is known to decode, and
+// panics when it does not.
+func NewFSM(db *badger.DB, opts ...FSMOption) *FSM {
+	f, err := OpenFSM(db, opts...)
+	if err != nil {
+		panic(err) //nolint:forbidigo // A caller that cannot handle the error has nothing safe to do.
 	}
 
 	return f
@@ -195,8 +222,7 @@ func (f *FSM) Apply(log *raft.Log) any {
 // entry. Each entry still gets its own response, as Apply would have given it.
 //
 // A failed commit stops the process. Badger may have applied part of it, so no
-// retry or error response can say what the store holds; a restart restores the
-// snapshot and replays the log, which rebuilds the store exactly.
+// retry or error response can say what the store holds.
 func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 	responses := make([]any, len(logs))
 	if len(logs) == 0 {
@@ -206,19 +232,14 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	commitOrStop := func(txn *badger.Txn) {
-		if err := f.commitBatch(txn); err != nil {
-			//nolint:forbidigo // A part-applied commit cannot be answered; restart rebuilds the store from the log.
-			panic(fmt.Sprintf("meta: committing applied entries %d-%d failed; stopping so the log rebuilds the store: %v",
-				logs[0].Index, logs[len(logs)-1].Index, err))
-		}
-	}
-	txn := f.db.NewTransaction(true)
-	staged := false
-	commit := func() { commitOrStop(txn) }
+	b := &batch{f: f, first: logs[0].Index, last: logs[len(logs)-1].Index, budget: newTxnBudget(f.db)}
+	b.begin()
 
 	for i, log := range logs {
-		if log.Type != raft.LogCommand {
+		// Every commit writes the applied row. An entry at or below it is
+		// already in the store, as after a restart raft replays it, so it is
+		// skipped and answers nil: no caller waits for a replayed entry.
+		if (f.persisted != 0 && log.Index <= f.persisted) || log.Type != raft.LogCommand {
 			continue
 		}
 		var cmd Command
@@ -230,43 +251,110 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 			// The batch transaction ends before the command and the next one
 			// starts after it, so the command reads the entries before it and
 			// the entries after it read the command's writes.
-			if staged {
-				commit()
-			} else {
-				txn.Discard()
-			}
-			responses[i] = f.applyTxn(cmd, commitOrStop)
-			txn, staged = f.db.NewTransaction(true), false
+			b.end()
+			responses[i] = f.applyTxn(cmd, log.Index, b)
+			b.begin()
 			continue
 		}
-		staged = true
-		resp, err := applyCommand(txn, cmd)
-		if errors.Is(err, badger.ErrTxnTooBig) {
-			commit()
-			txn = f.db.NewTransaction(true)
-			resp, err = applyCommand(txn, cmd)
-		}
-		if err != nil {
-			responses[i] = err
-			continue
-		}
-		responses[i] = resp
+		responses[i] = b.stage(cmd, log.Index)
 	}
-	commit()
+	b.end()
 	f.applied.Store(logs[len(logs)-1].Index)
 
 	return responses
 }
 
+// batch is the shared transaction of one ApplyBatch call.
+type batch struct {
+	f           *FSM
+	first, last uint64
+	txn         *badger.Txn
+	budget      txnBudget
+	// dirty is set once txn holds a write, and staged is the index of the
+	// last entry that wrote.
+	dirty  bool
+	staged uint64
+}
+
+func (b *batch) begin() {
+	b.txn, b.dirty, b.staged = b.f.db.NewTransaction(true), false, 0
+	b.budget.reset()
+}
+
+// end commits the shared transaction with its applied row, or discards it
+// when it holds no write, which leaves the store and the row as they were.
+func (b *batch) end() {
+	if !b.dirty {
+		b.txn.Discard()
+		return
+	}
+	b.commitOrStop(b.txn, b.staged)
+}
+
+// stage adds one command to the shared transaction, committing first when the
+// command and the applied row would not both fit.
+func (b *batch) stage(cmd Command, index uint64) any {
+	if IsReservedKey(cmd.Key) {
+		return fmt.Errorf("%w: %q", ErrReservedKey, cmd.Key)
+	}
+	cost, writes := commandCost(cmd)
+	if writes && !b.budget.fits(cost) && b.dirty {
+		b.end()
+		b.begin()
+	}
+	if writes && !b.budget.fits(cost) {
+		return fmt.Errorf("meta: entry %d with the applied row: %w", index, badger.ErrTxnTooBig)
+	}
+	resp, err := applyCommand(b.txn, cmd)
+	if errors.Is(err, badger.ErrTxnTooBig) && b.dirty {
+		b.end()
+		b.begin()
+		resp, err = applyCommand(b.txn, cmd)
+	}
+	if err != nil {
+		return err
+	}
+	b.budget.add(cost)
+	b.dirty, b.staged = true, index
+	return resp
+}
+
+// commitOrStop writes the applied row for index into txn and commits it.
+func (b *batch) commitOrStop(txn *badger.Txn, index uint64) {
+	if err := txn.Set(appliedKey, encodeApplied(index)); err != nil {
+		txn.Discard()
+		b.stop(err)
+	}
+	b.commitStaged(txn, index)
+}
+
+// commitStaged commits txn, whose applied row names index, and stops the
+// process when the commit fails.
+func (b *batch) commitStaged(txn *badger.Txn, index uint64) {
+	if err := b.f.commitBatch(txn); err != nil {
+		b.stop(err)
+	}
+	b.f.persisted = index
+}
+
+func (b *batch) stop(err error) {
+	//nolint:forbidigo // A part-applied commit cannot be answered; restart rebuilds the store from the log.
+	panic(fmt.Sprintf("meta: committing applied entries %d-%d failed; stopping so the log rebuilds the store: %v",
+		b.first, b.last, err))
+}
+
 // applyTxn evaluates a CommandTxn in a badger transaction of its own. It
-// commits only when every check holds and every write stages; otherwise it
-// discards the transaction, so no write of the command is published.
-func (f *FSM) applyTxn(cmd Command, commit func(*badger.Txn)) any {
+// commits, with the applied row, only when every check holds and every write
+// and the row stage; otherwise it discards the transaction and writes nothing.
+func (f *FSM) applyTxn(cmd Command, index uint64, b *batch) any {
 	if err := ValidateTxn(cmd.Checks, cmd.Writes); err != nil {
 		return err
 	}
 	txn := f.db.NewTransaction(true)
 	result, err := stageTxn(txn, cmd)
+	if err == nil && result.Applied {
+		err = txn.Set(appliedKey, encodeApplied(index))
+	}
 	if err != nil || !result.Applied {
 		txn.Discard()
 		if err != nil {
@@ -274,7 +362,7 @@ func (f *FSM) applyTxn(cmd Command, commit func(*badger.Txn)) any {
 		}
 		return result
 	}
-	commit(txn)
+	b.commitStaged(txn, index)
 	return result
 }
 
@@ -409,11 +497,78 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	if err != nil {
 		return err
 	}
+	rs := &restoreState{budget: newTxnBudget(f.db)}
 	if sorted {
-		return f.restoreByMerge(r, started)
+		err = f.restoreByMerge(r, started, rs)
+	} else {
+		err = f.restoreByReplace(r, started, rs)
+	}
+	if err == nil {
+		err = f.restoreApplied(rs.applied)
+	}
+	if err != nil && rs.wrote {
+		// The store is part old, part snapshot, and raft would go on without
+		// a retry. The next start restores the snapshot before it skips any
+		// entry.
+		//nolint:forbidigo // A part-restored store must not apply or answer another entry.
+		panic(fmt.Sprintf("meta: restoring a snapshot failed after it wrote to the store; stopping: %v", err))
 	}
 
-	return f.restoreByReplace(r, started)
+	return err
+}
+
+// restoreState is what a restore learns on its way: whether it may have
+// changed the store, and the applied row the snapshot holds, nil for none.
+type restoreState struct {
+	wrote   bool
+	applied []byte
+	budget  txnBudget
+}
+
+// write counts one write sent to a WriteBatch. The batch commits a chunk only
+// when its transaction is full, so until the count says it could be, the
+// store is unchanged.
+func (rs *restoreState) write(key, value []byte) {
+	cost := writeCost(key, value)
+	if !rs.budget.holds(cost) {
+		rs.wrote = true
+	}
+	rs.budget.add(cost)
+}
+
+// takeApplied keeps the snapshot's applied row aside and reports whether key
+// was that row, which the data pass then leaves out.
+func (rs *restoreState) takeApplied(key, value []byte) bool {
+	if !bytes.Equal(key, appliedKey) {
+		return false
+	}
+	rs.applied = bytes.Clone(value)
+	return true
+}
+
+// restoreApplied runs after every data row is flushed. It writes the
+// snapshot's applied row, or removes the local one when the snapshot has
+// none, then moves the in-memory index to match, backwards included.
+func (f *FSM) restoreApplied(row []byte) error {
+	var index uint64
+	if row != nil {
+		var err error
+		if index, err = decodeApplied(row); err != nil {
+			return fmt.Errorf("restore: %w", err)
+		}
+	}
+	err := f.db.Update(func(txn *badger.Txn) error {
+		if row == nil {
+			return txn.Delete(appliedKey)
+		}
+		return txn.Set(appliedKey, row)
+	})
+	if err != nil {
+		return fmt.Errorf("restore: write the applied index: %w", err)
+	}
+	f.persisted = index
+
+	return nil
 }
 
 // snapshotIsSorted reports whether the stream carries the marker promising key
@@ -444,7 +599,7 @@ func snapshotIsSorted(r *bufio.Reader) (bool, error) {
 // It is O(1) in memory on both sides, and it never passes through an empty
 // store -- which the drop-and-rewrite path does, so a crash in the middle of
 // one left a node with no metadata at all.
-func (f *FSM) restoreByMerge(r *bufio.Reader, started time.Time) error {
+func (f *FSM) restoreByMerge(r *bufio.Reader, started time.Time, rs *restoreState) error {
 	txn := f.db.NewTransaction(false)
 	defer txn.Discard()
 
@@ -457,24 +612,41 @@ func (f *FSM) restoreByMerge(r *bufio.Reader, started time.Time) error {
 
 	var added, changed, deleted, unchanged int
 
+	// valid reports whether the iterator is on a local data row, stepping
+	// past the applied row, which restoreApplied writes after the data.
+	valid := func() bool {
+		if it.Valid() && bytes.Equal(it.Item().Key(), appliedKey) {
+			it.Next()
+		}
+		return it.Valid()
+	}
+	drop := func() error {
+		key := it.Item().KeyCopy(nil)
+		rs.write(key, nil)
+		deleted++
+		return wb.Delete(key)
+	}
+
 	// Local keys the snapshot has passed are orphans: present here, absent
 	// there, and therefore deleted in the state the snapshot describes.
 	dropBefore := func(key []byte) error {
-		for it.Valid() && bytes.Compare(it.Item().Key(), key) < 0 {
-			if err := wb.Delete(it.Item().KeyCopy(nil)); err != nil {
+		for valid() && bytes.Compare(it.Item().Key(), key) < 0 {
+			if err := drop(); err != nil {
 				return err
 			}
-			deleted++
 			it.Next()
 		}
 		return nil
 	}
 
 	err := streamSnapshot(r, func(key, value []byte) error {
+		if rs.takeApplied(key, value) {
+			return nil
+		}
 		if err := dropBefore(key); err != nil {
 			return err
 		}
-		if it.Valid() && bytes.Equal(it.Item().Key(), key) {
+		if valid() && bytes.Equal(it.Item().Key(), key) {
 			local, err := it.Item().ValueCopy(nil)
 			if err != nil {
 				return err
@@ -492,19 +664,20 @@ func (f *FSM) restoreByMerge(r *bufio.Reader, started time.Time) error {
 			f.onKeyChanged(key, value)
 		}
 
+		rs.write(key, value)
 		return wb.Set(key, value)
 	})
 	if err != nil {
 		return err
 	}
 
-	for ; it.Valid(); it.Next() {
-		if err := wb.Delete(it.Item().KeyCopy(nil)); err != nil {
+	for ; valid(); it.Next() {
+		if err := drop(); err != nil {
 			return err
 		}
-		deleted++
 	}
 
+	rs.wrote = true
 	if err := wb.Flush(); err != nil {
 		return fmt.Errorf("restore: flush merge: %w", err)
 	}
@@ -536,7 +709,7 @@ func (f *FSM) restoreByMerge(r *bufio.Reader, started time.Time) error {
 //
 // DropAll is badger's own bulk clear and is not bounded by a transaction;
 // WriteBatch commits in chunks as it fills.
-func (f *FSM) restoreByReplace(r *bufio.Reader, started time.Time) error {
+func (f *FSM) restoreByReplace(r *bufio.Reader, started time.Time, rs *restoreState) error {
 	// Every key is rewritten here, so a change set from this path would name
 	// the whole store. Saying so beats reporting nothing, which a consumer
 	// cannot tell from a snapshot that changed nothing.
@@ -545,6 +718,7 @@ func (f *FSM) restoreByReplace(r *bufio.Reader, started time.Time) error {
 			"node", f.node, "reason", "unsorted snapshot, restored by replacement")
 	}
 
+	rs.wrote = true
 	if err := f.db.DropAll(); err != nil {
 		return fmt.Errorf("restore: drop existing data: %w", err)
 	}
@@ -554,6 +728,9 @@ func (f *FSM) restoreByReplace(r *bufio.Reader, started time.Time) error {
 
 	var entries int
 	err := streamSnapshot(r, func(key, value []byte) error {
+		if rs.takeApplied(key, value) {
+			return nil
+		}
 		entries++
 		return wb.Set(key, value)
 	})
@@ -637,8 +814,12 @@ func streamSnapshot(r *bufio.Reader, fn func(key, value []byte) error) error {
 	return nil
 }
 
-// Get reads a value from the local store (can be stale on non-leader).
+// Get reads a value from the local store (can be stale on non-leader). A
+// reserved key is never found.
 func (f *FSM) Get(key string) ([]byte, error) {
+	if IsReservedKey([]byte(key)) {
+		return nil, badger.ErrKeyNotFound
+	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
@@ -663,7 +844,7 @@ func (f *FSM) Scan(prefix string, fn func(key string, value []byte) error) error
 // ScanFrom iterates over keys with the prefix that sort strictly after the
 // cursor. Badger iterates in key order, so seeking past the last key a page
 // returned is the whole of the continuation: an empty cursor starts at the
-// beginning of the prefix.
+// beginning of the prefix. Reserved keys are never returned.
 func (f *FSM) ScanFrom(prefix, after string, fn func(key string, value []byte) error) error {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -688,6 +869,9 @@ func (f *FSM) ScanFrom(prefix, after string, fn func(key string, value []byte) e
 
 		for ; it.Valid(); it.Next() {
 			item := it.Item()
+			if IsReservedKey(item.Key()) {
+				continue
+			}
 			key := string(item.Key())
 
 			value, err := item.ValueCopy(nil)

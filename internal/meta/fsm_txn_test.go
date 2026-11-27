@@ -278,5 +278,6 @@ func TestFSM_Txn_ReplicasApplyingTheSameLogAgree(t *testing.T) {
 	assert.Equal(t, one, threes)
 	assert.Equal(t, []string{"applied", "applied", "mismatch", "applied", "mismatch", "applied", "error", "applied", "applied"},
 		one.kinds)
-	assert.Equal(t, []string{`"objects/a"="gen-3"`, `"objects/b"="gen-3"`}, one.store)
+	assert.Equal(t, []string{fmt.Sprintf("%q=%q", appliedKey, encodeApplied(9)), `"objects/a"="gen-3"`, `"objects/b"="gen-3"`},
+		one.store, "the applied row names the last entry that wrote, however the log was batched")
 }

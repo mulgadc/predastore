@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/mulgadc/predastore/internal/config"
+	"github.com/mulgadc/predastore/internal/rpc"
 )
 
 // ServeTxn registers the OpMetaTxn handler on a replica built from cfg, which
@@ -14,4 +15,10 @@ func ServeTxn(cfg *Config) { cfg.serveTxn = true }
 // the checks Txn makes first, so a test can show what the replica refuses.
 func (c *Client) SendTxnBody(ctx context.Context, target config.NodeID, body []byte) (*MetaResponse, error) {
 	return c.call(ctx, target, OpMetaTxn, &MetaRequest{}, body)
+}
+
+// SendWrite sends one keyed write to target without the client's own checks,
+// so a test can show what the replica refuses.
+func (c *Client) SendWrite(ctx context.Context, target config.NodeID, op rpc.Opcode, key string, value []byte) (*MetaResponse, error) {
+	return c.call(ctx, target, op, request(key, 0), value)
 }

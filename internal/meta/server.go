@@ -190,7 +190,9 @@ func (s *Server) open() (*rpc.Server, error) {
 	if s.cfg.OnKeyChanged != nil {
 		opts = append(opts, OnKeyChanged(s.cfg.OnKeyChanged))
 	}
-	s.fsm = NewFSM(s.badgerDB, opts...)
+	if s.fsm, err = OpenFSM(s.badgerDB, opts...); err != nil {
+		return nil, err
+	}
 
 	s.bolt, err = openLogStore(filepath.Join(s.cfg.DataDir, "raft.db"))
 	if err != nil {
@@ -489,6 +491,9 @@ func (s *Server) apply(cmd Command) error {
 // applyValue commits one command and returns whatever its FSM handler reported,
 // which for CommandSwap is the value it replaced.
 func (s *Server) applyValue(cmd Command) ([]byte, error) {
+	if IsReservedKey(cmd.Key) {
+		return nil, fmt.Errorf("%w: %q", ErrReservedKey, cmd.Key)
+	}
 	if s.raft.State() != raft.Leader {
 		return nil, ErrNotLeader
 	}
