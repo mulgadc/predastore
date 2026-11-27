@@ -111,15 +111,15 @@ func (s *Server) handleStatus(ctx context.Context, h MetaStatusRequest, stream t
 	return json.NewEncoder(stream).Encode(&status)
 }
 
-func (s *Server) handleLastKey(_ context.Context, h MetaRequest, stream transport.Stream) error {
+func (s *Server) handleLastKey(ctx context.Context, h MetaRequest, stream transport.Stream) error {
 	if !h.Leader || len(h.Key) == 0 || len(h.After) != 0 || h.Limit != 1 {
 		return respond(stream, &MetaResponse{Err: "invalid last-key lookup"})
 	}
 	if !s.fsm.mapHeadIndexReady() {
 		return respond(stream, &MetaResponse{Err: ErrCodeBehind})
 	}
-	if refused, err := s.refuseLeaderRead(h, stream); refused {
-		return err
+	if code := s.authorityRead(ctx); code != "" {
+		return respond(stream, &MetaResponse{Err: code, Leader: s.leaderAddr()})
 	}
 	key, err := s.fsm.LastKey(string(h.Key))
 	if errors.Is(err, errMapHeadIndexUnavailable) {
