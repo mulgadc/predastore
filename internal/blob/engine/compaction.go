@@ -139,6 +139,7 @@ func (store *Store) retainedTick() {
 	} else if orphans > 0 {
 		slog.Debug("dropped orphaned release rows", "count", orphans)
 	}
+	store.retireDeferredTick()
 }
 
 // kickPending reports whether a compaction kick is waiting for the loop.
@@ -1001,7 +1002,7 @@ func (store *Store) relocateExtent(badgerKey []byte, entry idxEntry, oldRaw []by
 	// the destination the extent actually landed in is the one that must be
 	// recorded, not whatever store.segNum happens to be afterward.
 	newExt := extent{SegNum: dstSeg.num, Off: dstOff, PSize: old.PSize, LSize: old.LSize}
-	allocation := idxEntry{Off: dstOff, Key: entry.Key, PSize: old.PSize, part: entry.part}
+	allocation := idxEntry{Off: dstOff, Key: entry.Key, PSize: old.PSize, part: entry.part, whole: entry.whole}
 	deferred := old.PSize > 0 && len(badgerKey) == preparedKeySize && badgerKey[0] == deferredPrefix
 	if !deferred {
 		err = dstSeg.appendPrepareAllocation(allocation, epoch, old.LSize)

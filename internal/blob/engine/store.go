@@ -72,6 +72,10 @@ type Store struct {
 	compactor           *compactor
 	startupRecovery     func(*Store) error
 	startupPartRecovery func(context.Context, string, [32]byte, uint32, uint64) (bool, error)
+	retireRecovered     func(context.Context, string, uint64) (bool, error)
+	retirementContext   context.Context
+	retirementAge       time.Duration
+	retirementCursor    []byte
 
 	// This node's slot among the cluster's blob nodes, which offsets its
 	// routine passes, and the pacing a routine pass runs under.
@@ -588,25 +592,28 @@ func (store *Store) lookup(rowKey []byte, key [32]byte, index uint32) (Reader, e
 // epoch is opaque here: the engine stores it, returns it on Lookup and matches
 // it on Commit, and never orders or interprets it.
 func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64) (Writer, error) {
-	return store.appendValue(key, index, size, epoch, false, model.MultipartPlacement{})
+	return store.appendValue(key, index, size, epoch, false, model.MultipartPlacement{}, false)
 }
 
 // AppendHeld is Append for a write whose fate a caller decides later. Its
 // prepared row is never swept by age; only Commit or Abort removes it.
 func (store *Store) AppendHeld(key [32]byte, index uint32, size int64, epoch uint64) (Writer, error) {
-	return store.appendValue(key, index, size, epoch, true, model.MultipartPlacement{})
+	return store.appendValue(key, index, size, epoch, true, model.MultipartPlacement{}, false)
 }
 
-// AppendPart records the exact multipart placement alongside the shard allocation.
-func (store *Store) AppendPart(key [32]byte, index uint32, size int64, epoch uint64, hold bool, placement string) (Writer, error) {
+// AppendPlacement records the declared placement alongside the shard allocation.
+func (store *Store) AppendPlacement(key [32]byte, index uint32, size int64, epoch uint64, hold bool, placement string) (Writer, error) {
+	if placement == "" {
+		return store.appendValue(key, index, size, epoch, hold, model.MultipartPlacement{}, true)
+	}
 	part, err := model.ParseMultipartPlacement(placement)
 	if err != nil {
 		return nil, err
 	}
-	return store.appendValue(key, index, size, epoch, hold, part)
+	return store.appendValue(key, index, size, epoch, hold, part, false)
 }
 
-func (store *Store) appendValue(key [32]byte, index uint32, size int64, epoch uint64, hold bool, part model.MultipartPlacement) (Writer, error) {
+func (store *Store) appendValue(key [32]byte, index uint32, size int64, epoch uint64, hold bool, part model.MultipartPlacement, whole bool) (Writer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("negative size %d", size)
 	}
@@ -660,7 +667,7 @@ func (store *Store) appendValue(key [32]byte, index uint32, size int64, epoch ui
 	}
 
 	idxKey := MakeKey(key, index)
-	if err := seg.appendPrepareAllocation(idxEntry{Off: off, Key: [36]byte(idxKey), PSize: ext.PSize, part: part}, epoch, size); err != nil {
+	if err := seg.appendPrepareAllocation(idxEntry{Off: off, Key: [36]byte(idxKey), PSize: ext.PSize, part: part, whole: whole}, epoch, size); err != nil {
 		seg.writers.Add(-1)
 		seg.releaseRef()
 		return nil, fmt.Errorf("append idx: %w", err)
@@ -1024,7 +1031,14 @@ func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) 
 				if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
 					return err
 				}
-				if err := txn.Set(rowKey, raw); err != nil {
+				ext, held, err := decodeIndexValue(raw)
+				if err != nil {
+					return err
+				}
+				if held != epoch {
+					return fmt.Errorf("%w: recovered epoch differs from release", ErrIntegrity)
+				}
+				if err := txn.Set(rowKey, encodePreparedValue(ext, epoch, retainedHoldStamp)); err != nil {
 					return err
 				}
 				if err := txn.Delete(row); err != nil {

@@ -188,6 +188,23 @@ func readRecoveryAuthority(ctx context.Context, client *meta.Client, key string)
 	}
 }
 
+func retireShardPlacement(ctx context.Context, client *meta.Client, placement string, epoch uint64) (bool, error) {
+	key := handlers.TableKey(model.TableObjects, placement)
+	raw, err := client.AuthorityGet(ctx, key)
+	if err == nil {
+		current, err := handlers.DecodePlacement(raw)
+		if err != nil || current.WriteEpoch == epoch {
+			return false, err
+		}
+	} else if !errors.Is(err, meta.ErrNotFound) {
+		return false, err
+	}
+	if err := client.RetirePlacement(ctx, key, epoch, raw); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // checkDataDirs proves every local node can write its directory before any
 // node starts, and names all that cannot. Found later, an unwritable drive
 // surfaces behind the readiness noise of the nodes already running.
@@ -506,6 +523,10 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 			},
 			AuthorizeRecoveredPart: func(ctx context.Context, placement string, key [32]byte, index uint32, epoch uint64) (bool, error) {
 				return authorizePartRecovery(ctx, metaClient, n.ID, placement, key, index, epoch)
+			},
+			DeferredRetirementAge: time.Duration(cfg.Compaction.DeferredRetirementAgeSeconds) * time.Second,
+			RetireRecovered: func(ctx context.Context, placement string, epoch uint64) (bool, error) {
+				return retireShardPlacement(ctx, metaClient, placement, epoch)
 			},
 		})
 		if berr != nil {

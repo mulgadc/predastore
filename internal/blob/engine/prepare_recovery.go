@@ -158,7 +158,7 @@ func (store *Store) replayPrepareIfNamed(
 		return err
 	}
 	if !named {
-		return store.deferPrepare(ctx, prepareRecoveryKey{key: key, index: index, epoch: epoch}, ext)
+		return store.deferPrepare(ctx, prepareRecoveryKey{key: key, index: index, epoch: epoch}, ext, record)
 	}
 	if err := store.stageRecoveredPrepare(key, index, epoch, ext); err != nil {
 		if errors.Is(err, ErrIntegrity) || errors.Is(err, os.ErrNotExist) {
@@ -171,7 +171,7 @@ func (store *Store) replayPrepareIfNamed(
 	return err
 }
 
-func (store *Store) deferPrepare(ctx context.Context, recovery prepareRecoveryKey, ext extent) error {
+func (store *Store) deferPrepare(ctx context.Context, recovery prepareRecoveryKey, ext extent, record prepareRecord) error {
 	if err := store.verifyPrepareExtent(recovery.key, recovery.index, ext); err != nil {
 		if errors.Is(err, ErrIntegrity) || errors.Is(err, os.ErrNotExist) {
 			slog.WarnContext(ctx, "cannot defer prepared shard", "segment", ext.SegNum, "offset", ext.Off, "error", err)
@@ -182,10 +182,17 @@ func (store *Store) deferPrepare(ctx context.Context, recovery prepareRecoveryKe
 	idxKey := MakeKey(recovery.key, recovery.index)
 	row := deferredKey(idxKey, recovery.epoch)
 	return store.index.Update(func(txn *badger.Txn) error {
-		current, _, err := readIndexValue(txn, row)
+		raw, err := readRaw(txn, row)
 		if err == nil {
+			current, _, err := decodeIndexValue(raw)
+			if err != nil {
+				return err
+			}
 			if ext.PSize > 0 && (current.SegNum != ext.SegNum || current.Off != ext.Off) {
 				return txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize))
+			}
+			if len(raw) == preparedValueSize && (record.whole || record.part.Key() != "") {
+				return txn.Set(row, encodeDeferredValue(ext, recovery.epoch, store.clock.Now(), record))
 			}
 			return nil
 		}
@@ -195,7 +202,7 @@ func (store *Store) deferPrepare(ctx context.Context, recovery prepareRecoveryKe
 		if err := txn.Delete(preparedKey(idxKey, recovery.epoch)); err != nil {
 			return err
 		}
-		return txn.Set(row, encodePreparedValue(ext, recovery.epoch, retainedHoldStamp))
+		return txn.Set(row, encodeDeferredValue(ext, recovery.epoch, store.clock.Now(), record))
 	})
 }
 
@@ -265,7 +272,11 @@ func (store *Store) promoteDeferred(row, prepared []byte) error {
 			if err != nil {
 				return err
 			}
-			if err := txn.Set(prepared, raw); err != nil {
+			ext, epoch, err := decodeIndexValue(raw)
+			if err != nil {
+				return err
+			}
+			if err := txn.Set(prepared, encodePreparedValue(ext, epoch, retainedHoldStamp)); err != nil {
 				return err
 			}
 			return txn.Delete(row)

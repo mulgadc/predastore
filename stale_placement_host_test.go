@@ -569,3 +569,57 @@ func TestS7_AScopedDeleteThatStopsLeavesARetainedAcknowledgedObjectReadable(t *t
 	require.Equal(t, want, got, "the object read back as another generation's body")
 	require.Equal(t, putHeaders.Get("ETag"), after.Get("ETag"))
 }
+
+func TestHostRetiresDeferredShardThroughRaft(t *testing.T) {
+	client, cfg := staleHostConfig(t)
+	cfg.Compaction.DeferredRetirementAgeSeconds = 1
+	cfg.Compaction.RetainedMaxAgeSeconds = 10
+	start := recoveryHostStarter(t, cfg, client)
+	stop := start()
+	status, body := client.send(http.MethodPut, "/"+staleBucket, "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	object := "/" + staleBucket + "/" + staleObject
+	status, body = client.send(http.MethodPut, object, "", []byte("extent to retire after restart"))
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	hash := model.ObjectHash(staleBucket, staleObject)
+	row := handlers.TableKey(model.TableObjects, string(hash[:]))
+	var placement handlers.ObjectToShardNodes
+	var raw, witness []byte
+	withHostClients(t, cfg, func(mc *meta.Client, bc *blob.Client, _ []config.NodeID) {
+		var err error
+		raw, err = mc.AuthorityGet(t.Context(), row)
+		require.NoError(t, err)
+		placement, err = handlers.DecodePlacement(raw)
+		require.NoError(t, err)
+		reader, err := bc.Get(t.Context(), placement.AllNodes()[0], blob.GetRequest{
+			Key: hash, Epoch: placement.WriteEpoch, RangeStart: -1, RangeEnd: -1,
+		})
+		require.NoError(t, err)
+		witness, err = io.ReadAll(reader)
+		require.NoError(t, err)
+		require.NoError(t, reader.Close())
+		require.NoError(t, mc.Delete(t.Context(), row))
+	})
+	stop()
+	client.http.CloseIdleConnections()
+	dropRecoveryHostShardRows(t, cfg, hash, placement)
+	start()
+
+	withHostClients(t, cfg, func(mc *meta.Client, bc *blob.Client, _ []config.NodeID) {
+		var recovered []byte
+		require.Eventually(t, func() bool {
+			reader, err := bc.Get(t.Context(), placement.AllNodes()[0], blob.GetRequest{
+				Key: hash, Epoch: placement.WriteEpoch, RangeStart: -1, RangeEnd: -1,
+			})
+			if err != nil {
+				return false
+			}
+			defer reader.Close()
+			recovered, err = io.ReadAll(reader)
+			return err == nil
+		}, 30*time.Second, 200*time.Millisecond)
+		require.Equal(t, witness, recovered)
+		_, err := mc.Swap(t.Context(), row, raw)
+		require.ErrorContains(t, err, "placement epoch has been retired")
+	})
+}

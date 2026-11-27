@@ -45,6 +45,7 @@ type idxEntry struct {
 	Key   [36]byte
 	PSize int64
 	part  model.MultipartPlacement
+	whole bool
 }
 
 func (e idxEntry) encode() []byte {
@@ -72,6 +73,7 @@ type prepareRecord struct {
 	epoch uint64
 	size  int64
 	part  model.MultipartPlacement
+	whole bool
 }
 
 func (r prepareRecord) encode(row []byte) {
@@ -84,7 +86,11 @@ func (r prepareRecord) encode(row []byte) {
 		binary.BigEndian.PutUint32(row[48:52], crc32.ChecksumIEEE(row[:48]))
 		return
 	}
-	copy(row[24:28], "PRE1")
+	if r.whole {
+		copy(row[24:28], "PROB")
+	} else {
+		copy(row[24:28], "PRE1")
+	}
 	binary.BigEndian.PutUint32(row[28:32], crc32.ChecksumIEEE(row[:28]))
 }
 
@@ -93,8 +99,10 @@ func decodePrepareRecord(row []byte) (prepareRecord, bool) {
 		return prepareRecord{}, false
 	}
 	var part model.MultipartPlacement
+	whole := false
 	switch string(row[24:28]) {
-	case "PRE1":
+	case "PRE1", "PROB":
+		whole = string(row[24:28]) == "PROB"
 		if binary.BigEndian.Uint32(row[28:32]) != crc32.ChecksumIEEE(row[:28]) {
 			return prepareRecord{}, false
 		}
@@ -111,6 +119,7 @@ func decodePrepareRecord(row []byte) (prepareRecord, bool) {
 		epoch: binary.BigEndian.Uint64(row[8:16]),
 		size:  int64(binary.BigEndian.Uint64(row[16:24])), //nolint:gosec // The sign bit is clear.
 		part:  part,
+		whole: whole,
 	}, true
 }
 
@@ -146,11 +155,12 @@ func scanIdx(dir string, segNum uint64) ([]idxEntry, error) {
 			return nil, err
 		}
 		if buf[0]&0x80 != 0 {
-			if paired && string(buf[24:28]) == "PRTP" {
+			if paired && (string(buf[24:28]) == "PRTP" || string(buf[24:28]) == "PROB") {
 				record, ok := decodePrepareRecord(buf)
 				entry := &entries[len(entries)-1]
 				if ok && record.off == entry.Off {
 					entry.part = record.part
+					entry.whole = record.whole
 				}
 			}
 			paired = false
@@ -276,7 +286,7 @@ func (seg *segment) waitForRefs(budget time.Duration) bool {
 func (seg *segment) appendPrepareAllocation(e idxEntry, epoch uint64, size int64) error {
 	var rows [2 * idxEntrySize]byte
 	copy(rows[:idxEntrySize], e.encode())
-	prepareRecord{off: e.Off, epoch: epoch, size: size, part: e.part}.encode(rows[idxEntrySize:])
+	prepareRecord{off: e.Off, epoch: epoch, size: size, part: e.part, whole: e.whole}.encode(rows[idxEntrySize:])
 	if _, err := seg.idx.WriteAt(rows[:], seg.idxSize); err != nil {
 		return err
 	}

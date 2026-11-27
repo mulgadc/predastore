@@ -92,6 +92,8 @@ type Config struct {
 	// AuthorizeRecoveredPrepare checks authoritative placement at startup.
 	AuthorizeRecoveredPrepare func(context.Context, [32]byte, uint32, uint64) (bool, error)
 	AuthorizeRecoveredPart    func(context.Context, string, [32]byte, uint32, uint64) (bool, error)
+	RetireRecovered           func(context.Context, string, uint64) (bool, error)
+	DeferredRetirementAge     time.Duration
 
 	// Store stands in for the engine that would be opened at DataDir. Test
 	// seam: production leaves it nil.
@@ -153,6 +155,7 @@ func (s *Server) Run(ctx context.Context) error {
 			engine.WithAEAD(s.cfg.AEAD), engine.WithCompaction(s.cfg.Compaction),
 			engine.WithStartupPrepareRecovery(ctx, s.cfg.AuthorizeRecoveredPrepare),
 			engine.WithStartupPartRecovery(s.cfg.AuthorizeRecoveredPart),
+			engine.WithDeferredRetirement(ctx, s.cfg.DeferredRetirementAge, s.cfg.RetireRecovered),
 			engine.WithRetainedMaxAge(s.cfg.RetainedMaxAge),
 			engine.WithCompactionSlot(slot, slots),
 			engine.WithCompactionPacing(s.cfg.CompactionMaxBytesPerSec, s.cfg.CompactionYieldLatency, s.cfg.CompactionMaxYield))
@@ -296,18 +299,23 @@ func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stre
 	return respond(stream, &Response{Size: h.Size, PoolNearFull: st.NearFull(), Epoch: h.Epoch})
 }
 
-type partAppender interface {
-	AppendPart(key [32]byte, index uint32, size int64, epoch uint64, hold bool, placement string) (engine.Writer, error)
+type placementAppender interface {
+	AppendPlacement(key [32]byte, index uint32, size int64, epoch uint64, hold bool, placement string) (engine.Writer, error)
 }
 
-var _ partAppender = (*engine.Store)(nil)
+var _ placementAppender = (*engine.Store)(nil)
 
 func (s *Server) appendShard(h Request) (engine.Writer, error) {
-	if h.PartPlacement != "" {
-		if store, ok := s.store.(partAppender); ok {
-			return store.AppendPart(h.Key, h.Index, h.Size, h.Epoch, h.Hold, h.PartPlacement)
+	if h.PartPlacement != "" && h.ObjectPlacement {
+		return nil, errors.New("conflicting shard placement identities")
+	}
+	if h.PartPlacement != "" || h.ObjectPlacement {
+		if store, ok := s.store.(placementAppender); ok {
+			return store.AppendPlacement(h.Key, h.Index, h.Size, h.Epoch, h.Hold, h.PartPlacement)
 		}
-		return nil, errors.New("store cannot record multipart placement")
+		if h.PartPlacement != "" {
+			return nil, errors.New("store cannot record multipart placement")
+		}
 	}
 	if h.Hold {
 		return s.store.AppendHeld(h.Key, h.Index, h.Size, h.Epoch)

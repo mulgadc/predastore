@@ -71,9 +71,9 @@ func encodePreparedValue(ext extent, epoch uint64, at int64) []byte {
 // because compaction and the reaper walk rows without knowing which kind they
 // hold; a caller that cares checks the width itself.
 func decodeIndexValue(buf []byte) (ext extent, epoch uint64, err error) {
-	if len(buf) != indexValueSize && len(buf) != preparedValueSize {
-		return ext, 0, fmt.Errorf("invalid index value length %d, want %d or %d",
-			len(buf), indexValueSize, preparedValueSize)
+	if len(buf) != indexValueSize && len(buf) != preparedValueSize && len(buf) != deferredValueSize {
+		return ext, 0, fmt.Errorf("invalid index value length %d, want %d, %d or %d",
+			len(buf), indexValueSize, preparedValueSize, deferredValueSize)
 	}
 	ext, err = decodeExtent(buf[:extentEncodedSize])
 	if err != nil {

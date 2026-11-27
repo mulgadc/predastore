@@ -287,7 +287,7 @@ func writeSingleShard(
 
 	counted := &countingReader{r: body}
 
-	resp, err := bc.Put(ctx, node, blob.PutRequest{Key: objectHash, Size: size, Index: 0, Epoch: epoch, PartPlacement: partPlacement}, counted)
+	resp, err := bc.Put(ctx, node, blob.PutRequest{Key: objectHash, Size: size, Index: 0, Epoch: epoch, PartPlacement: partPlacement, ObjectPlacement: partPlacement == ""}, counted)
 	if err != nil {
 		return writeResult{landed: []bool{false}, missing: []config.NodeID{node}}, err
 	}
@@ -452,11 +452,12 @@ func startShardStream(
 
 	go func() {
 		resp, err := bc.Put(ctx, node, blob.PutRequest{
-			Key:           objectHash,
-			Size:          shardSize,
-			Index:         uint32(index), //nolint:gosec // G115: index bounded by the shard count.
-			Epoch:         epoch,
-			PartPlacement: partPlacement,
+			Key:             objectHash,
+			Size:            shardSize,
+			Index:           uint32(index), //nolint:gosec // G115: index bounded by the shard count.
+			Epoch:           epoch,
+			PartPlacement:   partPlacement,
+			ObjectPlacement: partPlacement == "",
 		}, pr)
 		// Closing the read side is what releases a producer still writing into
 		// a stream whose node has gone: io.Pipe has no buffer and does not

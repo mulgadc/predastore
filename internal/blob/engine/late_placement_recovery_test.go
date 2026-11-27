@@ -31,7 +31,7 @@ func testCompactionReclaimsDeletedSpace(t *testing.T, part string) {
 		epoch = prepareValue(t, store, key, 0, payload)
 	} else {
 		epoch = 11
-		writer, err := store.AppendPart(key, 0, int64(len(payload)), epoch, false, part)
+		writer, err := store.AppendPlacement(key, 0, int64(len(payload)), epoch, false, part)
 		require.NoError(t, err)
 		_, err = writer.Write(payload)
 		require.NoError(t, err)
@@ -228,4 +228,82 @@ func testDeleteReleasesDeferredPrepare(t *testing.T, exact bool) {
 		return true, nil
 	})
 	require.ErrorIs(t, err, ErrKeyNotFound)
+}
+
+func TestDeferredRetirementReclaimsOnlyConfirmedPlacements(t *testing.T) {
+	const partPlacement = "part:01010101-0101-4101-8101-010101010101:10000"
+	for _, placement := range []string{"", partPlacement} {
+		name := "object"
+		if placement != "" {
+			name = "part"
+		}
+		t.Run(name, func(t *testing.T) {
+			key, unknown, filler := [32]byte{1}, [32]byte{2}, [32]byte{3}
+			expected := placement
+			if expected == "" {
+				expected = string(key[:])
+			}
+			const epoch uint64 = 11
+			const maxSize = 20 * KiB
+			var allow bool
+			var calls int
+			payload := []byte("acknowledged candidate bytes held through reader grace")
+			store, dir := openTestStore(t, WithMaxSegSize(maxSize))
+			writer, err := store.AppendPlacement(key, 0, int64(len(payload)), epoch, false, placement)
+			require.NoError(t, err)
+			_, err = writer.Write(payload)
+			require.NoError(t, err)
+			require.NoError(t, writer.Close())
+			prepareValue(t, store, unknown, 0, []byte("unclassified candidate must survive"))
+			putValue(t, store, filler, 0, []byte("roll over"))
+			absent := func(context.Context, [32]byte, uint32, uint64) (bool, error) { return false, nil }
+			require.NoError(t, store.replayRecoveredPrepares(t.Context(), absent))
+			require.NoError(t, store.Close())
+
+			store, err = Open(dir, WithAEAD(store.aead), WithMaxSegSize(maxSize),
+				WithStartupPrepareRecovery(t.Context(), absent),
+				WithDeferredRetirement(t.Context(), 0, func(_ context.Context, actual string, generation uint64) (bool, error) {
+					require.Equal(t, expected, actual)
+					require.Equal(t, epoch, generation)
+					calls++
+					return allow, nil
+				}))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = store.Close() })
+
+			require.NoError(t, store.sweepDeferred(t.Context(), time.Now().Add(-preparedMaxAge)))
+			require.Zero(t, calls)
+			require.NoError(t, store.sweepDeferred(t.Context(), time.Now().Add(time.Hour)))
+			require.Equal(t, 1, calls)
+			_, err = store.LookupAt(key, 0, epoch)
+			require.ErrorIs(t, err, ErrKeyNotFound)
+
+			allow = true
+			require.NoError(t, store.sweepDeferred(t.Context(), time.Now().Add(time.Hour)))
+			require.Equal(t, 2, calls)
+			dropped, err := store.sweepRetained(retainedMaxAge)
+			require.NoError(t, err)
+			require.Zero(t, dropped)
+			reader, err := store.LookupAt(key, 0, epoch)
+			require.NoError(t, err)
+			got, err := io.ReadAll(reader)
+			require.NoError(t, err)
+			require.NoError(t, reader.Close())
+			require.Equal(t, payload, got)
+
+			dropped, err = store.sweepRetained(-1)
+			require.NoError(t, err)
+			require.Equal(t, 1, dropped)
+			candidates, _, err := store.candidateSegments()
+			require.NoError(t, err)
+			require.Contains(t, candidates, uint64(0))
+			stats, err := store.compactSegment(0, nil)
+			require.NoError(t, err)
+			require.Greater(t, stats.reclaimed, stats.bytes)
+			_, err = os.Stat(filepath.Join(dir, fmt.Sprintf(segFilename, uint64(0))))
+			require.ErrorIs(t, err, os.ErrNotExist)
+			_, err = store.LookupAt(key, 0, epoch)
+			require.ErrorIs(t, err, ErrKeyNotFound)
+		})
+	}
 }
