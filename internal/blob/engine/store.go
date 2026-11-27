@@ -34,7 +34,11 @@ type Store struct {
 	dir string
 
 	// The on-disk index: key -> extent, plus the tombstone namespace.
-	index *badger.DB
+	// Index mutations all enter through indexUpdate or commitIndex. The
+	// commit guard keeps the WAL from rotating between Update and Sync.
+	index          *badger.DB
+	indexWrites    sync.RWMutex
+	indexCommitErr error
 
 	// Unbounded: entries accumulate as the store touches old segments. Fine at
 	// single-data-dir scale; thousands of distinct segments would want an LRU.
@@ -704,7 +708,7 @@ func (store *Store) prepareExtent(key [32]byte, index uint32, ext extent, epoch 
 		stamp = retainedHoldStamp
 	}
 	value := encodePreparedValue(ext, epoch, stamp)
-	if err := store.index.Update(func(txn *badger.Txn) error {
+	if err := store.indexUpdate(func(txn *badger.Txn) error {
 		return txn.Set(preparedKey(MakeKey(key, index), epoch), value)
 	}); err != nil {
 		return fmt.Errorf("prepare: %w", err)
@@ -732,7 +736,7 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 
 	for {
 		published = false
-		err := store.index.Update(func(txn *badger.Txn) error {
+		err := store.commitIndex(func(txn *badger.Txn) error {
 			raw, err := readRaw(txn, prepKey)
 			switch {
 			case errors.Is(err, badger.ErrKeyNotFound):
@@ -833,7 +837,7 @@ func (store *Store) Abort(key [32]byte, index uint32, epoch uint64) error {
 // encoding, and both are reclaimed the same way.
 func (store *Store) dropGeneration(rowKey []byte, want func(epoch uint64) bool) error {
 	for {
-		err := store.index.Update(func(txn *badger.Txn) error {
+		err := store.indexUpdate(func(txn *badger.Txn) error {
 			raw, err := readRaw(txn, rowKey)
 			if errors.Is(err, badger.ErrKeyNotFound) {
 				return nil
@@ -954,7 +958,7 @@ func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) 
 
 	rowKey := retainedKey(MakeKey(key, index), epoch)
 	for {
-		err := store.index.Update(func(txn *badger.Txn) error {
+		err := store.indexUpdate(func(txn *badger.Txn) error {
 			raw, err := readRaw(txn, rowKey)
 			if errors.Is(err, badger.ErrKeyNotFound) {
 				// Already reclaimed, which is the outcome the caller wanted.
@@ -998,7 +1002,7 @@ func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
 
 	idxKey := MakeKey(key, index)
 	deleted := false
-	err := store.index.Update(func(txn *badger.Txn) error {
+	err := store.indexUpdate(func(txn *badger.Txn) error {
 		// Every generation goes, not just the live one: a prepared row would
 		// resurrect the value on a later commit, and a retained row would keep
 		// answering a record that names it.
@@ -1044,7 +1048,7 @@ func (store *Store) DeleteEpoch(key [32]byte, index uint32, epoch uint64) (bool,
 
 	idxKey := MakeKey(key, index)
 	deleted := false
-	err := store.index.Update(func(txn *badger.Txn) error {
+	err := store.indexUpdate(func(txn *badger.Txn) error {
 		deleted = false
 		for _, rowKey := range [][]byte{preparedKey(idxKey, epoch), retainedKey(idxKey, epoch)} {
 			removed, err := dropRowAt(txn, rowKey, epoch)
@@ -1133,6 +1137,8 @@ func (store *Store) Close() error {
 		}
 	}
 
+	store.indexWrites.Lock()
+	defer store.indexWrites.Unlock()
 	if err := store.index.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close disk index: %w", err))
 	}

@@ -164,7 +164,7 @@ func (w *writer) Discard() error {
 	defer w.seg.writers.Add(-1)
 	defer func() { dropFragWindow(w.held); w.held, w.buf = nil, nil }()
 
-	if err := w.store.index.Update(func(txn *badger.Txn) error {
+	if err := w.store.indexUpdate(func(txn *badger.Txn) error {
 		return txn.Set(tombstoneKey(w.ext.SegNum, w.ext.Off), tombstoneValue(w.ext.PSize))
 	}); err != nil {
 		return fmt.Errorf("tombstone discarded extent: %w", err)

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/dgraph-io/badger/v4"
@@ -10,6 +11,41 @@ import (
 // which maps keys to extents and carries the tombstone namespace.
 func openIndex(dir string) (*badger.DB, error) {
 	return badger.Open(badger.DefaultOptions(dir).WithLoggingLevel(badger.WARNING))
+}
+
+func (store *Store) indexUpdate(update func(*badger.Txn) error) error {
+	store.indexWrites.RLock()
+	defer store.indexWrites.RUnlock()
+	if store.indexCommitErr != nil {
+		return store.indexCommitErr
+	}
+	return store.index.Update(update)
+}
+
+// commitIndex syncs the WAL used by a successful update before a shard
+// acknowledgement. A failed sync leaves an uncertain row in memory. Reject
+// further mutations until restart so a retry cannot certify that row after
+// the active WAL has changed.
+func (store *Store) commitIndex(update func(*badger.Txn) error) error {
+	store.indexWrites.Lock()
+	defer store.indexWrites.Unlock()
+	if store.indexCommitErr != nil {
+		return store.indexCommitErr
+	}
+
+	var committing bool
+	err := store.index.Update(func(txn *badger.Txn) error {
+		err := update(txn)
+		committing = err == nil
+		return err
+	})
+	if err == nil {
+		err = store.index.Sync()
+	}
+	if err != nil && committing && !errors.Is(err, badger.ErrConflict) {
+		store.indexCommitErr = fmt.Errorf("shard index commit requires reopen: %w", err)
+	}
+	return err
 }
 
 // indexGet returns a copy of the value stored under key. A missing key
@@ -34,7 +70,7 @@ func (store *Store) indexGet(key []byte) ([]byte, error) {
 
 // indexDelete removes a single key in its own transaction.
 func (store *Store) indexDelete(key []byte) error {
-	return store.index.Update(
+	return store.indexUpdate(
 		func(txn *badger.Txn) error {
 			return txn.Delete(key)
 		})

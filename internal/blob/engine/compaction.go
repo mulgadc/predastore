@@ -491,7 +491,7 @@ func (store *Store) dropOrphanedReleases(orphans [][]byte) (int, error) {
 		}
 		batch := orphans[start:min(start+orphanReleaseBatch, len(orphans))]
 		var n int
-		err := store.index.Update(func(txn *badger.Txn) error {
+		err := store.indexUpdate(func(txn *badger.Txn) error {
 			var err error
 			n, err = dropOrphanBatch(txn, batch)
 
@@ -1028,7 +1028,7 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 	// Swap onto the new slot only if the key still holds the one we copied from.
 	for {
 		var stale bool
-		err := store.index.Update(func(txn *badger.Txn) error {
+		err := store.indexUpdate(func(txn *badger.Txn) error {
 			stale = false
 			item, err := txn.Get(badgerKey)
 			switch {
