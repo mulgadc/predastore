@@ -384,6 +384,15 @@ Distributed storage with erasure coding, Raft-consensus metadata, and QUIC trans
 
 See [DESIGN.md](docs/DESIGN.md) §6 for the on-disk format: the segment layout, the fragment header field by field, and the AAD the GCM seal is bound to.
 
+## Upgrade and rollback
+
+Upgrade a cluster by stopping every node, installing the new release on every node, and starting every node again.
+Do not run nodes of two releases at the same time.
+
+A rollback is not supported below the release that writes `deleted-epoch:` tombstones.
+An earlier release never reads those tombstones, so the shards that they owe stay on disk and are never reclaimed.
+From the release that adds conditional `PutObject`, a rollback is not possible: an earlier meta replica cannot apply the conditional transactions in the log.
+
 ## Spinifex Integration
 
 Predastore is the default S3 storage provider for [Spinifex](https://github.com/mulgadc/spinifex), which turns the integration on by rendering one table into predastore's config:
