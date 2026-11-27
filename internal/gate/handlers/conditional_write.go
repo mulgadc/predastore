@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -516,7 +517,7 @@ func conditionalTxn(
 		if err != nil {
 			return nil, nil, err
 		}
-		checks = append(checks[:len(checks):len(checks)], meta.TxnCheck{Key: []byte(id.Key()), Value: pendingRow})
+		checks = append(slices.Clip(checks), meta.TxnCheck{Key: []byte(id.Key()), Value: pendingRow})
 		writes = append(writes, meta.TxnWrite{Key: []byte(id.Key()), Value: committedRow})
 	}
 	return checks, writes, nil

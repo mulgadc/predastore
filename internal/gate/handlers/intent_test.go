@@ -77,8 +77,8 @@ func TestDecodeIntentRefusesUnknownRows(t *testing.T) {
 // error its operation's map names. The handoff node holds nothing, as when no
 // shard was handed off.
 type intentBlob struct {
-	mu                               sync.Mutex
-	commits, aborts, releases        []shardPos
+	mu                              sync.Mutex
+	commits, aborts, releases       []shardPos
 	commitErr, abortErr, releaseErr map[shardPos]error
 }
 

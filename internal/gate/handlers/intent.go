@@ -90,8 +90,9 @@ type Intent struct {
 const intentFormat = 1
 
 type storedIntent struct {
-	Format int `json:"v"`
 	Intent
+
+	Format int `json:"v"`
 }
 
 var errIntentFormat = errors.New("malformed intent row")
@@ -114,7 +115,7 @@ func DecodeIntent(data []byte) (Intent, error) {
 	if s.Format != intentFormat {
 		return Intent{}, fmt.Errorf("%w: format %d", errIntentFormat, s.Format)
 	}
-	if err := s.Intent.validate(); err != nil {
+	if err := s.validate(); err != nil {
 		return Intent{}, err
 	}
 	return s.Intent, nil

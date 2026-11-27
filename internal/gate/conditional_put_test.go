@@ -18,6 +18,7 @@ import (
 // legacy record in for the one a write left.
 type condGate struct {
 	keyGate
+
 	meta *fakeMeta
 }
 

@@ -34,6 +34,7 @@ type txnFunc func() (meta.TxnOutcome, []meta.TxnValue, error)
 // Once dead, every call fails and changes nothing, as after a crash.
 type hookMeta struct {
 	*fakeMeta
+
 	log *eventLog
 
 	mu   sync.Mutex
@@ -135,6 +136,7 @@ func (l *eventLog) all() []string {
 // barrier, and fail an abort.
 type hookBlob struct {
 	BlobClient
+
 	log  *eventLog
 	dead *atomic.Bool
 
@@ -168,6 +170,7 @@ func (b *hookBlob) OpenHeldPut(ctx context.Context, node config.NodeID, req blob
 
 type hookHeld struct {
 	HeldPut
+
 	b *hookBlob
 }
 
@@ -220,6 +223,7 @@ func (b *hookBlob) Release(ctx context.Context, node config.NodeID, req blob.Rel
 // nodes and store that plain writes, reads and deletes use directly.
 type condHarness struct {
 	*realStoreGate
+
 	t   *testing.T
 	hm  *hookMeta
 	hb  *hookBlob
@@ -347,7 +351,7 @@ func (h *condHarness) requireNothingPrepared(id IntentID, in Intent) {
 func (h *condHarness) requireLiveAt(id IntentID, in Intent) {
 	h.t.Helper()
 	for i, n := range in.Nodes {
-		st, err := h.bc.BlobClient.(*blob.Client).Stat(context.Background(), n, blob.StatRequest{Key: id.Hash, Index: uint32(i)}) //nolint:gosec // G115: small index.
+		st, err := h.bc.BlobClient.(*blob.Client).Stat(context.Background(), n, blob.StatRequest{Key: id.Hash, Index: uint32(i)})
 		require.NoError(h.t, err)
 		require.Equal(h.t, id.Epoch, st.Epoch, "node %d index %d", n, i)
 	}
@@ -588,7 +592,7 @@ func TestACreateAcrossACreateAndDeleteIsWritten(t *testing.T) {
 // A transaction whose reply is lost after it applied is settled by the
 // fence, which finds the intent committed: the write answers 200 through the
 // normal success path, with its ETag and version, and reads back.
-// Verifies: ADR-0003:S7
+// Verifies: ADR-0003:S7.
 func TestS7_ALostReplyAfterTheTransactionAppliedAnswersTheWrite(t *testing.T) {
 	h := newCondHarness(t, rsProfiles[0])
 	h.enableVersioning()
@@ -624,7 +628,7 @@ func ifNoneMatchAllExceptCurrent(h *condHarness) http.Header {
 
 // A transaction whose reply is lost before it applied is fenced: the write
 // answers 500, its shards are aborted, and the previous object is current.
-// Verifies: ADR-0003:S7
+// Verifies: ADR-0003:S7.
 func TestS7_ALostReplyBeforeTheTransactionAppliedKeepsThePreviousObject(t *testing.T) {
 	h := newCondHarness(t, rsProfiles[0])
 	etag := h.mustPut("lock", body1)
@@ -649,7 +653,7 @@ func TestS7_ALostReplyBeforeTheTransactionAppliedKeepsThePreviousObject(t *testi
 // Two writes of one ETag: the first's transaction applies and its reply is
 // lost, and the second writes over it before the first is resolved. The
 // first's late shard commit must not demote the second, which stays current.
-// Verifies: ADR-0003:S7
+// Verifies: ADR-0003:S7.
 func TestS7_AnEqualETagWriteStaysCurrentAfterAnUnknownOutcomeResolves(t *testing.T) {
 	h := newCondHarness(t, rsProfiles[0])
 	etag := h.mustPut("lock", body1)
@@ -676,7 +680,7 @@ func TestS7_AnEqualETagWriteStaysCurrentAfterAnUnknownOutcomeResolves(t *testing
 // A refused transaction answers 503 SlowDown and leaves the previous
 // object. A candidate that cannot confirm its abort keeps the intent, and a
 // reaper pass finishes it.
-// Verifies: ADR-0003:S7
+// Verifies: ADR-0003:S7.
 func TestS7_ARefusedTransactionIsSlowDownAndAnUnconfirmedAbortKeepsTheIntent(t *testing.T) {
 	h := newCondHarness(t, rsProfiles[0])
 	etag := h.mustPut("lock", body1)
@@ -702,7 +706,7 @@ func TestS7_ARefusedTransactionIsSlowDownAndAnUnconfirmedAbortKeepsTheIntent(t *
 // A write fenced by the reaper while it streamed cannot publish: its own
 // transaction fails the pending check, it answers 500, and the previous
 // object stays readable.
-// Verifies: ADR-0003:S7
+// Verifies: ADR-0003:S7.
 func TestS7_AFencedWriterFailsAndKeepsThePreviousObject(t *testing.T) {
 	h := newCondHarness(t, rsProfiles[0])
 	etag := h.mustPut("lock", body1)
@@ -728,7 +732,7 @@ func TestS7_AFencedWriterFailsAndKeepsThePreviousObject(t *testing.T) {
 // A record that becomes visible is readable before any shard commit: a read
 // paused right after the transaction commits the held shards it names, for a
 // first write and for a new version.
-// Verifies: ADR-0003:S7
+// Verifies: ADR-0003:S7.
 func TestS7_AWriteIsReadableBetweenItsTransactionAndItsShardCommit(t *testing.T) {
 	for _, versioned := range []bool{false, true} {
 		t.Run(fmt.Sprintf("versioned=%t", versioned), func(t *testing.T) {
@@ -756,7 +760,7 @@ func TestS7_AWriteIsReadableBetweenItsTransactionAndItsShardCommit(t *testing.T)
 
 // Every owner's held stream is registered before the intent is written, and
 // no stream opens after it except an unheld handoff stream.
-// Verifies: ADR-0003:S7
+// Verifies: ADR-0003:S7.
 func TestS7_HeldStreamsOpenBeforeTheIntentAndHandoffIsUnheld(t *testing.T) {
 	h := newCondHarness(t, rsProfiles[0])
 	hash := model.ObjectHash("bkt", "lock")
@@ -825,7 +829,7 @@ func TestAShortfallOfHeldShardsIsNotImplemented(t *testing.T) {
 // A crash at each point of a conditional write leaves an intent from which a
 // reaper pass reaches one of two states: the new object readable at the
 // floor, or the previous object current. No held row of the write remains.
-// Verifies: ADR-0003:S7
+// Verifies: ADR-0003:S7.
 func TestS7_ACrashAtAnyPointConvergesThroughTheIntent(t *testing.T) {
 	type crash struct {
 		arm      func(h *condHarness)
