@@ -1,6 +1,9 @@
 package handlers
 
 import (
+	"context"
+	"slices"
+	"time"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -85,31 +88,44 @@ func BenchmarkListObjectsFullWalk(b *testing.B) {
 func BenchmarkMetaApplyDuringListing(b *testing.B) {
 	const n = 100_000
 	h, mc, _ := listBenchBucket(b, n)
-	b.Run(fmt.Sprintf("keys=%d", n), func(b *testing.B) {
-		var stop atomic.Bool
-		var listed, failed atomic.Int64
-		var wg sync.WaitGroup
-		for range 4 {
-			wg.Go(func() {
-				for !stop.Load() {
-					if listPage(h, url.Values{"list-type": {"2"}, "max-keys": {"1000"}}).Code != http.StatusOK {
-						failed.Add(1)
-					}
-					listed.Add(1)
+	b.Run(fmt.Sprintf("keys=%d", n), func(b *testing.B) { writeDuringListing(b, h, mc) })
+}
+
+// writeDuringListing times one metadata put per op while four clients list
+// the first page in a loop, and reports the median and the 99th percentile.
+func writeDuringListing(b *testing.B, h http.Handler, mc MetaClient) {
+	b.Helper()
+	var stop atomic.Bool
+	var listed, failed atomic.Int64
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for !stop.Load() {
+				if listPage(h, url.Values{"list-type": {"2"}, "max-keys": {"1000"}}).Code != http.StatusOK {
+					failed.Add(1)
 				}
-			})
+				listed.Add(1)
+			}
+		})
+	}
+	var lat []time.Duration
+	i := 0
+	for b.Loop() {
+		i++
+		start := time.Now()
+		if err := mc.Put(context.Background(), "bench/apply/"+strconv.Itoa(i), []byte("v")); err != nil {
+			b.Fatal(err)
 		}
-		i := 0
-		for b.Loop() {
-			i++
-			mc.apply(meta.Command{Type: meta.CommandPut, Key: []byte(fmt.Sprintf("bench/apply/%d", i)), Value: []byte("v")})
-		}
-		stop.Store(true)
-		wg.Wait()
-		if failed.Load() > 0 || listed.Load() == 0 {
-			b.Fatalf("listings: %d sent, %d failed", listed.Load(), failed.Load())
-		}
-	})
+		lat = append(lat, time.Since(start))
+	}
+	stop.Store(true)
+	wg.Wait()
+	if failed.Load() > 0 || listed.Load() == 0 {
+		b.Fatalf("listings: %d sent, %d failed", listed.Load(), failed.Load())
+	}
+	slices.Sort(lat)
+	b.ReportMetric(float64(lat[len(lat)/2].Nanoseconds()), "p50-ns")
+	b.ReportMetric(float64(lat[min(len(lat)-1, len(lat)*99/100)].Nanoseconds()), "p99-ns")
 }
 
 // BenchmarkListObjectsAfterDeletes lists the first page of a bucket whose
