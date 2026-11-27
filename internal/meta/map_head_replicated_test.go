@@ -136,6 +136,7 @@ func TestRaftCannotCompactToFailedMetadataRestore(t *testing.T) {
 
 type lastKeyResponse struct {
 	transport.Stream
+
 	body bytes.Buffer
 }
 
