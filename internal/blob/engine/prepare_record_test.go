@@ -91,3 +91,24 @@ func TestReopenCanReplayExactPreparedEpoch(t *testing.T) {
 	_, err = reopened.LookupAt(key, 0, abandoned)
 	require.ErrorIs(t, err, ErrKeyNotFound)
 }
+
+func TestPrepareRecordSurvivesCompactionSourceDrop(t *testing.T) {
+	store, dir := openTestStore(t, WithMaxSegSize(20*KiB))
+	key := [32]byte{1}
+	value := []byte("acknowledged, relocated payload")
+	epoch := prepareValue(t, store, key, 0, value)
+	_, err := store.Commit(key, 0, epoch)
+	require.NoError(t, err)
+	source := extentOf(t, store, key, 0).SegNum
+
+	putValue(t, store, [32]byte{2}, 0, []byte("fill source"))
+	putValue(t, store, [32]byte{3}, 0, []byte("roll to next segment"))
+	_, err = store.compactSegment(source, nil)
+	require.NoError(t, err)
+	require.NoFileExists(t, filepath.Join(dir, fmt.Sprintf(idxSegFilename, source)))
+	require.NoError(t, store.index.Update(func(txn *badger.Txn) error {
+		return txn.Delete(MakeKey(key, 0))
+	}))
+
+	require.Equal(t, value, replayPrepareRecord(t, store, key, 0, epoch))
+}

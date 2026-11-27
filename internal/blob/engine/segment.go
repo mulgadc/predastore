@@ -237,16 +237,7 @@ func (seg *segment) waitForRefs(budget time.Duration) bool {
 	return true
 }
 
-// appendIdx writes one row at the .idx append cursor and advances it. Caller
-// holds store.mutex.
-func (seg *segment) appendIdx(e idxEntry) error {
-	if _, err := seg.idx.WriteAt(e.encode(), seg.idxSize); err != nil {
-		return err
-	}
-	seg.idxSize += idxEntrySize
-	return nil
-}
-
+// appendPrepareAllocation writes both sidecar rows under store.mutex.
 func (seg *segment) appendPrepareAllocation(e idxEntry, epoch uint64, size int64) error {
 	var rows [2 * idxEntrySize]byte
 	copy(rows[:idxEntrySize], e.encode())

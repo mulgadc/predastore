@@ -973,6 +973,10 @@ func scanRowAt(txn *badger.Txn, prefix []byte, num uint64, off int64) (*slotRow,
 // there first, which moved reports as false. badgerKey is the live, prepared or
 // retained row; idxKey is always the 36-byte form the sidecar records.
 func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []byte, old extent, p *pacer) (moved bool, err error) {
+	_, epoch, err := decodeIndexValue(oldRaw)
+	if err != nil {
+		return false, fmt.Errorf("decode source epoch: %w", err)
+	}
 	fragCount := uint64(old.PSize / totalFragSize) //nolint:gosec // PSize is a non-negative multiple of totalFragSize.
 
 	store.mutex.Lock()
@@ -997,7 +1001,7 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 	// the destination the extent actually landed in is the one that must be
 	// recorded, not whatever store.segNum happens to be afterward.
 	newExt := extent{SegNum: dstSeg.num, Off: dstOff, PSize: old.PSize, LSize: old.LSize}
-	if err := dstSeg.appendIdx(idxEntry{Off: dstOff, Key: idxKey, PSize: old.PSize}); err != nil {
+	if err := dstSeg.appendPrepareAllocation(idxEntry{Off: dstOff, Key: idxKey, PSize: old.PSize}, epoch, old.LSize); err != nil {
 		srcSeg.releaseRef()
 		dstSeg.releaseRef()
 		store.mutex.Unlock()
