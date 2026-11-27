@@ -123,10 +123,9 @@ func TestClientTxn_AnErrorAfterProposalIsUnknownAndNotResent(t *testing.T) {
 	assert.Equal(t, 1, replica.calls())
 }
 
-// A not-leader answer proves nothing was proposed. The client answers refused
-// without following the redirect itself, and remembers the leader so the
-// caller's next transaction goes there.
-func TestClientTxn_ANotLeaderAnswerIsRefusedAndNotFollowed(t *testing.T) {
+// A not-leader answer that names a replica already tried leaves nothing to
+// send to. The client answers refused, sends once, and remembers the leader.
+func TestClientTxn_ANotLeaderAnswerNamingATriedReplicaIsRefused(t *testing.T) {
 	replica := &txnReplica{answer: func(stream transport.Stream) error {
 		return respond(stream, &MetaResponse{Err: ErrCodeNotLeader, Leader: RaftAddress(1)})
 	}}
@@ -142,6 +141,62 @@ func TestClientTxn_ANotLeaderAnswerIsRefusedAndNotFollowed(t *testing.T) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	assert.Equal(t, config.NodeID(1), client.leader)
+}
+
+// A follower refuses before it proposes, so the client sends to the leader it
+// names next, ahead of the other replicas, and each replica gets one send.
+func TestClientTxn_AFollowerRefusalIsSentToTheNamedLeader(t *testing.T) {
+	cfg := swapRetryCfg()
+	cfg.Hosts[0].Nodes = append(cfg.Hosts[0].Nodes,
+		config.Node{ID: 3, Role: config.RoleMeta, Port: 6303},
+		config.Node{ID: 4, Role: config.RoleMeta, Port: 6304})
+	follower := &txnReplica{answer: func(stream transport.Stream) error {
+		return respond(stream, &MetaResponse{Err: ErrCodeNotLeader, Leader: RaftAddress(3)})
+	}}
+	startTxnReplicaOn(t, follower, 6301)
+	other := &txnReplica{answer: func(stream transport.Stream) error {
+		return respond(stream, &MetaResponse{Err: ErrCodeNotLeader, Leader: RaftAddress(3)})
+	}}
+	startTxnReplicaOn(t, other, 6304)
+	leader := &txnReplica{answer: func(stream transport.Stream) error {
+		return respond(stream, &MetaResponse{})
+	}}
+	startTxnReplicaOn(t, leader, 6303)
+	client := newTxnClient(t, cfg, 1, 4, 3)
+
+	outcome, _, err := client.Txn(context.Background(), txnChecks, txnWrites)
+
+	require.NoError(t, err)
+	assert.Equal(t, TxnApplied, outcome)
+	assert.Equal(t, 1, follower.calls())
+	assert.Zero(t, other.calls(), "the named leader was not tried first")
+	assert.Equal(t, 1, leader.calls())
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	assert.Equal(t, config.NodeID(3), client.leader)
+}
+
+// A not-leader answer with no leader named still proves nothing was proposed,
+// so the client goes on to the next replica.
+func TestClientTxn_ANotLeaderAnswerWithNoHintMovesToTheNextReplica(t *testing.T) {
+	cfg := swapRetryCfg()
+	cfg.Hosts[0].Nodes = append(cfg.Hosts[0].Nodes, config.Node{ID: 3, Role: config.RoleMeta, Port: 6303})
+	follower := &txnReplica{answer: func(stream transport.Stream) error {
+		return respond(stream, &MetaResponse{Err: ErrCodeNotLeader})
+	}}
+	startTxnReplicaOn(t, follower, 6301)
+	leader := &txnReplica{answer: func(stream transport.Stream) error {
+		return respond(stream, &MetaResponse{})
+	}}
+	startTxnReplicaOn(t, leader, 6303)
+	client := newTxnClient(t, cfg, 1, 3)
+
+	outcome, _, err := client.Txn(context.Background(), txnChecks, txnWrites)
+
+	require.NoError(t, err)
+	assert.Equal(t, TxnApplied, outcome)
+	assert.Equal(t, 1, follower.calls())
+	assert.Equal(t, 1, leader.calls())
 }
 
 func TestClientTxn_AnInvalidAnswerIsRefused(t *testing.T) {

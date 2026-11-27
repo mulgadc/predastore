@@ -496,9 +496,9 @@ var ErrTxnRefused = errors.New("meta transaction refused")
 // ErrTxnUnknown wraps the error of a transaction whose outcome is unknown.
 var ErrTxnUnknown = errors.New("meta transaction outcome unknown")
 
-// Txn applies writes through the leader only if every check holds. It sends at
-// most once, moving to another replica only when a stream never opened, and
-// answers refused or unknown with an error wrapping ErrTxnRefused or ErrTxnUnknown.
+// Txn applies writes through the leader only if every check holds. It sends to
+// each replica at most once and moves on only after an undelivered send or a
+// not-leader refusal, going to the named leader first; ambiguity is TxnUnknown.
 func (c *Client) Txn(ctx context.Context, checks []TxnCheck, writes []TxnWrite) (outcome TxnOutcome, current []TxnValue, err error) {
 	defer observeOp(ctx, telemetry.MetaOpTxn, time.Now(), &err)
 
@@ -514,25 +514,57 @@ func (c *Client) Txn(ctx context.Context, checks []TxnCheck, writes []TxnWrite) 
 			ErrTxnRefused, ErrInvalidTxn, len(body), MaxTxnBodyBytes)
 	}
 
+	order := c.readOrder()
+	tried := make(map[config.NodeID]bool, len(order))
 	var lastErr error
-	for _, target := range c.readOrder() {
+	var hint config.NodeID
+	for {
+		target, ok := nextTxnTarget(order, tried, hint)
+		if !ok {
+			break
+		}
+		tried[target] = true
+		hint = 0
+
 		resp, err := c.call(ctx, target, OpMetaTxn, &MetaRequest{}, body)
-		if errors.Is(err, ErrUndelivered) {
+		switch {
+		case errors.Is(err, ErrUndelivered):
 			lastErr = err
-			if ctx.Err() != nil {
-				break
-			}
-			continue
-		}
-		if err != nil {
+		case err != nil:
 			return TxnUnknown, nil, fmt.Errorf("%w: %w", ErrTxnUnknown, err)
+		case resp.Err == ErrCodeNotLeader:
+			// A follower refuses before it proposes, so sending again is safe.
+			lastErr = fmt.Errorf("replica %d: %w", target, ErrNotLeader)
+			if id, perr := ParseRaftAddress(resp.Leader); perr == nil {
+				c.cacheLeader(id)
+				telemetry.RecordMetaRedirect(ctx, telemetry.RedirectNotLeader)
+				hint = id
+			}
+		default:
+			return c.txnAnswer(target, resp)
 		}
-		return c.txnAnswer(target, resp)
+		if ctx.Err() != nil {
+			break
+		}
 	}
 	if lastErr == nil {
 		lastErr = errors.New("no replica to send to")
 	}
 	return TxnRefused, nil, fmt.Errorf("%w: %w", ErrTxnRefused, lastErr)
+}
+
+// nextTxnTarget picks the hinted leader if it is untried, else the first
+// untried replica in order.
+func nextTxnTarget(order []config.NodeID, tried map[config.NodeID]bool, hint config.NodeID) (config.NodeID, bool) {
+	if hint != 0 && !tried[hint] {
+		return hint, true
+	}
+	for _, id := range order {
+		if !tried[id] {
+			return id, true
+		}
+	}
+	return 0, false
 }
 
 // txnAnswer maps one replica's answer onto an outcome. Any error envelope
@@ -545,11 +577,6 @@ func (c *Client) txnAnswer(target config.NodeID, resp *MetaResponse) (TxnOutcome
 	case resp.Err == "":
 		c.cacheLeader(target)
 		return TxnApplied, nil, nil
-	case resp.Err == ErrCodeNotLeader:
-		if id, perr := ParseRaftAddress(resp.Leader); perr == nil {
-			c.cacheLeader(id)
-		}
-		return TxnRefused, nil, fmt.Errorf("%w: replica %d: %w", ErrTxnRefused, target, ErrNotLeader)
 	case resp.Err == ErrCodeInvalid:
 		return TxnRefused, nil, fmt.Errorf("%w: replica %d: %s", ErrTxnRefused, target, resp.Err)
 	default:
