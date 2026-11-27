@@ -117,7 +117,7 @@ func TestHostReplaysPlacementPublishedAfterRestart(t *testing.T) {
 func testHostReplaysRaftNamedPlacement(t *testing.T, latePlacement bool) {
 	t.Helper()
 	client, cfg := staleHostConfig(t)
-	start := recoveryHostStarter(t, cfg)
+	start := recoveryHostStarter(t, cfg, client)
 	stop := start()
 	status, body := client.send(http.MethodPut, "/"+staleBucket, "", nil)
 	require.Equal(t, http.StatusOK, status, "%s", body)
@@ -156,7 +156,7 @@ func testHostReplaysRaftNamedPlacement(t *testing.T, latePlacement bool) {
 	require.Equal(t, want, body)
 }
 
-func recoveryHostStarter(t *testing.T, cfg *config.Config) func() func() {
+func recoveryHostStarter(t *testing.T, cfg *config.Config, client *s3Client) func() func() {
 	t.Helper()
 	require.NoError(t, cfg.Validate())
 	key := newMasterKey(t)
@@ -176,6 +176,7 @@ func recoveryHostStarter(t *testing.T, cfg *config.Config) func() func() {
 		})
 		t.Cleanup(stop)
 		awaitProbe(t, "http://127.0.0.1:"+strconv.Itoa(cfg.Hosts[0].AdminPort)+"/readyz", http.StatusOK)
+		awaitGate(t, client.http, client.base+"/")
 		return stop
 	}
 }
@@ -207,7 +208,7 @@ func dropRecoveryHostShardRows(t *testing.T, cfg *config.Config, hash [32]byte, 
 
 func TestHostRecoversMultipartPartAfterRestart(t *testing.T) {
 	client, cfg := staleHostConfig(t)
-	start := recoveryHostStarter(t, cfg)
+	start := recoveryHostStarter(t, cfg, client)
 	stop := start()
 
 	status, body := client.send(http.MethodPut, "/"+staleBucket, "", nil)
