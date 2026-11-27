@@ -31,6 +31,7 @@ func TestFSM_ApplyBatch_StopsOnAnEntryItCannotRead(t *testing.T) {
 	// "c2VjcmV0LWtleQ==" is "secret-key". The value is "dg==", "v".
 	entries := map[string]string{
 		"unknown type": `{"type":200,"key":"c2VjcmV0LWtleQ==","value":"dg=="}`,
+		"type 255":     `{"type":255,"key":"c2VjcmV0LWtleQ==","value":"dg=="}`,
 		"no type":      `{"key":"c2VjcmV0LWtleQ==","value":"dg=="}`,
 		"null type":    `{"type":null,"key":"c2VjcmV0LWtleQ==","value":"dg=="}`,
 		"undecodable":  `{not json`,
@@ -55,8 +56,13 @@ func TestFSM_ApplyBatch_StopsOnAnEntryItCannotRead(t *testing.T) {
 			msg := fmt.Sprint(stopped)
 			assert.Contains(t, msg, "entry 3")
 			assert.NotContains(t, msg, "secret", "the stop names no key")
-			if name == "unknown type" {
+			switch name {
+			case "unknown type":
 				assert.Contains(t, msg, "type 200")
+			case "type 255":
+				assert.Contains(t, msg, "type 255", "an explicit type is named, even the one the decode fills in")
+			case "no type", "null type":
+				assert.Contains(t, msg, "no type")
 			}
 			db, _ = restart(t, db, opts)
 			assert.Equal(t, uint64(1), storedApplied(t, db), "the row stays below the entry")

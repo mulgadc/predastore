@@ -276,7 +276,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 		cmd := f.cmd
 		f.cmd = Command{}
 		if err != nil || cmd.Type > CommandTxn {
-			b.stopOnUnreadableEntry(log.Index, cmd.Type, err)
+			b.stopOnUnreadableEntry(log.Index, log.Data, cmd.Type, err)
 		}
 		if cmd.Type == CommandTxn {
 			// The batch transaction ends before the command and the next one
@@ -417,18 +417,27 @@ func (b *batch) stopOnStoreError(txn *badger.Txn, index uint64, err error) {
 // stopOnUnreadableEntry stops the process on a committed entry this release
 // cannot read. A replica that can read it applies it, so answering and moving
 // on would leave the stores different. The message names no key.
-func (b *batch) stopOnUnreadableEntry(index uint64, typ CommandType, err error) {
+func (b *batch) stopOnUnreadableEntry(index uint64, data []byte, typ CommandType, err error) {
 	b.txn.Discard()
 	reason := fmt.Sprintf("type %d", typ)
 	switch {
 	case err != nil:
-		reason = fmt.Sprintf("an entry that does not decode (%s)", decodeErrorKind(err))
-	case typ == commandTypeUnset:
+		reason = fmt.Sprintf("an encoding that does not decode (%s)", decodeErrorKind(err))
+	case typ == commandTypeUnset && !hasType(data):
 		reason = "no type"
 	}
 	//nolint:forbidigo // Skipping an entry another replica applies diverges the stores; restart applies it again.
-	panic(fmt.Sprintf("meta: committed entry %d has %s, and this release knows types up to %d; "+
-		"stopping so the entry is not skipped. Upgrade this replica.", index, reason, CommandTxn))
+	panic(fmt.Sprintf("meta: committed entry %d has %s, and this release reads types up to %d; "+
+		"stopping so the entry is not skipped", index, reason, CommandTxn))
+}
+
+// hasType reports whether an entry that decoded sets its type to a value, as
+// opposed to leaving it out or null. Only a rejected entry pays for it.
+func hasType(data []byte) bool {
+	var probe struct {
+		Type json.RawMessage `json:"type"`
+	}
+	return json.Unmarshal(data, &probe) == nil && len(probe.Type) > 0 && string(probe.Type) != "null"
 }
 
 // decodeErrorKind names a decode failure without the bytes it failed on.

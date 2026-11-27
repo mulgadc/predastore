@@ -302,13 +302,13 @@ A failed check, a malformed transaction and a refused write are the same on ever
 
 A committed entry that this release cannot read also stops the process: an entry that does not decode, one with no `type` or a `null` type, or one whose type this release does not know.
 A replica that can read the entry applies it, so answering it and moving on would leave the stores different.
-The batch is discarded, so the applied row stays below the entry, and every start gives the entry to the FSM again.
-The panic names the index and the type, and never the key.
+The batch is discarded, so the applied row stays below the entry. Raft does not replay the log at start: it gives the entry to the FSM again once it knows the commit index, which a leader learns only with a quorum of running voters and a follower learns from the leader.
+The panic names the index and the type, and never the key. It states the fault only; the cases below decide the recovery.
 Recovery depends on the cause:
 
-- An entry that a later release reads: upgrade the replica. It applies the entry from its own log, so it needs no snapshot and no healthy quorum. If a quorum stops, the meta plane is down until enough voters run the later release.
+- An entry that a later release reads: upgrade the replica. It applies the entry from its own log, so it needs no snapshot from another replica, but it applies nothing until a quorum of voters runs again. If a quorum stops, the meta plane is down until enough voters to form a quorum run the later release.
 - An entry that only this replica cannot read, because its copy of the log is damaged: rebuild the replica from an empty data directory, as the `node-rebuild` stress scenario does. The leader sends it the log or a snapshot. This needs a healthy quorum.
-- An entry that no release can read: every replica that reaches it stops, the leader included. No procedure passes the entry yet, so the meta plane stays down. No write at or after the entry was acknowledged.
+- An entry that no release can read: every replica that reaches it stops, the leader included. No procedure passes the entry yet, so the meta plane stays down. A leader on a release before this stop answers such an entry with an error and applies the entries after it, so writes at or after the entry may have been acknowledged; any recovery must keep them.
 
 A replica stop does not make a new command type safe to propose. A new type is proposed only after every voter runs a release that reads it, or under a recorded hard-cutover exception. New semantics take a new command type, never a new field on an old one, because an older replica ignores a field it does not know.
 
