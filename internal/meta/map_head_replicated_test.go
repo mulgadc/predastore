@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/transport"
 	"github.com/stretchr/testify/require"
 )
@@ -109,6 +110,38 @@ func TestAuthorityGetRequiresQuorumForExactBinaryKey(t *testing.T) {
 	}
 	_, err = cluster.client(leader).AuthorityGet(t.Context(), key)
 	require.ErrorIs(t, err, ErrNoLeaderRead)
+}
+
+func TestAuthorityGetRefusesReplicaWithoutExactReadOpcode(t *testing.T) {
+	tr := transport.NewPipeTransport("swap-retry-host", 6301)
+	t.Cleanup(func() { tr.Close() })
+	ln, err := tr.Listen()
+	require.NoError(t, err)
+
+	want := []byte("placement from a prior metadata replica")
+	mux := rpc.NewMux()
+	rpc.RegisterHandler(mux, OpMetaGet, func(_ context.Context, _ MetaRequest, stream transport.Stream) error {
+		return respond(stream, &MetaResponse{Value: want})
+	})
+	srv, err := rpc.NewServer(mux, []transport.Listener{ln}, nil)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		require.NoError(t, <-done)
+	})
+
+	client := newSwapRetryClient(t, swapRetryCfg())
+	key := "objects/\x00\xff"
+	value, err := client.LeaderGet(t.Context(), key)
+	require.NoError(t, err)
+	require.Equal(t, want, value)
+
+	value, err = client.AuthorityGet(t.Context(), key)
+	require.ErrorIs(t, err, ErrNoLeaderRead)
+	require.Empty(t, value)
 }
 
 func TestRaftCannotCompactToFailedMetadataRestore(t *testing.T) {
