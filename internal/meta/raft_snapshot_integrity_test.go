@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/raft"
 	"github.com/stretchr/testify/require"
@@ -95,7 +96,8 @@ func TestRaftRefusesSnapshotTruncatedAtFrameBoundary(t *testing.T) {
 }
 
 func TestRaftFailedInstallsRetainUsableSnapshot(t *testing.T) {
-	store, err := raft.NewFileSnapshotStore(t.TempDir(), 2, io.Discard)
+	dir := t.TempDir()
+	store, err := newSnapshotStore(dir, 2, io.Discard)
 	require.NoError(t, err)
 	addr, receiver := raft.NewInmemTransport("")
 	t.Cleanup(func() { require.NoError(t, receiver.Close()) })
@@ -107,7 +109,7 @@ func TestRaftFailedInstallsRetainUsableSnapshot(t *testing.T) {
 	cfg.LocalID = "receiver"
 	cfg.LogOutput = io.Discard
 	members := raft.Configuration{Servers: []raft.Server{{ID: cfg.LocalID, Address: addr}}}
-	prior, err := store.Create(raft.SnapshotVersionMax, 1, 1, members, 1, receiver)
+	prior, err := store.active.Create(raft.SnapshotVersionMax, 1, 1, members, 1, receiver)
 	require.NoError(t, err)
 	snapshot := snapshotOf(t, map[string][]byte{"key": []byte("acknowledged")})
 	_, err = prior.Write(snapshot)
@@ -119,12 +121,17 @@ func TestRaftFailedInstallsRetainUsableSnapshot(t *testing.T) {
 	node, err := raft.NewRaft(cfg, fsm, logs, logs, store, receiver)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, node.Shutdown().Error()) })
+	require.Eventually(t, func() bool { return node.State() == raft.Leader },
+		5*time.Second, 10*time.Millisecond)
+	log := commandLog(t, 0, Command{Type: CommandPut, Key: []byte("suffix"), Value: []byte("acknowledged after snapshot")})
+	require.NoError(t, node.Apply(log.Data, time.Second).Error())
+	lastApplied := node.AppliedIndex()
 	got, err := fsm.Get("key")
 	require.NoError(t, err)
 	require.Equal(t, []byte("acknowledged"), got)
 
-	damaged := append(snapshotMagic[:len(snapshotMagic):len(snapshotMagic)], 0, 0, 0, 1)
-	for index := uint64(2); index <= 3; index++ {
+	install := func(n *raft.Raft, index uint64, data []byte) (raft.InstallSnapshotResponse, error) {
+		t.Helper()
 		request := &raft.InstallSnapshotRequest{
 			RPCHeader: raft.RPCHeader{
 				ProtocolVersion: raft.ProtocolVersionMax,
@@ -132,15 +139,20 @@ func TestRaftFailedInstallsRetainUsableSnapshot(t *testing.T) {
 				Addr:            []byte(senderAddr),
 			},
 			SnapshotVersion:    raft.SnapshotVersionMax,
-			Term:               node.CurrentTerm() + 1,
+			Term:               n.CurrentTerm() + 1,
 			LastLogIndex:       index,
 			LastLogTerm:        1,
 			Configuration:      raft.EncodeConfiguration(members),
 			ConfigurationIndex: 1,
-			Size:               int64(len(damaged)),
+			Size:               int64(len(data)),
 		}
 		var reply raft.InstallSnapshotResponse
-		err := sender.InstallSnapshot(cfg.LocalID, addr, request, &reply, bytes.NewReader(damaged))
+		err := sender.InstallSnapshot(cfg.LocalID, addr, request, &reply, bytes.NewReader(data))
+		return reply, err
+	}
+	damaged := append(snapshotMagic[:len(snapshotMagic):len(snapshotMagic)], 0, 0, 0, 1)
+	for index := lastApplied + 1; index <= lastApplied+2; index++ {
+		reply, err := install(node, index, damaged)
 		require.ErrorContains(t, err, "read key")
 		require.False(t, reply.Success)
 	}
@@ -151,5 +163,49 @@ func TestRaftFailedInstallsRetainUsableSnapshot(t *testing.T) {
 	for _, candidate := range snapshots {
 		retained = append(retained, candidate.ID)
 	}
-	require.Contains(t, retained, prior.ID(), "failed incoming installs must preserve the usable recovery point")
+	require.Equal(t, []string{prior.ID()}, retained, "failed incoming installs must preserve the usable recovery point")
+	staged, err := os.ReadDir(store.stage)
+	require.NoError(t, err)
+	require.Empty(t, staged)
+
+	// Leave a complete transfer staged as if the process stopped before
+	// it could call Restore. It cannot participate in startup selection.
+	pending, err := store.Create(raft.SnapshotVersionMax, lastApplied+3, 1, members, 1, receiver)
+	require.NoError(t, err)
+	_, err = pending.Write(snapshot)
+	require.NoError(t, err)
+	require.NoError(t, pending.Close())
+	require.NoError(t, node.Shutdown().Error())
+	store, err = newSnapshotStore(dir, 2, io.Discard)
+	require.NoError(t, err)
+	staged, err = os.ReadDir(store.stage)
+	require.NoError(t, err)
+	require.Empty(t, staged)
+
+	// Use a fresh Badger store and no repair peers. Snapshot and replay
+	// alone must recover both acknowledgements.
+	restartedFSM := NewFSM(newTestDB(t))
+	restarted, err := raft.NewRaft(cfg, restartedFSM, logs, logs, store, receiver)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, restarted.Shutdown().Error()) })
+	require.Eventually(t, func() bool {
+		got, err := restartedFSM.Get("suffix")
+		return err == nil && string(got) == "acknowledged after snapshot"
+	}, 5*time.Second, 10*time.Millisecond)
+	got, err = restartedFSM.Get("key")
+	require.NoError(t, err)
+	require.Equal(t, []byte("acknowledged"), got)
+
+	validIndex := restarted.AppliedIndex() + 1
+	valid := snapshotOf(t, map[string][]byte{"key": []byte("installed")})
+	reply, err := install(restarted, validIndex, valid)
+	require.NoError(t, err)
+	require.True(t, reply.Success)
+	published, err := store.List()
+	require.NoError(t, err)
+	require.Len(t, published, 2)
+	require.Equal(t, validIndex, published[0].Index)
+	got, err = restartedFSM.Get("key")
+	require.NoError(t, err)
+	require.Equal(t, []byte("installed"), got)
 }

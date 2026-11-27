@@ -205,7 +205,7 @@ func (s *Server) open() (*rpc.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create bolt store: %w", err)
 	}
-	snapshots, err := raft.NewFileSnapshotStore(filepath.Join(s.cfg.DataDir, "snapshots"), 2, os.Stderr)
+	snapshots, err := newSnapshotStore(filepath.Join(s.cfg.DataDir, "snapshots"), 2, os.Stderr)
 	if err != nil {
 		return nil, fmt.Errorf("create snapshot store: %w", err)
 	}

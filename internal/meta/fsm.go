@@ -598,6 +598,9 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	if err == nil {
 		err = f.rebuildMapHeads()
 	}
+	if err == nil {
+		err = publishInstalledSnapshot(rc)
+	}
 	if err != nil {
 		if rs.wrote {
 			//nolint:forbidigo // A part-restored store must not apply or answer another entry.
@@ -898,6 +901,9 @@ type FSMSnapshot struct {
 // rather than blocking it. Iterating badger also emits the frames in key
 // order, which is what the merging restore below needs.
 func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
+	if staged, ok := sink.(*stagedSnapshot); ok {
+		staged.local = true
+	}
 	started := time.Now()
 	var entries int
 	var written int64
