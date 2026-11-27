@@ -132,5 +132,4 @@ func TestSDKPutObjectIfMatch(t *testing.T) {
 	body, etag := getBody(t, client, key)
 	require.Equal(t, "v3", body)
 	require.Equal(t, aws.ToString(v3.ETag), etag)
-
 }
