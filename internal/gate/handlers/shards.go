@@ -155,7 +155,7 @@ func fullWidth(total int) writeResult {
 // or signature failure arrives here rather than at the end of the body. Those
 // are the client's fault and must not be reported as ours.
 func mapPutErr(err error) *model.S3Error {
-	if errors.Is(err, engine.ErrStoreFull) {
+	if isCapacityWriteFailure(err) {
 		return model.ErrInsufficientStorageError
 	}
 	if s3err, ok := model.IsS3Error(mapChunkedErr(err)); ok && !isInternal(s3err) {
@@ -178,7 +178,7 @@ func isInternal(err *model.S3Error) bool {
 // one makes the storage-failure metric fire on client errors.
 func writeFailureReason(err error) string {
 	switch {
-	case errors.Is(err, engine.ErrStoreFull):
+	case isCapacityWriteFailure(err):
 		return telemetry.WriteReasonStoreFull
 	case errors.Is(err, sigv4.ErrContentSHA256Mismatch),
 		errors.Is(err, chunked.ErrChunkSignature),
@@ -187,6 +187,13 @@ func writeFailureReason(err error) string {
 	default:
 		return telemetry.WriteReasonShardWrite
 	}
+}
+
+// A floor failure is reported as capacity only if every refusing holder was full.
+var errMixedShardFailure = errors.New("capacity and other shard failures")
+
+func isCapacityWriteFailure(err error) bool {
+	return errors.Is(err, engine.ErrStoreFull) && !errors.Is(err, errMixedShardFailure)
 }
 
 // placeShards resolves where an object's shards live, in the ring order
@@ -571,13 +578,15 @@ func collectStreams(ctx context.Context, cfg Config, streams []*shardStream, res
 		}
 	}
 
-	var firstErr error
+	var failures []error
+	capacityFailures := 0
 	for i, s := range streams {
 		result.holders[i] = s.holder
 		outcome := <-s.done
 		if outcome.err != nil {
-			if firstErr == nil {
-				firstErr = outcome.err
+			failures = append(failures, outcome.err)
+			if errors.Is(outcome.err, engine.ErrStoreFull) {
+				capacityFailures++
 			}
 			logShardWriteFailure(ctx, s.holder, i, outcome.err)
 			// The holder took the body and went quiet. Leave it named in the
@@ -603,8 +612,11 @@ func collectStreams(ctx context.Context, cfg Config, streams []*shardStream, res
 	}
 
 	if landed := result.landedCount(); landed < cfg.MinShards() {
+		if capacityFailures > 0 && capacityFailures < len(failures) {
+			failures = append(failures, errMixedShardFailure)
+		}
 		return result, fmt.Errorf("%w: %d of %d shards durable, nodes %v unreachable: %w",
-			errShardWriteFloor, landed, cfg.MinShards(), result.missing, firstErr)
+			errShardWriteFloor, landed, cfg.MinShards(), result.missing, errors.Join(failures...))
 	}
 
 	return result, nil
@@ -836,6 +848,8 @@ func recordShardReadError(ctx context.Context, node config.NodeID, err error) {
 // stale epoch is a node that is up, answering and wrong.
 func shardErrorReason(err error) string {
 	switch {
+	case errors.Is(err, engine.ErrStoreFull):
+		return telemetry.ShardReasonStoreFull
 	case errors.Is(err, blob.ErrEpochMismatch):
 		return telemetry.ShardReasonStaleEpoch
 	case errors.Is(err, blob.ErrNotFound):
