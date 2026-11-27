@@ -32,7 +32,7 @@ func statusTestCfg() *config.Config {
 // startStatusReplica runs one meta replica over a pipe transport, bootstrapping
 // it as a single-node cluster only when bootstrap is true, and returns a
 // client addressed to it plus a cleanup that stops the replica.
-func startStatusReplica(t *testing.T, bootstrap bool) *meta.Client {
+func startStatusReplica(t *testing.T, bootstrap bool, opts ...func(*meta.Config)) *meta.Client {
 	t.Helper()
 	cfg := statusTestCfg()
 
@@ -44,7 +44,7 @@ func startStatusReplica(t *testing.T, bootstrap bool) *meta.Client {
 	serverRes, err := rpc.NewResolver(cfg, 1, serverTr)
 	require.NoError(t, err)
 
-	svc, err := meta.New(meta.Config{
+	metaCfg := meta.Config{
 		NodeID:    1,
 		DataDir:   t.TempDir(),
 		Peers:     []config.NodeID{1},
@@ -57,7 +57,11 @@ func startStatusReplica(t *testing.T, bootstrap bool) *meta.Client {
 		ElectionTimeout:    50 * time.Millisecond,
 		LeaderLeaseTimeout: 50 * time.Millisecond,
 		CommitTimeout:      5 * time.Millisecond,
-	})
+	}
+	for _, opt := range opts {
+		opt(&metaCfg)
+	}
+	svc, err := meta.New(metaCfg)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
