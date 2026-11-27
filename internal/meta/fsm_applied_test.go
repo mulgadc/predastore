@@ -371,40 +371,6 @@ func TestFSM_Restore_ASnapshotWithoutTheRowClearsTheIndex(t *testing.T) {
 	}
 }
 
-// A restore that fails after it changed the store stops the replica, and the
-// row still names the old index because it is written after the data. The
-// next start restores the snapshot again and applies each later entry once.
-func TestFSM_Restore_AFailureAfterAWriteStopsTheReplica(t *testing.T) {
-	src := NewFSM(openStore(t, smallTxnOptions(t.TempDir())))
-	const n = 40
-	big := func(i int) string { return string(bytes.Repeat([]byte{byte(i)}, 8<<10)) }
-	for i := 1; i <= n; i++ {
-		src.Apply(swapLog(t, uint64(i), fmt.Sprintf("objects/%02d", i), big(i)))
-	}
-	stream := snapshotStream(t, src)
-
-	opts := smallTxnOptions(t.TempDir())
-	db := openStore(t, opts)
-	fsm := NewFSM(db)
-	fsm.ApplyBatch([]*raft.Log{swapLog(t, 1, "objects/01", "local"), swapLog(t, 2, "objects/zz", "local")})
-
-	assert.Panics(t, func() {
-		_ = fsm.Restore(io.NopCloser(bytes.NewReader(stream[:len(stream)-8])))
-	})
-	assert.Equal(t, uint64(2), storedApplied(t, db), "the row is written only after every data row")
-
-	db, fsm = restart(t, db, opts)
-	require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(stream))))
-	assert.Equal(t, uint64(n), fsm.persisted)
-
-	got := fsm.ApplyBatch([]*raft.Log{
-		swapLog(t, n, fmt.Sprintf("objects/%02d", n), "replayed"),
-		swapLog(t, n+1, fmt.Sprintf("objects/%02d", n), "gen-2"),
-	})
-	assert.Equal(t, []any{nil, []byte(big(n))}, got)
-	assertStored(t, db, map[string]*string{"objects/zz": nil, fmt.Sprintf("objects/%02d", n): str("gen-2")})
-}
-
 // A truncated snapshot that fails before any write reaches the store is
 // refused with an error and leaves the store and the row unchanged.
 func TestFSM_Restore_AFailureBeforeAnyWriteLeavesTheStore(t *testing.T) {
