@@ -2,12 +2,17 @@ package predastore_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,7 +20,9 @@ import (
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
+	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/model"
+	"github.com/mulgadc/predastore/internal/meta"
 	"github.com/mulgadc/predastore/internal/rpc"
 	"github.com/mulgadc/predastore/internal/testcerts"
 	"github.com/mulgadc/predastore/internal/transport"
@@ -121,6 +128,13 @@ func (c *s3Client) sendTyped(method, path, contentType string, body []byte) (int
 // single-host cluster.
 func withHostBlob(t *testing.T, cfg *config.Config, fn func(bc *blob.Client, blobIDs []config.NodeID)) {
 	t.Helper()
+	withHostClients(t, cfg, func(_ *meta.Client, bc *blob.Client, blobIDs []config.NodeID) { fn(bc, blobIDs) })
+}
+
+// withHostClients runs fn with a meta client and a blob client that reach the
+// nodes of a single-host cluster, as the gate's own clients do.
+func withHostClients(t *testing.T, cfg *config.Config, fn func(mc *meta.Client, bc *blob.Client, blobIDs []config.NodeID)) {
+	t.Helper()
 
 	// A single-host cluster starts no QUIC listener, so its nodes are reachable
 	// only over the in-process pipe the colocated nodes already use. Port 0
@@ -131,19 +145,26 @@ func withHostBlob(t *testing.T, cfg *config.Config, fn func(bc *blob.Client, blo
 	res, err := rpc.NewResolver(cfg, gateNodeID, pipe)
 	require.NoError(t, err)
 
-	var blobIDs []config.NodeID
+	var blobIDs, metaIDs []config.NodeID
 	for _, n := range cfg.Hosts[0].Nodes {
-		if n.Role == config.RoleBlob {
+		switch n.Role {
+		case config.RoleBlob:
 			blobIDs = append(blobIDs, n.ID)
+		case config.RoleMeta:
+			metaIDs = append(metaIDs, n.ID)
+		default:
 		}
 	}
 	connPool := rpc.NewConnPool(blobIDs[0], res)
 	defer connPool.Close()
+	cli := rpc.NewClient(connPool)
 
-	bc, err := blob.NewClient(blob.ClientConfig{Client: rpc.NewClient(connPool)})
+	mc, err := meta.NewClient(meta.ClientConfig{Client: cli, Replicas: metaIDs})
+	require.NoError(t, err)
+	bc, err := blob.NewClient(blob.ClientConfig{Client: cli})
 	require.NoError(t, err)
 
-	fn(bc, blobIDs)
+	fn(mc, bc, blobIDs)
 }
 
 // commitOrphanGeneration writes and commits a newer generation of every shard
@@ -250,10 +271,76 @@ func TestAPublishedOverwriteReplacesTheGenerationItDisplaced(t *testing.T) {
 	}
 }
 
-// A delete that read a placement naming the orphaned generation removes that
-// generation's shards, then stops before its placement removal. The record
-// still names the acknowledged generation, which now exists only as retained
-// rows, and a read must still serve it.
+// racedPlacementMeta lets a delete read a placement that names another
+// generation. The first read of placeKey publishes raced, reads it, and puts
+// the acknowledged record back. A removal of placeKey fails, as a crash would.
+type racedPlacementMeta struct {
+	handlers.MetaClient
+
+	placeKey      string
+	acknowledged  []byte
+	raced         []byte
+	racing        atomic.Bool
+	removeRefused atomic.Int32
+}
+
+var errDeleteStopped = errors.New("the delete stopped before its placement removal")
+
+func (m *racedPlacementMeta) Get(ctx context.Context, key string) ([]byte, error) {
+	if key != m.placeKey || !m.racing.CompareAndSwap(false, true) {
+		return m.MetaClient.Get(ctx, key)
+	}
+
+	if err := m.Put(ctx, key, m.raced); err != nil {
+		return nil, err
+	}
+	data, err := m.MetaClient.Get(ctx, key)
+	if restoreErr := m.Put(ctx, key, m.acknowledged); restoreErr != nil {
+		return nil, restoreErr
+	}
+
+	return data, err
+}
+
+func (m *racedPlacementMeta) Delete(ctx context.Context, key string) error {
+	if key == m.placeKey {
+		m.removeRefused.Add(1)
+		return errDeleteStopped
+	}
+
+	return m.MetaClient.Delete(ctx, key)
+}
+
+// scopedDelete is one DeleteEpoch the inline delete sent, and its answer.
+type scopedDelete struct {
+	node    config.NodeID
+	index   uint32
+	epoch   uint64
+	deleted bool
+}
+
+// recordingBlob records every DeleteEpoch the inline delete sends.
+type recordingBlob struct {
+	handlers.BlobClient
+
+	mu      sync.Mutex
+	deletes []scopedDelete
+}
+
+func (b *recordingBlob) DeleteEpoch(ctx context.Context, node config.NodeID, req blob.CommitRequest) (*blob.DeleteResponse, error) {
+	resp, err := b.BlobClient.DeleteEpoch(ctx, node, req)
+	if err == nil {
+		b.mu.Lock()
+		b.deletes = append(b.deletes, scopedDelete{node: node, index: req.Index, epoch: req.Epoch, deleted: resp.Deleted})
+		b.mu.Unlock()
+	}
+
+	return resp, err
+}
+
+// The inline delete reads a placement naming the orphaned generation, then the
+// acknowledged record is put back. The delete removes the orphan shards and stops
+// before its placement removal, and a read must still serve the retained rows.
 //
 // Verifies: ADR-0003:S7.
 func TestS7_AScopedDeleteThatStopsLeavesARetainedAcknowledgedObjectReadable(t *testing.T) {
@@ -267,20 +354,47 @@ func TestS7_AScopedDeleteThatStopsLeavesARetainedAcknowledgedObjectReadable(t *t
 	require.Equal(t, http.StatusOK, status, "PutObject: %s", body)
 
 	hash := model.ObjectHash(staleBucket, staleObject)
-	shards := cfg.RS.Data + cfg.RS.Parity
-	commitOrphanGeneration(t, cfg, hash, shards)
-	withHostBlob(t, cfg, func(bc *blob.Client, blobIDs []config.NodeID) {
-		for _, id := range blobIDs {
-			for idx := range shards {
-				resp, err := bc.DeleteEpoch(t.Context(), id,
-					blob.CommitRequest{Key: hash, Index: uint32(idx), Epoch: orphanEpoch})
-				require.NoError(t, err, "scoped delete of orphan shard %d on node %d", idx, id)
-				require.True(t, resp.Deleted, "the orphan shard %d on node %d was not removed", idx, id)
+	commitOrphanGeneration(t, cfg, hash, cfg.RS.Data+cfg.RS.Parity)
 
-				_, err = bc.Stat(t.Context(), id, blob.StatRequest{Key: hash, Index: uint32(idx)})
-				require.ErrorIs(t, err, blob.ErrNotFound, "position %d on node %d still has a live row", idx, id)
-			}
+	withHostClients(t, cfg, func(mc *meta.Client, bc *blob.Client, _ []config.NodeID) {
+		placeKey := handlers.TableKey(model.TableObjects, string(hash[:]))
+		acknowledged, err := mc.Get(t.Context(), placeKey)
+		require.NoError(t, err)
+		place, err := handlers.DecodePlacement(acknowledged)
+		require.NoError(t, err)
+		require.NotEqual(t, orphanEpoch, place.WriteEpoch, "setup: the record must name the acknowledged generation")
+		orphanPlace := place
+		orphanPlace.WriteEpoch = orphanEpoch
+		raced, err := handlers.EncodePlacement(orphanPlace)
+		require.NoError(t, err)
+
+		rm := &racedPlacementMeta{MetaClient: mc, placeKey: placeKey, acknowledged: acknowledged, raced: raced}
+		rb := &recordingBlob{BlobClient: bc}
+		cache := handlers.NewBucketCache(nil)
+		reqCtx := handlers.WithObject(handlers.WithBucket(t.Context(), model.Bucket{Name: staleBucket}),
+			model.Object{Bucket: model.Bucket{Name: staleBucket}, Key: staleObject})
+		req := httptest.NewRequest(http.MethodDelete, "/"+staleBucket+"/"+staleObject, nil).WithContext(reqCtx)
+		rr := httptest.NewRecorder()
+		handlers.DeleteObject(rm, rb, cache, handlers.Config{
+			Region: cfg.Region, DataShards: cfg.RS.Data, ParityShards: cfg.RS.Parity,
+		}).ServeHTTP(rr, req)
+		require.Equal(t, http.StatusInternalServerError, rr.Code, "setup: the delete must stop at its placement removal: %s", rr.Body.String())
+		require.Equal(t, int32(1), rm.removeRefused.Load(), "setup: the delete must reach its placement removal once")
+
+		positions := place.AllNodes()
+		require.Len(t, rb.deletes, len(positions), "the delete must send one scoped delete per position")
+		for _, d := range rb.deletes {
+			require.Equal(t, orphanEpoch, d.epoch, "the delete must name the generation its placement read named")
+			require.True(t, d.deleted, "the orphan shard %d on node %d was not removed", d.index, d.node)
 		}
+		for idx, id := range positions {
+			_, err := bc.Stat(t.Context(), id, blob.StatRequest{Key: hash, Index: uint32(idx)})
+			require.ErrorIs(t, err, blob.ErrNotFound, "position %d on node %d still has a live row", idx, id)
+		}
+
+		current, err := mc.Get(t.Context(), placeKey)
+		require.NoError(t, err)
+		require.Equal(t, acknowledged, current, "setup: the record must name the acknowledged generation again")
 	})
 
 	status, got, after := c.sendTyped(http.MethodGet, "/"+staleBucket+"/"+staleObject, "", nil)
