@@ -150,7 +150,8 @@ type FSM struct {
 	// applied is the last index Apply saw. raft does not tell Snapshot which
 	// index it is capturing, so a snapshot log line can only name one if the
 	// FSM tracks it.
-	applied atomic.Uint64
+	applied         atomic.Uint64
+	authorityWaiter atomic.Pointer[chan struct{}]
 
 	// persisted is the index the applied row names: the store already holds
 	// every entry at or below it, so ApplyBatch skips them. Guarded by mu.
@@ -302,6 +303,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 	b.end()
 	f.applyMapHeadChanges(mapHeadChanges)
 	f.applied.Store(logs[len(logs)-1].Index)
+	f.signalAuthorityApply()
 
 	return responses
 }

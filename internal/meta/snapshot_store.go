@@ -85,6 +85,7 @@ func (s *snapshotStore) Open(id string) (*raft.SnapshotMeta, io.ReadCloser, erro
 
 type stagedSnapshot struct {
 	raft.SnapshotSink
+
 	owner *snapshotStore
 	files *raft.FileSnapshotStore
 	dir   string
@@ -150,6 +151,7 @@ func (s *stagedSnapshot) publish() error {
 
 type snapshotInstall struct {
 	io.ReadCloser
+
 	staged *stagedSnapshot
 	closed bool
 }
