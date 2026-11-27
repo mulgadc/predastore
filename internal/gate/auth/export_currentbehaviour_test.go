@@ -230,3 +230,10 @@ func mustUnmarshalInto(t *testing.T, b []byte, v any) {
 		t.Fatalf("unmarshal fixture record: %v", err)
 	}
 }
+
+// NewAdmissionTestProvider builds a real NATSIAMProvider over a fake accounts
+// bucket for the external admission tests. getErr, when set, makes every
+// bucket read fail with that error, simulating an unavailable directory.
+func NewAdmissionTestProvider(t *testing.T, accounts map[string][]byte, getErr error) *NATSIAMProvider {
+	return newGateProvider(t, &fakeKV{data: accounts, getErr: getErr})
+}

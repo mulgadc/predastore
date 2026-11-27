@@ -282,10 +282,14 @@ type Bucket struct {
 // AuthEntry is one config-defined service account, as it appears under
 // [[auth]].
 type AuthEntry struct {
-	AccessKeyID     string       `toml:"access_key_id"`
-	SecretAccessKey string       `toml:"secret_access_key"`
-	AccountID       string       `toml:"account_id"`
-	Policy          []PolicyRule `toml:"policy"`
+	AccessKeyID     string `toml:"access_key_id"`
+	SecretAccessKey string `toml:"secret_access_key"`
+	AccountID       string `toml:"account_id"`
+	// Policy is presence-tracked by nil-ness: the TOML decoder leaves it nil
+	// when omitted and allocates an empty slice for an explicit `policy = []`,
+	// so omitted means unrestricted (the system root key's form) and an
+	// explicitly empty list denies everything.
+	Policy []PolicyRule `toml:"policy"`
 }
 
 // PolicyRule grants a config-defined account a set of actions on a bucket.

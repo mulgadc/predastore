@@ -31,10 +31,11 @@ func TestCredentialResult_IsIAMUser(t *testing.T) {
 // --- ConfigProvider tests ---
 
 func TestConfigProvider_Found(t *testing.T) {
-	p := NewConfigProvider([]Entry{
+	p, err := NewConfigProvider([]Entry{
 		{AccessKeyID: "AK1", SecretAccessKey: "SK1", AccountID: "acct-1"},
 		{AccessKeyID: "AK2", SecretAccessKey: "SK2", AccountID: "acct-2"},
 	})
+	require.NoError(t, err)
 
 	result, err := p.LookupCredentials("AK2")
 	require.NoError(t, err)
@@ -44,17 +45,19 @@ func TestConfigProvider_Found(t *testing.T) {
 }
 
 func TestConfigProvider_NotFound(t *testing.T) {
-	p := NewConfigProvider([]Entry{
+	p, err := NewConfigProvider([]Entry{
 		{AccessKeyID: "AK1", SecretAccessKey: "SK1"},
 	})
+	require.NoError(t, err)
 
-	_, err := p.LookupCredentials("AK_MISSING")
+	_, err = p.LookupCredentials("AK_MISSING")
 	assert.Error(t, err)
 }
 
 func TestConfigProvider_Empty(t *testing.T) {
-	p := NewConfigProvider(nil)
-	_, err := p.LookupCredentials("AK1")
+	p, err := NewConfigProvider(nil)
+	require.NoError(t, err)
+	_, err = p.LookupCredentials("AK1")
 	assert.Error(t, err)
 }
 

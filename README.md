@@ -38,9 +38,9 @@ Standalone is enough when a fixed set of service accounts and buckets, written i
 | | Standalone | Under Spinifex |
 |---|---|---|
 | Credentials | `[[auth]]` entries in the TOML | IAM access keys in NATS KV, plus the config accounts |
-| Authorisation | none — every config account is fully trusted | IAM policies, evaluated per request |
+| Authorisation | an entry without `policy` is fully trusted; `policy` rules are evaluated per request | IAM policies, evaluated per request |
 | Buckets | `[[bucket]]` entries, plus whatever clients create | created through the API, owned per account |
-| Multiple tenants | no — every key reaches every bucket | yes, enforced by account ownership |
+| Multiple tenants | scoped entries only: an entry with `policy` rules is confined to the buckets and actions they name, and an entry without a `policy` list is unrestricted | yes, enforced by account ownership |
 | Users, groups, roles | no | IAM users, groups and roles |
 | Temporary credentials | no | STS assumed-role sessions |
 | Rotating a key | edit the TOML, restart the host | `CreateAccessKey`, no restart |
@@ -48,7 +48,7 @@ Standalone is enough when a fixed set of service accounts and buckets, written i
 | Cluster topology | you write the TOML | generated from the joined node set |
 | External dependencies | none | NATS, and the Spinifex daemon that populates it |
 
-The second row is the one that decides most deployments. A config-defined account in `[[auth]]` bypasses both policy evaluation and the bucket-ownership check, so every key in the file reaches every bucket in the cluster no matter which account owns it. Standalone predastore cannot hand out a credential that is less than total, and that — rather than any missing S3 operation — is what a multi-tenant deployment needs Spinifex for.
+The second row is the one that decides most deployments. A config-defined account without a `policy` list bypasses both policy evaluation and the bucket-ownership check, so every such key in the file reaches every bucket in the cluster no matter which account owns it. An entry with `policy` rules is confined to them, but scoped keys still share one static config: credentials that change without a restart, users, groups, roles and temporary sessions remain Spinifex territory — see [Standalone or Spinifex?](#standalone-or-spinifex).
 
 ## Quick Start
 
@@ -332,7 +332,7 @@ Write every node under one `[[host]]` and the cluster runs in one process over t
 
 ### Accounts and Buckets
 
-`[[auth]]` is the whole of standalone access control. An entry's `account_id` is mandatory and becomes the owner of any bucket that key creates, but it does not confine the key: a config-defined account skips both policy evaluation and the bucket-ownership check, so it reads and writes every bucket in the cluster whoever owns it. Declare as few as the deployment needs, and use Spinifex if credentials have to be scoped — see [Standalone or Spinifex?](#standalone-or-spinifex).
+`[[auth]]` is the whole of standalone access control. An entry's `account_id` is mandatory and becomes the owner of any bucket that key creates. An entry without a `policy` list is fully trusted: it skips policy evaluation and the bucket-ownership check, so it reads and writes every bucket in the cluster whoever owns it. An entry with `policy` rules is confined to them: the rules are evaluated per request like IAM policies, and the ownership check applies, so the key reaches only what the rules grant. An explicitly empty `policy = []` denies the account everything, and the gate warns at startup. Scoping is trustworthy only once every gate serving the key runs a build that enforces it: remove or rotate scoped keys before an older gate returns to service. Declare as few unrestricted entries as the deployment needs — see [Standalone or Spinifex?](#standalone-or-spinifex). Upgrading from a build that ignored `policy` rules turns every declared policy on at once: an entry whose policy was decorative loses the access it named, most importantly the system key. Remove the `policy` list from entries that must stay unrestricted before or with the upgrade.
 
 `[[bucket]]` declares a bucket that exists from startup without a `CreateBucket` call, which is what a deployment with a fixed set of them wants. `account_id` is required and an entry missing it refuses the whole config, while an entry with an invalid name is dropped with a warning rather than being fatal. `public = true` serves GET and HEAD without a signature, and is worth setting only on a bucket genuinely meant to be world-readable.
 
@@ -396,9 +396,9 @@ master_key_path    = "/etc/spinifex/master.key"    # absolute; decrypts the stor
 access_keys_bucket = "spinifex-iam-access-keys"
 ```
 
-That table is the whole of it. With it present the gate opens Spinifex's JetStream KV buckets directly — there is no RPC and no callback into the control plane — and resolves an access key to the user, groups, roles and policies attached to it, decrypting each stored secret with the shared master key. A key prefixed `ASIA` is resolved as an STS session instead. Config-defined `[[auth]]` accounts are still matched first, so the service credentials in the file keep working whatever IAM holds.
+That table is the whole of it. With it present the gate opens Spinifex's JetStream KV buckets directly — there is no RPC and no callback into the control plane — and resolves an access key to the user, groups, roles and policies attached to it, decrypting each stored secret with the shared master key. A key prefixed `ASIA` is resolved as an STS session instead. Config-defined `[[auth]]` accounts are still matched first, so the service credentials in the file keep working whatever IAM holds, with one exception: only the protected control-plane accounts (`000000000000` and `000000000001`) skip IAM admission, and only with a policy-less key. Every other entry — including a policy-less one — needs an ACTIVE account record like any IAM credential, so a missing or unavailable directory refuses it.
 
-The connection retries indefinitely and the KV buckets are opened lazily, so predastore starts cleanly before the Spinifex daemon has created them and recovers on its own when NATS restarts. What the table buys is per-request authorisation: IAM users and roles, policy evaluation, temporary session credentials, and account ownership that genuinely separates tenants. Without it every credential is a root credential — see [Standalone or Spinifex?](#standalone-or-spinifex).
+The connection retries indefinitely and the KV buckets are opened lazily, so predastore starts cleanly before the Spinifex daemon has created them and recovers on its own when NATS restarts. What the table buys is per-request authorisation: IAM users and roles, policy evaluation, temporary session credentials, and account ownership that genuinely separates tenants. Without it every credential without a `policy` list is a root credential — see [Standalone or Spinifex?](#standalone-or-spinifex).
 
 Spinifex also leans on predastore as the store behind several of its own services, all of it ordinary S3 traffic through the same gate:
 

@@ -328,13 +328,13 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			}
 			if len(credResult.PolicyDocuments) == 0 {
 				slog.DebugContext(r.Context(), "No policies resolved for user, implicit deny",
-					"accessKeyID", accessKey, "accountID", credResult.AccountID)
+					"accountID", credResult.AccountID)
 			}
 			authorize = func(objectAction, objectKey string) bool {
 				objectResource := s3Resource(bucket, objectKey)
 				if iampolicy.EvaluateWithKeys(objectAction, objectResource, credResult.PolicyDocuments, keys) != iampolicy.Allow {
 					slog.DebugContext(r.Context(), "S3 access denied by policy",
-						"action", objectAction, "resource", objectResource, "accessKeyID", accessKey)
+						"action", objectAction, "resource", objectResource, "accountID", credResult.AccountID)
 					return false
 				}
 				return endpoint.permits(r.Context(), objectAction, objectResource, keys)
@@ -342,7 +342,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			if !isBulkDelete(r, key) && iampolicy.EvaluateWithKeys(action, resource, credResult.PolicyDocuments, keys) == iampolicy.Deny {
 				slog.DebugContext(r.Context(), "S3 access denied by policy",
 					"action", action, "resource", resource,
-					"accessKeyID", accessKey, "policyCount", len(credResult.PolicyDocuments))
+					"accountID", credResult.AccountID, "policyCount", len(credResult.PolicyDocuments))
 				handlers.WriteS3Error(w, r, http.StatusForbidden, "AccessDenied", "Access Denied")
 				return
 			}
@@ -363,7 +363,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			meta, err := handlers.ResolveBucketMetadata(r.Context(), s.cfg.Meta, s.handlerCfg, bucket)
 			if err != nil {
 				slog.ErrorContext(r.Context(), "Failed to resolve bucket metadata for ownership check",
-					"bucket", bucket, "error", err, "accessKeyID", accessKey)
+					"bucket", bucket, "error", err, "accountID", credResult.AccountID)
 				handlers.WriteS3Error(w, r, http.StatusInternalServerError, "InternalError",
 					"An internal error occurred")
 				return
@@ -372,7 +372,6 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 			// existence is reported consistently with non-authenticated paths.
 			if meta != nil && !bucketAccessAllowed(method, credResult.AccountID, meta, credResult.SkipPolicyCheck) {
 				slog.WarnContext(r.Context(), "Cross-account bucket access denied",
-					"accessKeyID", accessKey,
 					"callerAccountID", credResult.AccountID,
 					"bucketAccountID", meta.AccountID,
 					"bucket", bucket,

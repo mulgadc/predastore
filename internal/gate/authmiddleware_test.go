@@ -25,15 +25,17 @@ func TestSigV4AuthMiddleware(t *testing.T) {
 		Region: "ap-southeast-2",
 		Buckets: []handlers.BucketConfig{
 			{
-				Name:   "test-bucket01",
-				Region: "ap-southeast-2",
-				Public: false, // Not public - requires authentication
+				Name:      "test-bucket01",
+				Region:    "ap-southeast-2",
+				Public:    false, // Not public - requires authentication
+				AccountID: "000000000001",
 			},
 		},
 		Auth: []auth.Entry{
 			{
 				AccessKeyID:     "TESTACCESSKEY",
 				SecretAccessKey: "TESTSECRETKEY",
+				AccountID:       "000000000001",
 				Policy: []auth.PolicyRule{
 					{
 						Bucket:  "test-bucket01",

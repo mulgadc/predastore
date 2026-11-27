@@ -17,6 +17,7 @@ import (
 	iamarn "github.com/mulgadc/bluebottle/pkg/auth"
 	"github.com/mulgadc/bluebottle/pkg/iampolicy"
 	"github.com/mulgadc/bluebottle/pkg/masterkey"
+	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -35,9 +36,10 @@ type CredentialResult struct {
 	AccountID       string
 	UserName        string
 	// SkipPolicyCheck marks the caller as a trusted config-based service
-	// account. It bypasses both the IAM policy check AND the bucket-ownership
-	// check, granting unrestricted access to every bucket regardless of owner.
-	// Adding an [[auth]] entry to predastore.toml therefore grants god-mode.
+	// account with no policy rules: it bypasses both the IAM policy check AND
+	// the bucket-ownership check, granting unrestricted access to every bucket
+	// regardless of owner. A config entry that declares policy rules skips
+	// nothing and is evaluated like any NATS-sourced credential.
 	SkipPolicyCheck bool
 	PolicyDocuments []iampolicy.PolicyDocument // resolved policies (only for NATS-sourced credentials)
 	// PrincipalType is "user" or "assumed-role", mirroring the session record.
@@ -160,27 +162,83 @@ type iamPolicy struct {
 
 // ConfigProvider looks up credentials from the static config Auth entries.
 type ConfigProvider struct {
-	entries []Entry
+	computed []computedEntry
 }
 
 var _ CredentialProvider = (*ConfigProvider)(nil)
 
-// NewConfigProvider creates a provider backed by static config entries.
-func NewConfigProvider(entries []Entry) *ConfigProvider {
-	return &ConfigProvider{entries: entries}
+// computedEntry holds what a lookup needs, resolved once at construction: a
+// scoped entry carries its evaluated policy documents; an entry without a
+// policy keeps the unrestricted bypass the system root key relies on.
+type computedEntry struct {
+	accessKeyID     string
+	secretAccessKey string
+	accountID       string
+	skipPolicyCheck bool
+	documents       []iampolicy.PolicyDocument
+}
+
+// NewConfigProvider validates and precomputes the entries. An invalid bucket
+// selector is a startup error, not a per-request surprise. A policy that is
+// present but empty denies everything, which is worth a startup warning
+// because an operator who wrote `policy = []` meant something by it.
+func NewConfigProvider(entries []Entry) (*ConfigProvider, error) {
+	computed := make([]computedEntry, 0, len(entries))
+	for i, entry := range entries {
+		ce := computedEntry{
+			accessKeyID:     entry.AccessKeyID,
+			secretAccessKey: entry.SecretAccessKey,
+			accountID:       entry.AccountID,
+		}
+		if entry.Policy == nil {
+			ce.skipPolicyCheck = true
+		} else {
+			for _, rule := range entry.Policy {
+				if rule.Bucket == "*" {
+					continue
+				}
+				if err := (model.Bucket{Name: rule.Bucket}).Validate(); err != nil {
+					return nil, fmt.Errorf("auth entry %d (account %s): invalid bucket selector %q: %w", i, entry.AccountID, rule.Bucket, err)
+				}
+			}
+			if len(entry.Policy) == 0 {
+				slog.Warn("Config auth entry declares an empty policy; the account can do nothing",
+					"entryIndex", i, "accountID", entry.AccountID)
+			}
+			ce.documents = policyDocumentsFromRules(entry.Policy)
+		}
+		computed = append(computed, ce)
+	}
+	return &ConfigProvider{computed: computed}, nil
 }
 
 func (p *ConfigProvider) LookupCredentials(accessKeyID string) (*CredentialResult, error) {
-	for _, entry := range p.entries {
-		if entry.AccessKeyID == accessKeyID {
+	for _, ce := range p.computed {
+		if ce.accessKeyID == accessKeyID {
 			return &CredentialResult{
-				SecretAccessKey: entry.SecretAccessKey,
-				AccountID:       entry.AccountID,
-				SkipPolicyCheck: true,
+				SecretAccessKey: ce.secretAccessKey,
+				AccountID:       ce.accountID,
+				SkipPolicyCheck: ce.skipPolicyCheck,
+				PolicyDocuments: ce.documents,
 			}, nil
 		}
 	}
 	return nil, ErrKeyNotFound
+}
+
+// policyDocumentsFromRules turns config policy rules into the document shape
+// the IAM evaluator consumes, so scoped config accounts traverse the same
+// authorization path as NATS-sourced credentials.
+func policyDocumentsFromRules(rules []PolicyRule) []iampolicy.PolicyDocument {
+	doc := iampolicy.PolicyDocument{Version: "2012-10-17"}
+	for _, rule := range rules {
+		doc.Statement = append(doc.Statement, iampolicy.Statement{
+			Effect:   "Allow",
+			Action:   iampolicy.StringOrArr(rule.Actions),
+			Resource: iampolicy.StringOrArr{"arn:aws:s3:::" + rule.Bucket, "arn:aws:s3:::" + rule.Bucket + "/*"},
+		})
+	}
+	return []iampolicy.PolicyDocument{doc}
 }
 
 func (p *ConfigProvider) Close() {}
