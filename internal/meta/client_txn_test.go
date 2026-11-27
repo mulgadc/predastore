@@ -49,7 +49,13 @@ func (r *txnReplica) calls() int {
 // startTxnReplica serves r as node 1 of swapRetryCfg.
 func startTxnReplica(t *testing.T, r *txnReplica) {
 	t.Helper()
-	tr := transport.NewPipeTransport("swap-retry-host", 6301)
+	startTxnReplicaOn(t, r, 6301)
+}
+
+// startTxnReplicaOn serves r on port of the swapRetryCfg host.
+func startTxnReplicaOn(t *testing.T, r *txnReplica, port int) {
+	t.Helper()
+	tr := transport.NewPipeTransport("swap-retry-host", port)
 	t.Cleanup(func() { tr.Close() })
 	ln, err := tr.Listen()
 	require.NoError(t, err)
@@ -75,21 +81,29 @@ var (
 
 // A reply lost after the replica received the whole request may follow an
 // applied transaction, so the client must answer unknown and send nothing
-// again: a second apply could publish a record the cluster has moved past.
+// again, not even to another reachable replica: a second apply could publish
+// a record the cluster has moved past.
 func TestClientTxn_ALostReplyIsUnknownAndNotResent(t *testing.T) {
-	replica := &txnReplica{answer: func(stream transport.Stream) error {
+	cfg := swapRetryCfg()
+	cfg.Hosts[0].Nodes = append(cfg.Hosts[0].Nodes, config.Node{ID: 3, Role: config.RoleMeta, Port: 6303})
+	lossy := &txnReplica{answer: func(stream transport.Stream) error {
 		stream.CancelWrite(0)
 		return nil
 	}}
-	startTxnReplica(t, replica)
-	client := newSwapRetryClient(t, swapRetryCfg())
+	startTxnReplicaOn(t, lossy, 6301)
+	next := &txnReplica{answer: func(stream transport.Stream) error {
+		return respond(stream, &MetaResponse{})
+	}}
+	startTxnReplicaOn(t, next, 6303)
+	client := newTxnClient(t, cfg, 1, 3)
 
 	outcome, current, err := client.Txn(context.Background(), txnChecks, txnWrites)
 
 	assert.Equal(t, TxnUnknown, outcome)
 	require.ErrorIs(t, err, ErrTxnUnknown)
 	assert.Nil(t, current)
-	assert.Equal(t, 1, replica.calls(), "the transaction was sent %d times", replica.calls())
+	assert.Equal(t, 1, lossy.calls(), "the transaction was sent %d times", lossy.calls())
+	assert.Zero(t, next.calls(), "the client failed over after an ambiguous send")
 }
 
 // An error envelope can follow a proposal: raft reports a lost leadership
@@ -171,19 +185,7 @@ func TestClientTxn_AnUndeliveredAttemptMovesToTheNextReplica(t *testing.T) {
 		}})
 	}}
 	startTxnReplica(t, replica)
-
-	tr := transport.NewPipeTransport("swap-retry-client", 0)
-	t.Cleanup(func() { tr.Close() })
-	res, err := rpc.NewResolver(cfg, 2, tr)
-	require.NoError(t, err)
-	pool := rpc.NewConnPool(2, res)
-	t.Cleanup(func() { pool.Close() })
-	client, err := NewClient(ClientConfig{
-		Client:   rpc.NewClient(pool),
-		Replicas: []config.NodeID{3, 1},
-		Timeout:  2 * time.Second,
-	})
-	require.NoError(t, err)
+	client := newTxnClient(t, cfg, 3, 1)
 
 	outcome, current, err := client.Txn(context.Background(), txnChecks, txnWrites)
 
@@ -203,4 +205,22 @@ func TestClientTxn_NoReachableReplicaIsRefused(t *testing.T) {
 	assert.Equal(t, TxnRefused, outcome)
 	require.ErrorIs(t, err, ErrTxnRefused)
 	assert.ErrorIs(t, err, ErrUndelivered)
+}
+
+// newTxnClient builds a client, as node 2 of cfg, that tries replicas in order.
+func newTxnClient(t *testing.T, cfg *config.Config, replicas ...config.NodeID) *Client {
+	t.Helper()
+	tr := transport.NewPipeTransport("swap-retry-client", 0)
+	t.Cleanup(func() { tr.Close() })
+	res, err := rpc.NewResolver(cfg, 2, tr)
+	require.NoError(t, err)
+	pool := rpc.NewConnPool(2, res)
+	t.Cleanup(func() { pool.Close() })
+	client, err := NewClient(ClientConfig{
+		Client:   rpc.NewClient(pool),
+		Replicas: replicas,
+		Timeout:  2 * time.Second,
+	})
+	require.NoError(t, err)
+	return client
 }
