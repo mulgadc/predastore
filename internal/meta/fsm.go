@@ -790,23 +790,41 @@ func (f *FSM) restoreByReplace(r *bufio.Reader, started time.Time, rs *restoreSt
 			"node", f.node, "reason", "unsorted snapshot, restored by replacement")
 	}
 
-	rs.wrote = true
-	if err := f.db.DropAll(); err != nil {
-		return fmt.Errorf("restore: drop existing data: %w", err)
+	// The drop waits for the first decoded row, so a legacy snapshot that
+	// fails to decode leaves the store as it was and raft can fall back.
+	var wb *badger.WriteBatch
+	drop := func() error {
+		if wb != nil {
+			return nil
+		}
+		rs.wrote = true
+		if err := f.db.DropAll(); err != nil {
+			return fmt.Errorf("restore: drop existing data: %w", err)
+		}
+		wb = f.db.NewWriteBatch()
+		return nil
 	}
-
-	wb := f.db.NewWriteBatch()
-	defer wb.Cancel()
+	defer func() {
+		if wb != nil {
+			wb.Cancel()
+		}
+	}()
 
 	var entries int
 	err := streamSnapshot(r, func(key, value []byte) error {
 		if taken, err := rs.takeApplied(key, value); taken || err != nil {
 			return err
 		}
+		if err := drop(); err != nil {
+			return err
+		}
 		entries++
 		return wb.Set(key, value)
 	})
 	if err != nil {
+		return err
+	}
+	if err := drop(); err != nil {
 		return err
 	}
 
