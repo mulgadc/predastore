@@ -41,6 +41,12 @@ type suspectSet struct {
 	evicted atomic.Uint64
 }
 
+// entryOf is the entry an element holds; the list holds nothing else.
+func entryOf(e *list.Element) *suspectEntry {
+	entry, _ := e.Value.(*suspectEntry)
+	return entry
+}
+
 func newSuspectSet() *suspectSet {
 	return &suspectSet{order: list.New(), entries: make(map[shardPosition]*list.Element)}
 }
@@ -50,7 +56,7 @@ func (s *suspectSet) add(pos shardPosition, epoch uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e, ok := s.entries[pos]; ok {
-		entry := e.Value.(*suspectEntry)
+		entry := entryOf(e)
 		if entry.epoch == epoch {
 			return false
 		}
@@ -60,7 +66,8 @@ func (s *suspectSet) add(pos shardPosition, epoch uint64) bool {
 	}
 	if s.order.Len() >= suspectCap {
 		oldest := s.order.Front()
-		delete(s.entries, s.order.Remove(oldest).(*suspectEntry).pos)
+		delete(s.entries, entryOf(oldest).pos)
+		s.order.Remove(oldest)
 		s.evicted.Add(1)
 	}
 	s.entries[pos] = s.order.PushBack(&suspectEntry{pos: pos, epoch: epoch})
@@ -76,7 +83,7 @@ func (s *suspectSet) suspect(pos shardPosition, epoch uint64) bool {
 	if !ok {
 		return false
 	}
-	if e.Value.(*suspectEntry).epoch == epoch {
+	if entryOf(e).epoch == epoch {
 		return true
 	}
 	s.order.Remove(e)
@@ -89,7 +96,7 @@ func (s *suspectSet) clear(pos shardPosition, epoch uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.entries[pos]
-	if !ok || (epoch != 0 && e.Value.(*suspectEntry).epoch != epoch) {
+	if !ok || (epoch != 0 && entryOf(e).epoch != epoch) {
 		return
 	}
 	s.order.Remove(e)

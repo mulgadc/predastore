@@ -535,13 +535,13 @@ func (store *Store) lookup(rowKey []byte, key [32]byte, index uint32) (Reader, e
 	buf, held := takeFragWindow(ext.PSize / totalFragSize)
 
 	return &reader{
-		key:     key,
-		index:   index,
-		epoch:   epoch,
-		storeID: store.storeID,
-		aead:    store.aead,
-		seg:     seg,
-		ext:     ext,
+		key:      key,
+		index:    index,
+		epoch:    epoch,
+		storeID:  store.storeID,
+		aead:     store.aead,
+		seg:      seg,
+		ext:      ext,
 		buf:      buf,
 		held:     held,
 		latency:  store.latency,

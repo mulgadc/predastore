@@ -236,8 +236,10 @@ func TestAFailingSealIsAttemptedOncePerRetryWindow(t *testing.T) {
 		attempts.Add(1)
 		return errors.New("injected key check write failure")
 	}
-	if !tryRead(st, old, 0) || !tryRead(st, old, 0) {
-		t.Fatal("the value must read")
+	for range 2 {
+		if !tryRead(st, old, 0) {
+			t.Fatal("the value must read")
+		}
 	}
 	if becomesVerified(st) {
 		t.Fatal("a seal that failed must not verify the key")

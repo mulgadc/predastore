@@ -27,7 +27,7 @@ var (
 func largeBucket(b *testing.B) (*countingMeta, []string) {
 	b.Helper()
 	largeOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "list-large-")
+		dir, err := os.MkdirTemp("", "list-large-") //nolint:usetesting // Built once and shared by every benchmark, so it outlives any one b.TempDir.
 		if err != nil {
 			b.Fatal(err)
 		}

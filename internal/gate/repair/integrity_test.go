@@ -311,7 +311,7 @@ func newS3Fixture(t *testing.T, k, m, nodeCount int) *s3Fixture {
 // suspect reports whether the node holding shard index marks it suspect.
 func (f *s3Fixture) suspect(t *testing.T, index int) bool {
 	t.Helper()
-	held, err := f.nodes.client.Stat(context.Background(), f.place.AllNodes()[index], blob.StatRequest{Key: f.hash, Index: uint32(index)}) //nolint:gosec // G115: a stripe index.
+	held, err := f.nodes.client.Stat(context.Background(), f.place.AllNodes()[index], blob.StatRequest{Key: f.hash, Index: uint32(index)})
 	require.NoError(t, err)
 	return held.Suspect
 }

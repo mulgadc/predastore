@@ -2,16 +2,16 @@ package handlers
 
 import (
 	"context"
-	"slices"
-	"time"
 	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/meta"
