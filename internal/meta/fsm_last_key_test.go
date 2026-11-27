@@ -154,6 +154,7 @@ func (s *snapshotStoreCaptureGate) Create(version raft.SnapshotVersion, index, t
 func TestUnsupportedRestorePreservesCapturedSnapshot(t *testing.T) {
 	key := testHeadPrefix + "1"
 	fsm := NewFSM(newTestDB(t))
+	require.NoError(t, fsm.rebuildMapHeads())
 	files, err := raft.NewFileSnapshotStore(t.TempDir(), 1, io.Discard)
 	require.NoError(t, err)
 	store := &snapshotStoreCaptureGate{

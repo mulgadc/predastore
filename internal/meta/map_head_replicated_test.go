@@ -107,7 +107,8 @@ func TestRaftCannotCompactToFailedMetadataRestore(t *testing.T) {
 	firstLog, err := replica.bolt.FirstIndex()
 	require.NoError(t, err)
 
-	require.Error(t, replica.fsm.Restore(io.NopCloser(bytes.NewReader([]byte("{")))))
+	truncated := append(snapshotMagic[:len(snapshotMagic):len(snapshotMagic)], 0, 0, 0, 1)
+	require.Error(t, replica.fsm.Restore(io.NopCloser(bytes.NewReader(truncated))))
 	require.Error(t, replica.raft.Snapshot().Error())
 	_, err = cluster.client(leader).LeaderLastKey(ctx, testHeadPrefix)
 	require.ErrorIs(t, err, ErrNoLeaderRead)
