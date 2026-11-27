@@ -199,3 +199,21 @@ func TestTheCaptureDoesNotScaleWithTheStore(t *testing.T) {
 	assert.LessOrEqual(t, large, small+2,
 		"the capture grew with the store, so it is not a point-in-time view")
 }
+
+// A legacy JSON snapshot that fails to decode is an error, not a stop, and
+// leaves the store as it was, so raft can restore an older snapshot instead.
+func TestAMalformedLegacySnapshotLeavesTheStoreForFallback(t *testing.T) {
+	db := newTestDB(t)
+	fsm := NewFSM(db)
+	fsm.Apply(swapLog(t, 3, "objects/k", "gen-1"))
+	before := dumpStore(t, db)
+
+	var err error
+	require.NotPanics(t, func() {
+		err = fsm.Restore(io.NopCloser(bytes.NewReader([]byte(`{"objects/k": "not base64`))))
+	})
+
+	require.ErrorContains(t, err, "decode legacy json snapshot")
+	assert.Equal(t, before, dumpStore(t, db))
+	assert.Equal(t, uint64(3), fsm.persisted)
+}

@@ -473,6 +473,117 @@ func (c *Client) Swap(ctx context.Context, key string, value []byte) (previous [
 	return c.writeValue(ctx, OpMetaSwap, request(key, 0), value)
 }
 
+// TxnOutcome is how a conditional transaction ended, as far as the client can
+// know. The zero value is TxnUnknown, so an unset outcome is never read as a
+// definite one.
+type TxnOutcome int
+
+const (
+	// TxnUnknown: the request left the client and no answer proves whether
+	// it applied. Only the log can tell.
+	TxnUnknown TxnOutcome = iota
+	// TxnApplied: every check held and every write is published.
+	TxnApplied
+	// TxnMismatch: a check failed and no write is published.
+	TxnMismatch
+	// TxnRefused: nothing was proposed, so nothing can apply.
+	TxnRefused
+)
+
+// ErrTxnRefused wraps the error of a transaction that was never proposed.
+var ErrTxnRefused = errors.New("meta transaction refused")
+
+// ErrTxnUnknown wraps the error of a transaction whose outcome is unknown.
+var ErrTxnUnknown = errors.New("meta transaction outcome unknown")
+
+// Txn applies writes through the leader only if every check holds. It sends to
+// each replica at most once and moves on only after an undelivered send or a
+// not-leader refusal, going to the named leader first; ambiguity is TxnUnknown.
+func (c *Client) Txn(ctx context.Context, checks []TxnCheck, writes []TxnWrite) (outcome TxnOutcome, current []TxnValue, err error) {
+	defer observeOp(ctx, telemetry.MetaOpTxn, time.Now(), &err)
+
+	if err := ValidateTxn(checks, writes); err != nil {
+		return TxnRefused, nil, fmt.Errorf("%w: %w", ErrTxnRefused, err)
+	}
+	body, err := json.Marshal(TxnRequest{Checks: checks, Writes: writes})
+	if err != nil {
+		return TxnRefused, nil, fmt.Errorf("%w: encode: %w", ErrTxnRefused, err)
+	}
+	if len(body) > MaxTxnBodyBytes {
+		return TxnRefused, nil, fmt.Errorf("%w: %w: body of %d bytes exceeds the limit of %d",
+			ErrTxnRefused, ErrInvalidTxn, len(body), MaxTxnBodyBytes)
+	}
+
+	order := c.readOrder()
+	tried := make(map[config.NodeID]bool, len(order))
+	var lastErr error
+	var hint config.NodeID
+	for {
+		target, ok := nextTxnTarget(order, tried, hint)
+		if !ok {
+			break
+		}
+		tried[target] = true
+		hint = 0
+
+		resp, err := c.call(ctx, target, OpMetaTxn, &MetaRequest{}, body)
+		switch {
+		case errors.Is(err, ErrUndelivered):
+			lastErr = err
+		case err != nil:
+			return TxnUnknown, nil, fmt.Errorf("%w: %w", ErrTxnUnknown, err)
+		case resp.Err == ErrCodeNotLeader:
+			// A follower refuses before it proposes, so sending again is safe.
+			lastErr = fmt.Errorf("replica %d: %w", target, ErrNotLeader)
+			if id, perr := ParseRaftAddress(resp.Leader); perr == nil {
+				c.cacheLeader(id)
+				telemetry.RecordMetaRedirect(ctx, telemetry.RedirectNotLeader)
+				hint = id
+			}
+		default:
+			return c.txnAnswer(target, resp)
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no replica to send to")
+	}
+	return TxnRefused, nil, fmt.Errorf("%w: %w", ErrTxnRefused, lastErr)
+}
+
+// nextTxnTarget picks the hinted leader if it is untried, else the first
+// untried replica in order.
+func nextTxnTarget(order []config.NodeID, tried map[config.NodeID]bool, hint config.NodeID) (config.NodeID, bool) {
+	if hint != 0 && !tried[hint] {
+		return hint, true
+	}
+	for _, id := range order {
+		if !tried[id] {
+			return id, true
+		}
+	}
+	return 0, false
+}
+
+// txnAnswer maps one replica's answer onto an outcome. Any error envelope
+// other than a refusal may follow a proposal, so it is unknown.
+func (c *Client) txnAnswer(target config.NodeID, resp *MetaResponse) (TxnOutcome, []TxnValue, error) {
+	switch {
+	case resp.Err == "" && resp.Mismatch:
+		c.cacheLeader(target)
+		return TxnMismatch, resp.Current, nil
+	case resp.Err == "":
+		c.cacheLeader(target)
+		return TxnApplied, nil, nil
+	case resp.Err == ErrCodeInvalid:
+		return TxnRefused, nil, fmt.Errorf("%w: replica %d: %s", ErrTxnRefused, target, resp.Err)
+	default:
+		return TxnUnknown, nil, fmt.Errorf("%w: replica %d: %s", ErrTxnUnknown, target, resp.Err)
+	}
+}
+
 // Delete removes a key through the leader.
 func (c *Client) Delete(ctx context.Context, key string) (err error) {
 	defer observeOp(ctx, telemetry.MetaOpDelete, time.Now(), &err)
@@ -494,6 +605,9 @@ func (c *Client) write(ctx context.Context, op rpc.Opcode, req *MetaRequest, bod
 // unknown is simply tried again. A swap is not: it retries only on an attempt
 // that never reached a replica, or a refusal that names a leader.
 func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest, body []byte) ([]byte, error) {
+	if IsReservedKey(req.Key) {
+		return nil, fmt.Errorf("write %q: %w", req.Key, ErrReservedKey)
+	}
 	candidates := c.readOrder()
 	next := 0
 	target := candidates[next]
@@ -516,6 +630,10 @@ func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest
 		case resp.Err == "":
 			c.cacheLeader(target)
 			return resp.Value, nil
+		case resp.Err == ErrCodeInvalid:
+			// The replica refused the request before proposing it, and every
+			// replica would refuse it the same way.
+			return nil, fmt.Errorf("write %q: replica %d: %s", req.Key, target, resp.Err)
 		case resp.Err == ErrCodeNotLeader:
 			lastErr = ErrNotLeader
 			if id, perr := ParseRaftAddress(resp.Leader); perr == nil {

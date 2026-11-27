@@ -934,6 +934,7 @@ const (
 	MetaOpPut    = "put"
 	MetaOpDelete = "delete"
 	MetaOpStatus = "status"
+	MetaOpTxn    = "txn"
 )
 
 // MetaOutcomeNotFound is a read every replica answered, none of which held the

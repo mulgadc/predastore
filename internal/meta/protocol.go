@@ -26,6 +26,9 @@ const (
 	OpMetaPutMax rpc.Opcode = 0x1006
 	// OpMetaSwap writes a value and answers with the one it replaced.
 	OpMetaSwap rpc.Opcode = 0x1007
+	// OpMetaTxn applies a conditional transaction. Only the leader accepts
+	// it, and a client never sends one twice.
+	OpMetaTxn rpc.Opcode = 0x1008
 
 	// OpMetaStatus asks a replica to report its own raft state, rather than
 	// any data it holds.
@@ -39,6 +42,8 @@ const (
 	ErrCodeNotLeader = "not-leader"
 	// ErrCodeBehind answers a leader read the leader could not confirm in time.
 	ErrCodeBehind = "behind"
+	// ErrCodeInvalid refuses a malformed request before any proposal.
+	ErrCodeInvalid = "invalid"
 )
 
 // raftAddrPrefix builds the node-identifying raft advertise address space
@@ -113,6 +118,18 @@ type MetaResponse struct {
 	Value []byte `json:"value,omitempty"`
 	// Items is the payload for scan responses.
 	Items []ScanItem `json:"items,omitempty"`
+	// Mismatch reports a transaction whose checks did not hold, with the
+	// value of each checked key in Current.
+	Mismatch bool       `json:"mismatch,omitempty"`
+	Current  []TxnValue `json:"current,omitempty"`
+}
+
+// TxnRequest is the stream body of an OpMetaTxn. The handler proposes it only
+// after the client's half-close, so a request cut off in transit is never
+// applied.
+type TxnRequest struct {
+	Checks []TxnCheck `json:"checks,omitempty"`
+	Writes []TxnWrite `json:"writes"`
 }
 
 // ScanItem is one key-value pair in a scan response. Key is bytes for the same
