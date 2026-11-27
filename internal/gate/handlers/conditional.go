@@ -7,8 +7,8 @@ import (
 )
 
 // conditionalWriteHeaders are the preconditions S3 evaluates on a write or a
-// delete. This gate does not evaluate them, and ignoring one would let a write
-// or delete through that the caller asked to be refused.
+// delete. Only PutObject evaluates them; elsewhere, ignoring one would let a
+// write or delete through that the caller asked to be refused.
 var conditionalWriteHeaders = []string{"If-Match", "If-None-Match"}
 
 // refuseConditionalWrite answers 501 to a write or delete carrying a

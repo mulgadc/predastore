@@ -69,6 +69,7 @@ func (p ObjectToShardNodes) AllNodes() []config.NodeID {
 type shardWriteOutcome struct {
 	shardIndex   int
 	poolNearFull bool // mirrors PutResponse.PoolNearFull for this shard's node.
+	holding      bool // mirrors PutResponse.Holding: the prepared row is held.
 	err          error
 }
 
@@ -104,6 +105,9 @@ type writeResult struct {
 	// the landings is what the degraded signal counts: a shard that landed
 	// and lost its commit is as absent as one that never landed.
 	committed int
+
+	// holding counts the positions whose node confirmed a held prepared row.
+	holding int
 }
 
 func (r writeResult) landedCount() int {
@@ -350,6 +354,27 @@ func streamShards(
 	body io.Reader, lay layout, size int64, handoff config.NodeID,
 ) (writeResult, error) {
 	total := cfg.TotalShards()
+	streams := make([]*shardStream, total)
+	for i := range total {
+		streams[i] = startShardStream(ctx, bc, objectHash, epoch, i, shardNodes[i], lay.shardSize)
+	}
+	result, err := pumpStripes(ctx, bc, cfg, objectHash, epoch, streams, body, lay, size, handoff, nil)
+	if err != nil {
+		return result, err
+	}
+
+	return collectStreams(ctx, cfg, streams, result)
+}
+
+// pumpStripes encodes the body a stripe at a time into streams that are
+// already open. The first block re-aims every refused position, and every
+// position in refused, at the handoff node.
+func pumpStripes(
+	ctx context.Context, bc BlobClient, cfg Config,
+	objectHash [32]byte, epoch uint64, streams []*shardStream,
+	body io.Reader, lay layout, size int64, handoff config.NodeID, refusedAtStart []int,
+) (writeResult, error) {
+	total := cfg.TotalShards()
 	shardSize, blockSize := lay.shardSize, lay.blockSize
 
 	// What a write costs in memory is the working set, not the object: the
@@ -358,6 +383,7 @@ func streamShards(
 
 	enc, err := reedsolomon.New(cfg.DataShards, cfg.ParityShards)
 	if err != nil {
+		closeStreams(streams)
 		return writeResult{landed: make([]bool, total)}, err
 	}
 
@@ -367,11 +393,6 @@ func streamShards(
 	blocks := newBlockSet(total, blockSize)
 	defer blocks.release()
 	stripe := make([][]byte, total)
-
-	streams := make([]*shardStream, total)
-	for i := range total {
-		streams[i] = startShardStream(ctx, bc, objectHash, epoch, i, shardNodes[i], shardSize)
-	}
 
 	// The body is padded so a short last stripe still encodes, and counted so a
 	// body that does not deliver what it declared is an error rather than an
@@ -399,6 +420,10 @@ func streamShards(
 
 		refused := writeStripe(streams, stripe)
 		if offset == 0 {
+			if len(refusedAtStart) > 0 {
+				refused = append(refused, refusedAtStart...)
+				slices.Sort(refused)
+			}
 			handOff(ctx, bc, objectHash, epoch, streams, stripe, refused, handoff, shardSize)
 		}
 	}
@@ -409,7 +434,7 @@ func streamShards(
 		return result, fmt.Errorf("body delivered %d bytes, declared %d", counted.n, size)
 	}
 
-	return collectStreams(ctx, cfg, streams, result)
+	return result, nil
 }
 
 // shardStream carries one shard to one node while the encoder is still
@@ -565,6 +590,18 @@ func closeStreams(streams []*shardStream) {
 // collectStreams closes the live streams, waits for every put to report, and
 // assembles what the write left on the cluster.
 func collectStreams(ctx context.Context, cfg Config, streams []*shardStream, result writeResult) (writeResult, error) {
+	result, firstErr := gatherStreams(ctx, streams, result)
+	if landed := result.landedCount(); landed < cfg.MinShards() {
+		return result, fmt.Errorf("%w: %d of %d shards durable, nodes %v unreachable: %w",
+			errShardWriteFloor, landed, cfg.MinShards(), result.missing, firstErr)
+	}
+
+	return result, nil
+}
+
+// gatherStreams closes the live streams, waits for every put to report, and
+// records each position's outcome. It answers the first shard error.
+func gatherStreams(ctx context.Context, streams []*shardStream, result writeResult) (writeResult, error) {
 	for _, s := range streams {
 		if !s.failed {
 			_ = s.pw.Close()
@@ -600,14 +637,12 @@ func collectStreams(ctx context.Context, cfg Config, streams []*shardStream, res
 		if outcome.poolNearFull {
 			result.poolNearFull = true
 		}
+		if outcome.holding {
+			result.holding++
+		}
 	}
 
-	if landed := result.landedCount(); landed < cfg.MinShards() {
-		return result, fmt.Errorf("%w: %d of %d shards durable, nodes %v unreachable: %w",
-			errShardWriteFloor, landed, cfg.MinShards(), result.missing, firstErr)
-	}
-
-	return result, nil
+	return result, firstErr
 }
 
 // handoffNode is the node one step off the end of the stripe on the ring: where

@@ -27,6 +27,8 @@ type MetaClient interface {
 	Swap(ctx context.Context, key string, value []byte) ([]byte, error)
 	Delete(ctx context.Context, key string) error
 	Scan(ctx context.Context, prefix string, limit int) ([]meta.Item, error)
+	// Txn applies writes only if every check holds, sent at most once.
+	Txn(ctx context.Context, checks []meta.TxnCheck, writes []meta.TxnWrite) (meta.TxnOutcome, []meta.TxnValue, error)
 }
 
 var _ MetaClient = (*meta.Client)(nil)
