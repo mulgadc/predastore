@@ -209,6 +209,10 @@ type Reaper struct {
 	Workers         int `toml:"workers"`
 	PageSize        int `toml:"page_size"`
 	IntervalSeconds int `toml:"interval_seconds"`
+
+	// IntentMaxAgeSeconds is how old a pending write intent must be before
+	// the sweep fences it. Zero defaults to one hour.
+	IntentMaxAgeSeconds int `toml:"intent_max_age_seconds"`
 }
 
 // IsEnabled reports whether the sweep should run. Absent means on; a host with

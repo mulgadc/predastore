@@ -213,6 +213,8 @@ func newReaper(cfg Config) (*reaper.Service, error) {
 		Workers:  cfg.Reaper.Workers,
 		PageSize: cfg.Reaper.PageSize,
 		Interval: cfg.Reaper.Interval,
+
+		IntentMaxAge: cfg.Reaper.IntentMaxAge,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to build the reaper sweep: %w", err)

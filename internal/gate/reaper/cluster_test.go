@@ -125,6 +125,21 @@ func (f *fakeBlob) DeleteEpoch(_ context.Context, node config.NodeID, req blob.C
 	return &blob.DeleteResponse{Deleted: true}, nil
 }
 
+// errIntentUnmodelled answers the intent calls the tombstone fakes do not model.
+var errIntentUnmodelled = errors.New("the tombstone fakes hold no intent shards")
+
+func (f *fakeBlob) Commit(context.Context, config.NodeID, blob.CommitRequest) (bool, error) {
+	return false, errIntentUnmodelled
+}
+
+func (f *fakeBlob) Abort(context.Context, config.NodeID, blob.CommitRequest) error {
+	return errIntentUnmodelled
+}
+
+func (f *fakeBlob) Release(context.Context, config.NodeID, blob.ReleaseRequest) error {
+	return errIntentUnmodelled
+}
+
 var _ BlobClient = (*fakeBlob)(nil)
 
 // fakeMeta stands in for a meta group. rows is what the leader has applied.
@@ -226,6 +241,10 @@ func (m *fakeMeta) ScanFrom(_ context.Context, prefix, after string, limit int) 
 	}
 
 	return items, nil
+}
+
+func (m *fakeMeta) Txn(context.Context, []meta.TxnCheck, []meta.TxnWrite) (meta.TxnOutcome, []meta.TxnValue, error) {
+	return meta.TxnRefused, nil, errIntentUnmodelled
 }
 
 var _ MetaClient = (*fakeMeta)(nil)

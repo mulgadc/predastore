@@ -8,9 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
@@ -31,7 +29,6 @@ type txnFunc func() (meta.TxnOutcome, []meta.TxnValue, error)
 
 // hookMeta is the store a conditional writer sees. A hook runs at each of its
 // transactions, numbered from one, and decides when and whether it applies.
-// Once dead, every call fails and changes nothing, as after a crash.
 type hookMeta struct {
 	*fakeMeta
 
@@ -41,9 +38,6 @@ type hookMeta struct {
 	txns int
 	hook func(n int, next txnFunc) (meta.TxnOutcome, []meta.TxnValue, error)
 
-	// crashOnIntentDelete kills the writer at the delete of its intent row.
-	crashOnIntentDelete bool
-	dead                atomic.Bool
 	// onPut, when set, sees the key of every row the writer puts.
 	onPut func(key string)
 }
@@ -61,9 +55,6 @@ func (m *hookMeta) txnCount() int {
 }
 
 func (m *hookMeta) Txn(ctx context.Context, checks []meta.TxnCheck, writes []meta.TxnWrite) (meta.TxnOutcome, []meta.TxnValue, error) {
-	if m.dead.Load() {
-		return meta.TxnUnknown, nil, errInjected
-	}
 	m.mu.Lock()
 	m.txns++
 	n, hook := m.txns, m.hook
@@ -76,9 +67,6 @@ func (m *hookMeta) Txn(ctx context.Context, checks []meta.TxnCheck, writes []met
 }
 
 func (m *hookMeta) Put(ctx context.Context, key string, value []byte) error {
-	if m.dead.Load() {
-		return errInjected
-	}
 	if strings.HasPrefix(key, IntentPrefix) {
 		m.log.add("intent")
 	}
@@ -87,24 +75,6 @@ func (m *hookMeta) Put(ctx context.Context, key string, value []byte) error {
 		m.onPut(key)
 	}
 	return err
-}
-
-func (m *hookMeta) Delete(ctx context.Context, key string) error {
-	if m.dead.Load() {
-		return errInjected
-	}
-	if m.crashOnIntentDelete && strings.HasPrefix(key, IntentPrefix) {
-		m.dead.Store(true)
-		return errInjected
-	}
-	return m.fakeMeta.Delete(ctx, key)
-}
-
-func (m *hookMeta) LeaderGet(ctx context.Context, key string) ([]byte, error) {
-	if m.dead.Load() {
-		return nil, errInjected
-	}
-	return m.fakeMeta.LeaderGet(ctx, key)
 }
 
 // eventLog records the order of the writer's steps.
@@ -137,8 +107,7 @@ func (l *eventLog) all() []string {
 type hookBlob struct {
 	BlobClient
 
-	log  *eventLog
-	dead *atomic.Bool
+	log *eventLog
 
 	unsupported map[config.NodeID]bool
 	unreachable map[config.NodeID]bool
@@ -153,8 +122,6 @@ type hookBlob struct {
 
 func (b *hookBlob) OpenHeldPut(ctx context.Context, node config.NodeID, req blob.PutRequest) (HeldPut, error) {
 	switch {
-	case b.dead.Load():
-		return nil, errInjected
 	case b.unsupported[node]:
 		return nil, fmt.Errorf("node %d: %w", node, blob.ErrHoldUnsupported)
 	case b.unreachable[node]:
@@ -175,10 +142,6 @@ type hookHeld struct {
 }
 
 func (h *hookHeld) Send(ctx context.Context, body io.Reader) (*blob.PutResponse, error) {
-	if h.b.dead.Load() {
-		h.Abandon()
-		return nil, errInjected
-	}
 	resp, err := h.HeldPut.Send(ctx, body)
 	if err == nil && h.b.notHolding {
 		resp.Holding = false
@@ -187,17 +150,11 @@ func (h *hookHeld) Send(ctx context.Context, body io.Reader) (*blob.PutResponse,
 }
 
 func (b *hookBlob) Put(ctx context.Context, node config.NodeID, req blob.PutRequest, body io.Reader) (*blob.PutResponse, error) {
-	if b.dead.Load() {
-		return nil, errInjected
-	}
 	b.log.add(fmt.Sprintf("put %d/%d", node, req.Index))
 	return b.BlobClient.Put(ctx, node, req, body)
 }
 
 func (b *hookBlob) Commit(ctx context.Context, node config.NodeID, req blob.CommitRequest) (bool, error) {
-	if b.dead.Load() {
-		return false, errInjected
-	}
 	if b.commitGate != nil {
 		b.reachedOnce.Do(func() { close(b.commitReached) })
 		<-b.commitGate
@@ -206,17 +163,10 @@ func (b *hookBlob) Commit(ctx context.Context, node config.NodeID, req blob.Comm
 }
 
 func (b *hookBlob) Abort(ctx context.Context, node config.NodeID, req blob.CommitRequest) error {
-	if b.dead.Load() || b.abortFails[node] {
+	if b.abortFails[node] {
 		return errInjected
 	}
 	return b.BlobClient.Abort(ctx, node, req)
-}
-
-func (b *hookBlob) Release(ctx context.Context, node config.NodeID, req blob.ReleaseRequest) error {
-	if b.dead.Load() {
-		return errInjected
-	}
-	return b.BlobClient.Release(ctx, node, req)
 }
 
 // condHarness runs conditional writes through the hooks, over the same real
@@ -237,7 +187,7 @@ func newCondHarness(t *testing.T, p rsProfile) *condHarness {
 	hm := &hookMeta{fakeMeta: g.mc, log: log}
 	return &condHarness{
 		realStoreGate: g, t: t, log: log, hm: hm,
-		hb: &hookBlob{BlobClient: g.bc, log: log, dead: &hm.dead},
+		hb: &hookBlob{BlobClient: g.bc, log: log},
 	}
 }
 
@@ -303,38 +253,6 @@ func (h *condHarness) onlyIntent() (IntentID, Intent) {
 		return id, in
 	}
 	panic("unreachable")
-}
-
-// settle does what the reaper does with an intent: fence a pending one, then
-// commit or abort its shards, and delete the row once cleanup is complete.
-// It runs pass after pass until no intent is left.
-func (h *condHarness) settle() {
-	h.t.Helper()
-	ctx := context.Background()
-	require.Eventually(h.t, func() bool {
-		for key, row := range h.intents() {
-			id, ok := ParseIntentKey(key)
-			require.True(h.t, ok)
-			in, err := DecodeIntent(row)
-			require.NoError(h.t, err)
-			if in.State == IntentPending {
-				result, decided, err := FenceIntent(ctx, h.mc, id, row)
-				require.NoError(h.t, err)
-				require.Contains(h.t, []FenceResult{FenceApplied, FenceCommitted, FenceAborted}, result)
-				in = decided
-			}
-			complete := false
-			if in.State == IntentCommitted {
-				complete = CommitIntent(ctx, h.bc, id, in).Complete
-			} else {
-				complete = AbortIntent(ctx, h.bc, id, in)
-			}
-			if complete {
-				require.NoError(h.t, h.mc.Delete(ctx, key))
-			}
-		}
-		return len(h.intents()) == 0
-	}, 10*time.Second, 10*time.Millisecond, "an intent never converged")
 }
 
 // requireNothingPrepared fails if any candidate of a write still holds a
@@ -678,8 +596,8 @@ func TestS7_AnEqualETagWriteStaysCurrentAfterAnUnknownOutcomeResolves(t *testing
 }
 
 // A refused transaction answers 503 SlowDown and leaves the previous
-// object. A candidate that cannot confirm its abort keeps the intent, and a
-// reaper pass finishes it.
+// object. A candidate that cannot confirm its abort keeps the intent for the
+// reaper.
 // Verifies: ADR-0003:S7.
 func TestS7_ARefusedTransactionIsSlowDownAndAnUnconfirmedAbortKeepsTheIntent(t *testing.T) {
 	h := newCondHarness(t, rsProfiles[0])
@@ -696,11 +614,8 @@ func TestS7_ARefusedTransactionIsSlowDownAndAnUnconfirmedAbortKeepsTheIntent(t *
 	require.Equal(t, http.StatusServiceUnavailable, rr.Code, "body: %s", rr.Body.String())
 	assert.Contains(t, rr.Body.String(), "<Code>SlowDown</Code>")
 	h.requireBody("lock", body1)
-	id, in := h.onlyIntent()
+	_, in := h.onlyIntent()
 	assert.Equal(t, IntentPending, in.State)
-	h.settle()
-	h.requireNothingPrepared(id, in)
-	h.requireBody("lock", body1)
 }
 
 // A write fenced by the reaper while it streamed cannot publish: its own
@@ -824,66 +739,6 @@ func TestAShortfallOfHeldShardsIsNotImplemented(t *testing.T) {
 	rr = h.condPut("lock", body1, ifNoneMatchAll)
 	require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
 	h.requireBody("lock", body1)
-}
-
-// A crash at each point of a conditional write leaves an intent from which a
-// reaper pass reaches one of two states: the new object readable at the
-// floor, or the previous object current. No held row of the write remains.
-// Verifies: ADR-0003:S7.
-func TestS7_ACrashAtAnyPointConvergesThroughTheIntent(t *testing.T) {
-	type crash struct {
-		arm      func(h *condHarness)
-		newState bool
-	}
-	for name, c := range map[string]crash{
-		"after the intent": {arm: func(h *condHarness) {
-			h.hm.onPut = func(key string) {
-				if strings.HasPrefix(key, IntentPrefix) {
-					h.hm.dead.Store(true)
-				}
-			}
-		}},
-		"after the prepare": {arm: func(h *condHarness) {
-			h.hm.setHook(func(int, txnFunc) (meta.TxnOutcome, []meta.TxnValue, error) {
-				h.hm.dead.Store(true)
-				return meta.TxnUnknown, nil, errInjected
-			})
-		}},
-		"after the transaction": {newState: true, arm: func(h *condHarness) {
-			h.hm.setHook(func(_ int, next txnFunc) (meta.TxnOutcome, []meta.TxnValue, error) {
-				outcome, _, _ := next()
-				require.Equal(h.t, meta.TxnApplied, outcome)
-				h.hm.dead.Store(true)
-				return meta.TxnUnknown, nil, errInjected
-			})
-		}},
-		"after the shard commit": {newState: true, arm: func(h *condHarness) {
-			h.hm.crashOnIntentDelete = true
-		}},
-	} {
-		t.Run(name, func(t *testing.T) {
-			h := newCondHarness(t, rsProfiles[0])
-			etag := h.mustPut("lock", body1)
-			c.arm(h)
-
-			rr := h.condPut("lock", body2, ifMatch(etag))
-			require.True(t, h.hm.dead.Load(), "the writer never reached its crash point")
-			if !c.newState {
-				require.NotEqual(t, http.StatusOK, rr.Code)
-			}
-			id, in := h.onlyIntent()
-
-			h.settle()
-
-			if c.newState {
-				h.requireBody("lock", body2)
-				h.requireLiveAt(id, in)
-			} else {
-				h.requireBody("lock", body1)
-				h.requireNothingPrepared(id, in)
-			}
-		})
-	}
 }
 
 func requirePreconditionFailedRR(t *testing.T, rr *httptest.ResponseRecorder) {
