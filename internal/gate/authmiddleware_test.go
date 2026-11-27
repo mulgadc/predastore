@@ -377,16 +377,23 @@ func TestMapHeadModeRequiresSignatureCoverage(t *testing.T) {
 	})
 	for _, tc := range []struct {
 		name     string
+		method   string
 		sign     bool
 		signMode bool
 		status   int
 	}{
-		{"anonymous opt-in", false, false, http.StatusForbidden},
-		{"unsigned mode on signed request", true, false, http.StatusForbidden},
-		{"signed mode", true, true, http.StatusNoContent},
+		{"anonymous opt-in", http.MethodGet, false, false, http.StatusForbidden},
+		{"unsigned mode on signed request", http.MethodGet, true, false, http.StatusForbidden},
+		{"signed mode", http.MethodGet, true, true, http.StatusNoContent},
+		{"anonymous public bucket HEAD", http.MethodHead, false, false, http.StatusNoContent},
+		{"signed bucket HEAD with unsigned mode", http.MethodHead, true, false, http.StatusNoContent},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/"+bucket+"?list-type=2&max-keys=1&prefix=vol%2Fmap%2Fhead.", nil)
+			path := "/" + bucket
+			if tc.method == http.MethodGet {
+				path += "?list-type=2&max-keys=1&prefix=vol%2Fmap%2Fhead."
+			}
+			req := httptest.NewRequest(tc.method, path, nil)
 			if tc.signMode {
 				req.Header.Set(header, mode)
 			}

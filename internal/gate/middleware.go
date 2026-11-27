@@ -244,7 +244,7 @@ func (s *Server) sigV4AuthMiddleware(next http.Handler) http.Handler {
 		publicBucketAccess := s.cfg.validatePublicBucketPermission(method, bucket)
 
 		action := s3Action(r, bucket, key)
-		authorityRequested := action == "s3:ListBucket" && r.Header.Get(handlers.MapHeadReadModeHeader) != ""
+		authorityRequested := method == http.MethodGet && action == "s3:ListBucket" && r.Header.Get(handlers.MapHeadReadModeHeader) != ""
 		restoreTransferEncoding(r)
 		// Parse recognizes both header-authed and presigned requests; only a request with
 		// neither returns ErrMissingAuthentication.

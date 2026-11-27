@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -47,7 +48,9 @@ type Server struct {
 	bolt      *logStore
 
 	// One authority barrier can remain pending after its caller times out.
-	authorityBarrier chan struct{}
+	authorityQueue          authorityReadQueue
+	authorityProof          authorityProofState
+	authorityAppliedBarrier atomic.Uint64
 
 	// raftUp is set once raft exists. Callers outside Run reach the Server as
 	// soon as it is built, so they need a published answer rather than a read
@@ -92,7 +95,7 @@ func New(cfg Config) (*Server, error) {
 	cfg.TrailingLogs = orDefault(cfg.TrailingLogs, trailingLogs)
 	cfg.LeaderLeaseTimeout = orDefault(cfg.LeaderLeaseTimeout, 500*time.Millisecond)
 
-	return &Server{cfg: cfg, authorityBarrier: make(chan struct{}, 1)}, nil
+	return &Server{cfg: cfg}, nil
 }
 
 const (
@@ -205,7 +208,7 @@ func (s *Server) open() (*rpc.Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create bolt store: %w", err)
 	}
-	snapshots, err := raft.NewFileSnapshotStore(filepath.Join(s.cfg.DataDir, "snapshots"), 2, os.Stderr)
+	snapshots, err := newSnapshotStore(filepath.Join(s.cfg.DataDir, "snapshots"), 2, os.Stderr)
 	if err != nil {
 		return nil, fmt.Errorf("create snapshot store: %w", err)
 	}
@@ -552,38 +555,86 @@ const leaderReadWait = 5 * time.Second
 // code, empty meaning yes. The barrier commits through a quorum and applies every
 // earlier entry first, which also covers a new leader's unapplied prior term.
 func (s *Server) leaderRead() string {
-	return raftReadCode(s.raft.Barrier(leaderReadWait).Error())
+	future := s.raft.Barrier(leaderReadWait)
+	code := raftReadCode(future.Error())
+	if applied, ok := future.(raft.IndexFuture); code == "" && ok {
+		index := applied.Index()
+		for last := s.authorityAppliedBarrier.Load(); last < index; last = s.authorityAppliedBarrier.Load() {
+			if s.authorityAppliedBarrier.CompareAndSwap(last, index) {
+				s.fsm.signalAuthorityApply()
+				break
+			}
+		}
+	}
+	return code
+}
+
+type authorityReadBatch struct {
+	done    chan struct{}
+	waiters int
+	code    string
+}
+
+type authorityReadQueue struct {
+	mu      sync.Mutex
+	active  bool
+	pending *authorityReadBatch
 }
 
 func (s *Server) authorityRead(ctx context.Context) string {
 	ctx, cancel := context.WithTimeout(ctx, leaderReadWait)
 	defer cancel()
-	select {
-	case s.authorityBarrier <- struct{}{}:
-	case <-ctx.Done():
+	return s.authorityQueue.wait(ctx, s.freshAuthorityRead)
+}
+
+func (q *authorityReadQueue) wait(ctx context.Context, barrier func() string) string {
+	if ctx.Err() != nil {
 		return ErrCodeBehind
 	}
+	q.mu.Lock()
+	batch := q.pending
+	if batch == nil {
+		batch = &authorityReadBatch{done: make(chan struct{})}
+	}
+	batch.waiters++
+	if q.active {
+		q.pending = batch
+	} else {
+		q.active = true
+		go q.run(batch, barrier)
+	}
+	q.mu.Unlock()
 
-	result := make(chan string, 1)
-	go func() {
-		defer func() { <-s.authorityBarrier }()
-		deadline, _ := ctx.Deadline()
-		budget := time.Until(deadline)
-		if ctx.Err() != nil || budget <= 0 {
-			result <- ErrCodeBehind
-			return
-		}
-		result <- raftReadCode(s.raft.Barrier(budget).Error())
+	defer func() {
+		q.mu.Lock()
+		batch.waiters--
+		q.mu.Unlock()
 	}()
-
 	select {
-	case code := <-result:
+	case <-batch.done:
 		if ctx.Err() == nil {
-			return code
+			return batch.code
 		}
 	case <-ctx.Done():
 	}
 	return ErrCodeBehind
+}
+
+func (q *authorityReadQueue) run(batch *authorityReadBatch, barrier func() string) {
+	for {
+		batch.code = barrier()
+		close(batch.done)
+
+		q.mu.Lock()
+		batch = q.pending
+		q.pending = nil
+		if batch == nil || batch.waiters == 0 {
+			q.active = false
+			q.mu.Unlock()
+			return
+		}
+		q.mu.Unlock()
+	}
 }
 
 func raftReadCode(err error) string {
