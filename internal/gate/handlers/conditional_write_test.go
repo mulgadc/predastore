@@ -673,6 +673,62 @@ func TestS7_AWriteIsReadableBetweenItsTransactionAndItsShardCommit(t *testing.T)
 	}
 }
 
+// swapGateMeta holds every placement swap at a barrier until release closes.
+type swapGateMeta struct {
+	*fakeMeta
+
+	reached chan struct{}
+	release chan struct{}
+}
+
+func (m *swapGateMeta) Swap(ctx context.Context, key string, value []byte) ([]byte, error) {
+	close(m.reached)
+	<-m.release
+	return m.fakeMeta.Swap(ctx, key, value)
+}
+
+// A newer plain write commits its shards and stops before its swap; an older
+// conditional write then publishes its record and stops before its shard
+// commit. A read of the record serves the conditional body.
+// Verifies: ADR-0003:S7.
+func TestS7_AnOlderConditionalWriteIsReadableUnderANewerWritesShards(t *testing.T) {
+	h := newCondHarness(t, rsProfiles[0])
+	txnReached, txnRelease := make(chan struct{}), make(chan struct{})
+	h.hm.setHook(func(n int, next txnFunc) (meta.TxnOutcome, []meta.TxnValue, error) {
+		if n == 1 {
+			close(txnReached)
+			<-txnRelease
+		}
+		return next()
+	})
+	h.hb.commitGate, h.hb.commitReached = make(chan struct{}), make(chan struct{})
+
+	condDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { condDone <- h.condPut("lock", body2, ifNoneMatchAll) }()
+	<-txnReached
+
+	sm := &swapGateMeta{fakeMeta: h.mc, reached: make(chan struct{}), release: make(chan struct{})}
+	plainDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		plainDone <- h.serve(PutObject(sm, h.bc, h.ring, h.cache, h.cfg), http.MethodPut, "/bkt/lock", "lock", body1, nil)
+	}()
+	<-sm.reached
+
+	close(txnRelease)
+	<-h.hb.commitReached
+	cond := h.placementEpoch("lock")
+	h.requireBody("lock", body2)
+
+	close(h.hb.commitGate)
+	rr := <-condDone
+	require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
+	close(sm.release)
+	rr = <-plainDone
+	require.Equal(t, http.StatusOK, rr.Code, "body: %s", rr.Body.String())
+	assert.Greater(t, h.placementEpoch("lock"), cond, "the plain write must be the newer one")
+	h.requireBody("lock", body1)
+}
+
 // Every owner's held stream is registered before the intent is written, and
 // no stream opens after it except an unheld handoff stream.
 // Verifies: ADR-0003:S7.
