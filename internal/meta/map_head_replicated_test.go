@@ -2,13 +2,17 @@ package meta
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/mulgadc/predastore/internal/transport"
 	"github.com/stretchr/testify/require"
 )
 
@@ -128,4 +132,74 @@ func TestRaftCannotCompactToFailedMetadataRestore(t *testing.T) {
 		data, err := restarted.Get(ctx, acknowledged)
 		return err == nil && bytes.Equal(data, want)
 	}, 5*time.Second, 20*time.Millisecond, "the restarted replica must replay the acknowledged head from retained logs")
+}
+
+type lastKeyResponse struct {
+	transport.Stream
+	body bytes.Buffer
+}
+
+var _ transport.Stream = (*lastKeyResponse)(nil)
+
+func (r *lastKeyResponse) Write(data []byte) (int, error) {
+	return r.body.Write(data)
+}
+
+func TestLastKeyDeadlineWhileCommittedApplyIsHeld(t *testing.T) {
+	cluster := startMapHeadTestCluster(t)
+	client := cluster.client(cluster.voters...)
+	leader := cluster.leader(t, client)
+	replica := cluster.replicas[leader]
+	key := testHeadPrefix + "1"
+
+	replica.fsm.mu.Lock()
+	release := sync.OnceFunc(replica.fsm.mu.Unlock)
+	defer release()
+
+	beforeWrite := replica.raft.CommitIndex()
+	written := make(chan error, 1)
+	go func() { written <- client.Put(t.Context(), key, []byte("acknowledged")) }()
+	require.Eventually(t, func() bool {
+		return replica.raft.CommitIndex() > beforeWrite
+	}, 2*time.Second, 5*time.Millisecond)
+
+	req := request(testHeadPrefix, 1)
+	req.Leader = true
+	reply := &lastKeyResponse{}
+	ctx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancel()
+	read := make(chan error, 1)
+	go func() { read <- replica.handleLastKey(ctx, *req, reply) }()
+
+	select {
+	case err := <-read:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("the authority handler waited for stalled apply after its deadline")
+	}
+
+	var response MetaResponse
+	require.NoError(t, json.Unmarshal(reply.body.Bytes(), &response))
+	require.Equal(t, ErrCodeBehind, response.Err)
+	require.False(t, response.Last)
+	barrierIndex := replica.raft.LastIndex()
+	require.Greater(t, barrierIndex, beforeWrite+1, "the first barrier must already be in the Raft log")
+
+	for range 3 {
+		retry, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+		reply := &lastKeyResponse{}
+		err := replica.handleLastKey(retry, *req, reply)
+		cancel()
+		require.NoError(t, err)
+		response = MetaResponse{}
+		require.NoError(t, json.Unmarshal(reply.body.Bytes(), &response))
+		require.Equal(t, ErrCodeBehind, response.Err)
+	}
+	require.Equal(t, barrierIndex, replica.raft.LastIndex(), "a stalled barrier must bound queue growth")
+
+	release()
+	require.NoError(t, <-written)
+	got, err := client.LeaderLastKey(t.Context(), testHeadPrefix)
+	require.NoError(t, err)
+	require.Equal(t, key, got)
 }
