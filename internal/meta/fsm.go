@@ -81,12 +81,26 @@ type TxnResult struct {
 // ErrInvalidTxn reports a transaction that no store could apply as written.
 var ErrInvalidTxn = errors.New("invalid meta transaction")
 
+// Limits on one transaction. The gate sends at most five rows of one record
+// each, so these leave wide headroom and still bound what a request can cost.
+const (
+	MaxTxnChecks    = 16
+	MaxTxnWrites    = 16
+	MaxTxnBodyBytes = 1 << 20
+)
+
 // ValidateTxn rejects a transaction whose checks or writes are malformed. The
 // FSM, the server and the client run the same rules, so a replica never
 // learns of a malformed transaction that the client could have refused.
 func ValidateTxn(checks []TxnCheck, writes []TxnWrite) error {
 	if len(writes) == 0 {
 		return fmt.Errorf("%w: no writes", ErrInvalidTxn)
+	}
+	if len(checks) > MaxTxnChecks {
+		return fmt.Errorf("%w: %d checks exceed the limit of %d", ErrInvalidTxn, len(checks), MaxTxnChecks)
+	}
+	if len(writes) > MaxTxnWrites {
+		return fmt.Errorf("%w: %d writes exceed the limit of %d", ErrInvalidTxn, len(writes), MaxTxnWrites)
 	}
 	for i, c := range checks {
 		if len(c.Key) == 0 {

@@ -509,6 +509,10 @@ func (c *Client) Txn(ctx context.Context, checks []TxnCheck, writes []TxnWrite) 
 	if err != nil {
 		return TxnRefused, nil, fmt.Errorf("%w: encode: %w", ErrTxnRefused, err)
 	}
+	if len(body) > MaxTxnBodyBytes {
+		return TxnRefused, nil, fmt.Errorf("%w: %w: body of %d bytes exceeds the limit of %d",
+			ErrTxnRefused, ErrInvalidTxn, len(body), MaxTxnBodyBytes)
+	}
 
 	var lastErr error
 	for _, target := range c.readOrder() {

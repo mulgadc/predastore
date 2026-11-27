@@ -103,6 +103,8 @@ func TestFSM_Txn_AMalformedTransactionIsRejectedWithoutEffect(t *testing.T) {
 		"absent with a value": txnCommand([]TxnCheck{{Key: []byte("b"), Value: []byte("x"), Absent: true}}, put("a", "1")),
 		"write without key":   txnCommand(nil, put("a", "1"), TxnWrite{Value: []byte("x")}),
 		"delete with a value": txnCommand(nil, put("a", "1"), TxnWrite{Key: []byte("b"), Value: []byte("x"), Delete: true}),
+		"too many checks":     txnCommand(absentChecks(MaxTxnChecks+1), put("a", "1")),
+		"too many writes":     txnCommand(nil, puts(MaxTxnWrites+1)...),
 	}
 	for name, cmd := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -117,6 +119,35 @@ func TestFSM_Txn_AMalformedTransactionIsRejectedWithoutEffect(t *testing.T) {
 			assertStored(t, db, map[string]*string{"a": nil, "b": nil})
 		})
 	}
+}
+
+func absentChecks(n int) []TxnCheck {
+	checks := make([]TxnCheck, n)
+	for i := range checks {
+		checks[i] = absent(fmt.Sprintf("check/%d", i))
+	}
+	return checks
+}
+
+// puts writes "a" first, so a refused transaction leaves "a" absent.
+func puts(n int) []TxnWrite {
+	writes := make([]TxnWrite, n)
+	for i := range writes {
+		writes[i] = put(fmt.Sprintf("write/%d", i), "v")
+	}
+	writes[0] = put("a", "1")
+	return writes
+}
+
+// The limits refuse only what exceeds them: a transaction at both limits applies.
+func TestFSM_Txn_ATransactionAtTheLimitsApplies(t *testing.T) {
+	db := newTestDB(t)
+	fsm := NewFSM(db)
+
+	got := fsm.Apply(commandLog(t, 1, txnCommand(absentChecks(MaxTxnChecks), puts(MaxTxnWrites)...)))
+
+	assert.Equal(t, TxnResult{Applied: true}, got)
+	assertStored(t, db, map[string]*string{"a": str("1"), fmt.Sprintf("write/%d", MaxTxnWrites-1): str("v")})
 }
 
 // The entries before a transaction are visible to its checks, and every

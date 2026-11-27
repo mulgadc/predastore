@@ -88,11 +88,15 @@ func (s *Server) handleSwap(ctx context.Context, h MetaRequest, stream transport
 }
 
 // handleTxn reads the whole transaction before it proposes anything, so a
-// request that did not arrive complete is refused rather than applied.
+// request that did not arrive complete is refused rather than applied. It
+// reads at most one byte past the limit, so an oversized body costs no more.
 func (s *Server) handleTxn(ctx context.Context, h MetaRequest, stream transport.Stream) error {
-	body, err := io.ReadAll(stream)
+	body, err := io.ReadAll(io.LimitReader(stream, MaxTxnBodyBytes+1))
 	if err != nil {
 		return fmt.Errorf("read transaction: %w", err)
+	}
+	if len(body) > MaxTxnBodyBytes {
+		return respond(stream, &MetaResponse{Err: ErrCodeInvalid})
 	}
 	var req TxnRequest
 	if err := json.Unmarshal(body, &req); err != nil {
