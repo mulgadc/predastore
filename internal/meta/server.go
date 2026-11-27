@@ -46,6 +46,9 @@ type Server struct {
 	badgerDB  *badger.DB
 	bolt      *logStore
 
+	// One authority barrier can remain pending after its caller times out.
+	authorityBarrier chan struct{}
+
 	// raftUp is set once raft exists. Callers outside Run reach the Server as
 	// soon as it is built, so they need a published answer rather than a read
 	// of a field Run has not written yet.
@@ -89,7 +92,7 @@ func New(cfg Config) (*Server, error) {
 	cfg.TrailingLogs = orDefault(cfg.TrailingLogs, trailingLogs)
 	cfg.LeaderLeaseTimeout = orDefault(cfg.LeaderLeaseTimeout, 500*time.Millisecond)
 
-	return &Server{cfg: cfg}, nil
+	return &Server{cfg: cfg, authorityBarrier: make(chan struct{}, 1)}, nil
 }
 
 const (
@@ -167,6 +170,7 @@ func (s *Server) open() (*rpc.Server, error) {
 	rpc.RegisterHandler(mux, OpMetaPutMax, s.handlePutMax)
 	rpc.RegisterHandler(mux, OpMetaDelete, s.handleDelete)
 	rpc.RegisterHandler(mux, OpMetaScan, s.handleScan)
+	rpc.RegisterHandler(mux, OpMetaLastKey, s.handleLastKey)
 	rpc.RegisterHandler(mux, OpMetaStatus, s.handleStatus)
 	srv, err := rpc.NewServer(mux, s.cfg.Listeners, s.pool)
 	if err != nil {
@@ -192,6 +196,9 @@ func (s *Server) open() (*rpc.Server, error) {
 	}
 	if s.fsm, err = OpenFSM(s.badgerDB, opts...); err != nil {
 		return nil, err
+	}
+	if err := s.fsm.rebuildMapHeads(); err != nil {
+		return nil, fmt.Errorf("build map-head index: %w", err)
 	}
 
 	s.bolt, err = openLogStore(filepath.Join(s.cfg.DataDir, "raft.db"))
@@ -545,7 +552,41 @@ const leaderReadWait = 5 * time.Second
 // code, empty meaning yes. The barrier commits through a quorum and applies every
 // earlier entry first, which also covers a new leader's unapplied prior term.
 func (s *Server) leaderRead() string {
-	err := s.raft.Barrier(leaderReadWait).Error()
+	return raftReadCode(s.raft.Barrier(leaderReadWait).Error())
+}
+
+func (s *Server) authorityRead(ctx context.Context) string {
+	ctx, cancel := context.WithTimeout(ctx, leaderReadWait)
+	defer cancel()
+	select {
+	case s.authorityBarrier <- struct{}{}:
+	case <-ctx.Done():
+		return ErrCodeBehind
+	}
+
+	result := make(chan string, 1)
+	go func() {
+		defer func() { <-s.authorityBarrier }()
+		deadline, _ := ctx.Deadline()
+		budget := time.Until(deadline)
+		if ctx.Err() != nil || budget <= 0 {
+			result <- ErrCodeBehind
+			return
+		}
+		result <- raftReadCode(s.raft.Barrier(budget).Error())
+	}()
+
+	select {
+	case code := <-result:
+		if ctx.Err() == nil {
+			return code
+		}
+	case <-ctx.Done():
+	}
+	return ErrCodeBehind
+}
+
+func raftReadCode(err error) string {
 	switch {
 	case err == nil:
 		return ""

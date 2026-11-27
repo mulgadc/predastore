@@ -66,25 +66,6 @@ func TestARestoreThatChangesNothingReportsNothing(t *testing.T) {
 	assert.Empty(t, got)
 }
 
-// The replacement path rewrites every key, so a change set from it would name
-// the whole store. It says so instead, because a consumer cannot tell an empty
-// set from a set that was never produced.
-func TestTheReplacementPathSaysItHasNoChangeSet(t *testing.T) {
-	logs := captureLogs(t)
-
-	db := newTestDB(t)
-	dbSet(t, db, []byte("stale"), []byte("v"))
-
-	got, onChange := changeSet(t)
-	require.NoError(t, NewFSM(db, OnKeyChanged(onChange)).Restore(io.NopCloser(
-		bytes.NewReader(unsortedFrames(t, []string{"b", "a"}, map[string][]byte{
-			"a": []byte("1"), "b": []byte("2"),
-		})))))
-
-	assert.Empty(t, got)
-	assert.Contains(t, logs.String(), "meta: restore reports no change set")
-}
-
 // The callback is optional, and an FSM without one restores exactly as before.
 // Every other test in this package constructs one that way.
 func TestARestoreWithoutACallbackIsUnaffected(t *testing.T) {

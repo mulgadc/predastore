@@ -307,3 +307,34 @@ func TestFSM_Txn_ARowLargerThanTheBodyLimitIsAMismatchWithNoValue(t *testing.T) 
 	assert.Equal(t, []string{"small"}, read, "the large row is not read")
 	assertStored(t, db, map[string]*string{"small": str("1")})
 }
+
+func TestFSM_TxnUpdatesMapHeadsOnlyAfterSuccess(t *testing.T) {
+	fsm := NewFSM(newTestDB(t))
+	require.NoError(t, fsm.rebuildMapHeads())
+	old := testHeadPrefix + "1"
+	next := testHeadPrefix + "2"
+	apply := func(index uint64, cmd Command) any {
+		return fsm.Apply(commandLog(t, index, cmd))
+	}
+	assertHead := func(want string) {
+		t.Helper()
+		got, err := fsm.LastKey(testHeadPrefix)
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+	}
+
+	require.Nil(t, apply(1, Command{Type: CommandPut, Key: []byte(old), Value: []byte("old")}))
+	assertHead(old)
+	require.Equal(t, TxnResult{Applied: true}, apply(2, txnCommand(
+		[]TxnCheck{holds(old, "old")}, put(next, "new"),
+	)))
+	assertHead(next)
+	require.IsType(t, TxnResult{}, apply(3, txnCommand(
+		[]TxnCheck{absent(next)}, TxnWrite{Key: []byte(next), Delete: true},
+	)))
+	assertHead(next)
+	require.Equal(t, TxnResult{Applied: true}, apply(4, txnCommand(
+		[]TxnCheck{holds(next, "new")}, TxnWrite{Key: []byte(next), Delete: true},
+	)))
+	assertHead(old)
+}

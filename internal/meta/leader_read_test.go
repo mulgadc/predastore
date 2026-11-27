@@ -33,6 +33,16 @@ func TestLeaderReadIsServedByTheLeader(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, items, 1)
 	assert.Equal(t, "objects/b", items[0].Key)
+
+	const headPrefix = "objects/arn:aws:s3:::predastore/vol/map/head."
+	require.NoError(t, cli.Put(ctx, headPrefix+"a", []byte("one")))
+	require.NoError(t, cli.Put(ctx, headPrefix+"b", []byte("two")))
+	last, err := cli.LeaderLastKey(ctx, headPrefix)
+	require.NoError(t, err)
+	assert.Equal(t, headPrefix+"b", last)
+	last, err = cli.LeaderLastKey(ctx, "objects/arn:aws:s3:::predastore/empty/map/head.")
+	require.NoError(t, err)
+	assert.Empty(t, last)
 }
 
 // A replica that is not the leader must refuse rather than answer from a local
@@ -46,6 +56,8 @@ func TestLeaderReadIsRefusedWithoutALeader(t *testing.T) {
 	assert.NotErrorIs(t, err, meta.ErrNotFound, "a follower's not-found must not be trusted")
 
 	_, err = cli.LeaderScanFrom(ctx, "objects/", "", 10)
+	require.ErrorIs(t, err, meta.ErrNoLeaderRead)
+	_, err = cli.LeaderLastKey(ctx, "objects/")
 	require.ErrorIs(t, err, meta.ErrNoLeaderRead)
 
 	// The ordinary read is unchanged: it still answers from the local store.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -378,6 +379,33 @@ func (c *Client) LeaderScanFrom(ctx context.Context, prefix, after string, limit
 	}
 
 	return items, nil
+}
+
+// LeaderLastKey reads the greatest key in a prefix at the leader's read point.
+// Confirmation distinguishes an empty result from a reply by an older server.
+func (c *Client) LeaderLastKey(ctx context.Context, prefix string) (key string, err error) {
+	defer observeOp(ctx, telemetry.MetaOpScan, time.Now(), &err)
+
+	req := request(prefix, 1)
+	req.Last = true
+	resp, err := c.leaderRead(ctx, OpMetaLastKey, req)
+	if err != nil {
+		return "", err
+	}
+	if resp.Err != "" {
+		return "", errors.New(resp.Err)
+	}
+	if !resp.Last || len(resp.Items) > 1 {
+		return "", fmt.Errorf("%w: leader did not confirm a single last-key lookup", ErrNoLeaderRead)
+	}
+	if len(resp.Items) == 0 {
+		return "", nil
+	}
+	key = string(resp.Items[0].Key)
+	if !strings.HasPrefix(key, prefix) {
+		return "", fmt.Errorf("%w: last-key result outside requested prefix", ErrNoLeaderRead)
+	}
+	return key, nil
 }
 
 // leaderRead sends a leader read to each replica in turn until one serves it.

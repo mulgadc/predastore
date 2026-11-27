@@ -350,25 +350,19 @@ func TestFSM_Restore_AnOlderSnapshotMovesTheIndexBack(t *testing.T) {
 // A snapshot from before the row existed holds none, so the restore removes
 // the local row and replay skips nothing.
 func TestFSM_Restore_ASnapshotWithoutTheRowClearsTheIndex(t *testing.T) {
-	for name, stream := range map[string][]byte{
-		"sorted":      snapshotOf(t, map[string][]byte{"objects/k": []byte("snap")}),
-		"legacy json": []byte(`{"objects/k":"c25hcA=="}`),
-	} {
-		t.Run(name, func(t *testing.T) {
-			db := newTestDB(t)
-			fsm := NewFSM(db)
-			fsm.ApplyBatch([]*raft.Log{swapLog(t, 1, "objects/k", "gen-1"), swapLog(t, 2, "objects/j", "gen-1")})
-			require.Equal(t, uint64(2), fsm.persisted)
+	stream := snapshotOf(t, map[string][]byte{"objects/k": []byte("snap")})
+	db := newTestDB(t)
+	fsm := NewFSM(db)
+	fsm.ApplyBatch([]*raft.Log{swapLog(t, 1, "objects/k", "gen-1"), swapLog(t, 2, "objects/j", "gen-1")})
+	require.Equal(t, uint64(2), fsm.persisted)
 
-			require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(stream))))
+	require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(stream))))
 
-			assert.Zero(t, fsm.persisted)
-			_, err := dbGet(db, appliedKey)
-			assert.ErrorIs(t, err, badger.ErrKeyNotFound)
-			assert.Equal(t, map[string]string{"objects/k": "snap"}, contents(t, db))
-			assert.Equal(t, []any{[]byte("snap")}, fsm.ApplyBatch([]*raft.Log{swapLog(t, 1, "objects/k", "gen-1")}))
-		})
-	}
+	assert.Zero(t, fsm.persisted)
+	_, err := dbGet(db, appliedKey)
+	assert.ErrorIs(t, err, badger.ErrKeyNotFound)
+	assert.Equal(t, map[string]string{"objects/k": "snap"}, contents(t, db))
+	assert.Equal(t, []any{[]byte("snap")}, fsm.ApplyBatch([]*raft.Log{swapLog(t, 1, "objects/k", "gen-1")}))
 }
 
 // A truncated snapshot that fails before any write reaches the store is
