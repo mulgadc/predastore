@@ -736,9 +736,12 @@ const nodeAttrKey = "node"
 
 // Shard operations. Bounded, and the only values the op attribute may take.
 const (
-	ShardOpRead   = "read"
-	ShardOpWrite  = "write"
-	ShardOpDelete = "delete"
+	ShardOpRead         = "read"
+	ShardOpWrite        = "write"
+	ShardOpDelete       = "delete"
+	ShardOpWriteBody    = "write_body"
+	ShardOpPrepareReply = "prepare_reply"
+	ShardOpCommit       = "commit"
 )
 
 // Operation outcomes.
