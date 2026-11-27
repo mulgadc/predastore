@@ -156,6 +156,8 @@ type FSM struct {
 	// commit on demand; production always commits the transaction.
 	commitBatch func(*badger.Txn) error
 
+	limits txnLimits
+
 	// row and cmd are scratch space that ApplyBatch reuses, guarded by mu.
 	row appliedRow
 	cmd Command
@@ -196,7 +198,7 @@ func OpenFSM(db *badger.DB, opts ...FSMOption) (*FSM, error) {
 	if err != nil {
 		return nil, err
 	}
-	f := &FSM{db: db, commitBatch: (*badger.Txn).Commit, persisted: persisted}
+	f := &FSM{db: db, commitBatch: (*badger.Txn).Commit, persisted: persisted, limits: newTxnLimits(db)}
 	for _, opt := range opts {
 		opt(f)
 	}
@@ -236,7 +238,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	b := &batch{f: f, first: logs[0].Index, last: logs[len(logs)-1].Index, budget: newTxnBudget(f.db)}
+	b := &batch{f: f, first: logs[0].Index, last: logs[len(logs)-1].Index, budget: newTxnBudget(f.limits)}
 	b.begin()
 
 	for i, log := range logs {
@@ -306,7 +308,7 @@ func (b *batch) stage(cmd Command, index uint64) any {
 	if IsReservedKey(cmd.Key) {
 		return fmt.Errorf("%w: %q", ErrReservedKey, cmd.Key)
 	}
-	cost, writes := commandCost(cmd)
+	cost, writes := b.budget.commandCost(cmd)
 	if writes && !b.budget.fits(cost) && b.dirty {
 		b.end()
 		b.begin()
@@ -506,7 +508,7 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	if err != nil {
 		return err
 	}
-	rs := &restoreState{budget: newTxnBudget(f.db)}
+	rs := &restoreState{budget: newTxnBudget(f.limits)}
 	if sorted {
 		err = f.restoreByMerge(r, started, rs)
 	} else {
@@ -538,7 +540,7 @@ type restoreState struct {
 // when its transaction is full, so until the count says it could be, the
 // store is unchanged.
 func (rs *restoreState) write(key, value []byte) {
-	cost := writeCost(key, value)
+	cost := rs.budget.cost(key, len(value))
 	if !rs.budget.holds(cost) {
 		rs.wrote = true
 	}

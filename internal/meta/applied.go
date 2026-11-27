@@ -89,14 +89,13 @@ func readApplied(db *badger.DB) (uint64, error) {
 	return index, err
 }
 
-// writeCost bounds what badger charges a transaction for one write: the key,
-// the value or its 12-byte pointer, and 12 bytes of overhead. It is never
-// below badger's charge, so the room kept for the applied row is real.
-func writeCost(key, value []byte) int64 {
-	return int64(len(key) + max(len(value), 12) + 12)
-}
-
-var appliedRowCost = writeCost(appliedKey, make([]byte, appliedValueLen))
+// Badger charges a transaction, for each write, the key, the value or a
+// value pointer, and entryOverhead bytes. A value at or above the value
+// threshold goes to the value log, so only its pointer counts.
+const (
+	valuePointerLen int64 = 12
+	entryOverhead   int64 = 2 + 10
+)
 
 // A new badger transaction already counts one entry and 21 bytes for the
 // marker that ends it.
@@ -105,15 +104,45 @@ const (
 	txnBaseSize  int64 = int64(len("!badger!txn") + 10)
 )
 
+// txnLimits are the badger limits a txnBudget counts against.
+type txnLimits struct {
+	maxCount, maxSize int64
+	// threshold is the value size from which badger charges a pointer. With
+	// a dynamic threshold it is the highest the threshold can reach, so a
+	// cost is never below badger's charge.
+	threshold int64
+	rowCost   int64
+}
+
+func newTxnLimits(db *badger.DB) txnLimits {
+	opts := db.Opts()
+	l := txnLimits{maxCount: db.MaxBatchCount(), maxSize: db.MaxBatchSize(), threshold: opts.ValueThreshold}
+	if opts.VLogPercentile > 0 {
+		l.threshold = max(l.threshold, min(1<<20, l.maxSize))
+	}
+	l.rowCost = l.cost(appliedKey, appliedValueLen)
+	return l
+}
+
+// cost is what badger charges a transaction for one write of key with a value
+// of valueLen bytes.
+func (l *txnLimits) cost(key []byte, valueLen int) int64 {
+	v := int64(valueLen)
+	if v >= l.threshold {
+		v = valuePointerLen
+	}
+	return int64(len(key)) + v + entryOverhead
+}
+
 // txnBudget counts what the shared transaction has staged against badger's
 // limits, keeping room for the applied row.
 type txnBudget struct {
-	maxCount, maxSize int64
-	count, size       int64
+	txnLimits
+	count, size int64
 }
 
-func newTxnBudget(db *badger.DB) txnBudget {
-	b := txnBudget{maxCount: db.MaxBatchCount(), maxSize: db.MaxBatchSize()}
+func newTxnBudget(l txnLimits) txnBudget {
+	b := txnBudget{txnLimits: l}
 	b.reset()
 	return b
 }
@@ -121,7 +150,7 @@ func newTxnBudget(db *badger.DB) txnBudget {
 // fits reports whether one more write of cost and then the applied row stay
 // within both of badger's limits, which refuse a write that reaches either.
 func (b *txnBudget) fits(cost int64) bool {
-	return b.count+2 < b.maxCount && b.size+cost+appliedRowCost < b.maxSize
+	return b.count+2 < b.maxCount && b.size+cost+b.rowCost < b.maxSize
 }
 
 // holds reports whether one more write of cost stays within badger's limits.
@@ -135,12 +164,12 @@ func (b *txnBudget) reset() { b.count, b.size = txnBaseCount, txnBaseSize }
 
 // commandCost is what staging cmd charges, with ok false for a command that
 // stages no write.
-func commandCost(cmd Command) (cost int64, ok bool) {
+func (l *txnLimits) commandCost(cmd Command) (cost int64, ok bool) {
 	switch cmd.Type {
 	case CommandPut, CommandPutMax, CommandSwap:
-		return writeCost(cmd.Key, cmd.Value), true
+		return l.cost(cmd.Key, len(cmd.Value)), true
 	case CommandDelete:
-		return writeCost(cmd.Key, nil), true
+		return l.cost(cmd.Key, 0), true
 	default:
 		return 0, false
 	}

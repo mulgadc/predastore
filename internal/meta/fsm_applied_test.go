@@ -231,7 +231,8 @@ func TestFSM_ApplyBatch_KeepsRoomForTheAppliedRow(t *testing.T) {
 
 	filler := bytes.Repeat([]byte{0x5a}, 16<<10)
 	fillerKey := func(i int) []byte { return fmt.Appendf(nil, "f%03d", i) }
-	fillerCost := writeCost(fillerKey(0), filler)
+	limits := newTxnLimits(db)
+	fillerCost := limits.cost(fillerKey(0), len(filler))
 	fillers := int((maxSize-txnBaseSize)/fillerCost) - 1
 	remaining := maxSize - txnBaseSize - int64(fillers)*fillerCost
 	lastKey := []byte("last")
@@ -418,4 +419,40 @@ func TestFSM_Restore_AFailureBeforeAnyWriteLeavesTheStore(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, before, dumpStore(t, db))
 	assert.Equal(t, uint64(5), fsm.persisted)
+}
+
+// Badger keeps a value at or above its value threshold in the value log and
+// charges the transaction for a pointer only, so it takes a value larger than
+// a whole transaction. The release before the row took it too, and replay
+// after restoring an older snapshot must apply it again.
+func TestFSM_ApplyBatch_AValueInTheValueLogAppliesAndReplays(t *testing.T) {
+	opts := smallTxnOptions(t.TempDir())
+	db := openStore(t, opts)
+	key := []byte("objects/big")
+	value := bytes.Repeat([]byte{0x7a}, int(db.MaxBatchSize())+1)
+
+	// The premise: badger alone takes the value in an empty transaction,
+	// and a charge for the whole value could not fit.
+	premise := db.NewTransaction(true)
+	require.NoError(t, premise.Set(key, value))
+	premise.Discard()
+	require.Greater(t, int64(len(value)), db.MaxBatchSize())
+
+	fsm := NewFSM(db)
+	logs := []*raft.Log{
+		swapLog(t, 1, "objects/small", "gen-1"),
+		commandLog(t, 2, Command{Type: CommandPut, Key: key, Value: value}),
+		swapLog(t, 3, string(key), "gen-2"),
+	}
+	require.Equal(t, []any{[]byte(nil)}, fsm.ApplyBatch(logs[:1]))
+	older := snapshotStream(t, fsm)
+	assert.Equal(t, []any{nil, value}, fsm.ApplyBatch(logs[1:]))
+	require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(older))))
+
+	db, fsm = restart(t, db, opts)
+	replayed := fsm.ApplyBatch(logs)
+
+	assert.Equal(t, []any{nil, nil, value}, replayed, "entry 2 applies again, so entry 3 replaces it")
+	assertStored(t, db, map[string]*string{string(key): str("gen-2"), "objects/small": str("gen-1")})
+	assert.Equal(t, uint64(3), storedApplied(t, db))
 }

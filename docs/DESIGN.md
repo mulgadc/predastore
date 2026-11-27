@@ -292,6 +292,8 @@ The replica keeps one row of its own in badger, `\x00raft/applied`. Its value is
 On start, the FSM reads the row. When raft replays the log against the store, an entry at or below the row is already in the store, so `ApplyBatch` skips it and answers nil, because no caller waits for a replayed entry. An entry is therefore applied once, and a conditional entry or a `Swap` is never evaluated again against a state that already includes it. A store from a release before the row has no row, and the FSM applies every entry against it, then writes the row on its first commit. A row that does not decode stops the start with an error, and the replica skips nothing.
 
 The shared transaction keeps room for the row. Before it stages an entry, it counts the entry and the row against badger's transaction limits, and it commits first when both would not fit. So an entry that did not fit goes into the next commit, which names it, and replay does not skip it.
+The count is badger's own: the key, the value, and 12 bytes of overhead, but only a 12-byte pointer for a value at or above the value threshold, which badger keeps in the value log.
+So the FSM refuses an entry that badger alone accepts only when the row's own 38 bytes do not fit beside it.
 
 No command writes a key under `\x00raft/`. The FSM, the replica's handlers and the client refuse a put, delete, swap or transaction that names one, and a transaction cannot check one. `Get`, `LeaderGet` and every scan, the empty prefix included, never return the row.
 
