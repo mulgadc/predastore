@@ -31,7 +31,8 @@ const (
 	OpMetaTxn rpc.Opcode = 0x1008
 
 	// OpMetaLastKey confirms a map head without an ordinary scan.
-	OpMetaLastKey rpc.Opcode = 0x1009
+	OpMetaLastKey      rpc.Opcode = 0x1009
+	OpMetaAuthorityGet rpc.Opcode = 0x100a
 
 	// OpMetaStatus asks a replica to report its own raft state, rather than
 	// any data it holds.

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"crypto/sha256"
 	"os"
 	"os/signal"
@@ -28,7 +29,11 @@ func TestShardIndexWriteEIO(t *testing.T) {
 
 	store, err := Open(dir, WithAEAD(testAEAD(t)), WithFreeSpaceWatermark(0, 0))
 	require.NoError(t, err)
-	defer func() { require.NoError(t, store.Close()) }()
+	defer func() {
+		if store != nil {
+			require.NoError(t, store.Close())
+		}
+	}()
 	overwrite := [32]byte{0x31}
 	witness := [32]byte{0x72}
 	previous := []byte("previous acknowledged generation")
@@ -77,7 +82,14 @@ func TestShardIndexWriteEIO(t *testing.T) {
 				epoch, err := strconv.ParseUint(string(acknowledged), 10, 64)
 				require.NoError(t, err)
 				require.Equal(t, previous, readValue(t, store, overwrite, 0), "the live row must be stale for the replay probe")
-				require.Equal(t, current, replayPrepareRecord(t, store, overwrite, 0, epoch))
+				require.NoError(t, store.Close())
+				store = nil
+				staged, err := Open(dir, WithAEAD(testAEAD(t)), WithFreeSpaceWatermark(0, 0), WithStartupPrepareRecovery(t.Context(),
+					func(_ context.Context, key [32]byte, index uint32, candidate uint64) (bool, error) {
+						return key == overwrite && index == 0 && candidate == epoch, nil
+					}))
+				require.NoError(t, err)
+				store = staged
 			}
 		}
 		require.Equal(t, want, readValue(t, store, overwrite, 0))

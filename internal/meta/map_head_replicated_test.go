@@ -91,6 +91,26 @@ func TestLastKeyLeaderConfirmationWithLagAndFailover(t *testing.T) {
 	require.Equal(t, latest, key)
 }
 
+func TestAuthorityGetRequiresQuorumForExactBinaryKey(t *testing.T) {
+	cluster := startMapHeadTestCluster(t)
+	client := cluster.client(cluster.voters...)
+	leader := cluster.leader(t, client)
+	key := "objects/\x00\xff"
+	want := []byte("acknowledged placement")
+	require.NoError(t, client.Put(t.Context(), key, want))
+	value, err := client.AuthorityGet(t.Context(), key)
+	require.NoError(t, err)
+	require.Equal(t, want, value)
+
+	for _, id := range cluster.voters {
+		if id != leader {
+			cluster.stops[id]()
+		}
+	}
+	_, err = cluster.client(leader).AuthorityGet(t.Context(), key)
+	require.ErrorIs(t, err, ErrNoLeaderRead)
+}
+
 func TestRaftCannotCompactToFailedMetadataRestore(t *testing.T) {
 	cluster := startMapHeadTestCluster(t)
 	client := cluster.client(cluster.voters...)

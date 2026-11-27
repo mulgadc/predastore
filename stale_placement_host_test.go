@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -18,7 +19,10 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/dgraph-io/badger/v4"
+	"github.com/mulgadc/predastore"
 	"github.com/mulgadc/predastore/internal/blob"
+	"github.com/mulgadc/predastore/internal/blob/engine"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/model"
@@ -53,6 +57,15 @@ const gateNodeID config.NodeID = 1
 
 func startStaleHost(t *testing.T) (*s3Client, *config.Config) {
 	t.Helper()
+	client, cfg := staleHostConfig(t)
+	runHost(t, cfg, newMasterKey(t))
+	awaitProbe(t, "http://127.0.0.1:"+strconv.Itoa(cfg.Hosts[0].AdminPort)+"/readyz", http.StatusOK)
+	awaitGate(t, client.http, client.base+"/")
+	return client, cfg
+}
+
+func staleHostConfig(t *testing.T) (*s3Client, *config.Config) {
+	t.Helper()
 	certPath, keyPath, _ := testcerts.Generate(t)
 	adminPort, gatePort := freePort(t), freePort(t)
 
@@ -83,17 +96,80 @@ func startStaleHost(t *testing.T) (*s3Client, *config.Config) {
 			{AccessKeyID: staleKey, SecretAccessKey: staleSecret, AccountID: staleAccount},
 		},
 	}
-	runHost(t, cfg, newMasterKey(t))
-
-	awaitProbe(t, "http://127.0.0.1:"+strconv.Itoa(adminPort)+"/readyz", http.StatusOK)
 	client := &http.Client{Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}}
 	base := "https://127.0.0.1:" + strconv.Itoa(gatePort)
-	awaitGate(t, client, base+"/")
-
 	return &s3Client{t: t, base: base, region: cfg.Region,
 		accessKey: staleKey, secretKey: staleSecret, http: client}, cfg
+}
+
+func TestHostReplaysRaftNamedPlacementBeforeServingShards(t *testing.T) {
+	client, cfg := staleHostConfig(t)
+	require.NoError(t, cfg.Validate())
+	key := newMasterKey(t)
+	start := func() func() {
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() {
+			done <- predastore.Run(ctx, predastore.Options{Config: cfg, HostID: 1, MasterKey: key})
+		}()
+		stop := sync.OnceFunc(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				t.Error("host did not stop")
+			}
+		})
+		t.Cleanup(stop)
+		awaitProbe(t, "http://127.0.0.1:"+strconv.Itoa(cfg.Hosts[0].AdminPort)+"/readyz", http.StatusOK)
+		return stop
+	}
+	stop := start()
+	status, body := client.send(http.MethodPut, "/"+staleBucket, "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	want := bytes.Repeat([]byte("acknowledged payload"), 1024)
+	objectPath := "/" + staleBucket + "/" + staleObject
+	status, body = client.send(http.MethodPut, objectPath, "", want)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+
+	hash := model.ObjectHash(staleBucket, staleObject)
+	var placement handlers.ObjectToShardNodes
+	withHostClients(t, cfg, func(mc *meta.Client, _ *blob.Client, _ []config.NodeID) {
+		raw, err := mc.AuthorityGet(t.Context(), handlers.TableKey(model.TableObjects, string(hash[:])))
+		require.NoError(t, err)
+		placement, err = handlers.DecodePlacement(raw)
+		require.NoError(t, err)
+	})
+	stop()
+	client.http.CloseIdleConnections()
+
+	host := cfg.Hosts[0]
+	holders := placement.AllNodes()
+	require.Len(t, holders, 3)
+	for index, id := range holders {
+		for _, node := range host.Nodes {
+			if node.ID != id {
+				continue
+			}
+			db, err := badger.Open(badger.DefaultOptions(filepath.Join(config.NodeDataDir(host, node), "db")))
+			require.NoError(t, err)
+			require.NoError(t, db.Update(func(txn *badger.Txn) error {
+				row := engine.MakeKey(hash, uint32(index))
+				if _, err := txn.Get(row); err != nil {
+					return err
+				}
+				return txn.Delete(row)
+			}))
+			require.NoError(t, db.Close())
+		}
+	}
+
+	start()
+	status, body = client.send(http.MethodGet, objectPath, "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	require.Equal(t, want, body)
 }
 
 // sendTyped signs and issues one request, optionally declaring a content type,

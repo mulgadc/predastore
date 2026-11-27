@@ -83,6 +83,9 @@ type Config struct {
 	// held put body that has stopped arriving. Zero uses DefaultBodyIdleTimeout.
 	BodyIdleTimeout time.Duration
 
+	// AuthorizeRecoveredPrepare checks authoritative placement at startup.
+	AuthorizeRecoveredPrepare func(context.Context, [32]byte, uint32, uint64) (bool, error)
+
 	// Store stands in for the engine that would be opened at DataDir. Test
 	// seam: production leaves it nil.
 	Store Store
@@ -141,6 +144,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		st, err := engine.Open(s.cfg.DataDir,
 			engine.WithAEAD(s.cfg.AEAD), engine.WithCompaction(s.cfg.Compaction),
+			engine.WithStartupPrepareRecovery(ctx, s.cfg.AuthorizeRecoveredPrepare),
 			engine.WithRetainedMaxAge(s.cfg.RetainedMaxAge),
 			engine.WithCompactionSlot(slot, slots),
 			engine.WithCompactionPacing(s.cfg.CompactionMaxBytesPerSec, s.cfg.CompactionYieldLatency, s.cfg.CompactionMaxYield))

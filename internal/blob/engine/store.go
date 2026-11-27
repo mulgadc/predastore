@@ -68,6 +68,7 @@ type Store struct {
 	compactionInterval time.Duration
 	retainedMaxAge     time.Duration
 	compactor          *compactor
+	startupRecovery    func(*Store) error
 
 	// This node's slot among the cluster's blob nodes, which offsets its
 	// routine passes, and the pacing a routine pass runs under.
@@ -363,6 +364,14 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 			err = errors.Join(err, index.Close())
 		}
 	}()
+	segments := store.segCache
+	defer func() {
+		if err != nil {
+			for _, seg := range segments {
+				err = errors.Join(err, seg.Close())
+			}
+		}
+	}()
 
 	// Counted once here, then maintained by create and drop. Doing it at Open
 	// is what keeps the reporting path free of a directory read.
@@ -373,6 +382,13 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 
 	if _, err := store.nextAvailableSegment(); err != nil {
 		return nil, err
+	}
+
+	if store.startupRecovery != nil {
+		if err := store.startupRecovery(store); err != nil {
+			return nil, fmt.Errorf("recover prepared extents: %w", err)
+		}
+		store.startupRecovery = nil
 	}
 
 	if store.compactionEnabled {

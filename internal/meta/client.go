@@ -343,9 +343,18 @@ var ErrNoLeaderRead = errors.New("no meta replica would serve a leader read")
 // LeaderGet is Get answered only by a leader that has applied everything
 // committed. A follower's not-found is not trusted, so neither is its value.
 func (c *Client) LeaderGet(ctx context.Context, key string) (value []byte, err error) {
+	return c.getFromLeader(ctx, OpMetaGet, key)
+}
+
+// AuthorityGet requires the leader to confirm a fresh quorum before reading.
+func (c *Client) AuthorityGet(ctx context.Context, key string) ([]byte, error) {
+	return c.getFromLeader(ctx, OpMetaAuthorityGet, key)
+}
+
+func (c *Client) getFromLeader(ctx context.Context, op rpc.Opcode, key string) (value []byte, err error) {
 	defer observeOp(ctx, telemetry.MetaOpGet, time.Now(), &err)
 
-	resp, err := c.leaderRead(ctx, OpMetaGet, request(key, 0))
+	resp, err := c.leaderRead(ctx, op, request(key, 0))
 	if err != nil {
 		return nil, err
 	}
