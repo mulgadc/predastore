@@ -125,6 +125,13 @@ func (r writeResult) landedCount() int {
 // where the record says, and both the read path and repair look there.
 func (r writeResult) degraded() bool { return r.shortBy() > 0 }
 
+func (r writeResult) recordObjectWriteSuccess(ctx context.Context, dataShards int) {
+	telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeSuccess, "")
+	if r.committed > 0 {
+		telemetry.RecordObjectShardMargin(ctx, r.committed-dataShards)
+	}
+}
+
 // shortBy is how many positions the write is short of full width: those not
 // committed once the commits have run, and those that never landed before.
 func (r writeResult) shortBy() int {

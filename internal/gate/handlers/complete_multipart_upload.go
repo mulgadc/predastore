@@ -193,7 +193,7 @@ func CompleteMultipartUpload(mc MetaClient, bc BlobClient, ring *placement.Ring,
 
 		// An object assembled from parts is an object write like any other, so
 		// the counter means objects created rather than single-shot PUTs only.
-		telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeSuccess, "")
+		written.recordObjectWriteSuccess(ctx, cfg.DataShards)
 
 		// Cleanup is best-effort: the object is already durable, so a failed part
 		// delete must not fail the request.
