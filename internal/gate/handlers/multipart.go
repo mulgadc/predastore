@@ -231,7 +231,7 @@ func cleanupMultipartUpload(ctx context.Context, mc MetaClient, bc BlobClient, b
 				slog.WarnContext(ctx, "cleanup: part shard map corrupt, skipping shard delete", "uploadID", uploadID, "part", part.PartNumber, "error", err)
 			} else {
 				partObjKey := partObjectKey(key, uploadID, part.PartNumber)
-				if err := deleteObject(ctx, bc, bucket, partObjKey, model.ObjectHash(bucket, partObjKey), nodes); err != nil {
+				if err := deletePartShards(ctx, bc, bucket, partObjKey, model.ObjectHash(bucket, partObjKey), nodes); err != nil {
 					slog.ErrorContext(ctx, "cleanup: shard delete failed, continuing", "uploadID", uploadID, "part", part.PartNumber, "error", err)
 				}
 			}

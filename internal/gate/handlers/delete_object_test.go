@@ -38,40 +38,59 @@ func (m *putFailingMeta) Swap(ctx context.Context, key string, value []byte) ([]
 
 var _ MetaClient = (*putFailingMeta)(nil)
 
-// failingBlob fails every shard Delete, standing in for a fan-out that could
-// not reach any node.
+// failingBlob fails every scoped shard delete, standing in for a fan-out that
+// could not reach any node.
 type failingBlob struct {
 	*fakeBlob
 }
 
-func (b *failingBlob) Delete(_ context.Context, _ config.NodeID, _ blob.DeleteRequest) (*blob.DeleteResponse, error) {
+func (b *failingBlob) DeleteEpoch(_ context.Context, _ config.NodeID, _ blob.CommitRequest) (*blob.DeleteResponse, error) {
 	return nil, errors.New("simulated node unreachable")
 }
 
 var _ BlobClient = (*failingBlob)(nil)
 
-// tombstoneKey is the stored key one delete's tombstone lands under. An
-// unversioned delete removes the shard set under the plain object hash, which
-// is what ends the key.
-func tombstoneKey(bucket, key string) string {
-	return DeletedObjectKey(bucket, key, model.ObjectHash(bucket, key))
+// tombstoneKey is the stored key the tombstone of an unversioned delete at
+// one generation lands under.
+func tombstoneKey(bucket, key string, epoch uint64) string {
+	return DeletedObjectKey(bucket, key, model.ObjectHash(bucket, key), epoch)
 }
 
-// decodeTombstone reads and gob-decodes the tombstone a delete left.
-func decodeTombstone(t *testing.T, mc MetaClient, bucket, key string) DeletedObjectInfo {
+// scopedTombstones returns every row under the scoped prefix for one
+// unversioned key, keyed by its key within the table.
+func scopedTombstones(t *testing.T, mc MetaClient, bucket, key string) map[string]DeletedObjectInfo {
 	t.Helper()
-	data, err := metaGet(context.Background(), mc, model.TableObjects, tombstoneKey(bucket, key))
+	items, err := metaScan(context.Background(), mc, model.TableObjects, DeletedEpochPrefix, 0)
 	require.NoError(t, err)
 
-	var info DeletedObjectInfo
-	require.NoError(t, gob.NewDecoder(bytes.NewReader(data)).Decode(&info))
-	return info
+	found := make(map[string]DeletedObjectInfo)
+	for _, item := range items {
+		var info DeletedObjectInfo
+		require.NoError(t, gob.NewDecoder(bytes.NewReader(item.Value)).Decode(&info))
+		if info.Bucket == bucket && info.Key == key && info.ObjectHash == model.ObjectHash(bucket, key) {
+			found[item.Key] = info
+		}
+	}
+	return found
+}
+
+// decodeTombstone reads the one tombstone a delete left, and checks that it is
+// stored under the key that names its generation.
+func decodeTombstone(t *testing.T, mc MetaClient, bucket, key string) DeletedObjectInfo {
+	t.Helper()
+	found := scopedTombstones(t, mc, bucket, key)
+	require.Len(t, found, 1, "tombstones: %v", found)
+	for stored, info := range found {
+		require.Equal(t, tombstoneKey(bucket, key, info.WriteEpoch), stored)
+		return info
+	}
+	return DeletedObjectInfo{}
 }
 
 // tombstoneExists reports whether a delete left a tombstone behind.
-func tombstoneExists(mc MetaClient, bucket, key string) bool {
-	_, err := metaGet(context.Background(), mc, model.TableObjects, tombstoneKey(bucket, key))
-	return err == nil
+func tombstoneExists(t *testing.T, mc MetaClient, bucket, key string) bool {
+	t.Helper()
+	return len(scopedTombstones(t, mc, bucket, key)) > 0
 }
 
 // A fan-out that succeeds is the common case, and it must leave no tombstone
@@ -85,7 +104,7 @@ func TestDeleteStoredObjectSuccessWritesNoTombstone(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.False(t, f.exists(t, "a.txt"), "the placement record must be gone")
-	assert.False(t, tombstoneExists(f.write.mc, deleteTestBucket, "a.txt"), "a successful fan-out must leave no tombstone")
+	assert.False(t, tombstoneExists(t, f.write.mc, deleteTestBucket, "a.txt"), "a successful fan-out must leave no tombstone")
 }
 
 // When the fan-out fails the delete still succeeds from the caller's point of
@@ -131,10 +150,11 @@ func TestFailedTombstoneWriteAfterFailedFanOutLeavesBothIndexEntries(t *testing.
 	t.Parallel()
 
 	f := newDeleteFixture(t, "a.txt")
+	place := storedPlacement(t, f, "a.txt")
 	failingMeta := &putFailingMeta{
 		fakeMeta: f.write.mc,
 		failOn: func(key string) bool {
-			return key == TableKey(model.TableObjects, tombstoneKey(deleteTestBucket, "a.txt"))
+			return key == TableKey(model.TableObjects, tombstoneKey(deleteTestBucket, "a.txt", place.WriteEpoch))
 		},
 	}
 	bc := &failingBlob{fakeBlob: f.write.bc}
@@ -147,8 +167,7 @@ func TestFailedTombstoneWriteAfterFailedFanOutLeavesBothIndexEntries(t *testing.
 	_, arnErr := metaGet(context.Background(), f.write.mc, model.TableObjects, objectARN(deleteTestBucket, "a.txt"))
 	assert.NoError(t, arnErr, "the listing row must survive a failed tombstone write")
 
-	_, tombErr := metaGet(context.Background(), f.write.mc, model.TableObjects, tombstoneKey(deleteTestBucket, "a.txt"))
-	assert.Error(t, tombErr, "no tombstone should exist when its own write failed")
+	assert.False(t, tombstoneExists(t, f.write.mc, deleteTestBucket, "a.txt"), "no tombstone should exist when its own write failed")
 }
 
 // A listing row whose placement record has gone still names an object every

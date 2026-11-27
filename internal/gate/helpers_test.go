@@ -94,6 +94,10 @@ func (fakeBlob) Delete(context.Context, config.NodeID, blob.DeleteRequest) (*blo
 	return nil, errors.New("no blob nodes")
 }
 
+func (fakeBlob) DeleteEpoch(context.Context, config.NodeID, blob.CommitRequest) (*blob.DeleteResponse, error) {
+	return nil, errors.New("no blob nodes")
+}
+
 func (fakeBlob) Stat(context.Context, config.NodeID, blob.StatRequest) (*blob.StatResponse, error) {
 	return nil, errors.New("no blob nodes")
 }

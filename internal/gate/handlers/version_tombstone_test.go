@@ -30,17 +30,19 @@ func seedVersion(t *testing.T, f writeFixture, bucket, key, versionID string, bo
 	return versionHash
 }
 
-// tombstones returns every reclaim record in state, keyed by stored key.
+// tombstones returns every reclaim record in state under both prefixes the
+// reaper scans, keyed by stored key.
 func tombstones(t *testing.T, mc MetaClient) map[string]DeletedObjectInfo {
 	t.Helper()
-	items, err := metaScan(context.Background(), mc, model.TableObjects, DeletedObjectPrefix, 0)
-	require.NoError(t, err)
-
-	found := make(map[string]DeletedObjectInfo, len(items))
-	for _, item := range items {
-		var info DeletedObjectInfo
-		require.NoError(t, gob.NewDecoder(bytes.NewReader(item.Value)).Decode(&info))
-		found[item.Key] = info
+	found := make(map[string]DeletedObjectInfo)
+	for _, prefix := range []string{DeletedEpochPrefix, DeletedObjectPrefix} {
+		items, err := metaScan(context.Background(), mc, model.TableObjects, prefix, 0)
+		require.NoError(t, err)
+		for _, item := range items {
+			var info DeletedObjectInfo
+			require.NoError(t, gob.NewDecoder(bytes.NewReader(item.Value)).Decode(&info))
+			found[item.Key] = info
+		}
 	}
 	return found
 }
@@ -83,9 +85,9 @@ func TestTwoVersionsOfOneKeyKeepSeparateReclaimRecords(t *testing.T) {
 	}
 }
 
-// The record stays under the prefix the reclaim worker already scans, so one
-// scan reads both shapes and a rollback still finds the newer rows.
-func TestVersionReclaimRecordKeepsTheScannedPrefix(t *testing.T) {
+// A version delete writes its record under the epoch prefix, at the key that
+// names its version hash and generation.
+func TestVersionReclaimRecordUsesTheEpochPrefix(t *testing.T) {
 	t.Parallel()
 
 	const key = "nested/dir/a.txt"
@@ -97,11 +99,11 @@ func TestVersionReclaimRecordKeepsTheScannedPrefix(t *testing.T) {
 
 	found := tombstones(t, f.mc)
 	require.Len(t, found, 1)
-	for stored := range found {
-		assert.True(t, strings.HasPrefix(stored, DeletedObjectPrefix),
-			"%q is outside the prefix the reclaim worker scans", stored)
-		assert.Contains(t, stored, deleteTestBucket+"/"+key,
-			"%q does not name the object it reclaims", stored)
+	for stored, info := range found {
+		assert.True(t, strings.HasPrefix(stored, DeletedEpochPrefix),
+			"%q is outside the epoch prefix", stored)
+		assert.Equal(t, DeletedObjectKey(deleteTestBucket, key, versionHash, info.WriteEpoch), stored)
+		assert.NotZero(t, info.WriteEpoch)
 	}
 }
 

@@ -111,6 +111,10 @@ func (d *discardBlob) Delete(context.Context, config.NodeID, blob.DeleteRequest)
 	return &blob.DeleteResponse{}, nil
 }
 
+func (d *discardBlob) DeleteEpoch(context.Context, config.NodeID, blob.CommitRequest) (*blob.DeleteResponse, error) {
+	return &blob.DeleteResponse{}, nil
+}
+
 var _ BlobClient = (*discardBlob)(nil)
 
 // syntheticPlace resolves where a synthetic object of this size would go, so

@@ -14,26 +14,21 @@ import (
 	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
-// DeletedObjectPrefix keys the tombstone left behind by a delete whose shard
-// fan-out failed, so the reaper sweep can find which nodes still hold shards
-// it needs to reclaim. Exported so the reaper package, which pages only these
-// rows, can build the same scan prefix without duplicating it.
+// DeletedObjectPrefix keys the tombstones an older release wrote after a
+// failed shard fan-out. This release writes none, but the reaper still reads
+// them, so a row left from before the upgrade is reclaimed.
 const DeletedObjectPrefix = "deleted:"
 
-// DeletedObjectKey names one deleted shard set's tombstone. Exported so the
-// reclaim worker's tests can build a row the way a delete writes one.
-//
-// The object hash is in the key because every version of a key is its own
-// shard set under its own hash: without it, emptying a versioned bucket
-// overwrites one version's record with the next and loses the first's shards.
-//
-// It leads rather than trails, behind a byte a bucket name may not contain, so
-// no row can collide with one written in the older layout for an object key
-// that happens to end in a hash. Nothing parses this key — the reclaim worker
-// reads the row's value — so the prefix stays the one it already scans and one
-// pass still reads both layouts.
-func DeletedObjectKey(bucket, key string, objectHash [32]byte) string {
-	return DeletedObjectPrefix + "#" + hex.EncodeToString(objectHash[:]) + "/" + bucket + "/" + key
+// DeletedEpochPrefix keys the tombstone a failed scoped delete writes. It does
+// not start with DeletedObjectPrefix, so a reaper that scans only the older
+// prefix never reads one.
+const DeletedEpochPrefix = "deleted-epoch:"
+
+// DeletedObjectKey names the tombstone of one shard set at one generation, so
+// a reclaim of one failed delete's row cannot remove another's. The hash and
+// fixed-width epoch lead, so no object key can make two rows collide.
+func DeletedObjectKey(bucket, key string, objectHash [32]byte, epoch uint64) string {
+	return fmt.Sprintf("%s%s/%016x/%s/%s", DeletedEpochPrefix, hex.EncodeToString(objectHash[:]), epoch, bucket, key)
 }
 
 // DeletedObjectInfo names the shards a failed fan-out left behind, so the
@@ -45,7 +40,7 @@ type DeletedObjectInfo struct {
 	Key            string          `json:"key"`
 	ObjectHash     [32]byte        `json:"object_hash"`
 	DeletedAt      int64           `json:"deleted_at"`       // Unix timestamp
-	WriteEpoch     uint64          `json:"write_epoch"`      // The placement's write epoch, so the reaper can tell a recreate from its own delete still in flight
+	WriteEpoch     uint64          `json:"write_epoch"`      // The generation whose shards are still owed, zero for a pre-epoch object
 	DataShardNodes []config.NodeID `json:"data_shard_nodes"` // Which nodes had data shards
 	ParityNodes    []config.NodeID `json:"parity_nodes"`     // Which nodes had parity shards
 }
@@ -151,7 +146,7 @@ func deleteStoredVersion(ctx context.Context, mc MetaClient, bc BlobClient, buck
 		if err := gob.NewEncoder(&deletedBuf).Encode(deletedInfo); err != nil {
 			return model.NewS3Error(model.ErrInternalError, fmt.Sprintf("encode tombstone: %v", err), 500)
 		}
-		if err := metaPut(ctx, mc, model.TableObjects, DeletedObjectKey(bucket, key, objectHash), deletedBuf.Bytes()); err != nil {
+		if err := metaPut(ctx, mc, model.TableObjects, DeletedObjectKey(bucket, key, objectHash, place.WriteEpoch), deletedBuf.Bytes()); err != nil {
 			return model.NewS3Error(model.ErrInternalError, err.Error(), 500)
 		}
 	}

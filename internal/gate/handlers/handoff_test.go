@@ -174,6 +174,24 @@ func (b *nodeBlob) Delete(_ context.Context, node config.NodeID, req blob.Delete
 	return &blob.DeleteResponse{Deleted: held}, nil
 }
 
+func (b *nodeBlob) DeleteEpoch(_ context.Context, node config.NodeID, req blob.CommitRequest) (*blob.DeleteResponse, error) {
+	b.deletes.Add(1)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	addr := nodeAddr{node, req.Key, req.Index}
+	deleted := false
+	if s, ok := b.committed[addr]; ok && s.epoch == req.Epoch {
+		delete(b.committed, addr)
+		deleted = true
+	}
+	if s, ok := b.prepared[addr]; ok && s.epoch == req.Epoch {
+		delete(b.prepared, addr)
+		deleted = true
+	}
+
+	return &blob.DeleteResponse{Deleted: deleted}, nil
+}
+
 func (b *nodeBlob) held(node config.NodeID, key [32]byte, index uint32) (fakeShard, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
