@@ -7,9 +7,11 @@ import (
 )
 
 // openIndex opens the badger instance backing the store's on-disk index,
-// which maps keys to extents and carries the tombstone namespace.
+// which maps keys to extents and carries the tombstone namespace. Shard
+// commit acknowledgements count toward the gateway's durable read floor, so
+// their index entries must reach the WAL before Badger reports success.
 func openIndex(dir string) (*badger.DB, error) {
-	return badger.Open(badger.DefaultOptions(dir).WithLoggingLevel(badger.WARNING))
+	return badger.Open(badger.DefaultOptions(dir).WithLoggingLevel(badger.WARNING).WithSyncWrites(true))
 }
 
 // indexGet returns a copy of the value stored under key. A missing key
