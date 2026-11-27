@@ -62,19 +62,67 @@ func TestS7_AnInlineDeleteRacedByAWriteLeavesTheWriteReadable(t *testing.T) {
 	assert.Equal(t, body, got)
 }
 
-// A failed delete marks its tombstone scoped, so the reaper reclaims its
-// shards at the recorded generation, zero included.
-func TestAFailedDeleteWritesAScopedTombstone(t *testing.T) {
+// A failed delete writes its tombstone under the epoch prefix, at the key that
+// names the placement's generation, so the reaper reclaims that generation.
+func TestAFailedDeleteWritesItsTombstoneUnderTheEpochPrefix(t *testing.T) {
 	t.Parallel()
 
 	f := newDeleteFixture(t, "a.txt")
 	place := storedPlacement(t, f, "a.txt")
+	require.NotZero(t, place.WriteEpoch)
 
 	require.NoError(t, deleteStoredObject(context.Background(), f.write.mc, &failingBlob{fakeBlob: f.write.bc}, deleteTestBucket, "a.txt"))
 
 	info := decodeTombstone(t, f.write.mc, deleteTestBucket, "a.txt")
-	assert.True(t, info.Scoped, "a tombstone a scoped delete leaves must say so")
 	assert.Equal(t, place.WriteEpoch, info.WriteEpoch)
+}
+
+// A reaper of the older release scans only the older prefix and sends an
+// unscoped delete for each row it finds there. No failed delete, of an object
+// or of a version, may give it a row.
+//
+// Verifies: ADR-0003:S7.
+func TestS7_NoFailedDeleteWritesATombstoneUnderTheOlderPrefix(t *testing.T) {
+	t.Parallel()
+
+	f := newDeleteFixture(t, "a.txt", "b.txt")
+	ctx := context.Background()
+	failing := &failingBlob{fakeBlob: f.write.bc}
+	toPreEpoch(t, f, "b.txt")
+	versionHash := seedVersion(t, f.write, deleteTestBucket, "c.txt", "V1", []byte("version body"))
+
+	require.NoError(t, deleteStoredObject(ctx, f.write.mc, failing, deleteTestBucket, "a.txt"))
+	require.NoError(t, deleteStoredObject(ctx, f.write.mc, failing, deleteTestBucket, "b.txt"))
+	require.NoError(t, deleteStoredVersion(ctx, f.write.mc, failing, deleteTestBucket, "c.txt", versionHash))
+
+	older, err := metaScan(ctx, f.write.mc, model.TableObjects, DeletedObjectPrefix, 0)
+	require.NoError(t, err)
+	assert.Empty(t, older, "ADR-0003:S7: a failed delete wrote a row an older reaper deletes unscoped")
+	scoped, err := metaScan(ctx, f.write.mc, model.TableObjects, DeletedEpochPrefix, 0)
+	require.NoError(t, err)
+	assert.Len(t, scoped, 3, "setup: each failed delete must leave its obligation")
+}
+
+// Two failed deletes of one key with a recreate between them owe two
+// generations, so each keeps its own row.
+func TestTwoFailedDeletesAcrossARecreateKeepTwoRows(t *testing.T) {
+	t.Parallel()
+
+	f := newDeleteFixture(t, "a.txt")
+	ctx := context.Background()
+	failing := &failingBlob{fakeBlob: f.write.bc}
+	first := storedPlacement(t, f, "a.txt")
+	require.NoError(t, deleteStoredObject(ctx, f.write.mc, failing, deleteTestBucket, "a.txt"))
+
+	f.seed(t, "a.txt", []byte("the recreate"))
+	second := storedPlacement(t, f, "a.txt")
+	require.NotEqual(t, first.WriteEpoch, second.WriteEpoch, "setup: the recreate must mint a later generation")
+	require.NoError(t, deleteStoredObject(ctx, f.write.mc, failing, deleteTestBucket, "a.txt"))
+
+	found := scopedTombstones(t, f.write.mc, deleteTestBucket, "a.txt")
+	require.Len(t, found, 2, "the second delete overwrote the first one's obligation: %v", found)
+	assert.Contains(t, found, tombstoneKey(deleteTestBucket, "a.txt", first.WriteEpoch))
+	assert.Contains(t, found, tombstoneKey(deleteTestBucket, "a.txt", second.WriteEpoch))
 }
 
 // toPreEpoch rewrites a stored object as one written before epochs: its record
@@ -115,11 +163,12 @@ func TestADeleteOfAPreEpochObjectReclaimsItsShards(t *testing.T) {
 		_, held := f.write.bc.shards[shardID{key: objectHash, index: uint32(i)}]
 		assert.False(t, held, "index %d of a pre-epoch object survived its delete", i)
 	}
-	assert.False(t, tombstoneExists(f.write.mc, deleteTestBucket, "a.txt"))
+	assert.False(t, tombstoneExists(t, f.write.mc, deleteTestBucket, "a.txt"))
 }
 
-// A failed delete of a pre-epoch object keeps its obligation in a scoped
-// tombstone at epoch zero, which the reaper does not drop as legacy.
+// A failed delete of a pre-epoch object keeps its obligation in a tombstone
+// under the epoch prefix at epoch zero, which the reaper does not drop as
+// legacy.
 func TestAFailedDeleteOfAPreEpochObjectKeepsItsObligation(t *testing.T) {
 	t.Parallel()
 
@@ -129,7 +178,6 @@ func TestAFailedDeleteOfAPreEpochObjectKeepsItsObligation(t *testing.T) {
 	require.NoError(t, deleteStoredObject(context.Background(), f.write.mc, &failingBlob{fakeBlob: f.write.bc}, deleteTestBucket, "a.txt"))
 
 	info := decodeTombstone(t, f.write.mc, deleteTestBucket, "a.txt")
-	assert.True(t, info.Scoped)
 	assert.Zero(t, info.WriteEpoch)
 }
 

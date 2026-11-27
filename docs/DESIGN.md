@@ -242,7 +242,8 @@ The meta replicas are a plain key-value store. The table taxonomy is the gate's 
 |---|---|---|
 | `objects/<32-byte object hash>` | gob `ObjectToShardNodes` | Placement and object size, for retrieval |
 | `objects/arn:aws:s3:::<bucket>/<key>` | the 32-byte object hash | Listing, as one prefix scan per bucket |
-| `objects/deleted:<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record of a failed shard delete, which the tombstone reaper reclaims |
+| `objects/deleted-epoch:<hex object hash>/<16-hex-digit epoch>/<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record of a failed scoped shard delete, one row for each generation. N writes these rows and reads them. N-1 does not read them |
+| `objects/deleted:<bucket>/<key>`, `objects/deleted:#<hex object hash>/<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record of a failed shard delete from N-1. N-1 writes and reads only these rows. N reads them and does not write them |
 | `objects/part:<uploadID>:<part>` | gob `ObjectToShardNodes` | Placement of an in-flight multipart part |
 | `buckets/<name>` | gob `BucketMetadata` | Ownership, region, public flag |
 | `multipart/<uploadID>` | gob `UploadMetadata` | The upload itself |
@@ -552,14 +553,22 @@ A `Range` request is served straight from the data shards when it is short: the 
 
 The gate loads the placement and sends `DeleteEpoch` at the placement's `WriteEpoch` to every shard position in parallel, then removes the placement record and the listing row.
 Each shard delete removes only the rows of that epoch, so a write that lands at the same positions after the placement read keeps its shards.
-If a shard delete fails, the gate writes a `deleted:` record that names the nodes, the epoch and `Scoped` before it removes the placement record, and the object still leaves global state.
+If a shard delete fails, the gate writes a `deleted-epoch:` record before it removes the placement record, and the object still leaves global state.
+The record key contains the object hash, the `WriteEpoch`, the bucket and the key, so each failed delete of a distinct generation has its own record.
+The record names the nodes and the epoch.
+The prefix does not start with `deleted:`, so a reaper from before this prefix never reads the record.
 An object written before epochs has `WriteEpoch` zero, and its shards are deleted at epoch zero, which matches only rows from before epochs.
 
-The tombstone reaper sweeps the `deleted:` records.
-It sends `DeleteEpoch` at the record's epoch to every node the record names, and drops the record only when every shard delete succeeds, so a node that was down is reclaimed on a later pass.
+The tombstone reaper sweeps the `deleted-epoch:` records and the `deleted:` records.
+A `deleted:` record at epoch zero comes from before the epoch field, when the delete had already fanned out, and the reaper drops it.
+For each other record, the reaper reads the live placement at the record's hash with `LeaderGet`.
+When the leader cannot answer, the reaper keeps the record for a later pass, because a lagging follower can name an older epoch.
+A live placement at the record's own epoch is the delete still in flight, and the reaper keeps the record for a later pass.
+In the other cases, the reaper sends `DeleteEpoch` at the record's epoch to every node the record names.
+A live placement at another epoch is a recreate, and the reaper still deletes the record's epoch, because that delete cannot remove the shards of the recreate.
+A `deleted-epoch:` record at epoch zero is a failed delete of an object from before epochs, and the reaper deletes its shards at epoch zero.
+The reaper removes the record only when every shard delete succeeds, so a node that was down is reclaimed on a later pass.
 A node from before `DeleteEpoch` closes the stream unanswered, and the record stays until that node is upgraded.
-A record whose key has a live placement at another epoch is a recreate, and the reaper drops it without a shard delete.
-A record at epoch zero without `Scoped` comes from before the epoch field, when the delete had already fanned out, and the reaper drops it.
 Multipart part cleanup keeps the unscoped `Delete`, because each part hash belongs to one upload.
 
 ## Multipart
