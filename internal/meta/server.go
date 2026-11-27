@@ -164,6 +164,9 @@ func (s *Server) open() (*rpc.Server, error) {
 	rpc.RegisterHandler(mux, OpMetaGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpMetaPut, s.handlePut)
 	rpc.RegisterHandler(mux, OpMetaSwap, s.handleSwap)
+	if s.cfg.serveTxn {
+		rpc.RegisterHandler(mux, OpMetaTxn, s.handleTxn)
+	}
 	rpc.RegisterHandler(mux, OpMetaPutMax, s.handlePutMax)
 	rpc.RegisterHandler(mux, OpMetaDelete, s.handleDelete)
 	rpc.RegisterHandler(mux, OpMetaScan, s.handleScan)
@@ -191,7 +194,9 @@ func (s *Server) open() (*rpc.Server, error) {
 	if s.cfg.OnKeyChanged != nil {
 		opts = append(opts, OnKeyChanged(s.cfg.OnKeyChanged))
 	}
-	s.fsm = NewFSM(s.badgerDB, opts...)
+	if s.fsm, err = OpenFSM(s.badgerDB, opts...); err != nil {
+		return nil, err
+	}
 	if err := s.fsm.rebuildMapHeads(); err != nil {
 		return nil, fmt.Errorf("build map-head index: %w", err)
 	}
@@ -449,6 +454,35 @@ func (s *Server) swap(key string, value []byte) ([]byte, error) {
 	return s.applyValue(Command{Type: CommandSwap, Key: []byte(key), Value: value})
 }
 
+// txn proposes a conditional transaction. A not-leader error means raft
+// appended nothing; every other error leaves the outcome unknown.
+func (s *Server) txn(checks []TxnCheck, writes []TxnWrite) (TxnResult, error) {
+	if s.raft.State() != raft.Leader {
+		return TxnResult{}, ErrNotLeader
+	}
+	data, err := json.Marshal(Command{Type: CommandTxn, Checks: checks, Writes: writes})
+	if err != nil {
+		return TxnResult{}, fmt.Errorf("marshal command: %w", err)
+	}
+
+	future := s.raft.Apply(data, applyTimeout)
+	if err := future.Error(); err != nil {
+		// raft answers ErrNotLeader only for an entry it never appended.
+		if errors.Is(err, raft.ErrNotLeader) {
+			return TxnResult{}, ErrNotLeader
+		}
+		return TxnResult{}, fmt.Errorf("raft apply failed: %w", err)
+	}
+	switch response := future.Response().(type) {
+	case TxnResult:
+		return response, nil
+	case error:
+		return TxnResult{}, response
+	default:
+		return TxnResult{}, fmt.Errorf("unexpected transaction response %T", response)
+	}
+}
+
 // delete removes a key through raft consensus.
 func (s *Server) delete(key string) error {
 	return s.apply(Command{Type: CommandDelete, Key: []byte(key)})
@@ -464,6 +498,9 @@ func (s *Server) apply(cmd Command) error {
 // applyValue commits one command and returns whatever its FSM handler reported,
 // which for CommandSwap is the value it replaced.
 func (s *Server) applyValue(cmd Command) ([]byte, error) {
+	if IsReservedKey(cmd.Key) {
+		return nil, fmt.Errorf("%w: %q", ErrReservedKey, cmd.Key)
+	}
 	if s.raft.State() != raft.Leader {
 		return nil, ErrNotLeader
 	}

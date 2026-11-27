@@ -87,6 +87,33 @@ func (s *Server) handleSwap(ctx context.Context, h MetaRequest, stream transport
 	return respond(stream, resp)
 }
 
+// handleTxn reads the whole transaction before it proposes anything, so a
+// request that did not arrive complete is refused rather than applied. It
+// reads at most one byte past the limit, so an oversized body costs no more.
+func (s *Server) handleTxn(ctx context.Context, h MetaRequest, stream transport.Stream) error {
+	body, err := io.ReadAll(io.LimitReader(stream, MaxTxnBodyBytes+1))
+	if err != nil {
+		return fmt.Errorf("read transaction: %w", err)
+	}
+	if len(body) > MaxTxnBodyBytes {
+		return respond(stream, &MetaResponse{Err: ErrCodeInvalid})
+	}
+	var req TxnRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		return respond(stream, &MetaResponse{Err: ErrCodeInvalid})
+	}
+	if err := ValidateTxn(req.Checks, req.Writes); err != nil {
+		return respond(stream, &MetaResponse{Err: ErrCodeInvalid})
+	}
+	result, err := s.txn(req.Checks, req.Writes)
+	resp := s.writeResult(err)
+	if err == nil && !result.Applied {
+		resp.Mismatch, resp.Current = true, result.Current
+	}
+
+	return respond(stream, resp)
+}
+
 func (s *Server) handleDelete(ctx context.Context, h MetaRequest, stream transport.Stream) error {
 	return respond(stream, s.writeResult(s.delete(string(h.Key))))
 }
@@ -97,6 +124,8 @@ func (s *Server) writeResult(err error) *MetaResponse {
 	switch {
 	case errors.Is(err, ErrNotLeader):
 		return &MetaResponse{Err: ErrCodeNotLeader, Leader: s.leaderAddr()}
+	case errors.Is(err, ErrReservedKey):
+		return &MetaResponse{Err: ErrCodeInvalid}
 	case err != nil:
 		return &MetaResponse{Err: err.Error()}
 	}
