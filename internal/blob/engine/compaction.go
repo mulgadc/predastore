@@ -792,7 +792,7 @@ func (store *Store) compactSegment(num uint64, p *pacer) (segmentStats, error) {
 		if p.stopped() {
 			return stats, errCompactionStopped
 		}
-		moved, size, err := store.relocateSlot(e.Key, num, e.Off, p)
+		moved, size, err := store.relocateSlot(e, num, p)
 		if err != nil {
 			return stats, err
 		}
@@ -861,9 +861,9 @@ const relocateAttempts = 3
 // means a commit moved that row, possibly into a namespace still naming this
 // slot, so the slot is read afresh and tried again. moved reports a relocation;
 // a zero size with moved false means no row names the slot any more.
-func (store *Store) relocateSlot(idxKey [36]byte, num uint64, off int64, p *pacer) (moved bool, size int64, err error) {
+func (store *Store) relocateSlot(entry idxEntry, num uint64, p *pacer) (moved bool, size int64, err error) {
 	for range relocateAttempts {
-		badgerKey, raw, cur, err := store.rowAt(idxKey, num, off)
+		badgerKey, raw, cur, err := store.rowAt(entry.Key, num, entry.Off)
 		if err != nil {
 			return false, 0, err
 		}
@@ -872,7 +872,7 @@ func (store *Store) relocateSlot(idxKey [36]byte, num uint64, off int64, p *pace
 		if badgerKey == nil {
 			return false, 0, nil
 		}
-		moved, err := store.relocateExtent(badgerKey, idxKey, raw, cur, p)
+		moved, err := store.relocateExtent(badgerKey, entry, raw, cur, p)
 		if err != nil {
 			return false, 0, fmt.Errorf("relocate extent: %w", err)
 		}
@@ -881,7 +881,7 @@ func (store *Store) relocateSlot(idxKey [36]byte, num uint64, off int64, p *pace
 		}
 		size = cur.PSize
 	}
-	badgerKey, _, _, err := store.rowAt(idxKey, num, off)
+	badgerKey, _, _, err := store.rowAt(entry.Key, num, entry.Off)
 	if err != nil {
 		return false, 0, err
 	}
@@ -972,7 +972,7 @@ func scanRowAt(txn *badger.Txn, prefix []byte, num uint64, off int64) (*slotRow,
 // the index at it, unless a concurrent overwrite or delete of the same key gets
 // there first, which moved reports as false. badgerKey is the live, prepared or
 // retained row; idxKey is always the 36-byte form the sidecar records.
-func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []byte, old extent, p *pacer) (moved bool, err error) {
+func (store *Store) relocateExtent(badgerKey []byte, entry idxEntry, oldRaw []byte, old extent, p *pacer) (moved bool, err error) {
 	_, epoch, err := decodeIndexValue(oldRaw)
 	if err != nil {
 		return false, fmt.Errorf("decode source epoch: %w", err)
@@ -1001,7 +1001,7 @@ func (store *Store) relocateExtent(badgerKey []byte, idxKey [36]byte, oldRaw []b
 	// the destination the extent actually landed in is the one that must be
 	// recorded, not whatever store.segNum happens to be afterward.
 	newExt := extent{SegNum: dstSeg.num, Off: dstOff, PSize: old.PSize, LSize: old.LSize}
-	allocation := idxEntry{Off: dstOff, Key: idxKey, PSize: old.PSize}
+	allocation := idxEntry{Off: dstOff, Key: entry.Key, PSize: old.PSize, part: entry.part}
 	deferred := old.PSize > 0 && len(badgerKey) == preparedKeySize && badgerKey[0] == deferredPrefix
 	if !deferred {
 		err = dstSeg.appendPrepareAllocation(allocation, epoch, old.LSize)

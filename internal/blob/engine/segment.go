@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"time"
+
+	"github.com/mulgadc/predastore/internal/gate/model"
 )
 
 const (
@@ -42,6 +44,7 @@ type idxEntry struct {
 	Off   int64
 	Key   [36]byte
 	PSize int64
+	part  model.MultipartPlacement
 }
 
 func (e idxEntry) encode() []byte {
@@ -68,25 +71,46 @@ type prepareRecord struct {
 	off   int64
 	epoch uint64
 	size  int64
+	part  model.MultipartPlacement
 }
 
 func (r prepareRecord) encode(row []byte) {
 	binary.BigEndian.PutUint64(row[:8], ^uint64(r.off)) //nolint:gosec // Allocations have nonnegative offsets.
 	binary.BigEndian.PutUint64(row[8:16], r.epoch)
 	binary.BigEndian.PutUint64(row[16:24], uint64(r.size)) //nolint:gosec // Append validates the size.
+	if r.part != (model.MultipartPlacement{}) {
+		copy(row[24:28], "PRTP")
+		copy(row[28:46], r.part[:])
+		binary.BigEndian.PutUint32(row[48:52], crc32.ChecksumIEEE(row[:48]))
+		return
+	}
 	copy(row[24:28], "PRE1")
 	binary.BigEndian.PutUint32(row[28:32], crc32.ChecksumIEEE(row[:28]))
 }
 
 func decodePrepareRecord(row []byte) (prepareRecord, bool) {
-	if row[0]&0x80 == 0 || row[16]&0x80 != 0 || string(row[24:28]) != "PRE1" ||
-		binary.BigEndian.Uint32(row[28:32]) != crc32.ChecksumIEEE(row[:28]) {
+	if row[0]&0x80 == 0 || row[16]&0x80 != 0 {
+		return prepareRecord{}, false
+	}
+	var part model.MultipartPlacement
+	switch string(row[24:28]) {
+	case "PRE1":
+		if binary.BigEndian.Uint32(row[28:32]) != crc32.ChecksumIEEE(row[:28]) {
+			return prepareRecord{}, false
+		}
+	case "PRTP":
+		copy(part[:], row[28:46])
+		if binary.BigEndian.Uint32(row[48:52]) != crc32.ChecksumIEEE(row[:48]) || part.Key() == "" {
+			return prepareRecord{}, false
+		}
+	default:
 		return prepareRecord{}, false
 	}
 	return prepareRecord{
 		off:   int64(^binary.BigEndian.Uint64(row[:8])), //nolint:gosec // Inversion clears the sign bit checked above.
 		epoch: binary.BigEndian.Uint64(row[8:16]),
 		size:  int64(binary.BigEndian.Uint64(row[16:24])), //nolint:gosec // The sign bit is clear.
+		part:  part,
 	}, true
 }
 
@@ -116,11 +140,20 @@ func scanIdx(dir string, segNum uint64) ([]idxEntry, error) {
 	count := info.Size() / idxEntrySize
 	entries := make([]idxEntry, 0, count)
 	buf := make([]byte, idxEntrySize)
+	var paired bool
 	for i := range count {
 		if _, err := f.ReadAt(buf, i*idxEntrySize); err != nil {
 			return nil, err
 		}
 		if buf[0]&0x80 != 0 {
+			if paired && string(buf[24:28]) == "PRTP" {
+				record, ok := decodePrepareRecord(buf)
+				entry := &entries[len(entries)-1]
+				if ok && record.off == entry.Off {
+					entry.part = record.part
+				}
+			}
+			paired = false
 			continue
 		}
 		e, err := decodeIdxEntry(buf)
@@ -128,6 +161,7 @@ func scanIdx(dir string, segNum uint64) ([]idxEntry, error) {
 			return nil, err
 		}
 		entries = append(entries, e)
+		paired = true
 	}
 	return entries, nil
 }
@@ -242,7 +276,7 @@ func (seg *segment) waitForRefs(budget time.Duration) bool {
 func (seg *segment) appendPrepareAllocation(e idxEntry, epoch uint64, size int64) error {
 	var rows [2 * idxEntrySize]byte
 	copy(rows[:idxEntrySize], e.encode())
-	prepareRecord{off: e.Off, epoch: epoch, size: size}.encode(rows[idxEntrySize:])
+	prepareRecord{off: e.Off, epoch: epoch, size: size, part: e.part}.encode(rows[idxEntrySize:])
 	if _, err := seg.idx.WriteAt(rows[:], seg.idxSize); err != nil {
 		return err
 	}

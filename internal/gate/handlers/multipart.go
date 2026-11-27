@@ -130,6 +130,7 @@ func storePart(
 		return model.PartMetadata{}, writeResult{}, model.NewS3Error(model.ErrInternalError, "Failed to get shard placement", 500)
 	}
 
+	place.partPlacement = partShardKey(uploadID, partNumber)
 	written, err := writeObject(ctx, bc, cfg, ring, io.TeeReader(body, digest), size, objectHash, place)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to store part", "uploadID", uploadID, "part", partNumber, "error", err)
@@ -185,7 +186,7 @@ func storePart(
 	// Swapping rather than writing tells this writer which generation it
 	// displaced. Re-uploading a part is an overwrite like any other, and
 	// without that answer the generation it supersedes is never released.
-	previous, err := metaSwap(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber), shardRecord)
+	previous, err := metaSwap(ctx, mc, model.TableObjects, place.partPlacement, shardRecord)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to store part shard metadata", "uploadID", uploadID, "part", partNumber, "error", err)
 		return model.PartMetadata{}, written, model.NewS3Error(model.ErrInternalError, "Failed to store part shard metadata", 500)

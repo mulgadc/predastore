@@ -45,6 +45,14 @@ func WithStartupPrepareRecovery(
 	}
 }
 
+// WithStartupPartRecovery enables exact multipart placement checks on reopen.
+func WithStartupPartRecovery(authorize func(context.Context, string, [32]byte, uint32, uint64) (bool, error)) Option {
+	return func(store *Store) error {
+		store.startupPartRecovery = authorize
+		return nil
+	}
+}
+
 // replayRecoveredPrepares runs before the store serves requests or compacts.
 // authorize confirms that authoritative placement still names the exact shard.
 func (store *Store) replayRecoveredPrepares(
@@ -118,7 +126,7 @@ func (store *Store) replayPrepareSidecar(
 			continue
 		}
 		ext := extent{SegNum: number, Off: allocation.Off, PSize: allocation.PSize, LSize: record.size}
-		if err := store.replayPrepareIfNamed(ctx, allocation.Key, record.epoch, ext, authorize); err != nil {
+		if err := store.replayPrepareIfNamed(ctx, allocation.Key, record, ext, authorize); err != nil {
 			return err
 		}
 	}
@@ -127,17 +135,25 @@ func (store *Store) replayPrepareSidecar(
 func (store *Store) replayPrepareIfNamed(
 	ctx context.Context,
 	idxKey [36]byte,
-	epoch uint64,
+	record prepareRecord,
 	ext extent,
 	authorize func(context.Context, [32]byte, uint32, uint64) (bool, error),
 ) error {
+	epoch := record.epoch
 	needed, err := store.needsPrepareReplay(idxKey[:], epoch, ext)
 	if err != nil || !needed {
 		return err
 	}
 	key := [32]byte(idxKey[:32])
 	index := binary.BigEndian.Uint32(idxKey[32:])
-	named, err := authorize(ctx, key, index, epoch)
+	var named bool
+	if placement := record.part.Key(); placement != "" {
+		if store.startupPartRecovery != nil {
+			named, err = store.startupPartRecovery(ctx, placement, key, index, epoch)
+		}
+	} else {
+		named, err = authorize(ctx, key, index, epoch)
+	}
 	if err != nil {
 		return err
 	}

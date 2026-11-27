@@ -152,6 +152,7 @@ func (s *Server) Run(ctx context.Context) error {
 		st, err := engine.Open(s.cfg.DataDir,
 			engine.WithAEAD(s.cfg.AEAD), engine.WithCompaction(s.cfg.Compaction),
 			engine.WithStartupPrepareRecovery(ctx, s.cfg.AuthorizeRecoveredPrepare),
+			engine.WithStartupPartRecovery(s.cfg.AuthorizeRecoveredPart),
 			engine.WithRetainedMaxAge(s.cfg.RetainedMaxAge),
 			engine.WithCompactionSlot(slot, slots),
 			engine.WithCompactionPacing(s.cfg.CompactionMaxBytesPerSec, s.cfg.CompactionYieldLatency, s.cfg.CompactionMaxYield))
@@ -261,7 +262,7 @@ func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stre
 		return respond(stream, &Response{Err: "no write epoch specified"})
 	}
 
-	writer, err := st.Append(h.Key, h.Index, h.Size, h.Epoch)
+	writer, err := s.appendShard(h)
 	if err != nil {
 		// Drain the client's in-flight body so the reply is carried
 		// instead of racing a stream reset.
@@ -295,6 +296,25 @@ func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stre
 	return respond(stream, &Response{Size: h.Size, PoolNearFull: st.NearFull(), Epoch: h.Epoch})
 }
 
+type partAppender interface {
+	AppendPart(key [32]byte, index uint32, size int64, epoch uint64, hold bool, placement string) (engine.Writer, error)
+}
+
+var _ partAppender = (*engine.Store)(nil)
+
+func (s *Server) appendShard(h Request) (engine.Writer, error) {
+	if h.PartPlacement != "" {
+		if store, ok := s.store.(partAppender); ok {
+			return store.AppendPart(h.Key, h.Index, h.Size, h.Epoch, h.Hold, h.PartPlacement)
+		}
+		return nil, errors.New("store cannot record multipart placement")
+	}
+	if h.Hold {
+		return s.store.AppendHeld(h.Key, h.Index, h.Size, h.Epoch)
+	}
+	return s.store.Append(h.Key, h.Index, h.Size, h.Epoch)
+}
+
 // handlePutHeld opens a held put. It sends no body before Registered, so a
 // refusal is answered at once, and a second put of an open shard is refused
 // before it gets a writer that could prepare over the first.
@@ -306,7 +326,7 @@ func (s *Server) handlePutHeld(h Request, stream transport.Stream) error {
 	if !s.held.register(k, func() { stream.CancelRead(transport.StreamCodeCallerGone) }) {
 		return respond(stream, &Response{Err: "a held write of this shard is already open"})
 	}
-	writer, err := s.store.AppendHeld(h.Key, h.Index, h.Size, h.Epoch)
+	writer, err := s.appendShard(h)
 	if err != nil {
 		s.held.finish(k)
 		if errors.Is(err, engine.ErrStoreFull) {

@@ -6,6 +6,7 @@
 package engine
 
 import (
+	"context"
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/mulgadc/predastore/internal/gate/model"
 	"golang.org/x/sys/unix"
 )
 
@@ -64,11 +66,12 @@ type Store struct {
 
 	maxSegSize uint64
 
-	compactionEnabled  bool
-	compactionInterval time.Duration
-	retainedMaxAge     time.Duration
-	compactor          *compactor
-	startupRecovery    func(*Store) error
+	compactionEnabled   bool
+	compactionInterval  time.Duration
+	retainedMaxAge      time.Duration
+	compactor           *compactor
+	startupRecovery     func(*Store) error
+	startupPartRecovery func(context.Context, string, [32]byte, uint32, uint64) (bool, error)
 
 	// This node's slot among the cluster's blob nodes, which offsets its
 	// routine passes, and the pacing a routine pass runs under.
@@ -585,16 +588,25 @@ func (store *Store) lookup(rowKey []byte, key [32]byte, index uint32) (Reader, e
 // epoch is opaque here: the engine stores it, returns it on Lookup and matches
 // it on Commit, and never orders or interprets it.
 func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64) (Writer, error) {
-	return store.appendValue(key, index, size, epoch, false)
+	return store.appendValue(key, index, size, epoch, false, model.MultipartPlacement{})
 }
 
 // AppendHeld is Append for a write whose fate a caller decides later. Its
 // prepared row is never swept by age; only Commit or Abort removes it.
 func (store *Store) AppendHeld(key [32]byte, index uint32, size int64, epoch uint64) (Writer, error) {
-	return store.appendValue(key, index, size, epoch, true)
+	return store.appendValue(key, index, size, epoch, true, model.MultipartPlacement{})
 }
 
-func (store *Store) appendValue(key [32]byte, index uint32, size int64, epoch uint64, hold bool) (Writer, error) {
+// AppendPart records the exact multipart placement alongside the shard allocation.
+func (store *Store) AppendPart(key [32]byte, index uint32, size int64, epoch uint64, hold bool, placement string) (Writer, error) {
+	part, err := model.ParseMultipartPlacement(placement)
+	if err != nil {
+		return nil, err
+	}
+	return store.appendValue(key, index, size, epoch, hold, part)
+}
+
+func (store *Store) appendValue(key [32]byte, index uint32, size int64, epoch uint64, hold bool, part model.MultipartPlacement) (Writer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("negative size %d", size)
 	}
@@ -648,7 +660,7 @@ func (store *Store) appendValue(key [32]byte, index uint32, size int64, epoch ui
 	}
 
 	idxKey := MakeKey(key, index)
-	if err := seg.appendPrepareAllocation(idxEntry{Off: off, Key: [36]byte(idxKey), PSize: ext.PSize}, epoch, size); err != nil {
+	if err := seg.appendPrepareAllocation(idxEntry{Off: off, Key: [36]byte(idxKey), PSize: ext.PSize, part: part}, epoch, size); err != nil {
 		seg.writers.Add(-1)
 		seg.releaseRef()
 		return nil, fmt.Errorf("append idx: %w", err)

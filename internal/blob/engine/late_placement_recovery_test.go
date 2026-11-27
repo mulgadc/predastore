@@ -14,11 +14,29 @@ import (
 )
 
 func TestCompactionReclaimsDeletedSpaceAroundDeferredPrepare(t *testing.T) {
+	t.Run("object", func(t *testing.T) { testCompactionReclaimsDeletedSpace(t, "") })
+	t.Run("part", func(t *testing.T) {
+		testCompactionReclaimsDeletedSpace(t, "part:01010101-0101-4101-8101-010101010101:10000")
+	})
+}
+
+func testCompactionReclaimsDeletedSpace(t *testing.T, part string) {
+	t.Helper()
 	const maxSize = 20 * KiB
 	store, dir := openTestStore(t, WithMaxSegSize(maxSize))
 	key, deleted := [32]byte{1}, [32]byte{2}
 	payload := []byte("placement can arrive after compaction and restart")
-	epoch := prepareValue(t, store, key, 0, payload)
+	var epoch uint64
+	if part == "" {
+		epoch = prepareValue(t, store, key, 0, payload)
+	} else {
+		epoch = 11
+		writer, err := store.AppendPart(key, 0, int64(len(payload)), epoch, false, part)
+		require.NoError(t, err)
+		_, err = writer.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, writer.Close())
+	}
 	_, err := store.Commit(key, 0, epoch)
 	require.NoError(t, err)
 	source := extentOf(t, store, key, 0).SegNum
@@ -44,11 +62,18 @@ func TestCompactionReclaimsDeletedSpaceAroundDeferredPrepare(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 
 	require.NoError(t, store.Close())
-	reopened, err := Open(dir, WithMaxSegSize(maxSize), WithAEAD(store.aead), WithStartupPrepareRecovery(t.Context(), absent))
+	reopened, err := Open(dir, WithMaxSegSize(maxSize), WithAEAD(store.aead), WithStartupPrepareRecovery(t.Context(), absent),
+		WithStartupPartRecovery(func(_ context.Context, placement string, gotKey [32]byte, index uint32, gotEpoch uint64) (bool, error) {
+			return part != "" && placement == part && gotKey == key && index == 0 && gotEpoch == epoch, nil
+		}))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = reopened.Close() })
 	_, err = reopened.Lookup(deleted, 0)
 	require.ErrorIs(t, err, ErrKeyNotFound)
+	if part != "" {
+		require.Equal(t, payload, readValue(t, reopened, key, 0))
+		return
+	}
 	_, err = reopened.Commit(key, 0, epoch)
 	require.ErrorIs(t, err, ErrNotPrepared, "compaction must not make a deferred epoch publishable")
 	reader, err := reopened.LookupRecoveredAt(t.Context(), key, 0, epoch, func(_ context.Context, gotKey [32]byte, index uint32, gotEpoch uint64) (bool, error) {

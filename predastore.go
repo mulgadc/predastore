@@ -146,7 +146,9 @@ func authorizeShardRecovery(ctx context.Context, client *meta.Client, holder con
 }
 
 func authorizePartRecovery(ctx context.Context, client *meta.Client, holder config.NodeID, placement string, key [32]byte, index uint32, epoch uint64) (bool, error) {
-	partHash, err := handlers.PartPlacementHash(ctx, client.AuthorityGet, placement)
+	partHash, err := handlers.PartPlacementHash(ctx, func(ctx context.Context, key string) ([]byte, error) {
+		return readRecoveryAuthority(ctx, client, key)
+	}, placement)
 	if errors.Is(err, meta.ErrNotFound) {
 		return false, nil
 	}
@@ -157,28 +159,32 @@ func authorizePartRecovery(ctx context.Context, client *meta.Client, holder conf
 }
 
 func authorizePlacementRow(ctx context.Context, client *meta.Client, holder config.NodeID, placement string, index uint32, epoch uint64) (bool, error) {
-	rowKey := handlers.TableKey(model.TableObjects, placement)
+	raw, err := readRecoveryAuthority(ctx, client, handlers.TableKey(model.TableObjects, placement))
+	if errors.Is(err, meta.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	decoded, err := handlers.DecodePlacement(raw)
+	if err != nil {
+		return false, err
+	}
+	nodes := decoded.AllNodes()
+	return decoded.WriteEpoch == epoch && uint64(index) < uint64(len(nodes)) && nodes[index] == holder, nil
+}
+
+func readRecoveryAuthority(ctx context.Context, client *meta.Client, key string) ([]byte, error) {
 	for {
-		raw, err := client.AuthorityGet(ctx, rowKey)
-		switch {
-		case errors.Is(err, meta.ErrNotFound):
-			return false, nil
-		case errors.Is(err, meta.ErrNoLeaderRead):
-			select {
-			case <-ctx.Done():
-				return false, ctx.Err()
-			case <-time.After(250 * time.Millisecond):
-				continue
-			}
-		case err != nil:
-			return false, err
+		raw, err := client.AuthorityGet(ctx, key)
+		if !errors.Is(err, meta.ErrNoLeaderRead) {
+			return raw, err
 		}
-		placement, err := handlers.DecodePlacement(raw)
-		if err != nil {
-			return false, err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
 		}
-		nodes := placement.AllNodes()
-		return placement.WriteEpoch == epoch && uint64(index) < uint64(len(nodes)) && nodes[index] == holder, nil
 	}
 }
 

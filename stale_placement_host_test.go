@@ -240,6 +240,15 @@ func TestHostRecoversMultipartPartAfterRestart(t *testing.T) {
 	dropRecoveryHostShardRows(t, cfg, hash, placement)
 
 	start()
+	withHostClients(t, cfg, func(_ *meta.Client, bc *blob.Client, _ []config.NodeID) {
+		for index, node := range placement.AllNodes() {
+			stat, err := bc.Stat(t.Context(), node, blob.StatRequest{
+				Key: hash, Index: uint32(index),
+			})
+			require.NoError(t, err, "the part must be recovered before the first read")
+			require.Equal(t, placement.WriteEpoch, stat.Epoch)
+		}
+	})
 	complete := fmt.Sprintf("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>", etag)
 	status, body = client.send(http.MethodPost, object+"?uploadId="+upload.ID, "", []byte(complete))
 	require.Equal(t, http.StatusOK, status, "%s", body)

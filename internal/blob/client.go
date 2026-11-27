@@ -61,7 +61,8 @@ type PutRequest struct {
 	Size int64
 	// Epoch names the object generation this shard belongs to. Mandatory:
 	// zero is reserved as invalid and the node refuses it.
-	Epoch uint64
+	Epoch         uint64
+	PartPlacement string
 }
 
 // PutResponse reports what a node prepared.
@@ -300,13 +301,14 @@ func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, 
 
 func putHeader(req PutRequest, hold bool) *Request {
 	return &Request{
-		Key:        req.Key,
-		Index:      req.Index,
-		Size:       req.Size,
-		Epoch:      req.Epoch,
-		RangeStart: -1,
-		RangeEnd:   -1,
-		Hold:       hold,
+		Key:           req.Key,
+		Index:         req.Index,
+		Size:          req.Size,
+		Epoch:         req.Epoch,
+		RangeStart:    -1,
+		RangeEnd:      -1,
+		Hold:          hold,
+		PartPlacement: req.PartPlacement,
 	}
 }
 

@@ -280,14 +280,14 @@ func recordShardOutcome(ctx context.Context, op string, node config.NodeID, star
 // records size and a short value would read back as a corrupt object.
 func writeSingleShard(
 	ctx context.Context, bc BlobClient, node config.NodeID, body io.Reader, size int64,
-	objectHash [32]byte, epoch uint64,
+	objectHash [32]byte, epoch uint64, partPlacement string,
 ) (_ writeResult, err error) {
 	start := time.Now()
 	defer func() { recordShardOutcome(ctx, telemetry.ShardOpWrite, node, start, err) }()
 
 	counted := &countingReader{r: body}
 
-	resp, err := bc.Put(ctx, node, blob.PutRequest{Key: objectHash, Size: size, Index: 0, Epoch: epoch}, counted)
+	resp, err := bc.Put(ctx, node, blob.PutRequest{Key: objectHash, Size: size, Index: 0, Epoch: epoch, PartPlacement: partPlacement}, counted)
 	if err != nil {
 		return writeResult{landed: []bool{false}, missing: []config.NodeID{node}}, err
 	}
@@ -322,10 +322,10 @@ func writeObject(ctx context.Context, bc BlobClient, cfg Config, ring *placement
 	// to encode. Streaming it straight through is what keeps a single-node
 	// write off the heap, so it is its own path rather than a degenerate split.
 	if cfg.DataShards == 1 && cfg.ParityShards == 0 {
-		return writeSingleShard(ctx, bc, shardNodes[0], body, size, objectHash, epoch)
+		return writeSingleShard(ctx, bc, shardNodes[0], body, size, objectHash, epoch, place.partPlacement)
 	}
 
-	return streamShards(ctx, bc, cfg, objectHash, epoch, shardNodes, body,
+	return streamShards(ctx, bc, cfg, objectHash, epoch, shardNodes, body, place.partPlacement,
 		newLayout(cfg.DataShards, size, place.BlockSize), size,
 		handoffNode(ring, cfg, objectHash))
 }
@@ -362,7 +362,7 @@ func (zeroPadding) Read(p []byte) (int, error) {
 func streamShards(
 	ctx context.Context, bc BlobClient, cfg Config,
 	objectHash [32]byte, epoch uint64, shardNodes []config.NodeID,
-	body io.Reader, lay layout, size int64, handoff config.NodeID,
+	body io.Reader, partPlacement string, lay layout, size int64, handoff config.NodeID,
 ) (writeResult, error) {
 	total := cfg.TotalShards()
 	shardSize, blockSize := lay.shardSize, lay.blockSize
@@ -385,7 +385,7 @@ func streamShards(
 
 	streams := make([]*shardStream, total)
 	for i := range total {
-		streams[i] = startShardStream(ctx, bc, objectHash, epoch, i, shardNodes[i], shardSize)
+		streams[i] = startShardStream(ctx, bc, objectHash, epoch, i, shardNodes[i], shardSize, partPlacement)
 	}
 
 	// The body is padded so a short last stripe still encodes, and counted so a
@@ -414,7 +414,7 @@ func streamShards(
 
 		refused := writeStripe(streams, stripe)
 		if offset == 0 {
-			handOff(ctx, bc, objectHash, epoch, streams, stripe, refused, handoff, shardSize)
+			handOff(ctx, bc, objectHash, epoch, streams, stripe, refused, handoff, shardSize, partPlacement)
 		}
 	}
 
@@ -442,7 +442,7 @@ type shardStream struct {
 
 func startShardStream(
 	ctx context.Context, bc BlobClient, objectHash [32]byte, epoch uint64,
-	index int, node config.NodeID, shardSize int64,
+	index int, node config.NodeID, shardSize int64, partPlacement string,
 ) *shardStream {
 	pr, pw := io.Pipe()
 	s := &shardStream{
@@ -452,10 +452,11 @@ func startShardStream(
 
 	go func() {
 		resp, err := bc.Put(ctx, node, blob.PutRequest{
-			Key:   objectHash,
-			Size:  shardSize,
-			Index: uint32(index), //nolint:gosec // G115: index bounded by the shard count.
-			Epoch: epoch,
+			Key:           objectHash,
+			Size:          shardSize,
+			Index:         uint32(index), //nolint:gosec // G115: index bounded by the shard count.
+			Epoch:         epoch,
+			PartPlacement: partPlacement,
 		}, pr)
 		// Closing the read side is what releases a producer still writing into
 		// a stream whose node has gone: io.Pipe has no buffer and does not
@@ -540,7 +541,7 @@ func writeStripe(streams []*shardStream, stripe [][]byte) []int {
 func handOff(
 	ctx context.Context, bc BlobClient, objectHash [32]byte, epoch uint64,
 	streams []*shardStream, stripe [][]byte, refused []int,
-	handoff config.NodeID, shardSize int64,
+	handoff config.NodeID, shardSize int64, partPlacement string,
 ) {
 	if handoff == 0 {
 		return
@@ -549,7 +550,7 @@ func handOff(
 		if streams[i].owner == handoff {
 			continue
 		}
-		alt := startShardStream(ctx, bc, objectHash, epoch, i, handoff, shardSize)
+		alt := startShardStream(ctx, bc, objectHash, epoch, i, handoff, shardSize, partPlacement)
 		alt.owner = streams[i].owner
 		if !alt.write(stripe[i]) {
 			<-alt.done

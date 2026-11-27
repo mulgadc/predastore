@@ -67,7 +67,7 @@ type Request struct {
 	// put, commit and abort; on get it is the generation the caller will
 	// accept, and a node holding any other one answers epoch-mismatch.
 	Epoch uint64 `json:"epoch,omitempty"`
-	// PartPlacement is set by a gate reading an in-flight multipart part.
+	// PartPlacement identifies an in-flight multipart part on reads and writes.
 	PartPlacement string `json:"part_placement,omitempty"`
 	// Hold asks a put to prepare a row the age sweep never drops, and to
 	// answer Registered before it reads the body. A node that predates it
