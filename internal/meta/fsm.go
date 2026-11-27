@@ -156,6 +156,10 @@ type FSM struct {
 	// commit on demand; production always commits the transaction.
 	commitBatch func(*badger.Txn) error
 
+	// copyValue reads the value of an item an entry reads. A test replaces it
+	// to fail a read on demand.
+	copyValue func(*badger.Item) ([]byte, error)
+
 	limits txnLimits
 
 	// row and cmd are scratch space that ApplyBatch reuses, guarded by mu.
@@ -198,7 +202,7 @@ func OpenFSM(db *badger.DB, opts ...FSMOption) (*FSM, error) {
 	if err != nil {
 		return nil, err
 	}
-	f := &FSM{db: db, commitBatch: (*badger.Txn).Commit, persisted: persisted, limits: newTxnLimits(db)}
+	f := &FSM{db: db, commitBatch: (*badger.Txn).Commit, copyValue: valueCopy, persisted: persisted, limits: newTxnLimits(db)}
 	for _, opt := range opts {
 		opt(f)
 	}
@@ -316,13 +320,14 @@ func (b *batch) stage(cmd Command, index uint64) any {
 	if writes && !b.budget.fits(cost) {
 		return fmt.Errorf("meta: entry %d with the applied row: %w", index, badger.ErrTxnTooBig)
 	}
-	resp, err := applyCommand(b.txn, cmd)
+	resp, err := b.f.applyCommand(b.txn, cmd)
 	if errors.Is(err, badger.ErrTxnTooBig) && b.dirty {
 		b.end()
 		b.begin()
-		resp, err = applyCommand(b.txn, cmd)
+		resp, err = b.f.applyCommand(b.txn, cmd)
 	}
 	if err != nil {
+		b.stopOnStoreError(b.txn, index, err)
 		return err
 	}
 	b.budget.add(cost)
@@ -354,6 +359,47 @@ func (b *batch) stop(err error) {
 		b.first, b.last, err))
 }
 
+// storeError is a failure of the local store while an entry is evaluated.
+// Another replica can evaluate the same entry, so it is never the entry's
+// answer.
+type storeError struct{ err error }
+
+func (e *storeError) Error() string { return e.err.Error() }
+
+func (e *storeError) Unwrap() error { return e.err }
+
+// stopOnStoreError stops the process when err is a storeError, discarding
+// txn first so nothing staged commits. Answering instead would let a later
+// commit move the applied row past an entry this store never applied.
+func (b *batch) stopOnStoreError(txn *badger.Txn, index uint64, err error) {
+	var se *storeError
+	if !errors.As(err, &se) {
+		return
+	}
+	txn.Discard()
+	//nolint:forbidigo // An entry this store could not evaluate must not be skipped; restart applies it again.
+	panic(fmt.Sprintf("meta: reading the store to apply entry %d failed; stopping so the log applies it again: %v",
+		index, se.err))
+}
+
+func valueCopy(item *badger.Item) ([]byte, error) { return item.ValueCopy(nil) }
+
+// readValue reads key in txn, reporting an absent key with found false. Any
+// other failure is a storeError.
+func (f *FSM) readValue(txn *badger.Txn, key []byte) (value []byte, found bool, err error) {
+	item, err := txn.Get(key)
+	switch {
+	case errors.Is(err, badger.ErrKeyNotFound):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, &storeError{err}
+	}
+	if value, err = f.copyValue(item); err != nil {
+		return nil, false, &storeError{err}
+	}
+	return value, true, nil
+}
+
 // applyTxn evaluates a CommandTxn in a badger transaction of its own. It
 // commits, with the applied row, only when every check holds and every write
 // and the row stage; otherwise it discards the transaction and writes nothing.
@@ -362,7 +408,8 @@ func (f *FSM) applyTxn(cmd Command, index uint64, b *batch) any {
 		return err
 	}
 	txn := f.db.NewTransaction(true)
-	result, err := stageTxn(txn, cmd)
+	result, err := f.stageTxn(txn, cmd)
+	b.stopOnStoreError(txn, index, err)
 	if err == nil && result.Applied {
 		err = f.row.set(txn, index)
 	}
@@ -378,25 +425,28 @@ func (f *FSM) applyTxn(cmd Command, index uint64, b *batch) any {
 }
 
 // stageTxn reads every checked key, then stages the writes only if all the
-// checks hold. The result depends on the store and the command alone.
-func stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
+// checks hold. The result depends on the store and the command alone, and a
+// failure to read the store is a storeError.
+func (f *FSM) stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
 	current := make([]TxnValue, len(cmd.Checks))
 	holds := true
 	for i, check := range cmd.Checks {
 		current[i] = TxnValue{Key: check.Key}
-		switch item, err := txn.Get(check.Key); {
-		case err == nil:
-			value, err := item.ValueCopy(nil)
-			if err != nil {
-				return TxnResult{}, err
-			}
-			current[i].Value, current[i].Exists = value, true
-			holds = holds && !check.Absent && bytes.Equal(value, check.Value)
+		item, err := txn.Get(check.Key)
+		switch {
 		case errors.Is(err, badger.ErrKeyNotFound):
 			holds = holds && check.Absent
-		default:
-			return TxnResult{}, err
+			continue
+		case err != nil:
+			return TxnResult{}, &storeError{err}
 		}
+		current[i].Exists = true
+		value, err := f.copyValue(item)
+		if err != nil {
+			return TxnResult{}, &storeError{err}
+		}
+		current[i].Value = value
+		holds = holds && !check.Absent && bytes.Equal(value, check.Value)
 	}
 	if !holds {
 		return TxnResult{Current: current}, nil
@@ -416,7 +466,8 @@ func stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
 }
 
 // applyCommand stages one command in txn and returns its response: the
-// replaced value for CommandSwap, nil otherwise.
+// replaced value for CommandSwap, nil otherwise. A failure to read the store
+// is a storeError.
 //
 // CommandPutMax stores a placement record, and the epoch it carries orders
 // nothing. It exists so log entries written when this command did compare
@@ -428,20 +479,15 @@ func stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
 // the writes earlier in its batch. What the read buys is a writer knowing
 // which generation it displaced: the log settles who wins, and a caller that
 // reads the key itself beforehand races every other writer of that key.
-func applyCommand(txn *badger.Txn, cmd Command) (any, error) {
+func (f *FSM) applyCommand(txn *badger.Txn, cmd Command) (any, error) {
 	switch cmd.Type {
 	case CommandPut, CommandPutMax:
 		return nil, txn.Set(cmd.Key, cmd.Value)
 	case CommandDelete:
 		return nil, txn.Delete(cmd.Key)
 	case CommandSwap:
-		var previous []byte
-		switch item, err := txn.Get(cmd.Key); {
-		case err == nil:
-			if previous, err = item.ValueCopy(nil); err != nil {
-				return nil, err
-			}
-		case !errors.Is(err, badger.ErrKeyNotFound):
+		previous, _, err := f.readValue(txn, cmd.Key)
+		if err != nil {
 			return nil, err
 		}
 		if err := txn.Set(cmd.Key, cmd.Value); err != nil {

@@ -295,6 +295,11 @@ The shared transaction keeps room for the row. Before it stages an entry, it cou
 The count is badger's own: the key, the value, and 12 bytes of overhead, but only a 12-byte pointer for a value at or above the value threshold, which badger keeps in the value log.
 So the FSM refuses an entry that badger alone accepts only when the row's own 38 bytes do not fit beside it.
 
+A failure to read the store while the FSM evaluates an entry, such as a `Swap` or a check of a `CommandTxn`, stops the process.
+It is not the entry's answer, because another replica can read and apply the same entry, and a later commit would then name an index past an entry that this store does not hold.
+The restart applies the entry again.
+A failed check, a malformed transaction and a refused write are the same on every replica, so they stay answers.
+
 No command writes a key under `\x00raft/`. The FSM, the replica's handlers and the client refuse a put, delete, swap or transaction that names one, and a transaction cannot check one. `Get`, `LeaderGet` and every scan, the empty prefix included, never return the row.
 
 A snapshot holds the row at the index that it captured. A restore writes and flushes every data row first, then writes the snapshot's row in its own transaction, or removes the local row when the snapshot has none, and then sets the in-memory index from it. So the index moves back when raft restores an older snapshot. A restore that fails after a write can have reached the store stops the process, as a failed commit does, and the next start restores the snapshot again before it skips any entry.

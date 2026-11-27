@@ -421,6 +421,47 @@ func TestFSM_Restore_AFailureBeforeAnyWriteLeavesTheStore(t *testing.T) {
 	assert.Equal(t, uint64(5), fsm.persisted)
 }
 
+// A local read failure is this replica's alone, so it stops the replica
+// before any commit names the entry. A healthy replica applies the same log,
+// and the failed one, restarted, applies the entry again and agrees with it.
+func TestFSM_ApplyBatch_AStoreReadFailureStopsBeforeTheRowPassesTheEntry(t *testing.T) {
+	cases := map[string]Command{
+		"transaction": txnCommand([]TxnCheck{holds("intents/k", "pending")},
+			put("objects/k", "gen-1"), put("intents/k", "committed")),
+		"swap": {Type: CommandSwap, Key: []byte("intents/k"), Value: []byte("committed")},
+	}
+	for name, entry := range cases {
+		t.Run(name, func(t *testing.T) {
+			logs := []*raft.Log{
+				commandLog(t, 1, Command{Type: CommandPut, Key: []byte("intents/k"), Value: []byte("pending")}),
+				commandLog(t, 2, Command{Type: CommandPut, Key: []byte("before/k"), Value: []byte("v")}),
+				commandLog(t, 3, entry),
+				commandLog(t, 4, Command{Type: CommandPut, Key: []byte("after/k"), Value: []byte("v")}),
+			}
+			ref := newTestDB(t)
+			want := NewFSM(ref).ApplyBatch(logs)
+
+			opts := badger.DefaultOptions(t.TempDir()).WithLoggingLevel(badger.WARNING)
+			db := openStore(t, opts)
+			fsm := NewFSM(db)
+			fsm.ApplyBatch(logs[:1])
+			fsm.copyValue = func(*badger.Item) ([]byte, error) { return nil, errors.New("injected read failure") }
+
+			assert.PanicsWithValue(t,
+				"meta: reading the store to apply entry 3 failed; stopping so the log applies it again: injected read failure",
+				func() { fsm.ApplyBatch(logs[1:]) })
+			assert.Less(t, storedApplied(t, db), uint64(3), "no commit names the failed entry")
+			assertStored(t, db, map[string]*string{"intents/k": str("pending"), "after/k": nil})
+
+			db, fsm = restart(t, db, opts)
+			got := fsm.ApplyBatch(logs)
+
+			assert.Equal(t, want[2], got[2], "the restarted replica evaluates the entry again")
+			assert.Equal(t, dumpStore(t, ref), dumpStore(t, db))
+		})
+	}
+}
+
 // Badger keeps a value at or above its value threshold in the value log and
 // charges the transaction for a pointer only, so it takes a value larger than
 // a whole transaction. The release before the row took it too, and replay
