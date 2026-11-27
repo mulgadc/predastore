@@ -1386,6 +1386,22 @@ upgrade_tombstone_on_disk() {
     echo "$held"
 }
 
+# upgrade_intents_on_disk counts the meta stores that still hold a write intent
+# for bucket/key. The cluster must be stopped: Badger locks its store.
+upgrade_intents_on_disk() {
+    local bucket="$1" key="$2" hash host node dir held=0
+    hash="$(printf '%s' "$bucket/$key" | sha256sum | awk '{ print $1 }')"
+    while read -r host node <&3; do
+        dir="$PREDA_DIR/$UPGRADE_CLUSTER/host-$host/node-$node/badger"
+        [ -d "$dir" ] || continue
+        if "$BADGER_PROBE" -mode meta "$dir" 2>>"$RUN_DIR/upgrade-errors.txt" \
+            | grep -qF "intents/<$hash"; then
+            held=$(( held + 1 ))
+        fi
+    done 3< <(meta_nodes "$UPGRADE_CONFIG")
+    echo "$held"
+}
+
 # cond_put sends PutObject with If-None-Match: * and prints "200 <etag>",
 # "412", or the error code the gate answered instead.
 cond_put() {
@@ -1545,8 +1561,7 @@ run_upgrade() {
         "the reaper reclaimed the legacy tombstone of $doomed $(( $(date +%s) - started ))s after the first probe"
 
     # --- Phase: conditional-write ---
-    # Fails until conditional PutObject lands. Counted on its own, so it does
-    # not hide the result of the upgrade itself.
+    # Counted on its own, so it does not hide the result of the upgrade itself.
     local cond_key="conditional.bin" first second answer cond_etag=""
     first="$src_dir/conditional-1.bin"
     second="$src_dir/conditional-2.bin"
@@ -1566,6 +1581,9 @@ run_upgrade() {
     upgrade_save_logs 2-upgraded
     log "upgrade: restarting every node"
     stop_clusters
+    held="$(upgrade_intents_on_disk "$UPGRADE_PLAIN" "$cond_key")"
+    cond_check "$([ "$held" -eq 0 ] && echo true || echo false)" \
+        "$held meta store(s) hold a write intent for $cond_key before the restart, want 0"
     "$SCRIPTS_DIR/start.sh" -w "$UPGRADE_CLUSTER"
     upgrade_wait_ready "after the restart"
     warm_gate "${gates[0]}" "$UPGRADE_PLAIN" plain-001.bin upgrade \
@@ -1582,6 +1600,9 @@ run_upgrade() {
     upgrade_save_logs 3-restarted
     log "upgrade: stopping $UPGRADE_CLUSTER"
     stop_clusters
+    held="$(upgrade_intents_on_disk "$UPGRADE_PLAIN" "$cond_key")"
+    cond_check "$([ "$held" -eq 0 ] && echo true || echo false)" \
+        "$held meta store(s) hold a write intent for $cond_key after the restart, want 0"
 
     if [ "$UPGRADE_FAILURES" -eq 0 ]; then
         log "upgrade: passed $UPGRADE_CASES assertions"
