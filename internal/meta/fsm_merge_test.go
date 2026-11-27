@@ -3,10 +3,8 @@ package meta
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"io"
-	"sort"
 	"testing"
 
 	"github.com/dgraph-io/badger/v4"
@@ -14,10 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// unsortedFrames writes the frame format the way this file used to: no marker,
-// and in whatever order the keys are given, which for a Go map was arbitrary.
-// A merging restore cannot be correct against one of these, so producing one is
-// how the fallback gets tested.
+// unsortedFrames writes the retired frame format without a format marker.
 func unsortedFrames(t *testing.T, keys []string, data map[string][]byte) []byte {
 	t.Helper()
 
@@ -110,46 +105,6 @@ func TestARestoreThatRunsTwiceConverges(t *testing.T) {
 	}
 }
 
-// A merge join is only correct against a stream in key order, and two unsorted
-// formats are already written down on disk somewhere: the legacy JSON map, and
-// the frame stream this file produced while it iterated a Go map. Both must
-// still restore, by clearing and rewriting rather than by merging -- so a
-// follower on this version can take a snapshot from a leader on the last one.
-func TestAnUnsortedSnapshotIsStillRestored(t *testing.T) {
-	data := map[string][]byte{
-		"a/first":  []byte("1"),
-		"b/second": []byte("2"),
-		"c/third":  []byte("3"),
-	}
-	want := map[string]string{"a/first": "1", "b/second": "2", "c/third": "3"}
-
-	t.Run("frames in the wrong order", func(t *testing.T) {
-		keys := make([]string, 0, len(data))
-		for k := range data {
-			keys = append(keys, k)
-		}
-		sort.Sort(sort.Reverse(sort.StringSlice(keys)))
-
-		db := newTestDB(t)
-		dbSet(t, db, []byte("stale"), []byte("must not survive"))
-		require.NoError(t, NewFSM(db).Restore(
-			io.NopCloser(bytes.NewReader(unsortedFrames(t, keys, data)))))
-
-		assert.Equal(t, want, contents(t, db))
-	})
-
-	t.Run("legacy json", func(t *testing.T) {
-		body, err := json.Marshal(data)
-		require.NoError(t, err)
-
-		db := newTestDB(t)
-		dbSet(t, db, []byte("stale"), []byte("must not survive"))
-		require.NoError(t, NewFSM(db).Restore(io.NopCloser(bytes.NewReader(body))))
-
-		assert.Equal(t, want, contents(t, db))
-	})
-}
-
 // A truncated stream must fail rather than commit the prefix it managed to
 // read. Half a snapshot restored as though it were whole is silent metadata
 // loss, and on the merge path it would also delete every key past the cut.
@@ -159,10 +114,19 @@ func TestATruncatedSnapshotIsRefused(t *testing.T) {
 		"b": bytes.Repeat([]byte("y"), 64),
 	})
 
-	db := newTestDB(t)
-	err := NewFSM(db).Restore(io.NopCloser(bytes.NewReader(stream[:len(stream)-8])))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "read value")
+	t.Run("value body", func(t *testing.T) {
+		db := newTestDB(t)
+		err := NewFSM(db).Restore(io.NopCloser(bytes.NewReader(stream[:len(stream)-8])))
+		require.ErrorContains(t, err, "read value")
+	})
+	t.Run("absent key body", func(t *testing.T) {
+		db := newTestDB(t)
+		dbSet(t, db, []byte("b"), []byte("acknowledged"))
+		keyBodyOffset := len(snapshotMagic) + 4 + len("a") + 4 + 64 + 4
+		err := NewFSM(db).Restore(io.NopCloser(bytes.NewReader(stream[:keyBodyOffset])))
+		require.ErrorContains(t, err, "read key")
+		assert.Equal(t, "acknowledged", contents(t, db)["b"])
+	})
 }
 
 // The claim C4 makes, stated as a property rather than as a duration: capturing

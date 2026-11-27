@@ -2,7 +2,6 @@ package meta
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"sync"
@@ -93,28 +92,15 @@ func TestLastKeyRebuildAfterSnapshotRestore(t *testing.T) {
 	key := testHeadPrefix + "2"
 	src := newTestDB(t)
 	dbSet(t, src, []byte(key), []byte("new snapshot"))
-	sorted := snapshotStream(t, NewFSM(src))
-	legacy, err := json.Marshal(map[string][]byte{key: []byte("new snapshot")})
+
+	dst := newTestDB(t)
+	dbSet(t, dst, []byte(testHeadPrefix+"3"), []byte("old view"))
+	fsm := NewFSM(dst)
+	require.NoError(t, fsm.rebuildMapHeads())
+	require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(snapshotStream(t, NewFSM(src))))))
+	got, err := fsm.LastKey(testHeadPrefix)
 	require.NoError(t, err)
-	for _, tc := range []struct {
-		name string
-		data []byte
-	}{{"sorted", sorted}, {"legacy", legacy}} {
-		t.Run(tc.name, func(t *testing.T) {
-			dst := newTestDB(t)
-			dbSet(t, dst, []byte(testHeadPrefix+"3"), []byte("old view"))
-			fsm := NewFSM(dst)
-			require.NoError(t, fsm.rebuildMapHeads())
-			require.NoError(t, fsm.Restore(io.NopCloser(bytes.NewReader(tc.data))))
-			got, err := fsm.LastKey(testHeadPrefix)
-			require.NoError(t, err)
-			require.Equal(t, key, got)
-			require.Error(t, fsm.Restore(io.NopCloser(bytes.NewReader([]byte("{")))))
-			got, err = fsm.LastKey(testHeadPrefix)
-			require.ErrorIs(t, err, errMapHeadIndexUnavailable)
-			require.Empty(t, got)
-		})
-	}
+	require.Equal(t, key, got)
 }
 
 func TestFailedRestoreCannotBecomeANewSnapshot(t *testing.T) {
@@ -125,7 +111,7 @@ func TestFailedRestoreCannotBecomeANewSnapshot(t *testing.T) {
 		Type: CommandPut, Key: []byte(key), Value: []byte("acknowledged"),
 	})))
 	prior := snapshotStream(t, fsm)
-	require.Error(t, fsm.Restore(io.NopCloser(bytes.NewReader([]byte("{")))))
+	require.Error(t, fsm.Restore(io.NopCloser(bytes.NewReader(prior[:len(prior)-1]))))
 
 	snapshot, err := fsm.Snapshot()
 	if snapshot != nil {
@@ -146,9 +132,10 @@ func TestFailedRestoreCannotBecomeANewSnapshot(t *testing.T) {
 }
 
 // On the second user snapshot, pause Raft between capturing the FSM and
-// opening its real file sink. A restore at that point can invalidate the capture.
+// opening its real file sink.
 type snapshotStoreCaptureGate struct {
 	*raft.FileSnapshotStore
+
 	armed   bool
 	entered chan struct{}
 	release chan struct{}
@@ -164,7 +151,7 @@ func (s *snapshotStoreCaptureGate) Create(version raft.SnapshotVersion, index, t
 	return s.FileSnapshotStore.Create(version, index, term, configuration, configurationIndex, transport)
 }
 
-func TestRestoreRejectsAnEarlierLocalSnapshotCapture(t *testing.T) {
+func TestUnsupportedRestorePreservesCapturedSnapshot(t *testing.T) {
 	key := testHeadPrefix + "1"
 	fsm := NewFSM(newTestDB(t))
 	files, err := raft.NewFileSnapshotStore(t.TempDir(), 1, io.Discard)
@@ -217,92 +204,33 @@ func TestRestoreRejectsAnEarlierLocalSnapshotCapture(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Raft did not reach persistence after capturing the snapshot")
 	}
-	require.Error(t, fsm.Restore(io.NopCloser(bytes.NewReader([]byte("{")))))
-	_, err = fsm.Get(key)
-	require.ErrorIs(t, err, badger.ErrKeyNotFound, "failed legacy restore must have changed the store")
+	oldFormats := [][]byte{
+		[]byte(`{"old":"dmFsdWU="}`),
+		unsortedFrames(t, []string{"b", "a"}, map[string][]byte{"a": []byte("1"), "b": []byte("2")}),
+	}
+	for _, input := range oldFormats {
+		require.ErrorContains(t, fsm.Restore(io.NopCloser(bytes.NewReader(input))), "unsupported metadata snapshot format")
+		value, err := fsm.Get(key)
+		require.NoError(t, err)
+		require.Equal(t, []byte("acknowledged later"), value)
+		head, err := fsm.LastKey(testHeadPrefix)
+		require.NoError(t, err)
+		require.Equal(t, key, head)
+	}
 	release()
-	snapshotErr := future.Error()
+	require.NoError(t, future.Error())
 
 	snapshots, err := store.List()
 	require.NoError(t, err)
 	require.Len(t, snapshots, 1)
-	require.Equal(t, prior[0].ID, snapshots[0].ID,
-		"a stale capture must not publish and reap the previous recovery point")
-	require.Error(t, snapshotErr)
-	firstAfter, err := logs.FirstIndex()
+	require.Greater(t, snapshots[0].Index, prior[0].Index)
+	require.NoError(t, node.Shutdown().Error())
+
+	recovered := NewFSM(newTestDB(t))
+	reopened, err := raft.NewRaft(cfg, recovered, logs, logs, files, transport)
 	require.NoError(t, err)
-	require.Equal(t, first, firstAfter, "a stale snapshot cannot compact acknowledged log entries")
-}
-
-type blockingMetaSnapshotSink struct {
-	mockSnapshotSink
-
-	started chan struct{}
-	release chan struct{}
-	once    sync.Once
-}
-
-func (s *blockingMetaSnapshotSink) Write(data []byte) (int, error) {
-	s.once.Do(func() { close(s.started) })
-	<-s.release
-	return s.mockSnapshotSink.Write(data)
-}
-
-func TestLegacyRestoreRefusesWhileSnapshotPersists(t *testing.T) {
-	fsm := NewFSM(newTestDB(t))
-	key := testHeadPrefix + "1"
-	require.Nil(t, fsm.Apply(commandLog(t, 1, Command{
-		Type: CommandPut, Key: []byte(key), Value: []byte("before"),
-	})))
-	captured, err := fsm.Snapshot()
+	t.Cleanup(func() { require.NoError(t, reopened.Shutdown().Error()) })
+	value, err := recovered.Get(key)
 	require.NoError(t, err)
-	defer captured.Release()
-
-	sink := &blockingMetaSnapshotSink{started: make(chan struct{}), release: make(chan struct{})}
-	release := sync.OnceFunc(func() { close(sink.release) })
-	defer release()
-	persisted := make(chan error, 1)
-	go func() { persisted <- captured.Persist(sink) }()
-	select {
-	case <-sink.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot did not begin persistence")
-	}
-
-	write := commandLog(t, 2, Command{Type: CommandPut, Key: []byte(key), Value: []byte("after")})
-	applied := make(chan any, 1)
-	go func() { applied <- fsm.Apply(write) }()
-	select {
-	case result := <-applied:
-		require.Nil(t, result)
-	case <-time.After(2 * time.Second):
-		t.Fatal("snapshot persistence blocked an ordinary metadata apply")
-	}
-
-	input := []byte("{")
-	restored := make(chan error, 1)
-	go func() { restored <- fsm.Restore(io.NopCloser(bytes.NewReader(input))) }()
-
-	var restoreErr error
-	refusedBeforeRelease := false
-	select {
-	case restoreErr = <-restored:
-		refusedBeforeRelease = true
-	case <-time.After(2 * time.Second):
-	}
-	value, getErr := fsm.Get(key)
-	release()
-	require.NoError(t, <-persisted)
-	if !refusedBeforeRelease {
-		<-restored
-	}
-	require.True(t, refusedBeforeRelease, "legacy restore must return before the sink is released")
-	require.Error(t, restoreErr)
-	require.NoError(t, getErr, "legacy restore must leave Badger untouched while persistence is active")
-	require.Equal(t, []byte("after"), value)
-	require.True(t, sink.closed)
-
-	require.Error(t, fsm.Restore(io.NopCloser(bytes.NewReader(input))))
-	_, err = fsm.Get(key)
-	require.ErrorIs(t, err, badger.ErrKeyNotFound, "retry must reach legacy replacement after persistence")
+	require.Equal(t, []byte("acknowledged later"), value)
 }
