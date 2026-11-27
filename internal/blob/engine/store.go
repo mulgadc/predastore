@@ -632,7 +632,7 @@ func (store *Store) appendValue(key [32]byte, index uint32, size int64, epoch ui
 	}
 
 	idxKey := MakeKey(key, index)
-	if err := seg.appendIdx(idxEntry{Off: off, Key: [36]byte(idxKey), PSize: ext.PSize}); err != nil {
+	if err := seg.appendPrepareAllocation(idxEntry{Off: off, Key: [36]byte(idxKey), PSize: ext.PSize}, epoch, size); err != nil {
 		seg.writers.Add(-1)
 		seg.releaseRef()
 		return nil, fmt.Errorf("append idx: %w", err)

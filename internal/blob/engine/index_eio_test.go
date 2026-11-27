@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -56,7 +57,7 @@ func TestShardIndexWriteEIO(t *testing.T) {
 		} else {
 			require.True(t, published)
 			t.Logf("commit acknowledged: epoch %d checksum %x", epoch, sha256.Sum256(current))
-			require.NoError(t, os.WriteFile(filepath.Join(control, "acknowledged"), nil, 0600))
+			require.NoError(t, os.WriteFile(filepath.Join(control, "acknowledged"), []byte(strconv.FormatUint(epoch, 10)), 0600))
 		}
 		if phase == "shutdown" {
 			<-shutdown.Done()
@@ -68,11 +69,17 @@ func TestShardIndexWriteEIO(t *testing.T) {
 			return err == nil
 		}, 60*time.Second, 10*time.Millisecond)
 	case "verify":
-		want := previous
-		if _, err := os.Stat(filepath.Join(control, "acknowledged")); err == nil {
-			want = current
-		}
 		require.Equal(t, sentinel, readValue(t, store, witness, 0))
+		want := previous
+		if acknowledged, err := os.ReadFile(filepath.Join(control, "acknowledged")); err == nil {
+			want = current
+			if os.Getenv("PREDASTORE_INDEX_EIO_VERIFY_SIDECAR") == "1" {
+				epoch, err := strconv.ParseUint(string(acknowledged), 10, 64)
+				require.NoError(t, err)
+				require.Equal(t, previous, readValue(t, store, overwrite, 0), "the live row must be stale for the replay probe")
+				require.Equal(t, current, replayPrepareRecord(t, store, overwrite, 0, epoch))
+			}
+		}
 		require.Equal(t, want, readValue(t, store, overwrite, 0))
 	default:
 		t.Fatalf("unknown fixture phase %q", phase)

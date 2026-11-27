@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -61,6 +62,33 @@ func decodeIdxEntry(b []byte) (e idxEntry, err error) {
 	return e, nil
 }
 
+// A prepare record uses the same row width and a negative encoded offset.
+// Its matching allocation row supplies the key and physical extent size.
+type prepareRecord struct {
+	off   int64
+	epoch uint64
+	size  int64
+}
+
+func (r prepareRecord) encode(row []byte) {
+	binary.BigEndian.PutUint64(row[:8], ^uint64(r.off))
+	binary.BigEndian.PutUint64(row[8:16], r.epoch)
+	binary.BigEndian.PutUint64(row[16:24], uint64(r.size))
+	copy(row[24:28], "PRE1")
+	binary.BigEndian.PutUint32(row[28:32], crc32.ChecksumIEEE(row[:28]))
+}
+
+func decodePrepareRecord(row []byte) (prepareRecord, bool) {
+	if row[0]&0x80 == 0 || string(row[24:28]) != "PRE1" ||
+		binary.BigEndian.Uint32(row[28:32]) != crc32.ChecksumIEEE(row[:28]) {
+		return prepareRecord{}, false
+	}
+	return prepareRecord{
+		off: int64(^binary.BigEndian.Uint64(row[:8])), epoch: binary.BigEndian.Uint64(row[8:16]),
+		size: int64(binary.BigEndian.Uint64(row[16:24])),
+	}, true
+}
+
 // scanIdx reads a segment's whole .idx into memory, listing every extent ever
 // allocated there. The rows are hints: callers must back-check each against the
 // index, which is the authority on what is live.
@@ -90,6 +118,9 @@ func scanIdx(dir string, segNum uint64) ([]idxEntry, error) {
 	for i := range count {
 		if _, err := f.ReadAt(buf, i*idxEntrySize); err != nil {
 			return nil, err
+		}
+		if buf[0]&0x80 != 0 {
+			continue
 		}
 		e, err := decodeIdxEntry(buf)
 		if err != nil {
@@ -213,6 +244,17 @@ func (seg *segment) appendIdx(e idxEntry) error {
 		return err
 	}
 	seg.idxSize += idxEntrySize
+	return nil
+}
+
+func (seg *segment) appendPrepareAllocation(e idxEntry, epoch uint64, size int64) error {
+	var rows [2 * idxEntrySize]byte
+	copy(rows[:idxEntrySize], e.encode())
+	prepareRecord{off: e.Off, epoch: epoch, size: size}.encode(rows[idxEntrySize:])
+	if _, err := seg.idx.WriteAt(rows[:], seg.idxSize); err != nil {
+		return err
+	}
+	seg.idxSize += int64(len(rows))
 	return nil
 }
 
