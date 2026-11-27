@@ -118,7 +118,7 @@ func (r *realNodes) restart(id config.NodeID, aead cipher.AEAD) {
 // readShard reads one whole shard from a node at epoch, as the gate's GET does.
 func (r *realNodes) readShard(node config.NodeID, key [32]byte, index int, epoch uint64) ([]byte, error) {
 	rc, err := r.client.Get(context.Background(), node, blob.GetRequest{
-		Key: key, Index: uint32(index), RangeStart: -1, RangeEnd: -1, Epoch: epoch, //nolint:gosec // G115: a stripe index.
+		Key: key, Index: uint32(index), RangeStart: -1, RangeEnd: -1, Epoch: epoch,
 	})
 	if err != nil {
 		return nil, err
@@ -138,7 +138,7 @@ func (r *realNodes) store(c *cluster, name string) ([32]byte, handlers.ObjectToS
 	place := c.placeFor(hash, int64(len(body)), 7)
 	shards := encodeStripe(t, c.k, c.m, body)
 	for index, node := range place.AllNodes() {
-		req := blob.PutRequest{Key: hash, Index: uint32(index), Size: int64(len(shards[index])), Epoch: place.WriteEpoch} //nolint:gosec // G115: a stripe index.
+		req := blob.PutRequest{Key: hash, Index: uint32(index), Size: int64(len(shards[index])), Epoch: place.WriteEpoch}
 		_, err := r.client.Put(ctx, node, req, bytes.NewReader(shards[index]))
 		require.NoError(t, err)
 		_, err = r.client.Commit(ctx, node, blob.CommitRequest{Key: hash, Index: req.Index, Epoch: place.WriteEpoch})

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -39,7 +40,7 @@ func BenchmarkListObjectsFirstPage(b *testing.B) {
 		h, _, _ := listBenchBucket(b, n)
 		for _, maxKeys := range []int{1, 1000} {
 			b.Run(fmt.Sprintf("keys=%d/max-keys=%d", n, maxKeys), func(b *testing.B) {
-				benchListPage(b, h, url.Values{"list-type": {"2"}, "max-keys": {fmt.Sprint(maxKeys)}})
+				benchListPage(b, h, url.Values{"list-type": {"2"}, "max-keys": {strconv.Itoa(maxKeys)}})
 			})
 		}
 	}
