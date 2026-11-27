@@ -986,7 +986,7 @@ Things the design implies but the code does not do. Longer-horizon items live in
 
 **No ETag backfill for pre-v3 objects.** `PutObject` and `CompleteMultipartUpload` store the body's MD5 in placement record v3 — a plain hex digest for a single part, `"<md5>-<N>"` for a multipart object assembled from N parts — and `GetObject`, `HeadObject` and `ListObjectsV2` return it as the ETag. A record written under an older placement version has no digest, so these surfaces omit its ETag instead of serving a stale value, and nothing rewrites it to add one.
 
-**A delimiter listing reads the whole prefix.** A `ListObjects` page with a delimiter scans every row under the prefix and collapses them before it cuts the page, so its cost grows with the prefix. A page without a delimiter stops on the `max-keys` + 1st live row and prefetches no more values than that. It still passes over keys deleted since the store last compacted that sort before that row, and those can scale with the prefix.
+**A delimiter listing reads the whole prefix.** A `ListObjects` page with a delimiter scans every row under the prefix and collapses them before it cuts the page, so its cost grows with the prefix. A page without a delimiter stops on the `max-keys` + 1st live row and prefetches no more values than that. It still pays for keys deleted since badger last compacted, which it merges across its levels; that cost can scale with the number of recent deletes.
 
 **No multi-object delete.** `POST /{bucket}?delete=` has no route and returns 405.
 
