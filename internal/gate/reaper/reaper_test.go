@@ -224,26 +224,76 @@ func TestSameEpochPlacementIsTheDeleteStillInFlightNotARecreate(t *testing.T) {
 	assert.Zero(t, svc.Stats().Pending)
 }
 
-// A row under the older prefix with WriteEpoch == 0 predates the field: its
-// delete already fanned the shards out inline, so the sweep must drop it
-// without touching a shard or even consulting the placement table.
-func TestLegacyTombstoneIsDroppedWithoutDeletingShards(t *testing.T) {
+// legacyZeroEpochRow is the row the previous release writes when the shard
+// fan-out of a pre-epoch object fails: the hashed older layout at epoch zero.
+func legacyZeroEpochRow(name string) tombstoneRow {
+	row := tombstone(name, 0, nodes(1, 2), nodes(3))
+	row.layout = layoutOlderHashed
+
+	return row
+}
+
+// The previous release writes a zero-epoch row only after a failed fan-out,
+// so the row still owes shards. With a node down, the row and that node's
+// shard stay, and a later pass reclaims both once the node returns.
+func TestALegacyZeroEpochRowIsKeptUntilItsDownNodeReturns(t *testing.T) {
 	t.Parallel()
 
 	c := newCluster(t)
-	c.meta.failLeader(errors.New("no leader"))
-	row := tombstone("legacy", 0, nodes(1, 2), nodes(3))
-	row.layout = layoutOlderPlain
+	row := legacyZeroEpochRow("legacy-down")
 	stored := c.store(t, row)
+	c.blob.stop(2)
+
+	svc := c.service(8)
+	require.NoError(t, svc.Pass(t.Context()))
+	assert.True(t, c.meta.has(stored), "a legacy row with a shard still owed must stay")
+	assert.True(t, c.blob.hasEpoch(2, row.hash, 1, 0), "the down node's shard must stay owed")
+	assert.False(t, c.blob.hasEpoch(1, row.hash, 0, 0), "a reachable node kept the owed shard")
+	assert.Equal(t, int64(1), svc.Stats().Pending)
+
+	c.blob.resume(2)
+	require.NoError(t, svc.Pass(t.Context()))
+	for i, n := range append(slices.Clone(row.data), row.m...) {
+		assert.False(t, c.blob.has(n, row.hash, uint32(i)), "node %d still holds index %d", n, i)
+	}
+	assert.False(t, c.meta.has(stored), "the legacy row must go once every shard delete succeeds")
+	assert.Zero(t, svc.Stats().Pending)
+	for _, epoch := range c.blob.epochs {
+		assert.Zero(t, epoch, "every delete must name epoch zero")
+	}
+}
+
+// A legacy zero-epoch row whose key now holds a recreate deletes only epoch
+// zero, and the recreate at its positive epoch stays whole.
+//
+// Verifies: ADR-0003:S7.
+func TestS7_ALegacyZeroEpochRowReclaimsOnlyEpochZeroAcrossARecreate(t *testing.T) {
+	t.Parallel()
+	reclaimAcrossARecreate(t, layoutOlderHashed, 0)
+}
+
+// A legacy zero-epoch row whose placement is still live at epoch zero is the
+// delete still in flight. The sweep must send no shard delete and keep the row.
+//
+// Verifies: ADR-0003:S7.
+func TestS7_ALegacyZeroEpochRowWithALivePlacementAtEpochZeroIsLeftAlone(t *testing.T) {
+	t.Parallel()
+
+	c := newCluster(t)
+	row := legacyZeroEpochRow("legacy-live")
+	stored := c.store(t, row)
+	c.recordLivePlacement(t, row.hash, 0, row.data, row.m)
 
 	svc := c.service(8)
 	require.NoError(t, svc.Pass(t.Context()))
 
-	assert.Empty(t, c.blob.deletes, "a legacy tombstone's shards were already fanned out inline")
-	assert.True(t, c.blob.has(1, row.hash, 0), "shards a legacy tombstone names must be left untouched")
-	assert.False(t, c.meta.has(stored), "the legacy tombstone must still be dropped")
-	assert.Equal(t, int64(1), svc.Stats().Reclaimed)
-	assert.Zero(t, svc.Stats().Failed)
+	assert.Empty(t, c.blob.deletes, "ADR-0003:S7: a shard delete reached a generation that is still live")
+	assert.True(t, c.meta.has(stored), "the row must stay while its placement is live")
+	for i, n := range append(slices.Clone(row.data), row.m...) {
+		assert.True(t, c.blob.hasEpoch(n, row.hash, uint32(i), 0), "ADR-0003:S7: node %d lost index %d", n, i)
+	}
+	assert.Zero(t, svc.Stats().Failed, "a delete still in flight is not a failure")
+	assert.Zero(t, svc.Stats().Reclaimed)
 }
 
 // The whole point of the design: a tombstone whose node is down at delete
@@ -516,14 +566,14 @@ func TestAnEpochZeroRowUnderTheEpochPrefixIsReclaimedOnceTheNodeReturns(t *testi
 	}
 }
 
-// reclaimAcrossARecreate stores a row in a layout, recreates its key at a later
-// epoch, and holds one node down. The row must stay with that node's shard
-// owed, then go once the node returns, and the recreate must stay whole.
-func reclaimAcrossARecreate(t *testing.T, layout rowLayout) {
+// reclaimAcrossARecreate stores a row at an epoch in a layout, recreates its
+// key at a later epoch, and holds one node down. The row must stay with that
+// node's shard owed, then go once the node returns, and the recreate must stay.
+func reclaimAcrossARecreate(t *testing.T, layout rowLayout, epoch uint64) {
 	t.Helper()
 
 	c := newCluster(t)
-	row := tombstone("recreated", 4, nodes(1, 2), nodes(3))
+	row := tombstone("recreated", epoch, nodes(1, 2), nodes(3))
 	row.layout = layout
 	stored := c.store(t, row)
 	const recreated = 9
@@ -558,7 +608,7 @@ func reclaimAcrossARecreate(t *testing.T, layout rowLayout) {
 // Verifies: ADR-0003:S7.
 func TestS7_ARowWhoseKeyWasRecreatedReclaimsOnlyItsEpoch(t *testing.T) {
 	t.Parallel()
-	reclaimAcrossARecreate(t, layoutEpoch)
+	reclaimAcrossARecreate(t, layoutEpoch, 4)
 }
 
 // A positive-epoch row in the older release's format stays through a failed
@@ -568,7 +618,7 @@ func TestS7_ARowWhoseKeyWasRecreatedReclaimsOnlyItsEpoch(t *testing.T) {
 // Verifies: ADR-0003:S7.
 func TestS7_AnOlderPositiveEpochRowReclaimsOnlyItsEpoch(t *testing.T) {
 	t.Parallel()
-	reclaimAcrossARecreate(t, layoutOlderHashed)
+	reclaimAcrossARecreate(t, layoutOlderHashed, 4)
 }
 
 // A follower that lags can answer an older epoch while the leader still names

@@ -30,11 +30,10 @@
 // tombstone's epoch, which cannot touch the recreate's shards, and keeps the
 // tombstone until every shard delete succeeds.
 //
-// A DeletedObjectPrefix row at epoch zero predates the epoch field. Those
-// deletes fanned their shards out inline before the tombstone was durable, so
-// there is nothing left to reclaim, and it is dropped without a placement
-// check. A DeletedEpochPrefix row at epoch zero is a failed delete of a
-// pre-epoch object, and its shards are reclaimed at epoch zero.
+// A row at epoch zero, under either prefix, is a failed delete of an object
+// written before epochs. Its shards are still owed, and it is reclaimed like
+// any other row: the shard deletes name epoch zero, which matches only the
+// pre-epoch generation, so a recreate at a positive epoch is untouched.
 //
 // There is no election. Every gate that runs repair also runs this sweep, and
 // two gates racing the same tombstone issue the same idempotent shard deletes
@@ -111,8 +110,8 @@ const (
 )
 
 // Stats is what a pass did. Scanned counts tombstones read, Reclaimed the ones
-// removed once their shards were deleted or the row was a legacy one with
-// nothing owed, and Pending is what the last completed pass left owing.
+// removed once their shards were deleted, and Pending is what the last
+// completed pass left owing.
 type Stats struct {
 	Passes    int64
 	Scanned   int64
@@ -247,21 +246,14 @@ func (s *Service) Pass(ctx context.Context) error {
 
 // task is one tombstone row, decoded.
 type task struct {
-	key    string // the row's full stored key, as ScanFrom returned it
-	info   handlers.DeletedObjectInfo
-	legacy bool // the row is under DeletedObjectPrefix, from an older release
+	key  string // the row's full stored key, as ScanFrom returned it
+	info handlers.DeletedObjectInfo
 }
 
 // scan pages through both tombstone prefixes and emits each row it can decode.
 func (s *Service) scan(ctx context.Context, emit func(task) error) error {
-	for _, p := range []struct {
-		prefix string
-		legacy bool
-	}{
-		{handlers.DeletedEpochPrefix, false},
-		{handlers.DeletedObjectPrefix, true},
-	} {
-		if err := s.scanPrefix(ctx, p.prefix, p.legacy, emit); err != nil {
+	for _, prefix := range []string{handlers.DeletedEpochPrefix, handlers.DeletedObjectPrefix} {
+		if err := s.scanPrefix(ctx, prefix, emit); err != nil {
 			return err
 		}
 	}
@@ -272,7 +264,7 @@ func (s *Service) scan(ctx context.Context, emit func(task) error) error {
 // scanPrefix pages through one tombstone prefix. A row it cannot decode is
 // logged and skipped rather than failing the pass: a tombstone from a future
 // format must not stall reclaim for every other one.
-func (s *Service) scanPrefix(ctx context.Context, rowPrefix string, legacy bool, emit func(task) error) error {
+func (s *Service) scanPrefix(ctx context.Context, rowPrefix string, emit func(task) error) error {
 	prefix := handlers.TableKey(model.TableObjects, rowPrefix)
 	cursor := ""
 	for {
@@ -294,7 +286,7 @@ func (s *Service) scanPrefix(ctx context.Context, rowPrefix string, legacy bool,
 				continue
 			}
 			s.scanned.Add(1)
-			if err := emit(task{key: item.Key, info: info, legacy: legacy}); err != nil {
+			if err := emit(task{key: item.Key, info: info}); err != nil {
 				return err
 			}
 		}
@@ -316,16 +308,6 @@ func (s *Service) scanPrefix(ctx context.Context, rowPrefix string, legacy bool,
 // the caller must not count it against Failed. A false result with a non-nil
 // error explains why the reclaim could not complete.
 func (s *Service) reclaim(ctx context.Context, t task) (bool, error) {
-	if t.legacy && t.info.WriteEpoch == 0 {
-		// Legacy tombstone: its delete already fanned the shards out inline,
-		// before the epoch field existed to name the generation.
-		if err := s.cfg.Meta.Delete(ctx, t.key); err != nil {
-			return false, fmt.Errorf("drop legacy tombstone: %w", err)
-		}
-
-		return true, nil
-	}
-
 	liveKey := handlers.TableKey(model.TableObjects, string(t.info.ObjectHash[:]))
 	data, err := s.cfg.Meta.LeaderGet(ctx, liveKey)
 	switch {

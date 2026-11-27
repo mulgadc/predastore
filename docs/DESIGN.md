@@ -560,16 +560,18 @@ The prefix does not start with `deleted:`, so a reaper from before this prefix n
 An object written before epochs has `WriteEpoch` zero, and its shards are deleted at epoch zero, which matches only rows from before epochs.
 
 The tombstone reaper sweeps the `deleted-epoch:` records and the `deleted:` records.
-A `deleted:` record at epoch zero comes from before the epoch field, when the delete had already fanned out, and the reaper drops it.
-For each other record, the reaper reads the live placement at the record's hash with `LeaderGet`.
+The release before the `deleted-epoch:` prefix writes a `deleted:` record only after a failed shard fan-out, so a `deleted:` record still owes its shards.
+For each record, the reaper reads the live placement at the record's hash with `LeaderGet`.
 When the leader cannot answer, the reaper keeps the record for a later pass, because a lagging follower can name an older epoch.
 A live placement at the record's own epoch is the delete still in flight, and the reaper keeps the record for a later pass.
 In the other cases, the reaper sends `DeleteEpoch` at the record's epoch to every node the record names.
 A live placement at another epoch is a recreate, and the reaper still deletes the record's epoch, because that delete cannot remove the shards of the recreate.
-A `deleted-epoch:` record at epoch zero is a failed delete of an object from before epochs, and the reaper deletes its shards at epoch zero.
+A record at epoch zero, with either prefix, is a failed delete of an object from before epochs.
+The reaper deletes its shards at epoch zero, so a recreate at a positive epoch keeps its shards.
 The reaper removes the record only when every shard delete succeeds, so a node that was down is reclaimed on a later pass.
 A node from before `DeleteEpoch` closes the stream unanswered, and the record stays until that node is upgraded.
-Multipart part cleanup keeps the unscoped `Delete`, because each part hash belongs to one upload.
+Multipart part cleanup keeps the unscoped `Delete`.
+An object at the hidden part key of an upload has the same hash as the part, and the cleanup also removes the shards of that object.
 
 ## Multipart
 
