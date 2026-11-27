@@ -24,12 +24,18 @@ const (
 
 // startEngineNode runs a blob node over a real engine store in a directory
 // the test can reach.
-func startEngineNode(t *testing.T) (*blob.Client, string) {
+func startEngineNode(t *testing.T, opts ...engine.Option) (*blob.Client, string) {
+	t.Helper()
+	c, dir, _ := startEngineNodeStore(t, opts...)
+	return c, dir
+}
+
+func startEngineNodeStore(t *testing.T, opts ...engine.Option) (*blob.Client, string, *engine.Store) {
 	t.Helper()
 	dir := t.TempDir()
-	st, err := engine.Open(dir, engine.WithAEAD(storetest.TestAEAD()))
+	st, err := engine.Open(dir, append([]engine.Option{engine.WithAEAD(storetest.TestAEAD())}, opts...)...)
 	require.NoError(t, err)
-	return startStoreNode(t, st), dir
+	return startStoreNode(t, st), dir, st
 }
 
 // flipFirstFragment flips one ciphertext byte of the first fragment in the
@@ -47,7 +53,13 @@ func flipFirstFragment(t *testing.T, dir string) {
 		}
 	}
 	require.Len(t, held, 1)
-	f, err := os.OpenFile(held[0], os.O_RDWR, 0)
+	flipFragmentIn(t, held[0])
+}
+
+// flipFragmentIn flips one ciphertext byte of the first fragment in seg.
+func flipFragmentIn(t *testing.T, seg string) {
+	t.Helper()
+	f, err := os.OpenFile(seg, os.O_RDWR, 0)
 	require.NoError(t, err)
 	defer f.Close()
 	b := make([]byte, 1)
@@ -116,4 +128,35 @@ func TestASuspectMarkEndsWithItsGeneration(t *testing.T) {
 		require.NoError(t, commit(t, c, 6))
 		assert.False(t, statSuspect(t, c))
 	})
+}
+
+// Compaction copies a suspect shard's ciphertext to a new place unchanged,
+// so the mark, which names the generation and not the place, stays.
+func TestASuspectMarkSurvivesCompactionMovingTheShard(t *testing.T) {
+	c, dir, st := startEngineNodeStore(t, engine.WithMaxSegSize(40<<10), engine.WithCompaction(5*time.Millisecond),
+		engine.WithFreeSpaceWatermark(0, 0))
+	ctx := context.Background()
+	body := bytes.Repeat([]byte("c"), 12<<10)
+	for _, index := range []uint32{epochTestShardIndex, 1, 2} {
+		_, err := c.Put(ctx, epochServerNode, blob.PutRequest{Key: epochKey(), Index: index, Size: int64(len(body)), Epoch: 5}, bytes.NewReader(body))
+		require.NoError(t, err)
+		_, err = c.Commit(ctx, epochServerNode, blob.CommitRequest{Key: epochKey(), Index: index, Epoch: 5})
+		require.NoError(t, err)
+	}
+	flipFragmentIn(t, filepath.Join(dir, "0000000000000000.seg"))
+	_, err := get(t, c, 5)
+	require.Error(t, err)
+	require.True(t, statSuspect(t, c))
+
+	before := st.Snapshot().CompactionCycles
+	_, err = c.Delete(ctx, epochServerNode, blob.DeleteRequest{Key: epochKey(), Index: 1})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(filepath.Join(dir, "0000000000000000.seg"))
+		return os.IsNotExist(err) && st.Snapshot().CompactionCycles > before
+	}, 10*time.Second, 5*time.Millisecond, "compaction must move the shard out of its first segment")
+
+	assert.True(t, statSuspect(t, c), "the moved shard is still the bad generation")
+	_, err = get(t, c, 5)
+	assert.Error(t, err, "compaction copies the bad ciphertext as it was")
 }

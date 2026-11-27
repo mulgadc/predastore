@@ -104,7 +104,7 @@ func (r *reader) ReadAt(p []byte, off int64) (int, error) {
 			}
 
 			if r.keyCheck != nil {
-				r.keyCheck.authenticated(r.ext.SegNum, batchDiskOff+int64(pos+totalFragSize))
+				r.keyCheck.authenticated(frag.fragNum())
 			}
 
 			n := copy(p[totalCopied:], plaintext[bodyOffset:])

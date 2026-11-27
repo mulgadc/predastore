@@ -7,11 +7,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // keyCheckFilename holds the evidence that the store's master key is the key
@@ -25,100 +26,126 @@ const (
 
 	keyCheckSealed  = 's'
 	keyCheckPending = 'p'
+
+	keyCheckHeader     = len(keyCheckMagic) + 2
+	keyCheckPendingLen = keyCheckHeader + 8 + 4
 )
 
-var (
-	keyCheckPlaintext = []byte("predastore key check")
-	keyCheckAAD       = []byte("predastore keycheck v1")
-)
+// keyCheckRetry spaces the attempts to seal the key check after one fails.
+var keyCheckRetry = time.Minute
+
+var keyCheckPlaintext = []byte("predastore key check")
+
+// keyCheckAAD binds the sealed check to the store identity that every
+// fragment's nonce carries, so a check copied from another store fails.
+func keyCheckAAD(storeID uint32) []byte {
+	return binary.BigEndian.AppendUint32([]byte("predastore keycheck v1"), storeID)
+}
 
 // keyCheck tracks whether the store's key is verified. While it is pending,
-// a fragment that authenticates below the high-water was sealed by an earlier
-// release, which proves the key, and the first one seals the file.
+// a fragment numbered below the boundary was sealed before this release first
+// started on the store, so one that authenticates proves the key.
 type keyCheck struct {
-	dir  string
-	aead cipher.AEAD
+	dir     string
+	aead    cipher.AEAD
+	storeID uint32
 
 	verified atomic.Bool
 
-	// The high-water from the first start on this release, or zero when the
-	// check is not pending. Fragments this release writes lie at or above it.
-	hwSeg, hwOff uint64
-	pending      bool
+	// boundary is the first fragment number this release could have sealed,
+	// read from the pending file. Zero means the check is not pending.
+	boundary uint64
 
-	sealMu sync.Mutex
+	// sealing is set while a seal is in flight or waiting for its retry, so
+	// reads only ever start one.
+	sealing atomic.Bool
+	write   func([]byte) error
 }
 
 // openKeyCheck reads or creates the key check. hasData reports whether any
-// segment held data at open, and segNum and segSize name the append position.
-func openKeyCheck(dir string, aead cipher.AEAD, hasData bool, segNum uint64, segSize int64) (*keyCheck, error) {
-	kc := &keyCheck{dir: dir, aead: aead}
+// segment held data at open, and nextFrag is the first fragment number this
+// start can seal. Evidence that cannot be read leaves the store unverified.
+func openKeyCheck(dir string, aead cipher.AEAD, storeID uint32, hasData bool, nextFrag uint64) *keyCheck {
+	kc := &keyCheck{dir: dir, aead: aead, storeID: storeID}
+	kc.write = kc.writeFile
+	unverified := func(reason string, err error) *keyCheck {
+		slog.Error("the store's key check is unusable; integrity failures are not marked for repair",
+			"dir", dir, "reason", reason, "error", err)
+		return kc
+	}
+
 	raw, err := os.ReadFile(filepath.Join(dir, keyCheckFilename))
 	switch {
 	case errors.Is(err, os.ErrNotExist) && !hasData:
 		if err := kc.writeSealed(); err != nil {
-			return nil, err
+			return unverified("write", err)
 		}
 		kc.verified.Store(true)
-		return kc, nil
+		return kc
 	case errors.Is(err, os.ErrNotExist):
-		kc.hwSeg, kc.hwOff, kc.pending = segNum, uint64(max(segSize, 0)), true //nolint:gosec // G115: clamped non-negative.
+		kc.boundary = nextFrag
 		if err := kc.write(kc.pendingBytes()); err != nil {
-			return nil, err
+			kc.boundary = 0
+			return unverified("write", err)
 		}
-		return kc, nil
+		return kc
 	case err != nil:
-		return nil, fmt.Errorf("read key check: %w", err)
+		return unverified("read", err)
 	}
 
-	if len(raw) < len(keyCheckMagic)+2 || string(raw[:len(keyCheckMagic)]) != keyCheckMagic || raw[len(keyCheckMagic)] != keyCheckVersion {
-		return nil, fmt.Errorf("key check %s does not decode", filepath.Join(dir, keyCheckFilename))
+	if len(raw) < keyCheckHeader || string(raw[:len(keyCheckMagic)]) != keyCheckMagic || raw[len(keyCheckMagic)] != keyCheckVersion {
+		return unverified("does not decode", nil)
 	}
-	body := raw[len(keyCheckMagic)+2:]
+	body := raw[keyCheckHeader:]
 	switch raw[len(keyCheckMagic)+1] {
 	case keyCheckSealed:
 		nonceSize := aead.NonceSize()
 		if len(body) < nonceSize {
-			return nil, fmt.Errorf("key check %s is short", filepath.Join(dir, keyCheckFilename))
+			return unverified("short", nil)
 		}
-		plain, err := aead.Open(nil, body[:nonceSize], body[nonceSize:], keyCheckAAD)
-		if err == nil && bytes.Equal(plain, keyCheckPlaintext) {
-			kc.verified.Store(true)
-			return kc, nil
+		plain, err := aead.Open(nil, body[:nonceSize], body[nonceSize:], keyCheckAAD(storeID))
+		if err != nil || !bytes.Equal(plain, keyCheckPlaintext) {
+			slog.Error("the master key does not open this store's key check; integrity failures are not marked for repair",
+				"dir", dir)
+			return kc
 		}
-		slog.Error("the master key does not open this store's key check; integrity failures are not marked for repair",
-			"dir", dir)
-		return kc, nil
+		kc.verified.Store(true)
+		return kc
 	case keyCheckPending:
-		if len(body) != 16 {
-			return nil, fmt.Errorf("key check %s is short", filepath.Join(dir, keyCheckFilename))
+		if len(raw) != keyCheckPendingLen ||
+			crc32.ChecksumIEEE(raw[:keyCheckPendingLen-4]) != binary.BigEndian.Uint32(raw[keyCheckPendingLen-4:]) {
+			return unverified("pending record fails its checksum", nil)
 		}
-		kc.hwSeg, kc.hwOff, kc.pending = binary.BigEndian.Uint64(body[:8]), binary.BigEndian.Uint64(body[8:]), true
-		return kc, nil
+		boundary := binary.BigEndian.Uint64(body[:8])
+		// Fragment numbers only grow, so a boundary past this start's is not
+		// one this store wrote.
+		if boundary == 0 || boundary > nextFrag {
+			return unverified("pending boundary is past the store's fragment numbers", nil)
+		}
+		kc.boundary = boundary
+		return kc
 	default:
-		return nil, fmt.Errorf("key check %s has an unknown form", filepath.Join(dir, keyCheckFilename))
+		return unverified("unknown form", nil)
 	}
 }
 
-// below reports whether a fragment ending at end in segment seg lies wholly
-// below the high-water.
-func (kc *keyCheck) below(seg uint64, end int64) bool {
-	return seg < kc.hwSeg || (seg == kc.hwSeg && end >= 0 && uint64(end) <= kc.hwOff)
-}
+// pending reports whether a read can still supply the evidence.
+func (kc *keyCheck) pending() bool { return kc.boundary != 0 && !kc.verified.Load() }
 
 // authenticated records a fragment that opened under the current key. One
-// below the high-water proves the key and seals the file.
-func (kc *keyCheck) authenticated(seg uint64, end int64) {
-	if !kc.pending || kc.verified.Load() || !kc.below(seg, end) {
+// numbered below the boundary proves the key; sealing the file runs off the
+// read, one attempt at a time.
+func (kc *keyCheck) authenticated(fragNum uint64) {
+	if fragNum >= kc.boundary || !kc.pending() || !kc.sealing.CompareAndSwap(false, true) {
 		return
 	}
-	kc.sealMu.Lock()
-	defer kc.sealMu.Unlock()
-	if kc.verified.Load() {
-		return
-	}
+	go kc.seal()
+}
+
+func (kc *keyCheck) seal() {
 	if err := kc.writeSealed(); err != nil {
-		slog.Warn("could not seal the key check; trying again on a later read", "dir", kc.dir, "error", err)
+		slog.Warn("could not seal the key check; trying again later", "dir", kc.dir, "error", err)
+		time.AfterFunc(keyCheckRetry, func() { kc.sealing.Store(false) })
 		return
 	}
 	kc.verified.Store(true)
@@ -126,8 +153,8 @@ func (kc *keyCheck) authenticated(seg uint64, end int64) {
 
 func (kc *keyCheck) pendingBytes() []byte {
 	out := append([]byte(keyCheckMagic), keyCheckVersion, keyCheckPending)
-	out = binary.BigEndian.AppendUint64(out, kc.hwSeg)
-	return binary.BigEndian.AppendUint64(out, kc.hwOff)
+	out = binary.BigEndian.AppendUint64(out, kc.boundary)
+	return binary.BigEndian.AppendUint32(out, crc32.ChecksumIEEE(out))
 }
 
 func (kc *keyCheck) writeSealed() error {
@@ -137,11 +164,12 @@ func (kc *keyCheck) writeSealed() error {
 	}
 	out := append([]byte(keyCheckMagic), keyCheckVersion, keyCheckSealed)
 	out = append(out, nonce...)
-	return kc.write(kc.aead.Seal(out, nonce, keyCheckPlaintext, keyCheckAAD))
+	return kc.write(kc.aead.Seal(out, nonce, keyCheckPlaintext, keyCheckAAD(kc.storeID)))
 }
 
-// write replaces the file through a synced temporary file and a synced rename.
-func (kc *keyCheck) write(data []byte) error {
+// writeFile replaces the file through a synced temporary file and a synced
+// rename.
+func (kc *keyCheck) writeFile(data []byte) error {
 	path := filepath.Join(kc.dir, keyCheckFilename)
 	tmp := path + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
@@ -171,12 +199,11 @@ func (store *Store) KeyVerified() bool {
 	return store.keyCheck != nil && store.keyCheck.verified.Load()
 }
 
-// storeHasData reports whether any segment in dir holds more than a header,
-// and the size of segment num.
-func storeHasData(dir string, num uint64) (hasData bool, numSize int64, err error) {
+// storeHasData reports whether any segment in dir holds more than a header.
+func storeHasData(dir string) (bool, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return false, 0, err
+		return false, err
 	}
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".seg" {
@@ -184,14 +211,11 @@ func storeHasData(dir string, num uint64) (hasData bool, numSize int64, err erro
 		}
 		info, err := e.Info()
 		if err != nil {
-			return false, 0, err
+			return false, err
 		}
 		if info.Size() > segHeaderSize {
-			hasData = true
-		}
-		if e.Name() == fmt.Sprintf(segFilename, num) {
-			numSize = info.Size()
+			return true, nil
 		}
 	}
-	return hasData, numSize, nil
+	return false, nil
 }

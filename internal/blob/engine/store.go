@@ -349,15 +349,13 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("count segments: %w", err)
 	}
 
-	// Before the append position can move: the key check's high-water is
-	// where this start found it.
-	hasData, segSize, err := storeHasData(dir, store.segNum)
+	// Every fragment an earlier start sealed is numbered below the fragNum
+	// this start resumes from, which is what a pending key check records.
+	hasData, err := storeHasData(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read segments: %w", err)
 	}
-	if store.keyCheck, err = openKeyCheck(dir, store.aead, hasData, store.segNum, segSize); err != nil {
-		return nil, err
-	}
+	store.keyCheck = openKeyCheck(dir, store.aead, store.storeID, hasData, store.fragNum)
 
 	if _, err := store.nextAvailableSegment(); err != nil {
 		return nil, err
@@ -1313,7 +1311,7 @@ func MakeKey(key [32]byte, index uint32) []byte {
 // pendingKeyCheck is the key check a reader reports to, or nil once the key
 // is verified, so a verified store's reads skip it.
 func (store *Store) pendingKeyCheck() *keyCheck {
-	if store.keyCheck == nil || !store.keyCheck.pending || store.keyCheck.verified.Load() {
+	if store.keyCheck == nil || !store.keyCheck.pending() {
 		return nil
 	}
 	return store.keyCheck

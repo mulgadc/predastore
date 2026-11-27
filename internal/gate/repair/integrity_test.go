@@ -265,15 +265,23 @@ func serveS3(h http.Handler, method, key string, body []byte) *httptest.Response
 	return rr
 }
 
-// An S3 GET that meets a shard whose bytes fail authentication on its node is
-// answered from the other shards. The node's repair pass must then rewrite
-// that shard from its peers, so the node serves it again.
-func TestARepairPassReplacesAShardThatFailedAuthenticationOnGet(t *testing.T) {
-	const k, m = 2, 1
-	c := newCluster(t, k, m, 4)
-	nodes := startRealNodes(t, c.nodes)
-	ctx := context.Background()
-	mc := &s3Meta{rows: map[string][]byte{}}
+// s3Fixture is real blob nodes behind the S3 PUT and GET handlers, and one
+// object written through them.
+type s3Fixture struct {
+	c      *cluster
+	nodes  *realNodes
+	mc     *s3Meta
+	get    http.Handler
+	body   []byte
+	hash   [32]byte
+	place  handlers.ObjectToShardNodes
+	shards [][]byte
+}
+
+func newS3Fixture(t *testing.T, k, m, nodeCount int) *s3Fixture {
+	t.Helper()
+	f := &s3Fixture{c: newCluster(t, k, m, nodeCount), mc: &s3Meta{rows: map[string][]byte{}}}
+	f.nodes = startRealNodes(t, f.c.nodes)
 	epochs, err := handlers.NewEpochMinter(99)
 	require.NoError(t, err)
 	cfg := handlers.Config{
@@ -281,46 +289,93 @@ func TestARepairPassReplacesAShardThatFailedAuthenticationOnGet(t *testing.T) {
 		DegradedWrites: true, HintedHandoff: true, Epochs: epochs,
 	}
 	cache := handlers.NewBucketCache([]handlers.BucketConfig{{Name: "bkt"}})
+	f.get = handlers.GetObject(f.mc, f.nodes.client, f.c.ring, cache, cfg)
 
-	body := bytes.Repeat([]byte("integrity "), 6<<10)
-	rr := serveS3(handlers.PutObject(mc, nodes.client, c.ring, cache, cfg), http.MethodPut, "k", body)
+	f.body = bytes.Repeat([]byte("integrity "), 6<<10)
+	rr := serveS3(handlers.PutObject(f.mc, f.nodes.client, f.c.ring, cache, cfg), http.MethodPut, "k", f.body)
 	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
 
-	hash := model.ObjectHash("bkt", "k")
-	raw, err := mc.Get(ctx, handlers.TableKey(model.TableObjects, string(hash[:])))
+	f.hash = model.ObjectHash("bkt", "k")
+	raw, err := f.mc.Get(context.Background(), handlers.TableKey(model.TableObjects, string(f.hash[:])))
 	require.NoError(t, err)
-	place, err := handlers.DecodePlacement(raw)
+	f.place, err = handlers.DecodePlacement(raw)
 	require.NoError(t, err)
-	shards := make([][]byte, k+m)
-	for index, node := range place.AllNodes() {
-		shards[index], err = nodes.readShard(node, hash, index, place.WriteEpoch)
+	f.shards = make([][]byte, k+m)
+	for index, node := range f.place.AllNodes() {
+		f.shards[index], err = f.nodes.readShard(node, f.hash, index, f.place.WriteEpoch)
 		require.NoError(t, err)
 	}
+	return f
+}
 
-	target := place.DataShardNodes[0]
-	corruptOnlyShard(t, nodes.dirs[target])
-	_, err = nodes.readShard(target, hash, 0, place.WriteEpoch)
-	require.Error(t, err, "the flipped byte must fail authentication on the node")
+// suspect reports whether the node holding shard index marks it suspect.
+func (f *s3Fixture) suspect(t *testing.T, index int) bool {
+	t.Helper()
+	held, err := f.nodes.client.Stat(context.Background(), f.place.AllNodes()[index], blob.StatRequest{Key: f.hash, Index: uint32(index)}) //nolint:gosec // G115: a stripe index.
+	require.NoError(t, err)
+	return held.Suspect
+}
 
-	rr = serveS3(handlers.GetObject(mc, nodes.client, c.ring, cache, cfg), http.MethodGet, "k", nil)
+// getAnswersTheObject sends an S3 GET and checks it answers the stored bytes.
+func (f *s3Fixture) getAnswersTheObject(t *testing.T) {
+	t.Helper()
+	rr := serveS3(f.get, http.MethodGet, "k", nil)
 	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Equal(t, body, rr.Body.Bytes(), "the GET answers the stored bytes, rebuilt from the other shards")
+	require.Equal(t, f.body, rr.Body.Bytes(), "the GET answers the stored bytes, rebuilt from the other shards")
+}
 
+func (f *s3Fixture) pass(t *testing.T, node config.NodeID) {
+	t.Helper()
 	svc, err := New(Config{
-		Nodes: []config.NodeID{target}, Ring: c.ring, Meta: mc, Blob: nodes.client,
-		DataShards: k, ParityShards: m, Workers: 1,
+		Nodes: []config.NodeID{node}, Ring: f.c.ring, Meta: f.mc, Blob: f.nodes.client,
+		DataShards: f.c.k, ParityShards: f.c.m, Workers: 1,
 	})
 	require.NoError(t, err)
-	require.NoError(t, svc.Pass(ctx))
+	require.NoError(t, svc.Pass(context.Background()))
+}
 
-	got, err := nodes.readShard(target, hash, 0, place.WriteEpoch)
+// An S3 GET that meets a shard whose bytes fail authentication on its node is
+// answered from the other shards and marks the shard. The node's repair pass
+// rewrites it from its peers and reads it back, which clears the mark.
+func TestARepairPassReplacesAShardThatFailedAuthenticationOnGet(t *testing.T) {
+	f := newS3Fixture(t, 2, 1, 4)
+	target := f.place.DataShardNodes[0]
+	corruptOnlyShard(t, f.nodes.dirs[target])
+
+	f.getAnswersTheObject(t)
+	require.Eventually(t, func() bool { return f.suspect(t, 0) }, 5*time.Second, 5*time.Millisecond,
+		"the GET must mark the shard it could not read")
+
+	f.pass(t, target)
+	assert.Eventually(t, func() bool { return !f.suspect(t, 0) }, 5*time.Second, 5*time.Millisecond,
+		"the pass's own read back must clear the mark")
+
+	got, err := f.nodes.readShard(target, f.hash, 0, f.place.WriteEpoch)
 	require.NoError(t, err, "after the pass the node serves its shard again")
-	assert.Equal(t, shards[0], got, "the rewritten shard holds the bytes the PUT stored")
-	for index, node := range place.AllNodes()[1:] {
-		got, err := nodes.readShard(node, hash, index+1, place.WriteEpoch)
+	assert.Equal(t, f.shards[0], got, "the rewritten shard holds the bytes the PUT stored")
+	for index, node := range f.place.AllNodes()[1:] {
+		got, err := f.nodes.readShard(node, f.hash, index+1, f.place.WriteEpoch)
 		require.NoError(t, err)
-		assert.Equal(t, shards[index+1], got, "a healthy shard is left as it was")
+		assert.Equal(t, f.shards[index+1], got, "a healthy shard is left as it was")
 	}
+}
+
+// With two bad shards in an RS(2,2) stripe, the rebuild of one must not stop
+// at the other bad peer: it tries the next peer and rebuilds from the two
+// healthy ones.
+func TestARepairPassRebuildsPastAPeerThatFailsAuthentication(t *testing.T) {
+	f := newS3Fixture(t, 2, 2, 5)
+	target := f.place.DataShardNodes[0]
+	corruptOnlyShard(t, f.nodes.dirs[target])
+	corruptOnlyShard(t, f.nodes.dirs[f.place.DataShardNodes[1]])
+
+	f.getAnswersTheObject(t)
+	require.Eventually(t, func() bool { return f.suspect(t, 0) && f.suspect(t, 1) }, 5*time.Second, 5*time.Millisecond)
+
+	f.pass(t, target)
+	got, err := f.nodes.readShard(target, f.hash, 0, f.place.WriteEpoch)
+	require.NoError(t, err, "the rebuild must reach the healthy peers")
+	assert.Equal(t, f.shards[0], got)
 }
 
 // A node started under a key that is not the cluster's fails authentication on
