@@ -64,8 +64,10 @@ if [ $START_RC -ne 0 ]; then
 fi
 
 # Every host must report ready. A half-connected start shows up here: the
-# hosts whose peers they cannot verify never report meta_leader ok.
-READY=0
+# hosts whose peers they cannot verify never report meta_leader ok. Record
+# the verdict but do not stop: the S3 leg below runs either way, so a broken
+# build is reported through every surface it breaks, not just the first.
+READYZ_OK=1
 for _ in $(seq 1 45); do
     OK=3
     for ip in 127.0.0.1 127.0.0.2 127.0.0.3; do
@@ -73,20 +75,19 @@ for _ in $(seq 1 45); do
         [ "$R" = '"meta_leader":"ok"' ] || OK=$((OK - 1))
     done
     if [ "$OK" -eq 3 ]; then
-        READY=1
+        READYZ_OK=1
         break
     fi
     sleep 2
 done
-if [ $READY -ne 1 ]; then
+if [ $READYZ_OK -ne 1 ]; then
+    READYZ_OK=0
     echo "FAIL: cluster did not reach readyz on all three hosts within 90s"
     for ip in 127.0.0.1 127.0.0.2 127.0.0.3; do
         echo "  readyz $ip: $(curl -s --max-time 2 "http://$ip:9099/readyz" || echo unreachable)"
     done
     tail -10 "$WORK/start.log"
-    exit 1
 fi
-echo "readyz: all three hosts ok"
 
 # End-to-end proof: an authenticated S3 write through the gate, served by the
 # generated certificate.
@@ -125,5 +126,9 @@ if ! cmp -s "$WORK/object.txt" "$WORK/readback.txt"; then
 fi
 echo "s3: authenticated put/get round-trip ok"
 
+if [ $READYZ_OK -ne 1 ]; then
+    echo "FAIL: the S3 surface worked but readyz never reached ok on all hosts"
+    exit 1
+fi
 echo "PASS: all-loopback profile starts to readyz and serves authenticated S3"
 exit 0
