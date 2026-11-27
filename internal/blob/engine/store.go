@@ -13,11 +13,13 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"golang.org/x/sys/unix"
 )
 
 const indexFilename = "db"
@@ -31,7 +33,8 @@ const fragNumReservation = 1 << 20 // 1 048 576
 // Store manages segment files and an index mapping keys to on-disk
 // extents. All public methods are safe for concurrent use.
 type Store struct {
-	dir string
+	dir     string
+	dirLock *os.File
 
 	// The on-disk index: key -> extent, plus the tombstone namespace.
 	// Index mutations all enter through indexUpdate or commitIndex. The
@@ -326,6 +329,22 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, errors.New("aead is required (use WithAEAD)")
 	}
 
+	// Hold ownership before reading or reserving state. Badger's own lock
+	// is acquired later and covers only its index directory.
+	dirLock, err := os.Open(dir)
+	if err != nil {
+		return nil, fmt.Errorf("open store directory: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, dirLock.Close())
+		}
+	}()
+	if err := unix.Flock(int(dirLock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return nil, fmt.Errorf("lock store directory %s: %w", dir, err)
+	}
+	store.dirLock = dirLock
+
 	if err := store.loadState(); err != nil {
 		return nil, fmt.Errorf("load state: %w", err)
 	}
@@ -342,6 +361,12 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("open disk index: %w", err)
 	}
+	index := store.index
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, index.Close())
+		}
+	}()
 
 	// Counted once here, then maintained by create and drop. Doing it at Open
 	// is what keeps the reporting path free of a directory read.
@@ -1141,6 +1166,9 @@ func (store *Store) Close() error {
 	defer store.indexWrites.Unlock()
 	if err := store.index.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close disk index: %w", err))
+	}
+	if err := store.dirLock.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close store directory: %w", err))
 	}
 
 	return errors.Join(errs...)

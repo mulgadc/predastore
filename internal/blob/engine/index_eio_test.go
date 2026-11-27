@@ -3,7 +3,9 @@ package engine
 import (
 	"crypto/sha256"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -36,7 +38,9 @@ func TestShardIndexWriteEIO(t *testing.T) {
 	case "seed":
 		putValue(t, store, overwrite, 0, previous)
 		putValue(t, store, witness, 0, sentinel)
-	case "commit":
+	case "commit", "shutdown":
+		shutdown, stop := signal.NotifyContext(t.Context(), syscall.SIGTERM)
+		defer stop()
 		testEpochs.Store(10)
 		epoch := prepareValue(t, store, overwrite, 0, current)
 		require.NoError(t, os.WriteFile(filepath.Join(control, "prepared"), nil, 0600))
@@ -53,6 +57,11 @@ func TestShardIndexWriteEIO(t *testing.T) {
 			require.True(t, published)
 			t.Logf("commit acknowledged: epoch %d checksum %x", epoch, sha256.Sum256(current))
 			require.NoError(t, os.WriteFile(filepath.Join(control, "acknowledged"), nil, 0600))
+		}
+		if phase == "shutdown" {
+			<-shutdown.Done()
+			t.Log("shutdown requested")
+			return
 		}
 		require.Eventually(t, func() bool {
 			_, err := os.Stat(filepath.Join(control, "close"))
