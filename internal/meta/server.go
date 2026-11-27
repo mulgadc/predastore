@@ -161,6 +161,9 @@ func (s *Server) open() (*rpc.Server, error) {
 	rpc.RegisterHandler(mux, OpMetaGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpMetaPut, s.handlePut)
 	rpc.RegisterHandler(mux, OpMetaSwap, s.handleSwap)
+	if s.cfg.serveTxn {
+		rpc.RegisterHandler(mux, OpMetaTxn, s.handleTxn)
+	}
 	rpc.RegisterHandler(mux, OpMetaPutMax, s.handlePutMax)
 	rpc.RegisterHandler(mux, OpMetaDelete, s.handleDelete)
 	rpc.RegisterHandler(mux, OpMetaScan, s.handleScan)
@@ -440,6 +443,35 @@ func (s *Server) putMax(key string, value []byte, epoch uint64) error {
 // swap stores a value and returns the one it replaced.
 func (s *Server) swap(key string, value []byte) ([]byte, error) {
 	return s.applyValue(Command{Type: CommandSwap, Key: []byte(key), Value: value})
+}
+
+// txn proposes a conditional transaction. A not-leader error means raft
+// appended nothing; every other error leaves the outcome unknown.
+func (s *Server) txn(checks []TxnCheck, writes []TxnWrite) (TxnResult, error) {
+	if s.raft.State() != raft.Leader {
+		return TxnResult{}, ErrNotLeader
+	}
+	data, err := json.Marshal(Command{Type: CommandTxn, Checks: checks, Writes: writes})
+	if err != nil {
+		return TxnResult{}, fmt.Errorf("marshal command: %w", err)
+	}
+
+	future := s.raft.Apply(data, applyTimeout)
+	if err := future.Error(); err != nil {
+		// raft answers ErrNotLeader only for an entry it never appended.
+		if errors.Is(err, raft.ErrNotLeader) {
+			return TxnResult{}, ErrNotLeader
+		}
+		return TxnResult{}, fmt.Errorf("raft apply failed: %w", err)
+	}
+	switch response := future.Response().(type) {
+	case TxnResult:
+		return response, nil
+	case error:
+		return TxnResult{}, response
+	default:
+		return TxnResult{}, fmt.Errorf("unexpected transaction response %T", response)
+	}
 }
 
 // delete removes a key through raft consensus.

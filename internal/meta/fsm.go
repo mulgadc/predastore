@@ -29,6 +29,9 @@ const (
 	// learns what it superseded. Appended rather than inserted: these numbers
 	// are on disk in every existing log.
 	CommandSwap
+	// CommandTxn applies its writes only if every one of its checks holds,
+	// and publishes all of them or none.
+	CommandTxn
 )
 
 // Command represents a database operation that goes through Raft.
@@ -37,6 +40,71 @@ type Command struct {
 	Key   []byte      `json:"key"` // []byte for safe JSON base64 encoding of binary keys
 	Value []byte      `json:"value,omitempty"`
 	Epoch uint64      `json:"epoch,omitempty"`
+	// Checks and Writes are the body of a CommandTxn; other commands leave
+	// them empty, so their encoding is unchanged.
+	Checks []TxnCheck `json:"checks,omitempty"`
+	Writes []TxnWrite `json:"writes,omitempty"`
+}
+
+// TxnCheck is one precondition of a transaction: Key holds exactly Value, or,
+// with Absent set, Key holds nothing. An empty Value without Absent requires
+// the key to be present with an empty value.
+type TxnCheck struct {
+	Key    []byte `json:"key"`
+	Value  []byte `json:"value,omitempty"`
+	Absent bool   `json:"absent,omitempty"`
+}
+
+// TxnWrite is one write of a transaction: Key is set to Value, or, with
+// Delete set, removed.
+type TxnWrite struct {
+	Key    []byte `json:"key"`
+	Value  []byte `json:"value,omitempty"`
+	Delete bool   `json:"delete,omitempty"`
+}
+
+// TxnValue is what a checked key held when a transaction was evaluated.
+// Exists is false for an absent key, which then has no Value.
+type TxnValue struct {
+	Key    []byte `json:"key"`
+	Value  []byte `json:"value,omitempty"`
+	Exists bool   `json:"exists,omitempty"`
+}
+
+// TxnResult is the FSM's answer to a CommandTxn it evaluated. On a mismatch,
+// Current holds one entry per check, in check order.
+type TxnResult struct {
+	Applied bool
+	Current []TxnValue
+}
+
+// ErrInvalidTxn reports a transaction that no store could apply as written.
+var ErrInvalidTxn = errors.New("invalid meta transaction")
+
+// ValidateTxn rejects a transaction whose checks or writes are malformed. The
+// FSM, the server and the client run the same rules, so a replica never
+// learns of a malformed transaction that the client could have refused.
+func ValidateTxn(checks []TxnCheck, writes []TxnWrite) error {
+	if len(writes) == 0 {
+		return fmt.Errorf("%w: no writes", ErrInvalidTxn)
+	}
+	for i, c := range checks {
+		if len(c.Key) == 0 {
+			return fmt.Errorf("%w: check %d has no key", ErrInvalidTxn, i)
+		}
+		if c.Absent && len(c.Value) > 0 {
+			return fmt.Errorf("%w: check %d requires both absence and a value", ErrInvalidTxn, i)
+		}
+	}
+	for i, w := range writes {
+		if len(w.Key) == 0 {
+			return fmt.Errorf("%w: write %d has no key", ErrInvalidTxn, i)
+		}
+		if w.Delete && len(w.Value) > 0 {
+			return fmt.Errorf("%w: write %d is both a delete and a put", ErrInvalidTxn, i)
+		}
+	}
+	return nil
 }
 
 // FSM implements raft.FSM interface backed by Badger.
@@ -124,14 +192,16 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	txn := f.db.NewTransaction(true)
-	commit := func() {
+	commitOrStop := func(txn *badger.Txn) {
 		if err := f.commitBatch(txn); err != nil {
 			//nolint:forbidigo // A part-applied commit cannot be answered; restart rebuilds the store from the log.
 			panic(fmt.Sprintf("meta: committing applied entries %d-%d failed; stopping so the log rebuilds the store: %v",
 				logs[0].Index, logs[len(logs)-1].Index, err))
 		}
 	}
+	txn := f.db.NewTransaction(true)
+	staged := false
+	commit := func() { commitOrStop(txn) }
 
 	for i, log := range logs {
 		if log.Type != raft.LogCommand {
@@ -142,6 +212,20 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 			responses[i] = fmt.Errorf("failed to unmarshal command: %w", err)
 			continue
 		}
+		if cmd.Type == CommandTxn {
+			// The batch transaction ends before the command and the next one
+			// starts after it, so the command reads the entries before it and
+			// the entries after it read the command's writes.
+			if staged {
+				commit()
+			} else {
+				txn.Discard()
+			}
+			responses[i] = f.applyTxn(cmd, commitOrStop)
+			txn, staged = f.db.NewTransaction(true), false
+			continue
+		}
+		staged = true
 		resp, err := applyCommand(txn, cmd)
 		if errors.Is(err, badger.ErrTxnTooBig) {
 			commit()
@@ -158,6 +242,64 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 	f.applied.Store(logs[len(logs)-1].Index)
 
 	return responses
+}
+
+// applyTxn evaluates a CommandTxn in a badger transaction of its own. It
+// commits only when every check holds and every write stages; otherwise it
+// discards the transaction, so no write of the command is published.
+func (f *FSM) applyTxn(cmd Command, commit func(*badger.Txn)) any {
+	if err := ValidateTxn(cmd.Checks, cmd.Writes); err != nil {
+		return err
+	}
+	txn := f.db.NewTransaction(true)
+	result, err := stageTxn(txn, cmd)
+	if err != nil || !result.Applied {
+		txn.Discard()
+		if err != nil {
+			return fmt.Errorf("meta transaction not applied: %w", err)
+		}
+		return result
+	}
+	commit(txn)
+	return result
+}
+
+// stageTxn reads every checked key, then stages the writes only if all the
+// checks hold. The result depends on the store and the command alone.
+func stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
+	current := make([]TxnValue, len(cmd.Checks))
+	holds := true
+	for i, check := range cmd.Checks {
+		current[i] = TxnValue{Key: check.Key}
+		switch item, err := txn.Get(check.Key); {
+		case err == nil:
+			value, err := item.ValueCopy(nil)
+			if err != nil {
+				return TxnResult{}, err
+			}
+			current[i].Value, current[i].Exists = value, true
+			holds = holds && !check.Absent && bytes.Equal(value, check.Value)
+		case errors.Is(err, badger.ErrKeyNotFound):
+			holds = holds && check.Absent
+		default:
+			return TxnResult{}, err
+		}
+	}
+	if !holds {
+		return TxnResult{Current: current}, nil
+	}
+	for _, w := range cmd.Writes {
+		var err error
+		if w.Delete {
+			err = txn.Delete(w.Key)
+		} else {
+			err = txn.Set(w.Key, w.Value)
+		}
+		if err != nil {
+			return TxnResult{}, err
+		}
+	}
+	return TxnResult{Applied: true}, nil
 }
 
 // applyCommand stages one command in txn and returns its response: the

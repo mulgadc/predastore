@@ -473,6 +473,86 @@ func (c *Client) Swap(ctx context.Context, key string, value []byte) (previous [
 	return c.writeValue(ctx, OpMetaSwap, request(key, 0), value)
 }
 
+// TxnOutcome is how a conditional transaction ended, as far as the client can
+// know. The zero value is TxnUnknown, so an unset outcome is never read as a
+// definite one.
+type TxnOutcome int
+
+const (
+	// TxnUnknown: the request left the client and no answer proves whether
+	// it applied. Only the log can tell.
+	TxnUnknown TxnOutcome = iota
+	// TxnApplied: every check held and every write is published.
+	TxnApplied
+	// TxnMismatch: a check failed and no write is published.
+	TxnMismatch
+	// TxnRefused: nothing was proposed, so nothing can apply.
+	TxnRefused
+)
+
+// ErrTxnRefused wraps the error of a transaction that was never proposed.
+var ErrTxnRefused = errors.New("meta transaction refused")
+
+// ErrTxnUnknown wraps the error of a transaction whose outcome is unknown.
+var ErrTxnUnknown = errors.New("meta transaction outcome unknown")
+
+// Txn applies writes through the leader only if every check holds. It sends at
+// most once, moving to another replica only when a stream never opened, and
+// answers refused or unknown with an error wrapping ErrTxnRefused or ErrTxnUnknown.
+func (c *Client) Txn(ctx context.Context, checks []TxnCheck, writes []TxnWrite) (outcome TxnOutcome, current []TxnValue, err error) {
+	defer observeOp(ctx, telemetry.MetaOpTxn, time.Now(), &err)
+
+	if err := ValidateTxn(checks, writes); err != nil {
+		return TxnRefused, nil, fmt.Errorf("%w: %w", ErrTxnRefused, err)
+	}
+	body, err := json.Marshal(TxnRequest{Checks: checks, Writes: writes})
+	if err != nil {
+		return TxnRefused, nil, fmt.Errorf("%w: encode: %w", ErrTxnRefused, err)
+	}
+
+	var lastErr error
+	for _, target := range c.readOrder() {
+		resp, err := c.call(ctx, target, OpMetaTxn, &MetaRequest{}, body)
+		if errors.Is(err, ErrUndelivered) {
+			lastErr = err
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
+		if err != nil {
+			return TxnUnknown, nil, fmt.Errorf("%w: %w", ErrTxnUnknown, err)
+		}
+		return c.txnAnswer(target, resp)
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no replica to send to")
+	}
+	return TxnRefused, nil, fmt.Errorf("%w: %w", ErrTxnRefused, lastErr)
+}
+
+// txnAnswer maps one replica's answer onto an outcome. Any error envelope
+// other than a refusal may follow a proposal, so it is unknown.
+func (c *Client) txnAnswer(target config.NodeID, resp *MetaResponse) (TxnOutcome, []TxnValue, error) {
+	switch {
+	case resp.Err == "" && resp.Mismatch:
+		c.cacheLeader(target)
+		return TxnMismatch, resp.Current, nil
+	case resp.Err == "":
+		c.cacheLeader(target)
+		return TxnApplied, nil, nil
+	case resp.Err == ErrCodeNotLeader:
+		if id, perr := ParseRaftAddress(resp.Leader); perr == nil {
+			c.cacheLeader(id)
+		}
+		return TxnRefused, nil, fmt.Errorf("%w: replica %d: %w", ErrTxnRefused, target, ErrNotLeader)
+	case resp.Err == ErrCodeInvalid:
+		return TxnRefused, nil, fmt.Errorf("%w: replica %d: %s", ErrTxnRefused, target, resp.Err)
+	default:
+		return TxnUnknown, nil, fmt.Errorf("%w: replica %d: %s", ErrTxnUnknown, target, resp.Err)
+	}
+}
+
 // Delete removes a key through the leader.
 func (c *Client) Delete(ctx context.Context, key string) (err error) {
 	defer observeOp(ctx, telemetry.MetaOpDelete, time.Now(), &err)
