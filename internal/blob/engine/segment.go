@@ -247,17 +247,6 @@ func (seg *segment) appendIdx(e idxEntry) error {
 	return nil
 }
 
-func (seg *segment) appendPrepareAllocation(e idxEntry, epoch uint64, size int64) error {
-	var rows [2 * idxEntrySize]byte
-	copy(rows[:idxEntrySize], e.encode())
-	prepareRecord{off: e.Off, epoch: epoch, size: size}.encode(rows[idxEntrySize:])
-	if _, err := seg.idx.WriteAt(rows[:], seg.idxSize); err != nil {
-		return err
-	}
-	seg.idxSize += int64(len(rows))
-	return nil
-}
-
 func (seg *segment) syncIdx() error { return seg.idx.Sync() }
 
 // detachSegment takes a drained segment out of service so it can be unlinked

@@ -141,6 +141,19 @@ func (w *writer) Close() (err error) {
 		return fmt.Errorf("sync segment %d: %w", w.ext.SegNum, err)
 	}
 
+	// Write the recovery record only after the payload sync.
+	w.store.mutex.Lock()
+	var row [idxEntrySize]byte
+	prepareRecord{off: w.ext.Off, epoch: w.epoch, size: w.ext.LSize}.encode(row[:])
+	_, err = w.seg.idx.WriteAt(row[:], w.seg.idxSize)
+	if err == nil {
+		w.seg.idxSize += idxEntrySize
+	}
+	w.store.mutex.Unlock()
+	if err != nil {
+		return fmt.Errorf("append prepare record: %w", err)
+	}
+
 	// The .idx row must be durable before the index commit: it is compaction's
 	// only enumeration source, so every index-committed extent must already be
 	// findable in .idx or a drop could lose a live extent.
