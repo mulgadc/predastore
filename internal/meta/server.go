@@ -161,9 +161,7 @@ func (s *Server) open() (*rpc.Server, error) {
 	rpc.RegisterHandler(mux, OpMetaGet, s.handleGet)
 	rpc.RegisterHandler(mux, OpMetaPut, s.handlePut)
 	rpc.RegisterHandler(mux, OpMetaSwap, s.handleSwap)
-	if s.cfg.serveTxn {
-		rpc.RegisterHandler(mux, OpMetaTxn, s.handleTxn)
-	}
+	rpc.RegisterHandler(mux, OpMetaTxn, s.handleTxn)
 	rpc.RegisterHandler(mux, OpMetaPutMax, s.handlePutMax)
 	rpc.RegisterHandler(mux, OpMetaDelete, s.handleDelete)
 	rpc.RegisterHandler(mux, OpMetaScan, s.handleScan)

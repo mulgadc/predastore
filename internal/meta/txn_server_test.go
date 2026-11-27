@@ -16,7 +16,7 @@ import (
 // then mismatches with the value the first one wrote, and the store keeps
 // the first transaction's writes only.
 func TestTxnThroughTheLeader(t *testing.T) {
-	cli := startStatusReplica(t, true, meta.ServeTxn)
+	cli := startStatusReplica(t, true)
 	ctx := t.Context()
 	require.Eventually(t, func() bool {
 		st, err := cli.Status(ctx, 1)
@@ -52,7 +52,7 @@ func TestTxnThroughTheLeader(t *testing.T) {
 
 // A replica with no leader refuses before it proposes anything.
 func TestTxnIsRefusedWithoutALeader(t *testing.T) {
-	cli := startStatusReplica(t, false, meta.ServeTxn)
+	cli := startStatusReplica(t, false)
 
 	outcome, _, err := cli.Txn(t.Context(),
 		[]meta.TxnCheck{{Key: []byte("objects/k"), Absent: true}},
@@ -65,36 +65,6 @@ func TestTxnIsRefusedWithoutALeader(t *testing.T) {
 	_, err = cli.Get(t.Context(), "objects/k")
 	assert.ErrorIs(t, err, meta.ErrNotFound)
 }
-
-// A production replica does not serve OpMetaTxn, so no request can append a
-// CommandTxn: the log does not grow and the key stays absent.
-func TestAProductionReplicaRefusesTxn(t *testing.T) {
-	cli := startStatusReplica(t, true)
-	ctx := t.Context()
-	require.Eventually(t, func() bool {
-		st, err := cli.Status(ctx, 1)
-		return err == nil && st.IsLeader
-	}, 5*time.Second, 20*time.Millisecond, "replica never became leader")
-	// A leader read waits out the new term's first entry, so the log is still.
-	_, err := cli.LeaderGet(ctx, "objects/k")
-	require.ErrorIs(t, err, meta.ErrNotFound)
-	before, err := cli.Status(ctx, 1)
-	require.NoError(t, err)
-
-	outcome, _, err := cli.Txn(ctx,
-		[]meta.TxnCheck{{Key: []byte("objects/k"), Absent: true}},
-		[]meta.TxnWrite{{Key: []byte("objects/k"), Value: []byte("gen-1")}})
-
-	require.Error(t, err)
-	assert.NotEqual(t, meta.TxnApplied, outcome)
-	assert.NotEqual(t, meta.TxnMismatch, outcome)
-	after, err := cli.Status(ctx, 1)
-	require.NoError(t, err)
-	assert.Equal(t, before.CommitIndex, after.CommitIndex, "the refused transaction reached the log")
-	_, err = cli.LeaderGet(ctx, "objects/k")
-	assert.ErrorIs(t, err, meta.ErrNotFound)
-}
-
 func txnBody(t *testing.T, checks []meta.TxnCheck, writes []meta.TxnWrite) []byte {
 	t.Helper()
 	body, err := json.Marshal(meta.TxnRequest{Checks: checks, Writes: writes})
@@ -113,7 +83,7 @@ func paddedTxnBody(t *testing.T, writes []meta.TxnWrite, size int) []byte {
 
 func startTxnLeader(t *testing.T) *meta.Client {
 	t.Helper()
-	cli := startStatusReplica(t, true, meta.ServeTxn)
+	cli := startStatusReplica(t, true)
 	require.Eventually(t, func() bool {
 		st, err := cli.Status(t.Context(), 1)
 		return err == nil && st.IsLeader
@@ -180,7 +150,7 @@ func TestTxnOverALimitIsRefusedWithoutALogAppend(t *testing.T) {
 
 // The client refuses an oversized transaction itself, so no replica sees it.
 func TestClientTxn_AnOversizedTransactionIsRefusedBeforeSending(t *testing.T) {
-	cli := startStatusReplica(t, true, meta.ServeTxn)
+	cli := startStatusReplica(t, true)
 
 	outcome, _, err := cli.Txn(t.Context(), nil, []meta.TxnWrite{
 		{Key: []byte("objects/k"), Value: bytes.Repeat([]byte{'v'}, meta.MaxTxnBodyBytes)},

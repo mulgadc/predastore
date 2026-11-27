@@ -51,7 +51,6 @@ func startReplayReplica(t *testing.T, dataDir string, bootstrap bool) (*meta.Cli
 		LeaderLeaseTimeout: 50 * time.Millisecond,
 		CommitTimeout:      5 * time.Millisecond,
 	}
-	meta.ServeTxn(&metaCfg)
 	svc, err := meta.New(metaCfg)
 	require.NoError(t, err)
 
