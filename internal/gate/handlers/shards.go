@@ -988,8 +988,8 @@ func deleteObject(ctx context.Context, bc BlobClient, bucket, key string, object
 	})
 }
 
-// deletePartShards removes every generation of a multipart part's shards. A
-// part hash belongs to one upload, so no later write can share its positions.
+// deletePartShards removes every generation of a multipart part's shards. An
+// object at the part's hidden key shares the hash, so it loses its shards too.
 func deletePartShards(ctx context.Context, bc BlobClient, bucket, key string, partHash [32]byte, place ObjectToShardNodes) error {
 	return fanOutDelete(ctx, bucket, key, place, func(node config.NodeID, index uint32) (*blob.DeleteResponse, error) {
 		return bc.Delete(ctx, node, blob.DeleteRequest{Key: partHash, Index: index})
