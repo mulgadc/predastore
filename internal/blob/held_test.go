@@ -196,6 +196,45 @@ func TestGetServesARetainedEpochWithNoLiveRow(t *testing.T) {
 	assert.Equal(t, first, got)
 }
 
+func TestGetServesReleasedDeferredEpochAboveLiveEpoch(t *testing.T) {
+	dir := t.TempDir()
+	aead := storetest.TestAEAD()
+	es, err := engine.Open(dir, engine.WithAEAD(aead), engine.WithFreeSpaceWatermark(0, 0))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = es.Close() })
+	first := []byte("surviving older index row")
+	second := []byte("released generation needed by a reader")
+	for i, body := range [][]byte{first, second} {
+		w, err := es.Append(epochKey(), epochTestShardIndex, int64(len(body)), uint64(i+1))
+		require.NoError(t, err)
+		_, err = w.Write(body)
+		require.NoError(t, err)
+		require.NoError(t, w.Close())
+		if i == 0 {
+			_, err = es.Commit(epochKey(), epochTestShardIndex, 1)
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, es.Close())
+
+	recovered, err := engine.Open(dir, engine.WithAEAD(aead),
+		engine.WithStartupPrepareRecovery(t.Context(), func(context.Context, [32]byte, uint32, uint64) (bool, error) {
+			return false, nil
+		}))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = recovered.Close() })
+	c := startStoreNode(t, recovered)
+	require.NoError(t, c.Release(t.Context(), epochServerNode, blob.ReleaseRequest{
+		Key: epochKey(), Index: epochTestShardIndex, Epoch: 2,
+	}))
+	got, err := get(t, c, 2)
+	require.NoError(t, err)
+	require.Equal(t, second, got)
+	stat, err := c.Stat(t.Context(), epochServerNode, blob.StatRequest{Key: epochKey(), Index: epochTestShardIndex})
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), stat.Epoch)
+}
+
 // A row written before epochs carries epoch zero, and DeleteEpoch at zero is
 // how a delete reclaims it. It leaves a later generation at another position.
 func TestDeleteEpochZeroReclaimsAPreEpochRow(t *testing.T) {

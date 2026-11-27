@@ -978,8 +978,7 @@ func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
 
 // ReleaseGeneration marks one superseded generation of a shard position as
 // finished with, named by the epoch that wrote it. It reaches only the
-// retained namespace, so it cannot touch the generation the node is serving
-// however stale the caller's idea of that is.
+// retained namespace and deferred recovery extents, leaving the live row alone.
 //
 // It records the release rather than dropping the generation, and the sweep
 // reclaims it once the grace window has passed. A reader that resolved the old
@@ -988,30 +987,46 @@ func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
 // routine failed read. The delay is what keeps that reader whole; the release
 // is what makes the generation reclaimable at all.
 func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) error {
+	recovery := prepareRecoveryKey{key: key, index: index, epoch: epoch}
 	store.mutex.Lock()
-	closed := store.closed
-	store.mutex.Unlock()
-	if closed {
+	if store.closed {
+		store.mutex.Unlock()
 		return ErrClosedStore
 	}
+	ext, deferred := store.deferredPrepares[recovery.shard()][epoch]
+	if deferred {
+		defer store.mutex.Unlock()
+	} else {
+		store.mutex.Unlock()
+	}
 
-	rowKey := retainedKey(MakeKey(key, index), epoch)
+	idxKey := MakeKey(key, index)
+	rowKey := retainedKey(idxKey, epoch)
 	for {
 		err := store.index.Update(func(txn *badger.Txn) error {
 			raw, err := readRaw(txn, rowKey)
 			if errors.Is(err, badger.ErrKeyNotFound) {
-				// Already reclaimed, which is the outcome the caller wanted.
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			_, held, err := decodeIndexValue(raw)
-			if err != nil {
-				return fmt.Errorf("decode retained row: %w", err)
-			}
-			if held != epoch {
-				return nil
+				if !deferred {
+					return nil
+				}
+				retained, err := retainReleasedPrepare(txn, idxKey, rowKey, epoch, ext)
+				if err != nil || !retained {
+					return err
+				}
+			} else {
+				if err != nil {
+					return err
+				}
+				_, held, err := decodeIndexValue(raw)
+				if err != nil {
+					return fmt.Errorf("decode retained row: %w", err)
+				}
+				if held != epoch {
+					if deferred {
+						return fmt.Errorf("%w: retained row has a different epoch", ErrIntegrity)
+					}
+					return nil
+				}
 			}
 
 			return txn.Set(releasedKeyFor(rowKey), encodeReleasedValue(time.Now().UnixNano()))
@@ -1022,9 +1037,39 @@ func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) 
 		if err != nil {
 			return fmt.Errorf("release generation: %w", err)
 		}
-
+		if deferred {
+			store.removeDeferredPrepareLocked(recovery)
+		}
 		return nil
 	}
+}
+
+// retainReleasedPrepare installs the deferred extent in the ordinary grace
+// window. The prepared row and retained row must never name the same extent.
+func retainReleasedPrepare(txn *badger.Txn, idxKey, rowKey []byte, epoch uint64, ext extent) (bool, error) {
+	_, live, err := readIndexValue(txn, idxKey)
+	if err == nil && live == epoch {
+		return false, nil
+	}
+	if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+		return false, err
+	}
+	if _, err := txn.Get(tombstoneKey(ext.SegNum, ext.Off)); !errors.Is(err, badger.ErrKeyNotFound) {
+		return false, err
+	}
+	prepKey := preparedKey(idxKey, epoch)
+	prepared, _, err := readIndexValue(txn, prepKey)
+	if err == nil {
+		if prepared != ext {
+			return false, ErrNotPrepared
+		}
+		if err := txn.Delete(prepKey); err != nil {
+			return false, err
+		}
+	} else if !errors.Is(err, badger.ErrKeyNotFound) {
+		return false, err
+	}
+	return true, txn.Set(rowKey, encodePreparedValue(ext, epoch, retainedHoldStamp))
 }
 
 // Delete removes a key's index entry and tombstones its extent, in one

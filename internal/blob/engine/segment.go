@@ -71,21 +71,22 @@ type prepareRecord struct {
 }
 
 func (r prepareRecord) encode(row []byte) {
-	binary.BigEndian.PutUint64(row[:8], ^uint64(r.off))
+	binary.BigEndian.PutUint64(row[:8], ^uint64(r.off)) //nolint:gosec // Allocations have nonnegative offsets.
 	binary.BigEndian.PutUint64(row[8:16], r.epoch)
-	binary.BigEndian.PutUint64(row[16:24], uint64(r.size))
+	binary.BigEndian.PutUint64(row[16:24], uint64(r.size)) //nolint:gosec // Append validates the size.
 	copy(row[24:28], "PRE1")
 	binary.BigEndian.PutUint32(row[28:32], crc32.ChecksumIEEE(row[:28]))
 }
 
 func decodePrepareRecord(row []byte) (prepareRecord, bool) {
-	if row[0]&0x80 == 0 || string(row[24:28]) != "PRE1" ||
+	if row[0]&0x80 == 0 || row[16]&0x80 != 0 || string(row[24:28]) != "PRE1" ||
 		binary.BigEndian.Uint32(row[28:32]) != crc32.ChecksumIEEE(row[:28]) {
 		return prepareRecord{}, false
 	}
 	return prepareRecord{
-		off: int64(^binary.BigEndian.Uint64(row[:8])), epoch: binary.BigEndian.Uint64(row[8:16]),
-		size: int64(binary.BigEndian.Uint64(row[16:24])),
+		off:   int64(^binary.BigEndian.Uint64(row[:8])), //nolint:gosec // Inversion clears the sign bit checked above.
+		epoch: binary.BigEndian.Uint64(row[8:16]),
+		size:  int64(binary.BigEndian.Uint64(row[16:24])), //nolint:gosec // The sign bit is clear.
 	}, true
 }
 

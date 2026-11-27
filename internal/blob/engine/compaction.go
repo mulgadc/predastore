@@ -335,6 +335,19 @@ func (store *Store) sweepPrepared(maxAge time.Duration) (int, error) {
 
 	dropped := 0
 	for _, k := range stale {
+		if len(k) == preparedKeySize {
+			shard := prepareRecoveryShard{
+				key:   [32]byte(k[1:33]),
+				index: binary.BigEndian.Uint32(k[33:37]),
+			}
+			epoch := binary.BigEndian.Uint64(k[37:])
+			store.mutex.Lock()
+			_, deferred := store.deferredPrepares[shard][epoch]
+			store.mutex.Unlock()
+			if deferred {
+				continue
+			}
+		}
 		// The row is re-read inside the drop's own transaction, so a commit
 		// that published it between the scan and here simply finds nothing
 		// left to drop rather than losing its extent underneath it.

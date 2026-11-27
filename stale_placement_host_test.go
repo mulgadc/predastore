@@ -203,7 +203,6 @@ func dropRecoveryHostShardRows(t *testing.T, cfg *config.Config, hash [32]byte, 
 			require.NoError(t, db.Close())
 		}
 	}
-
 }
 
 func TestHostRecoversMultipartPartAfterRestart(t *testing.T) {

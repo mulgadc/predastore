@@ -2,11 +2,60 @@ package engine
 
 import (
 	"context"
+	"io"
 	"testing"
+	"time"
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/stretchr/testify/require"
 )
+
+func TestReleaseKeepsDeferredPrepareReadableUntilGrace(t *testing.T) {
+	store, _ := openTestStore(t, WithMaxSegSize(20*KiB))
+	key := [32]byte{1}
+	old := []byte("older live index row")
+	putValue(t, store, key, 0, old)
+	payload := []byte("displaced placement still in use by a reader")
+	epoch := prepareValue(t, store, key, 0, payload)
+	// The prepared row survived, but the index update from Commit did not.
+	require.NoError(t, store.replayRecoveredPrepares(t.Context(), func(context.Context, [32]byte, uint32, uint64) (bool, error) {
+		return false, nil
+	}))
+	recovery := prepareRecoveryKey{key: key, index: 0, epoch: epoch}
+	ext, held := store.deferredPrepares[recovery.shard()][epoch]
+	require.True(t, held)
+	source := ext.SegNum
+	putValue(t, store, [32]byte{2}, 0, []byte("roll to next segment"))
+
+	dropped, err := store.sweepPrepared(-1)
+	require.NoError(t, err)
+	require.Zero(t, dropped, "an old prepared row may still back a delayed placement")
+
+	require.NoError(t, store.ReleaseGeneration(key, 0, epoch))
+	_, held = store.deferredPrepares[recovery.shard()][epoch]
+	require.False(t, held)
+	require.Equal(t, old, readValue(t, store, key, 0))
+	dropped, err = store.sweepRetained(time.Hour)
+	require.NoError(t, err)
+	require.Zero(t, dropped)
+	reader, err := store.LookupAt(key, 0, epoch)
+	require.NoError(t, err)
+	got, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+	require.Equal(t, payload, got)
+
+	dropped, err = store.sweepRetained(-1)
+	require.NoError(t, err)
+	require.Equal(t, 1, dropped)
+	_, err = store.LookupAt(key, 0, epoch)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+	_, err = store.Commit(key, 0, epoch)
+	require.ErrorIs(t, err, ErrNotPrepared)
+	_, err = store.compactSegment(source, nil)
+	require.NoError(t, err)
+	require.Equal(t, old, readValue(t, store, key, 0))
+}
 
 func TestPrepareReplayPreservesExtentUntilLatePlacement(t *testing.T) {
 	store, _ := openTestStore(t, WithMaxSegSize(20*KiB))

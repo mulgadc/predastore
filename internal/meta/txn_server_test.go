@@ -151,17 +151,17 @@ func TestTxnOrdersPlacementAgainstExtentReclamation(t *testing.T) {
 			if reclaimFirst {
 				assert.Equal(t, meta.TxnApplied, reclaim())
 				assert.Equal(t, meta.TxnMismatch, publish())
-				want, err := cli.AuthorityGet(ctx, string(placement))
+				got, err := cli.AuthorityGet(ctx, string(placement))
 				require.NoError(t, err)
-				assert.Equal(t, previous, want)
+				assert.Equal(t, previous, got)
 				return
 			}
 
 			assert.Equal(t, meta.TxnApplied, publish())
 			assert.Equal(t, meta.TxnMismatch, reclaim())
-			want, err := cli.AuthorityGet(ctx, string(placement))
+			got, err := cli.AuthorityGet(ctx, string(placement))
 			require.NoError(t, err)
-			assert.Equal(t, next, want)
+			assert.Equal(t, next, got)
 			_, err = cli.AuthorityGet(ctx, string(fence))
 			require.ErrorIs(t, err, meta.ErrNotFound)
 		})

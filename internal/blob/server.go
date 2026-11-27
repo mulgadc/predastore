@@ -555,6 +555,10 @@ func (s *Server) resolveEpoch(h Request, stale engine.Reader) (engine.Reader, er
 	}
 
 	if _, err := s.store.Commit(h.Key, h.Index, h.Epoch); err != nil {
+		if errors.Is(err, engine.ErrNotPrepared) {
+			// A deferred extent may have been released without becoming live.
+			return s.store.LookupAt(h.Key, h.Index, h.Epoch)
+		}
 		return nil, err
 	}
 	reader, err := s.store.LookupAt(h.Key, h.Index, h.Epoch)
