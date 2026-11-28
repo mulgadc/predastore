@@ -34,6 +34,13 @@ func TestConfigAuthPolicy_ScopedEntryEnforced(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, status)
 	assert.Contains(t, body, "AccessDenied")
 
+	// The bucket check in isolation: the declared action on an undeclared
+	// same-owner bucket, so only the bucket differs from the granted request.
+	status, nextCalled, body = runMiddleware(t, server, signedReq(t, http.MethodGet, "/other-bucket/x", "AKIASCOPE"))
+	assert.False(t, nextCalled, "a GET outside the declared policy must not reach the handler")
+	assert.Equal(t, http.StatusForbidden, status)
+	assert.Contains(t, body, "AccessDenied")
+
 	status, nextCalled, _ = runMiddleware(t, server, signedReq(t, http.MethodGet, "/backup/keys.db", "AKIASCOPE"))
 	assert.True(t, nextCalled, "the declared action on the declared bucket must pass")
 	assert.Equal(t, http.StatusOK, status)
