@@ -3,7 +3,9 @@ package engine
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
@@ -22,7 +24,7 @@ func WithDeferredRetirement(ctx context.Context, age time.Duration, retire func(
 		if age <= 0 {
 			age = preparedMaxAge
 		}
-		store.retirementContext = ctx
+		store.deferredContext = ctx
 		store.retirementAge = age
 		store.retireRecovered = retire
 		return nil
@@ -43,19 +45,19 @@ func encodeDeferredValue(ext extent, epoch uint64, seen time.Time, record prepar
 }
 
 type deferredCandidate struct {
-	shard     prepareRecoveryKey
-	placement string
+	shard  prepareRecoveryKey
+	part   string
+	ext    extent
+	retire bool
 }
 
-// retireDeferredTick bounds the metadata work between regular compaction passes.
-func (store *Store) retireDeferredTick() {
-	if store.retireRecovered == nil {
+// reconcileDeferredTick bounds the metadata work between compaction passes.
+func (store *Store) reconcileDeferredTick(ctx context.Context) {
+	if store.retireRecovered == nil && store.authorizeRecovered == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(store.retirementContext, 2*time.Second)
-	defer cancel()
 	if err := store.sweepDeferred(ctx, store.clock.Now().Add(-store.retirementAge)); err != nil {
-		slog.Debug("deferred shard retirement pass incomplete", "error", err)
+		slog.Debug("deferred shard pass incomplete", "error", err)
 	}
 }
 
@@ -82,7 +84,7 @@ func (store *Store) sweepDeferred(ctx context.Context, cutoff time.Time) error {
 			}
 			item := it.Item()
 			key := item.Key()
-			if len(key) != preparedKeySize || item.ValueSize() != int64(deferredValueSize) {
+			if len(key) != preparedKeySize {
 				it.Next()
 				continue
 			}
@@ -90,23 +92,40 @@ func (store *Store) sweepDeferred(ctx context.Context, cutoff time.Time) error {
 			if err != nil {
 				return err
 			}
-			seen, err := decodePreparedAt(raw[:preparedValueSize])
-			if err != nil || seen > cutoff.UnixNano() {
+			ext, epoch, err := decodeIndexValue(raw)
+			if err != nil || epoch == 0 || epoch != binary.BigEndian.Uint64(key[37:]) {
 				it.Next()
 				continue
 			}
-			candidate := deferredCandidate{shard: prepareRecoveryKey{
-				key:   [32]byte(key[1:33]),
-				index: binary.BigEndian.Uint32(key[33:37]),
-				epoch: binary.BigEndian.Uint64(key[37:]),
-			}}
-			switch raw[preparedValueSize] {
-			case deferredObject:
-				candidate.placement = string(candidate.shard.key[:])
-			case deferredPart:
-				candidate.placement = model.MultipartPlacement(raw[preparedValueSize+1:]).Key()
+			candidate := deferredCandidate{
+				shard: prepareRecoveryKey{
+					key:   [32]byte(key[1:33]),
+					index: binary.BigEndian.Uint32(key[33:37]),
+					epoch: epoch,
+				},
+				ext: ext,
 			}
-			if candidate.placement != "" && candidate.shard.epoch != 0 {
+			if len(raw) == deferredValueSize {
+				seen, err := decodePreparedAt(raw[:preparedValueSize])
+				if err != nil {
+					return err
+				}
+				switch raw[preparedValueSize] {
+				case deferredObject:
+					candidate.retire = seen <= cutoff.UnixNano()
+				case deferredPart:
+					candidate.part = model.MultipartPlacement(raw[preparedValueSize+1:]).Key()
+					if candidate.part == "" {
+						it.Next()
+						continue
+					}
+					candidate.retire = seen <= cutoff.UnixNano()
+				default:
+					it.Next()
+					continue
+				}
+			}
+			if candidate.retire || store.authorizeRecovered != nil {
 				candidates = append(candidates, candidate)
 			}
 			it.Next()
@@ -118,12 +137,31 @@ func (store *Store) sweepDeferred(ctx context.Context, cutoff time.Time) error {
 		return err
 	}
 
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
 	for _, candidate := range candidates {
-		if err := ctx.Err(); err != nil {
+		if err := lookupCtx.Err(); err != nil {
 			return err
 		}
+		named, err := store.deferredNamed(lookupCtx, candidate)
+		if err != nil {
+			continue
+		}
+		if named {
+			// At most one full extent per pass. Other rows remain durable.
+			idxKey := MakeKey(candidate.shard.key, candidate.shard.index)
+			store.retirementCursor = append(deferredKey(idxKey, candidate.shard.epoch), 0)
+			return store.recoverDeferred(ctx, candidate)
+		}
+		if !candidate.retire || store.retireRecovered == nil {
+			continue
+		}
 		shard := candidate.shard
-		retired, err := store.retireRecovered(ctx, candidate.placement, shard.epoch)
+		placement := candidate.part
+		if placement == "" {
+			placement = string(shard.key[:])
+		}
+		retired, err := store.retireRecovered(lookupCtx, placement, shard.epoch)
 		if err != nil || !retired {
 			continue
 		}
@@ -132,4 +170,33 @@ func (store *Store) sweepDeferred(ctx context.Context, cutoff time.Time) error {
 		}
 	}
 	return nil
+}
+
+func (store *Store) deferredNamed(ctx context.Context, candidate deferredCandidate) (bool, error) {
+	shard := candidate.shard
+	if candidate.part != "" && store.startupPartRecovery != nil {
+		return store.startupPartRecovery(ctx, candidate.part, shard.key, shard.index, shard.epoch)
+	}
+	if candidate.part == "" && store.authorizeRecovered != nil {
+		return store.authorizeRecovered(ctx, shard.key, shard.index, shard.epoch)
+	}
+	return false, nil
+}
+
+func (store *Store) recoverDeferred(ctx context.Context, candidate deferredCandidate) error {
+	shard := candidate.shard
+	if err := store.verifyPrepareExtentContext(ctx, shard.key, shard.index, candidate.ext); err != nil {
+		if errors.Is(err, ErrIntegrity) || errors.Is(err, os.ErrNotExist) {
+			slog.WarnContext(ctx, "cannot promote deferred shard", "segment", candidate.ext.SegNum, "offset", candidate.ext.Off, "error", err)
+			return nil
+		}
+		return err
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	named, err := store.deferredNamed(lookupCtx, candidate)
+	if err != nil || !named {
+		return err
+	}
+	return store.publishDeferredPrepare(shard.key, shard.index, shard.epoch, candidate.ext)
 }

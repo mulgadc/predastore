@@ -14,6 +14,8 @@ import (
 	"github.com/dgraph-io/badger/v4"
 )
 
+type prepareAuthority = func(context.Context, [32]byte, uint32, uint64) (bool, error)
+
 type prepareRecoveryKey struct {
 	key   [32]byte
 	index uint32
@@ -37,6 +39,8 @@ func WithStartupPrepareRecovery(
 ) Option {
 	return func(store *Store) error {
 		if authorize != nil {
+			store.authorizeRecovered = authorize
+			store.deferredContext = ctx
 			store.startupRecovery = func(store *Store) error {
 				return store.replayRecoveredPrepares(ctx, authorize)
 			}
@@ -206,7 +210,7 @@ func (store *Store) deferPrepare(ctx context.Context, recovery prepareRecoveryKe
 	})
 }
 
-// LookupRecoveredAt checks current placement before publishing a deferred shard.
+// LookupRecoveredAt checks current placement before opening a deferred shard.
 func (store *Store) LookupRecoveredAt(
 	ctx context.Context, key [32]byte, index uint32, epoch uint64,
 	authorize func(context.Context, [32]byte, uint32, uint64) (bool, error),
@@ -216,10 +220,8 @@ func (store *Store) LookupRecoveredAt(
 	}
 	idxKey := MakeKey(key, index)
 	row := deferredKey(idxKey, epoch)
-	var candidate extent
 	err := store.index.View(func(txn *badger.Txn) error {
-		var err error
-		candidate, _, err = readIndexValue(txn, row)
+		_, err := txn.Get(row)
 		return err
 	})
 	if errors.Is(err, badger.ErrKeyNotFound) {
@@ -235,26 +237,33 @@ func (store *Store) LookupRecoveredAt(
 	if !named {
 		return nil, ErrKeyNotFound
 	}
-	// A durable hold can survive a reopen even when the payload does not.
-	if err := store.verifyPrepareExtent(key, index, candidate); err != nil {
+	r, err := store.lookupReader(row, key, index)
+	if errors.Is(err, ErrKeyNotFound) {
+		// Promotion or release can move the row during the authority check.
+		return store.LookupAt(key, index, epoch)
+	}
+	if err != nil {
 		return nil, err
 	}
-	if err := store.publishDeferredPrepare(key, index, epoch, row, preparedKey(idxKey, epoch)); err != nil {
+	if err := r.openDeferred(epoch); err != nil {
+		_ = r.Close()
 		return nil, err
 	}
-	return store.LookupAt(key, index, epoch)
+	return r, nil
 }
 
-func (store *Store) publishDeferredPrepare(key [32]byte, index uint32, epoch uint64, row, prepared []byte) error {
+func (store *Store) publishDeferredPrepare(key [32]byte, index uint32, epoch uint64, verified extent) error {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 	if store.closed {
 		return ErrClosedStore
 	}
-	if err := store.promoteDeferred(row, prepared); err != nil {
+	idxKey := MakeKey(key, index)
+	promoted, err := store.promoteDeferred(deferredKey(idxKey, epoch), preparedKey(idxKey, epoch), verified)
+	if err != nil || !promoted {
 		return err
 	}
-	_, err := store.Commit(key, index, epoch)
+	_, err = store.Commit(key, index, epoch)
 	if errors.Is(err, ErrNotPrepared) {
 		// A concurrent release can already have moved the epoch to retained.
 		return nil
@@ -262,27 +271,25 @@ func (store *Store) publishDeferredPrepare(key [32]byte, index uint32, epoch uin
 	return err
 }
 
-func (store *Store) promoteDeferred(row, prepared []byte) error {
+func (store *Store) promoteDeferred(row, prepared []byte, verified extent) (bool, error) {
 	for {
+		promoted := false
 		err := store.index.Update(func(txn *badger.Txn) error {
-			raw, err := readRaw(txn, row)
+			ext, epoch, err := readIndexValue(txn, row)
 			if errors.Is(err, badger.ErrKeyNotFound) {
 				return nil
 			}
-			if err != nil {
-				return err
-			}
-			ext, epoch, err := decodeIndexValue(raw)
-			if err != nil {
+			if err != nil || ext != verified {
 				return err
 			}
 			if err := txn.Set(prepared, encodePreparedValue(ext, epoch, retainedHoldStamp)); err != nil {
 				return err
 			}
+			promoted = true
 			return txn.Delete(row)
 		})
 		if !errors.Is(err, badger.ErrConflict) {
-			return err
+			return promoted, err
 		}
 	}
 }
@@ -368,22 +375,29 @@ func (store *Store) stageVerifiedPrepareLocked(key [32]byte, index uint32, epoch
 	}
 }
 
-// verifyPrepareExtent checks the whole extent while holding a segment reference.
-// An allocation record can be on disk even if the body never finished.
-func (store *Store) verifyPrepareExtent(key [32]byte, index uint32, ext extent) error {
+func (ext extent) validatePrepare() error {
 	if ext.Off < segHeaderSize || (ext.Off-segHeaderSize)%totalFragSize != 0 ||
 		ext.LSize < 0 || ext.PSize < 0 || ext.PSize%totalFragSize != 0 {
 		return fmt.Errorf("%w: invalid prepare extent", ErrIntegrity)
 	}
-	count := ext.PSize / totalFragSize
-	if ext.LSize == 0 {
-		if count == 0 {
-			return nil
-		}
-		return fmt.Errorf("%w: nonempty extent for an empty shard", ErrIntegrity)
+	var count int64
+	if ext.LSize != 0 {
+		count = 1 + (ext.LSize-1)/fragBodySize
 	}
-	if count != 1+(ext.LSize-1)/fragBodySize {
+	if ext.PSize/totalFragSize != count {
 		return fmt.Errorf("%w: prepare extent size does not match its fragments", ErrIntegrity)
+	}
+	return nil
+}
+
+func (store *Store) verifyPrepareExtent(key [32]byte, index uint32, ext extent) error {
+	return store.verifyPrepareExtentContext(context.Background(), key, index, ext)
+}
+
+// verifyPrepareExtentContext checks the whole extent while holding a segment reference.
+func (store *Store) verifyPrepareExtentContext(ctx context.Context, key [32]byte, index uint32, ext extent) error {
+	if err := ext.validatePrepare(); err != nil || ext.LSize == 0 {
+		return err
 	}
 
 	store.mutex.Lock()
@@ -410,30 +424,45 @@ func (store *Store) verifyPrepareExtent(key [32]byte, index uint32, ext extent) 
 	}
 
 	var frag fragment
-	var valueNum, firstFrag uint64
-	for i := range count {
+	var anchor prepareFragmentAnchor
+	for i := range ext.PSize / totalFragSize {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		offset := ext.Off + i*totalFragSize
 		if _, err := seg.ReadAt(frag[:], offset); err != nil {
 			return fmt.Errorf("read prepared fragment at %d: %w", offset, err)
 		}
 		if i == 0 {
-			valueNum, firstFrag = frag.valueNum(), frag.fragNum()
-		}
-		if frag.valueNum() != valueNum || frag.fragNum() < firstFrag || frag.fragNum()-firstFrag != uint64(i) {
-			return fmt.Errorf("%w: discontinuous prepared fragments at %d", ErrIntegrity, offset)
+			anchor = prepareFragmentAnchor{value: frag.valueNum(), first: frag.fragNum()}
 		}
 		body, err := frag.open(store.aead, key, index, store.storeID)
 		if err != nil {
 			return fmt.Errorf("open prepared fragment at %d: %w", offset, err)
 		}
-		expected := min(ext.LSize-i*fragBodySize, fragBodySize)
-		var flags fragFlags
-		if i == count-1 {
-			flags = flagEndOfValue
+		if err := anchor.check(&frag, i, ext.LSize, len(body)); err != nil {
+			return fmt.Errorf("prepared fragment at %d: %w", offset, err)
 		}
-		if int64(len(body)) != expected || fragFlags(binary.BigEndian.Uint32(frag[24:28])) != flags {
-			return fmt.Errorf("%w: inconsistent prepared fragment length at %d", ErrIntegrity, offset)
-		}
+	}
+	return nil
+}
+
+type prepareFragmentAnchor struct {
+	value uint64
+	first uint64
+}
+
+func (a prepareFragmentAnchor) check(frag *fragment, index, size int64, bodyLen int) error {
+	if index < 0 || frag.valueNum() != a.value || frag.fragNum() < a.first || frag.fragNum()-a.first != uint64(index) {
+		return fmt.Errorf("%w: discontinuous prepared fragments", ErrIntegrity)
+	}
+	remaining := size - index*fragBodySize
+	var flags fragFlags
+	if remaining <= fragBodySize {
+		flags = flagEndOfValue
+	}
+	if int64(bodyLen) != min(remaining, fragBodySize) || fragFlags(binary.BigEndian.Uint32(frag[24:28])) != flags {
+		return fmt.Errorf("%w: inconsistent prepared fragment length", ErrIntegrity)
 	}
 	return nil
 }

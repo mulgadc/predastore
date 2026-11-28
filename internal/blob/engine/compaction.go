@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -30,8 +31,10 @@ const (
 // WithCompaction is supplied; stopped and joined by Close before segments and
 // the index are drained.
 type compactor struct {
-	store *Store
-	done  chan struct{}
+	store  *Store
+	done   chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// kick requests an out-of-cycle compaction pass. Buffered to 1 so a
 	// non-blocking send never stalls the caller (Append holds store.mutex
@@ -46,7 +49,12 @@ type compactor struct {
 }
 
 func (store *Store) startCompactor() {
-	c := &compactor{store: store, done: make(chan struct{}), kick: make(chan struct{}, 1)}
+	parent := store.deferredContext
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	c := &compactor{store: store, done: make(chan struct{}), kick: make(chan struct{}, 1), ctx: ctx, cancel: cancel}
 	store.compactor = c
 	c.wg.Add(1)
 	slog.Info("compactor started")
@@ -139,7 +147,9 @@ func (store *Store) retainedTick() {
 	} else if orphans > 0 {
 		slog.Debug("dropped orphaned release rows", "count", orphans)
 	}
-	store.retireDeferredTick()
+	if store.compactor != nil {
+		store.reconcileDeferredTick(store.compactor.ctx)
+	}
 }
 
 // kickPending reports whether a compaction kick is waiting for the loop.
@@ -162,6 +172,9 @@ func (store *Store) kickCompaction() {
 }
 
 func (c *compactor) stop() {
+	if c.cancel != nil {
+		c.cancel()
+	}
 	close(c.done)
 	c.wg.Wait()
 	slog.Info("compactor stopped")

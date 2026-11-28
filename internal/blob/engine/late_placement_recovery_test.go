@@ -158,11 +158,18 @@ func TestPrepareReplayPreservesExtentUntilLatePlacement(t *testing.T) {
 	}))
 	_, err = store.compactSegment(source, nil)
 	require.NoError(t, err)
-	r, err := store.LookupRecoveredAt(t.Context(), key, 0, epoch, func(_ context.Context, candidate [32]byte, shard uint32, candidateEpoch uint64) (bool, error) {
+	store.authorizeRecovered = func(_ context.Context, candidate [32]byte, shard uint32, candidateEpoch uint64) (bool, error) {
 		return candidate == key && shard == 0 && candidateEpoch == epoch, nil
-	})
+	}
+	r, err := store.LookupRecoveredAt(t.Context(), key, 0, epoch, store.authorizeRecovered)
 	require.NoError(t, err, "a late-published placement still needs its durable extent")
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
 	require.NoError(t, r.Close())
+	_, err = store.LookupAt(key, 0, epoch)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+	require.NoError(t, store.sweepDeferred(t.Context(), time.Time{}))
 	require.Equal(t, payload, readValue(t, store, key, 0))
 }
 
@@ -306,4 +313,53 @@ func TestDeferredRetirementReclaimsOnlyConfirmedPlacements(t *testing.T) {
 			require.ErrorIs(t, err, ErrKeyNotFound)
 		})
 	}
+}
+
+func TestS8DeferredRangeDoesNotReadUnrequestedFragments(t *testing.T) {
+	store, _ := openTestStore(t, WithMaxSegSize(1*MiB))
+	key := [32]byte{1}
+	payload := make([]byte, 16*fragBodySize)
+	payload[0] = 42
+	epoch := prepareValue(t, store, key, 0, payload)
+	require.NoError(t, store.replayRecoveredPrepares(t.Context(), func(context.Context, [32]byte, uint32, uint64) (bool, error) {
+		return false, nil
+	}))
+
+	var ext extent
+	require.NoError(t, store.index.View(func(txn *badger.Txn) error {
+		var err error
+		ext, _, err = readIndexValue(txn, deferredKey(MakeKey(key, 0), epoch))
+		return err
+	}))
+	seg := store.segCache[ext.SegNum]
+	tail := ext.Off + ext.PSize - 1
+	var original [1]byte
+	_, err := seg.ReadAt(original[:], tail)
+	require.NoError(t, err)
+	_, err = seg.WriteAt([]byte{original[0] ^ 0xff}, tail)
+	require.NoError(t, err)
+
+	named := func(context.Context, [32]byte, uint32, uint64) (bool, error) { return true, nil }
+	r, err := store.LookupRecoveredAt(t.Context(), key, 0, epoch, named)
+	require.NoError(t, err, "the lookup must leave unrelated fragments to background verification")
+	var got [1]byte
+	_, err = r.ReadAt(got[:], 0)
+	require.NoError(t, err)
+	require.Equal(t, payload[0], got[0])
+	_, err = r.ReadAt(got[:], int64(len(payload)-1))
+	require.ErrorIs(t, err, ErrIntegrity)
+	require.NoError(t, r.Close())
+	_, err = store.LookupAt(key, 0, epoch)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	store.authorizeRecovered = named
+	require.NoError(t, store.sweepDeferred(t.Context(), time.Time{}))
+	_, err = store.LookupAt(key, 0, epoch)
+	require.ErrorIs(t, err, ErrKeyNotFound, "background recovery must reject a damaged extent")
+
+	_, err = seg.WriteAt(original[:], tail)
+	require.NoError(t, err)
+	require.NoError(t, store.sweepDeferred(t.Context(), time.Time{}))
+	require.NoError(t, store.sweepDeferred(t.Context(), time.Time{}))
+	require.Equal(t, payload, readValue(t, store, key, 0))
 }

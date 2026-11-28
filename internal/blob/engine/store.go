@@ -71,9 +71,10 @@ type Store struct {
 	retainedMaxAge      time.Duration
 	compactor           *compactor
 	startupRecovery     func(*Store) error
+	authorizeRecovered  prepareAuthority
 	startupPartRecovery func(context.Context, string, [32]byte, uint32, uint64) (bool, error)
 	retireRecovered     func(context.Context, string, uint64) (bool, error)
-	retirementContext   context.Context
+	deferredContext     context.Context
 	retirementAge       time.Duration
 	retirementCursor    []byte
 
@@ -539,6 +540,14 @@ func (store *Store) LookupAt(key [32]byte, index uint32, epoch uint64) (Reader, 
 // wider prepared-shaped value so they can be aged out, and decodeIndexValue
 // takes both widths, so the same open serves either namespace.
 func (store *Store) lookup(rowKey []byte, key [32]byte, index uint32) (Reader, error) {
+	r, err := store.lookupReader(rowKey, key, index)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (store *Store) lookupReader(rowKey []byte, key [32]byte, index uint32) (*reader, error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
