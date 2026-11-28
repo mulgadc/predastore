@@ -26,8 +26,8 @@ func TestAFullSuspectSetAdmitsANewFailure(t *testing.T) {
 }
 
 // Each generation of a position is marked on its own: an older read that
-// fails after a newer one does not replace the newer mark, and clearing one
-// generation, epoch zero included, leaves the others.
+// fails after a newer one does not replace the newer mark, a stat of one
+// generation keeps the others, and clearing one, epoch zero included, too.
 func TestSuspectMarksAreKeptPerGeneration(t *testing.T) {
 	s := newSuspectSet()
 	pos := shardPosition{key: [32]byte{1}, index: 2}
@@ -38,8 +38,8 @@ func TestSuspectMarksAreKeptPerGeneration(t *testing.T) {
 	if !s.suspect(pos, 8) {
 		t.Fatal("an older generation's failure, or a legacy delete, must not clear the live mark")
 	}
-	if s.suspect(pos, 7) {
-		t.Fatal("a stat of the live generation forgets the older one")
+	if !s.suspect(pos, 7) {
+		t.Fatal("a stat of the live generation must keep the older mark: S3 can still serve that generation from the retained row")
 	}
 	s.clearPosition(pos)
 	if s.suspect(pos, 8) || s.len() != 0 {

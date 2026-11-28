@@ -62,6 +62,17 @@ func TestANewStoreVerifiesItsKeyAtOpen(t *testing.T) {
 		t.Fatal("another key must not open the key check")
 	}
 	closeStore(t, st)
+	if st := openStoreIn(t, dir, testAEAD(t)); st.KeyVerified() {
+		t.Fatal("a store that ran under another key may hold shards sealed under it, so it is never verified again")
+	}
+}
+
+// A store that restarts under its own key stays verified.
+func TestAVerifiedStoreStaysVerifiedAcrossARestart(t *testing.T) {
+	dir := t.TempDir()
+	st := openStoreIn(t, dir, testAEAD(t))
+	putValue(t, st, [32]byte{0x77}, 0, bytes.Repeat([]byte("k"), KiB))
+	closeStore(t, st)
 	if st := openStoreIn(t, dir, testAEAD(t)); !st.KeyVerified() {
 		t.Fatal("the store's own key must open the key check after a restart")
 	}
