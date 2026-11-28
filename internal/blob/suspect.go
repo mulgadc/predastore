@@ -86,6 +86,14 @@ func (s *suspectSet) suspect(pos shardPosition, live uint64) bool {
 	return found
 }
 
+// has reports whether one generation of a position is in the set.
+func (s *suspectSet) has(pos shardPosition, epoch uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.entries[pos][epoch]
+	return ok
+}
+
 // clearEpoch forgets one generation of a position.
 func (s *suspectSet) clearEpoch(pos shardPosition, epoch uint64) {
 	s.mu.Lock()

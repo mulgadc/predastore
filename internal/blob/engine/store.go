@@ -349,11 +349,7 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("count segments: %w", err)
 	}
 
-	hasData, err := storeHasData(dir)
-	if err != nil {
-		return nil, fmt.Errorf("read segments: %w", err)
-	}
-	store.keyVerified = openKeyCheck(dir, store.aead, store.storeID, hasData)
+	store.keyVerified = openKeyCheck(dir, store.aead, store.storeID)
 
 	if _, err := store.nextAvailableSegment(); err != nil {
 		return nil, err
@@ -788,6 +784,19 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 			// so a record naming this generation can land after the newer one
 			// has already taken the position, and it has to resolve.
 			case liveErr == nil && liveEpoch > epoch:
+				// A rebuild of a generation already retained replaces that row;
+				// the bytes it held are dead.
+				if prev, err := readRaw(txn, retainedKey(idxKey, epoch)); err == nil {
+					prevExt, _, decErr := decodeIndexValue(prev)
+					if decErr != nil {
+						return fmt.Errorf("decode retained generation: %w", decErr)
+					}
+					if err := txn.Set(tombstoneKey(prevExt.SegNum, prevExt.Off), tombstoneValue(prevExt.PSize)); err != nil {
+						return fmt.Errorf("tombstone replaced retained generation: %w", err)
+					}
+				} else if !errors.Is(err, badger.ErrKeyNotFound) {
+					return err
+				}
 				if err := txn.Set(retainedKey(idxKey, epoch), encodePreparedValue(ext, epoch, retainedHoldStamp)); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
 				}

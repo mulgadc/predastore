@@ -26,7 +26,10 @@ func (s *Service) repairShard(ctx context.Context, t task) (repairRoute, error) 
 	// The node already holds this generation, so publishing or a handoff
 	// copy changes nothing: only bytes rebuilt from peers replace it.
 	if t.replace {
-		if err := s.rebuildShard(ctx, t); err != nil {
+		// A newer live generation makes the commit report superseded, while
+		// the rebuilt bytes replace the retained one the record names; the
+		// read back decides.
+		if err := s.rebuildShard(ctx, t); err != nil && !errors.Is(err, errSuperseded) {
 			return routeRebuild, err
 		}
 		return routeRebuild, s.readBack(ctx, t)

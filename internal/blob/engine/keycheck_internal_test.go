@@ -144,3 +144,38 @@ func TestADamagedKeyCheckLeavesTheStoreServing(t *testing.T) {
 		})
 	}
 }
+
+// A scan that cannot tell whether the store is new leaves repair off and the
+// store serving, and a store with a sealed check does not scan at all.
+func TestASegmentScanThatFailsLeavesTheStoreServing(t *testing.T) {
+	oh := [32]byte{0x76}
+	dir := t.TempDir()
+	st := openStoreIn(t, dir, testAEAD(t))
+	putValue(t, st, oh, 0, bytes.Repeat([]byte("s"), KiB))
+	closeStore(t, st)
+
+	prev := segmentsHoldData
+	scans := 0
+	segmentsHoldData = func(string) (bool, error) {
+		scans++
+		return false, os.ErrPermission
+	}
+	t.Cleanup(func() { segmentsHoldData = prev })
+
+	st = openStoreIn(t, dir, testAEAD(t))
+	if !st.KeyVerified() || scans != 0 {
+		t.Fatalf("a store with a sealed check must not scan its segments: verified %v, scans %d", st.KeyVerified(), scans)
+	}
+	closeStore(t, st)
+
+	if err := os.Remove(filepath.Join(dir, keyCheckFilename)); err != nil {
+		t.Fatal(err)
+	}
+	st = openStoreIn(t, dir, testAEAD(t))
+	if st.KeyVerified() || !tryRead(st, oh) {
+		t.Fatal("a failed scan must leave repair off and the store serving")
+	}
+	if keyCheckExists(t, dir) {
+		t.Fatal("a store that might hold data must not be sealed as new")
+	}
+}

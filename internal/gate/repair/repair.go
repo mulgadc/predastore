@@ -477,12 +477,14 @@ func (s *Service) inspect(
 		s.owned.Add(1)
 
 		held, err := s.cfg.Blob.Stat(ctx, node, blob.StatRequest{
-			Key: hash, Index: uint32(index),
+			Key: hash, Index: uint32(index), Epoch: place.WriteEpoch,
 		})
 		switch {
 		case err == nil && held.Epoch == place.WriteEpoch && !held.Suspect:
 			continue // the node has the generation the record names
-		case err == nil && held.Epoch == place.WriteEpoch:
+		case err == nil && held.Suspect:
+			// The record's generation failed authentication on the node, live
+			// or retained under a newer one, so only a rebuild replaces it.
 			if err := emit(task{hash: hash, index: index, node: node, place: place, replace: true}); err != nil {
 				return err
 			}

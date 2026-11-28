@@ -32,13 +32,28 @@ func keyCheckAAD(storeID uint32) []byte {
 	return binary.BigEndian.AppendUint32([]byte("predastore keycheck v1"), storeID)
 }
 
+// segmentsHoldData reports whether a store directory holds data. A test
+// replaces it to fail the scan.
+var segmentsHoldData = storeHasData
+
 // openKeyCheck reports whether the store's key is verified. Only a new store
 // gets a key check, sealed here; a store that held data before the check
 // existed has none and is never verified. Unreadable evidence never stops the
 // store from opening.
-func openKeyCheck(dir string, aead cipher.AEAD, storeID uint32, hasData bool) bool {
+func openKeyCheck(dir string, aead cipher.AEAD, storeID uint32) bool {
 	path := filepath.Join(dir, keyCheckFilename)
 	raw, err := os.ReadFile(path)
+	hasData := true
+	if errors.Is(err, os.ErrNotExist) {
+		// Only a store with no check needs to know whether it is new. A scan
+		// that cannot tell leaves repair off rather than the store closed.
+		var scanErr error
+		if hasData, scanErr = segmentsHoldData(dir); scanErr != nil {
+			slog.Error("could not tell whether the store is new; integrity failures are not marked for repair",
+				"dir", dir, "error", scanErr)
+			return false
+		}
+	}
 	switch {
 	case errors.Is(err, os.ErrNotExist) && !hasData:
 		if err := writeKeyCheck(dir, aead, storeID); err != nil {
