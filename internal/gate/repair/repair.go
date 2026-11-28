@@ -137,7 +137,7 @@ type Stats struct {
 	// authentication on its node: repair does not replace one.
 	Suspect int64 `json:"suspect"`
 	Failed  int64 `json:"failed"`
-	Pending    int64 `json:"pending"`
+	Pending int64 `json:"pending"`
 	// Deferred counts passes held back: the cluster never became ready, or no
 	// peer of an owed shard answered.
 	Deferred int64 `json:"deferred"`

@@ -545,6 +545,7 @@ func TestARepairPassLeavesASuspectRetainedGenerationInPlace(t *testing.T) {
 // puts counts the puts that reach blob nodes through repair.
 type countingPuts struct {
 	BlobClient
+
 	puts atomic.Int64
 }
 

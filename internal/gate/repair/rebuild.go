@@ -38,7 +38,7 @@ func (s *Service) repairShard(ctx context.Context, t task) (repairRoute, error) 
 	case err == nil:
 		return 0, fmt.Errorf("%w: node=%d index=%d holds %016x under a newer generation",
 			errSuperseded, t.node, t.index, t.place.WriteEpoch)
-	case err != nil && !errors.Is(err, blob.ErrNotPrepared) && !errors.Is(err, blob.ErrOvertakenUnproven):
+	case !errors.Is(err, blob.ErrNotPrepared) && !errors.Is(err, blob.ErrOvertakenUnproven):
 		return 0, fmt.Errorf("publish prepared shard: %w", err)
 	}
 
