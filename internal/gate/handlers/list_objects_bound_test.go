@@ -89,12 +89,16 @@ func (m *fsmMeta) Scan(ctx context.Context, prefix string, limit int) ([]meta.It
 
 // ScanFrom stops at limit as the replica's scan handler does.
 func (m *fsmMeta) ScanFrom(_ context.Context, prefix, after string, limit int) ([]meta.Item, error) {
+	errLimit := errors.New("limit")
 	var items []meta.Item
-	err := m.fsm.ScanFromLimit(prefix, after, limit, func(key string, value []byte) error {
+	err := m.fsm.ScanFrom(prefix, after, func(key string, value []byte) error {
 		items = append(items, meta.Item{Key: key, Value: value})
+		if limit > 0 && len(items) >= limit {
+			return errLimit
+		}
 		return nil
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, errLimit) {
 		return nil, err
 	}
 	return items, nil
