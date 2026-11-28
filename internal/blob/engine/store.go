@@ -354,6 +354,11 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 	if err := store.loadState(); err != nil {
 		return nil, fmt.Errorf("load state: %w", err)
 	}
+	if store.deferredState {
+		if err := store.reserveLegacyStateTemp(); err != nil {
+			return nil, err
+		}
+	}
 
 	// Reserve a fresh window durably before Open returns. On a new data dir this
 	// is also what locks in the generated storeID, before any fragment can be

@@ -14,6 +14,7 @@ import (
 )
 
 const stateFilename = "state.json"
+const legacyStateTemp = stateFilename + ".tmp"
 
 // The header makes engines that only accept the old JSON record refuse Open.
 const deferredStateHeader = "predastore-store-state-v2\n"
@@ -80,7 +81,7 @@ func (store *Store) saveState() (retErr error) {
 		data = append([]byte(deferredStateHeader), data...)
 	}
 
-	tmpPath := filepath.Join(store.dir, stateFilename+".tmp")
+	tmpPath := filepath.Join(store.dir, stateFilename+".next")
 	finalPath := filepath.Join(store.dir, stateFilename)
 
 	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
@@ -127,10 +128,31 @@ func (store *Store) fenceDeferredState() error {
 	if store.deferredState {
 		return nil
 	}
+	if err := store.reserveLegacyStateTemp(); err != nil {
+		return err
+	}
 	store.deferredState = true
 	if err := store.saveState(); err != nil {
 		store.deferredState = false
 		return fmt.Errorf("fence deferred shard state: %w", err)
+	}
+	return nil
+}
+
+// reserveLegacyStateTemp stops an older open that already loaded the counters.
+func (store *Store) reserveLegacyStateTemp() error {
+	path := filepath.Join(store.dir, legacyStateTemp)
+	if err := os.Mkdir(path, 0700); err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("reserve legacy state path: %w", err)
+		}
+		info, statErr := os.Lstat(path)
+		if statErr != nil {
+			return fmt.Errorf("inspect legacy state path: %w", statErr)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("legacy state writer still owns %s: %w", path, err)
+		}
 	}
 	return nil
 }
