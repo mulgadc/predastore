@@ -230,7 +230,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // newCredentialProvider resolves the auth chain: NATS-backed IAM when it is
 // configured, with the config-defined accounts always as the fallback.
 func newCredentialProvider(config Config) (auth.CredentialProvider, error) {
-	configProv := auth.NewConfigProvider(config.Auth)
+	configProv, err := auth.NewConfigProvider(config.Auth)
+	if err != nil {
+		return nil, err
+	}
 
 	if config.IAM == nil {
 		slog.Info("IAM not configured, using config-only auth")

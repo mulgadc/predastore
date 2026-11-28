@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // twoHostCluster is two hosts, each running a gate and two blob nodes, which is
@@ -114,4 +115,24 @@ func TestEveryBlobNodeTakesADistinctCompactionSlot(t *testing.T) {
 	slot, slots := compactionSlot(c, 99)
 	assert.Equal(t, 0, slot)
 	assert.Equal(t, 1, slots)
+}
+
+// The conversion to the gate's entry type must preserve the omitted, empty,
+// and scoped forms of an [[auth]] policy, because the gate's enforcement
+// branches on that distinction.
+func TestAuthEntriesPreservePolicyPresence(t *testing.T) {
+	c := &Config{Auth: []AuthEntry{
+		{AccessKeyID: "A1", SecretAccessKey: "s", AccountID: "000000000001"},
+		{AccessKeyID: "A2", SecretAccessKey: "s", AccountID: "000000000002", Policy: []PolicyRule{}},
+		{AccessKeyID: "A3", SecretAccessKey: "s", AccountID: "000000000003",
+			Policy: []PolicyRule{{Bucket: "backup", Actions: []string{"s3:GetObject"}}}},
+	}}
+
+	entries := authEntries(c)
+	require.Len(t, entries, 3)
+	assert.Nil(t, entries[0].Policy, "omitted stays nil")
+	require.NotNil(t, entries[1].Policy)
+	assert.Empty(t, entries[1].Policy, "explicitly empty stays present and empty")
+	require.NotNil(t, entries[2].Policy)
+	assert.Equal(t, "backup", entries[2].Policy[0].Bucket)
 }

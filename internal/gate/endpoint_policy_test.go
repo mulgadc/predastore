@@ -164,9 +164,11 @@ func policyGate(t *testing.T) (addr string, pki endpointPKI, gate *Server, objec
 	iam, err := auth.NewNATSIAMProvider(&auth.IAMConfig{NATSUrl: ns.ClientURL(), MasterKeyPath: keyPath})
 	require.NoError(t, err)
 	t.Cleanup(iam.Close)
-	creds := auth.NewChainProvider(iam, auth.NewConfigProvider([]auth.Entry{{
+	config, err := auth.NewConfigProvider([]auth.Entry{{
 		AccessKeyID: serviceKey, SecretAccessKey: callerSecret, AccountID: policyAccount,
-	}}))
+	}})
+	require.NoError(t, err)
+	creds := auth.NewChainProvider(iam, config)
 
 	objects = &recordingMeta{fakeMeta: newFakeMeta(t,
 		model.BucketMetadata{Name: "owner-bucket", Region: "ap-southeast-2", AccountID: policyAccount, OwnerID: keyCreator}),

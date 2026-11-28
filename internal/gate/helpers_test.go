@@ -143,17 +143,18 @@ func newAuthTestConfig() Config {
 	return Config{
 		Region: "ap-southeast-2",
 		Buckets: []handlers.BucketConfig{
-			{Name: "test-bucket01", Region: "ap-southeast-2", Public: true},
-			{Name: "private", Region: "ap-southeast-2", Public: false},
-			{Name: "local", Region: "ap-southeast-2", Public: false},
+			{Name: "test-bucket01", Region: "ap-southeast-2", Public: true, AccountID: "000000000002"},
+			{Name: "private", Region: "ap-southeast-2", Public: false, AccountID: "000000000002"},
+			{Name: "local", Region: "ap-southeast-2", Public: false, AccountID: "000000000002"},
 		},
 		Auth: []auth.Entry{
 			{
 				AccessKeyID:     "AKIAIOSFODNN7EXAMPLE",
 				SecretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+				AccountID:       "000000000002",
 				Policy: []auth.PolicyRule{
-					{Bucket: "private", Actions: []string{"s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListAllMyBuckets"}},
-					{Bucket: "local", Actions: []string{"s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListAllMyBuckets"}},
+					{Bucket: "private", Actions: []string{"s3:*"}},
+					{Bucket: "local", Actions: []string{"s3:*"}},
 				},
 			},
 		},

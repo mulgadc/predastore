@@ -113,7 +113,9 @@ func TestProtectedAccount(t *testing.T) {
 
 func TestChainProviderDelegatesAccountChecksToIAM(t *testing.T) {
 	iam := newGateProvider(t, &fakeKV{data: map[string][]byte{gateAccount: accountRecord("TERMINATING")}})
-	chain := NewChainProvider(iam, NewConfigProvider(nil))
+	config, err := NewConfigProvider(nil)
+	require.NoError(t, err)
+	chain := NewChainProvider(iam, config)
 	assert.ErrorIs(t, chain.CheckAccountActive(context.Background(), gateAccount), ErrAccountNotActive)
 }
 

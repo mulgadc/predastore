@@ -169,9 +169,16 @@ func bucketConfigs(c *Config) []handlers.BucketConfig {
 func authEntries(c *Config) []auth.Entry {
 	entries := make([]auth.Entry, len(c.Auth))
 	for i, a := range c.Auth {
-		rules := make([]auth.PolicyRule, len(a.Policy))
-		for j, p := range a.Policy {
-			rules[j] = auth.PolicyRule{Bucket: p.Bucket, Actions: p.Actions}
+		// Preserve nil: an omitted policy must stay nil through the copy (the
+		// unrestricted form), while an explicitly empty list denies all. A
+		// make() of length zero is non-nil and would turn omission into
+		// deny-all.
+		var rules []auth.PolicyRule
+		if a.Policy != nil {
+			rules = make([]auth.PolicyRule, len(a.Policy))
+			for j, p := range a.Policy {
+				rules[j] = auth.PolicyRule{Bucket: p.Bucket, Actions: p.Actions}
+			}
 		}
 		entries[i] = auth.Entry{
 			AccessKeyID:     a.AccessKeyID,

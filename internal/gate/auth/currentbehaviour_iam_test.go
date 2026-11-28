@@ -450,9 +450,10 @@ func TestCurrentBehaviour_PredastorePolicy_IdentityEvaluation(t *testing.T) {
 func TestCurrentBehaviour_PredastoreBootstrap_ConfigShadowsIAM(t *testing.T) {
 	f := auth.NewCharFixture(t, allowAllS3)
 	f.SetKeyStatus("Inactive")
-	config := auth.NewConfigProvider([]auth.Entry{{
+	config, err := auth.NewConfigProvider([]auth.Entry{{
 		AccessKeyID: auth.CharAKID, SecretAccessKey: auth.CharSecret, AccountID: "000000000000",
 	}})
+	require.NoError(t, err)
 	h := charGate(t, auth.NewChainProvider(f.Provider, config))
 
 	// CURRENT: deactivating the key in IAM does not revoke it here, and a
@@ -467,9 +468,10 @@ func TestCurrentBehaviour_PredastoreBootstrap_ConfigIgnoresAccountStatus(t *test
 	f.SetAccountStatus("TERMINATING")
 	// IAM can no longer admit this key, so only the config entry can.
 	f.SetKeyStatus("Inactive")
-	config := auth.NewConfigProvider([]auth.Entry{{
+	config, err := auth.NewConfigProvider([]auth.Entry{{
 		AccessKeyID: auth.CharAKID, SecretAccessKey: auth.CharSecret, AccountID: auth.TestSessionAccount,
 	}})
+	require.NoError(t, err)
 
 	assert.Equal(t, replyOK, headPrivate(t, charGate(t, auth.NewChainProvider(f.Provider, config)), auth.CharAKID, auth.CharSecret))
 }

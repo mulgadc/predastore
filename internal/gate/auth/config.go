@@ -8,7 +8,10 @@ type Entry struct {
 	AccessKeyID     string
 	SecretAccessKey string
 	AccountID       string
-	Policy          []PolicyRule
+	// Policy is presence-tracked by nil-ness: nil means the entry is
+	// unrestricted (the system root key's form), and an empty list denies
+	// everything.
+	Policy []PolicyRule
 }
 
 // Action						Meaning
