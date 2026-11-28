@@ -34,6 +34,8 @@ type PassSummary struct {
 	RepairedStandby int64 `json:"repaired_standby"`
 	RepairedRebuild int64 `json:"repaired_rebuild"`
 	Superseded      int64 `json:"superseded"`
+	// Suspect is the owned positions the pass found suspect and left alone.
+	Suspect int64 `json:"suspect"`
 
 	FailedPeerUnreachable int64 `json:"failed_peer_unreachable"`
 	FailedPeerOtherEpoch  int64 `json:"failed_peer_other_epoch"`
@@ -87,6 +89,7 @@ func (s *Service) summarise(ctx context.Context, before Stats, start time.Time, 
 		RepairedStandby: after.RepairedStandby - before.RepairedStandby,
 		RepairedRebuild: after.RepairedRebuild - before.RepairedRebuild,
 		Superseded:      after.Superseded - before.Superseded,
+		Suspect:         after.Suspect - before.Suspect,
 
 		FailedPeerUnreachable: after.FailedPeerUnreachable - before.FailedPeerUnreachable,
 		FailedPeerOtherEpoch:  after.FailedPeerOtherEpoch - before.FailedPeerOtherEpoch,
@@ -115,6 +118,7 @@ func (s *Service) summarise(ctx context.Context, before Stats, start time.Time, 
 		"repaired_standby", sum.RepairedStandby,
 		"repaired_rebuild", sum.RepairedRebuild,
 		"superseded", sum.Superseded,
+		"suspect", sum.Suspect,
 		"failed_peer_unreachable", sum.FailedPeerUnreachable,
 		"failed_peer_other_epoch", sum.FailedPeerOtherEpoch,
 		"failed_peer_missing", sum.FailedPeerMissing,
@@ -122,6 +126,10 @@ func (s *Service) summarise(ctx context.Context, before Stats, start time.Time, 
 		"remaining", sum.Remaining,
 		"duration_ms", sum.DurationMs)
 
+	if sum.Suspect > 0 {
+		slog.WarnContext(ctx, "Repair left shards that failed authentication in place; suspect-shard repair is off until the cross-node key check lands",
+			"suspect", sum.Suspect)
+	}
 	if sum.OwedStreak >= owedStreakWarning {
 		slog.WarnContext(ctx, "Repair found shards owed on consecutive passes",
 			"consecutive_passes", sum.OwedStreak, "owed", sum.Owed, "remaining", sum.Remaining)

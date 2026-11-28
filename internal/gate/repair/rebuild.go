@@ -23,19 +23,9 @@ import (
 // round trip and no reconstruction, and it is the same forward recovery a read
 // performs, so asking costs nothing when the answer is no.
 func (s *Service) repairShard(ctx context.Context, t task) (repairRoute, error) {
-	// The node already holds this generation, so publishing or a handoff
-	// copy changes nothing: only bytes rebuilt from peers replace it.
-	if t.replace {
-		// A newer live generation makes the commit report superseded, while
-		// the rebuilt bytes replace the retained one the record names; the
-		// read back decides.
-		if err := s.rebuildShard(ctx, t); err != nil && !errors.Is(err, errSuperseded) {
-			return routeRebuild, err
-		}
-		return routeRebuild, s.readBack(ctx, t)
-	}
-	// Superseded means the node has moved past this generation and published
-	// nothing, so nothing was repaired and the other routes still have to run.
+	// Superseded means the node holds this generation under a newer live one,
+	// which reads still resolve to. A rebuild over it would replace bytes
+	// that may be sound under the cluster's key, so it stays as it is.
 	superseded, err := s.cfg.Blob.Commit(ctx, t.node, blob.CommitRequest{
 		Key: t.hash, Index: uint32(t.index), Epoch: t.place.WriteEpoch, //nolint:gosec // G115: bounded by the shard count.
 	})
@@ -45,6 +35,9 @@ func (s *Service) repairShard(ctx context.Context, t task) (repairRoute, error) 
 			"node", t.node, "index", t.index)
 
 		return routeCommit, nil
+	case err == nil:
+		return 0, fmt.Errorf("%w: node=%d index=%d holds %016x under a newer generation",
+			errSuperseded, t.node, t.index, t.place.WriteEpoch)
 	case err != nil && !errors.Is(err, blob.ErrNotPrepared) && !errors.Is(err, blob.ErrOvertakenUnproven):
 		return 0, fmt.Errorf("publish prepared shard: %w", err)
 	}
@@ -56,24 +49,6 @@ func (s *Service) repairShard(ctx context.Context, t task) (repairRoute, error) 
 	}
 
 	return routeRebuild, s.rebuildShard(ctx, t)
-}
-
-// readBack reads a replaced shard from its node in full. The node forgets the
-// failure only once a whole read authenticates; a failed one leaves the shard
-// owed for the next pass.
-func (s *Service) readBack(ctx context.Context, t task) error {
-	body, err := s.cfg.Blob.Get(ctx, t.node, blob.GetRequest{
-		Key: t.hash, Index: uint32(t.index), //nolint:gosec // G115: bounded by the shard count.
-		RangeStart: -1, RangeEnd: -1, Epoch: t.place.WriteEpoch,
-	})
-	if err != nil {
-		return fmt.Errorf("read back replaced shard: %w", err)
-	}
-	defer body.Close()
-	if _, err := io.Copy(io.Discard, body); err != nil {
-		return fmt.Errorf("read back replaced shard: %w", err)
-	}
-	return nil
 }
 
 // errGeometryMismatch reports a record written under another erasure code

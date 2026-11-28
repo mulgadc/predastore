@@ -334,43 +334,15 @@ func (f *s3Fixture) pass(t *testing.T, node config.NodeID) {
 	require.NoError(t, svc.Pass(context.Background()))
 }
 
-// An S3 GET that meets a shard whose bytes fail authentication on its node is
-// answered from the other shards and marks the shard. The node's repair pass
-// rewrites it from its peers and reads it back, which clears the mark.
-func TestARepairPassReplacesAShardThatFailedAuthenticationOnGet(t *testing.T) {
-	f := newS3Fixture(t, 2, 1, 4)
-	target := f.place.DataShardNodes[0]
-	corruptOnlyShard(t, f.nodes.dirs[target])
-
-	f.getAnswersTheObject(t)
-	require.Eventually(t, func() bool { return f.suspect(t, 0) }, 5*time.Second, 5*time.Millisecond,
-		"the GET must mark the shard it could not read")
-
-	f.pass(t, target)
-	assert.Eventually(t, func() bool { return !f.suspect(t, 0) }, 5*time.Second, 5*time.Millisecond,
-		"the pass's own read back must clear the mark")
-
-	got, err := f.nodes.readShard(target, f.hash, 0, f.place.WriteEpoch)
-	require.NoError(t, err, "after the pass the node serves its shard again")
-	assert.Equal(t, f.shards[0], got, "the rewritten shard holds the bytes the PUT stored")
-	for index, node := range f.place.AllNodes()[1:] {
-		got, err := f.nodes.readShard(node, f.hash, index+1, f.place.WriteEpoch)
-		require.NoError(t, err)
-		assert.Equal(t, f.shards[index+1], got, "a healthy shard is left as it was")
-	}
-}
-
-// With two bad shards in an RS(2,2) stripe, the rebuild of one must not stop
-// at the other bad peer: it tries the next peer and rebuilds from the two
+// With a missing shard and a bad peer in an RS(2,2) stripe, the rebuild must
+// not stop at the bad peer: it tries the next peer and rebuilds from the two
 // healthy ones.
 func TestARepairPassRebuildsPastAPeerThatFailsAuthentication(t *testing.T) {
 	f := newS3Fixture(t, 2, 2, 5)
 	target := f.place.DataShardNodes[0]
-	corruptOnlyShard(t, f.nodes.dirs[target])
+	_, err := f.nodes.client.Delete(context.Background(), target, blob.DeleteRequest{Key: f.hash, Index: 0})
+	require.NoError(t, err)
 	corruptOnlyShard(t, f.nodes.dirs[f.place.DataShardNodes[1]])
-
-	f.getAnswersTheObject(t)
-	require.Eventually(t, func() bool { return f.suspect(t, 0) && f.suspect(t, 1) }, 5*time.Second, 5*time.Millisecond)
 
 	f.pass(t, target)
 	got, err := f.nodes.readShard(target, f.hash, 0, f.place.WriteEpoch)
@@ -476,7 +448,7 @@ func TestARebuildRefusesARecordOfAnotherErasureCode(t *testing.T) {
 		DataShards: 3, ParityShards: 1, Workers: 1,
 	})
 	require.NoError(t, err)
-	err = svc.rebuildShard(context.Background(), task{hash: obj.hash, index: 0, node: target, place: obj.place, replace: true})
+	err = svc.rebuildShard(context.Background(), task{hash: obj.hash, index: 0, node: target, place: obj.place})
 	require.ErrorIs(t, err, errGeometryMismatch)
 	assert.Zero(t, c.blob.puts.Load(), "nothing may be written under the wrong code")
 }
@@ -542,8 +514,8 @@ func TestAPeerThatFailsItsBodyDoesNotStopThePass(t *testing.T) {
 
 // A newer writer can commit its shard and stop before it publishes, so S3
 // still reads the generation the record names, now retained. When that shard
-// fails authentication, the pass rebuilds that generation and reads it back.
-func TestARepairPassReplacesACorruptRetainedGenerationS3StillServes(t *testing.T) {
+// fails authentication, the pass reports it and leaves it in place.
+func TestARepairPassLeavesASuspectRetainedGenerationInPlace(t *testing.T) {
 	f := newS3Fixture(t, 2, 1, 4)
 	target := f.place.DataShardNodes[0]
 	ctx := context.Background()
@@ -556,19 +528,18 @@ func TestARepairPassReplacesACorruptRetainedGenerationS3StillServes(t *testing.T
 	corruptOnlyShard(t, f.nodes.dirs[target])
 	f.getAnswersTheObject(t)
 
+	blobs := &countingPuts{BlobClient: f.nodes.client}
 	svc, err := New(Config{
-		Nodes: []config.NodeID{target}, Ring: f.c.ring, Meta: f.mc, Blob: f.nodes.client,
+		Nodes: []config.NodeID{target}, Ring: f.c.ring, Meta: f.mc, Blob: blobs,
 		DataShards: 2, ParityShards: 1, Workers: 1,
 	})
 	require.NoError(t, err)
 	require.NoError(t, svc.Pass(ctx))
 	stats := svc.Stats()
-	assert.Equal(t, int64(1), stats.Repaired, "the retained generation is repaired")
-	assert.Zero(t, stats.Superseded, "a repair of the generation S3 serves is not a superseded write")
-
-	got, err := f.nodes.readShard(target, f.hash, 0, f.place.WriteEpoch)
-	require.NoError(t, err, "the node serves the generation the record names again")
-	assert.Equal(t, f.shards[0], got)
+	assert.Zero(t, blobs.puts.Load(), "no shard may be written over a suspect generation")
+	assert.Zero(t, stats.Repaired)
+	assert.Zero(t, stats.Superseded)
+	assert.Equal(t, int64(1), stats.Suspect, "the pass reports the suspect generation it left")
 }
 
 // puts counts the puts that reach blob nodes through repair.
@@ -602,6 +573,7 @@ func TestARepairPassLeavesASuspectShardInPlace(t *testing.T) {
 
 	assert.Zero(t, blobs.puts.Load(), "no shard may be written over a suspect one")
 	assert.Zero(t, svc.Stats().Repaired)
+	assert.Equal(t, int64(1), svc.Stats().Suspect, "the pass reports the suspect shard it left")
 	assert.True(t, f.suspect(t, 0), "the shard is still reported suspect")
 	_, err = f.nodes.readShard(target, f.hash, 0, f.place.WriteEpoch)
 	assert.Error(t, err, "the suspect shard is left as it was")
