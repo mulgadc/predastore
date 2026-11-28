@@ -133,8 +133,11 @@ type Stats struct {
 	Owed       int64 `json:"owed"`
 	Repaired   int64 `json:"repaired"`
 	Superseded int64 `json:"superseded"`
-	Failed     int64 `json:"failed"`
-	Pending    int64 `json:"pending"`
+	// Suspect counts owned positions left in place because their shard failed
+	// authentication on its node: repair does not replace one.
+	Suspect int64 `json:"suspect"`
+	Failed  int64 `json:"failed"`
+	Pending int64 `json:"pending"`
 	// Deferred counts passes held back: the cluster never became ready, or no
 	// peer of an owed shard answered.
 	Deferred int64 `json:"deferred"`
@@ -167,7 +170,7 @@ type Service struct {
 	readyTimeout time.Duration
 	readyPoll    time.Duration
 
-	passes, scanned, owned, repaired, superseded, failed, pending atomic.Int64
+	passes, scanned, owned, repaired, superseded, suspect, failed, pending atomic.Int64
 
 	deferred, owed atomic.Int64
 
@@ -227,6 +230,7 @@ func (s *Service) Stats() Stats {
 		Owed:       s.owed.Load(),
 		Repaired:   s.repaired.Load(),
 		Superseded: s.superseded.Load(),
+		Suspect:    s.suspect.Load(),
 		Failed:     s.failed.Load(),
 		Pending:    s.pending.Load(),
 		Deferred:   s.deferred.Load(),
@@ -474,11 +478,17 @@ func (s *Service) inspect(
 		s.owned.Add(1)
 
 		held, err := s.cfg.Blob.Stat(ctx, node, blob.StatRequest{
-			Key: hash, Index: uint32(index),
+			Key: hash, Index: uint32(index), Epoch: place.WriteEpoch,
 		})
 		switch {
-		case err == nil && held.Epoch == place.WriteEpoch:
+		case err == nil && held.Epoch == place.WriteEpoch && !held.Suspect:
 			continue // the node has the generation the record names
+		case err == nil && held.Suspect:
+			// The node's key is not confirmed across nodes, so a shard that
+			// fails authentication may be sound under the cluster's key, and
+			// repair leaves it in place, live or retained.
+			s.suspect.Add(1)
+			continue
 		case err != nil && !errors.Is(err, blob.ErrNotFound):
 			// A node that cannot be reached is not a node that owes a shard,
 			// and rebuilding into it would fail anyway. The next pass asks

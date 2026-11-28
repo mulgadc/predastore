@@ -175,6 +175,27 @@ func (s *Server) handleLastKey(ctx context.Context, h MetaRequest, stream transp
 	return respond(stream, &response)
 }
 
+// errScanLimit stops a scan once it holds the rows it was asked for, without
+// surfacing an error to the client.
+var errScanLimit = errors.New("scan limit reached")
+
+// scanItems collects the rows of one scan request. It stops on the row that
+// reaches the limit, so the scan never reads the value of the row after it.
+func (s *Server) scanItems(h MetaRequest) ([]ScanItem, error) {
+	var items []ScanItem
+	err := s.scan(string(h.Key), string(h.After), func(key string, value []byte) error {
+		items = append(items, ScanItem{Key: []byte(key), Value: value})
+		if h.Limit > 0 && len(items) >= h.Limit {
+			return errScanLimit
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errScanLimit) {
+		return nil, err
+	}
+	return items, nil
+}
+
 func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport.Stream) error {
 	if h.Last {
 		return respond(stream, &MetaResponse{Err: "last-key lookup requires a dedicated operation"})
@@ -182,18 +203,8 @@ func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport
 	if refused, err := s.refuseLeaderRead(h, stream); refused {
 		return err
 	}
-	// errScanLimit stops iteration once the limit is reached without
-	// surfacing an error to the client.
-	errScanLimit := errors.New("scan limit reached")
-	var items []ScanItem
-	err := s.scan(string(h.Key), string(h.After), func(key string, value []byte) error {
-		if h.Limit > 0 && len(items) >= h.Limit {
-			return errScanLimit
-		}
-		items = append(items, ScanItem{Key: []byte(key), Value: value})
-		return nil
-	})
-	if err != nil && !errors.Is(err, errScanLimit) {
+	items, err := s.scanItems(h)
+	if err != nil {
 		return respond(stream, &MetaResponse{Err: err.Error()})
 	}
 	return respond(stream, &MetaResponse{Items: items})

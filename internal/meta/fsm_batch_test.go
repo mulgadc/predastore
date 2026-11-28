@@ -58,10 +58,9 @@ func TestFSM_ApplyBatch_RespondsAsSequentialApply(t *testing.T) {
 	assert.Equal(t, uint64(len(cmds)), fsm.applied.Load())
 }
 
-// TestFSM_ApplyBatch_AnswersEachEntryOnItsOwn covers the entries a batch can
-// carry besides good commands: a configuration change, which only the batch
-// path is sent, and commands that cannot be applied. Each gets its own answer
-// and none stops the rest of the batch.
+// TestFSM_ApplyBatch_AnswersEachEntryOnItsOwn covers an entry a batch can
+// carry besides commands: a configuration change, which only the batch path is
+// sent. It gets its own answer and does not stop the rest of the batch.
 func TestFSM_ApplyBatch_AnswersEachEntryOnItsOwn(t *testing.T) {
 	db := newTestDB(t)
 	fsm := NewFSM(db)
@@ -69,9 +68,7 @@ func TestFSM_ApplyBatch_AnswersEachEntryOnItsOwn(t *testing.T) {
 	logs := []*raft.Log{
 		commandLog(t, 1, Command{Type: CommandPut, Key: []byte("before"), Value: []byte("v")}),
 		{Index: 2, Term: 1, Type: raft.LogConfiguration, Data: []byte("not a command")},
-		{Index: 3, Term: 1, Type: raft.LogCommand, Data: []byte("{not json")},
-		commandLog(t, 4, Command{Type: CommandType(200), Key: []byte("k")}),
-		commandLog(t, 5, Command{Type: CommandPut, Key: []byte("after"), Value: []byte("v")}),
+		commandLog(t, 3, Command{Type: CommandPut, Key: []byte("after"), Value: []byte("v")}),
 	}
 
 	got := fsm.ApplyBatch(logs)
@@ -79,14 +76,12 @@ func TestFSM_ApplyBatch_AnswersEachEntryOnItsOwn(t *testing.T) {
 	require.Len(t, got, len(logs))
 	assert.Nil(t, got[0])
 	assert.Nil(t, got[1], "a configuration entry is not a command")
-	assert.ErrorContains(t, got[2].(error), "unmarshal")
-	assert.ErrorContains(t, got[3].(error), "unknown command type")
-	assert.Nil(t, got[4])
+	assert.Nil(t, got[2])
 	for _, key := range []string{"before", "after"} {
 		_, err := dbGet(db, []byte(key))
 		assert.NoError(t, err, "key %s", key)
 	}
-	assert.Equal(t, uint64(5), fsm.applied.Load())
+	assert.Equal(t, uint64(3), fsm.applied.Load())
 }
 
 // TestFSM_ApplyBatch_SplitsATransactionBadgerRefuses fills a batch past what one

@@ -241,7 +241,7 @@ The meta replicas are a plain key-value store. The table taxonomy is the gate's 
 | Key | Value | Purpose |
 |---|---|---|
 | `objects/<32-byte object hash>` | gob `ObjectToShardNodes` | Placement and object size, for retrieval |
-| `objects/arn:aws:s3:::<bucket>/<key>` | the 32-byte object hash | Listing, as one prefix scan per bucket |
+| `objects/arn:aws:s3:::<bucket>/<key>` | the 32-byte object hash | Listing. A page without a delimiter scans from its cursor for at most `max-keys` + 1 rows; a page with a delimiter still scans every row under the prefix |
 | `objects/deleted-epoch:<hex object hash>/<16-hex-digit epoch>/<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record of a failed scoped shard delete, one row for each generation. N writes these rows and reads them. N-1 does not read them |
 | `objects/deleted:<bucket>/<key>`, `objects/deleted:#<hex object hash>/<bucket>/<key>` | gob `DeletedObjectInfo` | Delete record of a failed shard delete from N-1. N-1 writes and reads only these rows. N reads them and does not write them |
 | `objects/part:<uploadID>:<part>` | gob `ObjectToShardNodes` | Placement of an in-flight multipart part |
@@ -299,6 +299,18 @@ A failure to read the store while the FSM evaluates an entry, such as a `Swap` o
 It is not the entry's answer, because another replica can read and apply the same entry, and a later commit would then name an index past an entry that this store does not hold.
 The restart applies the entry again.
 A failed check, a malformed transaction and a refused write are the same on every replica, so they stay answers.
+
+A committed entry that this release cannot read also stops the process: an entry that does not decode, one with no `type` or a `null` type, or one whose type this release does not know.
+A replica that can read the entry applies it, so answering it and moving on would leave the stores different.
+The batch is discarded, so the applied row stays below the entry. Raft does not replay the log at start: it gives the entry to the FSM again once it knows the commit index, which a leader learns only with a quorum of running voters and a follower learns from the leader.
+The panic names the index and the type, and never the key. It states the fault only; the cases below decide the recovery.
+Recovery depends on the cause:
+
+- An entry that a later release reads: upgrade the replica. It applies the entry from its own log, so it needs no snapshot from another replica, but it applies nothing until a quorum of voters runs again. If a quorum stops, the meta plane is down until enough voters to form a quorum run the later release.
+- An entry that only this replica cannot read, because its copy of the log is damaged: rebuild the replica from an empty data directory, as the `node-rebuild` stress scenario does. The leader sends it the log or a snapshot. This needs a healthy quorum.
+- An entry that no release can read: every replica that reaches it stops, the leader included. No procedure passes the entry yet, so the meta plane stays down. A leader on a release before this stop answers such an entry with an error and applies the entries after it, so writes at or after the entry may have been acknowledged; any recovery must keep them.
+
+A replica stop does not make a new command type safe to propose. A new type is proposed only after every voter runs a release that reads it, or under a recorded hard-cutover exception. New semantics take a new command type, never a new field on an old one, because an older replica ignores a field it does not know.
 
 No command writes a key under `\x00raft/`. The FSM, the replica's handlers and the client refuse a put, delete, swap or transaction that names one, and a transaction cannot check one. `Get`, `LeaderGet` and every scan, the empty prefix included, never return the row.
 
@@ -363,7 +375,7 @@ A blob node knows nothing about S3. Its vocabulary is a **key** (32 opaque bytes
 
 A put also reports `PoolNearFull` on success, so callers can back off before a write is ever outright rejected.
 
-**A write is two operations.** `Put` makes the value durable but invisible; `Commit` publishes it and `Abort` discards it. A get names the epoch it wants, and a node holding another generation answers `epoch-mismatch` rather than bytes — see §8. `Stat` answers what generation a node holds without its body, which is what repair asks of every position it owns.
+**A write is two operations.** `Put` makes the value durable but invisible; `Commit` publishes it and `Abort` discards it. A get names the epoch it wants, and a node holding another generation answers `epoch-mismatch` rather than bytes — see §8. `Stat` answers what generation a node holds without its body, which is what repair asks of every position it owns. Its `suspect` flag reports that a read of that generation failed authentication on the node; repair reports such a shard and leaves it in place (see *Repair*).
 
 **A held put** sets `Hold` in its header.
 The node registers the writer in memory and sends a `Registered` envelope before it reads any body byte, and the client sends the body only after that envelope.
@@ -391,6 +403,7 @@ A node that predates it closes the stream with no envelope, which the client rep
 ```
 <data dir>/
 ├── state.json                 # monotonic counters + the data dir's crypto identity
+├── keycheck                   # evidence that the master key is the key that sealed this store
 ├── db/                        # badger: key‖index → extent, plus tombstones
 ├── 0000000000000000.seg       # append-only fragments
 ├── 0000000000000000.idx       # reverse sidecar: what was ever allocated in that segment
@@ -457,6 +470,8 @@ The writer then owns a disjoint byte range. It assembles fragments into an in-me
 Tombstones are keyed by physical slot — `'d'` ‖ big-endian `segNum` ‖ big-endian `off`, 17 bytes — with the dead byte count as the value. Keying by slot rather than by object key is what lets one key die repeatedly: on delete, on overwrite, and on a relocation that lost its race. They only accelerate compaction's candidate selection and are never consulted for correctness.
 
 ### Retained generations
+
+A `Commit` that publishes a prepared row over a live row **at the same epoch** does not demote anything. The live row keeps serving that epoch, so no record can name the bytes it displaces, and the same transaction writes a tombstone for them. A reader that already holds them keeps its segment reference, and compaction does not detach a segment with references. This is the case of a retried write and of a repaired shard.
 
 A `Commit` promotes the new generation and **demotes** the one it replaces to `'r'` ‖ key ‖ index ‖ big-endian epoch, rather than destroying it. Shards are published before the placement record, so a record can name a generation the nodes have already passed, and a demoted generation still answers `LookupAt` for exactly that reason.
 
@@ -658,6 +673,8 @@ A holder that cannot run `DeleteEpoch` keeps its copy, and the return still coun
 
 Before publishing, the record is re-read and the rebuilt shard discarded if the epoch has moved, so a write that lands mid-repair is not demoted to the generation before it. That window is narrowed rather than closed; what survives it is a shard the next read discards and the next pass rebuilds, which is a wasted repair and not a wrong object.
 
+**A shard that fails authentication on a read is reported and left in place.** When a get's body fails its GCM tag, the node records the position and the generation, each generation on its own, in a bounded in-memory set of 4096 entries, and a later `Stat` reports that generation `suspect`. Repair's `Stat` names the record's generation, so a corrupt generation that S3 still serves from the retained row, under a newer live one whose writer has not published, is reported too. A `Stat` reports the mark of the generation it is asked about, or of the live one, and clears no other. A full set evicts its oldest entry, and an evicted shard that is still bad enters again at its next failed read. A whole read that authenticates, a delete, or a `Stat` that finds the position absent clears the entry; a ranged read does not, because it can miss the bad fragment. Repair does not replace a suspect shard on any store until a check across nodes confirms each node's master key (bead `mulga-gb5ve`): under another key every shard fails, and a binary that does not read the key check can seal shards under another key without the check noticing. It counts the suspect positions of each pass in its summary and logs a warning when there are any; an operator who sees one compares that node's key fingerprint with its peers' and checks its disk. Repair also leaves in place a generation the node holds retained under a newer live one, which reads still resolve to, and does not rebuild over it. A peer whose body fails during a rebuild is skipped, and the rebuild tries again from the stripe's other peers; when too few are left, that stripe fails and the pass goes on. A record written under another erasure code than the one repair runs is left alone. The node marks nothing while its store's key is unverified (see *Encryption at rest*). A restart forgets the set; the next failed read finds the shard again.
+
 If fewer than `K` peers hold the record's generation, the rebuild fails and says so. Inventing a shard from a mixture of generations would replace a detectable loss with an undetectable one, which is the defect this whole design exists to remove.
 
 ---
@@ -680,6 +697,7 @@ What this buys:
 
 - **Confidentiality.** Disk-level access yields ciphertext and tags. Plaintext is never written.
 - **Authenticated integrity.** GCM is the sole integrity authority; there is no separate checksum. Disk corruption, tampering and a wrong master key all surface as one `ErrIntegrity`.
+- **Key check.** The `keycheck` file is the evidence that the node's master key is the key that sealed the store, which is what lets a node mark a failed read as suspect. It authorises no write: repair replaces no suspect shard on any store. Only a new store gets one: `Open` seals it when the directory holds no segment file at all, bound to the store's `storeID`, so a copy from another store does not open. A store that held data before the file existed gets none, because it may have run under another key, and a node alone cannot tell which key its peers use; at open it logs that suspect-shard repair is off on it until a check across nodes can confirm its key. A key that does not open the file leaves the store unverified for good: the file is renamed `keycheck.refused` and kept for diagnosis, because the store goes on accepting writes under that key, so the original key returning later proves nothing. If that rename or its directory sync fails, the store does not open, so it takes no write under that key while a restart could still trust the original check. A file that is damaged leaves the store unverified while it stays so. In both cases reads and writes run as before and no shard is marked.
 - **Position binding.** The AAD binds each fragment to its `(key, index, valueNum, fragNum)` slot, so swapping fragments between values — or rewriting the header to claim a different slot — fails the tag.
 - **Cross-data-dir defence.** `storeID` enters the nonce, not the AAD, so splicing a fragment from one data dir into another yields a different nonce at read time and the tag fails.
 - **Mandatory.** `engine.Open` errors without `WithAEAD`, `blob.New` errors without an AEAD, and `s3d` refuses to start without `-encryption-key`. There is no unencrypted code path.
@@ -848,7 +866,7 @@ Version mismatch, missing region, an erasure code that is absent or invalid, `pa
 | Failure | Detected as | Response |
 |---|---|---|
 | No index row for the shard | `not-found` from the blob node | The join fails; the gate refetches with parity and reconstructs |
-| Fragment fails its GCM tag | `ErrIntegrity` | Same. Covers corruption, tampering, fragment swaps and a wrong master key indistinguishably |
+| Fragment fails its GCM tag | `ErrIntegrity` | Same, and the node marks the shard for repair when its key is verified. Covers corruption, tampering, fragment swaps and a wrong master key indistinguishably |
 | Node unreachable or slow | Stream error or deadline | Same |
 | Fewer than `K` valid shards | Reconstruction fails | 500 to the client |
 | Object metadata missing | Meta read fails | 404 `NoSuchKey` |
@@ -968,7 +986,7 @@ Things the design implies but the code does not do. Longer-horizon items live in
 
 **No ETag backfill for pre-v3 objects.** `PutObject` and `CompleteMultipartUpload` store the body's MD5 in placement record v3 — a plain hex digest for a single part, `"<md5>-<N>"` for a multipart object assembled from N parts — and `GetObject`, `HeadObject` and `ListObjectsV2` return it as the ETag. A record written under an older placement version has no digest, so these surfaces omit its ETag instead of serving a stale value, and nothing rewrites it to add one.
 
-**Listings are not paginated.** `ListObjects` scans and returns everything under the prefix, always reporting `IsTruncated: false` and a max-keys of 1000 it does not enforce.
+**A delimiter listing reads the whole prefix.** A `ListObjects` page with a delimiter scans every row under the prefix and collapses them before it cuts the page, so its cost grows with the prefix. A page without a delimiter stops on the `max-keys` + 1st live row, and the replica copies no value past it. Badger still reads ahead one live item, walks the tombstones before it and copies inline values of what it reads ahead, and its value prefetch still runs. It still pays for keys deleted since badger last compacted, which it merges across its levels; that cost can scale with the number of recent deletes.
 
 **No multi-object delete.** `POST /{bucket}?delete=` has no route and returns 405.
 

@@ -27,6 +27,8 @@ type MetaClient interface {
 	Swap(ctx context.Context, key string, value []byte) ([]byte, error)
 	Delete(ctx context.Context, key string) error
 	Scan(ctx context.Context, prefix string, limit int) ([]meta.Item, error)
+	// ScanFrom is Scan starting strictly after the stored key after.
+	ScanFrom(ctx context.Context, prefix, after string, limit int) ([]meta.Item, error)
 }
 
 var _ MetaClient = (*meta.Client)(nil)
@@ -117,6 +119,27 @@ func metaScan(ctx context.Context, mc MetaClient, table, prefix string, limit in
 		return nil, errNoMetaClient
 	}
 	items, err := mc.Scan(ctx, TableKey(table, prefix), limit)
+	if err != nil {
+		return nil, err
+	}
+	for i := range items {
+		items[i].Key = strings.TrimPrefix(items[i].Key, tablePrefix(table))
+	}
+	return items, nil
+}
+
+// metaScanFrom is metaScan from strictly after the row key after, at most limit
+// rows. A caller that cuts a page from the result relies on the rows arriving
+// in ascending key order, which one replica's scan gives.
+func metaScanFrom(ctx context.Context, mc MetaClient, table, prefix, after string, limit int) ([]meta.Item, error) {
+	if mc == nil {
+		return nil, errNoMetaClient
+	}
+	from := ""
+	if after != "" {
+		from = TableKey(table, after)
+	}
+	items, err := mc.ScanFrom(ctx, TableKey(table, prefix), from, limit)
 	if err != nil {
 		return nil, err
 	}

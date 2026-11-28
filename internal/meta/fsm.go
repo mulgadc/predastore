@@ -36,6 +36,14 @@ const (
 	CommandRetirePlacement
 )
 
+// commandTypeLast is the highest type this release applies. A replica stops on
+// any committed entry above it, so a type appended above must also move this.
+const commandTypeLast = CommandRetirePlacement
+
+// commandTypeUnset fills the type before a decode, so an entry with no type,
+// or a null one, keeps a value that no release knows and is never a put.
+const commandTypeUnset = ^CommandType(0)
+
 // Command represents a database operation that goes through Raft.
 type Command struct {
 	Type  CommandType `json:"type"`
@@ -269,13 +277,12 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 		}
 		// Decoding into f.cmd keeps the command off the heap. It is cleared
 		// after the copy, so it holds no value beyond this entry.
-		f.cmd = Command{}
+		f.cmd = Command{Type: commandTypeUnset}
 		err := json.Unmarshal(log.Data, &f.cmd)
 		cmd := f.cmd
 		f.cmd = Command{}
-		if err != nil {
-			responses[i] = fmt.Errorf("failed to unmarshal command: %w", err)
-			continue
+		if err != nil || cmd.Type > commandTypeLast {
+			b.stopOnUnreadableEntry(log.Index, log.Data, cmd.Type, err)
 		}
 		if cmd.Type == CommandTxn {
 			// The batch transaction ends before the command and the next one
@@ -411,6 +418,46 @@ func (b *batch) stopOnStoreError(txn *badger.Txn, index uint64, err error) {
 	//nolint:forbidigo // An entry this store could not evaluate must not be skipped; restart applies it again.
 	panic(fmt.Sprintf("meta: reading the store to apply entry %d failed; stopping so the log applies it again: %v",
 		index, se.err))
+}
+
+// stopOnUnreadableEntry stops the process on a committed entry this release
+// cannot read. A replica that can read it applies it, so answering and moving
+// on would leave the stores different. The message names no key.
+func (b *batch) stopOnUnreadableEntry(index uint64, data []byte, typ CommandType, err error) {
+	b.txn.Discard()
+	reason := fmt.Sprintf("type %d", typ)
+	switch {
+	case err != nil:
+		reason = fmt.Sprintf("an encoding that does not decode (%s)", decodeErrorKind(err))
+	case typ == commandTypeUnset && !hasType(data):
+		reason = "no type"
+	}
+	//nolint:forbidigo // Skipping an entry another replica applies diverges the stores; restart applies it again.
+	panic(fmt.Sprintf("meta: committed entry %d has %s, and this release reads types up to %d; "+
+		"stopping so the entry is not skipped", index, reason, commandTypeLast))
+}
+
+// hasType reports whether an entry that decoded sets its type to a value, as
+// opposed to leaving it out or null. Only a rejected entry pays for it.
+func hasType(data []byte) bool {
+	var probe struct {
+		Type json.RawMessage `json:"type"`
+	}
+	return json.Unmarshal(data, &probe) == nil && len(probe.Type) > 0 && string(probe.Type) != "null"
+}
+
+// decodeErrorKind names a decode failure without the bytes it failed on.
+func decodeErrorKind(err error) string {
+	var syntax *json.SyntaxError
+	var typ *json.UnmarshalTypeError
+	switch {
+	case errors.As(err, &syntax):
+		return fmt.Sprintf("syntax error at offset %d", syntax.Offset)
+	case errors.As(err, &typ):
+		return fmt.Sprintf("field %q is not a %s", typ.Field, typ.Type)
+	default:
+		return "invalid JSON"
+	}
 }
 
 func valueCopy(item *badger.Item) ([]byte, error) { return item.ValueCopy(nil) }
@@ -879,7 +926,7 @@ func (f *FSM) ScanFrom(prefix, after string, fn func(key string, value []byte) e
 			}
 			key := string(item.Key())
 
-			value, err := item.ValueCopy(nil)
+			value, err := f.copyValue(item)
 			if err != nil {
 				return err
 			}

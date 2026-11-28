@@ -110,6 +110,9 @@ type Response struct {
 	// Holding confirms on a put's final envelope that the row it prepared is
 	// held. Only a shard answered with it counts toward a held write's floor.
 	Holding bool `json:"holding,omitempty"`
+	// Suspect accompanies a stat whose shard failed authentication on a read
+	// at the generation it holds, so repair rebuilds it from its peers.
+	Suspect bool `json:"suspect,omitempty"`
 	// Open reports that an abort found a held writer still receiving its
 	// body. The writer discards its extent when it closes; abort again to
 	// learn that it has.

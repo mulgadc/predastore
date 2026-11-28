@@ -65,6 +65,9 @@ type Store struct {
 	fragNumHighWater uint64
 	deferredState    bool
 
+	// keyVerified reports that a key check this store sealed opens under aead.
+	keyVerified bool
+
 	maxSegSize uint64
 
 	compactionEnabled   bool
@@ -395,6 +398,11 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 	store.stats.liveSegments, err = countSegments(dir)
 	if err != nil {
 		return nil, fmt.Errorf("count segments: %w", err)
+	}
+
+	if store.keyVerified, err = openKeyCheck(dir, store.aead, store.storeID); err != nil {
+		_ = store.index.Close()
+		return nil, err
 	}
 
 	if _, err := store.nextAvailableSegment(); err != nil {
@@ -857,10 +865,31 @@ func (store *Store) Commit(key [32]byte, index uint32, epoch uint64) (published 
 			// so a record naming this generation can land after the newer one
 			// has already taken the position, and it has to resolve.
 			case liveErr == nil && liveEpoch > epoch:
+				// A rebuild of a generation already retained replaces that row;
+				// the bytes it held are dead.
+				if prev, err := readRaw(txn, retainedKey(idxKey, epoch)); err == nil {
+					prevExt, _, decErr := decodeIndexValue(prev)
+					if decErr != nil {
+						return fmt.Errorf("decode retained generation: %w", decErr)
+					}
+					if err := txn.Set(tombstoneKey(prevExt.SegNum, prevExt.Off), tombstoneValue(prevExt.PSize)); err != nil {
+						return fmt.Errorf("tombstone replaced retained generation: %w", err)
+					}
+				} else if !errors.Is(err, badger.ErrKeyNotFound) {
+					return err
+				}
 				if err := txn.Set(retainedKey(idxKey, epoch), encodePreparedValue(ext, epoch, retainedHoldStamp)); err != nil {
 					return fmt.Errorf("retain superseded generation: %w", err)
 				}
 				return txn.Delete(prepKey)
+
+			// The same generation written again: the live row keeps serving the
+			// epoch, so no record can name the bytes it displaces. They are dead
+			// now; an open reader keeps its segment reference until it closes.
+			case liveErr == nil && liveEpoch == epoch:
+				if err := txn.Set(tombstoneKey(old.SegNum, old.Off), tombstoneValue(old.PSize)); err != nil {
+					return fmt.Errorf("tombstone displaced extent: %w", err)
+				}
 
 			// Demoted, not destroyed: a record naming this generation is still
 			// answerable until the sweep decides otherwise. Riding the same txn

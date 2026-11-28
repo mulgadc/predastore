@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"github.com/klauspost/reedsolomon"
 	"github.com/mulgadc/predastore/internal/blob"
@@ -22,8 +23,9 @@ import (
 // round trip and no reconstruction, and it is the same forward recovery a read
 // performs, so asking costs nothing when the answer is no.
 func (s *Service) repairShard(ctx context.Context, t task) (repairRoute, error) {
-	// Superseded means the node has moved past this generation and published
-	// nothing, so nothing was repaired and the other routes still have to run.
+	// Superseded means the node holds this generation under a newer live one,
+	// which reads still resolve to. A rebuild over it would replace bytes
+	// that may be sound under the cluster's key, so it stays as it is.
 	superseded, err := s.cfg.Blob.Commit(ctx, t.node, blob.CommitRequest{
 		Key: t.hash, Index: uint32(t.index), Epoch: t.place.WriteEpoch, //nolint:gosec // G115: bounded by the shard count.
 	})
@@ -33,7 +35,10 @@ func (s *Service) repairShard(ctx context.Context, t task) (repairRoute, error) 
 			"node", t.node, "index", t.index)
 
 		return routeCommit, nil
-	case err != nil && !errors.Is(err, blob.ErrNotPrepared) && !errors.Is(err, blob.ErrOvertakenUnproven):
+	case err == nil:
+		return 0, fmt.Errorf("%w: node=%d index=%d holds %016x under a newer generation",
+			errSuperseded, t.node, t.index, t.place.WriteEpoch)
+	case !errors.Is(err, blob.ErrNotPrepared) && !errors.Is(err, blob.ErrOvertakenUnproven):
 		return 0, fmt.Errorf("publish prepared shard: %w", err)
 	}
 
@@ -45,6 +50,14 @@ func (s *Service) repairShard(ctx context.Context, t task) (repairRoute, error) 
 
 	return routeRebuild, s.rebuildShard(ctx, t)
 }
+
+// errGeometryMismatch reports a record written under another erasure code
+// than the one repair runs, which repair leaves alone.
+var errGeometryMismatch = errors.New("the record's erasure code is not the one repair runs")
+
+// errPeerBodies reports a rebuild that ran out of peers after some of them
+// failed part way through their shard.
+var errPeerBodies = errors.New("peer shards failed during the rebuild")
 
 // errNoHandoff reports that the handoff holder has nothing for this position,
 // which is the ordinary case and not a failure.
@@ -122,18 +135,62 @@ func (s *Service) handoffNode(hash [32]byte) config.NodeID {
 // are one Reconstruct with a single output slot open, and the arithmetic is the
 // erasure coder's rather than written out here.
 func (s *Service) rebuildShard(ctx context.Context, t task) error {
+	// The stripe's own geometry decides which index is data and which is
+	// parity. Rebuilding under another code would write wrong bytes over it.
+	if len(t.place.DataShardNodes) != s.cfg.DataShards || len(t.place.ParityShardNodes) != s.cfg.ParityShards {
+		return fmt.Errorf("%w: the record is RS(%d,%d) and repair runs RS(%d,%d)", errGeometryMismatch,
+			len(t.place.DataShardNodes), len(t.place.ParityShardNodes), s.cfg.DataShards, s.cfg.ParityShards)
+	}
 	total := s.cfg.DataShards + s.cfg.ParityShards
+	skip := make(map[int]bool, total)
+	// A peer can answer its envelope and then fail its body, as a shard that
+	// fails authentication does. The rebuild then tries again without it,
+	// while the stripe still has peers it has not tried.
+	for {
+		failed, err := s.rebuildFrom(ctx, t, total, skip)
+		if err != nil && failed < 0 && len(skip) > 0 && errors.Is(err, errTooFewPeers) {
+			// Peers did answer, so this is the stripe failing, not the node
+			// cut off from the cluster, and the pass goes on.
+			return fmt.Errorf("%w: %d peers failed their shard bodies, and then: %v", errPeerBodies, len(skip), err) //nolint:errorlint // The shortfall must not classify as no peer reachable.
+		}
+		if err == nil || failed < 0 {
+			return err
+		}
+		skip[failed] = true
+		slog.InfoContext(ctx, "Peer shard failed during a rebuild; trying the next peer",
+			"node", t.node, "index", t.index, "peer_index", failed, "err", err)
+	}
+}
+
+// rebuildFrom rebuilds once from peers not in skip. On failure it names the
+// first peer whose body failed, or -1 when none did.
+func (s *Service) rebuildFrom(ctx context.Context, t task, total int, skip map[int]bool) (int, error) {
 	shardSize := (t.place.Size + int64(s.cfg.DataShards) - 1) / int64(s.cfg.DataShards)
 
-	sources, closeSources, err := s.fetchPeers(ctx, t, total)
+	sources, closeSources, err := s.fetchPeers(ctx, t, total, skip)
 	if err != nil {
-		return err
+		return -1, err
 	}
 	defer closeSources()
+	peers := make([]*peerBody, total)
+	for i, src := range sources {
+		if src != nil {
+			peers[i] = &peerBody{r: src}
+			sources[i] = peers[i]
+		}
+	}
+	firstFailed := func() int {
+		for i, p := range peers {
+			if p != nil && p.failed.Load() {
+				return i
+			}
+		}
+		return -1
+	}
 
 	enc, err := reedsolomon.NewStream(s.cfg.DataShards, s.cfg.ParityShards)
 	if err != nil {
-		return err
+		return -1, err
 	}
 
 	// The rebuilt shard is streamed straight into the put rather than buffered:
@@ -162,11 +219,25 @@ func (s *Service) rebuildShard(ctx context.Context, t task) error {
 	wg.Wait()
 
 	if putErr != nil {
-		return fmt.Errorf("write rebuilt shard: %w", putErr)
+		return firstFailed(), fmt.Errorf("write rebuilt shard: %w", putErr)
 	}
 
 	_, err = s.publish(ctx, t)
-	return err
+	return -1, err
+}
+
+// peerBody records whether a peer's shard failed part way through.
+type peerBody struct {
+	r      io.Reader
+	failed atomic.Bool
+}
+
+func (p *peerBody) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if err != nil && !errors.Is(err, io.EOF) {
+		p.failed.Store(true)
+	}
+	return n, err
 }
 
 // publish commits the rebuilt shard, but only after confirming the record still
@@ -251,7 +322,7 @@ func (s *Service) currentEpoch(ctx context.Context, hash [32]byte) (uint64, erro
 // and repair is the one place that would do it deliberately if nobody said
 // otherwise.
 func (s *Service) fetchPeers(
-	ctx context.Context, t task, total int,
+	ctx context.Context, t task, total int, skip map[int]bool,
 ) ([]io.Reader, func(), error) {
 	readers := make([]io.Reader, total)
 	var opened []io.Closer
@@ -264,7 +335,7 @@ func (s *Service) fetchPeers(
 	have := 0
 	var short peerShortfallError
 	for index, node := range t.place.AllNodes() {
-		if index == t.index || have >= s.cfg.DataShards {
+		if index == t.index || skip[index] || have >= s.cfg.DataShards {
 			continue
 		}
 		r, err := s.cfg.Blob.Get(ctx, node, blob.GetRequest{
