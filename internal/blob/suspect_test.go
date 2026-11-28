@@ -3,6 +3,7 @@ package blob_test
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -159,4 +160,39 @@ func TestASuspectMarkSurvivesCompactionMovingTheShard(t *testing.T) {
 	assert.True(t, statSuspect(t, c), "the moved shard is still the bad generation")
 	_, err = get(t, c, 5)
 	assert.Error(t, err, "compaction copies the bad ciphertext as it was")
+}
+
+// A store from an earlier release has no key check. Once upgraded, its key
+// can verify, but a shard that then fails authentication is never marked:
+// such a store could verify a wrong key, and repair must not act on it.
+func TestAnUpgradedStoreMarksNoShardSuspect(t *testing.T) {
+	dir := t.TempDir()
+	aead := storetest.TestAEAD()
+	st, err := engine.Open(dir, engine.WithAEAD(aead))
+	require.NoError(t, err)
+	body := bytes.Repeat([]byte("u"), 4096)
+	w, err := st.Append(epochKey(), epochTestShardIndex, int64(len(body)), 5)
+	require.NoError(t, err)
+	_, err = w.Write(body)
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+	_, err = st.Commit(epochKey(), epochTestShardIndex, 5)
+	require.NoError(t, err)
+	require.NoError(t, st.Close())
+	require.NoError(t, os.Remove(filepath.Join(dir, "keycheck")))
+
+	st, err = engine.Open(dir, engine.WithAEAD(aead))
+	require.NoError(t, err)
+	r, err := st.Lookup(epochKey(), epochTestShardIndex)
+	require.NoError(t, err)
+	_, err = io.ReadAll(r)
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	require.Eventually(t, st.KeyVerified, 5*time.Second, time.Millisecond, "a read of the old shard verifies the key")
+
+	c := startStoreNode(t, st)
+	flipFirstFragment(t, dir)
+	_, err = get(t, c, 5)
+	require.Error(t, err)
+	assert.False(t, statSuspect(t, c), "an upgraded store must not mark a shard for repair")
 }
