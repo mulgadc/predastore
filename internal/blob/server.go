@@ -466,14 +466,13 @@ func (s *Server) handleStat(ctx context.Context, h Request, stream transport.Str
 		// reporting it as missing would send repair to rebuild over it.
 		return respond(stream, &Response{Err: fmt.Sprintf("stat: %v", err)})
 	}
-	resp := Response{Epoch: reader.Epoch(), Size: reader.Size()}
-	if h.Epoch != 0 && h.Epoch != reader.Epoch() {
-		// The record's generation is retained under a newer live one, and a
-		// read of the record still resolves to it.
-		resp.Suspect = s.suspects.has(pos, h.Epoch)
-	} else {
-		resp.Suspect = s.suspects.suspect(pos, reader.Epoch())
+	// A caller that names its record's generation is told about that one,
+	// which can be retained under a newer live one; otherwise the live one.
+	asked := reader.Epoch()
+	if h.Epoch != 0 {
+		asked = h.Epoch
 	}
+	resp := Response{Epoch: reader.Epoch(), Size: reader.Size(), Suspect: s.suspects.suspect(pos, asked)}
 	if closeErr := reader.Close(); closeErr != nil {
 		return respond(stream, &Response{Err: fmt.Sprintf("stat: %v", closeErr)})
 	}

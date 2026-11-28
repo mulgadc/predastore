@@ -69,25 +69,10 @@ func (s *suspectSet) add(pos shardPosition, epoch uint64) bool {
 	return true
 }
 
-// suspect reports whether the live generation of a position is in the set,
-// and forgets the position's other generations, which a stat has shown are no
-// longer live.
-func (s *suspectSet) suspect(pos shardPosition, live uint64) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	found := false
-	for epoch, e := range s.entries[pos] {
-		if epoch == live {
-			found = true
-			continue
-		}
-		s.removeLocked(e)
-	}
-	return found
-}
-
-// has reports whether one generation of a position is in the set.
-func (s *suspectSet) has(pos shardPosition, epoch uint64) bool {
+// suspect reports whether one generation of a position is in the set. It
+// clears nothing: an older generation can still be served from the retained
+// row, so only a read, a delete or eviction ends its mark.
+func (s *suspectSet) suspect(pos shardPosition, epoch uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, ok := s.entries[pos][epoch]

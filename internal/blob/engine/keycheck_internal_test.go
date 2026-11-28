@@ -61,7 +61,11 @@ func TestANewStoreVerifiesItsKeyAtOpen(t *testing.T) {
 	if st.KeyVerified() {
 		t.Fatal("another key must not open the key check")
 	}
+	putValue(t, st, [32]byte{0x78}, 0, bytes.Repeat([]byte("w"), KiB))
 	closeStore(t, st)
+	if _, err := os.Stat(filepath.Join(dir, keyCheckRefusedFilename)); err != nil {
+		t.Fatalf("the refused check must be kept for diagnosis: %v", err)
+	}
 	if st := openStoreIn(t, dir, testAEAD(t)); st.KeyVerified() {
 		t.Fatal("a store that ran under another key may hold shards sealed under it, so it is never verified again")
 	}

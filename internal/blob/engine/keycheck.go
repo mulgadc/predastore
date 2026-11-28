@@ -17,6 +17,11 @@ import (
 // only this evidence tells that apart from corruption.
 const keyCheckFilename = "keycheck"
 
+// keyCheckRefusedFilename keeps a key check that another key failed to open.
+// Its presence keeps the store unverified for good: it may hold shards that
+// other key sealed, so the original key returning proves nothing.
+const keyCheckRefusedFilename = "keycheck.refused"
+
 const (
 	keyCheckMagic   = "PDKC"
 	keyCheckVersion = 1
@@ -42,6 +47,14 @@ var segmentsHoldData = storeHasData
 // store from opening.
 func openKeyCheck(dir string, aead cipher.AEAD, storeID uint32) bool {
 	path := filepath.Join(dir, keyCheckFilename)
+	if _, err := os.Stat(filepath.Join(dir, keyCheckRefusedFilename)); err == nil {
+		slog.Warn("this store once opened under another master key; suspect-shard repair stays off on it", "dir", dir)
+		return false
+	} else if !errors.Is(err, os.ErrNotExist) {
+		slog.Error("could not read the store's refused key check; integrity failures are not marked for repair",
+			"dir", dir, "error", err)
+		return false
+	}
 	raw, err := os.ReadFile(path)
 	hasData := true
 	if errors.Is(err, os.ErrNotExist) {
@@ -81,8 +94,14 @@ func openKeyCheck(dir string, aead cipher.AEAD, storeID uint32) bool {
 	body := raw[keyCheckHeader:]
 	plain, err := aead.Open(nil, body[:nonceSize], body[nonceSize:], keyCheckAAD(storeID))
 	if err != nil || !bytes.Equal(plain, keyCheckPlaintext) {
-		slog.Error("the master key does not open this store's key check; integrity failures are not marked for repair",
-			"dir", dir)
+		// Writes go on under this key, so no later start may trust the
+		// check again; the store keeps serving.
+		refuseErr := os.Rename(path, filepath.Join(dir, keyCheckRefusedFilename))
+		if refuseErr == nil {
+			refuseErr = syncDirectory(dir)
+		}
+		slog.Error("the master key does not open this store's key check; suspect-shard repair is off on this store for good",
+			"dir", dir, "error", refuseErr)
 		return false
 	}
 	return true
