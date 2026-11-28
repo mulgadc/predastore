@@ -267,11 +267,12 @@ func (r *stripeReader) open(ctx context.Context, index int, node config.NodeID, 
 		ctx, cancel := context.WithCancel(ctx)
 		opening := time.AfterFunc(shardOpenTimeout, cancel)
 		req := blob.GetRequest{
-			Key:        r.objectHash,
-			RangeStart: -1, // -1 for both means the whole shard
-			RangeEnd:   -1,
-			Index:      uint32(index), //nolint:gosec // G115: index bounded by shard count.
-			Epoch:      r.place.WriteEpoch,
+			Key:           r.objectHash,
+			RangeStart:    -1, // -1 for both means the whole shard
+			RangeEnd:      -1,
+			Index:         uint32(index), //nolint:gosec // G115: index bounded by shard count.
+			Epoch:         r.place.WriteEpoch,
+			PartPlacement: r.place.partPlacement,
 		}
 		if from > 0 {
 			req.RangeStart, req.RangeEnd = from, r.lay.shardSize-1

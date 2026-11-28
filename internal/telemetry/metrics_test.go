@@ -1092,6 +1092,7 @@ func recordEveryInstrument(t *testing.T) map[string]metricdata.Aggregation {
 	})
 	RecordObjectRead(ctx, ReadPathDirect)
 	RecordObjectWrite(ctx, WriteOutcomeSuccess, "")
+	RecordObjectShardMargin(ctx, 0)
 	EnterGateInflight(ctx, GateOpPut, 1)()
 	RecordObjectPhase(ctx, GateOpPut, PhaseShardFanout, 0.01)
 	RecordMetaClientOp(ctx, MetaOpGet, OutcomeSuccess, 0.01)

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/placement"
@@ -41,6 +42,25 @@ func partShardKey(uploadID string, partNumber int) string {
 // in a hidden prefix so an in-flight upload never shows up in a listing.
 func partObjectKey(key, uploadID string, partNumber int) string {
 	return fmt.Sprintf(".multipart/%s/%s/%05d", uploadID, key, partNumber)
+}
+
+// PartPlacementHash checks that a placement key names a part of this upload.
+func PartPlacementHash(ctx context.Context, get func(context.Context, string) ([]byte, error), placement string) ([32]byte, error) {
+	part, ok := strings.CutPrefix(placement, partKeyPrefix)
+	uploadID, number, split := strings.Cut(part, ":")
+	n, err := strconv.Atoi(number)
+	if !ok || !split || uploadID == "" || err != nil || n < 1 || n > 10000 || partShardKey(uploadID, n) != placement {
+		return [32]byte{}, errors.New("invalid multipart placement key")
+	}
+	raw, err := get(ctx, TableKey(model.TableMultipart, uploadID))
+	if err != nil {
+		return [32]byte{}, err
+	}
+	var upload model.UploadMetadata
+	if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(&upload); err != nil {
+		return [32]byte{}, fmt.Errorf("decode upload metadata: %w", err)
+	}
+	return model.ObjectHash(upload.Bucket, partObjectKey(upload.Key, uploadID, n)), nil
 }
 
 // getUploadMetadata retrieves and validates upload metadata.
@@ -110,6 +130,7 @@ func storePart(
 		return model.PartMetadata{}, writeResult{}, model.NewS3Error(model.ErrInternalError, "Failed to get shard placement", 500)
 	}
 
+	place.partPlacement = partShardKey(uploadID, partNumber)
 	written, err := writeObject(ctx, bc, cfg, ring, io.TeeReader(body, digest), size, objectHash, place)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to store part", "uploadID", uploadID, "part", partNumber, "error", err)
@@ -165,7 +186,7 @@ func storePart(
 	// Swapping rather than writing tells this writer which generation it
 	// displaced. Re-uploading a part is an overwrite like any other, and
 	// without that answer the generation it supersedes is never released.
-	previous, err := metaSwap(ctx, mc, model.TableObjects, partShardKey(uploadID, partNumber), shardRecord)
+	previous, err := metaSwap(ctx, mc, model.TableObjects, place.partPlacement, shardRecord)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to store part shard metadata", "uploadID", uploadID, "part", partNumber, "error", err)
 		return model.PartMetadata{}, written, model.NewS3Error(model.ErrInternalError, "Failed to store part shard metadata", 500)

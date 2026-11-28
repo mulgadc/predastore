@@ -55,8 +55,9 @@ const (
 	metricShardLongest  = "predastore.shard.stall.longest"
 	metricShardRate     = "predastore.shard.throughput"
 
-	metricObjectReads  = "predastore.object.reads"
-	metricObjectWrites = "predastore.object.writes"
+	metricObjectReads       = "predastore.object.reads"
+	metricObjectWrites      = "predastore.object.writes"
+	metricObjectShardMargin = "predastore.object.shard_margin"
 
 	metricGateInflightBytes    = "predastore.gate.inflight.bytes"
 	metricGateInflightRequests = "predastore.gate.inflight.requests"
@@ -118,7 +119,7 @@ var metricNames = []string{
 	metricShardErrors, metricShardOps, metricShardDuration,
 	metricShardHedges, metricShardTTFB, metricShardBytes,
 	metricShardStalls, metricShardLongest, metricShardRate,
-	metricObjectReads, metricObjectWrites,
+	metricObjectReads, metricObjectWrites, metricObjectShardMargin,
 	metricGateInflightBytes, metricGateInflightRequests,
 	metricBlobFreeFrac, metricBlobFreeBytes, metricBlobTotalBytes, metricBlobPressure,
 	metricBlobSegments, metricBlobSegNum, metricBlobValueNum, metricBlobFragNum,
@@ -168,8 +169,9 @@ var (
 	shardOps      metric.Int64Counter
 	shardDuration metric.Float64Histogram
 
-	objectReads  metric.Int64Counter
-	objectWrites metric.Int64Counter
+	objectReads       metric.Int64Counter
+	objectWrites      metric.Int64Counter
+	objectShardMargin metric.Int64Histogram
 
 	gateInflightBytes    metric.Int64UpDownCounter
 	gateInflightRequests metric.Int64UpDownCounter
@@ -275,6 +277,9 @@ func instruments() {
 			"Object reads served, by path. A reconstructed read consumed parity to answer, and is the only in-band evidence that a blob node is losing data.", "{read}")
 		objectWrites = int64Counter(metricObjectWrites,
 			"Object writes by outcome and failure reason.", "{write}")
+		objectShardMargin = int64Histogram(metricObjectShardMargin,
+			"Additional shard losses a nonempty object can tolerate at acknowledgement.", "{shard}",
+			metric.WithExplicitBucketBoundaries(0, 1, 2, 3, 4, 8, 16))
 
 		gateInflightBytes = int64UpDownCounter(metricGateInflightBytes,
 			"Object payload bytes currently resident in gate memory. Declared object size rather than a heap measurement: concurrency multiplying object size is what exhausts a gate.", "By")
@@ -403,9 +408,9 @@ func int64Counter(name, description, unit string) metric.Int64Counter {
 	return c
 }
 
-func int64Histogram(name, description, unit string) metric.Int64Histogram {
-	h, err := meter.Int64Histogram(name,
-		metric.WithDescription(description), metric.WithUnit(unit))
+func int64Histogram(name, description, unit string, opts ...metric.Int64HistogramOption) metric.Int64Histogram {
+	opts = append(opts, metric.WithDescription(description), metric.WithUnit(unit))
+	h, err := meter.Int64Histogram(name, opts...)
 	if err != nil {
 		otel.Handle(err)
 	}
@@ -736,9 +741,12 @@ const nodeAttrKey = "node"
 
 // Shard operations. Bounded, and the only values the op attribute may take.
 const (
-	ShardOpRead   = "read"
-	ShardOpWrite  = "write"
-	ShardOpDelete = "delete"
+	ShardOpRead         = "read"
+	ShardOpWrite        = "write"
+	ShardOpDelete       = "delete"
+	ShardOpWriteBody    = "write_body"
+	ShardOpPrepareReply = "prepare_reply"
+	ShardOpCommit       = "commit"
 )
 
 // Operation outcomes.
@@ -1255,6 +1263,14 @@ func RecordObjectWrite(ctx context.Context, outcome, reason string) {
 		return
 	}
 	objectWrites.Add(ctx, 1, objectAttrs("outcome", outcome, "reason", reason).add...)
+}
+
+// RecordObjectShardMargin records the shard-loss tolerance at write acknowledgement.
+func RecordObjectShardMargin(ctx context.Context, margin int) {
+	instruments()
+	if objectShardMargin != nil {
+		objectShardMargin.Record(ctx, int64(margin))
+	}
 }
 
 // EnterGateInflight records one request holding size bytes of object payload

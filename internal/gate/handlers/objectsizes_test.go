@@ -125,7 +125,7 @@ func TestObjectSizeLadderRoundTrips(t *testing.T) {
 						require.Equalf(t, int64(size), place.Size,
 							"the placement of %s records the size written", key)
 
-						got, degraded, err := readObject(ctx, f.bc, f.cfg, "sizes", key, place, place.Size, 0)
+						got, degraded, err := readObject(ctx, f.bc, f.cfg, "sizes", key, place, place.Size, 0, frozenClock())
 						require.NoErrorf(t, err, "reading %d bytes back from %s", size, key)
 						assert.Zerof(t, degraded, "%s read cleanly, so nothing was reconstructed", key)
 						assert.Equalf(t, want, got, "%d bytes round-tripped through %s", size, key)
