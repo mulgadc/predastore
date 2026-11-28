@@ -400,7 +400,10 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("count segments: %w", err)
 	}
 
-	store.keyVerified = openKeyCheck(dir, store.aead, store.storeID)
+	if store.keyVerified, err = openKeyCheck(dir, store.aead, store.storeID); err != nil {
+		_ = store.index.Close()
+		return nil, err
+	}
 
 	if _, err := store.nextAvailableSegment(); err != nil {
 		return nil, err

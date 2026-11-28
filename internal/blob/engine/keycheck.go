@@ -44,16 +44,16 @@ var segmentsHoldData = storeHasData
 // openKeyCheck reports whether the store's key is verified. Only a new store
 // gets a key check, sealed here; a store that held data before the check
 // existed has none and is never verified. Unreadable evidence never stops the
-// store from opening.
-func openKeyCheck(dir string, aead cipher.AEAD, storeID uint32) bool {
+// store from opening, except a refusal that cannot be made durable.
+func openKeyCheck(dir string, aead cipher.AEAD, storeID uint32) (bool, error) {
 	path := filepath.Join(dir, keyCheckFilename)
 	if _, err := os.Stat(filepath.Join(dir, keyCheckRefusedFilename)); err == nil {
 		slog.Warn("this store once opened under another master key; suspect-shard repair stays off on it", "dir", dir)
-		return false
+		return false, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		slog.Error("could not read the store's refused key check; integrity failures are not marked for repair",
 			"dir", dir, "error", err)
-		return false
+		return false, nil
 	}
 	raw, err := os.ReadFile(path)
 	hasData := true
@@ -64,7 +64,7 @@ func openKeyCheck(dir string, aead cipher.AEAD, storeID uint32) bool {
 		if hasData, scanErr = segmentsHoldData(dir); scanErr != nil {
 			slog.Error("could not tell whether the store is new; integrity failures are not marked for repair",
 				"dir", dir, "error", scanErr)
-			return false
+			return false, nil
 		}
 	}
 	switch {
@@ -72,24 +72,24 @@ func openKeyCheck(dir string, aead cipher.AEAD, storeID uint32) bool {
 		if err := writeKeyCheck(dir, aead, storeID); err != nil {
 			slog.Error("could not write the store's key check; integrity failures are not marked for repair",
 				"dir", dir, "error", err)
-			return false
+			return false, nil
 		}
-		return true
+		return true, nil
 	case errors.Is(err, os.ErrNotExist):
 		slog.Warn("this store was created before the key check; suspect-shard repair is off on it "+
 			"until a check across nodes can confirm its key", "dir", dir)
-		return false
+		return false, nil
 	case err != nil:
 		slog.Error("could not read the store's key check; integrity failures are not marked for repair",
 			"dir", dir, "error", err)
-		return false
+		return false, nil
 	}
 
 	nonceSize := aead.NonceSize()
 	if len(raw) < keyCheckHeader+nonceSize || string(raw[:len(keyCheckMagic)]) != keyCheckMagic ||
 		raw[len(keyCheckMagic)] != keyCheckVersion || raw[len(keyCheckMagic)+1] != keyCheckSealed {
 		slog.Error("the store's key check does not decode; integrity failures are not marked for repair", "dir", dir)
-		return false
+		return false, nil
 	}
 	body := raw[keyCheckHeader:]
 	plain, err := aead.Open(nil, body[:nonceSize], body[nonceSize:], keyCheckAAD(storeID))
@@ -100,11 +100,16 @@ func openKeyCheck(dir string, aead cipher.AEAD, storeID uint32) bool {
 		if refuseErr == nil {
 			refuseErr = syncDirectory(dir)
 		}
+		if refuseErr != nil {
+			// Until the refusal is on disk a restart could trust the check
+			// again, so the store takes no write under this key.
+			return false, fmt.Errorf("the master key does not open the store's key check, and refusing it failed: %w", refuseErr)
+		}
 		slog.Error("the master key does not open this store's key check; suspect-shard repair is off on this store for good",
-			"dir", dir, "error", refuseErr)
-		return false
+			"dir", dir)
+		return false, nil
 	}
-	return true
+	return true, nil
 }
 
 // writeKeyCheck seals the check through a synced temporary file and a synced
@@ -145,21 +150,15 @@ func writeKeyCheck(dir string, aead cipher.AEAD, storeID uint32) error {
 // the key that sealed its data. Without it, a failed read may be a wrong key.
 func (store *Store) KeyVerified() bool { return store.keyVerified }
 
-// storeHasData reports whether any segment in dir holds more than a header.
+// storeHasData reports whether dir holds any segment file. Only a vault with
+// none is new; one with only segment headers may come from an earlier release.
 func storeHasData(dir string) (bool, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return false, err
 	}
 	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".seg" {
-			continue
-		}
-		info, err := e.Info()
-		if err != nil {
-			return false, err
-		}
-		if info.Size() > segHeaderSize {
+		if !e.IsDir() && filepath.Ext(e.Name()) == ".seg" {
 			return true, nil
 		}
 	}
