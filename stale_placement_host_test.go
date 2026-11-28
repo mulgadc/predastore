@@ -6,10 +6,13 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -18,7 +21,10 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/dgraph-io/badger/v4"
+	"github.com/mulgadc/predastore"
 	"github.com/mulgadc/predastore/internal/blob"
+	"github.com/mulgadc/predastore/internal/blob/engine"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/handlers"
 	"github.com/mulgadc/predastore/internal/gate/model"
@@ -53,6 +59,15 @@ const gateNodeID config.NodeID = 1
 
 func startStaleHost(t *testing.T) (*s3Client, *config.Config) {
 	t.Helper()
+	client, cfg := staleHostConfig(t)
+	runHost(t, cfg, newMasterKey(t))
+	awaitProbe(t, "http://127.0.0.1:"+strconv.Itoa(cfg.Hosts[0].AdminPort)+"/readyz", http.StatusOK)
+	awaitGate(t, client.http, client.base+"/")
+	return client, cfg
+}
+
+func staleHostConfig(t *testing.T) (*s3Client, *config.Config) {
+	t.Helper()
 	certPath, keyPath, _ := testcerts.Generate(t)
 	adminPort, gatePort := freePort(t), freePort(t)
 
@@ -83,17 +98,168 @@ func startStaleHost(t *testing.T) (*s3Client, *config.Config) {
 			{AccessKeyID: staleKey, SecretAccessKey: staleSecret, AccountID: staleAccount},
 		},
 	}
-	runHost(t, cfg, newMasterKey(t))
-
-	awaitProbe(t, "http://127.0.0.1:"+strconv.Itoa(adminPort)+"/readyz", http.StatusOK)
 	client := &http.Client{Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}}
 	base := "https://127.0.0.1:" + strconv.Itoa(gatePort)
-	awaitGate(t, client, base+"/")
-
 	return &s3Client{t: t, base: base, region: cfg.Region,
 		accessKey: staleKey, secretKey: staleSecret, http: client}, cfg
+}
+
+func TestHostReplaysRaftNamedPlacementBeforeServingShards(t *testing.T) {
+	testHostReplaysRaftNamedPlacement(t, false)
+}
+
+func TestHostReplaysPlacementPublishedAfterRestart(t *testing.T) {
+	testHostReplaysRaftNamedPlacement(t, true)
+}
+
+func testHostReplaysRaftNamedPlacement(t *testing.T, latePlacement bool) {
+	t.Helper()
+	client, cfg := staleHostConfig(t)
+	start := recoveryHostStarter(t, cfg, client)
+	stop := start()
+	status, body := client.send(http.MethodPut, "/"+staleBucket, "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	want := bytes.Repeat([]byte("acknowledged payload"), 1024)
+	objectPath := "/" + staleBucket + "/" + staleObject
+	status, body = client.send(http.MethodPut, objectPath, "", want)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+
+	hash := model.ObjectHash(staleBucket, staleObject)
+	var placement handlers.ObjectToShardNodes
+	placementKey := handlers.TableKey(model.TableObjects, string(hash[:]))
+	var placementValue []byte
+	withHostClients(t, cfg, func(mc *meta.Client, _ *blob.Client, _ []config.NodeID) {
+		raw, err := mc.AuthorityGet(t.Context(), placementKey)
+		require.NoError(t, err)
+		placementValue = raw
+		placement, err = handlers.DecodePlacement(raw)
+		require.NoError(t, err)
+		if latePlacement {
+			require.NoError(t, mc.Delete(t.Context(), placementKey))
+		}
+	})
+	stop()
+	client.http.CloseIdleConnections()
+
+	dropRecoveryHostShardRows(t, cfg, hash, placement)
+
+	start()
+	if latePlacement {
+		withHostClients(t, cfg, func(mc *meta.Client, _ *blob.Client, _ []config.NodeID) {
+			require.NoError(t, mc.Put(t.Context(), placementKey, placementValue))
+		})
+	}
+	status, body = client.send(http.MethodGet, objectPath, "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	require.Equal(t, want, body)
+}
+
+func recoveryHostStarter(t *testing.T, cfg *config.Config, client *s3Client) func() func() {
+	t.Helper()
+	require.NoError(t, cfg.Validate())
+	key := newMasterKey(t)
+	return func() func() {
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() {
+			done <- predastore.Run(ctx, predastore.Options{Config: cfg, HostID: 1, MasterKey: key})
+		}()
+		stop := sync.OnceFunc(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(15 * time.Second):
+				t.Error("host did not stop")
+			}
+		})
+		t.Cleanup(stop)
+		awaitProbe(t, "http://127.0.0.1:"+strconv.Itoa(cfg.Hosts[0].AdminPort)+"/readyz", http.StatusOK)
+		awaitGate(t, client.http, client.base+"/")
+		return stop
+	}
+}
+
+func dropRecoveryHostShardRows(t *testing.T, cfg *config.Config, hash [32]byte, placement handlers.ObjectToShardNodes) {
+	t.Helper()
+	host := cfg.Hosts[0]
+	holders := placement.AllNodes()
+	require.Len(t, holders, 3)
+	for index, id := range holders {
+		for _, node := range host.Nodes {
+			if node.ID != id {
+				continue
+			}
+			db, err := badger.Open(badger.DefaultOptions(filepath.Join(config.NodeDataDir(host, node), "db")))
+			require.NoError(t, err)
+			require.NoError(t, db.Update(func(txn *badger.Txn) error {
+				row := engine.MakeKey(hash, uint32(index))
+				if _, err := txn.Get(row); err != nil {
+					return err
+				}
+				return txn.Delete(row)
+			}))
+			require.NoError(t, db.Close())
+		}
+	}
+}
+
+func TestHostRecoversMultipartPartAfterRestart(t *testing.T) {
+	client, cfg := staleHostConfig(t)
+	start := recoveryHostStarter(t, cfg, client)
+	stop := start()
+
+	status, body := client.send(http.MethodPut, "/"+staleBucket, "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	object := "/" + staleBucket + "/" + staleObject
+	status, body = client.send(http.MethodPost, object+"?uploads", "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	var upload struct {
+		ID string `xml:"UploadId"`
+	}
+	require.NoError(t, xml.Unmarshal(body, &upload))
+	require.NotEmpty(t, upload.ID)
+
+	want := bytes.Repeat([]byte("acknowledged multipart bytes"), 400)
+	status, body, headers := client.sendTyped(http.MethodPut, object+"?uploadId="+upload.ID+"&partNumber=1", "", want)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	etag := headers.Get("ETag")
+	require.NotEmpty(t, etag)
+	var placement handlers.ObjectToShardNodes
+	withHostClients(t, cfg, func(mc *meta.Client, _ *blob.Client, _ []config.NodeID) {
+		row := handlers.TableKey(model.TableObjects, "part:"+upload.ID+":00001")
+		raw, err := mc.AuthorityGet(t.Context(), row)
+		require.NoError(t, err)
+		placement, err = handlers.DecodePlacement(raw)
+		require.NoError(t, err)
+	})
+	stop()
+	client.http.CloseIdleConnections()
+	hash := model.ObjectHash(staleBucket, ".multipart/"+upload.ID+"/"+staleObject+"/00001")
+	dropRecoveryHostShardRows(t, cfg, hash, placement)
+
+	start()
+	withHostClients(t, cfg, func(_ *meta.Client, bc *blob.Client, _ []config.NodeID) {
+		for index, node := range placement.AllNodes() {
+			stat, err := bc.Stat(t.Context(), node, blob.StatRequest{
+				Key: hash, Index: uint32(index),
+			})
+			require.NoError(t, err, "the part must be recovered before the first read")
+			require.Equal(t, placement.WriteEpoch, stat.Epoch)
+		}
+	})
+	complete := fmt.Sprintf("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>", etag)
+	status, body = client.send(http.MethodPost, object+"?uploadId="+upload.ID, "", []byte(complete))
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	var completed struct {
+		ETag string `xml:"ETag"`
+	}
+	require.NoError(t, xml.Unmarshal(body, &completed))
+	require.NotEmpty(t, completed.ETag)
+	status, body = client.send(http.MethodGet, object, "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	require.Equal(t, want, body)
 }
 
 // sendTyped signs and issues one request, optionally declaring a content type,
@@ -402,4 +568,58 @@ func TestS7_AScopedDeleteThatStopsLeavesARetainedAcknowledgedObjectReadable(t *t
 		"ADR-0003:S7: an acknowledged object held only as retained rows stopped reading back: %s", got)
 	require.Equal(t, want, got, "the object read back as another generation's body")
 	require.Equal(t, putHeaders.Get("ETag"), after.Get("ETag"))
+}
+
+func TestHostRetiresDeferredShardThroughRaft(t *testing.T) {
+	client, cfg := staleHostConfig(t)
+	cfg.Compaction.DeferredRetirementAgeSeconds = 1
+	cfg.Compaction.RetainedMaxAgeSeconds = 10
+	start := recoveryHostStarter(t, cfg, client)
+	stop := start()
+	status, body := client.send(http.MethodPut, "/"+staleBucket, "", nil)
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	object := "/" + staleBucket + "/" + staleObject
+	status, body = client.send(http.MethodPut, object, "", []byte("extent to retire after restart"))
+	require.Equal(t, http.StatusOK, status, "%s", body)
+	hash := model.ObjectHash(staleBucket, staleObject)
+	row := handlers.TableKey(model.TableObjects, string(hash[:]))
+	var placement handlers.ObjectToShardNodes
+	var raw, witness []byte
+	withHostClients(t, cfg, func(mc *meta.Client, bc *blob.Client, _ []config.NodeID) {
+		var err error
+		raw, err = mc.AuthorityGet(t.Context(), row)
+		require.NoError(t, err)
+		placement, err = handlers.DecodePlacement(raw)
+		require.NoError(t, err)
+		reader, err := bc.Get(t.Context(), placement.AllNodes()[0], blob.GetRequest{
+			Key: hash, Epoch: placement.WriteEpoch, RangeStart: -1, RangeEnd: -1,
+		})
+		require.NoError(t, err)
+		witness, err = io.ReadAll(reader)
+		require.NoError(t, err)
+		require.NoError(t, reader.Close())
+		require.NoError(t, mc.Delete(t.Context(), row))
+	})
+	stop()
+	client.http.CloseIdleConnections()
+	dropRecoveryHostShardRows(t, cfg, hash, placement)
+	start()
+
+	withHostClients(t, cfg, func(mc *meta.Client, bc *blob.Client, _ []config.NodeID) {
+		var recovered []byte
+		require.Eventually(t, func() bool {
+			reader, err := bc.Get(t.Context(), placement.AllNodes()[0], blob.GetRequest{
+				Key: hash, Epoch: placement.WriteEpoch, RangeStart: -1, RangeEnd: -1,
+			})
+			if err != nil {
+				return false
+			}
+			defer reader.Close()
+			recovered, err = io.ReadAll(reader)
+			return err == nil
+		}, 30*time.Second, 200*time.Millisecond)
+		require.Equal(t, witness, recovered)
+		_, err := mc.Swap(t.Context(), row, raw)
+		require.ErrorContains(t, err, "placement epoch has been retired")
+	})
 }

@@ -343,9 +343,18 @@ var ErrNoLeaderRead = errors.New("no meta replica would serve a leader read")
 // LeaderGet is Get answered only by a leader that has applied everything
 // committed. A follower's not-found is not trusted, so neither is its value.
 func (c *Client) LeaderGet(ctx context.Context, key string) (value []byte, err error) {
+	return c.getFromLeader(ctx, OpMetaGet, key)
+}
+
+// AuthorityGet requires the leader to confirm a fresh quorum before reading.
+func (c *Client) AuthorityGet(ctx context.Context, key string) ([]byte, error) {
+	return c.getFromLeader(ctx, OpMetaAuthorityGet, key)
+}
+
+func (c *Client) getFromLeader(ctx context.Context, op rpc.Opcode, key string) (value []byte, err error) {
 	defer observeOp(ctx, telemetry.MetaOpGet, time.Now(), &err)
 
-	resp, err := c.leaderRead(ctx, OpMetaGet, request(key, 0))
+	resp, err := c.leaderRead(ctx, op, request(key, 0))
 	if err != nil {
 		return nil, err
 	}
@@ -612,6 +621,14 @@ func (c *Client) txnAnswer(target config.NodeID, resp *MetaResponse) (TxnOutcome
 	}
 }
 
+// RetirePlacement makes epoch ineligible if the observed placement is current.
+// Use an empty observed value when the placement was absent.
+func (c *Client) RetirePlacement(ctx context.Context, key string, epoch uint64, observed []byte) error {
+	req := request(key, 0)
+	req.Epoch = epoch
+	return c.write(ctx, OpMetaRetirePlacement, req, observed)
+}
+
 // Delete removes a key through the leader.
 func (c *Client) Delete(ctx context.Context, key string) (err error) {
 	defer observeOp(ctx, telemetry.MetaOpDelete, time.Now(), &err)
@@ -681,6 +698,9 @@ func (c *Client) writeValue(ctx context.Context, op rpc.Opcode, req *MetaRequest
 			// the entry is in the log, and the next leader can commit it.
 			if op == OpMetaSwap {
 				return nil, fmt.Errorf("swap %q: %w", req.Key, lastErr)
+			}
+			if op == OpMetaRetirePlacement {
+				return nil, fmt.Errorf("retire placement %q: %w", req.Key, lastErr)
 			}
 		}
 

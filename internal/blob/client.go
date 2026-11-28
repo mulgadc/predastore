@@ -13,6 +13,7 @@ import (
 	"github.com/mulgadc/predastore/internal/blob/engine"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/rpc"
+	"github.com/mulgadc/predastore/internal/telemetry"
 	"github.com/mulgadc/predastore/internal/transport"
 )
 
@@ -60,7 +61,9 @@ type PutRequest struct {
 	Size int64
 	// Epoch names the object generation this shard belongs to. Mandatory:
 	// zero is reserved as invalid and the node refuses it.
-	Epoch uint64
+	Epoch           uint64
+	PartPlacement   string
+	ObjectPlacement bool
 }
 
 // PutResponse reports what a node prepared.
@@ -85,7 +88,8 @@ type GetRequest struct {
 	RangeEnd   int64
 	// Epoch is the generation the caller will accept. Zero reads whatever the
 	// node holds, which only a caller with no placement record should do.
-	Epoch uint64
+	Epoch         uint64
+	PartPlacement string
 }
 
 // DeleteRequest identifies the value a delete removes.
@@ -304,13 +308,15 @@ func (c *Client) Put(ctx context.Context, nodeID config.NodeID, req PutRequest, 
 
 func putHeader(req PutRequest, hold bool) *Request {
 	return &Request{
-		Key:        req.Key,
-		Index:      req.Index,
-		Size:       req.Size,
-		Epoch:      req.Epoch,
-		RangeStart: -1,
-		RangeEnd:   -1,
-		Hold:       hold,
+		Key:             req.Key,
+		Index:           req.Index,
+		Size:            req.Size,
+		Epoch:           req.Epoch,
+		RangeStart:      -1,
+		RangeEnd:        -1,
+		Hold:            hold,
+		PartPlacement:   req.PartPlacement,
+		ObjectPlacement: req.ObjectPlacement,
 	}
 }
 
@@ -377,8 +383,10 @@ func (c *Client) sendBody(
 	// steadily must not be cut off. The caller's cancellation still applies.
 	stopCaller := context.AfterFunc(ctx, func() { abortStream(stream) })
 	guard := transport.NewWriteGuard(io.LimitReader(body, size), stream, c.idleTimeout)
+	start := time.Now()
 	_, err := stream.ReadFrom(guard)
 	guard.Stop()
+	recordWritePhase(ctx, nodeID, telemetry.ShardOpWriteBody, start, err != nil)
 	if err != nil {
 		stopCaller()
 		abortStream(stream)
@@ -396,7 +404,9 @@ func (c *Client) sendBody(
 
 	// The node does not answer until the shard is durable, so this waits on
 	// the disk and is bounded as such.
+	start = time.Now()
 	resp, err := c.awaitEnvelopeWithin(ctx, stream, br, c.commitTimeout)
+	recordWritePhase(ctx, nodeID, telemetry.ShardOpPrepareReply, start, err != nil || resp.Err != "")
 	if err != nil {
 		stream.CancelRead(0)
 		// The body is already delivered and half-closed, so a node that has
@@ -417,6 +427,14 @@ func (c *Client) sendBody(
 		return nil, fmt.Errorf("put to node %d: %s", nodeID, resp.Err)
 	}
 	return resp, nil
+}
+
+func recordWritePhase(ctx context.Context, nodeID config.NodeID, op string, start time.Time, failed bool) {
+	outcome := telemetry.OutcomeSuccess
+	if failed {
+		outcome = telemetry.OutcomeError
+	}
+	telemetry.RecordShardOp(ctx, op, outcome, uint64(nodeID), time.Since(start).Seconds())
 }
 
 // Delete marks a value deleted on the node.
@@ -489,7 +507,9 @@ func (c *Client) Stat(ctx context.Context, nodeID config.NodeID, req StatRequest
 // Commit publishes a prepared shard. The bool reports that a newer generation
 // had already taken the position, so this commit published nothing — a lost
 // race, not a failure.
-func (c *Client) Commit(ctx context.Context, nodeID config.NodeID, req CommitRequest) (bool, error) {
+func (c *Client) Commit(ctx context.Context, nodeID config.NodeID, req CommitRequest) (_ bool, err error) {
+	start := time.Now()
+	defer func() { recordWritePhase(ctx, nodeID, telemetry.ShardOpCommit, start, err != nil) }()
 	resp, err := c.finish(ctx, nodeID, OpCommit, "commit", req)
 	if err != nil {
 		return false, err
@@ -578,11 +598,12 @@ func (c *Client) finish(ctx context.Context, nodeID config.NodeID, op rpc.Opcode
 // stream.
 func (c *Client) Get(ctx context.Context, nodeID config.NodeID, req GetRequest) (io.ReadCloser, error) {
 	stream, err := c.openBounded(ctx, nodeID, OpGet, &Request{
-		Key:        req.Key,
-		Index:      req.Index,
-		Epoch:      req.Epoch,
-		RangeStart: req.RangeStart,
-		RangeEnd:   req.RangeEnd,
+		Key:           req.Key,
+		Index:         req.Index,
+		Epoch:         req.Epoch,
+		RangeStart:    req.RangeStart,
+		RangeEnd:      req.RangeEnd,
+		PartPlacement: req.PartPlacement,
 	})
 	if err != nil {
 		return nil, err

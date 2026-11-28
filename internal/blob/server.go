@@ -49,6 +49,12 @@ type SnapshotStore interface {
 
 var _ SnapshotStore = (*engine.Store)(nil)
 
+type recoveredPrepareStore interface {
+	LookupRecoveredAt(context.Context, [32]byte, uint32, uint64, func(context.Context, [32]byte, uint32, uint64) (bool, error)) (engine.Reader, error)
+}
+
+var _ recoveredPrepareStore = (*engine.Store)(nil)
+
 var _ Store = (*engine.Store)(nil)
 
 // Config is everything one blob node runs on. The listeners arrive already
@@ -83,6 +89,12 @@ type Config struct {
 	// BodyIdleTimeout bounds a get body whose peer has stopped reading, and a
 	// held put body that has stopped arriving. Zero uses DefaultBodyIdleTimeout.
 	BodyIdleTimeout time.Duration
+
+	// AuthorizeRecoveredPrepare checks authoritative placement at startup.
+	AuthorizeRecoveredPrepare func(context.Context, [32]byte, uint32, uint64) (bool, error)
+	AuthorizeRecoveredPart    func(context.Context, string, [32]byte, uint32, uint64) (bool, error)
+	RetireRecovered           func(context.Context, string, uint64) (bool, error)
+	DeferredRetirementAge     time.Duration
 
 	// Store stands in for the engine that would be opened at DataDir. Test
 	// seam: production leaves it nil.
@@ -143,6 +155,9 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		st, err := engine.Open(s.cfg.DataDir,
 			engine.WithAEAD(s.cfg.AEAD), engine.WithCompaction(s.cfg.Compaction),
+			engine.WithStartupPrepareRecovery(ctx, s.cfg.AuthorizeRecoveredPrepare),
+			engine.WithStartupPartRecovery(s.cfg.AuthorizeRecoveredPart),
+			engine.WithDeferredRetirement(ctx, s.cfg.DeferredRetirementAge, s.cfg.RetireRecovered),
 			engine.WithRetainedMaxAge(s.cfg.RetainedMaxAge),
 			engine.WithCompactionSlot(slot, slots),
 			engine.WithCompactionPacing(s.cfg.CompactionMaxBytesPerSec, s.cfg.CompactionYieldLatency, s.cfg.CompactionMaxYield))
@@ -252,7 +267,7 @@ func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stre
 		return respond(stream, &Response{Err: "no write epoch specified"})
 	}
 
-	writer, err := st.Append(h.Key, h.Index, h.Size, h.Epoch)
+	writer, err := s.appendShard(h)
 	if err != nil {
 		// Drain the client's in-flight body so the reply is carried
 		// instead of racing a stream reset.
@@ -286,6 +301,30 @@ func (s *Server) handlePut(ctx context.Context, h Request, stream transport.Stre
 	return respond(stream, &Response{Size: h.Size, PoolNearFull: st.NearFull(), Epoch: h.Epoch})
 }
 
+type placementAppender interface {
+	AppendPlacement(key [32]byte, index uint32, size int64, epoch uint64, hold bool, placement string) (engine.Writer, error)
+}
+
+var _ placementAppender = (*engine.Store)(nil)
+
+func (s *Server) appendShard(h Request) (engine.Writer, error) {
+	if h.PartPlacement != "" && h.ObjectPlacement {
+		return nil, errors.New("conflicting shard placement identities")
+	}
+	if h.PartPlacement != "" || h.ObjectPlacement {
+		if store, ok := s.store.(placementAppender); ok {
+			return store.AppendPlacement(h.Key, h.Index, h.Size, h.Epoch, h.Hold, h.PartPlacement)
+		}
+		if h.PartPlacement != "" {
+			return nil, errors.New("store cannot record multipart placement")
+		}
+	}
+	if h.Hold {
+		return s.store.AppendHeld(h.Key, h.Index, h.Size, h.Epoch)
+	}
+	return s.store.Append(h.Key, h.Index, h.Size, h.Epoch)
+}
+
 // handlePutHeld opens a held put. It sends no body before Registered, so a
 // refusal is answered at once, and a second put of an open shard is refused
 // before it gets a writer that could prepare over the first.
@@ -297,7 +336,7 @@ func (s *Server) handlePutHeld(h Request, stream transport.Stream) error {
 	if !s.held.register(k, func() { stream.CancelRead(transport.StreamCodeCallerGone) }) {
 		return respond(stream, &Response{Err: "a held write of this shard is already open"})
 	}
-	writer, err := s.store.AppendHeld(h.Key, h.Index, h.Size, h.Epoch)
+	writer, err := s.appendShard(h)
 	if err != nil {
 		s.held.finish(k)
 		if errors.Is(err, engine.ErrStoreFull) {
@@ -448,6 +487,9 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 	reader, err := st.Lookup(h.Key, h.Index)
 	if errors.Is(err, engine.ErrKeyNotFound) && h.Epoch != 0 {
 		reader, err = s.completeFirst(h)
+		if err != nil {
+			reader, err = s.lookupRecovered(ctx, h, err)
+		}
 	}
 	if err != nil {
 		return respond(stream, &Response{Err: ErrCodeNotFound})
@@ -455,6 +497,9 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 	if h.Epoch != 0 && reader.Epoch() != h.Epoch {
 		held := reader.Epoch()
 		reader, err = s.resolveEpoch(h, reader)
+		if err != nil {
+			reader, err = s.lookupRecovered(ctx, h, err)
+		}
 		if err != nil {
 			return respond(stream, &Response{Err: ErrCodeEpochMismatch, Epoch: held})
 		}
@@ -521,6 +566,23 @@ func (s *Server) markSuspect(pos shardPosition, epoch uint64) {
 	}
 }
 
+func (s *Server) lookupRecovered(ctx context.Context, h Request, cause error) (engine.Reader, error) {
+	if !errors.Is(cause, engine.ErrNotPrepared) && !errors.Is(cause, engine.ErrKeyNotFound) {
+		return nil, cause
+	}
+	store, ok := s.store.(recoveredPrepareStore)
+	if !ok || s.cfg.AuthorizeRecoveredPrepare == nil {
+		return nil, cause
+	}
+	if h.PartPlacement != "" && s.cfg.AuthorizeRecoveredPart != nil {
+		return store.LookupRecoveredAt(ctx, h.Key, h.Index, h.Epoch,
+			func(ctx context.Context, key [32]byte, index uint32, epoch uint64) (bool, error) {
+				return s.cfg.AuthorizeRecoveredPart(ctx, h.PartPlacement, key, index, epoch)
+			})
+	}
+	return store.LookupRecoveredAt(ctx, h.Key, h.Index, h.Epoch, s.cfg.AuthorizeRecoveredPrepare)
+}
+
 // resolveEpoch answers a get whose live shard is the wrong generation. Two
 // cases reach here and both are ordinary:
 //
@@ -555,6 +617,10 @@ func (s *Server) resolveEpoch(h Request, stale engine.Reader) (engine.Reader, er
 	}
 
 	if _, err := s.store.Commit(h.Key, h.Index, h.Epoch); err != nil {
+		if errors.Is(err, engine.ErrNotPrepared) {
+			// A deferred extent may have been released without becoming live.
+			return s.store.LookupAt(h.Key, h.Index, h.Epoch)
+		}
 		return nil, err
 	}
 	reader, err := s.store.LookupAt(h.Key, h.Index, h.Epoch)

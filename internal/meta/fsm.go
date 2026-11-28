@@ -32,6 +32,8 @@ const (
 	// CommandTxn applies its writes only if every one of its checks holds,
 	// and publishes all of them or none.
 	CommandTxn
+	// CommandRetirePlacement makes one exact placement epoch ineligible.
+	CommandRetirePlacement
 )
 
 // commandTypeUnset fills the type before a decode, so an entry with no type,
@@ -299,7 +301,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 			continue
 		}
 		responses[i] = b.stage(cmd, log.Index)
-		if _, failed := responses[i].(error); !failed && isMapHeadObject(cmd.Key) {
+		if _, failed := responses[i].(error); !failed && cmd.Type != CommandRetirePlacement && isMapHeadObject(cmd.Key) {
 			mapHeadChanges = append(mapHeadChanges, Command{Type: cmd.Type, Key: cmd.Key})
 		}
 	}
@@ -532,7 +534,9 @@ func (f *FSM) stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
 		if w.Delete {
 			err = txn.Delete(w.Key)
 		} else {
-			err = txn.Set(w.Key, w.Value)
+			if err = refuseRetiredPlacement(txn, w.Key, w.Value); err == nil {
+				err = txn.Set(w.Key, w.Value)
+			}
 		}
 		if err != nil {
 			return TxnResult{}, err
@@ -558,10 +562,16 @@ func (f *FSM) stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
 func (f *FSM) applyCommand(txn *badger.Txn, cmd Command) (any, error) {
 	switch cmd.Type {
 	case CommandPut, CommandPutMax:
+		if err := refuseRetiredPlacement(txn, cmd.Key, cmd.Value); err != nil {
+			return nil, err
+		}
 		return nil, txn.Set(cmd.Key, cmd.Value)
 	case CommandDelete:
 		return nil, txn.Delete(cmd.Key)
 	case CommandSwap:
+		if err := refuseRetiredPlacement(txn, cmd.Key, cmd.Value); err != nil {
+			return nil, err
+		}
 		previous, _, err := f.readValue(txn, cmd.Key)
 		if err != nil {
 			return nil, err
@@ -570,6 +580,8 @@ func (f *FSM) applyCommand(txn *badger.Txn, cmd Command) (any, error) {
 			return nil, err
 		}
 		return previous, nil
+	case CommandRetirePlacement:
+		return nil, f.retirePlacement(txn, cmd)
 	default:
 		return nil, fmt.Errorf("unknown command type: %d", cmd.Type)
 	}

@@ -29,6 +29,8 @@ import (
 	"github.com/mulgadc/predastore/internal/blob"
 	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate"
+	"github.com/mulgadc/predastore/internal/gate/handlers"
+	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/gate/repair"
 	"github.com/mulgadc/predastore/internal/meta"
 	"github.com/mulgadc/predastore/internal/rpc"
@@ -137,6 +139,70 @@ func Run(ctx context.Context, opts Options) error {
 		g.Go(func() error { return run(gctx) })
 	}
 	return g.Wait()
+}
+
+func authorizeShardRecovery(ctx context.Context, client *meta.Client, holder config.NodeID, key [32]byte, index uint32, epoch uint64) (bool, error) {
+	return authorizePlacementRow(ctx, client, holder, string(key[:]), index, epoch)
+}
+
+func authorizePartRecovery(ctx context.Context, client *meta.Client, holder config.NodeID, placement string, key [32]byte, index uint32, epoch uint64) (bool, error) {
+	partHash, err := handlers.PartPlacementHash(ctx, func(ctx context.Context, key string) ([]byte, error) {
+		return readRecoveryAuthority(ctx, client, key)
+	}, placement)
+	if errors.Is(err, meta.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil || partHash != key {
+		return false, err
+	}
+	return authorizePlacementRow(ctx, client, holder, placement, index, epoch)
+}
+
+func authorizePlacementRow(ctx context.Context, client *meta.Client, holder config.NodeID, placement string, index uint32, epoch uint64) (bool, error) {
+	raw, err := readRecoveryAuthority(ctx, client, handlers.TableKey(model.TableObjects, placement))
+	if errors.Is(err, meta.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	decoded, err := handlers.DecodePlacement(raw)
+	if err != nil {
+		return false, err
+	}
+	nodes := decoded.AllNodes()
+	return decoded.WriteEpoch == epoch && uint64(index) < uint64(len(nodes)) && nodes[index] == holder, nil
+}
+
+func readRecoveryAuthority(ctx context.Context, client *meta.Client, key string) ([]byte, error) {
+	for {
+		raw, err := client.AuthorityGet(ctx, key)
+		if !errors.Is(err, meta.ErrNoLeaderRead) {
+			return raw, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+func retireShardPlacement(ctx context.Context, client *meta.Client, placement string, epoch uint64) (bool, error) {
+	key := handlers.TableKey(model.TableObjects, placement)
+	raw, err := client.AuthorityGet(ctx, key)
+	if err == nil {
+		current, err := handlers.DecodePlacement(raw)
+		if err != nil || current.WriteEpoch == epoch {
+			return false, err
+		}
+	} else if !errors.Is(err, meta.ErrNotFound) {
+		return false, err
+	}
+	if err := client.RetirePlacement(ctx, key, epoch, raw); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // checkDataDirs proves every local node can write its directory before any
@@ -432,6 +498,14 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 		// The node owns its store: it creates the directory, opens the engine
 		// and closes it again, so no failure here can leak one.
 		slot, slots := compactionSlot(cfg, n.ID)
+		pool = rpc.NewConnPool(n.ID, res)
+		metaClient, merr := meta.NewClient(meta.ClientConfig{
+			Client: rpc.NewClient(pool), Replicas: nodeIDs(nodesByRole(cfg, RoleMeta)),
+		})
+		if merr != nil {
+			cleanup()
+			return builtNode{}, fmt.Errorf("create recovery client for blob node %d: %w", n.ID, merr)
+		}
 		svc, berr := blob.New(blob.Config{
 			NodeID:                   n.ID,
 			DataDir:                  dir,
@@ -444,6 +518,16 @@ func buildNode(cfg *Config, host HostConfig, n NodeConfig, opts Options, barrier
 			CompactionYieldLatency:   time.Duration(cfg.Compaction.YieldLatencyMs) * time.Millisecond,
 			CompactionMaxYield:       time.Duration(cfg.Compaction.MaxYieldSeconds) * time.Second,
 			Listeners:                lns,
+			AuthorizeRecoveredPrepare: func(ctx context.Context, key [32]byte, index uint32, epoch uint64) (bool, error) {
+				return authorizeShardRecovery(ctx, metaClient, n.ID, key, index, epoch)
+			},
+			AuthorizeRecoveredPart: func(ctx context.Context, placement string, key [32]byte, index uint32, epoch uint64) (bool, error) {
+				return authorizePartRecovery(ctx, metaClient, n.ID, placement, key, index, epoch)
+			},
+			DeferredRetirementAge: time.Duration(cfg.Compaction.DeferredRetirementAgeSeconds) * time.Second,
+			RetireRecovered: func(ctx context.Context, placement string, epoch uint64) (bool, error) {
+				return retireShardPlacement(ctx, metaClient, placement, epoch)
+			},
 		})
 		if berr != nil {
 			cleanup()

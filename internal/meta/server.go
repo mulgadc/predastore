@@ -174,6 +174,8 @@ func (s *Server) open() (*rpc.Server, error) {
 	rpc.RegisterHandler(mux, OpMetaDelete, s.handleDelete)
 	rpc.RegisterHandler(mux, OpMetaScan, s.handleScan)
 	rpc.RegisterHandler(mux, OpMetaLastKey, s.handleLastKey)
+	rpc.RegisterHandler(mux, OpMetaAuthorityGet, s.handleAuthorityGet)
+	rpc.RegisterHandler(mux, OpMetaRetirePlacement, s.handleRetirePlacement)
 	rpc.RegisterHandler(mux, OpMetaStatus, s.handleStatus)
 	srv, err := rpc.NewServer(mux, s.cfg.Listeners, s.pool)
 	if err != nil {
@@ -667,14 +669,15 @@ func (s *Server) status() MetaStatus {
 	leader := string(s.raft.Leader())
 
 	return MetaStatus{
-		NodeID:       strconv.FormatUint(uint64(s.cfg.NodeID), 10),
-		State:        stats["state"],
-		Leader:       leader,
-		LeaderAddr:   s.leaderDialAddr(leader),
-		Term:         stats["term"],
-		CommitIndex:  stats["commit_index"],
-		AppliedIndex: stats["applied_index"],
-		IsLeader:     s.raft.State() == raft.Leader,
+		NodeID:              strconv.FormatUint(uint64(s.cfg.NodeID), 10),
+		State:               stats["state"],
+		Leader:              leader,
+		LeaderAddr:          s.leaderDialAddr(leader),
+		Term:                stats["term"],
+		CommitIndex:         stats["commit_index"],
+		AppliedIndex:        stats["applied_index"],
+		IsLeader:            s.raft.State() == raft.Leader,
+		PlacementRetirement: true,
 	}
 }
 

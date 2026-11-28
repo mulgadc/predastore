@@ -54,6 +54,7 @@ type ObjectToShardNodes struct {
 
 	DataShardNodes   []config.NodeID
 	ParityShardNodes []config.NodeID
+	partPlacement    string
 }
 
 // AllNodes returns the shard nodes in shard order: data first, then parity, so
@@ -125,6 +126,13 @@ func (r writeResult) landedCount() int {
 // where the record says, and both the read path and repair look there.
 func (r writeResult) degraded() bool { return r.shortBy() > 0 }
 
+func (r writeResult) recordObjectWriteSuccess(ctx context.Context, dataShards int) {
+	telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeSuccess, "")
+	if r.committed > 0 {
+		telemetry.RecordObjectShardMargin(ctx, r.committed-dataShards)
+	}
+}
+
 // shortBy is how many positions the write is short of full width: those not
 // committed once the commits have run, and those that never landed before.
 func (r writeResult) shortBy() int {
@@ -155,7 +163,7 @@ func fullWidth(total int) writeResult {
 // or signature failure arrives here rather than at the end of the body. Those
 // are the client's fault and must not be reported as ours.
 func mapPutErr(err error) *model.S3Error {
-	if errors.Is(err, engine.ErrStoreFull) {
+	if isCapacityWriteFailure(err) {
 		return model.ErrInsufficientStorageError
 	}
 	if s3err, ok := model.IsS3Error(mapChunkedErr(err)); ok && !isInternal(s3err) {
@@ -178,7 +186,7 @@ func isInternal(err *model.S3Error) bool {
 // one makes the storage-failure metric fire on client errors.
 func writeFailureReason(err error) string {
 	switch {
-	case errors.Is(err, engine.ErrStoreFull):
+	case isCapacityWriteFailure(err):
 		return telemetry.WriteReasonStoreFull
 	case errors.Is(err, sigv4.ErrContentSHA256Mismatch),
 		errors.Is(err, chunked.ErrChunkSignature),
@@ -187,6 +195,13 @@ func writeFailureReason(err error) string {
 	default:
 		return telemetry.WriteReasonShardWrite
 	}
+}
+
+// A floor failure is reported as capacity only if every refusing holder was full.
+var errMixedShardFailure = errors.New("capacity and other shard failures")
+
+func isCapacityWriteFailure(err error) bool {
+	return errors.Is(err, engine.ErrStoreFull) && !errors.Is(err, errMixedShardFailure)
 }
 
 // placeShards resolves where an object's shards live, in the ring order
@@ -265,14 +280,14 @@ func recordShardOutcome(ctx context.Context, op string, node config.NodeID, star
 // records size and a short value would read back as a corrupt object.
 func writeSingleShard(
 	ctx context.Context, bc BlobClient, node config.NodeID, body io.Reader, size int64,
-	objectHash [32]byte, epoch uint64,
+	objectHash [32]byte, epoch uint64, partPlacement string,
 ) (_ writeResult, err error) {
 	start := time.Now()
 	defer func() { recordShardOutcome(ctx, telemetry.ShardOpWrite, node, start, err) }()
 
 	counted := &countingReader{r: body}
 
-	resp, err := bc.Put(ctx, node, blob.PutRequest{Key: objectHash, Size: size, Index: 0, Epoch: epoch}, counted)
+	resp, err := bc.Put(ctx, node, blob.PutRequest{Key: objectHash, Size: size, Index: 0, Epoch: epoch, PartPlacement: partPlacement, ObjectPlacement: partPlacement == ""}, counted)
 	if err != nil {
 		return writeResult{landed: []bool{false}, missing: []config.NodeID{node}}, err
 	}
@@ -307,10 +322,10 @@ func writeObject(ctx context.Context, bc BlobClient, cfg Config, ring *placement
 	// to encode. Streaming it straight through is what keeps a single-node
 	// write off the heap, so it is its own path rather than a degenerate split.
 	if cfg.DataShards == 1 && cfg.ParityShards == 0 {
-		return writeSingleShard(ctx, bc, shardNodes[0], body, size, objectHash, epoch)
+		return writeSingleShard(ctx, bc, shardNodes[0], body, size, objectHash, epoch, place.partPlacement)
 	}
 
-	return streamShards(ctx, bc, cfg, objectHash, epoch, shardNodes, body,
+	return streamShards(ctx, bc, cfg, objectHash, epoch, shardNodes, body, place.partPlacement,
 		newLayout(cfg.DataShards, size, place.BlockSize), size,
 		handoffNode(ring, cfg, objectHash))
 }
@@ -347,7 +362,7 @@ func (zeroPadding) Read(p []byte) (int, error) {
 func streamShards(
 	ctx context.Context, bc BlobClient, cfg Config,
 	objectHash [32]byte, epoch uint64, shardNodes []config.NodeID,
-	body io.Reader, lay layout, size int64, handoff config.NodeID,
+	body io.Reader, partPlacement string, lay layout, size int64, handoff config.NodeID,
 ) (writeResult, error) {
 	total := cfg.TotalShards()
 	shardSize, blockSize := lay.shardSize, lay.blockSize
@@ -370,7 +385,7 @@ func streamShards(
 
 	streams := make([]*shardStream, total)
 	for i := range total {
-		streams[i] = startShardStream(ctx, bc, objectHash, epoch, i, shardNodes[i], shardSize)
+		streams[i] = startShardStream(ctx, bc, objectHash, epoch, i, shardNodes[i], shardSize, partPlacement)
 	}
 
 	// The body is padded so a short last stripe still encodes, and counted so a
@@ -399,7 +414,7 @@ func streamShards(
 
 		refused := writeStripe(streams, stripe)
 		if offset == 0 {
-			handOff(ctx, bc, objectHash, epoch, streams, stripe, refused, handoff, shardSize)
+			handOff(ctx, bc, objectHash, epoch, streams, stripe, refused, handoff, shardSize, partPlacement)
 		}
 	}
 
@@ -427,7 +442,7 @@ type shardStream struct {
 
 func startShardStream(
 	ctx context.Context, bc BlobClient, objectHash [32]byte, epoch uint64,
-	index int, node config.NodeID, shardSize int64,
+	index int, node config.NodeID, shardSize int64, partPlacement string,
 ) *shardStream {
 	pr, pw := io.Pipe()
 	s := &shardStream{
@@ -437,10 +452,12 @@ func startShardStream(
 
 	go func() {
 		resp, err := bc.Put(ctx, node, blob.PutRequest{
-			Key:   objectHash,
-			Size:  shardSize,
-			Index: uint32(index), //nolint:gosec // G115: index bounded by the shard count.
-			Epoch: epoch,
+			Key:             objectHash,
+			Size:            shardSize,
+			Index:           uint32(index), //nolint:gosec // G115: index bounded by the shard count.
+			Epoch:           epoch,
+			PartPlacement:   partPlacement,
+			ObjectPlacement: partPlacement == "",
 		}, pr)
 		// Closing the read side is what releases a producer still writing into
 		// a stream whose node has gone: io.Pipe has no buffer and does not
@@ -525,7 +542,7 @@ func writeStripe(streams []*shardStream, stripe [][]byte) []int {
 func handOff(
 	ctx context.Context, bc BlobClient, objectHash [32]byte, epoch uint64,
 	streams []*shardStream, stripe [][]byte, refused []int,
-	handoff config.NodeID, shardSize int64,
+	handoff config.NodeID, shardSize int64, partPlacement string,
 ) {
 	if handoff == 0 {
 		return
@@ -534,7 +551,7 @@ func handOff(
 		if streams[i].owner == handoff {
 			continue
 		}
-		alt := startShardStream(ctx, bc, objectHash, epoch, i, handoff, shardSize)
+		alt := startShardStream(ctx, bc, objectHash, epoch, i, handoff, shardSize, partPlacement)
 		alt.owner = streams[i].owner
 		if !alt.write(stripe[i]) {
 			<-alt.done
@@ -571,13 +588,15 @@ func collectStreams(ctx context.Context, cfg Config, streams []*shardStream, res
 		}
 	}
 
-	var firstErr error
+	var failures []error
+	capacityFailures := 0
 	for i, s := range streams {
 		result.holders[i] = s.holder
 		outcome := <-s.done
 		if outcome.err != nil {
-			if firstErr == nil {
-				firstErr = outcome.err
+			failures = append(failures, outcome.err)
+			if errors.Is(outcome.err, engine.ErrStoreFull) {
+				capacityFailures++
 			}
 			logShardWriteFailure(ctx, s.holder, i, outcome.err)
 			// The holder took the body and went quiet. Leave it named in the
@@ -603,8 +622,11 @@ func collectStreams(ctx context.Context, cfg Config, streams []*shardStream, res
 	}
 
 	if landed := result.landedCount(); landed < cfg.MinShards() {
+		if capacityFailures > 0 && capacityFailures < len(failures) {
+			failures = append(failures, errMixedShardFailure)
+		}
 		return result, fmt.Errorf("%w: %d of %d shards durable, nodes %v unreachable: %w",
-			errShardWriteFloor, landed, cfg.MinShards(), result.missing, firstErr)
+			errShardWriteFloor, landed, cfg.MinShards(), result.missing, errors.Join(failures...))
 	}
 
 	return result, nil
@@ -836,6 +858,8 @@ func recordShardReadError(ctx context.Context, node config.NodeID, err error) {
 // stale epoch is a node that is up, answering and wrong.
 func shardErrorReason(err error) string {
 	switch {
+	case errors.Is(err, engine.ErrStoreFull):
+		return telemetry.ShardReasonStoreFull
 	case errors.Is(err, blob.ErrEpochMismatch):
 		return telemetry.ShardReasonStaleEpoch
 	case errors.Is(err, blob.ErrNotFound):

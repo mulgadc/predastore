@@ -4,16 +4,52 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/mulgadc/bluebottle/pkg/sigv4"
 	"github.com/mulgadc/predastore/internal/blob/engine"
+	"github.com/mulgadc/predastore/internal/config"
 	"github.com/mulgadc/predastore/internal/gate/chunked"
 	"github.com/mulgadc/predastore/internal/gate/model"
 	"github.com/mulgadc/predastore/internal/telemetry"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestShardWriteFloorStatusDoesNotDependOnFailureOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		causes [2]error
+		status int
+		reason string
+	}{
+		{"capacity then I/O", [2]error{engine.ErrStoreFull, syscall.EIO}, http.StatusInternalServerError, telemetry.WriteReasonShardWrite},
+		{"I/O then capacity", [2]error{syscall.EIO, engine.ErrStoreFull}, http.StatusInternalServerError, telemetry.WriteReasonShardWrite},
+		{"capacity only", [2]error{engine.ErrStoreFull, engine.ErrStoreFull}, http.StatusInsufficientStorage, telemetry.WriteReasonStoreFull},
+		{"I/O only", [2]error{syscall.EIO, syscall.EIO}, http.StatusInternalServerError, telemetry.WriteReasonShardWrite},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var streams []*shardStream
+			for index, cause := range tc.causes {
+				done := make(chan shardWriteOutcome, 1)
+				done <- shardWriteOutcome{err: cause}
+				node := config.NodeID(index + 1)
+				streams = append(streams, &shardStream{failed: true, done: done, owner: node, holder: node})
+			}
+			_, err := collectStreams(t.Context(), Config{DataShards: 2}, streams, writeResult{holders: make([]config.NodeID, 2)})
+			assert.ErrorIs(t, err, errShardWriteFloor)
+			for _, cause := range tc.causes {
+				assert.ErrorIs(t, err, cause)
+			}
+			assert.Equal(t, tc.status, mapPutErr(err).StatusCode)
+			assert.Equal(t, tc.reason, writeFailureReason(err))
+		})
+	}
+	assert.Equal(t, telemetry.ShardReasonStoreFull, shardErrorReason(engine.ErrStoreFull))
+	assert.Equal(t, telemetry.ShardReasonTransport, shardErrorReason(syscall.EIO))
+}
 
 // TestMapPutErr covers how a failure during the shard write is reported. The
 // body is decoded as the shards are written, so a client's framing or signature

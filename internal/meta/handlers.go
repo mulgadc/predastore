@@ -44,6 +44,17 @@ func (s *Server) handleGet(ctx context.Context, h MetaRequest, stream transport.
 	if refused, err := s.refuseLeaderRead(h, stream); refused {
 		return err
 	}
+	return s.respondGet(h, stream)
+}
+
+func (s *Server) handleAuthorityGet(ctx context.Context, h MetaRequest, stream transport.Stream) error {
+	if code := s.authorityRead(ctx); code != "" {
+		return respond(stream, &MetaResponse{Err: code, Leader: s.leaderAddr()})
+	}
+	return s.respondGet(h, stream)
+}
+
+func (s *Server) respondGet(h MetaRequest, stream transport.Stream) error {
 	// The raft node keys by Go string; the bytes survive the conversion, so
 	// the key badger stores is the one the client sent.
 	value, err := s.get(string(h.Key))

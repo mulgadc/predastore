@@ -198,7 +198,7 @@ func PutObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucket
 
 		// Counted only once both keys have landed: until then the shards exist
 		// but nothing references them, which is not an object.
-		telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeSuccess, "")
+		written.recordObjectWriteSuccess(ctx, cfg.DataShards)
 
 		// Nearfull writes still succeed; the header lets clients back off before
 		// hitting the hard 507 rejection.

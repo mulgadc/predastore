@@ -6,6 +6,7 @@
 package engine
 
 import (
+	"context"
 	"crypto/cipher"
 	"encoding/binary"
 	"errors"
@@ -13,11 +14,14 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/dgraph-io/badger/v4"
+	"github.com/mulgadc/predastore/internal/gate/model"
+	"golang.org/x/sys/unix"
 )
 
 const indexFilename = "db"
@@ -31,7 +35,8 @@ const fragNumReservation = 1 << 20 // 1 048 576
 // Store manages segment files and an index mapping keys to on-disk
 // extents. All public methods are safe for concurrent use.
 type Store struct {
-	dir string
+	dir     string
+	dirLock *os.File
 
 	// The on-disk index: key -> extent, plus the tombstone namespace.
 	index *badger.DB
@@ -58,16 +63,24 @@ type Store struct {
 
 	// The durably-reserved ceiling on fragNum; Append fsyncs only to raise it.
 	fragNumHighWater uint64
+	deferredState    bool
 
 	// keyVerified reports that a key check this store sealed opens under aead.
 	keyVerified bool
 
 	maxSegSize uint64
 
-	compactionEnabled  bool
-	compactionInterval time.Duration
-	retainedMaxAge     time.Duration
-	compactor          *compactor
+	compactionEnabled   bool
+	compactionInterval  time.Duration
+	retainedMaxAge      time.Duration
+	compactor           *compactor
+	startupRecovery     func(*Store) error
+	authorizeRecovered  prepareAuthority
+	startupPartRecovery func(context.Context, string, [32]byte, uint32, uint64) (bool, error)
+	retireRecovered     func(context.Context, string, uint64) (bool, error)
+	deferredContext     context.Context
+	retirementAge       time.Duration
+	retirementCursor    []byte
 
 	// This node's slot among the cluster's blob nodes, which offsets its
 	// routine passes, and the pacing a routine pass runs under.
@@ -325,8 +338,29 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, errors.New("aead is required (use WithAEAD)")
 	}
 
+	// Hold ownership before reading or reserving state. Badger's own lock
+	// is acquired later and covers only its index directory.
+	dirLock, err := os.Open(dir)
+	if err != nil {
+		return nil, fmt.Errorf("open store directory: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, dirLock.Close())
+		}
+	}()
+	if err := unix.Flock(int(dirLock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return nil, fmt.Errorf("lock store directory %s: %w", dir, err)
+	}
+	store.dirLock = dirLock
+
 	if err := store.loadState(); err != nil {
 		return nil, fmt.Errorf("load state: %w", err)
+	}
+	if store.deferredState {
+		if err := store.reserveLegacyStateTemp(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Reserve a fresh window durably before Open returns. On a new data dir this
@@ -341,6 +375,23 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("open disk index: %w", err)
 	}
+	index := store.index
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, index.Close())
+		}
+	}()
+	if err := store.fenceExistingDeferred(); err != nil {
+		return nil, err
+	}
+	segments := store.segCache
+	defer func() {
+		if err != nil {
+			for _, seg := range segments {
+				err = errors.Join(err, seg.Close())
+			}
+		}
+	}()
 
 	// Counted once here, then maintained by create and drop. Doing it at Open
 	// is what keeps the reporting path free of a directory read.
@@ -353,6 +404,13 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 
 	if _, err := store.nextAvailableSegment(); err != nil {
 		return nil, err
+	}
+
+	if store.startupRecovery != nil {
+		if err := store.startupRecovery(store); err != nil {
+			return nil, fmt.Errorf("recover prepared extents: %w", err)
+		}
+		store.startupRecovery = nil
 	}
 
 	if store.compactionEnabled {
@@ -496,6 +554,14 @@ func (store *Store) LookupAt(key [32]byte, index uint32, epoch uint64) (Reader, 
 // wider prepared-shaped value so they can be aged out, and decodeIndexValue
 // takes both widths, so the same open serves either namespace.
 func (store *Store) lookup(rowKey []byte, key [32]byte, index uint32) (Reader, error) {
+	r, err := store.lookupReader(rowKey, key, index)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (store *Store) lookupReader(rowKey []byte, key [32]byte, index uint32) (*reader, error) {
 	store.mutex.Lock()
 	defer store.mutex.Unlock()
 
@@ -549,16 +615,28 @@ func (store *Store) lookup(rowKey []byte, key [32]byte, index uint32) (Reader, e
 // epoch is opaque here: the engine stores it, returns it on Lookup and matches
 // it on Commit, and never orders or interprets it.
 func (store *Store) Append(key [32]byte, index uint32, size int64, epoch uint64) (Writer, error) {
-	return store.appendValue(key, index, size, epoch, false)
+	return store.appendValue(key, index, size, epoch, false, model.MultipartPlacement{}, false)
 }
 
 // AppendHeld is Append for a write whose fate a caller decides later. Its
 // prepared row is never swept by age; only Commit or Abort removes it.
 func (store *Store) AppendHeld(key [32]byte, index uint32, size int64, epoch uint64) (Writer, error) {
-	return store.appendValue(key, index, size, epoch, true)
+	return store.appendValue(key, index, size, epoch, true, model.MultipartPlacement{}, false)
 }
 
-func (store *Store) appendValue(key [32]byte, index uint32, size int64, epoch uint64, hold bool) (Writer, error) {
+// AppendPlacement records the declared placement alongside the shard allocation.
+func (store *Store) AppendPlacement(key [32]byte, index uint32, size int64, epoch uint64, hold bool, placement string) (Writer, error) {
+	if placement == "" {
+		return store.appendValue(key, index, size, epoch, hold, model.MultipartPlacement{}, true)
+	}
+	part, err := model.ParseMultipartPlacement(placement)
+	if err != nil {
+		return nil, err
+	}
+	return store.appendValue(key, index, size, epoch, hold, part, false)
+}
+
+func (store *Store) appendValue(key [32]byte, index uint32, size int64, epoch uint64, hold bool, part model.MultipartPlacement, whole bool) (Writer, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("negative size %d", size)
 	}
@@ -612,7 +690,7 @@ func (store *Store) appendValue(key [32]byte, index uint32, size int64, epoch ui
 	}
 
 	idxKey := MakeKey(key, index)
-	if err := seg.appendIdx(idxEntry{Off: off, Key: [36]byte(idxKey), PSize: ext.PSize}); err != nil {
+	if err := seg.appendPrepareAllocation(idxEntry{Off: off, Key: [36]byte(idxKey), PSize: ext.PSize, part: part, whole: whole}, epoch, size); err != nil {
 		seg.writers.Add(-1)
 		seg.releaseRef()
 		return nil, fmt.Errorf("append idx: %w", err)
@@ -915,7 +993,7 @@ func readRaw(txn *badger.Txn, key []byte) ([]byte, error) {
 // The prefix covers a whole shard position, and a live row for an object hash
 // that happens to start with the namespace byte would be a different width, so
 // the width check is what keeps the scan from deleting an unrelated object.
-func dropRowsUnder(txn *badger.Txn, prefix []byte) error {
+func dropRowsUnder(txn *badger.Txn, prefix []byte) (bool, error) {
 	opts := badger.DefaultIteratorOptions
 	opts.Prefix = prefix
 	it := txn.NewIterator(opts)
@@ -929,14 +1007,14 @@ func dropRowsUnder(txn *badger.Txn, prefix []byte) error {
 		}
 		raw, err := item.ValueCopy(nil)
 		if err != nil {
-			return fmt.Errorf("copy value: %w", err)
+			return false, fmt.Errorf("copy value: %w", err)
 		}
 		ext, _, err := decodeIndexValue(raw)
 		if err != nil {
-			return fmt.Errorf("decode row: %w", err)
+			return false, fmt.Errorf("decode row: %w", err)
 		}
 		if err := txn.Set(tombstoneKey(ext.SegNum, ext.Off), tombstoneValue(ext.PSize)); err != nil {
-			return fmt.Errorf("put tombstone: %w", err)
+			return false, fmt.Errorf("put tombstone: %w", err)
 		}
 		keys = append(keys, item.KeyCopy(nil))
 	}
@@ -944,10 +1022,10 @@ func dropRowsUnder(txn *badger.Txn, prefix []byte) error {
 	// Deleting inside the iteration would invalidate it.
 	for _, k := range keys {
 		if err := txn.Delete(k); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return len(keys) > 0, nil
 }
 
 // readIndexValue decodes the extent and epoch a key currently points at.
@@ -961,8 +1039,7 @@ func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
 
 // ReleaseGeneration marks one superseded generation of a shard position as
 // finished with, named by the epoch that wrote it. It reaches only the
-// retained namespace, so it cannot touch the generation the node is serving
-// however stale the caller's idea of that is.
+// retained namespace and deferred recovery extents, leaving the live row alone.
 //
 // It records the release rather than dropping the generation, and the sweep
 // reclaims it once the grace window has passed. A reader that resolved the old
@@ -972,31 +1049,48 @@ func readIndexValue(txn *badger.Txn, key []byte) (extent, uint64, error) {
 // is what makes the generation reclaimable at all.
 func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) error {
 	store.mutex.Lock()
-	closed := store.closed
-	store.mutex.Unlock()
-	if closed {
+	defer store.mutex.Unlock()
+	if store.closed {
 		return ErrClosedStore
 	}
 
-	rowKey := retainedKey(MakeKey(key, index), epoch)
+	idxKey := MakeKey(key, index)
+	rowKey := retainedKey(idxKey, epoch)
 	for {
 		err := store.index.Update(func(txn *badger.Txn) error {
-			raw, err := readRaw(txn, rowKey)
+			_, held, err := readIndexValue(txn, rowKey)
 			if errors.Is(err, badger.ErrKeyNotFound) {
-				// Already reclaimed, which is the outcome the caller wanted.
-				return nil
-			}
-			if err != nil {
+				row := deferredKey(idxKey, epoch)
+				raw, err := readRaw(txn, row)
+				if errors.Is(err, badger.ErrKeyNotFound) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				_, live, err := readIndexValue(txn, idxKey)
+				if err == nil && live == epoch {
+					return nil
+				}
+				if err != nil && !errors.Is(err, badger.ErrKeyNotFound) {
+					return err
+				}
+				ext, held, err := decodeIndexValue(raw)
+				if err != nil {
+					return err
+				}
+				if held != epoch {
+					return fmt.Errorf("%w: recovered epoch differs from release", ErrIntegrity)
+				}
+				if err := txn.Set(rowKey, encodePreparedValue(ext, epoch, retainedHoldStamp)); err != nil {
+					return err
+				}
+				if err := txn.Delete(row); err != nil {
+					return err
+				}
+			} else if err != nil || held != epoch {
 				return err
 			}
-			_, held, err := decodeIndexValue(raw)
-			if err != nil {
-				return fmt.Errorf("decode retained row: %w", err)
-			}
-			if held != epoch {
-				return nil
-			}
-
 			return txn.Set(releasedKeyFor(rowKey), encodeReleasedValue(time.Now().UnixNano()))
 		})
 		if errors.Is(err, badger.ErrConflict) {
@@ -1005,7 +1099,6 @@ func (store *Store) ReleaseGeneration(key [32]byte, index uint32, epoch uint64) 
 		if err != nil {
 			return fmt.Errorf("release generation: %w", err)
 		}
-
 		return nil
 	}
 }
@@ -1025,11 +1118,14 @@ func (store *Store) Delete(key [32]byte, index uint32) (bool, error) {
 	idxKey := MakeKey(key, index)
 	deleted := false
 	err := store.index.Update(func(txn *badger.Txn) error {
-		// Every generation goes, not just the live one: a prepared row would
-		// resurrect the value on a later commit, and a retained row would keep
-		// answering a record that names it.
+		scan := deferredScan(idxKey)
+		found, err := dropRowsUnder(txn, scan)
+		if err != nil {
+			return fmt.Errorf("delete deferred shard: %w", err)
+		}
+		deleted = found
 		for _, scan := range [][]byte{preparedScan(idxKey), retainedScan(idxKey)} {
-			if err := dropRowsUnder(txn, scan); err != nil {
+			if _, err := dropRowsUnder(txn, scan); err != nil {
 				return fmt.Errorf("delete: %w", err)
 			}
 		}
@@ -1072,7 +1168,7 @@ func (store *Store) DeleteEpoch(key [32]byte, index uint32, epoch uint64) (bool,
 	deleted := false
 	err := store.index.Update(func(txn *badger.Txn) error {
 		deleted = false
-		for _, rowKey := range [][]byte{preparedKey(idxKey, epoch), retainedKey(idxKey, epoch)} {
+		for _, rowKey := range [][]byte{preparedKey(idxKey, epoch), retainedKey(idxKey, epoch), deferredKey(idxKey, epoch)} {
 			removed, err := dropRowAt(txn, rowKey, epoch)
 			if err != nil {
 				return fmt.Errorf("delete epoch: %w", err)
@@ -1161,6 +1257,9 @@ func (store *Store) Close() error {
 
 	if err := store.index.Close(); err != nil {
 		errs = append(errs, fmt.Errorf("close disk index: %w", err))
+	}
+	if err := store.dirLock.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close store directory: %w", err))
 	}
 
 	return errors.Join(errs...)
