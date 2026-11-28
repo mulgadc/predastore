@@ -570,3 +570,39 @@ func TestARepairPassReplacesACorruptRetainedGenerationS3StillServes(t *testing.T
 	require.NoError(t, err, "the node serves the generation the record names again")
 	assert.Equal(t, f.shards[0], got)
 }
+
+// puts counts the puts that reach blob nodes through repair.
+type countingPuts struct {
+	BlobClient
+	puts atomic.Int64
+}
+
+func (c *countingPuts) Put(ctx context.Context, node config.NodeID, req blob.PutRequest, body io.Reader) (*blob.PutResponse, error) {
+	c.puts.Add(1)
+	return c.BlobClient.Put(ctx, node, req, body)
+}
+
+// Suspect-shard repair is off on every store until a key is confirmed across
+// nodes. On a store whose key check verifies, a shard that an S3 GET marks
+// suspect is reported by the pass and left in place.
+func TestARepairPassLeavesASuspectShardInPlace(t *testing.T) {
+	f := newS3Fixture(t, 2, 1, 4)
+	target := f.place.DataShardNodes[0]
+	corruptOnlyShard(t, f.nodes.dirs[target])
+	f.getAnswersTheObject(t)
+	require.Eventually(t, func() bool { return f.suspect(t, 0) }, 5*time.Second, 5*time.Millisecond)
+
+	blobs := &countingPuts{BlobClient: f.nodes.client}
+	svc, err := New(Config{
+		Nodes: []config.NodeID{target}, Ring: f.c.ring, Meta: f.mc, Blob: blobs,
+		DataShards: 2, ParityShards: 1, Workers: 1,
+	})
+	require.NoError(t, err)
+	require.NoError(t, svc.Pass(context.Background()))
+
+	assert.Zero(t, blobs.puts.Load(), "no shard may be written over a suspect one")
+	assert.Zero(t, svc.Stats().Repaired)
+	assert.True(t, f.suspect(t, 0), "the shard is still reported suspect")
+	_, err = f.nodes.readShard(target, f.hash, 0, f.place.WriteEpoch)
+	assert.Error(t, err, "the suspect shard is left as it was")
+}
