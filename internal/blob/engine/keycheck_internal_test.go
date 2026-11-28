@@ -194,3 +194,45 @@ func TestASegmentScanThatFailsLeavesTheStoreServing(t *testing.T) {
 		t.Fatal("a store that might hold data must not be sealed as new")
 	}
 }
+
+// A vault from an earlier release can hold segment files with only their
+// headers. It is not new, so it gets no key check and stays unverified.
+func TestAVaultWithOnlySegmentHeadersIsNotNew(t *testing.T) {
+	dir := t.TempDir()
+	closeStore(t, openStoreIn(t, dir, testAEAD(t)))
+	if err := os.Remove(filepath.Join(dir, keyCheckFilename)); err != nil {
+		t.Fatal(err)
+	}
+	segs, err := filepath.Glob(filepath.Join(dir, "*.seg"))
+	if err != nil || len(segs) == 0 {
+		t.Fatalf("the vault must hold a segment file, or this proves nothing: %v", err)
+	}
+
+	st := openStoreIn(t, dir, testAEAD(t))
+	if st.KeyVerified() || keyCheckExists(t, dir) {
+		t.Fatal("a vault with segment files from an earlier release must not be sealed as new")
+	}
+}
+
+// When the refusal of a key check cannot be made durable, the store does not
+// open: it must not take writes under that key while a restart could still
+// trust the original check.
+func TestARefusalThatCannotBeMadeDurableStopsTheOpen(t *testing.T) {
+	dir := t.TempDir()
+	closeStore(t, openStoreIn(t, dir, testAEAD(t)))
+
+	prev := syncDirectory
+	syncDirectory = func(path string) error {
+		if _, err := os.Stat(filepath.Join(dir, "keycheck.refused")); err == nil && path == dir {
+			return os.ErrPermission
+		}
+		return prev(path)
+	}
+	t.Cleanup(func() { syncDirectory = prev })
+
+	st, err := Open(dir, WithFreeSpaceWatermark(0, 0), WithAEAD(wrongAEAD(t)))
+	if err == nil {
+		_ = st.Close()
+		t.Fatal("a refusal that is not durable must stop the open")
+	}
+}
