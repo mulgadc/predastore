@@ -183,6 +183,9 @@ func (store *Store) deferPrepare(ctx context.Context, recovery prepareRecoveryKe
 		}
 		return err
 	}
+	if err := store.fenceDeferredState(); err != nil {
+		return err
+	}
 	idxKey := MakeKey(recovery.key, recovery.index)
 	row := deferredKey(idxKey, recovery.epoch)
 	return store.index.Update(func(txn *badger.Txn) error {

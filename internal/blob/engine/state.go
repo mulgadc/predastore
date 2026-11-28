@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
@@ -8,9 +9,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/dgraph-io/badger/v4"
 )
 
 const stateFilename = "state.json"
+
+// The header makes engines that only accept the old JSON record refuse Open.
+const deferredStateHeader = "predastore-store-state-v2\n"
 
 type state struct {
 	SegNum           uint64 `json:"segNum"`
@@ -39,6 +45,7 @@ func (store *Store) loadState() error {
 		return nil
 	}
 
+	data, store.deferredState = bytes.CutPrefix(data, []byte(deferredStateHeader))
 	var sta state
 	if err := json.Unmarshal(data, &sta); err != nil {
 		return err
@@ -67,6 +74,10 @@ func (store *Store) saveState() (retErr error) {
 	data, err := json.Marshal(sta)
 	if err != nil {
 		return err
+	}
+
+	if store.deferredState {
+		data = append([]byte(deferredStateHeader), data...)
 	}
 
 	tmpPath := filepath.Join(store.dir, stateFilename+".tmp")
@@ -108,4 +119,45 @@ func (store *Store) saveState() (retErr error) {
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+// fenceDeferredState is called before a durable deferred row can be protected
+// only by its new index namespace.
+func (store *Store) fenceDeferredState() error {
+	if store.deferredState {
+		return nil
+	}
+	store.deferredState = true
+	if err := store.saveState(); err != nil {
+		store.deferredState = false
+		return fmt.Errorf("fence deferred shard state: %w", err)
+	}
+	return nil
+}
+
+func (store *Store) fenceExistingDeferred() error {
+	if store.deferredState {
+		return nil
+	}
+	found := false
+	if err := store.index.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = []byte{deferredPrefix}
+		opts.PrefetchValues = false
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			if len(it.Item().Key()) == preparedKeySize {
+				found = true
+				break
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if found {
+		return store.fenceDeferredState()
+	}
+	return nil
 }

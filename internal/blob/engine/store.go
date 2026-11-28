@@ -63,6 +63,7 @@ type Store struct {
 
 	// The durably-reserved ceiling on fragNum; Append fsyncs only to raise it.
 	fragNumHighWater uint64
+	deferredState    bool
 
 	maxSegSize uint64
 
@@ -372,6 +373,9 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 			err = errors.Join(err, index.Close())
 		}
 	}()
+	if err := store.fenceExistingDeferred(); err != nil {
+		return nil, err
+	}
 	segments := store.segCache
 	defer func() {
 		if err != nil {
