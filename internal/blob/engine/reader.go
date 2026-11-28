@@ -21,6 +21,8 @@ type reader struct {
 	seg *segment
 	ext extent
 
+	deferred *prepareFragmentAnchor
+
 	buf []byte
 
 	// held is the pooled window behind buf, or nil when buf is this reader's
@@ -34,6 +36,32 @@ type reader struct {
 	latency *latencyMeter
 
 	closed bool
+}
+
+func (r *reader) openDeferred(epoch uint64) error {
+	if r.epoch != epoch {
+		return fmt.Errorf("%w: deferred epoch does not match its row", ErrIntegrity)
+	}
+	if err := r.ext.validatePrepare(); err != nil || r.ext.LSize == 0 {
+		return err
+	}
+	var frag fragment
+	if err := r.latency.timed(latencyRead, func() error {
+		_, err := r.seg.ReadAt(frag[:], r.ext.Off)
+		return err
+	}); err != nil {
+		return err
+	}
+	body, err := frag.open(r.aead, r.key, r.index, r.storeID)
+	if err != nil {
+		return err
+	}
+	anchor := prepareFragmentAnchor{value: frag.valueNum(), first: frag.fragNum()}
+	if err := anchor.check(&frag, 0, r.ext.LSize, len(body)); err != nil {
+		return err
+	}
+	r.deferred = &anchor
+	return nil
 }
 
 // Read implements io.Reader by delegating to ReadAt at the current position.
@@ -98,6 +126,12 @@ func (r *reader) ReadAt(p []byte, off int64) (int, error) {
 			plaintext, err := frag.open(r.aead, r.key, r.index, r.storeID)
 			if err != nil {
 				return totalCopied, fmt.Errorf("segment %d offset %d: %w", r.ext.SegNum, batchDiskOff+int64(pos), err)
+			}
+
+			if r.deferred != nil {
+				if err := r.deferred.check(frag, startFragIdx+int64(i), r.ext.LSize, len(plaintext)); err != nil {
+					return totalCopied, fmt.Errorf("segment %d offset %d: %w", r.ext.SegNum, batchDiskOff+int64(pos), err)
+				}
 			}
 
 			n := copy(p[totalCopied:], plaintext[bodyOffset:])

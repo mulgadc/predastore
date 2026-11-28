@@ -171,6 +171,8 @@ func (l *txnLimits) commandCost(cmd Command) (cost int64, ok bool) {
 		return l.cost(cmd.Key, len(cmd.Value)), true
 	case CommandDelete:
 		return l.cost(cmd.Key, 0), true
+	case CommandRetirePlacement:
+		return l.cost(placementRetirementKey(cmd.Key, cmd.Epoch), 0), true
 	default:
 		return 0, false
 	}

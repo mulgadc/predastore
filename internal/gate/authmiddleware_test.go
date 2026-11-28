@@ -359,3 +359,54 @@ func TestSigV4AuthMiddleware_MismatchReportsBothDigests(t *testing.T) {
 	assert.Equal(t, hex.EncodeToString(signedSum[:]), body.Client)
 	assert.Equal(t, hex.EncodeToString(sentSum[:]), body.Computed)
 }
+
+func TestMapHeadModeRequiresSignatureCoverage(t *testing.T) {
+	const (
+		bucket = "test-bucket01"
+		region = "ap-southeast-2"
+		header = "X-Predastore-Read-Mode"
+		mode   = "latest-map-head"
+	)
+	server := newTestGate(t, Config{
+		Region:  region,
+		Buckets: []handlers.BucketConfig{{Name: bucket, Region: region, Public: true}},
+		Auth: []auth.Entry{{
+			AccessKeyID: "TESTACCESSKEY", SecretAccessKey: "TESTSECRETKEY",
+			Policy: []auth.PolicyRule{{Bucket: bucket, Actions: []string{"s3:ListBucket"}}},
+		}},
+	})
+	for _, tc := range []struct {
+		name     string
+		method   string
+		sign     bool
+		signMode bool
+		status   int
+	}{
+		{"anonymous opt-in", http.MethodGet, false, false, http.StatusForbidden},
+		{"unsigned mode on signed request", http.MethodGet, true, false, http.StatusForbidden},
+		{"signed mode", http.MethodGet, true, true, http.StatusNoContent},
+		{"anonymous public bucket HEAD", http.MethodHead, false, false, http.StatusNoContent},
+		{"signed bucket HEAD with unsigned mode", http.MethodHead, true, false, http.StatusNoContent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := "/" + bucket
+			if tc.method == http.MethodGet {
+				path += "?list-type=2&max-keys=1&prefix=vol%2Fmap%2Fhead."
+			}
+			req := httptest.NewRequest(tc.method, path, nil)
+			if tc.signMode {
+				req.Header.Set(header, mode)
+			}
+			if tc.sign {
+				signTestReq(t, req, nil, "TESTACCESSKEY", "TESTSECRETKEY", region, "s3")
+			}
+			req.Header.Set(header, mode)
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			})
+			rr := httptest.NewRecorder()
+			resolveRouter(next, server.sigV4AuthMiddleware).ServeHTTP(rr, req)
+			require.Equal(t, tc.status, rr.Code, rr.Body.String())
+		})
+	}
+}

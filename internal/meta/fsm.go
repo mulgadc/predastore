@@ -32,6 +32,8 @@ const (
 	// CommandTxn applies its writes only if every one of its checks holds,
 	// and publishes all of them or none.
 	CommandTxn
+	// CommandRetirePlacement makes one exact placement epoch ineligible.
+	CommandRetirePlacement
 )
 
 // Command represents a database operation that goes through Raft.
@@ -136,8 +138,12 @@ func ValidateTxn(checks []TxnCheck, writes []TxnWrite) error {
 
 // FSM implements raft.FSM interface backed by Badger.
 type FSM struct {
-	mu sync.RWMutex
-	db *badger.DB
+	mapHeadsMu sync.RWMutex
+	mapHeads   mapHeadIndex
+
+	mu            sync.RWMutex
+	db            *badger.DB
+	restoreUnsafe bool
 
 	// node labels the snapshot lifecycle logs, which are otherwise
 	// indistinguishable between the replicas colocated in one process.
@@ -146,7 +152,8 @@ type FSM struct {
 	// applied is the last index Apply saw. raft does not tell Snapshot which
 	// index it is capturing, so a snapshot log line can only name one if the
 	// FSM tracks it.
-	applied atomic.Uint64
+	applied         atomic.Uint64
+	authorityWaiter atomic.Pointer[chan struct{}]
 
 	// persisted is the index the applied row names: the store already holds
 	// every entry at or below it, so ApplyBatch skips them. Guarded by mu.
@@ -249,6 +256,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	var mapHeadChanges []Command
 	b := &batch{f: f, first: logs[0].Index, last: logs[len(logs)-1].Index, budget: newTxnBudget(f.limits)}
 	b.begin()
 
@@ -275,13 +283,29 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 			// the entries after it read the command's writes.
 			b.end()
 			responses[i] = f.applyTxn(cmd, log.Index, b)
+			if result, ok := responses[i].(TxnResult); ok && result.Applied {
+				for _, write := range cmd.Writes {
+					if isMapHeadObject(write.Key) {
+						cmdType := CommandPut
+						if write.Delete {
+							cmdType = CommandDelete
+						}
+						mapHeadChanges = append(mapHeadChanges, Command{Type: cmdType, Key: write.Key})
+					}
+				}
+			}
 			b.begin()
 			continue
 		}
 		responses[i] = b.stage(cmd, log.Index)
+		if _, failed := responses[i].(error); !failed && cmd.Type != CommandRetirePlacement && isMapHeadObject(cmd.Key) {
+			mapHeadChanges = append(mapHeadChanges, Command{Type: cmd.Type, Key: cmd.Key})
+		}
 	}
 	b.end()
+	f.applyMapHeadChanges(mapHeadChanges)
 	f.applied.Store(logs[len(logs)-1].Index)
+	f.signalAuthorityApply()
 
 	return responses
 }
@@ -467,7 +491,9 @@ func (f *FSM) stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
 		if w.Delete {
 			err = txn.Delete(w.Key)
 		} else {
-			err = txn.Set(w.Key, w.Value)
+			if err = refuseRetiredPlacement(txn, w.Key, w.Value); err == nil {
+				err = txn.Set(w.Key, w.Value)
+			}
 		}
 		if err != nil {
 			return TxnResult{}, err
@@ -493,10 +519,16 @@ func (f *FSM) stageTxn(txn *badger.Txn, cmd Command) (TxnResult, error) {
 func (f *FSM) applyCommand(txn *badger.Txn, cmd Command) (any, error) {
 	switch cmd.Type {
 	case CommandPut, CommandPutMax:
+		if err := refuseRetiredPlacement(txn, cmd.Key, cmd.Value); err != nil {
+			return nil, err
+		}
 		return nil, txn.Set(cmd.Key, cmd.Value)
 	case CommandDelete:
 		return nil, txn.Delete(cmd.Key)
 	case CommandSwap:
+		if err := refuseRetiredPlacement(txn, cmd.Key, cmd.Value); err != nil {
+			return nil, err
+		}
 		previous, _, err := f.readValue(txn, cmd.Key)
 		if err != nil {
 			return nil, err
@@ -505,6 +537,8 @@ func (f *FSM) applyCommand(txn *badger.Txn, cmd Command) (any, error) {
 			return nil, err
 		}
 		return previous, nil
+	case CommandRetirePlacement:
+		return nil, f.retirePlacement(txn, cmd)
 	default:
 		return nil, fmt.Errorf("unknown command type: %d", cmd.Type)
 	}
@@ -526,6 +560,12 @@ func (f *FSM) applyCommand(txn *badger.Txn, cmd Command) (any, error) {
 // and Milliseconds would truncate every one to zero.
 func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	started := time.Now()
+
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.restoreUnsafe {
+		return nil, errors.New("meta: snapshot capture refused after failed restore")
+	}
 	index := f.applied.Load()
 
 	snap := &FSMSnapshot{node: f.node, index: index, txn: f.db.NewTransaction(false)}
@@ -535,13 +575,7 @@ func (f *FSM) Snapshot() (raft.FSMSnapshot, error) {
 	return snap, nil
 }
 
-// Restore rebuilds the FSM from a snapshot written by FSMSnapshot.Persist.
-//
-// A stream that declares itself sorted is merged into the existing store: only
-// what differs is written, and nothing is dropped first. An unsorted one --
-// the legacy JSON map, or a frame stream from a version that iterated a Go map
-// -- cannot be merged in one pass, so it takes the older path of clearing the
-// store and rewriting it.
+// Restore merges a sorted snapshot into the local metadata store.
 func (f *FSM) Restore(rc io.ReadCloser) error {
 	defer rc.Close()
 
@@ -557,32 +591,39 @@ func (f *FSM) Restore(rc io.ReadCloser) error {
 	}
 	slog.Info("meta: restoring from snapshot", "node", f.node, "install", install)
 
+	r := bufio.NewReader(rc)
+	var marker [len(snapshotMagic)]byte
+	if _, err := io.ReadFull(r, marker[:]); err != nil {
+		return fmt.Errorf("unsupported metadata snapshot format: %w", err)
+	}
+	if marker != snapshotMagic {
+		return errors.New("unsupported metadata snapshot format")
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	r := bufio.NewReader(rc)
-	sorted, err := snapshotIsSorted(r)
-	if err != nil {
-		return err
-	}
+	f.restoreUnsafe = true
+	f.setMapHeads(nil)
 	rs := &restoreState{budget: newTxnBudget(f.limits)}
-	if sorted {
-		err = f.restoreByMerge(r, started, rs)
-	} else {
-		err = f.restoreByReplace(r, started, rs)
-	}
+	err := f.restoreByMerge(r, started, rs)
 	if err == nil {
 		err = f.restoreApplied(rs)
 	}
-	if err != nil && rs.wrote {
-		// The store is part old, part snapshot, and raft would go on without
-		// a retry. The next start restores the snapshot before it skips any
-		// entry.
-		//nolint:forbidigo // A part-restored store must not apply or answer another entry.
-		panic(fmt.Sprintf("meta: restoring a snapshot failed after it wrote to the store; stopping: %v", err))
+	if err == nil {
+		err = f.rebuildMapHeads()
 	}
-
-	return err
+	if err == nil {
+		err = publishInstalledSnapshot(rc)
+	}
+	if err != nil {
+		if rs.wrote {
+			//nolint:forbidigo // A part-restored store must not apply or answer another entry.
+			panic(fmt.Sprintf("meta: restoring a snapshot failed after it wrote to the store; stopping: %v", err))
+		}
+		return err
+	}
+	f.restoreUnsafe = false
+	return nil
 }
 
 // restoreState is what a restore learns on its way: whether it may have
@@ -640,23 +681,6 @@ func (f *FSM) restoreApplied(rs *restoreState) error {
 	f.persisted = rs.index
 
 	return nil
-}
-
-// snapshotIsSorted reports whether the stream carries the marker promising key
-// order, consuming the marker when it does.
-func snapshotIsSorted(r *bufio.Reader) (bool, error) {
-	head, err := r.Peek(len(snapshotMagic))
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false, fmt.Errorf("peek snapshot: %w", err)
-	}
-	if len(head) < len(snapshotMagic) || !bytes.Equal(head, snapshotMagic[:]) {
-		return false, nil
-	}
-	if _, err := r.Discard(len(snapshotMagic)); err != nil {
-		return false, fmt.Errorf("read snapshot marker: %w", err)
-	}
-
-	return true, nil
 }
 
 // restoreByMerge walks the snapshot and the local store together, both in key
@@ -762,137 +786,30 @@ func (f *FSM) restoreByMerge(r *bufio.Reader, started time.Time, rs *restoreStat
 	return nil
 }
 
-// restoreByReplace clears the store and rewrites it, which is the only thing
-// that can be done with a stream whose order is unknown.
-//
-// Clear and rewrite used to run inside a single db.Update. Badger caps how much
-// one transaction may hold, so once the metadata set outgrew that cap every
-// snapshot became permanently unrestorable:
-//
-//	raft: snapshot restore progress: ... percent-complete="100.00%"
-//	raft: failed to restore snapshot: error="Txn is too big to fit into one request"
-//	failed to create raft node: failed to load any existing snapshots
-//
-// and the node could never start again -- on every node at once, since they all
-// restore the same oversized snapshot, taking the metadata plane (and with it
-// the AMI catalogue, so DescribeImages) down with it. The write path has no
-// matching limit, so snapshots that cannot be read back are written happily.
-// See mulga-tjoz9.
-//
-// DropAll is badger's own bulk clear and is not bounded by a transaction;
-// WriteBatch commits in chunks as it fills.
-func (f *FSM) restoreByReplace(r *bufio.Reader, started time.Time, rs *restoreState) error {
-	// Every key is rewritten here, so a change set from this path would name
-	// the whole store. Saying so beats reporting nothing, which a consumer
-	// cannot tell from a snapshot that changed nothing.
-	if f.onKeyChanged != nil {
-		slog.Warn("meta: restore reports no change set",
-			"node", f.node, "reason", "unsorted snapshot, restored by replacement")
-	}
-
-	// The drop waits for the first decoded row, so a legacy snapshot that
-	// fails to decode leaves the store as it was and raft can fall back.
-	var wb *badger.WriteBatch
-	drop := func() error {
-		if wb != nil {
-			return nil
-		}
-		rs.wrote = true
-		if err := f.db.DropAll(); err != nil {
-			return fmt.Errorf("restore: drop existing data: %w", err)
-		}
-		wb = f.db.NewWriteBatch()
-		return nil
-	}
-	defer func() {
-		if wb != nil {
-			wb.Cancel()
-		}
-	}()
-
-	var entries int
-	err := streamSnapshot(r, func(key, value []byte) error {
-		if taken, err := rs.takeApplied(key, value); taken || err != nil {
-			return err
-		}
-		if err := drop(); err != nil {
-			return err
-		}
-		entries++
-		return wb.Set(key, value)
-	})
-	if err != nil {
-		return err
-	}
-	if err := drop(); err != nil {
-		return err
-	}
-
-	if err := wb.Flush(); err != nil {
-		return fmt.Errorf("restore: flush batch: %w", err)
-	}
-
-	slog.Info("meta: snapshot restored",
-		"node", f.node, "entries", entries, "replaced", true,
-		"duration_ms", time.Since(started).Milliseconds())
-
-	return nil
-}
-
-// streamSnapshot yields every key/value pair in the stream, without holding
-// the stream in memory. The marker, if there was one, has already been read.
-//
-// It also accepts the legacy JSON snapshot format (a single map object) so a
-// node upgraded on top of a store with pre-existing snapshots still starts.
-// Legacy snapshots lost binary keys to U+FFFD substitution before the upgrade;
-// they are decoded as-is, with no recovery, and future snapshots are written in
-// the frame format. That one path does hold the snapshot in memory, because a
-// JSON object cannot be read any other way -- it is a compatibility path for
-// snapshots written by a version that could not produce a large one.
+// streamSnapshot reads sorted key-value frames after the format marker.
 func streamSnapshot(r *bufio.Reader, fn func(key, value []byte) error) error {
-	first, err := r.Peek(1)
-	if err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil // empty snapshot
-		}
-		return fmt.Errorf("peek snapshot: %w", err)
-	}
-
-	if first[0] == '{' {
-		var data map[string][]byte
-		if err := json.NewDecoder(r).Decode(&data); err != nil {
-			return fmt.Errorf("decode legacy json snapshot: %w", err)
-		}
-		for k, v := range data {
-			if err := fn([]byte(k), v); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
 	var lenBuf [4]byte
-	read := func() ([]byte, error) {
-		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-			return nil, err
-		}
+	readBody := func() ([]byte, error) {
 		buf := make([]byte, binary.BigEndian.Uint32(lenBuf[:]))
 		_, err := io.ReadFull(r, buf)
 		return buf, err
 	}
 
 	for {
-		// A clean EOF on the frame boundary ends the stream; a short read
-		// mid-frame is a truncated snapshot and must surface as an error, not
-		// a silent stop.
-		key, err := read()
-		if err != nil {
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 			if errors.Is(err, io.EOF) {
-				break
+				return nil
 			}
+			return fmt.Errorf("read key length: %w", err)
+		}
+		key, err := readBody()
+		if err != nil {
 			return fmt.Errorf("read key: %w", err)
 		}
-		value, err := read()
+		if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+			return fmt.Errorf("read value length: %w", err)
+		}
+		value, err := readBody()
 		if err != nil {
 			return fmt.Errorf("read value: %w", err)
 		}
@@ -900,8 +817,6 @@ func streamSnapshot(r *bufio.Reader, fn func(key, value []byte) error) error {
 			return err
 		}
 	}
-
-	return nil
 }
 
 // Get reads a value from the local store (can be stale on non-leader). A
@@ -977,12 +892,7 @@ func (f *FSM) ScanFrom(prefix, after string, fn func(key string, value []byte) e
 	})
 }
 
-// snapshotMagic marks a stream whose frames are in key order. Restoring by
-// merge is only correct against a sorted stream, and two unsorted formats are
-// already in the wild: the legacy JSON map, and the frame stream this file
-// produced while it iterated a Go map. The first byte tells all three apart --
-// a JSON snapshot starts with '{', a key length starts with 0x00 for any key
-// badger accepts, and this starts with neither.
+// snapshotMagic identifies snapshots with frames in key order.
 var snapshotMagic = [4]byte{0xFF, 'P', 'D', 'S'}
 
 // FSMSnapshot implements raft.FSMSnapshot over a badger read transaction.
@@ -1005,6 +915,9 @@ type FSMSnapshot struct {
 // rather than blocking it. Iterating badger also emits the frames in key
 // order, which is what the merging restore below needs.
 func (s *FSMSnapshot) Persist(sink raft.SnapshotSink) error {
+	if staged, ok := sink.(*stagedSnapshot); ok {
+		staged.local = true
+	}
 	started := time.Now()
 	var entries int
 	var written int64

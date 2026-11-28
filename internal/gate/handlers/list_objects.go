@@ -1,7 +1,9 @@
 package handlers
 
 import (
+	"context"
 	"encoding/base64"
+	"encoding/xml"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -86,6 +88,17 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 		if !ok {
 			WriteS3Error(w, r, http.StatusBadRequest, string(model.ErrInvalidArgument),
 				"max-keys must be a non-negative integer")
+			return
+		}
+
+		if mode := r.Header.Get(MapHeadReadModeHeader); mode != "" {
+			if mode != latestMapHeadMode || !listV2 || maxKeys != 1 ||
+				!strings.HasSuffix(prefix, "/map/head.") || strings.TrimSuffix(prefix, "/map/head.") == "" ||
+				delimiter != "" || query.Get("continuation-token") != "" || query.Get("start-after") != "" {
+				WriteS3Error(w, r, http.StatusBadRequest, string(model.ErrInvalidArgument), "Invalid map-head lookup")
+				return
+			}
+			writeLatestMapHead(w, r, mc, bucket, prefix, encodingType, encode)
 			return
 		}
 
@@ -218,6 +231,52 @@ func ListObjects(mc MetaClient, cache *BucketCache) http.Handler {
 			slog.DebugContext(ctx, "failed to write XML response", "error", err)
 		}
 	})
+}
+
+// MapHeadReadModeHeader selects the leader-backed map-head lookup.
+const MapHeadReadModeHeader = "X-Predastore-Read-Mode"
+
+const latestMapHeadMode = "latest-map-head"
+
+type mapHeadLeader interface {
+	LeaderLastKey(ctx context.Context, prefix string) (string, error)
+}
+
+func writeLatestMapHead(w http.ResponseWriter, r *http.Request, mc MetaClient, bucket, prefix, encodingType string, encode func(string) string) {
+	leader, ok := mc.(mapHeadLeader)
+	if !ok {
+		WriteS3Error(w, r, http.StatusServiceUnavailable, "ServiceUnavailable", "Map-head authority unavailable")
+		return
+	}
+	bucketPrefix := TableKey(model.TableObjects, objectARN(bucket, ""))
+	key, err := leader.LeaderLastKey(r.Context(), bucketPrefix+prefix)
+	if err != nil || (key != "" && !strings.HasPrefix(key, bucketPrefix+prefix)) {
+		WriteS3Error(w, r, http.StatusServiceUnavailable, "ServiceUnavailable", "Map-head authority unavailable")
+		return
+	}
+	// Authority confirms membership only. Object attributes come from placement,
+	// so omit them instead of inventing values or making a second metadata read.
+	type mapHeadEntry struct {
+		Key string `xml:"Key"`
+	}
+	result := struct {
+		XMLName      xml.Name       `xml:"ListBucketResult"`
+		Name         string         `xml:"Name"`
+		Prefix       string         `xml:"Prefix"`
+		EncodingType string         `xml:"EncodingType,omitempty"`
+		KeyCount     int            `xml:"KeyCount"`
+		MaxKeys      int            `xml:"MaxKeys"`
+		IsTruncated  bool           `xml:"IsTruncated"`
+		Contents     []mapHeadEntry `xml:"Contents"`
+	}{Name: bucket, Prefix: encode(prefix), EncodingType: encodingType, MaxKeys: 1}
+	if key != "" {
+		result.Contents = []mapHeadEntry{{Key: encode(strings.TrimPrefix(key, bucketPrefix))}}
+		result.KeyCount = 1
+	}
+	w.Header().Set(MapHeadReadModeHeader, latestMapHeadMode)
+	if err := writeXML(w, http.StatusOK, result); err != nil {
+		slog.DebugContext(r.Context(), "failed to write map-head response", "error", err)
+	}
 }
 
 // collapse turns scanned rows into listing entries, folding everything below a

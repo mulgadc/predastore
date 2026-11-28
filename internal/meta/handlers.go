@@ -44,6 +44,17 @@ func (s *Server) handleGet(ctx context.Context, h MetaRequest, stream transport.
 	if refused, err := s.refuseLeaderRead(h, stream); refused {
 		return err
 	}
+	return s.respondGet(h, stream)
+}
+
+func (s *Server) handleAuthorityGet(ctx context.Context, h MetaRequest, stream transport.Stream) error {
+	if code := s.authorityRead(ctx); code != "" {
+		return respond(stream, &MetaResponse{Err: code, Leader: s.leaderAddr()})
+	}
+	return s.respondGet(h, stream)
+}
+
+func (s *Server) respondGet(h MetaRequest, stream transport.Stream) error {
 	// The raft node keys by Go string; the bytes survive the conversion, so
 	// the key badger stores is the one the client sent.
 	value, err := s.get(string(h.Key))
@@ -140,7 +151,34 @@ func (s *Server) handleStatus(ctx context.Context, h MetaStatusRequest, stream t
 	return json.NewEncoder(stream).Encode(&status)
 }
 
+func (s *Server) handleLastKey(ctx context.Context, h MetaRequest, stream transport.Stream) error {
+	if !h.Leader || len(h.Key) == 0 || len(h.After) != 0 || h.Limit != 1 {
+		return respond(stream, &MetaResponse{Err: "invalid last-key lookup"})
+	}
+	if !s.fsm.mapHeadIndexReady() {
+		return respond(stream, &MetaResponse{Err: ErrCodeBehind})
+	}
+	if code := s.authorityRead(ctx); code != "" {
+		return respond(stream, &MetaResponse{Err: code, Leader: s.leaderAddr()})
+	}
+	key, err := s.fsm.LastKey(string(h.Key))
+	if errors.Is(err, errMapHeadIndexUnavailable) {
+		return respond(stream, &MetaResponse{Err: ErrCodeBehind})
+	}
+	if err != nil {
+		return respond(stream, &MetaResponse{Err: err.Error()})
+	}
+	response := MetaResponse{Last: true}
+	if key != "" {
+		response.Items = []ScanItem{{Key: []byte(key)}}
+	}
+	return respond(stream, &response)
+}
+
 func (s *Server) handleScan(ctx context.Context, h MetaRequest, stream transport.Stream) error {
+	if h.Last {
+		return respond(stream, &MetaResponse{Err: "last-key lookup requires a dedicated operation"})
+	}
 	if refused, err := s.refuseLeaderRead(h, stream); refused {
 		return err
 	}

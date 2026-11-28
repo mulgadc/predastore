@@ -229,8 +229,9 @@ func (r Reaper) IsEnabled() bool { return r.Enabled == nil || *r.Enabled }
 // one kicked by a write crossing the watermark, runs unpaced. Zero takes the
 // store's default, except YieldLatencyMs, where zero turns the yield off.
 type Compaction struct {
-	IntervalSeconds       int `toml:"interval_seconds"`
-	RetainedMaxAgeSeconds int `toml:"-"`
+	IntervalSeconds              int `toml:"interval_seconds"`
+	RetainedMaxAgeSeconds        int `toml:"-"`
+	DeferredRetirementAgeSeconds int `toml:"-"`
 
 	MaxBytesPerSec  int64 `toml:"max_bytes_per_sec"`
 	YieldLatencyMs  int   `toml:"yield_latency_ms"`

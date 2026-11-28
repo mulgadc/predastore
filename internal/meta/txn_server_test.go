@@ -121,6 +121,53 @@ func startTxnLeader(t *testing.T) *meta.Client {
 	return cli
 }
 
+// A placement publisher and an abandoned-extent reclaimer need to agree on
+// one outcome. This exercises the existing test-only transaction endpoint:
+// each operation checks the state the other would change in the same Raft log.
+func TestTxnOrdersPlacementAgainstExtentReclamation(t *testing.T) {
+	for _, reclaimFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reclaim_first=%t", reclaimFirst), func(t *testing.T) {
+			cli := startTxnLeader(t)
+			ctx := t.Context()
+			placement := []byte("objects/key")
+			fence := []byte("extent-fence/key/epoch-2")
+			previous := []byte("epoch-1")
+			next := []byte("epoch-2")
+			require.NoError(t, cli.Put(ctx, string(placement), previous))
+
+			publish := func() meta.TxnOutcome {
+				outcome, _, err := cli.Txn(ctx, []meta.TxnCheck{{Key: fence, Absent: true}},
+					[]meta.TxnWrite{{Key: placement, Value: next}})
+				require.NoError(t, err)
+				return outcome
+			}
+			reclaim := func() meta.TxnOutcome {
+				outcome, _, err := cli.Txn(ctx, []meta.TxnCheck{{Key: placement, Value: previous}},
+					[]meta.TxnWrite{{Key: fence, Value: []byte("abandoned")}})
+				require.NoError(t, err)
+				return outcome
+			}
+
+			if reclaimFirst {
+				assert.Equal(t, meta.TxnApplied, reclaim())
+				assert.Equal(t, meta.TxnMismatch, publish())
+				got, err := cli.AuthorityGet(ctx, string(placement))
+				require.NoError(t, err)
+				assert.Equal(t, previous, got)
+				return
+			}
+
+			assert.Equal(t, meta.TxnApplied, publish())
+			assert.Equal(t, meta.TxnMismatch, reclaim())
+			got, err := cli.AuthorityGet(ctx, string(placement))
+			require.NoError(t, err)
+			assert.Equal(t, next, got)
+			_, err = cli.AuthorityGet(ctx, string(fence))
+			require.ErrorIs(t, err, meta.ErrNotFound)
+		})
+	}
+}
+
 // A body of exactly the byte limit is served, so the limit refuses only what
 // exceeds it.
 func TestTxnAtTheByteLimitApplies(t *testing.T) {

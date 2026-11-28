@@ -30,6 +30,11 @@ const (
 	// it, and a client never sends one twice.
 	OpMetaTxn rpc.Opcode = 0x1008
 
+	// OpMetaLastKey confirms a map head without an ordinary scan.
+	OpMetaLastKey         rpc.Opcode = 0x1009
+	OpMetaAuthorityGet    rpc.Opcode = 0x100a
+	OpMetaRetirePlacement rpc.Opcode = 0x100b
+
 	// OpMetaStatus asks a replica to report its own raft state, rather than
 	// any data it holds.
 	OpMetaStatus rpc.Opcode = 0x1005
@@ -95,12 +100,13 @@ type MetaRequest struct {
 	// through a prefix rather than asking for the first N matches forever. It
 	// is exclusive, and empty starts at the beginning of the prefix.
 	After []byte `json:"after,omitempty"`
-	// Epoch is used by OpMetaPutMax to reject a placement older than the one
-	// already published for the object.
+	// Epoch identifies the placement generation for an epoch-qualified write.
 	Epoch uint64 `json:"epoch,omitempty"`
 	// Leader asks for a read only the leader may answer, and only once it has
 	// applied everything committed. A follower refuses with not-leader.
 	Leader bool `json:"leader,omitempty"`
+	// Last requests the greatest key under the prefix on a leader scan.
+	Last bool `json:"last,omitempty"`
 }
 
 func (h *MetaRequest) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }
@@ -118,6 +124,8 @@ type MetaResponse struct {
 	Value []byte `json:"value,omitempty"`
 	// Items is the payload for scan responses.
 	Items []ScanItem `json:"items,omitempty"`
+	// Last confirms that the requested reverse lookup ran on the leader.
+	Last bool `json:"last,omitempty"`
 	// Mismatch reports a transaction whose checks did not hold, with the
 	// value of each checked key in Current.
 	Mismatch bool       `json:"mismatch,omitempty"`
@@ -175,7 +183,8 @@ type MetaStatus struct {
 	AppliedIndex string `json:"applied_index"`
 	// IsLeader is State == "Leader", spelled out for callers that only care
 	// about that.
-	IsLeader bool `json:"is_leader"`
+	IsLeader            bool `json:"is_leader"`
+	PlacementRetirement bool `json:"placement_retirement,omitempty"`
 }
 
 func (h *MetaStatus) Append(buf []byte) ([]byte, error) { return appendJSON(buf, h) }

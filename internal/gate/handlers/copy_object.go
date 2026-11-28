@@ -175,7 +175,7 @@ func CopyObject(mc MetaClient, bc BlobClient, ring *placement.Ring, cache *Bucke
 			HandleError(w, r, model.NewS3Error(model.ErrInternalError, err.Error(), 500))
 			return
 		}
-		telemetry.RecordObjectWrite(ctx, telemetry.WriteOutcomeSuccess, "")
+		written.recordObjectWriteSuccess(ctx, cfg.DataShards)
 
 		if written.poolNearFull {
 			w.Header().Set("X-Predastore-Pool-Pressure", "nearfull")
