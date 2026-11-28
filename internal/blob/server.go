@@ -420,7 +420,7 @@ func (s *Server) handleStat(ctx context.Context, h Request, stream transport.Str
 	reader, err := s.store.Lookup(h.Key, h.Index)
 	switch {
 	case errors.Is(err, engine.ErrKeyNotFound):
-		s.suspects.clear(pos, 0)
+		s.suspects.clearPosition(pos)
 		return respond(stream, &Response{Err: ErrCodeNotFound})
 	case err != nil:
 		// A store that could not answer has not shown the shard missing, and
@@ -494,7 +494,7 @@ func (s *Server) handleGet(ctx context.Context, h Request, stream transport.Stre
 	}
 	// Only a read of the whole value proves every fragment authenticates.
 	if rangeStart == 0 && rangeEnd == totalSize-1 {
-		s.suspects.clear(pos, reader.Epoch())
+		s.suspects.clearEpoch(pos, reader.Epoch())
 	}
 	return nil
 }
@@ -597,7 +597,7 @@ func (s *Server) handleDeleteEpoch(ctx context.Context, h Request, stream transp
 	if err != nil {
 		return respond(stream, &Response{Err: err.Error()})
 	}
-	s.suspects.clear(shardPosition{key: h.Key, index: h.Index}, h.Epoch)
+	s.suspects.clearEpoch(shardPosition{key: h.Key, index: h.Index}, h.Epoch)
 	return respond(stream, &Response{Deleted: deleted})
 }
 
@@ -607,6 +607,6 @@ func (s *Server) handleDelete(ctx context.Context, h Request, stream transport.S
 	if err != nil {
 		return respond(stream, &Response{Err: err.Error()})
 	}
-	s.suspects.clear(shardPosition{key: h.Key, index: h.Index}, 0)
+	s.suspects.clearPosition(shardPosition{key: h.Key, index: h.Index})
 	return respond(stream, &Response{Deleted: deleted})
 }

@@ -886,8 +886,8 @@ func (f *FSM) ScanFrom(prefix, after string, fn func(key string, value []byte) e
 }
 
 // ScanFromLimit is ScanFrom that stops once fn has seen limit keys, before it
-// reads the next one, and prefetches no more values than it can return. Zero
-// is no limit.
+// reads the next one, and reads values only for the keys it returns. Zero is
+// no limit.
 func (f *FSM) ScanFromLimit(prefix, after string, limit int, fn func(key string, value []byte) error) error {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -895,8 +895,9 @@ func (f *FSM) ScanFromLimit(prefix, after string, limit int, fn func(key string,
 	return f.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
 		opts.Prefix = []byte(prefix)
-		if limit > 0 && limit < opts.PrefetchSize {
-			opts.PrefetchSize = limit
+		// Value prefetch would read values past the limit row.
+		if limit > 0 {
+			opts.PrefetchValues = false
 		}
 		seen := 0
 		it := txn.NewIterator(opts)

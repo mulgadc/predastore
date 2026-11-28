@@ -31,13 +31,13 @@ type suspectEntry struct {
 	epoch uint64
 }
 
-// suspectSet holds, for each position, the generation whose read failed
-// authentication on this node. It is in memory only: a restart forgets it,
-// and the next failed read finds the shard again.
+// suspectSet holds the generations of shard positions whose read failed
+// authentication on this node, each generation on its own. It is in memory
+// only: a restart forgets it, and the next failed read finds the shard again.
 type suspectSet struct {
 	mu      sync.Mutex
 	order   *list.List
-	entries map[shardPosition]*list.Element
+	entries map[shardPosition]map[uint64]*list.Element
 	evicted atomic.Uint64
 }
 
@@ -48,59 +48,69 @@ func entryOf(e *list.Element) *suspectEntry {
 }
 
 func newSuspectSet() *suspectSet {
-	return &suspectSet{order: list.New(), entries: make(map[shardPosition]*list.Element)}
+	return &suspectSet{order: list.New(), entries: make(map[shardPosition]map[uint64]*list.Element)}
 }
 
-// add records the generation of a position and reports whether it was new.
+// add records one generation of a position and reports whether it was new.
 func (s *suspectSet) add(pos shardPosition, epoch uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e, ok := s.entries[pos]; ok {
-		entry := entryOf(e)
-		if entry.epoch == epoch {
-			return false
-		}
-		entry.epoch = epoch
-		s.order.MoveToBack(e)
-		return true
+	if _, ok := s.entries[pos][epoch]; ok {
+		return false
 	}
 	if s.order.Len() >= suspectCap {
-		oldest := s.order.Front()
-		delete(s.entries, entryOf(oldest).pos)
-		s.order.Remove(oldest)
+		s.removeLocked(s.order.Front())
 		s.evicted.Add(1)
 	}
-	s.entries[pos] = s.order.PushBack(&suspectEntry{pos: pos, epoch: epoch})
+	if s.entries[pos] == nil {
+		s.entries[pos] = make(map[uint64]*list.Element, 1)
+	}
+	s.entries[pos][epoch] = s.order.PushBack(&suspectEntry{pos: pos, epoch: epoch})
 	return true
 }
 
-// suspect reports whether the generation of a position is in the set. A
-// different generation there is stale, and is dropped.
-func (s *suspectSet) suspect(pos shardPosition, epoch uint64) bool {
+// suspect reports whether the live generation of a position is in the set,
+// and forgets the position's other generations, which a stat has shown are no
+// longer live.
+func (s *suspectSet) suspect(pos shardPosition, live uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.entries[pos]
-	if !ok {
-		return false
+	found := false
+	for epoch, e := range s.entries[pos] {
+		if epoch == live {
+			found = true
+			continue
+		}
+		s.removeLocked(e)
 	}
-	if entryOf(e).epoch == epoch {
-		return true
-	}
-	s.order.Remove(e)
-	delete(s.entries, pos)
-	return false
+	return found
 }
 
-// clear forgets a position, or with a non-zero epoch only that generation.
-func (s *suspectSet) clear(pos shardPosition, epoch uint64) {
+// clearEpoch forgets one generation of a position.
+func (s *suspectSet) clearEpoch(pos shardPosition, epoch uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	e, ok := s.entries[pos]
-	if !ok || (epoch != 0 && entryOf(e).epoch != epoch) {
-		return
+	if e, ok := s.entries[pos][epoch]; ok {
+		s.removeLocked(e)
 	}
+}
+
+// clearPosition forgets every generation of a position.
+func (s *suspectSet) clearPosition(pos shardPosition) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, e := range s.entries[pos] {
+		s.removeLocked(e)
+	}
+}
+
+func (s *suspectSet) removeLocked(e *list.Element) {
+	entry := entryOf(e)
 	s.order.Remove(e)
-	delete(s.entries, pos)
+	delete(s.entries[entry.pos], entry.epoch)
+	if len(s.entries[entry.pos]) == 0 {
+		delete(s.entries, entry.pos)
+	}
 }
 
 func (s *suspectSet) len() int {

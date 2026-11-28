@@ -462,3 +462,79 @@ func TestARepairPassOnAnUpgradedStoreUnderAWrongKeyKeepsTheOriginalShard(t *test
 	}, 5*time.Second, 20*time.Millisecond, "under the cluster's key the node serves its original shard")
 	assert.Equal(t, f.shards[0], got)
 }
+
+// A record written under another erasure code is left alone: rebuilding it
+// under the code repair runs would write wrong bytes at that index.
+func TestARebuildRefusesARecordOfAnotherErasureCode(t *testing.T) {
+	c := newCluster(t, 2, 2, 5)
+	obj := c.store("written as rs-2-2", 8192)
+	target := obj.place.AllNodes()[0]
+	c.blob.forget(target, obj.hash, 0)
+
+	svc, err := New(Config{
+		Nodes: []config.NodeID{target}, Ring: c.ring, Meta: c.meta, Blob: c.blob,
+		DataShards: 3, ParityShards: 1, Workers: 1,
+	})
+	require.NoError(t, err)
+	err = svc.rebuildShard(context.Background(), task{hash: obj.hash, index: 0, node: target, place: obj.place, replace: true})
+	require.ErrorIs(t, err, errGeometryMismatch)
+	assert.Zero(t, c.blob.puts.Load(), "nothing may be written under the wrong code")
+}
+
+// bodyFailingBlob fails one peer's shard part way through its body, and makes
+// another peer unreachable, for one object only.
+type bodyFailingBlob struct {
+	*fakeBlob
+	key         [32]byte
+	bad, absent config.NodeID
+}
+
+type failingBody struct{ r io.Reader }
+
+func (f failingBody) Read(p []byte) (int, error) {
+	n, _ := f.r.Read(p[:min(len(p), 16)])
+	if n == 0 {
+		return 0, errors.New("injected body failure")
+	}
+	return n, errors.New("injected body failure")
+}
+
+func (b *bodyFailingBlob) Get(ctx context.Context, node config.NodeID, req blob.GetRequest) (io.ReadCloser, error) {
+	if req.Key == b.key && node == b.absent {
+		return nil, errNodeDown
+	}
+	rc, err := b.fakeBlob.Get(ctx, node, req)
+	if err != nil || req.Key != b.key || node != b.bad {
+		return rc, err
+	}
+	return io.NopCloser(failingBody{rc}), nil
+}
+
+// A stripe whose peers fail their bodies, with the rest unreachable, fails on
+// its own; the pass goes on and repairs the next stripe.
+func TestAPeerThatFailsItsBodyDoesNotStopThePass(t *testing.T) {
+	// One data shard, so a rebuild reads one peer, and after that peer fails
+	// its body the only other peer is unreachable.
+	c := newCluster(t, 1, 2, 3)
+	first, second := c.store("stripe-a", 8192), c.store("stripe-b", 8192)
+	if bytes.Compare(first.hash[:], second.hash[:]) > 0 {
+		first, second = second, first
+	}
+	target := first.place.AllNodes()[0]
+	require.Equal(t, target, second.place.AllNodes()[0], "both stripes must start on one node")
+	c.blob.forget(target, first.hash, 0)
+	c.blob.forget(target, second.hash, 0)
+
+	bb := &bodyFailingBlob{fakeBlob: c.blob, key: first.hash, bad: first.place.AllNodes()[1], absent: first.place.AllNodes()[2]}
+	svc, err := New(Config{
+		Nodes: []config.NodeID{target}, Ring: c.ring, Meta: c.meta, Blob: bb,
+		DataShards: 1, ParityShards: 2, Workers: 1, PageSize: 1,
+	})
+	require.NoError(t, err)
+	require.NoError(t, svc.Pass(context.Background()))
+
+	_, held := c.blob.held(target, second.hash, 0)
+	assert.True(t, held, "the later stripe is repaired")
+	_, held = c.blob.held(target, first.hash, 0)
+	assert.False(t, held)
+}

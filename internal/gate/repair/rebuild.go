@@ -73,6 +73,14 @@ func (s *Service) readBack(ctx context.Context, t task) error {
 	return nil
 }
 
+// errGeometryMismatch reports a record written under another erasure code
+// than the one repair runs, which repair leaves alone.
+var errGeometryMismatch = errors.New("the record's erasure code is not the one repair runs")
+
+// errPeerBodies reports a rebuild that ran out of peers after some of them
+// failed part way through their shard.
+var errPeerBodies = errors.New("peer shards failed during the rebuild")
+
 // errNoHandoff reports that the handoff holder has nothing for this position,
 // which is the ordinary case and not a failure.
 var errNoHandoff = errors.New("no shard on the handoff holder")
@@ -149,6 +157,12 @@ func (s *Service) handoffNode(hash [32]byte) config.NodeID {
 // are one Reconstruct with a single output slot open, and the arithmetic is the
 // erasure coder's rather than written out here.
 func (s *Service) rebuildShard(ctx context.Context, t task) error {
+	// The stripe's own geometry decides which index is data and which is
+	// parity. Rebuilding under another code would write wrong bytes over it.
+	if len(t.place.DataShardNodes) != s.cfg.DataShards || len(t.place.ParityShardNodes) != s.cfg.ParityShards {
+		return fmt.Errorf("%w: the record is RS(%d,%d) and repair runs RS(%d,%d)", errGeometryMismatch,
+			len(t.place.DataShardNodes), len(t.place.ParityShardNodes), s.cfg.DataShards, s.cfg.ParityShards)
+	}
 	total := s.cfg.DataShards + s.cfg.ParityShards
 	skip := make(map[int]bool, total)
 	// A peer can answer its envelope and then fail its body, as a shard that
@@ -156,6 +170,11 @@ func (s *Service) rebuildShard(ctx context.Context, t task) error {
 	// while the stripe still has peers it has not tried.
 	for {
 		failed, err := s.rebuildFrom(ctx, t, total, skip)
+		if err != nil && failed < 0 && len(skip) > 0 && errors.Is(err, errTooFewPeers) {
+			// Peers did answer, so this is the stripe failing, not the node
+			// cut off from the cluster, and the pass goes on.
+			return fmt.Errorf("%w: %d peers failed their shard bodies, and then: %v", errPeerBodies, len(skip), err) //nolint:errorlint // The shortfall must not classify as no peer reachable.
+		}
 		if err == nil || failed < 0 {
 			return err
 		}
