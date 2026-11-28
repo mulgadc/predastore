@@ -91,7 +91,7 @@ func BenchmarkConfigProvider_LookupCredentials(b *testing.B) {
 	entries := make([]Entry, 0, 9)
 	entries = append(entries, Entry{AccessKeyID: "AKIASCOPE", SecretAccessKey: "secret", AccountID: "000000000002",
 		Policy: []PolicyRule{{Bucket: "backup", Actions: []string{"s3:GetObject", "s3:PutObject", "s3:ListBucket"}}}})
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		entries = append(entries, Entry{AccessKeyID: "AKIAOTHER" + string(rune('0'+i)), SecretAccessKey: "secret", AccountID: "000000000009"})
 	}
 	p, err := NewConfigProvider(entries)
