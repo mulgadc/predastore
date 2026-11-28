@@ -485,6 +485,7 @@ func TestARebuildRefusesARecordOfAnotherErasureCode(t *testing.T) {
 // another peer unreachable, for one object only.
 type bodyFailingBlob struct {
 	*fakeBlob
+
 	key         [32]byte
 	bad, absent config.NodeID
 }
