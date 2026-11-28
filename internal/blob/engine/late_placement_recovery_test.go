@@ -363,3 +363,24 @@ func TestS8DeferredRangeDoesNotReadUnrequestedFragments(t *testing.T) {
 	require.NoError(t, store.sweepDeferred(t.Context(), time.Time{}))
 	require.Equal(t, payload, readValue(t, store, key, 0))
 }
+
+func TestDeferredReadRetainsAnEpochReleasedDuringAuthorityCheck(t *testing.T) {
+	store, _ := openTestStore(t)
+	key := [32]byte{1}
+	payload := []byte("the resolved epoch remains readable through grace")
+	epoch := prepareValue(t, store, key, 0, payload)
+	require.NoError(t, store.replayRecoveredPrepares(t.Context(), func(context.Context, [32]byte, uint32, uint64) (bool, error) {
+		return false, nil
+	}))
+	_, err := store.LookupAt(key, 0, epoch)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	r, err := store.LookupRecoveredAt(t.Context(), key, 0, epoch, func(context.Context, [32]byte, uint32, uint64) (bool, error) {
+		return false, store.ReleaseGeneration(key, 0, epoch)
+	})
+	require.NoError(t, err)
+	got, err := io.ReadAll(r)
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+	require.Equal(t, payload, got)
+}

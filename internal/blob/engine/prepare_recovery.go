@@ -225,7 +225,7 @@ func (store *Store) LookupRecoveredAt(
 		return err
 	})
 	if errors.Is(err, badger.ErrKeyNotFound) {
-		return nil, ErrKeyNotFound
+		return store.LookupAt(key, index, epoch)
 	}
 	if err != nil {
 		return nil, err
@@ -235,7 +235,9 @@ func (store *Store) LookupRecoveredAt(
 		return nil, err
 	}
 	if !named {
-		return nil, ErrKeyNotFound
+		// Release can move the resolved epoch into reader grace during
+		// the authority check. Only the live and retained rows can serve it.
+		return store.LookupAt(key, index, epoch)
 	}
 	r, err := store.lookupReader(row, key, index)
 	if errors.Is(err, ErrKeyNotFound) {
