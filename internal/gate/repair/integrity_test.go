@@ -539,3 +539,34 @@ func TestAPeerThatFailsItsBodyDoesNotStopThePass(t *testing.T) {
 	_, held = c.blob.held(target, first.hash, 0)
 	assert.False(t, held)
 }
+
+// A newer writer can commit its shard and stop before it publishes, so S3
+// still reads the generation the record names, now retained. When that shard
+// fails authentication, the pass rebuilds that generation and reads it back.
+func TestARepairPassReplacesACorruptRetainedGenerationS3StillServes(t *testing.T) {
+	f := newS3Fixture(t, 2, 1, 4)
+	target := f.place.DataShardNodes[0]
+	ctx := context.Background()
+	newer := bytes.Repeat([]byte("n"), len(f.shards[0]))
+	_, err := f.nodes.client.Put(ctx, target, blob.PutRequest{Key: f.hash, Index: 0, Size: int64(len(newer)), Epoch: f.place.WriteEpoch + 1}, bytes.NewReader(newer))
+	require.NoError(t, err)
+	_, err = f.nodes.client.Commit(ctx, target, blob.CommitRequest{Key: f.hash, Index: 0, Epoch: f.place.WriteEpoch + 1})
+	require.NoError(t, err)
+
+	corruptOnlyShard(t, f.nodes.dirs[target])
+	f.getAnswersTheObject(t)
+
+	svc, err := New(Config{
+		Nodes: []config.NodeID{target}, Ring: f.c.ring, Meta: f.mc, Blob: f.nodes.client,
+		DataShards: 2, ParityShards: 1, Workers: 1,
+	})
+	require.NoError(t, err)
+	require.NoError(t, svc.Pass(ctx))
+	stats := svc.Stats()
+	assert.Equal(t, int64(1), stats.Repaired, "the retained generation is repaired")
+	assert.Zero(t, stats.Superseded, "a repair of the generation S3 serves is not a superseded write")
+
+	got, err := f.nodes.readShard(target, f.hash, 0, f.place.WriteEpoch)
+	require.NoError(t, err, "the node serves the generation the record names again")
+	assert.Equal(t, f.shards[0], got)
+}

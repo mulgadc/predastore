@@ -3,6 +3,10 @@ package engine
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/dgraph-io/badger/v4"
@@ -93,5 +97,108 @@ func TestASameEpochReplaceDoesNotLetTheSweepTakeTheNamedGeneration(t *testing.T)
 	}
 	if !bytes.Equal(buf.Bytes(), replacement) {
 		t.Fatalf("the named generation does not read the replacement")
+	}
+}
+
+// A rebuild of a generation that a newer commit already demoted replaces the
+// retained row. The bytes it displaces are dead, so they are tombstoned.
+func TestARebuildOfARetainedGenerationTombstonesTheBytesItDisplaces(t *testing.T) {
+	st, _ := openTestStore(t)
+	oh := [32]byte{0x63}
+	named, newer := nextTestEpoch(), nextTestEpoch()
+
+	prepareAt(t, st, oh, 0, named, bytes.Repeat([]byte("a"), 4*KiB))
+	commitAt(t, st, oh, 0, named)
+	prepareAt(t, st, oh, 0, newer, bytes.Repeat([]byte("n"), 4*KiB))
+	commitAt(t, st, oh, 0, newer)
+	raw, err := st.indexGet(retainedKey(MakeKey(oh, 0), named))
+	if err != nil {
+		t.Fatalf("read the retained row: %v", err)
+	}
+	displaced, _, err := decodeIndexValue(raw)
+	if err != nil {
+		t.Fatalf("decode the retained row: %v", err)
+	}
+
+	rebuilt := bytes.Repeat([]byte("r"), 4*KiB)
+	prepareAt(t, st, oh, 0, named, rebuilt)
+	if published, err := st.Commit(oh, 0, named); err != nil || published {
+		t.Fatalf("a commit under a newer live row publishes nothing: published %v, err %v", published, err)
+	}
+
+	if _, err := st.indexGet(tombstoneKey(displaced.SegNum, displaced.Off)); err != nil {
+		t.Errorf("the displaced retained extent has no tombstone, so its space is never reclaimed: %v", err)
+	}
+	r, err := st.LookupAt(oh, 0, named)
+	if err != nil {
+		t.Fatalf("lookup the named generation: %v", err)
+	}
+	defer r.Close()
+	buf := new(bytes.Buffer)
+	if _, err := buf.ReadFrom(r); err != nil || !bytes.Equal(buf.Bytes(), rebuilt) {
+		t.Fatalf("the named generation must read the rebuilt bytes: %v", err)
+	}
+}
+
+// A same-epoch replace frees the old bytes physically through compaction, but
+// only after a reader that already holds them closes. The replacement reads
+// back after a restart.
+func TestASameEpochReplaceIsReclaimedByCompactionAfterItsReaderCloses(t *testing.T) {
+	st, dir := openTestStore(t, WithMaxSegSize(40*KiB))
+	oh := [32]byte{0x64}
+	epoch := nextTestEpoch()
+	old := bytes.Repeat([]byte("o"), 12*KiB)
+	prepareAt(t, st, oh, 0, epoch, old)
+	commitAt(t, st, oh, 0, epoch)
+	putValue(t, st, oh, 1, bytes.Repeat([]byte("f"), 12*KiB))
+	putValue(t, st, oh, 2, bytes.Repeat([]byte("f"), 12*KiB))
+	if ext := extentOf(t, st, oh, 0); ext.SegNum != 0 {
+		t.Fatalf("the value must start in segment 0, got %d", ext.SegNum)
+	}
+	for _, idx := range []uint32{1, 2} {
+		if _, err := st.Delete(oh, idx); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+	}
+
+	held, err := st.Lookup(oh, 0)
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	replacement := bytes.Repeat([]byte("r"), 12*KiB)
+	prepareAt(t, st, oh, 0, epoch, replacement)
+	commitAt(t, st, oh, 0, epoch)
+	if ext := extentOf(t, st, oh, 0); ext.SegNum == 0 {
+		t.Fatal("the replacement must land outside segment 0, or this proves nothing")
+	}
+
+	seg0 := filepath.Join(dir, fmt.Sprintf(segFilename, 0))
+	if err := st.compactOnce(); err != nil {
+		t.Fatalf("compact with the reader open: %v", err)
+	}
+	if _, err := os.Stat(seg0); err != nil {
+		t.Fatalf("segment 0 must stay while a reader holds the old bytes: %v", err)
+	}
+	got, err := io.ReadAll(held)
+	if err != nil || !bytes.Equal(got, old) {
+		t.Fatalf("the open reader must still read the bytes it resolved: %v", err)
+	}
+	if err := held.Close(); err != nil {
+		t.Fatalf("close reader: %v", err)
+	}
+
+	if err := st.compactOnce(); err != nil {
+		t.Fatalf("compact after the reader closed: %v", err)
+	}
+	if _, err := os.Stat(seg0); !os.IsNotExist(err) {
+		t.Fatalf("segment 0 holds only dead bytes and must be reclaimed: %v", err)
+	}
+
+	if err := st.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	st = openStoreIn(t, dir, testAEAD(t))
+	if got := readValue(t, st, oh, 0); !bytes.Equal(got, replacement) {
+		t.Fatal("after a restart the position must read the replacement")
 	}
 }
