@@ -36,6 +36,10 @@ const (
 	CommandRetirePlacement
 )
 
+// commandTypeLast is the highest type this release applies. A replica stops on
+// any committed entry above it, so a type appended above must also move this.
+const commandTypeLast = CommandRetirePlacement
+
 // commandTypeUnset fills the type before a decode, so an entry with no type,
 // or a null one, keeps a value that no release knows and is never a put.
 const commandTypeUnset = ^CommandType(0)
@@ -277,7 +281,7 @@ func (f *FSM) ApplyBatch(logs []*raft.Log) []any {
 		err := json.Unmarshal(log.Data, &f.cmd)
 		cmd := f.cmd
 		f.cmd = Command{}
-		if err != nil || cmd.Type > CommandTxn {
+		if err != nil || cmd.Type > commandTypeLast {
 			b.stopOnUnreadableEntry(log.Index, log.Data, cmd.Type, err)
 		}
 		if cmd.Type == CommandTxn {
@@ -430,7 +434,7 @@ func (b *batch) stopOnUnreadableEntry(index uint64, data []byte, typ CommandType
 	}
 	//nolint:forbidigo // Skipping an entry another replica applies diverges the stores; restart applies it again.
 	panic(fmt.Sprintf("meta: committed entry %d has %s, and this release reads types up to %d; "+
-		"stopping so the entry is not skipped", index, reason, CommandTxn))
+		"stopping so the entry is not skipped", index, reason, commandTypeLast))
 }
 
 // hasType reports whether an entry that decoded sets its type to a value, as
