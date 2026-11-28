@@ -412,3 +412,53 @@ func TestARepairPassUnderAWrongKeyKeepsTheShardTheRightKeyReads(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond, "under the cluster's key the node serves its shard")
 	assert.Equal(t, shards[0], got)
 }
+
+// reopenAsEarlierRelease stops a node, removes its key check as a store from
+// an earlier release has none, and starts it again under aead.
+func (r *realNodes) reopenAsEarlierRelease(id config.NodeID, aead cipher.AEAD) {
+	r.stops[id]()
+	if err := os.Remove(filepath.Join(r.dirs[id], "keycheck")); err != nil && !os.IsNotExist(err) {
+		r.t.Fatal(err)
+	}
+	r.start(id, aead)
+}
+
+// A store from an earlier release can hold shards sealed under a wrong key as
+// well as under the cluster key. Opened under the wrong key, it reads its own
+// wrong-key shard, and a repair pass must still not replace the original.
+func TestARepairPassOnAnUpgradedStoreUnderAWrongKeyKeepsTheOriginalShard(t *testing.T) {
+	f := newS3Fixture(t, 2, 1, 4)
+	target := f.place.DataShardNodes[0]
+	wrong, err := masterkey.NewAEAD(bytes.Repeat([]byte{0x43}, 32))
+	require.NoError(t, err)
+
+	// Before the amended code opens it: a second shard written under the
+	// wrong key, and no key check, as an earlier release leaves the store.
+	f.nodes.reopenAsEarlierRelease(target, wrong)
+	other := sha256.Sum256([]byte("written under the wrong key"))
+	body := bytes.Repeat([]byte("w"), 4096)
+	ctx := context.Background()
+	require.Eventually(t, func() bool {
+		_, err := f.nodes.client.Put(ctx, target, blob.PutRequest{Key: other, Index: 0, Size: int64(len(body)), Epoch: 9}, bytes.NewReader(body))
+		return err == nil
+	}, 5*time.Second, 20*time.Millisecond)
+	_, err = f.nodes.client.Commit(ctx, target, blob.CommitRequest{Key: other, Index: 0, Epoch: 9})
+	require.NoError(t, err)
+	f.nodes.reopenAsEarlierRelease(target, wrong)
+
+	require.Eventually(t, func() bool {
+		got, err := f.nodes.readShard(target, other, 0, 9)
+		return err == nil && bytes.Equal(got, body)
+	}, 5*time.Second, 20*time.Millisecond, "the wrong key opens the shard it sealed")
+	f.getAnswersTheObject(t)
+	assert.False(t, f.suspect(t, 0), "an upgraded store marks no shard for repair")
+	f.pass(t, target)
+
+	f.nodes.restart(target, storetest.TestAEAD())
+	var got []byte
+	require.Eventually(t, func() bool {
+		got, err = f.nodes.readShard(target, f.hash, 0, f.place.WriteEpoch)
+		return err == nil
+	}, 5*time.Second, 20*time.Millisecond, "under the cluster's key the node serves its original shard")
+	assert.Equal(t, f.shards[0], got)
+}

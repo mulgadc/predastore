@@ -33,9 +33,6 @@ type reader struct {
 	// Records the segment read's latency for compaction's yield; may be nil.
 	latency *latencyMeter
 
-	// Told of each fragment that opens while the store's key is unverified.
-	keyCheck *keyCheck
-
 	closed bool
 }
 
@@ -101,10 +98,6 @@ func (r *reader) ReadAt(p []byte, off int64) (int, error) {
 			plaintext, err := frag.open(r.aead, r.key, r.index, r.storeID)
 			if err != nil {
 				return totalCopied, fmt.Errorf("segment %d offset %d: %w", r.ext.SegNum, batchDiskOff+int64(pos), err)
-			}
-
-			if r.keyCheck != nil {
-				r.keyCheck.authenticated(frag.fragNum())
 			}
 
 			n := copy(p[totalCopied:], plaintext[bodyOffset:])

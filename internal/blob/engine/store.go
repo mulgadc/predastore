@@ -59,8 +59,8 @@ type Store struct {
 	// The durably-reserved ceiling on fragNum; Append fsyncs only to raise it.
 	fragNumHighWater uint64
 
-	// keyCheck is the evidence that aead is the key that sealed this store.
-	keyCheck *keyCheck
+	// keyVerified reports that a key check this store sealed opens under aead.
+	keyVerified bool
 
 	maxSegSize uint64
 
@@ -349,13 +349,11 @@ func Open(dir string, opts ...Option) (store *Store, err error) {
 		return nil, fmt.Errorf("count segments: %w", err)
 	}
 
-	// Every fragment an earlier start sealed is numbered below the fragNum
-	// this start resumes from, which is what a pending key check records.
 	hasData, err := storeHasData(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read segments: %w", err)
 	}
-	store.keyCheck = openKeyCheck(dir, store.aead, store.storeID, hasData, store.fragNum)
+	store.keyVerified = openKeyCheck(dir, store.aead, store.storeID, hasData)
 
 	if _, err := store.nextAvailableSegment(); err != nil {
 		return nil, err
@@ -545,7 +543,6 @@ func (store *Store) lookup(rowKey []byte, key [32]byte, index uint32) (Reader, e
 		buf:      buf,
 		held:     held,
 		latency:  store.latency,
-		keyCheck: store.pendingKeyCheck(),
 	}, nil
 }
 
@@ -1306,13 +1303,4 @@ func MakeKey(key [32]byte, index uint32) []byte {
 	binary.BigEndian.PutUint32(idxKey[32:], index)
 
 	return idxKey
-}
-
-// pendingKeyCheck is the key check a reader reports to, or nil once the key
-// is verified, so a verified store's reads skip it.
-func (store *Store) pendingKeyCheck() *keyCheck {
-	if store.keyCheck == nil || !store.keyCheck.pending() {
-		return nil
-	}
-	return store.keyCheck
 }

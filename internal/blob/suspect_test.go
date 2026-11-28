@@ -162,9 +162,9 @@ func TestASuspectMarkSurvivesCompactionMovingTheShard(t *testing.T) {
 	assert.Error(t, err, "compaction copies the bad ciphertext as it was")
 }
 
-// A store from an earlier release has no key check. Once upgraded, its key
-// can verify, but a shard that then fails authentication is never marked:
-// such a store could verify a wrong key, and repair must not act on it.
+// A store from an earlier release has no key check, and it may have run under
+// another key, so a shard that fails authentication on it is never marked and
+// repair never replaces one.
 func TestAnUpgradedStoreMarksNoShardSuspect(t *testing.T) {
 	dir := t.TempDir()
 	aead := storetest.TestAEAD()
@@ -188,7 +188,7 @@ func TestAnUpgradedStoreMarksNoShardSuspect(t *testing.T) {
 	_, err = io.ReadAll(r)
 	require.NoError(t, err)
 	require.NoError(t, r.Close())
-	require.Eventually(t, st.KeyVerified, 5*time.Second, time.Millisecond, "a read of the old shard verifies the key")
+	require.False(t, st.KeyVerified(), "a store from an earlier release has no evidence for its key")
 
 	c := startStoreNode(t, st)
 	flipFirstFragment(t, dir)
